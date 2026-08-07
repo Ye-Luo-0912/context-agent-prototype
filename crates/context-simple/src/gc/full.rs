@@ -5,7 +5,7 @@ use agent_contracts::{
 
 use crate::diagnostics;
 use crate::engine::{SimpleContextConfig, State};
-use crate::index::entity::{entities_match, extract_entities};
+use crate::index::entity::entities_match;
 use crate::policy::score_item_with_breakdown;
 
 /// Cap on transitive dependency expansion during the mark phase: the root
@@ -122,10 +122,7 @@ fn mark_roots(
         let in_active_scope = active_task.is_some_and(|task| item.task_id == Some(task));
         let durable_session_memory =
             item.retention == ContextRetention::Durable && item.scope == ContextScope::Session;
-        let hot = !hot_entities.is_empty() && {
-            let item_entities = extract_entities(&item.content);
-            entities_match(&item_entities, hot_entities)
-        };
+        let hot = !hot_entities.is_empty() && entities_match(&item.entities, hot_entities);
         if is_pin || in_active_scope || durable_session_memory || hot {
             marked.push(item.id);
         }
@@ -274,11 +271,8 @@ fn reactivation_reason(
     if item.retention == ContextRetention::Pinned || item.scope == ContextScope::Pinned {
         return Some("explicitly pinned again".to_string());
     }
-    if !hot_entities.is_empty() {
-        let item_entities = extract_entities(&item.content);
-        if entities_match(&item_entities, hot_entities) {
-            return Some("entities are hot again in the working set".to_string());
-        }
+    if !hot_entities.is_empty() && entities_match(&item.entities, hot_entities) {
+        return Some("entities are hot again in the working set".to_string());
     }
     // The score is the fallback: a genuinely high-value item (importance,
     // retention, affinity) may still be worth reactivating even without a
@@ -297,6 +291,7 @@ fn reactivation_reason(
 mod tests {
     use super::*;
     use crate::engine::SimpleContextEngine;
+    use crate::index::entity::extract_entities;
     use agent_contracts::{
         ContextEngine, ContextIngress, ContextKind, ContextMaintenanceTrigger, TaskId, ToolOutput,
     };
@@ -372,6 +367,7 @@ mod tests {
                 if item.kind == ContextKind::UserMessage {
                     item.task_id = Some(TaskId::new());
                     item.content = "fix CacheStore.rs".into();
+                    item.entities = extract_entities(&item.content);
                     item.state = ContextState::Archived;
                     item.relevance = 0.0;
                     item.gc_generation = 99; // already past the cap
@@ -529,6 +525,7 @@ mod tests {
                     // the hot set at ingest, so the content must change).
                     item.task_id = Some(TaskId::new());
                     item.content = "error in TempStore.rs:7".into();
+                    item.entities = extract_entities(&item.content);
                     item.state = ContextState::Cooling;
                 }
             }

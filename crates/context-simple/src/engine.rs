@@ -383,6 +383,13 @@ impl ContextEngine for SimpleContextEngine {
     async fn restore(&self, data: Value) -> AgentResult<()> {
         let mut state = self.state.lock().await;
         *state = checkpoint::deserialize(data)?;
+        // Old checkpoints predate the entity signature cache; backfill it
+        // once so restored items keep scoring and dependency behavior.
+        for item in &mut state.items {
+            if item.entities.is_empty() {
+                item.entities = entity::extract_entities(&item.content);
+            }
+        }
         Ok(())
     }
 }

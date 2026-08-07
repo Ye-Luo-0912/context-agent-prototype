@@ -596,6 +596,7 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
             evicted_at_tick: None,
+            entities: Vec::new(),
         };
         let dep = ContextItem {
             id: dep_id,
@@ -619,6 +620,7 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
             evicted_at_tick: None,
+            entities: Vec::new(),
         };
         state.items.push(hub);
         state.items.push(dep);
@@ -686,6 +688,7 @@ async fn dependency_expansion_can_be_disabled() {
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
             evicted_at_tick: None,
+            entities: Vec::new(),
         };
         let dep = ContextItem {
             id: dep_id,
@@ -709,6 +712,7 @@ async fn dependency_expansion_can_be_disabled() {
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
             evicted_at_tick: None,
+            entities: Vec::new(),
         };
         state.items.push(hub);
         state.items.push(dep);
@@ -764,6 +768,7 @@ async fn archived_dependency_below_threshold_stays_out() {
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
             evicted_at_tick: None,
+            entities: Vec::new(),
         };
         let dep = ContextItem {
             id: dep_id,
@@ -787,6 +792,7 @@ async fn archived_dependency_below_threshold_stays_out() {
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
             evicted_at_tick: None,
+            entities: Vec::new(),
         };
         state.items.push(hub);
         state.items.push(dep);
@@ -1337,6 +1343,7 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
             evicted_at_tick: None,
+            entities: Vec::new(),
         };
         let oversized_pin = ContextItem {
             id: ContextItemId::new(),
@@ -1360,6 +1367,7 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
             evicted_at_tick: None,
+            entities: Vec::new(),
         };
         state.items.push(small_pin);
         state.items.push(oversized_pin);

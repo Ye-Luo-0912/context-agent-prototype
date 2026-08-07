@@ -64,8 +64,7 @@ pub(crate) fn queue_decision_supersessions(
         {
             continue;
         }
-        let prior_entities = extract_entities(&item.content);
-        if entities_match(&entities, &prior_entities) {
+        if entities_match(&entities, &item.entities) {
             let snippet: String = item.content.chars().take(60).collect();
             state
                 .pending_supersessions
@@ -88,8 +87,7 @@ pub(crate) fn queue_error_verifications(state: &mut State, content: &str, reason
         if is_excluded(item) {
             continue;
         }
-        let prior_entities = extract_entities(&item.content);
-        if entities_match(&entities, &prior_entities) {
+        if entities_match(&entities, &item.entities) {
             state
                 .pending_verifications
                 .push((item.id, reason.to_string()));
@@ -112,8 +110,7 @@ pub(crate) fn queue_error_recurrence(state: &mut State, content: &str, round: u6
         if is_excluded(item) {
             continue;
         }
-        let prior_entities = extract_entities(&item.content);
-        if entities_match(&entities, &prior_entities) {
+        if entities_match(&entities, &item.entities) {
             state.pending_supersessions.push((
                 item.id,
                 format!(

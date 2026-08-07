@@ -102,6 +102,13 @@ pub struct ContextItem {
     /// the current pass, so an item cannot bounce out and back in one GC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evicted_at_tick: Option<u64>,
+    /// Precomputed entity signature of `content` (the same tokens the
+    /// policy, dependency linking, supersession and GC all use), so the hot
+    /// paths do not re-parse item content on every pass. The engine keeps it
+    /// in sync; `serde(default)` keeps old checkpoints and hand-built items
+    /// valid (restore backfills items with an empty signature).
+    #[serde(default)]
+    pub entities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

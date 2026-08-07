@@ -4,9 +4,12 @@ use agent_contracts::{
 };
 
 use crate::engine::{SimpleContextConfig, State};
+use crate::index::entity::extract_entities;
 
 /// Build a fresh item stamped with the current turn, tick and task. Content
-/// is truncated to the configured bound before it enters the heap.
+/// is truncated to the configured bound before it enters the heap, and the
+/// entity signature is precomputed once so dependency linking, supersession,
+/// scoring and GC never re-parse the content.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_item(
     state: &State,
@@ -19,6 +22,7 @@ pub(crate) fn make_item(
     source: Option<String>,
 ) -> ContextItem {
     let content = truncate_chars(content, config.max_item_chars);
+    let entities = extract_entities(&content);
     ContextItem {
         id: ContextItemId::new(),
         task_id: state.focus.as_ref().map(|f| f.task_id),
@@ -41,6 +45,7 @@ pub(crate) fn make_item(
         residency: ContextResidency::Resident,
         gc_generation: 0,
         evicted_at_tick: None,
+        entities,
     }
 }
 

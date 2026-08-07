@@ -42,24 +42,21 @@ pub(crate) fn score_item_with_breakdown(
     // How much of this item's entity signature is hot right now. 0 when the
     // item (or the hot set) has no entities. This complements focus_match:
     // focus entities come from the user message, hot_entities additionally
-    // covers files/symbols the agent actually touched via tools.
-    let entity_affinity = if hot_entities.is_empty() {
+    // covers files/symbols the agent actually touched via tools. The item's
+    // signature is precomputed at ingest, so scoring never re-parses content.
+    let entity_affinity = if hot_entities.is_empty() || item.entities.is_empty() {
         0.0
     } else {
-        let item_entities = crate::index::entity::extract_entities(&item.content);
-        if item_entities.is_empty() {
-            0.0
-        } else {
-            let matched = item_entities
-                .iter()
-                .filter(|entity| {
-                    hot_entities
-                        .iter()
-                        .any(|hot| hot.contains(*entity) || entity.contains(hot))
-                })
-                .count();
-            0.18 * (matched as f32 / item_entities.len() as f32)
-        }
+        let matched = item
+            .entities
+            .iter()
+            .filter(|entity| {
+                hot_entities
+                    .iter()
+                    .any(|hot| hot.contains(*entity) || entity.contains(hot))
+            })
+            .count();
+        0.18 * (matched as f32 / item.entities.len() as f32)
     };
 
     let scope_bonus = match item.scope {
@@ -127,6 +124,7 @@ mod tests {
     use agent_contracts::{ContextItemId, ContextKind, ContextState};
 
     fn tool_item(content: &str, importance: f32) -> ContextItem {
+        let entities = crate::index::entity::extract_entities(content);
         ContextItem {
             id: ContextItemId::new(),
             task_id: None,
@@ -149,6 +147,7 @@ mod tests {
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
             evicted_at_tick: None,
+            entities,
         }
     }
 

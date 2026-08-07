@@ -1,7 +1,7 @@
 use agent_contracts::{ContextItem, ContextItemId, ContextState};
 
 use crate::engine::{SimpleContextConfig, State};
-use crate::index::entity::{entities_match, extract_entities};
+use crate::index::entity::entities_match;
 
 /// Per-item cap on explicit dependency edges recorded at ingest.
 pub(crate) const MAX_DEPENDENCY_EDGES: usize = 8;
@@ -9,24 +9,26 @@ pub(crate) const MAX_DEPENDENCY_EDGES: usize = 8;
 /// Link a fresh item to prior non-dropped items that share at least one
 /// entity (new item depends on prior), bounded per item, then store it.
 /// Gated by `dependency_expansion` so `baseline_v0()` records no edges.
+/// Prior items reuse their precomputed entity signature, so ingest does not
+/// re-parse every old item's content (O(N) signature lookups, not O(N)
+/// re-extractions).
 pub(crate) fn push_linked(
     state: &mut State,
     config: &SimpleContextConfig,
     mut item: ContextItem,
 ) -> ContextItemId {
     if config.dependency_expansion {
-        let entities = extract_entities(&item.content);
+        let entities = item.entities.clone();
         if !entities.is_empty() {
             let mut edges = 0usize;
             for prior in state.items.iter().rev() {
                 if prior.state == ContextState::Dropped {
                     continue;
                 }
-                let prior_entities = extract_entities(&prior.content);
-                if prior_entities.is_empty() {
+                if prior.entities.is_empty() {
                     continue;
                 }
-                if entities_match(&entities, &prior_entities) {
+                if entities_match(&entities, &prior.entities) {
                     item.dependencies.push(prior.id);
                     edges += 1;
                     if edges >= MAX_DEPENDENCY_EDGES {
