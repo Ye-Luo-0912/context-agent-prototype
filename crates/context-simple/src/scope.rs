@@ -1,22 +1,19 @@
 use agent_contracts::{
-    ContextItem, ContextRetention, ContextScope, ContextState, ContextStateTransition, Scope,
-    ScopeId, ScopeKind, ScopeState, TaskId,
+    ContextItem, ContextRetention, ContextScope, ContextState, ContextStateTransition, Label,
+    LifecycleLabel, Scope, ScopeId, ScopeKind, ScopeState, TaskId,
 };
 
 use crate::engine::State;
 
-/// Tags that mark an item as a durable outcome worth keeping when its scope
-/// closes: decisions, findings, constraints, open loops, artifact references
-/// and evidence references are promoted to the parent scope. Everything else
-/// in a closed scope is released.
-const PROMOTION_TAGS: [&str; 6] = [
-    "decision",
-    "finding",
-    "constraint",
-    "open-loop",
-    "artifact-ref",
-    "evidence-ref",
-];
+/// Pinned or durable items, and items carrying a core content label, are the
+/// durable outcomes of the scope. Everything else in a closed scope is
+/// released.
+fn should_promote(item: &ContextItem) -> bool {
+    matches!(
+        item.retention,
+        ContextRetention::Pinned | ContextRetention::Durable
+    ) || item.tags.iter().any(|tag| tag.is_promotable())
+}
 
 /// Lazily open the single session scope of the run. Every run has exactly
 /// one; it is never closed.
@@ -338,22 +335,8 @@ fn legacy_belongs_to(item: &ContextItem, scope: &Scope) -> bool {
     }
 }
 
-/// Pinned or durable items, and items carrying a promotion tag, are the
+/// Pinned or durable items, and items carrying a core content label, are the
 /// durable outcomes of the scope.
-fn should_promote(item: &ContextItem) -> bool {
-    matches!(
-        item.retention,
-        ContextRetention::Pinned | ContextRetention::Durable
-    ) || item
-        .tags
-        .iter()
-        .any(|tag| PROMOTION_TAGS.contains(&tag.as_str()))
-}
-
-/// Promote one item to the parent scope: it becomes durable, moves to the
-/// parent's scope marker and is reactivated if it had cooled down. Already
-/// promoted items are left alone (the task close and its focus cascade both
-/// see the same members).
 fn promote(
     item: &mut ContextItem,
     parent_scope: ContextScope,
@@ -361,7 +344,11 @@ fn promote(
     turn: u64,
     transitions: &mut Vec<ContextStateTransition>,
 ) {
-    if item.tags.iter().any(|tag| tag == "promoted") {
+    if item
+        .tags
+        .iter()
+        .any(|tag| tag.is_lifecycle(LifecycleLabel::Promoted))
+    {
         return;
     }
     let from = item.state;
@@ -372,7 +359,7 @@ fn promote(
         item.retention = ContextRetention::Durable;
     }
     item.scope = parent_scope;
-    item.tags.push("promoted".into());
+    item.tags.push(Label::lifecycle(LifecycleLabel::Promoted));
     if item.state != ContextState::Active {
         item.state = ContextState::Active;
         item.relevance = 0.5;

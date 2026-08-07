@@ -1,8 +1,8 @@
 use agent_contracts::{
     AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItem, ContextItemId,
     ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextQuery, ContextRetention, ContextScope, ContextStateTransition, FocusState,
-    MaterializedContext, Scope, ScopeId, ScopeKind,
+    ContextQuery, ContextRetention, ContextScope, ContextStateTransition, CoreLabel, FocusState,
+    Label, MaterializedContext, Scope, ScopeId, ScopeKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -154,7 +154,7 @@ impl ContextEngine for SimpleContextEngine {
                 if self.config.supersession && reachability::classify_decision(&content) {
                     // Decisions are promoted and tracked so later decisions
                     // can supersede them.
-                    item.tags.push("decision".into());
+                    item.tags.push(Label::core(CoreLabel::Decision));
                     item.importance = 0.72;
                 }
                 let item_id = dependency::push_linked(&mut state, &self.config, item);

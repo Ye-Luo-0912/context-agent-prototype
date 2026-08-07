@@ -1153,7 +1153,12 @@ async fn promoted_finding_reactivates_for_a_related_task() {
             .find(|item| item.content.contains("use TOML for config"))
             .expect("promoted decision");
         assert_eq!(decision.scope, ContextScope::Session);
-        assert!(decision.tags.iter().any(|tag| tag == "promoted"));
+        assert!(
+            decision
+                .tags
+                .iter()
+                .any(|tag| tag.is_lifecycle(agent_contracts::LifecycleLabel::Promoted))
+        );
         assert_ne!(decision.state, ContextState::Dropped);
     }
     engine

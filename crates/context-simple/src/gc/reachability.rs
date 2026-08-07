@@ -1,5 +1,6 @@
 use agent_contracts::{
-    ContextItem, ContextItemId, ContextKind, ContextState, ContextStateTransition,
+    ContextItem, ContextItemId, ContextKind, ContextState, ContextStateTransition, CoreLabel,
+    Label, LifecycleLabel,
 };
 
 use crate::engine::State;
@@ -29,9 +30,10 @@ pub(crate) fn classify_decision(text: &str) -> bool {
 /// True when the item is permanently excluded from model requests: a
 /// superseded decision or a verified-fixed error, whatever its score.
 pub(crate) fn is_excluded(item: &ContextItem) -> bool {
-    item.tags
-        .iter()
-        .any(|tag| tag == "superseded" || tag == "verified-fixed")
+    item.tags.iter().any(|tag| {
+        tag.is_lifecycle(LifecycleLabel::Superseded)
+            || tag.is_lifecycle(LifecycleLabel::VerifiedFixed)
+    })
 }
 
 /// Queue supersession for every non-dropped decision item that shares an
@@ -50,12 +52,16 @@ pub(crate) fn queue_decision_supersessions(
         if Some(item.id) == except_id {
             continue;
         }
-        let is_decision =
-            item.kind == ContextKind::Decision || item.tags.iter().any(|tag| tag == "decision");
+        let is_decision = item.kind == ContextKind::Decision
+            || item.tags.iter().any(|tag| tag.is_core(CoreLabel::Decision));
         if !is_decision || item.state == ContextState::Dropped {
             continue;
         }
-        if item.tags.iter().any(|tag| tag == "superseded") {
+        if item
+            .tags
+            .iter()
+            .any(|tag| tag.is_lifecycle(LifecycleLabel::Superseded))
+        {
             continue;
         }
         let prior_entities = extract_entities(&item.content);
@@ -142,7 +148,7 @@ pub(crate) fn drain_supersessions(state: &mut State, turn: u64) -> Vec<ContextSt
         }
         item.state = ContextState::Archived;
         item.relevance = 0.0;
-        item.tags.push("superseded".into());
+        item.tags.push(Label::lifecycle(LifecycleLabel::Superseded));
     }
     transitions
 }
@@ -171,7 +177,8 @@ pub(crate) fn drain_verifications(state: &mut State, turn: u64) -> Vec<ContextSt
         }
         item.state = ContextState::Archived;
         item.relevance = 0.0;
-        item.tags.push("verified-fixed".into());
+        item.tags
+            .push(Label::lifecycle(LifecycleLabel::VerifiedFixed));
     }
     transitions
 }

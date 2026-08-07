@@ -68,8 +68,11 @@ pub struct ContextItem {
     pub last_access_turn: u64,
     #[serde(default)]
     pub dependencies: Vec<ContextItemId>,
+    /// Typed labels: core content labels, lifecycle markers and extension
+    /// namespaces. Promotion and GC decide membership by these instead of
+    /// raw string matching.
     #[serde(default)]
-    pub tags: Vec<String>,
+    pub tags: Vec<crate::label::Label>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
