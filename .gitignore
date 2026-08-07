@@ -1,0 +1,5 @@
+/target
+/.focus-agent
+*.db
+*.db-shm
+*.db-wal

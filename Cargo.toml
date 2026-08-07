@@ -1,0 +1,47 @@
+[workspace]
+members = [
+    "crates/agent-contracts",
+    "crates/context-simple",
+    "crates/context-baselines",
+    "crates/context-contextcore",
+    "crates/agent-context-service",
+    "crates/agent-workspace",
+    "crates/tool-runtime",
+    "crates/agent-storage",
+    "crates/agent-kernel",
+    "crates/agent-replay",
+    "crates/provider-openai",
+    "crates/agent-tui",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+agent-contracts = { path = "crates/agent-contracts" }
+context-simple = { path = "crates/context-simple" }
+context-baselines = { path = "crates/context-baselines" }
+context-contextcore = { path = "crates/context-contextcore" }
+agent-workspace = { path = "crates/agent-workspace" }
+tool-runtime = { path = "crates/tool-runtime" }
+agent-storage = { path = "crates/agent-storage" }
+agent-kernel = { path = "crates/agent-kernel" }
+provider-openai = { path = "crates/provider-openai" }
+
+async-trait = "0.1"
+futures-util = "0.3"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "process", "fs", "io-util", "io-std"] }
+tokio-util = { version = "0.7", features = ["io", "codec"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+ratatui = "0.30"
+crossterm = "0.29"
+anyhow = "1"

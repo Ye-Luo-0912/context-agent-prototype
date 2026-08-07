@@ -1,0 +1,12 @@
+[package]
+name = "context-simple"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+agent-contracts.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

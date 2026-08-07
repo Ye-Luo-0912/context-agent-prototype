@@ -1,0 +1,13 @@
+[package]
+name = "context-baselines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Baseline ContextEngine implementations (append-only, rolling summary) for A/B/C lifecycle experiments"
+
+[dependencies]
+agent-contracts.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
