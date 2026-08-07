@@ -9,14 +9,27 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentError, AgentResult, Capability, CapabilityLifecycle, ToolDispatcher, ToolExecutionRequest,
-    ToolOutput, ToolSpec,
+    AgentError, AgentResult, Capability, CapabilityLifecycle, CapabilityStatus,
+    CapabilityTransport, ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
 };
 use async_trait::async_trait;
 
 struct Entry {
     capability: Arc<dyn Capability>,
     started: bool,
+    /// The effective maturity. External (out-of-process) capabilities are
+    /// pinned to Experimental regardless of their declared status, so an LLM
+    /// cannot promote its own module to Stable.
+    status: CapabilityStatus,
+}
+
+/// One row of the platform's capability catalog (the discovery surface).
+#[derive(Debug, Clone)]
+pub struct CapabilityCatalogEntry {
+    pub id: String,
+    pub status: CapabilityStatus,
+    pub transport: CapabilityTransport,
+    pub tools: Vec<String>,
 }
 
 /// Runtime-mutable registry of dynamic capabilities, shared between the
@@ -52,14 +65,58 @@ impl CapabilityRegistry {
                 )));
             }
         }
+        // The maturity ladder is climbed, not declared: out-of-process
+        // (external/LLM-authored) capabilities always start Experimental.
+        let status = if manifest.transport != CapabilityTransport::InProcess
+            && manifest.status != CapabilityStatus::Experimental
+        {
+            CapabilityStatus::Experimental
+        } else {
+            manifest.status
+        };
         inner.insert(
             manifest.id.clone(),
             Entry {
                 capability,
                 started: false,
+                status,
             },
         );
         Ok(())
+    }
+
+    /// The effective maturity of a registered capability (Experimental for
+    /// external capabilities regardless of declaration).
+    pub fn status(&self, id: &str) -> Option<CapabilityStatus> {
+        self.inner
+            .read()
+            .expect("capability registry poisoned")
+            .get(id)
+            .map(|entry| entry.status)
+    }
+
+    /// Snapshot of every registered capability, for the discovery surface.
+    pub fn catalog(&self) -> Vec<CapabilityCatalogEntry> {
+        let inner = self.inner.read().expect("capability registry poisoned");
+        let mut entries: Vec<_> = inner
+            .values()
+            .map(|entry| {
+                let manifest = entry.capability.manifest();
+                CapabilityCatalogEntry {
+                    id: manifest.id.clone(),
+                    status: entry.status,
+                    transport: manifest.transport.clone(),
+                    tools: entry
+                        .capability
+                        .tool_specs()
+                        .iter()
+                        .map(|s| s.name.clone())
+                        .collect(),
+                }
+            })
+            .collect();
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        entries
     }
 
     /// The tool schemas all registered capabilities contribute, so the

@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex};
 
 use agent_contracts::{
     AgentResult, ApprovalGate, CancellationToken, Capability, CapabilityLifecycle,
-    CapabilityManifest, CapabilityTransport, ContextDiagnostics, ContextEngine, ContextIngress,
-    ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
-    ContextStateTransition, MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest,
-    ModelTransport, RunId, ScopeId, ScopeKind, ToolCall, ToolDispatcher, ToolExecutionRequest,
-    ToolOutput, ToolRisk, ToolSpec,
+    CapabilityManifest, CapabilityStatus, CapabilityTransport, ContextDiagnostics, ContextEngine,
+    ContextIngress, ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger,
+    ContextQuery, ContextStateTransition, MaterializedContext, ModelCapabilities, ModelOutput,
+    ModelRequest, ModelTransport, RunId, ScopeId, ScopeKind, ToolCall, ToolDispatcher,
+    ToolExecutionRequest, ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_runtime::{
     APPROVAL_POLICY, CapabilityAwareDispatcher, CapabilityId, ContextModule, ModelModule, Module,
@@ -280,6 +280,7 @@ impl DemoCapability {
                 version: "1.0.0".into(),
                 name: "demo".into(),
                 summary: "demo capability".into(),
+                status: CapabilityStatus::Experimental,
                 permissions: vec!["workspace:read".into()],
                 dependencies: Vec::new(),
                 lifecycle,
@@ -292,6 +293,13 @@ impl DemoCapability {
     fn with_dependency(id: &str, dependency: &str) -> Self {
         let mut capability = Self::new(id, CapabilityLifecycle::Eager, Arc::new(Mutex::new(false)));
         capability.manifest.dependencies.push(dependency.into());
+        capability
+    }
+
+    fn declared_stable(id: &str, transport: CapabilityTransport) -> Self {
+        let mut capability = Self::new(id, CapabilityLifecycle::Lazy, Arc::new(Mutex::new(false)));
+        capability.manifest.status = CapabilityStatus::Stable;
+        capability.manifest.transport = transport;
         capability
     }
 }
@@ -449,4 +457,52 @@ async fn missing_capability_lookup_fails_with_a_clear_error() {
     }
     // Module claims are empty for an unregistered id.
     assert!(host.registry().claims(APPROVAL_POLICY).is_none());
+}
+
+#[tokio::test]
+async fn external_capabilities_start_experimental_regardless_of_declared_status() {
+    let host = ModuleHost::new();
+    let registry = host.capability_registry();
+
+    // An out-of-process capability declares itself Stable; the platform must
+    // not let the LLM promote its own module.
+    registry
+        .register(Arc::new(DemoCapability::declared_stable(
+            "ext-llm-module",
+            CapabilityTransport::Process {
+                program: "plugin".into(),
+            },
+        )))
+        .unwrap();
+    assert_eq!(
+        registry.status("ext-llm-module"),
+        Some(CapabilityStatus::Experimental),
+        "external capabilities enter at the bottom of the maturity ladder"
+    );
+
+    // The catalog reports the effective status, not the declaration.
+    let entry = registry
+        .catalog()
+        .into_iter()
+        .find(|entry| entry.id == "ext-llm-module")
+        .expect("registered capability must appear in the catalog");
+    assert_eq!(entry.status, CapabilityStatus::Experimental);
+    assert_eq!(entry.tools, vec!["ext-llm-module.demo".to_string()]);
+}
+
+#[tokio::test]
+async fn trusted_builtin_capabilities_keep_their_declared_status() {
+    let host = ModuleHost::new();
+    let registry = host.capability_registry();
+    registry
+        .register(Arc::new(DemoCapability::declared_stable(
+            "trusted-core",
+            CapabilityTransport::InProcess,
+        )))
+        .unwrap();
+    assert_eq!(
+        registry.status("trusted-core"),
+        Some(CapabilityStatus::Stable),
+        "the trusted core declares its own maturity"
+    );
 }

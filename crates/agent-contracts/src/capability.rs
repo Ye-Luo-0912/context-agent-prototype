@@ -23,6 +23,39 @@ pub enum CapabilityLifecycle {
     Lazy,
 }
 
+/// Maturity of a capability on the self-improvement ladder. External
+/// capabilities always enter as `Experimental` — the LLM cannot declare its
+/// own module `Stable`; the ladder is climbed through testing and
+/// validation (the replay/evaluation infrastructure is the future
+/// evaluator), not by declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityStatus {
+    /// Newly published; not yet exercised by real runs.
+    #[default]
+    Experimental,
+    /// Exercised by replay/evaluation scenarios.
+    Tested,
+    /// Passed validation against the evaluation gate.
+    Validated,
+    /// Approved for normal use.
+    Stable,
+    /// Superseded; kept only for migration warnings.
+    Deprecated,
+}
+
+impl CapabilityStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Experimental => "experimental",
+            Self::Tested => "tested",
+            Self::Validated => "validated",
+            Self::Stable => "stable",
+            Self::Deprecated => "deprecated",
+        }
+    }
+}
+
 /// How a capability's service is reached.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CapabilityTransport {
@@ -44,6 +77,10 @@ pub struct CapabilityManifest {
     pub version: String,
     pub name: String,
     pub summary: String,
+    /// Maturity on the Experimental -> Stable ladder. External registrations
+    /// are pinned to Experimental by the registry, whatever is declared here.
+    #[serde(default)]
+    pub status: CapabilityStatus,
     /// Declared permissions, e.g. "workspace:read", "process:run".
     #[serde(default)]
     pub permissions: Vec<String>,
