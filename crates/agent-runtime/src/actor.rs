@@ -103,23 +103,39 @@ impl RuntimeActor {
                 command = rx.recv() => {
                     match command {
                         Some(RuntimeCommand::Stop { reply }) => {
-                            self.cancel_turn().await;
-                            let _ = self.kernel.stop().await;
-                            let _ = reply.send(());
+                            let result = self.shutdown().await;
+                            let _ = reply.send(result);
                             return;
                         }
                         Some(command) => self.process(command, &op_tx).await,
-                        None => return,
+                        // Every caller handle was dropped: the run must still
+                        // shut down cleanly (cancel, flush, RunCompleted)
+                        // instead of silently returning.
+                        None => {
+                            let _ = self.shutdown().await;
+                            return;
+                        }
                     }
                 }
                 completed = op_rx.recv() => {
                     match completed {
                         Some(completion) => self.on_operation_completed(completion, &op_tx).await,
-                        None => return,
+                        None => {
+                            let _ = self.shutdown().await;
+                            return;
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Ordered teardown for the actor: cancel any in-flight turn, then stop
+    /// the kernel (journal flush + `RunCompleted`). The kernel stop result is
+    /// returned so a flush failure reaches the caller.
+    async fn shutdown(&mut self) -> AgentResult<()> {
+        self.cancel_turn().await;
+        self.kernel.stop().await
     }
 
     async fn process(

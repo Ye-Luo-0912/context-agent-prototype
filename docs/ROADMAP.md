@@ -769,6 +769,38 @@ the `ContextQuery` and asserts the engine received exactly
 tiny and a huge item and asserts the huge one cannot blow the budget
 while the tiny one is always selected first.
 
+### V1-P0-8: shutdown and durability ownership move into the runtime ✅ (implemented)
+
+Shutdown is no longer a best-effort sequence owned by the caller:
+
+- the actor's `Stop` arm runs a real `shutdown()` (cancel the turn, then
+  `kernel.stop()` — journal flush + `RunCompleted`) and **replies with
+  the kernel stop result** instead of swallowing it;
+- the `rx.recv() -> None` path (every caller handle dropped) runs the
+  same teardown instead of returning silently, so durability work never
+  depends on the caller remembering to stop;
+- a new `RuntimeInstance` (`agent-runtime`) owns the `ModuleHost`, the
+  `RuntimeHandle` and the actor `JoinHandle` together, with one ordered
+  `shutdown()`:
+
+```text
+cancel any turn
+  → stop the actor (kernel stop: flush journal, emit RunCompleted)
+  → stop the module host (reverse registration order)
+  → join the actor task
+  → aggregate errors into one result
+```
+
+- the TUI composition root now uses `runtime.shutdown().await`; a
+  shutdown failure (e.g. a journal flush error) surfaces instead of
+  being discarded, and the actor join handle is no longer thrown away.
+
+Acceptance: an actor test drops every handle (keeping only a broadcast
+subscriber) and asserts `RunCompleted` still fires; `RuntimeInstance`
+tests assert the module lifecycle brackets the run (`start` ... `stop`),
+that `shutdown` aggregates a failing module stop into its error, and
+that shutdown never hangs when the actor was never started.
+
 ---
 
 ## Later, only after evidence

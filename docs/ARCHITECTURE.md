@@ -509,6 +509,24 @@ ModuleHost
                      kernel tool_provider -> model tool schemas -> invoke
 ```
 
+Since V1-P0-8 the composition root composes into one `RuntimeInstance`
+that owns the `ModuleHost`, the `RuntimeHandle` and the actor `JoinHandle`.
+Shutdown is a single ordered step with aggregated errors:
+
+```text
+runtime.shutdown()
+  cancel any turn
+    → stop the actor (kernel stop: flush journal, emit RunCompleted)
+    → stop the module host (reverse registration order)
+    → join the actor task
+    → aggregate errors
+```
+
+The actor itself never returns silently: `Stop` replies with the kernel
+stop result, and the "all handles dropped" path (`rx.recv() -> None`)
+runs the same teardown so journal flush and `RunCompleted` do not depend
+on the caller remembering to stop.
+
 ## 9. ContextCore migration path
 
 The adapter pattern is implemented (P5):

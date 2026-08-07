@@ -15,7 +15,7 @@ use agent_kernel::{
 };
 use agent_runtime::{
     ApprovalModule, ArtifactModule, CapabilityAwareDispatcher, ContextModule, EventModule,
-    ModelModule, ModuleHost, RuntimeHandle, ToolModule, spawn_runtime,
+    ModelModule, ModuleHost, RuntimeHandle, RuntimeInstance, ToolModule,
 };
 use agent_storage::FileEventJournal;
 use agent_workspace::Workspace;
@@ -124,10 +124,12 @@ async fn main() -> anyhow::Result<()> {
     ));
     // The runtime actor owns all subsequent mutation: commands are serialized
     // and long-running turns report back as operations, so focus/pin/task
-    // commands can no longer race an in-flight turn.
-    let (handle, _runtime_task) = spawn_runtime(kernel);
-    let mut runtime_events = handle.subscribe();
-    handle.start().await?;
+    // commands can no longer race an in-flight turn. The instance owns the
+    // host, the handle and the actor task, so shutdown runs in one ordered
+    // step and surfaces every error.
+    let runtime = RuntimeInstance::spawn(host, kernel);
+    let mut runtime_events = runtime.handle().subscribe();
+    runtime.start().await?;
 
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
@@ -138,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
 
     let result = run_ui(
         &mut terminal,
-        handle.clone(),
+        runtime.handle().clone(),
         &mut runtime_events,
         interactive,
         &context_policy,
@@ -146,13 +148,20 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
-    let _ = handle.stop().await;
-    let _ = host.stop().await;
+    // cancel -> stop actor (flush journal, RunCompleted) -> stop modules ->
+    // join the actor; any failure is aggregated into one error.
+    let shutdown_result = runtime.shutdown().await;
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
 
-    result
+    match (result, shutdown_result) {
+        (Err(ui_error), _) => Err(ui_error),
+        (Ok(()), Err(shutdown_error)) => {
+            Err(anyhow::Error::new(shutdown_error).context("runtime shutdown failed"))
+        }
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 async fn run_ui(

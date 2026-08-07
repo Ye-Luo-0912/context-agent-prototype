@@ -7,6 +7,7 @@ pub mod budget;
 mod capability;
 mod command;
 pub mod host;
+mod instance;
 pub mod modules;
 mod prompt;
 mod sink;
@@ -19,6 +20,7 @@ pub use host::{
     APPROVAL_POLICY, ARTIFACT_STORE, CONTEXT_SERVICE, CapabilityId, EVENT_STORE, MODEL_PROVIDER,
     Module, ModuleHost, ServiceRegistry, TOOL_PROVIDER,
 };
+pub use instance::RuntimeInstance;
 pub use modules::{
     ApprovalModule, ArtifactModule, ContextModule, EventModule, ModelModule, ToolModule,
 };

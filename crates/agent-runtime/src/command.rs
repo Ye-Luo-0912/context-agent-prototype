@@ -44,7 +44,7 @@ pub enum RuntimeCommand {
         reply: Reply<()>,
     },
     Stop {
-        reply: Reply<()>,
+        reply: Reply<AgentResult<()>>,
     },
 }
 
@@ -138,15 +138,11 @@ impl RuntimeHandle {
         let _ = rx.await;
     }
 
-    /// Stop the runtime: cancel any turn, stop the kernel and end the actor.
+    /// Stop the runtime: cancel any turn, stop the kernel (flush the journal,
+    /// emit `RunCompleted`) and end the actor. The kernel stop result — and
+    /// with it any flush failure — is returned instead of swallowed.
     pub async fn stop(&self) -> AgentResult<()> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(RuntimeCommand::Stop { reply: tx })
-            .await
-            .map_err(|_| AgentError::Internal("runtime actor already stopped".into()))?;
-        rx.await
-            .map_err(|_| AgentError::Internal("runtime actor stopped without reply".into()))
+        self.call(|reply| RuntimeCommand::Stop { reply }).await
     }
 
     /// Send a command whose reply carries a `Result` and return the inner

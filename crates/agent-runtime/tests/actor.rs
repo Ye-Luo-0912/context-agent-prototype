@@ -396,3 +396,31 @@ async fn engine_receives_only_the_context_frame_budget() {
 
     handle.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn dropping_all_handles_still_shuts_down_cleanly() {
+    let kernel = kernel(Arc::new(StreamingModel));
+    // An independent subscriber survives the handle drop and must still see
+    // the teardown events: the actor runs full shutdown when every caller
+    // handle is gone instead of returning silently.
+    let mut events = kernel.subscribe();
+    let (handle, task) = spawn_runtime(kernel);
+    handle.start().await.unwrap();
+    drop(handle);
+
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("actor task did not end after all handles dropped")
+        .expect("actor task panicked");
+
+    let mut run_completed = false;
+    while let Ok(envelope) = events.try_recv() {
+        if matches!(envelope.event, RuntimeEvent::RunCompleted) {
+            run_completed = true;
+        }
+    }
+    assert!(
+        run_completed,
+        "dropping all handles must still run the full shutdown"
+    );
+}
