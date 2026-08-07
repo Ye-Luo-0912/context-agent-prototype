@@ -17,9 +17,8 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentError, AgentResult, ContextBuildRequest, ContextDiagnostics, ContextEngine,
-    ContextIngress, ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextSnapshot,
+    AgentError, AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, MaterializedContext,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -232,10 +231,10 @@ impl ContextEngine for ContextServiceAdapter {
             .map_err(|e| AgentError::Context(format!("decode maintain report: {e}")))
     }
 
-    async fn build_snapshot(&self, request: ContextBuildRequest) -> AgentResult<ContextSnapshot> {
-        let value = self.call(ServiceOp::BuildSnapshot { request }).await?;
+    async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
+        let value = self.call(ServiceOp::Materialize { query }).await?;
         serde_json::from_value(value)
-            .map_err(|e| AgentError::Context(format!("decode snapshot: {e}")))
+            .map_err(|e| AgentError::Context(format!("decode materialized context: {e}")))
     }
 
     async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {

@@ -11,8 +11,8 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentResult, ContextBuildRequest, ContextDiagnostics, ContextEngine, ContextIngress,
-    ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextSnapshot,
+    AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, MaterializedContext,
     ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage, ModelOutput, ModelRequest,
     ModelRole, ModelTransport, RuntimeEvent, ToolCall, ToolDispatcher, ToolExecutionRequest,
     ToolOutput, ToolSpec,
@@ -36,12 +36,10 @@ impl ContextEngine for TestContextEngine {
     ) -> AgentResult<ContextMaintenanceReport> {
         Ok(ContextMaintenanceReport::default())
     }
-    async fn build_snapshot(&self, request: ContextBuildRequest) -> AgentResult<ContextSnapshot> {
-        Ok(ContextSnapshot {
-            messages: vec![
-                ModelMessage::system(request.system_prompt),
-                ModelMessage::user(request.current_input),
-            ],
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            focus: None,
+            items: Vec::new(),
             selected: Vec::new(),
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),
@@ -159,12 +157,10 @@ impl ContextEngine for RecordingContextEngine {
         self.maintains.lock().await.push(trigger);
         Ok(ContextMaintenanceReport::default())
     }
-    async fn build_snapshot(&self, request: ContextBuildRequest) -> AgentResult<ContextSnapshot> {
-        Ok(ContextSnapshot {
-            messages: vec![
-                ModelMessage::system(request.system_prompt),
-                ModelMessage::user(request.current_input),
-            ],
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            focus: None,
+            items: Vec::new(),
             selected: Vec::new(),
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),

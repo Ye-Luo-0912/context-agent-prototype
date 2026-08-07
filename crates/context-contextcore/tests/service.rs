@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_contracts::{
-    AgentResult, ContextBuildRequest, ContextEngine, ContextIngress, ContextItemSummary,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextSnapshot, ModelCapabilities,
-    ModelOutput, ModelRequest, ModelTransport, RuntimeEvent, ToolOutput,
+    AgentResult, ContextEngine, ContextIngress, ContextItemSummary, ContextMaintenanceReport,
+    ContextMaintenanceTrigger, ContextQuery, MaterializedContext, ModelCapabilities, ModelOutput,
+    ModelRequest, ModelTransport, RuntimeEvent, ToolOutput,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
 use context_contextcore::{ContextServiceAdapter, ContextServiceConfig, ServiceEngine};
@@ -52,20 +52,20 @@ async fn full_contract_round_trip_across_the_process_boundary() {
         .unwrap();
     assert!(report.diagnostics.total_items >= 2);
 
-    let snapshot: ContextSnapshot = engine
-        .build_snapshot(ContextBuildRequest {
-            system_prompt: "system".into(),
+    let snapshot: MaterializedContext = engine
+        .materialize(ContextQuery {
             current_input: "continue".into(),
             budget_tokens: 4096,
+            hints: Default::default(),
         })
         .await
         .unwrap();
     assert!(snapshot.approx_tokens > 0);
     assert!(
         snapshot
-            .messages
+            .items
             .iter()
-            .any(|m| m.content.contains("never touch generated files")),
+            .any(|item| item.content.contains("never touch generated files")),
         "pinned constraint must cross the wire"
     );
 
@@ -197,10 +197,10 @@ async fn service_equivalence_with_in_process_engine() {
                 .unwrap();
         }
         let snapshot = engine
-            .build_snapshot(ContextBuildRequest {
-                system_prompt: "s".into(),
+            .materialize(ContextQuery {
                 current_input: "next".into(),
                 budget_tokens: 12_000,
+                hints: Default::default(),
             })
             .await
             .unwrap();

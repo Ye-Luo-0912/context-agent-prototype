@@ -25,7 +25,8 @@ This repository intentionally does **not** include vectors, RAG, knowledge graph
                   │ WorkingSet│  │ + Workspace   │
                   └─────┬─────┘  └──────┬────────┘
                         │               │
-                        │ ContextSnapshot│ ToolOutput
+                        │ Materialized  │ ToolOutput
+                        │ Context       │
                         v               v
                        ModelTransport  Artifact Store
 

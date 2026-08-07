@@ -112,7 +112,8 @@ Correct order:
 2. score/select candidate working set
 3. reactivate/archive as appropriate
 4. pack selected candidates into model budget
-5. build ContextSnapshot
+5. materialize the working set as structured items (prompt assembly is
+   the runtime's job, after the engine returns)
 ```
 
 Incorrect order:
@@ -308,7 +309,7 @@ items sharing at least one entity (new item depends on prior). Edges are
 exposed via `ContextItemSummary.dependencies` and rendered by the replay
 report (`depends on: <id>`).
 
-At `build_snapshot`, after primary selection, the working set is expanded
+At `materialize`, after primary selection, the working set is expanded
 with dependencies of selected items:
 
 - skipped: already-selected items, `Dropped`, and `superseded` /
@@ -371,7 +372,7 @@ answer exactly:
 - **Selection**: every `ContextPrepared` event carries the selected items with
   `score`, `approx_tokens`, and a `ScoreBreakdown`
   (`importance`, `focus`, `recency`, `access`, `scope_bonus`, `retention_bonus`,
-  `total`). `build_snapshot` also bumps `access_count` and
+  `total`). `materialize` also bumps `access_count` and
   `last_access_turn` on consumed items.
 - **Transitions**: every `ContextMaintained` event carries
   `report.transitions: Vec<ContextStateTransition>` with `item_id`, `kind`,
@@ -387,8 +388,8 @@ answer exactly:
 ### 11.2 Deterministic replay
 
 `crates/agent-replay` walks a JSONL trace and drives a fresh
-`SimpleContextEngine` with the same ingest / maintain / build_snapshot calls
-the kernel made (maintenance triggers are recorded on `ContextMaintained`
+`SimpleContextEngine` with the same ingest / maintain / materialize calls
+the runtime made (maintenance triggers are recorded on `ContextMaintained`
 events). Output is a per-item lifecycle report plus final diagnostics.
 
 ```bash

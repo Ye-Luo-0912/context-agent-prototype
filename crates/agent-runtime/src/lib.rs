@@ -6,6 +6,7 @@ mod actor;
 mod command;
 pub mod host;
 pub mod modules;
+mod prompt;
 mod sink;
 
 pub use actor::{RuntimeActor, spawn_runtime};
@@ -17,3 +18,4 @@ pub use host::{
 pub use modules::{
     ApprovalModule, ArtifactModule, ContextModule, EventModule, ModelModule, ToolModule,
 };
+pub use prompt::PromptAssembler;

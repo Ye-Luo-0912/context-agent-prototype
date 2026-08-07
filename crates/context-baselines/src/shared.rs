@@ -8,7 +8,7 @@
 
 use agent_contracts::{
     ContextDiagnostics, ContextIngress, ContextItemId, ContextItemSummary, ContextKind,
-    ContextScope, ContextState, ModelMessage, ModelRole,
+    ContextScope, ContextState, MaterializedItem,
 };
 
 /// Token estimator shared by the baseline engines. Must match the convention
@@ -115,19 +115,33 @@ pub(crate) fn records_for_ingress(ingress: &ContextIngress, turn: u64) -> Vec<Re
     }
 }
 
-/// Render a retained record as a model-facing message.
-pub(crate) fn record_message(record: &Record) -> ModelMessage {
-    match record.kind {
-        ContextKind::UserMessage => ModelMessage::user(&record.content),
-        ContextKind::AssistantMessage => ModelMessage::assistant(&record.content),
-        _ => ModelMessage {
-            role: ModelRole::Tool,
-            content: format!("{}: {}", kind_label(record.kind), record.content),
-            name: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        },
+/// Map the retained records to structured working-set items. Baselines never
+/// render protocol messages themselves — the prompt assembler does that, so
+/// A/B/C measure the selection policy, not the rendering.
+pub(crate) fn materialized_items(
+    records: &[Record],
+    summary: Option<&Record>,
+) -> Vec<MaterializedItem> {
+    let mut items = Vec::with_capacity(records.len() + usize::from(summary.is_some()));
+    if let Some(summary) = summary {
+        items.push(MaterializedItem {
+            item_id: summary.id,
+            kind: summary.kind,
+            scope: summary.scope,
+            state: ContextState::Active,
+            content: summary.content.clone(),
+            source: summary.source.clone(),
+        });
     }
+    items.extend(records.iter().map(|record| MaterializedItem {
+        item_id: record.id,
+        kind: record.kind,
+        scope: record.scope,
+        state: ContextState::Active,
+        content: record.content.clone(),
+        source: record.source.clone(),
+    }));
+    items
 }
 
 /// Diagnostics for engines where everything retained counts as active.
@@ -154,39 +168,4 @@ pub(crate) fn active_diagnostics(
         approx_active_tokens,
         ..ContextDiagnostics::default()
     }
-}
-
-fn kind_label(kind: ContextKind) -> &'static str {
-    match kind {
-        ContextKind::Goal => "GOAL",
-        ContextKind::Constraint => "CONSTRAINT",
-        ContextKind::Decision => "DECISION",
-        ContextKind::UserMessage => "USER",
-        ContextKind::AssistantMessage => "ASSISTANT",
-        ContextKind::ToolObservation => "TOOL",
-        ContextKind::FileObservation => "FILE",
-        ContextKind::Error => "ERROR",
-        ContextKind::Summary => "SUMMARY",
-        ContextKind::Note => "NOTE",
-    }
-}
-
-/// Build a full snapshot body shared by both baseline engines: system prompt,
-/// optional summary marker, retained records, then the current user input.
-pub(crate) fn build_messages(
-    system_prompt: &str,
-    summary: Option<&Record>,
-    records: &[Record],
-    current_input: &str,
-) -> Vec<ModelMessage> {
-    let mut messages = Vec::with_capacity(records.len() + 3);
-    messages.push(ModelMessage::system(system_prompt));
-    if let Some(summary) = summary {
-        messages.push(ModelMessage::system(summary.content.clone()));
-    }
-    for record in records {
-        messages.push(record_message(record));
-    }
-    messages.push(ModelMessage::user(current_input));
-    messages
 }

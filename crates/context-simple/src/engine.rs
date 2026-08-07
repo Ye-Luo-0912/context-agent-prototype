@@ -1,8 +1,7 @@
 use agent_contracts::{
-    AgentResult, ContextBuildRequest, ContextDiagnostics, ContextEngine, ContextIngress,
-    ContextItem, ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextRetention, ContextScope, ContextSnapshot, FocusState, Scope,
-    ScopeId,
+    AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItem, ContextItemId,
+    ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
+    ContextQuery, ContextRetention, ContextScope, FocusState, MaterializedContext, Scope, ScopeId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -307,14 +306,10 @@ impl ContextEngine for SimpleContextEngine {
         ))
     }
 
-    async fn build_snapshot(&self, request: ContextBuildRequest) -> AgentResult<ContextSnapshot> {
+    async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
         let mut state = self.state.lock().await;
         state.tick += 1;
-        Ok(materializer::build_snapshot(
-            &mut state,
-            &self.config,
-            &request,
-        ))
+        Ok(materializer::materialize(&mut state, &self.config, &query))
     }
 
     async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {

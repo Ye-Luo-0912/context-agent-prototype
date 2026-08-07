@@ -4,9 +4,9 @@
 use std::sync::{Arc, Mutex};
 
 use agent_contracts::{
-    AgentResult, ApprovalGate, ContextBuildRequest, ContextDiagnostics, ContextEngine,
-    ContextIngress, ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextSnapshot, ModelCapabilities, ModelMessage, ModelOutput, ModelRequest, ModelTransport,
+    AgentResult, ApprovalGate, ContextDiagnostics, ContextEngine, ContextIngress,
+    ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
+    MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport,
     ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
 };
 use agent_runtime::{
@@ -28,12 +28,10 @@ impl ContextEngine for StubContextEngine {
     ) -> AgentResult<ContextMaintenanceReport> {
         Ok(ContextMaintenanceReport::default())
     }
-    async fn build_snapshot(&self, request: ContextBuildRequest) -> AgentResult<ContextSnapshot> {
-        Ok(ContextSnapshot {
-            messages: vec![
-                ModelMessage::system(request.system_prompt),
-                ModelMessage::user(request.current_input),
-            ],
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            focus: None,
+            items: Vec::new(),
             selected: Vec::new(),
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),

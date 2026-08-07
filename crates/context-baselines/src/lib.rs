@@ -21,8 +21,8 @@ pub use rolling::{RollingConfig, RollingSummaryEngine};
 mod tests {
     use super::*;
     use agent_contracts::{
-        ContextBuildRequest, ContextEngine, ContextIngress, ContextMaintenanceTrigger,
-        ContextSnapshot, ToolOutput,
+        ContextEngine, ContextHints, ContextIngress, ContextMaintenanceTrigger, ContextQuery,
+        MaterializedContext, ToolOutput,
     };
     use serde_json::json;
 
@@ -39,11 +39,11 @@ mod tests {
     }
 
     async fn snapshot_tokens(engine: &dyn ContextEngine, input: &str) -> usize {
-        let snapshot: ContextSnapshot = engine
-            .build_snapshot(ContextBuildRequest {
-                system_prompt: "sys".into(),
+        let snapshot: MaterializedContext = engine
+            .materialize(ContextQuery {
                 current_input: input.into(),
                 budget_tokens: 100_000,
+                hints: ContextHints::default(),
             })
             .await
             .unwrap();

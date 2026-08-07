@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
 
 use agent_contracts::{
-    ContextBuildRequest, ContextItem, ContextItemId, ContextRetention, ContextSelection,
-    ContextSnapshot, ContextState, ModelMessage, ScoreBreakdown,
+    ContextItem, ContextItemId, ContextQuery, ContextRetention, ContextSelection, ContextState,
+    MaterializedContext, MaterializedItem, ScoreBreakdown,
 };
 
 use crate::diagnostics;
@@ -18,16 +18,16 @@ const MAX_EXPANSION_ITEMS: usize = 8;
 /// can follow selected items without blowing the budget.
 const EXPANSION_RESERVE_TOKENS: usize = 1024;
 
-/// Materialize the Context Frame for one model request: score the heap,
-/// pack the best candidates into the budget, expand along explicit
-/// dependency edges within a reserved slice, and render the result as
-/// messages. The runtime owns the turn frame; this only covers the
-/// long-term working set.
-pub(crate) fn build_snapshot(
+/// Materialize the working set for one model request: score the heap, pack
+/// the best candidates into the budget and expand along explicit dependency
+/// edges within a reserved slice. The result is structured items — prompt
+/// rendering belongs to the runtime's prompt assembler. The runtime owns
+/// the turn frame; this only covers the long-term working set.
+pub(crate) fn materialize(
     state: &mut State,
     config: &SimpleContextConfig,
-    request: &ContextBuildRequest,
-) -> ContextSnapshot {
+    query: &ContextQuery,
+) -> MaterializedContext {
     let now_tick = state.tick;
     let focus = state.focus.clone();
 
@@ -38,7 +38,7 @@ pub(crate) fn build_snapshot(
         .filter(|(_, item)| {
             item.state != ContextState::Dropped
                 && !(item.kind == agent_contracts::ContextKind::UserMessage
-                    && item.content == request.current_input)
+                    && item.content == query.current_input)
                 && !is_excluded(item)
         })
         .map(|(index, item)| {
@@ -51,8 +51,7 @@ pub(crate) fn build_snapshot(
 
     candidates.sort_by(|a, b| b.1.total.partial_cmp(&a.1.total).unwrap_or(Ordering::Equal));
 
-    let fixed_tokens = approx_tokens(&request.system_prompt)
-        + approx_tokens(&request.current_input)
+    let fixed_tokens = approx_tokens(&query.current_input)
         + focus
             .as_ref()
             .map(|f| approx_tokens(&f.goal) + approx_tokens(&f.current_query))
@@ -60,13 +59,18 @@ pub(crate) fn build_snapshot(
     // A small slice of the budget is reserved for dependency expansion so
     // traceability items can follow the working set without letting the
     // snapshot exceed the budget.
-    let total_budget = request.budget_tokens.saturating_sub(fixed_tokens);
+    let total_budget = query.budget_tokens.saturating_sub(fixed_tokens);
     let expansion_reserve = EXPANSION_RESERVE_TOKENS.min(total_budget);
     let mut remaining = total_budget - expansion_reserve;
     let mut selected_indices = Vec::new();
     let mut selections = Vec::new();
 
     for (index, breakdown, tokens) in candidates {
+        if let Some(max) = query.hints.max_selected_items
+            && selections.len() >= max
+        {
+            break;
+        }
         let item = &state.items[index];
         if item.state == ContextState::Archived && breakdown.total < config.active_threshold {
             continue;
@@ -128,6 +132,13 @@ pub(crate) fn build_snapshot(
             if added >= MAX_EXPANSION_ITEMS {
                 break;
             }
+            if query
+                .hints
+                .max_selected_items
+                .is_some_and(|max| selections.len() >= max)
+            {
+                break;
+            }
             if seen.contains(&dep_index) {
                 continue;
             }
@@ -152,48 +163,50 @@ pub(crate) fn build_snapshot(
 
     selected_indices.sort_by_key(|index| state.items[*index].created_tick);
     let turn = state.turn;
-    let mut working_context = String::new();
+
+    // Access reinforcement happens on every materialization: an item that
+    // reached the working set earns a fresh access stamp.
     for index in &selected_indices {
         let item = &mut state.items[*index];
         item.last_access_tick = now_tick;
         item.last_access_turn = turn;
         item.access_count = item.access_count.saturating_add(1);
-        working_context.push_str(&format!(
-            "\n[{:?} | {:?} | {:?}]\n{}\n",
-            item.kind, item.scope, item.state, item.content
-        ));
     }
 
-    let mut messages = vec![ModelMessage::system(request.system_prompt.clone())];
-    if let Some(focus) = &focus {
-        messages.push(ModelMessage::system(format!(
-            "CURRENT FOCUS\nGoal: {}\nPhase: {}\nCurrent query: {}\nActive entities: {}",
-            focus.goal,
-            focus.phase,
-            focus.current_query,
-            if focus.active_entities.is_empty() {
-                "(none)".to_string()
-            } else {
-                focus.active_entities.join(", ")
+    let items: Vec<MaterializedItem> = selected_indices
+        .iter()
+        .map(|index| {
+            let item = &state.items[*index];
+            MaterializedItem {
+                item_id: item.id,
+                kind: item.kind,
+                scope: item.scope,
+                state: item.state,
+                content: item.content.clone(),
+                source: item.source.clone(),
             }
-        )));
-    }
-    if !working_context.is_empty() {
-        messages.push(ModelMessage::system(format!(
-            "SELECTED WORKING CONTEXT\nOnly use these prior items when they remain relevant to the current focus.\n{}",
-            working_context
-        )));
-    }
-    messages.push(ModelMessage::user(request.current_input.clone()));
+        })
+        .collect();
 
-    let approx_tokens_total = messages.iter().map(|m| approx_tokens(&m.content)).sum();
-    let diagnostics = diagnostics::compute(state);
+    // The engine-side token share: focus frame + selected items + the
+    // current user input. The system prompt and tool schemas are the
+    // runtime's share and are added by the prompt assembler.
+    let approx_tokens_total = focus
+        .as_ref()
+        .map(|f| approx_tokens(&f.goal) + approx_tokens(&f.current_query))
+        .unwrap_or_default()
+        + items
+            .iter()
+            .map(|item| approx_tokens(&item.content))
+            .sum::<usize>()
+        + approx_tokens(&query.current_input);
 
-    ContextSnapshot {
-        messages,
+    MaterializedContext {
+        focus,
+        items,
         selected: selections,
         approx_tokens: approx_tokens_total,
-        diagnostics,
+        diagnostics: diagnostics::compute(state),
     }
 }
 

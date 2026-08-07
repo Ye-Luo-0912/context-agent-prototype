@@ -9,11 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_contracts::{
-    AgentResult, ApprovalDecision, ApprovalGate, ContextBuildRequest, ContextDiagnostics,
-    ContextEngine, ContextIngress, ContextItemSummary, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextSnapshot, ModelCapabilities, ModelOutput, ModelRequest,
-    ModelTransport, RuntimeEvent, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutput,
-    ToolRisk, ToolSpec,
+    AgentResult, ApprovalDecision, ApprovalGate, ContextDiagnostics, ContextEngine, ContextIngress,
+    ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
+    MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport,
+    RuntimeEvent, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, ApprovalBroker, InteractiveApprovalGate};
 use agent_runtime::{RuntimeHandle, spawn_runtime};
@@ -33,12 +32,10 @@ impl ContextEngine for TestContextEngine {
     ) -> AgentResult<ContextMaintenanceReport> {
         Ok(ContextMaintenanceReport::default())
     }
-    async fn build_snapshot(&self, request: ContextBuildRequest) -> AgentResult<ContextSnapshot> {
-        Ok(ContextSnapshot {
-            messages: vec![
-                agent_contracts::ModelMessage::system(request.system_prompt),
-                agent_contracts::ModelMessage::user(request.current_input),
-            ],
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            focus: None,
+            items: Vec::new(),
             selected: Vec::new(),
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),

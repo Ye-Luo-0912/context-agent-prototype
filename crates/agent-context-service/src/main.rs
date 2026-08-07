@@ -49,9 +49,9 @@ async fn handle(op: ServiceOp, engine: &dyn ContextEngine) -> Result<Value, Agen
             let report = engine.maintain(trigger).await?;
             serde_json::to_value(report).map_err(|e| AgentError::Context(e.to_string()))
         }
-        ServiceOp::BuildSnapshot { request } => {
-            let snapshot = engine.build_snapshot(request).await?;
-            serde_json::to_value(snapshot).map_err(|e| AgentError::Context(e.to_string()))
+        ServiceOp::Materialize { query } => {
+            let materialized = engine.materialize(query).await?;
+            serde_json::to_value(materialized).map_err(|e| AgentError::Context(e.to_string()))
         }
         ServiceOp::Diagnostics => {
             let diagnostics = engine.diagnostics().await?;

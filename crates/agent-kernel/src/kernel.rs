@@ -7,11 +7,11 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, ContextBuildRequest,
-    ContextEngine, ContextIngress, ContextItemSummary, ContextKind, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextSnapshot, EventJournal, FocusState, ModelEventSink,
-    ModelOutput, ModelRequest, ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, TaskId,
-    ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
+    AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, ContextEngine, ContextIngress,
+    ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
+    ContextQuery, EventJournal, FocusState, MaterializedContext, ModelEventSink, ModelOutput,
+    ModelRequest, ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, TaskId, ToolCall,
+    ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
 };
 use tokio::sync::broadcast;
 
@@ -146,11 +146,13 @@ impl AgentKernel {
         self.context.maintain(trigger).await
     }
 
-    pub async fn context_build_snapshot(
+    /// Materialize the working set for one model request. The result is
+    /// structured items; prompt assembly happens in the runtime actor.
+    pub async fn context_materialize(
         &self,
-        request: ContextBuildRequest,
-    ) -> AgentResult<ContextSnapshot> {
-        self.context.build_snapshot(request).await
+        query: ContextQuery,
+    ) -> AgentResult<MaterializedContext> {
+        self.context.materialize(query).await
     }
 
     /// One model round: stream the request to the provider. The result is a

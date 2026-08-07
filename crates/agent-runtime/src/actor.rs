@@ -8,16 +8,16 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, ContextBuildRequest, ContextIngress,
-    ContextMaintenanceTrigger, ContextSnapshot, ModelInput, ModelMessage, ModelRequest, ModelRole,
-    OperationId, OperationOutcome, OperationResult, RuntimeEvent, ScopeId, TaskId, ToolCall,
-    TurnFrame, TurnFrameStep, TurnId,
+    AgentError, AgentResult, CancellationToken, ContextHints, ContextIngress,
+    ContextMaintenanceTrigger, ContextQuery, ModelRequest, OperationId, OperationOutcome,
+    OperationResult, RuntimeEvent, ScopeId, TaskId, ToolCall, TurnFrame, TurnFrameStep, TurnId,
 };
 use agent_kernel::AgentKernel;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::command::{Reply, RuntimeCommand, RuntimeHandle};
+use crate::prompt::PromptAssembler;
 use crate::sink::LiveSink;
 
 /// Which operation a spawned task is running.
@@ -70,12 +70,16 @@ struct ActorState {
 
 pub struct RuntimeActor {
     kernel: Arc<AgentKernel>,
+    /// Owns the system prompt and renders the five-layer model input. The
+    /// context engine only ever returns structured items.
+    assembler: PromptAssembler,
     state: ActorState,
 }
 
 impl RuntimeActor {
     pub fn new(kernel: Arc<AgentKernel>) -> Self {
         Self {
+            assembler: PromptAssembler::new(kernel.system_prompt()),
             kernel,
             state: ActorState::default(),
         }
@@ -351,16 +355,22 @@ impl RuntimeActor {
             }
         }
 
-        let snapshot = match self
+        // The system prompt is the runtime's own overhead; the context
+        // engine budgets for the working set with the rest.
+        let budget = self
             .kernel
-            .context_build_snapshot(ContextBuildRequest {
-                system_prompt: self.kernel.system_prompt(),
+            .context_budget_tokens()
+            .saturating_sub(self.assembler.system_prompt_tokens());
+        let materialized = match self
+            .kernel
+            .context_materialize(ContextQuery {
                 current_input: current_input.clone(),
-                budget_tokens: self.kernel.context_budget_tokens(),
+                budget_tokens: budget,
+                hints: ContextHints::default(),
             })
             .await
         {
-            Ok(snapshot) => snapshot,
+            Ok(materialized) => materialized,
             Err(error) => {
                 let _ = self
                     .kernel
@@ -375,13 +385,15 @@ impl RuntimeActor {
         let _ = self
             .kernel
             .emit_event(RuntimeEvent::ContextPrepared {
-                diagnostics: snapshot.diagnostics.clone(),
-                selected: snapshot.selected.clone(),
+                diagnostics: materialized.diagnostics.clone(),
+                selected: materialized.selected.clone(),
             })
             .await;
         let _ = self.kernel.emit_event(RuntimeEvent::ModelStarted).await;
 
-        let input = build_model_input(&self.kernel, &snapshot, &current_input, &turn.turn_frame);
+        let input =
+            self.assembler
+                .assemble(&materialized, &turn.turn_frame, self.kernel.tool_specs());
         let cancel = CancellationToken::new();
         let operation_id = OperationId::new();
         let generation = self.state.generation;
@@ -406,8 +418,8 @@ impl RuntimeActor {
                         tools: input.tool_schemas.clone(),
                         metadata: serde_json::json!({
                             "run_id": run_id.to_string(),
-                            "context_selected": snapshot.selected.len(),
-                            "context_approx_tokens": snapshot.approx_tokens,
+                            "context_selected": materialized.selected.len(),
+                            "context_approx_tokens": materialized.approx_tokens,
                         }),
                         cancel: cancel.clone(),
                     },
@@ -667,36 +679,6 @@ impl RuntimeActor {
                 .await;
             let _ = self.kernel.emit_event(RuntimeEvent::TurnCompleted).await;
         }
-    }
-}
-
-/// Assemble the five-layer model input from the working-set snapshot and the
-/// runtime-owned turn stack. Free function so it can be called while the
-/// turn is borrowed.
-fn build_model_input(
-    kernel: &AgentKernel,
-    snapshot: &ContextSnapshot,
-    current_input: &str,
-    turn: &TurnFrame,
-) -> ModelInput {
-    let system_prompt = kernel.system_prompt();
-    let mut context_frame = Vec::new();
-    for (index, message) in snapshot.messages.iter().enumerate() {
-        let is_policy =
-            index == 0 && message.role == ModelRole::System && message.content == system_prompt;
-        let is_current_user = index + 1 == snapshot.messages.len()
-            && message.role == ModelRole::User
-            && message.content == current_input;
-        if !is_policy && !is_current_user {
-            context_frame.push(message.clone());
-        }
-    }
-    ModelInput {
-        system_policy: vec![ModelMessage::system(system_prompt)],
-        focus_frame: None,
-        context_frame,
-        turn_frame: turn.clone(),
-        tool_schemas: kernel.tool_specs(),
     }
 }
 

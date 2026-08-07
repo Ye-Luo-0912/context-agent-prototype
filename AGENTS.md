@@ -7,7 +7,9 @@ Before changing architecture, preserve the invariants below.
 ## Non-negotiable invariants
 
 1. **Do not make the conversation transcript the source of model context.**
-   - Model input must be rebuilt from `ContextEngine::build_snapshot`.
+   - Model input must be rebuilt from `ContextEngine::materialize`
+     (`ContextQuery` -> structured `MaterializedContext`), then rendered by
+     the runtime-owned `PromptAssembler`.
    - Never add a global append-only `messages: Vec<_>` to `AgentKernel` as the authoritative context mechanism.
 
 2. **Token pressure must not be the trigger for forgetting.**

@@ -167,7 +167,7 @@ impl TurnFrame {
 /// ```text
 /// System Policy        - standing instructions for every request
 /// Focus Frame          - the current task/goal (structured in a later phase)
-/// Context Frame        - the long-term working set, from ContextEngine::build_snapshot
+/// Context Frame        - the long-term working set, from ContextEngine::materialize
 /// Turn Frame           - the current turn's execution stack, owned by the runtime
 /// Active Tool Schemas  - tool definitions for this request (ModelRequest.tools)
 /// ```

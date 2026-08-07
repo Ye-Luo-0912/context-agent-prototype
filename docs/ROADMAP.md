@@ -317,7 +317,7 @@ based and fully explainable through lifecycle transitions:
   exposed in `ScoreBreakdown` and the selection reason;
 - **explicit dependency graph**: at ingest, a new item records up to 8
   dependencies on prior non-dropped items sharing at least one entity;
-  `build_snapshot` expands the working set with dependencies of selected
+  `materialize` expands the working set with dependencies of selected
   items (best first, cap +8, a 1 K-token reserve carved out of the model
   budget; Dropped / superseded / verified-fixed items never re-enter;
   Archived dependencies only when they still clear the active threshold),
@@ -370,7 +370,7 @@ The ContextCore integration shape is implemented as a real process boundary:
 - `context-contextcore` — an adapter crate implementing the exact
   `ContextEngine` contract over a JSON-lines stdio protocol (`wire`: one
   request per line, one response per line; `ping` handshake, `ingest`,
-  `maintain`, `build_snapshot`, `diagnostics`, `inspect`, `checkpoint`,
+  `maintain`, `materialize`, `diagnostics`, `inspect`, `checkpoint`,
   `restore`, `shutdown`). `ContextServiceAdapter` spawns the service,
   handshakes, and maps every trait call to a request/response;
 - `agent-context-service` — a standalone service process that runs a real
@@ -406,19 +406,20 @@ no ContextCore vocabulary leaks through the Agent API.
 Split the three responsibilities the prototype currently mixes: the execution
 protocol (runtime-owned turn stack), the long-term working set (context
 engine), and the composition of modules (a runtime framework). This follows
-the review that identified: model input is rebuilt from a `ContextSnapshot`,
-but nothing distinguishes the current turn's tool protocol from long-term
-memory; the context engine has grown too dense; the kernel orchestrates via
-`Mutex`es while the TUI spawns tasks that mutate shared state.
+the review that identified: model input is rebuilt from the materialized
+working set, but nothing distinguishes the current turn's tool protocol from
+long-term memory; the context engine has grown too dense; the kernel
+orchestrates via `Mutex`es while the TUI spawns tasks that mutate shared
+state.
 
 ### V1-M1: Turn Runtime ✅ (implemented)
 
 The model input is now assembled in five layers:
 
 ```text
-System Policy    - standing instructions (kernel-owned)
+System Policy    - standing instructions (runtime-owned)
 Focus Frame      - the current task/goal (structured in a later phase)
-Context Frame    - the selected working set from ContextEngine::build_snapshot
+Context Frame    - the selected working set from ContextEngine::materialize
 Turn Frame       - the current turn's execution stack (runtime-owned)
 Active Tool Schemas - tool definitions for this request
 ```
@@ -582,15 +583,35 @@ Acceptance:
   persist order, and the interactive approval loop (allow / deny /
   timeout) all pass against the new state machine.
 
-### V1-P0-2: prompt assembly leaves the context engine (next)
+### V1-P0-2: prompt assembly leaves the context engine ✅ (implemented)
 
-- replace `ContextBuildRequest { system_prompt, current_input, budget }`
-  and `ContextSnapshot { messages }` with a structured working set
-  (`ContextQuery` -> `MaterializedContext`); the engine stops building
-  `ModelMessage`s;
-- a single `PromptAssembler` (runtime-owned) is the only place that
+The context engine no longer knows the prompt protocol:
+
+- `ContextBuildRequest { system_prompt, current_input, budget }` and
+  `ContextSnapshot { messages }` are gone. The contract is now
+  `ContextQuery { current_input, budget_tokens, hints }` ->
+  `MaterializedContext { focus, items, selected, approx_tokens,
+  diagnostics }`, where `items` are structured `MaterializedItem`s
+  (content, kind, scope, state) — never rendered `ModelMessage`s;
+- a single `PromptAssembler` in `agent-runtime` is the only place that
   renders System + Focus + Context + Turn + Tool Schemas into the
-  five-layer `ModelInput`.
+  five-layer `ModelInput`. The actor subtracts the system prompt's own
+  token cost before handing the budget to the engine;
+- `ContextHints { max_selected_items }` opens a per-request knob the
+  engine honors (primary selection and dependency expansion both cap);
+- the token estimator moved to `agent-contracts::tokens` so engines,
+  the assembler and the replay harness measure the same quantity;
+  replay now reports the true input cost (system prompt + materialized
+  share) instead of an engine-rendered approximation;
+- the wire protocol carries the same change (`build_snapshot` ->
+  `materialize`), so the ContextCore adapter path is unchanged in shape.
+
+Acceptance:
+
+- workspace tests green (including a new `max_selected_items` cap test
+  and the context-service end-to-end tests across the process boundary);
+- the engine returns `Vec<MaterializedItem>` and the kernel/actor never
+  reassemble prompt text from engine output.
 
 ### V1-P0-3: scope ownership moves to the runtime (next)
 

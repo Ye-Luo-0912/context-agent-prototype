@@ -1,7 +1,7 @@
 use agent_contracts::{
-    ContextBuildRequest, ContextEngine, ContextIngress, ContextItem, ContextItemId, ContextKind,
-    ContextMaintenanceTrigger, ContextRetention, ContextScope, ContextState, FocusState, ScopeKind,
-    ScopeState, ToolOutput,
+    ContextEngine, ContextHints, ContextIngress, ContextItem, ContextItemId, ContextKind,
+    ContextMaintenanceTrigger, ContextQuery, ContextRetention, ContextScope, ContextState,
+    FocusState, ScopeKind, ScopeState, ToolOutput,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -107,19 +107,19 @@ async fn pinned_context_survives_maintenance() {
     }
 
     let snapshot = engine
-        .build_snapshot(ContextBuildRequest {
-            system_prompt: "test".into(),
+        .materialize(ContextQuery {
             current_input: "continue".into(),
             budget_tokens: 4096,
+            hints: ContextHints::default(),
         })
         .await
         .unwrap();
 
     assert!(
         snapshot
-            .messages
+            .items
             .iter()
-            .any(|m| m.content.contains("Never edit generated files"))
+            .any(|item| item.content.contains("Never edit generated files"))
     );
 }
 
@@ -206,10 +206,10 @@ async fn checkpoint_restore_roundtrip() {
 
     let before = engine.diagnostics().await.unwrap();
     let snapshot_before = engine
-        .build_snapshot(ContextBuildRequest {
-            system_prompt: "s".into(),
+        .materialize(ContextQuery {
             current_input: "refactor AuthService".into(),
             budget_tokens: 8192,
+            hints: ContextHints::default(),
         })
         .await
         .unwrap();
@@ -319,18 +319,18 @@ async fn completed_task_working_set_is_archived_and_stays_out() {
         .await
         .unwrap();
     let snapshot = engine
-        .build_snapshot(ContextBuildRequest {
-            system_prompt: "s".into(),
+        .materialize(ContextQuery {
             current_input: "task two: add tests".into(),
             budget_tokens: 8192,
+            hints: ContextHints::default(),
         })
         .await
         .unwrap();
     assert!(
         !snapshot
-            .messages
+            .items
             .iter()
-            .any(|m| m.content.contains("refactor auth module")),
+            .any(|item| item.content.contains("refactor auth module")),
         "completed task details leaked into the new task's working set"
     );
 }
@@ -373,19 +373,19 @@ async fn later_decision_supersedes_earlier_decision() {
     // goal may still carry its text — the goal is set once and is the
     // task statement, not the superseded item).
     let snapshot = engine
-        .build_snapshot(ContextBuildRequest {
-            system_prompt: "s".into(),
+        .materialize(ContextQuery {
             current_input: "continue".into(),
             budget_tokens: 8192,
+            hints: ContextHints::default(),
         })
         .await
         .unwrap();
     let working = snapshot
-        .messages
+        .items
         .iter()
-        .find(|m| m.content.starts_with("SELECTED WORKING CONTEXT"))
-        .map(|m| m.content.as_str())
-        .unwrap_or_default();
+        .map(|item| item.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         !working.contains("use TOML for config"),
         "superseded decision leaked back into the working context"
@@ -611,10 +611,10 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
     }
 
     let snapshot = engine
-        .build_snapshot(ContextBuildRequest {
-            system_prompt: "s".into(),
+        .materialize(ContextQuery {
             current_input: "go".into(),
             budget_tokens: 4096,
+            hints: ContextHints::default(),
         })
         .await
         .unwrap();
@@ -693,10 +693,10 @@ async fn dependency_expansion_can_be_disabled() {
     }
 
     let snapshot = engine
-        .build_snapshot(ContextBuildRequest {
-            system_prompt: "s".into(),
+        .materialize(ContextQuery {
             current_input: "go".into(),
             budget_tokens: 4096,
+            hints: ContextHints::default(),
         })
         .await
         .unwrap();
@@ -763,10 +763,10 @@ async fn archived_dependency_below_threshold_stays_out() {
     }
 
     let snapshot = engine
-        .build_snapshot(ContextBuildRequest {
-            system_prompt: "s".into(),
+        .materialize(ContextQuery {
             current_input: "go".into(),
             budget_tokens: 4096,
+            hints: ContextHints::default(),
         })
         .await
         .unwrap();
@@ -1041,18 +1041,18 @@ async fn promoted_finding_reactivates_for_a_related_task() {
         .await
         .unwrap();
     let snapshot = engine
-        .build_snapshot(ContextBuildRequest {
-            system_prompt: "s".into(),
+        .materialize(ContextQuery {
             current_input: "task two: read the TOML config".into(),
             budget_tokens: 8192,
+            hints: ContextHints::default(),
         })
         .await
         .unwrap();
     assert!(
         snapshot
-            .messages
+            .items
             .iter()
-            .any(|m| m.content.contains("use TOML for config")),
+            .any(|item| item.content.contains("use TOML for config")),
         "the promoted finding must re-enter the working set for a related task"
     );
 }
@@ -1113,4 +1113,49 @@ async fn checkpoint_preserves_scope_tree() {
             "one task scope, reused after restore"
         );
     }
+}
+
+#[tokio::test]
+async fn max_selected_items_hint_caps_the_working_set() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    for i in 0..6 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: format!("request {i}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let uncapped = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 8192,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        uncapped.items.len() > 3,
+        "without the hint the budget decides, got {}",
+        uncapped.items.len()
+    );
+
+    let capped = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 8192,
+            hints: ContextHints {
+                max_selected_items: Some(2),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        capped.items.len(),
+        2,
+        "the hint must cap the working set, got {}",
+        capped.items.len()
+    );
+    assert_eq!(capped.selected.len(), 2);
 }

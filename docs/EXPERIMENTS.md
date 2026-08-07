@@ -42,9 +42,9 @@ Measured per scenario per engine:
 
 | Metric | Meaning |
 | --- | --- |
-| `in_tok_total` | Sum of `ContextSnapshot.approx_tokens` over every model round — total model input consumed by the task. |
-| `in_tok_max` | Largest single snapshot — the worst single model request. |
-| `over_budget` | Snapshots exceeding the configured budget (12 K tokens in the comparison). |
+| `in_tok_total` | Sum over every model round of (system prompt + `MaterializedContext.approx_tokens`) — total model input consumed by the task. |
+| `in_tok_max` | Largest single model input — the worst single model request. |
+| `over_budget` | Model inputs exceeding the configured budget (12 K tokens in the comparison). |
 | `churn` | Total lifecycle transitions emitted by maintenance (C: archive/cool/drop; B: collapses). |
 | `final_total` / `final_active` | Items retained vs. active at the end of the scenario. |
 

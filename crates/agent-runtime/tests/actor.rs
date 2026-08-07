@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_contracts::{
-    AgentResult, ContextBuildRequest, ContextDiagnostics, ContextEngine, ContextIngress,
-    ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextSnapshot,
-    ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage, ModelOutput, ModelRequest,
-    ModelTransport, RuntimeEvent, ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
+    AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, MaterializedContext,
+    ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput, ModelRequest, ModelTransport,
+    RuntimeEvent, ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
 use agent_runtime::{RuntimeHandle, spawn_runtime};
@@ -28,12 +28,10 @@ impl ContextEngine for TestContextEngine {
     ) -> AgentResult<ContextMaintenanceReport> {
         Ok(ContextMaintenanceReport::default())
     }
-    async fn build_snapshot(&self, request: ContextBuildRequest) -> AgentResult<ContextSnapshot> {
-        Ok(ContextSnapshot {
-            messages: vec![
-                ModelMessage::system(request.system_prompt),
-                ModelMessage::user(request.current_input),
-            ],
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            focus: None,
+            items: Vec::new(),
             selected: Vec::new(),
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),

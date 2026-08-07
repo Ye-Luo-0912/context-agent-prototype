@@ -40,17 +40,10 @@ pub(crate) fn make_item(
 }
 
 /// Token estimate shared across the crate (ascii chars / 4 + non-ascii chars).
+/// Delegates to the workspace-wide convention so engines, the prompt
+/// assembler and the replay harness measure the same quantity.
 pub(crate) fn approx_tokens(text: &str) -> usize {
-    let mut ascii = 0usize;
-    let mut non_ascii = 0usize;
-    for ch in text.chars() {
-        if ch.is_ascii() {
-            ascii += 1;
-        } else if !ch.is_whitespace() {
-            non_ascii += 1;
-        }
-    }
-    ascii.div_ceil(4) + non_ascii
+    agent_contracts::tokens::approx_tokens(text)
 }
 
 pub(crate) fn truncate_chars(mut text: String, max_chars: usize) -> String {

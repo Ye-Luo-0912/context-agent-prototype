@@ -11,15 +11,15 @@
 use std::sync::Mutex as StdMutex;
 
 use agent_contracts::{
-    AgentError, AgentResult, ContextBuildRequest, ContextDiagnostics, ContextEngine,
-    ContextIngress, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextScope,
-    ContextSelection, ContextSnapshot, ContextState, ContextStateTransition, ScoreBreakdown,
+    AgentError, AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextKind,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextScope,
+    ContextSelection, ContextState, ContextStateTransition, MaterializedContext, ScoreBreakdown,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::shared::{
-    Record, active_diagnostics, approx_tokens, build_messages, records_for_ingress,
+    Record, active_diagnostics, approx_tokens, materialized_items, records_for_ingress,
 };
 
 /// Configuration for the rolling-summary baseline.
@@ -173,15 +173,14 @@ impl ContextEngine for RollingSummaryEngine {
         })
     }
 
-    async fn build_snapshot(&self, request: ContextBuildRequest) -> AgentResult<ContextSnapshot> {
+    async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
         let state = self.state.lock().expect("rolling state poisoned");
-        let messages = build_messages(
-            &request.system_prompt,
-            state.summary.as_ref(),
-            &state.records,
-            &request.current_input,
-        );
-        let snapshot_tokens: usize = messages.iter().map(|m| approx_tokens(&m.content)).sum();
+        let items = materialized_items(&state.records, state.summary.as_ref());
+        let approx_tokens_total: usize = items
+            .iter()
+            .map(|item| approx_tokens(&item.content))
+            .sum::<usize>()
+            + approx_tokens(&query.current_input);
         let mut selected: Vec<ContextSelection> = Vec::new();
         if let Some(summary) = &state.summary {
             selected.push(ContextSelection {
@@ -199,10 +198,11 @@ impl ContextEngine for RollingSummaryEngine {
             reason: "append + rolling summary baseline: retained history".into(),
             breakdown: ScoreBreakdown::default(),
         }));
-        Ok(ContextSnapshot {
-            messages,
+        Ok(MaterializedContext {
+            focus: None,
+            items,
             selected,
-            approx_tokens: snapshot_tokens,
+            approx_tokens: approx_tokens_total,
             diagnostics: state.diagnostics(),
         })
     }

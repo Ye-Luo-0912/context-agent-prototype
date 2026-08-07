@@ -1,22 +1,23 @@
 //! Baseline A: append-only transcript.
 //!
-//! Every message and tool observation is retained forever; `build_snapshot`
-//! returns the full history. There is no lifecycle maintenance — nothing
-//! leaves the working set, so input tokens grow linearly with the task. The
-//! experiment harness measures how quickly this crosses the budget.
+//! Every message and tool observation is retained forever; `materialize`
+//! returns the full history as the working set. There is no lifecycle
+//! maintenance — nothing leaves the working set, so input tokens grow
+//! linearly with the task. The experiment harness measures how quickly
+//! this crosses the budget.
 
 use std::sync::Mutex as StdMutex;
 
 use agent_contracts::{
-    AgentError, AgentResult, ContextBuildRequest, ContextDiagnostics, ContextEngine,
-    ContextIngress, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextSelection,
-    ContextSnapshot, ScoreBreakdown,
+    AgentError, AgentResult, ContextDiagnostics, ContextEngine, ContextIngress,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextSelection,
+    MaterializedContext, ScoreBreakdown,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::shared::{
-    Record, active_diagnostics, approx_tokens, build_messages, records_for_ingress,
+    Record, active_diagnostics, approx_tokens, materialized_items, records_for_ingress,
 };
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -68,15 +69,14 @@ impl ContextEngine for AppendOnlyEngine {
         })
     }
 
-    async fn build_snapshot(&self, request: ContextBuildRequest) -> AgentResult<ContextSnapshot> {
+    async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
         let state = self.state.lock().expect("append-only state poisoned");
-        let messages = build_messages(
-            &request.system_prompt,
-            None,
-            &state.records,
-            &request.current_input,
-        );
-        let snapshot_tokens: usize = messages.iter().map(|m| approx_tokens(&m.content)).sum();
+        let items = materialized_items(&state.records, None);
+        let approx_tokens_total: usize = items
+            .iter()
+            .map(|item| approx_tokens(&item.content))
+            .sum::<usize>()
+            + approx_tokens(&query.current_input);
         let selected = state
             .records
             .iter()
@@ -88,10 +88,11 @@ impl ContextEngine for AppendOnlyEngine {
                 breakdown: ScoreBreakdown::default(),
             })
             .collect();
-        Ok(ContextSnapshot {
-            messages,
+        Ok(MaterializedContext {
+            focus: None,
+            items,
             selected,
-            approx_tokens: snapshot_tokens,
+            approx_tokens: approx_tokens_total,
             diagnostics: active_diagnostics(&state.records, None, 0),
         })
     }

@@ -5,7 +5,7 @@
 //! kernel contract unchanged when the service behind the socket is swapped
 //! for a real ContextCore runtime.
 
-use agent_contracts::{ContextBuildRequest, ContextIngress, ContextMaintenanceTrigger};
+use agent_contracts::{ContextIngress, ContextMaintenanceTrigger, ContextQuery};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -30,8 +30,8 @@ pub enum ServiceOp {
     Maintain {
         trigger: ContextMaintenanceTrigger,
     },
-    BuildSnapshot {
-        request: ContextBuildRequest,
+    Materialize {
+        query: ContextQuery,
     },
     Diagnostics,
     Inspect {
@@ -123,15 +123,15 @@ mod tests {
     fn op_tag_is_snake_case_on_the_wire() {
         let request = ServiceRequest {
             id: 1,
-            op: ServiceOp::BuildSnapshot {
-                request: ContextBuildRequest {
-                    system_prompt: "s".into(),
+            op: ServiceOp::Materialize {
+                query: ContextQuery {
                     current_input: "i".into(),
                     budget_tokens: 100,
+                    hints: Default::default(),
                 },
             },
         };
         let line = serde_json::to_string(&request).unwrap();
-        assert!(line.contains("\"op\":\"build_snapshot\""), "{line}");
+        assert!(line.contains("\"op\":\"materialize\""), "{line}");
     }
 }

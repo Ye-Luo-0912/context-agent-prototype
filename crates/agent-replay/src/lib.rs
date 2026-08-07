@@ -4,7 +4,7 @@
 //! (`UserMessageAccepted`, `Pinned`, `ToolFinished`, `ContextMaintained`,
 //! `ContextPrepared`, ...). Replay walks those events in order and drives a
 //! fresh context engine with the exact same ingest / maintain /
-//! build_snapshot calls, then reports, per item:
+//! materialize calls, then reports, per item:
 //!
 //! - what entered and why (`source`, `kind`, entry turn);
 //! - which model turns consumed it (from `ContextPrepared` selections);
@@ -21,8 +21,9 @@ mod scenarios;
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use agent_contracts::{
-    ContextBuildRequest, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemId,
-    ContextItemSummary, ContextKind, ContextState, FocusState, RuntimeEvent, RuntimeEventEnvelope,
+    ContextDiagnostics, ContextEngine, ContextHints, ContextIngress, ContextItemId,
+    ContextItemSummary, ContextKind, ContextQuery, ContextState, FocusState, RuntimeEvent,
+    RuntimeEventEnvelope, tokens,
 };
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 
@@ -187,20 +188,24 @@ pub async fn run_engine(
                 }
             }
             RuntimeEvent::ContextPrepared { .. } => {
-                let snapshot = engine
-                    .build_snapshot(ContextBuildRequest {
-                        system_prompt: config.system_prompt.clone(),
+                let materialized = engine
+                    .materialize(ContextQuery {
                         current_input: current_input.clone(),
                         budget_tokens: config.budget_tokens,
+                        hints: ContextHints::default(),
                     })
                     .await?;
                 snapshot_builds += 1;
-                input_tokens_total += snapshot.approx_tokens;
-                input_tokens_max = input_tokens_max.max(snapshot.approx_tokens);
-                if snapshot.approx_tokens > config.budget_tokens {
+                // The materialized share plus the runtime-owned system prompt
+                // is what the model request actually pays for.
+                let input_tokens =
+                    tokens::approx_tokens(&config.system_prompt) + materialized.approx_tokens;
+                input_tokens_total += input_tokens;
+                input_tokens_max = input_tokens_max.max(input_tokens);
+                if input_tokens > config.budget_tokens {
                     over_budget_snapshots += 1;
                 }
-                for selection in snapshot.selected {
+                for selection in materialized.selected {
                     consumed
                         .entry(selection.item_id)
                         .or_default()

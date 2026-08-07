@@ -74,10 +74,17 @@ The kernel needs four operations only:
 
 1. `ingest` — submit a meaningful runtime observation.
 2. `maintain` — trigger continuous lifecycle maintenance.
-3. `build_snapshot` — construct the model-facing working context.
+3. `materialize` — select the model-facing working set as structured items.
 4. `diagnostics` — expose bounded observability.
 
 The API is asynchronous even though `context-simple` is in-process. This leaves room for a future ContextCore service adapter over local IPC/HTTP/gRPC without changing the kernel contract.
+
+Since V1-P0-2 the engine never renders prompt text. It answers a
+`ContextQuery { current_input, budget_tokens, hints }` with a
+`MaterializedContext { focus, items, selected, approx_tokens,
+diagnostics }`; `items` are structured `MaterializedItem`s and the
+runtime-owned `PromptAssembler` is the only place that turns them into
+`ModelMessage`s.
 
 Three implementations exist behind the same contract, plus the P5
 process-boundary adapter:
@@ -197,10 +204,10 @@ User input
 maintain(BeforeModel)
    │
    v
-build_snapshot()               ── the Context Frame (long-term working set)
+ContextEngine.materialize(ContextQuery)   ── the Context Frame (long-term working set)
    │
    v
-ModelInput = System Policy + Focus Frame + Context Frame + Turn Frame + Tool Schemas
+PromptAssembler.assemble() = System Policy + Focus Frame + Context Frame + Turn Frame + Tool Schemas
    │
    v
 ModelTransport.complete_stream()
@@ -235,21 +242,24 @@ The model-facing request is intentionally rebuilt from state instead of
 replaying an append-only transcript. The input is assembled in five layers:
 
 ```text
-System Policy    - standing instructions (kernel-owned)
-Focus Frame      - the current task/goal (structured in a later phase)
-Context Frame    - the selected working set from ContextEngine::build_snapshot
+System Policy    - standing instructions (runtime-owned)
+Focus Frame      - the current task/goal, rendered from the materialized focus
+Context Frame    - the selected working set, rendered from MaterializedItem's
 Turn Frame       - the current turn's execution stack (runtime-owned)
 Active Tool Schemas - tool definitions for this request
 ```
 
 The split is deliberate. The context engine owns the long-term working set
 and knows nothing about the execution protocol; the runtime owns the turn
-stack and never scores or evicts it while the turn is open. This keeps the
-context engine from growing into a module that simultaneously does memory,
-execution protocol, prompt formatting and provider continuation.
+stack and never scores or evicts it while the turn is open. Since V1-P0-2
+prompt rendering lives in one place only: `PromptAssembler` turns the
+engine's structured `MaterializedContext` into the five-layer input. The
+engine could not format a prompt even if it wanted to — it never sees the
+system prompt or the tool schemas.
 
-A `ContextSnapshot` is a disposable projection of the Context Frame. It is
-not the source of truth and should never be persisted as the memory model.
+A `MaterializedContext` is a disposable projection of the Context Frame. It
+is not the source of truth and should never be persisted as the memory
+model.
 
 Since V1-M2 the engine keeps a runtime **scope tree** (Session -> Task ->
 Focus -> Tool) as the first-class unit of residency. Scopes carry their own
@@ -343,7 +353,7 @@ As the runtime grows, `AppState` should become a dedicated `RunStateAggregator` 
 ## 8b. Replay and checkpoints (P0.5)
 
 `agent-replay` is an offline analysis binary: it reads a JSONL trace from
-`agent-storage` and re-runs the recorded ingest/maintain/build_snapshot calls
+`agent-storage` and re-runs the recorded ingest/maintain/materialize calls
 against a fresh `SimpleContextEngine`, then prints a per-item lifecycle report.
 
 ```text
@@ -425,8 +435,8 @@ protocol (see `context-contextcore::wire`):
 
 ```text
 ContextIngress      -> request op `ingest`
-ContextBuildRequest -> request op `build_snapshot`
-ContextSnapshot     <- response payload
+ContextQuery        -> request op `materialize`
+MaterializedContext <- response payload
 Diagnostics         <- response payload
 ```
 

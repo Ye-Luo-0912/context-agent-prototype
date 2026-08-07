@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentResult, ContextItemId, ModelMessage, ScopeId, TaskId, ToolOutput};
+use crate::{AgentResult, ContextItemId, ScopeId, TaskId, ToolOutput};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContextKind {
@@ -167,10 +167,20 @@ pub enum ContextMaintenanceTrigger {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextBuildRequest {
-    pub system_prompt: String,
+pub struct ContextQuery {
     pub current_input: String,
     pub budget_tokens: usize,
+    #[serde(default)]
+    pub hints: ContextHints,
+}
+
+/// Runtime knobs for one materialization. Kept open so later policy work can
+/// add per-request guidance without breaking the contract.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ContextHints {
+    /// Hard cap on how many items the engine may select. Dependency
+    /// expansion still respects it; `None` means the budget alone decides.
+    pub max_selected_items: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -233,9 +243,27 @@ pub struct ContextDiagnostics {
     pub closed_scopes: usize,
 }
 
+/// One structured entry of the materialized working set. The engine returns
+/// content, never rendered prompt text; the runtime's prompt assembler
+/// decides how the entry is presented to the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextSnapshot {
-    pub messages: Vec<ModelMessage>,
+pub struct MaterializedItem {
+    pub item_id: ContextItemId,
+    pub kind: ContextKind,
+    pub scope: ContextScope,
+    pub state: ContextState,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// The structured result of one `ContextEngine::materialize` call: the
+/// focus, the selected working set and its selections/diagnostics. Prompt
+/// rendering is deliberately absent — that is the prompt assembler's job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializedContext {
+    pub focus: Option<FocusState>,
+    pub items: Vec<MaterializedItem>,
     pub selected: Vec<ContextSelection>,
     pub approx_tokens: usize,
     pub diagnostics: ContextDiagnostics,
@@ -283,7 +311,10 @@ pub trait ContextEngine: Send + Sync {
         trigger: ContextMaintenanceTrigger,
     ) -> AgentResult<ContextMaintenanceReport>;
 
-    async fn build_snapshot(&self, request: ContextBuildRequest) -> AgentResult<ContextSnapshot>;
+    /// Materialize the working set for one model request: score, budget-pack
+    /// and expand the selection, returning structured items. The runtime
+    /// turns them into prompt text via its prompt assembler.
+    async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext>;
 
     async fn diagnostics(&self) -> AgentResult<ContextDiagnostics>;
 
