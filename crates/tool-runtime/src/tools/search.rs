@@ -136,7 +136,7 @@ impl Tool for SearchGrepTool {
             .map_err(|e| AgentError::InvalidRequest(format!("search.grep args: {e}")))?;
         let regex = Regex::new(&args.pattern)
             .map_err(|e| AgentError::InvalidRequest(format!("invalid regex: {e}")))?;
-        let root = self.workspace.resolve_relative(&args.path)?;
+        let root = self.workspace.resolve_relative(&args.path).await?;
 
         let mut files = Vec::new();
         let mut budget = MAX_FILES_SCANNED;

@@ -8,7 +8,7 @@
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, RunId, ToolOutput, ToolRisk, ToolSpec,
 };
-use agent_workspace::{CHANGE_CAPTURE_LIMIT, Workspace, WorkspaceChange};
+use agent_workspace::Workspace;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -88,7 +88,7 @@ impl Tool for EditReplaceTool {
             ));
         }
 
-        let path = self.workspace.resolve_relative(&args.path)?;
+        let path = self.workspace.resolve_mutation(&args.path).await?;
         let metadata = fs::metadata(&path)
             .await
             .map_err(|e| AgentError::Io(format!("metadata {}: {e}", path.display())))?;
@@ -147,25 +147,11 @@ impl Tool for EditReplaceTool {
             });
         }
 
-        fs::write(&path, updated.as_bytes())
-            .await
-            .map_err(|e| AgentError::Io(format!("write {}: {e}", path.display())))?;
-
-        let old_content = if metadata.len() as usize <= CHANGE_CAPTURE_LIMIT {
-            Some(original)
-        } else {
-            None
-        };
-        let change = WorkspaceChange {
-            timestamp_ms: now_ms(),
-            tool: "edit.replace".into(),
-            path: display_relative(&self.workspace, &path),
-            action: "replace".into(),
-            bytes_before: metadata.len(),
-            bytes_after: updated.len() as u64,
-            old_content,
-        };
-        self.workspace.record_change(change).await?;
+        let transaction = self
+            .workspace
+            .begin_mutation("edit.replace", "replace", &args.path)
+            .await?;
+        transaction.apply(updated.as_bytes()).await?;
 
         Ok(ToolOutput {
             call_id: call_id.into(),
@@ -187,13 +173,6 @@ impl Tool for EditReplaceTool {
             metadata: json!({"changed": true, "occurrences": count, "bytes_before": metadata.len(), "bytes_after": updated.len()}),
         })
     }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

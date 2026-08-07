@@ -688,6 +688,56 @@ Acceptance:
   tool reaches the tool provider and routes calls; mid-run registration
   with lazy start-on-first-use; dependency and duplicate-id validation.
 
+### V1-P0-5: workspace confinement is a Trusted Core boundary ✅ (implemented)
+
+`Workspace::resolve_relative` is now a confinement check, not a lexical
+join:
+
+- lexical guards stay (`..`, absolute paths, drive prefixes, root
+  components are rejected);
+- the candidate is then walked component by component from the canonical
+  root: every existing intermediate is canonicalized and must still be
+  under the root, so symlinks, junctions and reparse points anywhere
+  along the path cannot redirect the tail outside the workspace;
+- missing tail components are appended lexically afterwards, so
+  new-file writes keep working;
+- `resolve_mutation` adds a hard rejection of the runtime state
+  directory (`.focus-agent/` — traces, checkpoints, artifacts, change
+  journal), and mutating tools (`fs.write`, `edit.replace`) resolve
+  through it. Reads (`fs.list`/`fs.read`/`search.grep`) keep
+  `resolve_relative`.
+
+Acceptance: workspace tests green, including real junction escapes on
+Windows (`mklink /J`) being rejected, state-dir writes rejected through
+both a direct path and a link into the state dir, and normal relative
+resolution unchanged.
+
+### V1-P0-6: mutations become journaled transactions ✅ (implemented)
+
+`Workspace::begin_mutation` returns a `MutationTransaction` replacing
+per-tool file writes:
+
+```text
+resolve_mutation → capture old content (bounded) → stage temp file in
+target dir → record change journal → atomic rename (swap)
+```
+
+- the journal entry is written *before* the swap, so a journal failure
+  never leaves the target half-mutated and a retrying agent cannot
+  double-apply an already-landed mutation; any failure removes the temp
+  file and leaves the target untouched;
+- `edit.replace` and `fs.write` both go through the transaction —
+  `fs.write` now journals every write (action `write`, old content
+  captured up to `CHANGE_CAPTURE_LIMIT`) instead of bypassing the change
+  journal;
+- the temp file lives next to the target (same filesystem) so the swap
+  is a true atomic rename.
+
+Acceptance: workspace + tool tests green; `fs.write` journals new-file
+and overwrite cases with old content; a failed commit (rename over a
+non-empty directory) leaves unrelated targets untouched and cleans up
+the temp file.
+
 ---
 
 ## Later, only after evidence

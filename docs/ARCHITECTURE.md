@@ -157,6 +157,44 @@ work (searches, shell processes) can be aborted cooperatively by the caller.
 Tool risk classes (`ReadOnly` / `WorkspaceWrite` / `ProcessExecution`) drive
 approval before execution.
 
+### Workspace confinement (Trusted Core boundary)
+
+`agent-workspace` is the one path through which file tools touch the disk,
+and since V1-P0-5 it is a confinement boundary, not a path joiner:
+
+- `Workspace::resolve_relative` rejects `..`, absolute paths, drive
+  prefixes and root components, then walks the candidate component by
+  component from the canonical root: every existing intermediate is
+  canonicalized and must remain under the root. Symlinks, junctions and
+  reparse points anywhere along the path therefore cannot redirect the
+  tail outside the workspace; missing tail components are appended
+  lexically so new-file writes still work. (Windows verbatim `\\?\`
+  prefixes from `canonicalize` are normalized away so returned paths
+  stay display-friendly.)
+- `Workspace::resolve_mutation` adds a hard rejection of the runtime
+  state directory (`.focus-agent/` — traces, checkpoints, artifacts,
+  change journal); mutating tools (`fs.write`, `edit.replace`) resolve
+  through it, so ordinary coding tools cannot overwrite runtime state.
+- Read tools (`fs.list`/`fs.read`/`search.grep`) use `resolve_relative`
+  and can still read artifacts.
+
+### Mutation transactions
+
+Since V1-P0-6 every file mutation is a `MutationTransaction` produced by
+`Workspace::begin_mutation`:
+
+```text
+resolve_mutation → capture old content (bounded) → stage temp file in
+target dir → record change journal → atomic rename (swap)
+```
+
+The journal entry lands *before* the swap, so a journal failure never
+leaves the target half-mutated (a retrying agent cannot double-apply an
+already-landed mutation); any failure removes the temp file and leaves
+the target untouched. `fs.write` and `edit.replace` both use it —
+`fs.write` now journals every write instead of bypassing the change
+journal.
+
 ### Approval flow
 
 `agent-kernel` owns the `ApprovalGate` contract. Two implementations exist:

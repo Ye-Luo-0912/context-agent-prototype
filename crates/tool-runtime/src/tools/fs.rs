@@ -63,7 +63,7 @@ impl Tool for FsListTool {
     ) -> AgentResult<ToolOutput> {
         let args: ListArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("fs.list args: {e}")))?;
-        let path = self.workspace.resolve_relative(&args.path)?;
+        let path = self.workspace.resolve_relative(&args.path).await?;
         let mut reader = fs::read_dir(&path)
             .await
             .map_err(|e| AgentError::Io(format!("list {}: {e}", path.display())))?;
@@ -196,7 +196,7 @@ impl Tool for FsReadTool {
             )));
         }
 
-        let path = self.workspace.resolve_relative(&args.path)?;
+        let path = self.workspace.resolve_relative(&args.path).await?;
         let metadata = fs::metadata(&path)
             .await
             .map_err(|e| AgentError::Io(format!("metadata {}: {e}", path.display())))?;
@@ -281,15 +281,12 @@ impl Tool for FsWriteTool {
     ) -> AgentResult<ToolOutput> {
         let args: WriteArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("fs.write args: {e}")))?;
-        let path = self.workspace.resolve_relative(&args.path)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| AgentError::Io(format!("create parent dir: {e}")))?;
-        }
-        fs::write(&path, args.content.as_bytes())
-            .await
-            .map_err(|e| AgentError::Io(format!("write {}: {e}", path.display())))?;
+        let path = self.workspace.resolve_mutation(&args.path).await?;
+        let transaction = self
+            .workspace
+            .begin_mutation("fs.write", "write", &args.path)
+            .await?;
+        transaction.apply(args.content.as_bytes()).await?;
 
         Ok(ToolOutput {
             call_id: call_id.into(),
@@ -312,4 +309,81 @@ fn display_relative(workspace: &Workspace, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_contracts::{CancellationToken, ToolExecutionRequest};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn fs_write_journals_a_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = FsWriteTool::new(workspace.clone());
+        let run_id = RunId::new();
+
+        let write = |path: &str, content: &str| {
+            let tool = &tool;
+            let call = agent_contracts::ToolCall {
+                id: "c".into(),
+                name: "fs.write".into(),
+                arguments: json!({"path": path, "content": content}),
+            };
+            async move {
+                tool.execute(run_id, "c", call.arguments, CancellationToken::new())
+                    .await
+            }
+        };
+
+        // Writing a new file records the mutation with zero bytes before.
+        let output = write("notes.txt", "first").await.unwrap();
+        assert!(output.ok);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("notes.txt"))
+                .await
+                .unwrap(),
+            "first"
+        );
+        let journal = fs::read_to_string(workspace.state_dir().join("changes.jsonl"))
+            .await
+            .unwrap();
+        let record: serde_json::Value = serde_json::from_str(journal.trim()).unwrap();
+        assert_eq!(record["tool"], "fs.write");
+        assert_eq!(record["action"], "write");
+        assert_eq!(record["path"], "notes.txt");
+        assert_eq!(record["bytes_before"], 0);
+        assert_eq!(record["bytes_after"], 5);
+
+        // Overwriting captures the previous content as the journal backup.
+        write("notes.txt", "second").await.unwrap();
+        let journal = fs::read_to_string(workspace.state_dir().join("changes.jsonl"))
+            .await
+            .unwrap();
+        let lines: Vec<&str> = journal.lines().collect();
+        let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(record["old_content"], "first");
+    }
+
+    #[tokio::test]
+    async fn fs_write_rejects_state_dir_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = FsWriteTool::new(workspace);
+        let run_id = RunId::new();
+        let request = ToolExecutionRequest {
+            run_id,
+            call: agent_contracts::ToolCall {
+                id: "c".into(),
+                name: "fs.write".into(),
+                arguments: json!({"path": ".focus-agent/traces.jsonl", "content": "x"}),
+            },
+            cancel: CancellationToken::new(),
+        };
+        let result = tool
+            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .await;
+        assert!(result.is_err(), "state dir writes must be rejected");
+    }
 }
