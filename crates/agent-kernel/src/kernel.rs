@@ -7,15 +7,13 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentError, AgentResult, ApprovalDecision, ApprovalGate, CancellationToken,
-    ContextBuildRequest, ContextEngine, ContextIngress, ContextItemSummary, ContextKind,
-    ContextMaintenanceTrigger, ContextSnapshot, EventJournal, FocusState, ModelChunk,
-    ModelEventSink, ModelInput, ModelMessage, ModelRequest, ModelRole, ModelTransport, RunId,
-    RuntimeEvent, RuntimeEventEnvelope, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest,
-    ToolOutput, TurnFrame, TurnFrameStep,
+    AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, ContextBuildRequest,
+    ContextEngine, ContextIngress, ContextItemSummary, ContextKind, ContextMaintenanceReport,
+    ContextMaintenanceTrigger, ContextSnapshot, EventJournal, FocusState, ModelEventSink,
+    ModelOutput, ModelRequest, ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, TaskId,
+    ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
 };
-use serde_json::json;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 
 #[derive(Debug, Clone)]
 pub struct AgentKernelConfig {
@@ -39,6 +37,10 @@ impl Default for AgentKernelConfig {
     }
 }
 
+/// The runtime's executor: stateless primitives over the engine contracts
+/// (context, model, tools, approval, journal) plus the event plumbing. The
+/// execution *state machine* (turn frame, generation, what to commit) lives
+/// in the runtime actor — this type owns no turn state and no locks for it.
 pub struct AgentKernel {
     run_id: RunId,
     config: AgentKernelConfig,
@@ -49,8 +51,6 @@ pub struct AgentKernel {
     journal: Option<Arc<dyn EventJournal>>,
     event_tx: broadcast::Sender<RuntimeEventEnvelope>,
     seq: Arc<AtomicU64>,
-    turn_cancel: Mutex<Option<CancellationToken>>,
-    turn_lock: Mutex<()>,
 }
 
 impl AgentKernel {
@@ -73,8 +73,6 @@ impl AgentKernel {
             journal,
             event_tx,
             seq: Arc::new(AtomicU64::new(0)),
-            turn_cancel: Mutex::new(None),
-            turn_lock: Mutex::new(()),
         }
     }
 
@@ -86,15 +84,32 @@ impl AgentKernel {
         self.event_tx.subscribe()
     }
 
-    /// The broadcast sender behind `subscribe`, for the runtime actor to hand
-    /// out fresh subscriptions.
+    /// The broadcast sender behind `subscribe`, for live event sinks.
     pub fn event_sender(&self) -> broadcast::Sender<RuntimeEventEnvelope> {
         self.event_tx.clone()
     }
 
-    /// Surface a runtime-level warning through the normal event stream.
-    pub async fn emit_warning(&self, message: String) -> AgentResult<()> {
-        self.emit(RuntimeEvent::Warning { message }).await
+    /// The shared sequence counter, so live deltas and journaled events keep
+    /// one consistent envelope order.
+    pub fn seq(&self) -> Arc<AtomicU64> {
+        self.seq.clone()
+    }
+
+    /// Configuration accessors the actor drives the turn loop with.
+    pub fn system_prompt(&self) -> String {
+        self.config.system_prompt.clone()
+    }
+
+    pub fn context_budget_tokens(&self) -> usize {
+        self.config.context_budget_tokens
+    }
+
+    pub fn max_tool_rounds(&self) -> usize {
+        self.config.max_tool_rounds
+    }
+
+    pub fn tool_specs(&self) -> Vec<ToolSpec> {
+        self.tools.specs()
     }
 
     pub async fn start(&self) -> AgentResult<()> {
@@ -109,247 +124,83 @@ impl AgentKernel {
         Ok(())
     }
 
-    /// Cancel the in-flight turn (if any). The model provider observes the
-    /// token and aborts its stream; the turn loop then stops cleanly.
-    pub async fn cancel_current_turn(&self) {
-        if let Some(token) = self.turn_cancel.lock().await.take() {
-            token.cancel();
-        }
+    /// Journal + broadcast one runtime event (the single write path).
+    pub async fn emit_event(&self, event: RuntimeEvent) -> AgentResult<()> {
+        self.emit(event).await
     }
 
-    pub async fn handle_user_message(&self, content: String) -> AgentResult<()> {
-        let result = self.handle_user_message_inner(content).await;
-        if let Err(error) = &result {
-            let _ = self
-                .emit(RuntimeEvent::Error {
-                    message: error.to_string(),
-                })
-                .await;
-        }
-        result
+    /// Surface a runtime-level warning through the normal event stream.
+    pub async fn emit_warning(&self, message: String) -> AgentResult<()> {
+        self.emit(RuntimeEvent::Warning { message }).await
     }
 
-    async fn handle_user_message_inner(&self, content: String) -> AgentResult<()> {
-        let _guard = self.turn_lock.lock().await;
-        if content.trim().is_empty() {
-            return Ok(());
-        }
-
-        self.emit(RuntimeEvent::UserMessageAccepted {
-            content: content.clone(),
-        })
-        .await?;
-        self.context
-            .ingest(ContextIngress::UserMessage {
-                content: content.clone(),
-            })
-            .await?;
-        let report = self
-            .context
-            .maintain(ContextMaintenanceTrigger::UserInput)
-            .await?;
-        self.emit(RuntimeEvent::ContextMaintained {
-            trigger: ContextMaintenanceTrigger::UserInput,
-            report,
-        })
-        .await?;
-
-        let cancel = CancellationToken::new();
-        *self.turn_cancel.lock().await = Some(cancel.clone());
-        let result = self.run_turn(&content, &cancel).await;
-        self.turn_cancel.lock().await.take();
-        result
+    /// Context primitives: the actor decides when they run.
+    pub async fn context_ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+        self.context.ingest(ingress).await
     }
 
-    async fn run_turn(&self, content: &str, cancel: &CancellationToken) -> AgentResult<()> {
-        // The execution stack of this turn: user message, assistant tool
-        // calls, tool results, in order. Runtime-owned, kept verbatim, never
-        // scored or evicted while the turn is open.
-        let mut turn = TurnFrame::new(content.to_string());
-
-        for round in 0..=self.config.max_tool_rounds {
-            if cancel.is_cancelled() {
-                self.emit(RuntimeEvent::Warning {
-                    message: "turn cancelled".into(),
-                })
-                .await?;
-                self.emit(RuntimeEvent::TurnCompleted).await?;
-                return Ok(());
-            }
-
-            if round == self.config.max_tool_rounds {
-                let message = format!(
-                    "tool round budget exhausted after {} rounds",
-                    self.config.max_tool_rounds
-                );
-                self.emit(RuntimeEvent::Warning {
-                    message: message.clone(),
-                })
-                .await?;
-                return Err(AgentError::Internal(message));
-            }
-
-            let report = self
-                .context
-                .maintain(ContextMaintenanceTrigger::BeforeModel)
-                .await?;
-            self.emit(RuntimeEvent::ContextMaintained {
-                trigger: ContextMaintenanceTrigger::BeforeModel,
-                report,
-            })
-            .await?;
-
-            let snapshot = self
-                .context
-                .build_snapshot(ContextBuildRequest {
-                    system_prompt: self.config.system_prompt.clone(),
-                    current_input: content.to_string(),
-                    budget_tokens: self.config.context_budget_tokens,
-                })
-                .await?;
-            self.emit(RuntimeEvent::ContextPrepared {
-                diagnostics: snapshot.diagnostics.clone(),
-                selected: snapshot.selected.clone(),
-            })
-            .await?;
-
-            self.emit(RuntimeEvent::ModelStarted).await?;
-            let sink = KernelSink {
-                event_tx: self.event_tx.clone(),
-                seq: self.seq.clone(),
-                run_id: self.run_id,
-            };
-            let input = self.build_model_input(&snapshot, content, &turn);
-            let output = match self
-                .model
-                .complete_stream(
-                    ModelRequest {
-                        messages: input.into_messages(),
-                        tools: input.tool_schemas.clone(),
-                        metadata: json!({
-                            "run_id": self.run_id.to_string(),
-                            "context_selected": snapshot.selected.len(),
-                            "context_approx_tokens": snapshot.approx_tokens,
-                        }),
-                        cancel: cancel.clone(),
-                    },
-                    &sink,
-                )
-                .await
-            {
-                Ok(output) => output,
-                Err(error) => {
-                    if cancel.is_cancelled() {
-                        self.emit(RuntimeEvent::Warning {
-                            message: "turn cancelled".into(),
-                        })
-                        .await?;
-                        self.emit(RuntimeEvent::TurnCompleted).await?;
-                        return Ok(());
-                    }
-                    return Err(error);
-                }
-            };
-
-            if output.tool_calls.is_empty() {
-                // The model finished. The turn's tool observations now become
-                // the long-term record, then the final assistant message.
-                self.persist_turn_observations(&turn).await?;
-                self.context
-                    .ingest(ContextIngress::AssistantMessage {
-                        content: output.content.clone(),
-                    })
-                    .await?;
-                self.emit(RuntimeEvent::AssistantMessage {
-                    content: output.content,
-                })
-                .await?;
-                let report = self
-                    .context
-                    .maintain(ContextMaintenanceTrigger::AfterModel)
-                    .await?;
-                self.emit(RuntimeEvent::ContextMaintained {
-                    trigger: ContextMaintenanceTrigger::AfterModel,
-                    report,
-                })
-                .await?;
-                self.emit(RuntimeEvent::TurnCompleted).await?;
-                return Ok(());
-            }
-
-            turn.push_tool_calls(output.tool_calls.clone());
-            for call in output.tool_calls {
-                let tool_output = self.execute_tool(call, cancel).await;
-                self.emit(RuntimeEvent::ToolFinished {
-                    output: tool_output.clone(),
-                })
-                .await?;
-                turn.push_tool_result(tool_output);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Assemble the five-layer model input. The context engine owns the
-    /// long-term working set; the runtime owns the turn stack. The snapshot's
-    /// first system message is the standing policy and its trailing user
-    /// message is the current turn's user message — both move to their own
-    /// layers so the context frame carries only working-set content.
-    fn build_model_input(
+    pub async fn context_maintain(
         &self,
-        snapshot: &ContextSnapshot,
-        current_input: &str,
-        turn: &TurnFrame,
-    ) -> ModelInput {
-        let mut context_frame = Vec::new();
-        for (index, message) in snapshot.messages.iter().enumerate() {
-            let is_policy = index == 0
-                && message.role == ModelRole::System
-                && message.content == self.config.system_prompt;
-            let is_current_user = index + 1 == snapshot.messages.len()
-                && message.role == ModelRole::User
-                && message.content == current_input;
-            if !is_policy && !is_current_user {
-                context_frame.push(message.clone());
-            }
-        }
-        ModelInput {
-            system_policy: vec![ModelMessage::system(self.config.system_prompt.clone())],
-            focus_frame: None,
-            context_frame,
-            turn_frame: turn.clone(),
-            tool_schemas: self.tools.specs(),
-        }
+        trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        self.context.maintain(trigger).await
     }
 
-    /// When the turn ends, its tool observations become the long-term record:
-    /// ingest them as tool observations, then run maintenance once so the
-    /// error and supersession lifecycles observe the whole turn at once.
-    async fn persist_turn_observations(&self, turn: &TurnFrame) -> AgentResult<()> {
-        let mut ingested = false;
-        for step in &turn.steps {
-            if let TurnFrameStep::ToolResult { output } = step {
-                self.context
-                    .ingest(ContextIngress::ToolObservation {
-                        output: output.clone(),
-                    })
-                    .await?;
-                ingested = true;
+    pub async fn context_build_snapshot(
+        &self,
+        request: ContextBuildRequest,
+    ) -> AgentResult<ContextSnapshot> {
+        self.context.build_snapshot(request).await
+    }
+
+    /// One model round: stream the request to the provider. The result is a
+    /// value for the actor to validate and commit — nothing is committed
+    /// here.
+    pub async fn run_model_round(
+        &self,
+        request: ModelRequest,
+        sink: &dyn ModelEventSink,
+    ) -> AgentResult<ModelOutput> {
+        self.model.complete_stream(request, sink).await
+    }
+
+    /// Execute one tool call: look up the spec, run approval, dispatch.
+    /// Emits nothing — ToolStarted/ToolFinished are committed by the actor.
+    pub async fn execute_tool(&self, call: ToolCall, cancel: CancellationToken) -> ToolOutput {
+        let spec = self
+            .tools
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == call.name);
+        let Some(spec) = spec else {
+            return tool_error_output(&call, format!("unknown tool: {}", call.name));
+        };
+
+        match self.approval.authorize(&call, &spec).await {
+            Ok(ApprovalDecision::Allow) => {}
+            Ok(ApprovalDecision::Deny) => {
+                return tool_error_output(
+                    &call,
+                    format!("tool denied by approval policy: {}", call.name),
+                );
+            }
+            Err(error) => {
+                return tool_error_output(&call, format!("approval check failed: {error}"));
             }
         }
-        if ingested {
-            let report = self
-                .context
-                .maintain(ContextMaintenanceTrigger::AfterTool)
-                .await?;
-            self.emit(RuntimeEvent::ContextMaintained {
-                trigger: ContextMaintenanceTrigger::AfterTool,
-                report,
+
+        match self
+            .tools
+            .execute(ToolExecutionRequest {
+                run_id: self.run_id,
+                call: call.clone(),
+                cancel,
             })
-            .await?;
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => tool_error_output(&call, error.to_string()),
         }
-        Ok(())
     }
 
     /// Switch the runtime's focus to a new goal, opening a fresh task scope
@@ -434,50 +285,6 @@ impl AgentKernel {
         self.context.checkpoint().await
     }
 
-    async fn execute_tool(&self, call: ToolCall, cancel: &CancellationToken) -> ToolOutput {
-        if let Err(error) = self
-            .emit(RuntimeEvent::ToolStarted { call: call.clone() })
-            .await
-        {
-            tracing::warn!(%error, "failed to emit tool-start event");
-        }
-
-        let spec = self
-            .tools
-            .specs()
-            .into_iter()
-            .find(|spec| spec.name == call.name);
-        let Some(spec) = spec else {
-            return tool_error_output(&call, format!("unknown tool: {}", call.name));
-        };
-
-        match self.approval.authorize(&call, &spec).await {
-            Ok(ApprovalDecision::Allow) => {}
-            Ok(ApprovalDecision::Deny) => {
-                return tool_error_output(
-                    &call,
-                    format!("tool denied by approval policy: {}", call.name),
-                );
-            }
-            Err(error) => {
-                return tool_error_output(&call, format!("approval check failed: {error}"));
-            }
-        }
-
-        match self
-            .tools
-            .execute(ToolExecutionRequest {
-                run_id: self.run_id,
-                call: call.clone(),
-                cancel: cancel.clone(),
-            })
-            .await
-        {
-            Ok(output) => output,
-            Err(error) => tool_error_output(&call, error.to_string()),
-        }
-    }
-
     async fn emit(&self, event: RuntimeEvent) -> AgentResult<()> {
         let envelope = RuntimeEventEnvelope {
             run_id: self.run_id,
@@ -491,42 +298,6 @@ impl AgentKernel {
         }
         let _ = self.event_tx.send(envelope);
         Ok(())
-    }
-}
-
-/// Forwards streamed text deltas to live subscribers without journaling them
-/// (the final `AssistantMessage` carries the complete content for replay).
-#[derive(Clone)]
-struct KernelSink {
-    event_tx: broadcast::Sender<RuntimeEventEnvelope>,
-    seq: Arc<AtomicU64>,
-    run_id: RunId,
-}
-
-impl KernelSink {
-    fn emit_live(&self, event: RuntimeEvent) {
-        let envelope = RuntimeEventEnvelope {
-            run_id: self.run_id,
-            seq: self.seq.fetch_add(1, Ordering::Relaxed) + 1,
-            timestamp_ms: now_ms(),
-            event,
-        };
-        let _ = self.event_tx.send(envelope);
-    }
-}
-
-#[async_trait::async_trait]
-impl ModelEventSink for KernelSink {
-    async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
-        match chunk {
-            ModelChunk::TextDelta { delta } => {
-                self.emit_live(RuntimeEvent::ModelDelta { delta });
-                Ok(())
-            }
-            // Tool-call argument deltas are internal to the model round; the
-            // kernel surfaces tool execution via ToolStarted/ToolFinished.
-            ModelChunk::ToolCallDelta { .. } | ModelChunk::Done => Ok(()),
-        }
     }
 }
 

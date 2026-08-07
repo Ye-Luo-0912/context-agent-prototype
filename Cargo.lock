@@ -308,6 +308,7 @@ version = "0.1.0"
 dependencies = [
  "agent-contracts",
  "agent-kernel",
+ "agent-runtime",
  "async-trait",
  "context-simple",
  "serde",

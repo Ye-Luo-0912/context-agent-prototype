@@ -98,22 +98,27 @@ async fn adapter_plugs_into_a_real_kernel_without_rewrites() {
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     ));
-    let mut events = kernel.subscribe();
-    kernel.start().await.unwrap();
+    let (handle, _runtime_task) = agent_runtime::spawn_runtime(kernel);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
 
-    kernel
-        .handle_user_message("hello service".into())
-        .await
-        .unwrap();
+    handle.user_message("hello service".into()).await.unwrap();
 
     let mut reply = None;
     let mut completed = false;
-    while let Ok(envelope) = events.try_recv() {
-        match envelope.event {
-            RuntimeEvent::AssistantMessage { content } => reply = Some(content),
-            RuntimeEvent::TurnCompleted => completed = true,
-            _ => {}
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::AssistantMessage { content } => reply = Some(content),
+                RuntimeEvent::TurnCompleted => completed = true,
+                _ => {}
+            }
         }
+        if completed {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert_eq!(reply.as_deref(), Some("hello from the other side"));
     assert!(

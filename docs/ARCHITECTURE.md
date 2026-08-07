@@ -358,7 +358,7 @@ state (items, focus, counters) to `.focus-agent/checkpoints/*.json`, separate
 from the event journal. `restore` reloads it. Traces are for learning/replay;
 checkpoints are for durable runtime state.
 
-## 8c. Runtime actor and module host (V1-M3)
+## 8c. Runtime actor and module host (V1-M3, hardened V1-P0-1)
 
 Since V1-M3 the runtime is an actor (`agent-runtime`), not `Mutex`
 orchestration. Callers hold a cloneable `RuntimeHandle`:
@@ -366,20 +366,28 @@ orchestration. Callers hold a cloneable `RuntimeHandle`:
 ```text
 RuntimeHandle ── mpsc<RuntimeCommand> ──▶ RuntimeActor (owns mutable state)
                      │                        │
-                     │                        └── spawned turn task ──▶ OperationResult
+                     │                        └── model/tool operations
+                     │                            └─▶ OperationResult
                      └──── events ◀── broadcast channel (kernel events)
 ```
 
 - every mutation (user message, focus, pin, task completion, checkpoint)
   is a command; the actor serializes them, so focus/pin/task commands can
-  no longer interleave with an in-flight turn (the previous structural
-  race);
-- a turn runs as a spawned operation that reports back an `OperationResult`
-  carrying run/turn/task/scope/operation ids and a generation; the actor
-  drops results whose generation moved on (cancel, stop) — stale results
-  never race into the new state;
-- the actor selects on both the command channel and the completion channel,
-  so `/cancel` is processed mid-turn and a new turn can start right after.
+  no longer interleave with an in-flight turn;
+- since V1-P0-1 the actor *is* the runtime: it owns the turn execution
+  state machine and the `TurnFrame`. Model rounds and tool calls are
+  spawned operations that report an `OperationResult` (run/turn/task/
+  scope/operation ids + generation); the actor validates the generation
+  and only then commits (turn-frame push, context ingest/maintenance,
+  events). Stale results are dropped before they can cause side effects —
+  `is_stale` no longer protects only "after the whole kernel turn ran";
+- `AgentKernel` is now a stateless executor/helper: context/model/tool
+  primitives plus event plumbing (journal, sequence, broadcast). Its
+  turn loop, turn locks and `TurnFrame` ownership are gone;
+- the actor selects on both the command channel and the operation
+  completion channel, so `/cancel` is processed mid-operation and a new
+  turn can start right after; cancellation is committed by the actor
+  immediately (warning + TurnCompleted).
 
 Composition uses a module host over typed capabilities:
 

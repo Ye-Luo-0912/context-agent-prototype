@@ -527,6 +527,90 @@ Acceptance:
 
 ---
 
+## V1-P0: structural fixes — the actor owns the runtime
+
+Follow-up review of V1-M3. Each item is a small milestone with its own
+verification; they are being implemented in order.
+
+### V1-P0-1: the actor is the runtime ✅ (implemented)
+
+`AgentKernel` no longer runs turns. The turn execution state machine lives
+in the `RuntimeActor`:
+
+```text
+RuntimeActor
+   ├─ prepare model operation (maintain BeforeModel, snapshot, model input)
+   │       ↓
+   │    async execute            -> OperationResult
+   │       ↓
+   ├─ validate generation        (stale => drop + warning, nothing committed)
+   ├─ commit                     (turn-frame push / context ingest / events)
+   │
+   ├─ prepare tool operation (ToolStarted)
+   │       ↓
+   │    async execute            -> OperationResult (approval + dispatch)
+   │       ↓
+   ├─ validate generation
+   ├─ commit                     (tool result into the turn frame, ToolFinished)
+   │
+   └─ continue state machine     (next tool / next model round / finalize)
+```
+
+Consequences:
+
+- model rounds and tool calls are real `Operation`s — `OperationOutcome::
+  ModelOutput` and `::ToolOutput` are now used, not just `Completed`;
+- only the actor commits: a stale result (cancel, generation bump) is
+  dropped before it can touch the context, the turn frame or the event
+  stream; the previously unavoidable side effects of "the whole kernel
+  turn already finished" are gone;
+- `AgentKernel` is a stateless executor/helper (context/model/tool
+  primitives + event plumbing + journal); its `turn_lock`/`turn_cancel`
+  and the `TurnFrame` ownership are gone — execution ownership is no
+  longer duplicated;
+- the actor owns the `TurnFrame` (execution stack) across model/tool
+  operations, so the M1 invariant (turn frame is never scored or evicted
+  mid-turn) is enforced by construction;
+- cancellation is committed by the actor immediately (Warning + TurnCompleted),
+  and the in-flight operation's late result is dropped as stale.
+
+Acceptance:
+
+- workspace tests green; the kernel streaming/turn-frame/approval tests
+  moved to `agent-runtime` (they now test the actor): streamed deltas,
+  cancellation of a hanging model round, turn-frame protocol pairing +
+  persist order, and the interactive approval loop (allow / deny /
+  timeout) all pass against the new state machine.
+
+### V1-P0-2: prompt assembly leaves the context engine (next)
+
+- replace `ContextBuildRequest { system_prompt, current_input, budget }`
+  and `ContextSnapshot { messages }` with a structured working set
+  (`ContextQuery` -> `MaterializedContext`); the engine stops building
+  `ModelMessage`s;
+- a single `PromptAssembler` (runtime-owned) is the only place that
+  renders System + Focus + Context + Turn + Tool Schemas into the
+  five-layer `ModelInput`.
+
+### V1-P0-3: scope ownership moves to the runtime (next)
+
+- `ContextItem` gains `scope_id`; scope membership is no longer inferred
+  from `ContextScope + task_id + created_tick`;
+- the runtime drives the scope tree (Session -> Task -> Focus -> Tool)
+  as execution frames; tool scopes open at tool start and close when the
+  model consumes the result; the context engine only applies the
+  promotion / warm / cold / externalize decision on close.
+
+### V1-P0-4: the module host becomes an extension platform (next)
+
+- `ServiceRegistry` registration becomes public so external crates can
+  publish capabilities; core services stay typed;
+- a dynamic capability plane (manifest: id/version/name/summary/
+  permissions/dependencies/lifecycle/transport) so the LLM can register
+  new capabilities at runtime against a stable core ABI.
+
+---
+
 ## Later, only after evidence
 
 - vector recall;

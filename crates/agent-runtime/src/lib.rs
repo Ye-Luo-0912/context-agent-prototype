@@ -6,6 +6,7 @@ mod actor;
 mod command;
 pub mod host;
 pub mod modules;
+mod sink;
 
 pub use actor::{RuntimeActor, spawn_runtime};
 pub use command::{Reply, RuntimeCommand, RuntimeHandle};

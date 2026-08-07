@@ -1,9 +1,9 @@
-//! Interactive approval-gate tests at the kernel level.
+//! Interactive approval-gate tests at the actor level.
 //!
-//! Verifies the full loop: a workspace-write / process-execution tool call
-//! broadcasts an `ApprovalRequest` to the broker, blocks until the UI answers
-//! through `InteractiveApprovalGate::respond`, and proceeds or fails
-//! accordingly. Read-only tools must never prompt.
+//! Verifies the full loop through the runtime: a workspace-write /
+//! process-execution tool call broadcasts an `ApprovalRequest` to the broker,
+//! blocks until the UI answers through `InteractiveApprovalGate::respond`,
+//! and proceeds or fails accordingly. Read-only tools must never prompt.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,6 +16,7 @@ use agent_contracts::{
     ToolRisk, ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, ApprovalBroker, InteractiveApprovalGate};
+use agent_runtime::{RuntimeHandle, spawn_runtime};
 use serde_json::json;
 
 #[derive(Debug)]
@@ -140,47 +141,46 @@ impl ModelTransport for OneToolCallModel {
     }
 }
 
-fn kernel(model: Arc<dyn ModelTransport>, gate: Arc<dyn ApprovalGate>) -> Arc<AgentKernel> {
-    Arc::new(AgentKernel::new(
+async fn spawn_with(model: Arc<dyn ModelTransport>, gate: Arc<dyn ApprovalGate>) -> RuntimeHandle {
+    let kernel = Arc::new(AgentKernel::new(
         AgentKernelConfig::default(),
         Arc::new(TestContextEngine),
         model,
         Arc::new(RiskToolDispatcher),
         gate,
         None,
-    ))
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    handle.start().await.unwrap();
+    handle
 }
 
-/// Collects the ToolFinished outputs of one turn.
-fn finished_outputs(
+/// Wait for a ToolFinished event carrying one output; fails on timeout.
+async fn wait_for_tool_finished(
     events: &mut tokio::sync::broadcast::Receiver<agent_contracts::RuntimeEventEnvelope>,
-) -> Vec<agent_contracts::ToolOutput> {
-    let mut outputs = Vec::new();
-    while let Ok(envelope) = events.try_recv() {
-        if let RuntimeEvent::ToolFinished { output } = envelope.event {
-            outputs.push(output);
+) -> agent_contracts::ToolOutput {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::ToolFinished { output } = envelope.event {
+                return output;
+            }
         }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    outputs
+    panic!("ToolFinished was not emitted before the deadline");
 }
 
 #[tokio::test]
 async fn read_only_tools_never_prompt() {
     let broker = ApprovalBroker::new();
     let gate = Arc::new(InteractiveApprovalGate::new(broker.clone()));
-    let kernel = kernel(Arc::new(OneToolCallModel::new("read.only")), gate);
-    let mut events = kernel.subscribe();
-    kernel.start().await.unwrap();
+    let handle = spawn_with(Arc::new(OneToolCallModel::new("read.only")), gate).await;
+    let mut events = handle.subscribe();
 
-    kernel.handle_user_message("go".into()).await.unwrap();
-
-    let outputs = finished_outputs(&mut events);
-    assert_eq!(outputs.len(), 1);
-    assert!(
-        outputs[0].ok,
-        "read-only call must run: {}",
-        outputs[0].summary
-    );
+    handle.user_message("go".into()).await.unwrap();
+    let output = wait_for_tool_finished(&mut events).await;
+    assert!(output.ok, "read-only call must run: {}", output.summary);
     assert!(
         broker.pending().await.is_empty(),
         "read-only tool must not create an approval request"
@@ -192,21 +192,18 @@ async fn write_tool_waits_for_allow() {
     let broker = ApprovalBroker::new();
     let gate = Arc::new(InteractiveApprovalGate::new(broker.clone()));
     let mut approval_rx = broker.subscribe();
-    let kernel = kernel(Arc::new(OneToolCallModel::new("write.tool")), gate.clone());
-    let mut events = kernel.subscribe();
-    kernel.start().await.unwrap();
+    let handle = spawn_with(Arc::new(OneToolCallModel::new("write.tool")), gate.clone()).await;
+    let mut events = handle.subscribe();
 
-    let turn = kernel.clone();
-    let task = tokio::spawn(async move { turn.handle_user_message("go".into()).await });
+    handle.user_message("go".into()).await.unwrap();
 
-    // The kernel blocks inside authorize() until the UI answers.
+    // The tool operation blocks inside authorize() until the UI answers.
     let request = tokio::time::timeout(Duration::from_secs(2), approval_rx.recv())
         .await
         .expect("write tool must broadcast an approval request")
         .expect("broker channel closed");
     assert_eq!(request.spec.name, "write.tool");
     assert_eq!(request.call.arguments, json!({"probe": true}));
-
     assert_eq!(
         broker.pending().await.len(),
         1,
@@ -219,17 +216,12 @@ async fn write_tool_waits_for_allow() {
         "respond should resolve the pending request"
     );
 
-    tokio::time::timeout(Duration::from_secs(2), task)
-        .await
-        .expect("turn hung after approval")
-        .expect("turn panicked")
-        .expect("turn failed after allow");
-
-    let outputs = finished_outputs(&mut events);
-    assert_eq!(outputs.len(), 1);
-    assert!(outputs[0].ok, "allowed write tool must run");
+    let output = wait_for_tool_finished(&mut events).await;
+    assert!(output.ok, "allowed write tool must run");
+    let pending = broker.pending().await;
+    eprintln!("pending after allow: {pending:?}");
     assert!(
-        broker.pending().await.is_empty(),
+        pending.is_empty(),
         "resolved request leaves the pending queue"
     );
 }
@@ -239,12 +231,10 @@ async fn write_tool_can_be_denied() {
     let broker = ApprovalBroker::new();
     let gate = Arc::new(InteractiveApprovalGate::new(broker.clone()));
     let mut approval_rx = broker.subscribe();
-    let kernel = kernel(Arc::new(OneToolCallModel::new("proc.tool")), gate.clone());
-    let mut events = kernel.subscribe();
-    kernel.start().await.unwrap();
+    let handle = spawn_with(Arc::new(OneToolCallModel::new("proc.tool")), gate.clone()).await;
+    let mut events = handle.subscribe();
 
-    let turn = kernel.clone();
-    let task = tokio::spawn(async move { turn.handle_user_message("go".into()).await });
+    handle.user_message("go".into()).await.unwrap();
 
     let request = tokio::time::timeout(Duration::from_secs(2), approval_rx.recv())
         .await
@@ -258,19 +248,12 @@ async fn write_tool_can_be_denied() {
         "respond should resolve the pending request"
     );
 
-    tokio::time::timeout(Duration::from_secs(2), task)
-        .await
-        .expect("turn hung after denial")
-        .expect("turn panicked")
-        .expect("turn failed after deny");
-
-    let outputs = finished_outputs(&mut events);
-    assert_eq!(outputs.len(), 1);
-    assert!(!outputs[0].ok, "denied tool must not run");
+    let output = wait_for_tool_finished(&mut events).await;
+    assert!(!output.ok, "denied tool must not run");
     assert!(
-        outputs[0].summary.contains("denied"),
+        output.summary.contains("denied"),
         "summary should explain the denial: {}",
-        outputs[0].summary
+        output.summary
     );
     assert!(
         broker.pending().await.is_empty(),
@@ -287,19 +270,17 @@ async fn unanswered_request_times_out_and_denies() {
         InteractiveApprovalGate::new(broker.clone())
             .with_answer_timeout(Duration::from_millis(200)),
     );
-    let kernel = kernel(Arc::new(OneToolCallModel::new("write.tool")), gate);
-    let mut events = kernel.subscribe();
-    kernel.start().await.unwrap();
+    let handle = spawn_with(Arc::new(OneToolCallModel::new("write.tool")), gate).await;
+    let mut events = handle.subscribe();
 
-    kernel.handle_user_message("go".into()).await.unwrap();
+    handle.user_message("go".into()).await.unwrap();
 
-    let outputs = finished_outputs(&mut events);
-    assert_eq!(outputs.len(), 1);
-    assert!(!outputs[0].ok, "unanswered request must be denied");
+    let output = wait_for_tool_finished(&mut events).await;
+    assert!(!output.ok, "unanswered request must be denied");
     assert!(
-        outputs[0].summary.contains("timed out"),
+        output.summary.contains("timed out"),
         "summary should explain the timeout: {}",
-        outputs[0].summary
+        output.summary
     );
     assert!(
         broker.pending().await.is_empty(),

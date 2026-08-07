@@ -211,7 +211,7 @@ async fn cancel_then_new_turn_drops_stale_completion() {
     let mut stale_warning = false;
     while let Ok(envelope) = events.try_recv() {
         if let RuntimeEvent::Warning { message } = envelope.event
-            && message.contains("stale turn result dropped")
+            && message.contains("stale model result dropped")
         {
             stale_warning = true;
         }
