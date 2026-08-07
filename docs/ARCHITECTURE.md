@@ -70,12 +70,17 @@ Important consequences:
 
 ### ContextEngine
 
-The kernel needs four operations only:
+The kernel needs five operations only:
 
 1. `ingest` — submit a meaningful runtime observation.
-2. `maintain` — trigger continuous lifecycle maintenance.
+2. `maintain` — trigger continuous lifecycle maintenance (the semantic
+   state machine: active/cooling/archived/dropped with reasons).
 3. `materialize` — select the model-facing working set as structured items.
-4. `diagnostics` — expose bounded observability.
+4. `gc` — run a full mark/sweep/reactivate pass (the physical compactor:
+   root marking, reversible eviction, generations). Has a default no-op
+   implementation, so engines without a GC pass (baselines, the wire
+   adapter) keep working unchanged.
+5. `diagnostics` — expose bounded observability.
 
 The API is asynchronous even though `context-simple` is in-process. This leaves room for a future ContextCore service adapter over local IPC/HTTP/gRPC without changing the kernel contract.
 
@@ -91,7 +96,9 @@ process-boundary adapter:
 
 - `context-simple::SimpleContextEngine` (C) — dynamic working set with
   lifecycle states (active/cooling/archived/dropped), focus affinity,
-  scoring and transitions.
+  scoring, transitions, and a full GC pass (V1-M6) that separates
+  residency (resident/evicted), generation and semantic state and evicts
+  into a bounded reversible buffer.
 - `context-baselines::AppendOnlyEngine` (A) — append-only transcript,
   no maintenance.
 - `context-baselines::RollingSummaryEngine` (B) — append, then collapse

@@ -717,6 +717,15 @@ impl RuntimeActor {
                 })
                 .await;
         }
+        // Turn boundary: the full GC pass compacts what the per-event
+        // residency machine demoted. Eviction is reversible, and the report
+        // explains every eviction and reactivation.
+        if let Ok(report) = self.kernel.context_gc().await {
+            let _ = self
+                .kernel
+                .emit_event(RuntimeEvent::ContextGc { report })
+                .await;
+        }
         let _ = self.kernel.emit_event(RuntimeEvent::TurnCompleted).await;
         self.state.turn = None;
     }

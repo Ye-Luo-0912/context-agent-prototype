@@ -3,14 +3,18 @@ use agent_contracts::{ContextDiagnostics, ContextState, ScopeState};
 use crate::engine::State;
 use crate::item::approx_tokens;
 
-/// Counts of the current heap by state, the active token estimate and the
-/// scope tree by lifecycle state.
+/// Counts of the current heap by state, the active token estimate, the scope
+/// tree by lifecycle state and the GC residency split.
 pub(crate) fn compute(state: &State) -> ContextDiagnostics {
     let mut diagnostics = ContextDiagnostics {
         total_items: state.items.len(),
         focus_generation: state.focus.as_ref().map_or(0, |f| f.generation),
         turn: state.turn,
         tool_round: state.tool_round,
+        resident_items: state.items.len(),
+        evicted_items: state.eviction_buffer.len(),
+        gc_evicted_total: state.gc_evicted_total,
+        gc_reactivated_total: state.gc_reactivated_total,
         ..ContextDiagnostics::default()
     };
 

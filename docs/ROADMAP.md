@@ -528,6 +528,44 @@ Acceptance:
 
 ---
 
+### V1-M6: Context GC v1 ✅ (implemented)
+
+The GC dimension is separated from the semantic state machine instead of
+being folded into `ContextState`:
+
+- `ContextResidency::Resident | Evicted` — where the item physically lives
+  (heap vs bounded eviction buffer), a new field on `ContextItem` together
+  with `gc_generation: u32` (full passes survived without being a root) and
+  `evicted_at_tick: Option<u64>` (stamp that keeps same-pass bounce-back
+  out of the reactivation scan);
+- `ContextEngine::gc()` — a full mark/sweep/reactivate pass with a default
+  no-op implementation, so baselines and the wire adapter keep working
+  unchanged; `AgentKernel::context_gc()` forwards it and the `RuntimeActor`
+  runs it at turn boundaries, emitting `RuntimeEvent::ContextGc`;
+- mark phase: roots = pins, active task/focus scope members, durable
+  session memory, hot-entity matches, bounded dependency reachability;
+- sweep: semantically Dropped items are evicted unconditionally (they no
+  longer linger in heap/checkpoint forever), unmarked live items climb
+  `gc_generation` and are evicted past `gc_max_generation` (3) or the
+  `turn_ttl_ticks * 4` age bound; Active items are never evicted — GC
+  compacts what the policy demoted, it does not fight it;
+- reversible eviction: a bounded buffer (`gc_buffer_capacity`, 256)
+  reactivates items whose entities are hot again, that are pinned again,
+  or whose score still clears the active threshold
+  (`gc_reactivate_per_pass`, 8); overflow purges the oldest, counted;
+- explainability: `ContextGcReport` carries per-item `ContextEviction` /
+  `ContextReactivation` records with human-readable reasons, and
+  `ContextDiagnostics` gained resident/evicted counts plus cumulative
+  gc counters; the replay harness drives `engine.gc()` for `ContextGc`
+  events in a trace.
+
+Acceptance: 5 new `gc::full` tests (dropped-item eviction with reason,
+root marking vs generational eviction, hot-again reactivation with reason,
+bounded buffer + purge, generational ladder to the cap); full workspace
+build/test/clippy/fmt green; A/B/C replay baseline unchanged.
+
+---
+
 ## V1-P0: structural fixes — the actor owns the runtime
 
 Follow-up review of V1-M3. Each item is a small milestone with its own

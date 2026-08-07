@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 const JOURNAL_BUFFER: usize = 4_096;
 
 enum JournalCommand {
-    Append(RuntimeEventEnvelope),
+    Append(Box<RuntimeEventEnvelope>),
     Flush(oneshot::Sender<AgentResult<()>>),
 }
 
@@ -70,7 +70,7 @@ impl FileEventJournal {
 impl EventJournal for FileEventJournal {
     async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
         self.tx
-            .send(JournalCommand::Append(envelope.clone()))
+            .send(JournalCommand::Append(Box::new(envelope.clone())))
             .await
             .map_err(|_| AgentError::Storage("event journal writer stopped".into()))
     }

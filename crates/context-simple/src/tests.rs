@@ -593,6 +593,9 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
             dependencies: vec![dep_id],
             tags: Vec::new(),
             source: None,
+            residency: agent_contracts::ContextResidency::Resident,
+            gc_generation: 0,
+            evicted_at_tick: None,
         };
         let dep = ContextItem {
             id: dep_id,
@@ -613,6 +616,9 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
             dependencies: Vec::new(),
             tags: Vec::new(),
             source: None,
+            residency: agent_contracts::ContextResidency::Resident,
+            gc_generation: 0,
+            evicted_at_tick: None,
         };
         state.items.push(hub);
         state.items.push(dep);
@@ -677,6 +683,9 @@ async fn dependency_expansion_can_be_disabled() {
             dependencies: vec![dep_id],
             tags: Vec::new(),
             source: None,
+            residency: agent_contracts::ContextResidency::Resident,
+            gc_generation: 0,
+            evicted_at_tick: None,
         };
         let dep = ContextItem {
             id: dep_id,
@@ -697,6 +706,9 @@ async fn dependency_expansion_can_be_disabled() {
             dependencies: Vec::new(),
             tags: Vec::new(),
             source: None,
+            residency: agent_contracts::ContextResidency::Resident,
+            gc_generation: 0,
+            evicted_at_tick: None,
         };
         state.items.push(hub);
         state.items.push(dep);
@@ -749,6 +761,9 @@ async fn archived_dependency_below_threshold_stays_out() {
             dependencies: vec![dep_id],
             tags: Vec::new(),
             source: None,
+            residency: agent_contracts::ContextResidency::Resident,
+            gc_generation: 0,
+            evicted_at_tick: None,
         };
         let dep = ContextItem {
             id: dep_id,
@@ -769,6 +784,9 @@ async fn archived_dependency_below_threshold_stays_out() {
             dependencies: Vec::new(),
             tags: Vec::new(),
             source: None,
+            residency: agent_contracts::ContextResidency::Resident,
+            gc_generation: 0,
+            evicted_at_tick: None,
         };
         state.items.push(hub);
         state.items.push(dep);
@@ -1316,6 +1334,9 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
             dependencies: Vec::new(),
             tags: Vec::new(),
             source: Some("pinned".into()),
+            residency: agent_contracts::ContextResidency::Resident,
+            gc_generation: 0,
+            evicted_at_tick: None,
         };
         let oversized_pin = ContextItem {
             id: ContextItemId::new(),
@@ -1336,6 +1357,9 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
             dependencies: Vec::new(),
             tags: Vec::new(),
             source: Some("pinned".into()),
+            residency: agent_contracts::ContextResidency::Resident,
+            gc_generation: 0,
+            evicted_at_tick: None,
         };
         state.items.push(small_pin);
         state.items.push(oversized_pin);

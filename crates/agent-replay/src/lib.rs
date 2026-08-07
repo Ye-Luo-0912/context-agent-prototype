@@ -90,6 +90,10 @@ pub struct ReplayOutcome {
     pub over_budget_snapshots: usize,
     /// Measurement: total lifecycle transitions emitted by maintenance.
     pub transitions_total: usize,
+    /// Measurement: total GC evictions / reactivations (reversible, so they
+    /// are part of the lifecycle story, not an error).
+    pub gc_evictions: usize,
+    pub gc_reactivations: usize,
 }
 
 /// Replay a slice of envelopes through the dynamic working-set engine.
@@ -121,6 +125,8 @@ pub async fn run_engine(
     let mut input_tokens_max = 0usize;
     let mut over_budget_snapshots = 0usize;
     let mut transitions_total = 0usize;
+    let mut gc_evictions = 0usize;
+    let mut gc_reactivations = 0usize;
 
     for envelope in events {
         events_consumed += 1;
@@ -213,6 +219,14 @@ pub async fn run_engine(
                         .push(current_turn);
                 }
             }
+            RuntimeEvent::ContextGc { .. } => {
+                // Replay the GC pass exactly like the runtime does at turn
+                // boundaries, and count what it evicted/reactivated so the
+                // report can explain the residency story.
+                let gc_report = engine.gc().await?;
+                gc_evictions += gc_report.evictions.len();
+                gc_reactivations += gc_report.reactivations.len();
+            }
             _ => {}
         }
     }
@@ -232,6 +246,8 @@ pub async fn run_engine(
         input_tokens_max,
         over_budget_snapshots,
         transitions_total,
+        gc_evictions,
+        gc_reactivations,
     })
 }
 
@@ -293,13 +309,17 @@ pub fn render_report(outcome: &ReplayOutcome) -> String {
     ));
     let diagnostics = &outcome.final_diagnostics;
     out.push_str(&format!(
-        "final context: total={} active={} cooling={} archived={} dropped={} active~{} tok\n\n",
+        "final context: total={} active={} cooling={} archived={} dropped={} active~{} tok | resident={} evicted={} gc(evict={} react={})\n\n",
         diagnostics.total_items,
         diagnostics.active_items,
         diagnostics.cooling_items,
         diagnostics.archived_items,
         diagnostics.dropped_items,
         diagnostics.approx_active_tokens,
+        diagnostics.resident_items,
+        diagnostics.evicted_items,
+        outcome.gc_evictions,
+        outcome.gc_reactivations,
     ));
 
     for item in &outcome.items {

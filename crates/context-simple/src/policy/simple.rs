@@ -146,6 +146,9 @@ mod tests {
             dependencies: Vec::new(),
             tags: Vec::new(),
             source: Some("tool:shell.exec".to_string()),
+            residency: agent_contracts::ContextResidency::Resident,
+            gc_generation: 0,
+            evicted_at_tick: None,
         }
     }
 

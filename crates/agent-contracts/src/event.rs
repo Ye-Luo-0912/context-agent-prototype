@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentResult, ContextDiagnostics, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextSelection, RunId, ToolCall, ToolOutput,
+    AgentResult, ContextDiagnostics, ContextGcReport, ContextMaintenanceReport,
+    ContextMaintenanceTrigger, ContextSelection, RunId, ToolCall, ToolOutput,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +36,12 @@ pub enum RuntimeEvent {
         #[serde(default)]
         trigger: ContextMaintenanceTrigger,
         report: ContextMaintenanceReport,
+    },
+    /// A full GC pass ran: roots were marked, unmarked items were evicted to
+    /// the reversible buffer and/or reactivated. The report explains every
+    /// eviction and reactivation.
+    ContextGc {
+        report: ContextGcReport,
     },
     ModelStarted,
     /// Live streamed text delta. Never journaled (the final `AssistantMessage`

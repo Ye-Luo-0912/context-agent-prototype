@@ -7,12 +7,12 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, ContextEngine, ContextIngress,
-    ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextQuery, ContextStateTransition, EventJournal, FocusState, MaterializedContext,
-    ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest, ModelTransport, RunId,
-    RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, TaskId, ToolCall, ToolDispatcher,
-    ToolExecutionRequest, ToolOutput, ToolSpec,
+    AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, ContextEngine, ContextGcReport,
+    ContextIngress, ContextItemSummary, ContextKind, ContextMaintenanceReport,
+    ContextMaintenanceTrigger, ContextQuery, ContextStateTransition, EventJournal, FocusState,
+    MaterializedContext, ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest,
+    ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, TaskId,
+    ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
 };
 use tokio::sync::broadcast;
 
@@ -149,6 +149,13 @@ impl AgentKernel {
         trigger: ContextMaintenanceTrigger,
     ) -> AgentResult<ContextMaintenanceReport> {
         self.context.maintain(trigger).await
+    }
+
+    /// Run a full GC pass (mark roots, sweep, reversible eviction). Called
+    /// by the actor at turn boundaries; engines without a GC pass return an
+    /// empty report.
+    pub async fn context_gc(&self) -> AgentResult<ContextGcReport> {
+        self.context.gc().await
     }
 
     /// Materialize the working set for one model request. The result is

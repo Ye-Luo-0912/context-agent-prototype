@@ -1,5 +1,6 @@
 use agent_contracts::{
-    ContextItem, ContextItemId, ContextKind, ContextRetention, ContextScope, ContextState,
+    ContextItem, ContextItemId, ContextKind, ContextResidency, ContextRetention, ContextScope,
+    ContextState,
 };
 
 use crate::engine::{SimpleContextConfig, State};
@@ -37,6 +38,9 @@ pub(crate) fn make_item(
         dependencies: Vec::new(),
         tags: Vec::new(),
         source,
+        residency: ContextResidency::Resident,
+        gc_generation: 0,
+        evicted_at_tick: None,
     }
 }
 

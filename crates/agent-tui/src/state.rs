@@ -138,6 +138,54 @@ impl AppState {
                 self.context = report.diagnostics;
                 self.record_transitions(report.transitions);
             }
+            RuntimeEvent::ContextGc { report } => {
+                let evicted_buffer = report.diagnostics.evicted_items;
+                self.context = report.diagnostics;
+                // Evictions and reactivations are lifecycle events worth
+                // showing in the panel: GC must be explainable.
+                for eviction in report.evictions {
+                    self.context_transitions.push(ContextStateTransition {
+                        item_id: eviction.item_id,
+                        kind: eviction.kind,
+                        scope: eviction.scope,
+                        from: agent_contracts::ContextState::Archived,
+                        to: agent_contracts::ContextState::Archived,
+                        turn: self.context.turn,
+                        reason: format!(
+                            "evicted (gen {}): {}",
+                            eviction.generation, eviction.reason
+                        ),
+                    });
+                }
+                for reactivation in report.reactivations {
+                    self.context_transitions.push(ContextStateTransition {
+                        item_id: reactivation.item_id,
+                        kind: reactivation.kind,
+                        scope: reactivation.scope,
+                        from: agent_contracts::ContextState::Archived,
+                        to: agent_contracts::ContextState::Active,
+                        turn: self.context.turn,
+                        reason: format!("reactivated: {}", reactivation.reason),
+                    });
+                }
+                let overflow = self
+                    .context_transitions
+                    .len()
+                    .saturating_sub(MAX_PANEL_TRANSITIONS);
+                if overflow > 0 {
+                    self.context_transitions.drain(..overflow);
+                }
+                if report.evicted > 0 || report.reactivated > 0 {
+                    self.push_system(format!(
+                        "context gc: marked {} roots, evicted {}, reactivated {} (resident {}, evicted buffer {})",
+                        report.marked_roots,
+                        report.evicted,
+                        report.reactivated,
+                        report.resident,
+                        evicted_buffer,
+                    ));
+                }
+            }
             RuntimeEvent::ModelStarted => {
                 self.busy = true;
                 self.streaming = false;

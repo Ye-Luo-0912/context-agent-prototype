@@ -1,8 +1,9 @@
 use agent_contracts::{
-    AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItem, ContextItemId,
-    ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextQuery, ContextRetention, ContextScope, ContextStateTransition, CoreLabel, FocusState,
-    Label, MaterializedContext, Scope, ScopeId, ScopeKind,
+    AgentResult, ContextDiagnostics, ContextEngine, ContextGcReport, ContextIngress, ContextItem,
+    ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
+    ContextMaintenanceTrigger, ContextQuery, ContextRetention, ContextScope,
+    ContextStateTransition, CoreLabel, FocusState, Label, MaterializedContext, Scope, ScopeId,
+    ScopeKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,7 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::checkpoint;
 use crate::diagnostics;
-use crate::gc::{minor, reachability};
+use crate::gc::{full, minor, reachability};
 use crate::heap;
 use crate::index::{dependency, entity};
 use crate::item;
@@ -34,6 +35,16 @@ pub struct SimpleContextConfig {
     /// Record explicit dependency edges between items sharing entities
     /// and expand the working set with dependencies of selected items.
     pub dependency_expansion: bool,
+    /// Run the full GC pass (mark roots, sweep, reversible eviction) when
+    /// `ContextEngine::gc` is invoked.
+    pub gc_enabled: bool,
+    /// Items surviving this many full passes without root reachability are
+    /// eviction candidates (the generational dimension of GC).
+    pub gc_max_generation: u32,
+    /// Cap on the reversible eviction buffer; overflow purges oldest.
+    pub gc_buffer_capacity: usize,
+    /// Max items reactivated per GC pass (newest first).
+    pub gc_reactivate_per_pass: usize,
 }
 
 impl Default for SimpleContextConfig {
@@ -47,6 +58,10 @@ impl Default for SimpleContextConfig {
             error_verification: true,
             entity_affinity: true,
             dependency_expansion: true,
+            gc_enabled: true,
+            gc_max_generation: 3,
+            gc_buffer_capacity: 256,
+            gc_reactivate_per_pass: 8,
         }
     }
 }
@@ -98,6 +113,17 @@ pub(crate) struct State {
     /// consumed); drained by maintenance so promotion/eviction is recorded.
     #[serde(default)]
     pub(crate) pending_closed_scopes: Vec<ScopeId>,
+    /// Items evicted by the full GC pass. Bounded by
+    /// `gc_buffer_capacity`; eviction is reversible — items re-enter the
+    /// heap when they become roots again. Overflow purges the oldest.
+    #[serde(default)]
+    pub(crate) eviction_buffer: Vec<ContextItem>,
+    /// Cumulative GC counters, so diagnostics explain a run's eviction and
+    /// reactivation behavior without replaying every report.
+    #[serde(default)]
+    pub(crate) gc_evicted_total: u64,
+    #[serde(default)]
+    pub(crate) gc_reactivated_total: u64,
 }
 
 pub struct SimpleContextEngine {
@@ -309,6 +335,13 @@ impl ContextEngine for SimpleContextEngine {
             now_tick,
             turn,
         ))
+    }
+
+    async fn gc(&self) -> AgentResult<ContextGcReport> {
+        let mut state = self.state.lock().await;
+        state.tick += 1;
+        let now_tick = state.tick;
+        Ok(full::run_full_gc(&mut state, &self.config, now_tick))
     }
 
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {

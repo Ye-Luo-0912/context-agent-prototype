@@ -346,6 +346,86 @@ Both features are configurable: `SimpleContextConfig { entity_affinity,
 dependency_expansion }` (default on);
 `SimpleContextConfig::baseline_v0()` turns all four P4 flags off.
 
+## 9d. V1-M6: full GC pass (residency / generation / semantic state)
+
+The per-event `maintain()` pass is the **semantic** machine: it decides
+Active/Cooling/Archived/Dropped and records every transition with a reason.
+The full GC pass (`ContextEngine::gc`, run by the runtime actor at turn
+boundaries) is the **physical** compactor. It keeps three dimensions
+separate instead of folding them into one state enum:
+
+```text
+semantic state  ContextState::Active/Cooling/Archived/Dropped
+                owned by the residency machine (maintain), not by GC
+residency       ContextResidency::Resident | Evicted
+                where the item physically lives (heap vs eviction buffer)
+generation      gc_generation: u32
+                full passes survived without being a root; roots reset to 0
+```
+
+### Mark phase (roots)
+
+Roots are the current attention and are never swept while alive:
+
+- pinned items (`Pinned` retention or scope);
+- every item of the active task/focus scope (the working set is protected);
+- durable session memory (task summaries promoted to the session scope);
+- items whose entity signature overlaps the hot set (last user message +
+  recent tool observations);
+- a bounded transitive slice of their dependency edges (`+8`), so a working
+  item keeps the items it depends on.
+
+### Sweep phase
+
+A **semantically Dropped item is evicted unconditionally** — the residency
+machine already decided it is gone, so GC physically removes it from the
+heap instead of letting it linger in checkpoints forever (a P2/perf issue).
+An unmarked live item survives with `gc_generation += 1`; when that counter
+clears `gc_max_generation` (default 3), or a non-durable item is older than
+`turn_ttl_ticks * 4`, it becomes an eviction candidate. Active items are
+never evicted: GC does not fight the policy — it compacts what the policy
+demoted.
+
+### Reversible eviction + reactivation
+
+Eviction is **reversible**. Evicted items move to a bounded buffer
+(`gc_buffer_capacity`, default 256) with `residency = Evicted` and an
+`evicted_at_tick` stamp. Every `gc()` pass then scans the buffer (newest
+first, `gc_reactivate_per_pass` max) and reactivates items that are relevant
+again:
+
+- pinned again;
+- entities hot again in the working set;
+- score still clears the active threshold.
+
+Reactivation restores the item to the heap as `Active` and resets its
+generation. Items evicted by the *current* pass are skipped, so nothing
+bounces out and back in one GC. Only a buffer overflow is irreversible, and
+it is bounded and counted (`purged`).
+
+### Explainability
+
+The `ContextGcReport` explains every decision:
+
+```text
+marked_roots / resident / evicted / reactivated / purged
+evictions:      "survived 3 GC passes without root reachability (max 3)"
+                "semantically dropped; evicted to reversible buffer (gen 1)"
+                "stale: age 21 > ttl x4 = 20; not reachable from roots"
+reactivations:  "entities are hot again in the working set"
+                "score 0.61 >= active threshold 0.58"
+diagnostics:    resident_items / evicted_items / gc_evicted_total /
+                gc_reactivated_total
+```
+
+The runtime emits a `ContextGc` event after `AfterModel` maintenance; the
+replay harness drives `engine.gc()` for every `ContextGc` event in a trace,
+so the residency story (entered/selected/cooled/evicted/reactivated) is
+replayable end to end. `SimpleContextConfig { gc_enabled, gc_max_generation,
+gc_buffer_capacity, gc_reactivate_per_pass }` (all on by default) tune the
+pass; `ContextEngine::gc` has a default no-op implementation, so baselines
+and the wire adapter keep working unchanged.
+
 ## 10. What should become durable later
 
 A later policy can promote only structured outcomes such as:
