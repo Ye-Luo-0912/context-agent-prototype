@@ -457,8 +457,19 @@ mod tests {
         let workspace = Workspace::open(dir.path()).await.unwrap();
         assert!(workspace.resolve_relative("../x").await.is_err());
         assert!(workspace.resolve_relative("a/../../x").await.is_err());
-        assert!(workspace.resolve_relative("C:\\x").await.is_err());
-        assert!(workspace.resolve_relative("\\x").await.is_err());
+        // "Absolute" is platform-defined: `C:\x` and `\x` are absolute on
+        // Windows but legal relative filenames on Unix, where `/x` is the
+        // absolute form.
+        #[cfg(windows)]
+        {
+            assert!(workspace.resolve_relative("C:\\x").await.is_err());
+            assert!(workspace.resolve_relative("\\x").await.is_err());
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(workspace.resolve_relative("/x").await.is_err());
+            assert!(workspace.resolve_relative("//x").await.is_err());
+        }
     }
 
     #[tokio::test]
@@ -466,7 +477,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let resolved = workspace.resolve_relative("src/lib.rs").await.unwrap();
-        assert_eq!(resolved, dir.path().join("src/lib.rs"));
+        // The workspace root is canonicalized on open; on Windows that
+        // expands 8.3 short names (e.g. RUNNER~1 -> runneradmin) that
+        // `tempdir().path()` still reports, so compare against the
+        // canonicalized root instead of the raw tempdir path.
+        let canonical_root = normalize_canonical(std::fs::canonicalize(dir.path()).unwrap());
+        assert_eq!(resolved, canonical_root.join("src/lib.rs"));
         let root = workspace.resolve_relative(".").await.unwrap();
         assert_eq!(root, workspace.root());
     }
