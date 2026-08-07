@@ -54,14 +54,32 @@ agent-contracts
   +-- agent-storage
   +-- agent-kernel
 
+agent-runtime -> agent-kernel + agent-workspace
 agent-tui -> composition of all implementations
 ```
+
+`agent-kernel` is the **stateless core facade** (contracts, budgets,
+approval, event publication, model/tool/context wiring through traits —
+no turn state). `agent-runtime` owns the turn state machine (`RuntimeActor`),
+the scope lifecycle, prompt assembly, capability registry and module host,
+and is the only orchestrator. Keep it that way: never add turn state back to
+the kernel, and never let a second orchestrator appear. The long-term
+direction is to fold the kernel's remaining responsibilities into
+`agent-runtime` and retire the kernel crate — but only by moving them, not
+by resurrecting a parallel orchestrator.
+
+The runtime stays implementation-agnostic: concrete context engines
+(`context-simple`, `context-baselines`) and tool dispatchers (`tool-runtime`)
+are wired by the composition root (`agent-tui`), never imported by
+`agent-runtime`.
 
 Forbidden examples:
 
 ```text
 agent-kernel -> context-simple       # forbidden
 agent-kernel -> agent-tui            # forbidden
+agent-runtime -> context-simple      # forbidden (concrete engine)
+agent-runtime -> tool-runtime        # forbidden (concrete dispatcher)
 tool-runtime -> context-simple       # forbidden
 tool-runtime -> ContextEngine        # forbidden
 context-simple -> tool-runtime       # forbidden
@@ -78,9 +96,15 @@ Every context policy change should eventually be explainable as:
 item entered because ...
 item selected because ...
 item cooled/archived/dropped because ...
-item reactivated because ...
+item evicted because ...          # GC pass: roots marked, why it left
+item reactivated because ...      # GC pass: why it came back
 model turn N consumed it
 ```
+
+Since V1-M6 the GC dimension is explicit: `ContextItem` carries
+`residency` (Resident/Evicted), `gc_generation` and an eviction stamp, and
+`ContextEngine::gc()` runs a mark/roots + sweep + reversible-eviction pass
+that reports a reason for every eviction and reactivation.
 
 Prefer explicit features before opaque learned scoring:
 
@@ -104,15 +128,32 @@ Prefer explicit features before opaque learned scoring:
 
 ## First implementation priorities
 
-See `docs/ROADMAP.md`. In order:
+See `docs/ROADMAP.md`. Current state at this head:
 
-1. compile/contract validation;
-2. per-item context lifecycle instrumentation + replay;
-3. one real streaming model provider;
-4. practical coding tools (search/patch/git/process streaming);
-5. A/B/C context-policy experiments;
-6. smarter non-vector lifecycle policy;
-7. ContextCore adapter.
+- done: P0 skeleton; P0.5 observability + deterministic replay; P1 real
+  streaming provider; P2 backlog (retry safety, cancellable backoff,
+  bounded provider errors, per-provider wire flags); V1-M3 runtime
+  framework; V1-M6 context GC v1; V1-P0..P8 (actor owns the turn,
+  prompt split, scope ownership, extension platform, workspace path
+  confinement, mutation transaction, model budget, shutdown ownership,
+  tool lifecycle, capability maturity ladder, capability manifest +
+  process transport hardening).
+
+Next, in order:
+
+1. V1-M9 Adaptive Runtime — context/tool meta-tools, GC hints/tags/leases,
+   manual collect. The LLM can tune the runtime, but cannot bypass the
+   kernel (permissions, budgets, approval stay kernel-owned).
+2. V2 Self-Iteration — capability generation → sandbox test → replay →
+   evaluate → register/rollback. The LLM grows capabilities instead of
+   editing production core.
+3. Evidence-gated (later, only after measurement): smarter non-vector
+   lifecycle policy, ContextCore adapter, vector recall / learned selection
+   / cross-session memory (invariant 8).
+
+Every architectural change must still be explainable as `entered because /
+selected because / cooled-archived-dropped because / evicted-reactivated
+because / model turn N consumed it`.
 
 ## Definition of done for architectural changes
 
