@@ -124,6 +124,8 @@ pub(crate) fn record_message(record: &Record) -> ModelMessage {
             role: ModelRole::Tool,
             content: format!("{}: {}", kind_label(record.kind), record.content),
             name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         },
     }
 }

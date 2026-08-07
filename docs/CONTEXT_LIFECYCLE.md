@@ -363,3 +363,28 @@ state — items, focus, tick/turn counters — to a separate JSON file under
 `.focus-agent/checkpoints/`, independent of the event journal. `restore`
 replaces engine state from such a file. This keeps durable runtime state
 separate from the append-only trace used for learning/replay.
+
+## 12. Turn Frame vs Context Frame (V1)
+
+Since V1-M1 the model input is assembled in five layers, and tool
+observations flow in two distinct phases:
+
+- **During a turn** tool results live in the runtime-owned `TurnFrame` (the
+  execution stack): they are rendered as protocol messages — an assistant
+  message carrying `tool_calls`, then a `tool` message paired by
+  `tool_call_id` — and they are never scored, garbage-collected or evicted.
+- **When the turn ends** (the model stops calling tools) the observations
+  are persisted as the long-term record: `ingest(ToolObservation)` for each
+  result, then one `maintain(AfterTool)` pass, then the final assistant
+  message and `maintain(AfterModel)`.
+
+Consequences:
+
+- no mid-turn duplication: the model sees each result once, in protocol
+  form, and the context frame does not re-render the same observation;
+- long-term memory still accumulates every observation (errors, verified
+  fixes, decisions) — as a batch at turn end, so the error/supersession
+  lifecycle observes the whole turn together;
+- `AfterTool` maintenance now runs once per turn (at persist time) instead
+  of once per tool call. The replay/A/B/C harnesses drive the engines
+  directly and are unaffected by the kernel's timing.

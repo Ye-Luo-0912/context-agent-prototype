@@ -56,8 +56,8 @@ async fn main() -> anyhow::Result<()> {
     let journal = FileEventJournal::open(workspace.state_dir().join("traces")).await?;
 
     // The context engine is a composition-root choice: the same kernel, tools
-    // and UI run against any `ContextEngine` implementation (P3 A/B/C, and
-    // the P5 process-boundary adapter).
+    // and UI run against any `ContextEngine` implementation (the A/B/C baselines, and
+    // the process-boundary adapter).
     let context_engine: Arc<dyn ContextEngine> = match context_policy.as_str() {
         "append" => Arc::new(AppendOnlyEngine::new()),
         "rolling" => Arc::new(RollingSummaryEngine::with_config(RollingConfig::default())),

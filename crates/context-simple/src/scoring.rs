@@ -64,7 +64,7 @@ pub(crate) fn score_item_with_breakdown(
         same_task = item.task_id == Some(focus.task_id);
     }
 
-    // P4: how much of this item's entity signature is hot right now. 0 when
+    // How much of this item's entity signature is hot right now. 0 when
     // the item (or the hot set) has no entities. This complements focus_match:
     // focus entities come from the user message, hot_entities additionally
     // covers files/symbols the agent actually touched via tools.

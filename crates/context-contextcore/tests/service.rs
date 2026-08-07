@@ -3,7 +3,7 @@
 //! Cargo sets `CARGO_BIN_EXE_agent-context-service` for integration tests, so
 //! these tests spawn the real service process and drive the full
 //! `ContextEngine` contract across the process boundary — including plugging
-//! the adapter into a real `AgentKernel` (the P5 acceptance criterion: a
+//! the adapter into a real `AgentKernel` (the acceptance criterion: a
 //! composition-root change, nothing else).
 
 use std::sync::Arc;

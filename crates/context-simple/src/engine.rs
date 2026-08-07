@@ -12,11 +12,11 @@ use tokio::sync::Mutex;
 
 use crate::scoring::{extract_entities, score_item_with_breakdown};
 
-/// P4: per-item cap on explicit dependency edges recorded at ingest.
+/// Per-item cap on explicit dependency edges recorded at ingest.
 const MAX_DEPENDENCY_EDGES: usize = 8;
-/// P4: per-snapshot cap on items pulled in by dependency expansion.
+/// Per-snapshot cap on items pulled in by dependency expansion.
 const MAX_EXPANSION_ITEMS: usize = 8;
-/// P4: token reserve carved out of the model budget so dependency expansion
+/// Token reserve carved out of the model budget so dependency expansion
 /// can follow selected items without blowing the budget.
 const EXPANSION_RESERVE_TOKENS: usize = 1024;
 /// Cap for the hot-entity set, matching `extract_entities`'s per-text cap.
@@ -28,15 +28,15 @@ pub struct SimpleContextConfig {
     pub archive_threshold: f32,
     pub turn_ttl_ticks: u64,
     pub max_item_chars: usize,
-    /// P4: detect superseding decisions and archive the superseded ones.
+    /// Detect superseding decisions and archive the superseded ones.
     pub supersession: bool,
-    /// P4: error -> fix -> verified lifecycle (errors persist until a
+    /// Error -> fix -> verified lifecycle (errors persist until a
     /// successful result on the same entities verifies the fix).
     pub error_verification: bool,
-    /// P4: reward items whose entity signature is hot (last user message +
+    /// Reward items whose entity signature is hot (last user message +
     /// recent tool observations).
     pub entity_affinity: bool,
-    /// P4: record explicit dependency edges between items sharing entities
+    /// Record explicit dependency edges between items sharing entities
     /// and expand the working set with dependencies of selected items.
     pub dependency_expansion: bool,
 }
@@ -57,7 +57,7 @@ impl Default for SimpleContextConfig {
 }
 
 impl SimpleContextConfig {
-    /// The P3-era policy: no supersession, no error verification, no entity
+    /// The baseline policy: no supersession, no error verification, no entity
     /// affinity, no dependency graph. Kept for A/B/C comparison so the P4
     /// delta is measurable.
     pub fn baseline_v0() -> Self {
@@ -86,7 +86,7 @@ struct State {
     /// (item_id, reason) queued by ingest for verified-fixed errors.
     #[serde(default)]
     pending_verifications: Vec<(ContextItemId, String)>,
-    /// P4: entities named by the last user message or touched by recent tool
+    /// Entities named by the last user message or touched by recent tool
     /// observations. Reset on user message / focus change, extended by tools.
     #[serde(default)]
     hot_entities: Vec<String>,
@@ -533,7 +533,7 @@ impl ContextEngine for SimpleContextEngine {
             }
         }
 
-        // P4: supersession and verification intents recorded by ingest become
+        // Supersession and verification intents recorded by ingest become
         // observable state changes here, with explainable reasons.
         let supersessions = std::mem::take(&mut state.pending_supersessions);
         for (item_id, reason) in supersessions {
@@ -725,7 +725,7 @@ impl ContextEngine for SimpleContextEngine {
                 item.state != ContextState::Dropped
                     && !(item.kind == ContextKind::UserMessage
                         && item.content == request.current_input)
-                    // P4: superseded decisions and verified-fixed errors never
+                    // Superseded decisions and verified-fixed errors never
                     // re-enter a model request, whatever their score.
                     && !item
                         .tags
@@ -748,7 +748,7 @@ impl ContextEngine for SimpleContextEngine {
                 .as_ref()
                 .map(|f| approx_tokens(&f.goal) + approx_tokens(&f.current_query))
                 .unwrap_or_default();
-        // P4: a small slice of the budget is reserved for dependency expansion
+        // A small slice of the budget is reserved for dependency expansion
         // so traceability items can follow the working set without letting the
         // snapshot exceed the budget.
         let total_budget = request.budget_tokens.saturating_sub(fixed_tokens);
@@ -779,7 +779,7 @@ impl ContextEngine for SimpleContextEngine {
             });
         }
 
-        // P4: explicit dependency expansion — pull in dependencies of selected
+        // Explicit dependency expansion — pull in dependencies of selected
         // items (skip Dropped and superseded/verified-fixed; Archived items
         // only when they still clear the active threshold), best dependencies
         // first, bounded per snapshot, spending only the reserved slice.

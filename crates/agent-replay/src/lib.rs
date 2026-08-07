@@ -11,7 +11,7 @@
 //! - every state transition, with the maintenance turn and reason;
 //! - the final state.
 //!
-//! The same machinery powers the P3 A/B/C comparison: `scenarios` synthesizes
+//! The same machinery powers the A/B/C comparison: `scenarios` synthesizes
 //! deterministic task traces and `compare_scenario` runs each trace through
 //! the append-only, rolling-summary and dynamic-working-set engines to
 //! measure input-token cost, over-budget turns and context churn.
@@ -67,7 +67,7 @@ pub struct ReplayedItem {
     pub source: Option<String>,
     pub created_turn: u64,
     pub access_count: u32,
-    /// P4: ids of prior items this item explicitly depends on (shared entities).
+    /// Ids of prior items this item explicitly depends on (shared entities).
     pub dependencies: Vec<ContextItemId>,
     pub consumed_turns: Vec<u64>,
     pub transitions: Vec<ReplayedTransition>,
@@ -81,13 +81,13 @@ pub struct ReplayOutcome {
     pub tool_rounds: u64,
     pub snapshot_builds: usize,
     pub final_diagnostics: ContextDiagnostics,
-    /// P3 measurement: total input tokens across all snapshot builds.
+    /// Measurement: total input tokens across all snapshot builds.
     pub input_tokens_total: usize,
-    /// P3 measurement: largest single snapshot (worst single model request).
+    /// Measurement: largest single snapshot (worst single model request).
     pub input_tokens_max: usize,
-    /// P3 measurement: snapshots that exceeded the configured budget.
+    /// Measurement: snapshots that exceeded the configured budget.
     pub over_budget_snapshots: usize,
-    /// P3 measurement: total lifecycle transitions emitted by maintenance.
+    /// Measurement: total lifecycle transitions emitted by maintenance.
     pub transitions_total: usize,
 }
 
@@ -103,7 +103,7 @@ pub async fn replay_events(
 
 /// Replay a slice of envelopes through any `ContextEngine` implementation and
 /// collect lifecycle + token-cost measurements. Used by both single-engine
-/// replay and the P3 A/B/C comparison.
+/// replay and the A/B/C comparison.
 pub async fn run_engine(
     engine: Arc<dyn ContextEngine>,
     events: &[RuntimeEventEnvelope],
@@ -853,7 +853,7 @@ mod tests {
             ContextState::Dropped,
             "successful observation should stay ephemeral"
         );
-        // P4 dependency graph: the successful observation shares the
+        // Dependency graph: the successful observation shares the
         // AuthService.rs entity with the earlier error, so it must depend on it.
         assert!(
             ok_item.dependencies.contains(&tool_item.id),

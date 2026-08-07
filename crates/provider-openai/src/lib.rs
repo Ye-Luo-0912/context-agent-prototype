@@ -165,7 +165,32 @@ fn build_wire_request(request: &ModelRequest, config: &OpenAiConfig) -> Value {
                 "role": role_name(message.role),
                 "content": message.content,
             });
-            if let Some(name) = &message.name {
+            if message.role == ModelRole::Assistant && !message.tool_calls.is_empty() {
+                // OpenAI serializes arguments as a JSON string inside tool_calls.
+                wire["tool_calls"] = json!(
+                    message
+                        .tool_calls
+                        .iter()
+                        .map(|call| {
+                            json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": call.name,
+                                    "arguments": call.arguments.to_string(),
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                );
+            }
+            if message.role == ModelRole::Tool {
+                // Tool results pair via tool_call_id; name is not part of the
+                // OpenAI tool-message shape.
+                if let Some(call_id) = &message.tool_call_id {
+                    wire["tool_call_id"] = json!(call_id);
+                }
+            } else if let Some(name) = &message.name {
                 wire["name"] = json!(name);
             }
             wire
@@ -226,6 +251,12 @@ mod tests {
             messages: vec![
                 ModelMessage::system("be focused"),
                 ModelMessage::user("list files"),
+                ModelMessage::assistant_tool_calls(vec![agent_contracts::ToolCall {
+                    id: "call-1".into(),
+                    name: "fs.list".into(),
+                    arguments: json!({"path": ""}),
+                }]),
+                ModelMessage::tool_result("call-1", "fs.list", "a, b, c"),
             ],
             tools: vec![ToolSpec {
                 name: "fs.list".into(),
@@ -250,5 +281,22 @@ mod tests {
         assert_eq!(wire["messages"][1]["role"], "user");
         assert_eq!(wire["tools"][0]["function"]["name"], "fs.list");
         assert_eq!(wire["max_tokens"], 2048);
+
+        // Assistant tool calls serialize as function calls with string args.
+        let assistant = &wire["messages"][2];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["tool_calls"][0]["id"], "call-1");
+        assert_eq!(assistant["tool_calls"][0]["type"], "function");
+        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "fs.list");
+        assert_eq!(
+            assistant["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"\"}"
+        );
+
+        // Tool results pair via tool_call_id, not name.
+        let tool = &wire["messages"][3];
+        assert_eq!(tool["role"], "tool");
+        assert_eq!(tool["tool_call_id"], "call-1");
+        assert!(tool.get("name").is_none());
     }
 }

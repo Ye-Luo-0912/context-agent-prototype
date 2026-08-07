@@ -9,9 +9,10 @@ use std::{
 use agent_contracts::{
     AgentError, AgentResult, ApprovalDecision, ApprovalGate, CancellationToken,
     ContextBuildRequest, ContextEngine, ContextIngress, ContextItemSummary, ContextKind,
-    ContextMaintenanceTrigger, EventJournal, FocusState, ModelChunk, ModelEventSink, ModelRequest,
-    ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, ToolCall, ToolDispatcher,
-    ToolExecutionRequest, ToolOutput,
+    ContextMaintenanceTrigger, ContextSnapshot, EventJournal, FocusState, ModelChunk,
+    ModelEventSink, ModelInput, ModelMessage, ModelRequest, ModelRole, ModelTransport, RunId,
+    RuntimeEvent, RuntimeEventEnvelope, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutput,
+    TurnFrame, TurnFrameStep,
 };
 use serde_json::json;
 use tokio::sync::{Mutex, broadcast};
@@ -150,6 +151,11 @@ impl AgentKernel {
     }
 
     async fn run_turn(&self, content: &str, cancel: &CancellationToken) -> AgentResult<()> {
+        // The execution stack of this turn: user message, assistant tool
+        // calls, tool results, in order. Runtime-owned, kept verbatim, never
+        // scored or evicted while the turn is open.
+        let mut turn = TurnFrame::new(content.to_string());
+
         for round in 0..=self.config.max_tool_rounds {
             if cancel.is_cancelled() {
                 self.emit(RuntimeEvent::Warning {
@@ -202,12 +208,13 @@ impl AgentKernel {
                 seq: self.seq.clone(),
                 run_id: self.run_id,
             };
+            let input = self.build_model_input(&snapshot, content, &turn);
             let output = match self
                 .model
                 .complete_stream(
                     ModelRequest {
-                        messages: snapshot.messages,
-                        tools: self.tools.specs(),
+                        messages: input.into_messages(),
+                        tools: input.tool_schemas.clone(),
                         metadata: json!({
                             "run_id": self.run_id.to_string(),
                             "context_selected": snapshot.selected.len(),
@@ -234,6 +241,9 @@ impl AgentKernel {
             };
 
             if output.tool_calls.is_empty() {
+                // The model finished. The turn's tool observations now become
+                // the long-term record, then the final assistant message.
+                self.persist_turn_observations(&turn).await?;
                 self.context
                     .ingest(ContextIngress::AssistantMessage {
                         content: output.content.clone(),
@@ -256,29 +266,78 @@ impl AgentKernel {
                 return Ok(());
             }
 
+            turn.push_tool_calls(output.tool_calls.clone());
             for call in output.tool_calls {
                 let tool_output = self.execute_tool(call, cancel).await;
                 self.emit(RuntimeEvent::ToolFinished {
                     output: tool_output.clone(),
                 })
                 .await?;
-                self.context
-                    .ingest(ContextIngress::ToolObservation {
-                        output: tool_output,
-                    })
-                    .await?;
-                let report = self
-                    .context
-                    .maintain(ContextMaintenanceTrigger::AfterTool)
-                    .await?;
-                self.emit(RuntimeEvent::ContextMaintained {
-                    trigger: ContextMaintenanceTrigger::AfterTool,
-                    report,
-                })
-                .await?;
+                turn.push_tool_result(tool_output);
             }
         }
 
+        Ok(())
+    }
+
+    /// Assemble the five-layer model input. The context engine owns the
+    /// long-term working set; the runtime owns the turn stack. The snapshot's
+    /// first system message is the standing policy and its trailing user
+    /// message is the current turn's user message — both move to their own
+    /// layers so the context frame carries only working-set content.
+    fn build_model_input(
+        &self,
+        snapshot: &ContextSnapshot,
+        current_input: &str,
+        turn: &TurnFrame,
+    ) -> ModelInput {
+        let mut context_frame = Vec::new();
+        for (index, message) in snapshot.messages.iter().enumerate() {
+            let is_policy = index == 0
+                && message.role == ModelRole::System
+                && message.content == self.config.system_prompt;
+            let is_current_user = index + 1 == snapshot.messages.len()
+                && message.role == ModelRole::User
+                && message.content == current_input;
+            if !is_policy && !is_current_user {
+                context_frame.push(message.clone());
+            }
+        }
+        ModelInput {
+            system_policy: vec![ModelMessage::system(self.config.system_prompt.clone())],
+            focus_frame: None,
+            context_frame,
+            turn_frame: turn.clone(),
+            tool_schemas: self.tools.specs(),
+        }
+    }
+
+    /// When the turn ends, its tool observations become the long-term record:
+    /// ingest them as tool observations, then run maintenance once so the
+    /// error and supersession lifecycles observe the whole turn at once.
+    async fn persist_turn_observations(&self, turn: &TurnFrame) -> AgentResult<()> {
+        let mut ingested = false;
+        for step in &turn.steps {
+            if let TurnFrameStep::ToolResult { output } = step {
+                self.context
+                    .ingest(ContextIngress::ToolObservation {
+                        output: output.clone(),
+                    })
+                    .await?;
+                ingested = true;
+            }
+        }
+        if ingested {
+            let report = self
+                .context
+                .maintain(ContextMaintenanceTrigger::AfterTool)
+                .await?;
+            self.emit(RuntimeEvent::ContextMaintained {
+                trigger: ContextMaintenanceTrigger::AfterTool,
+                report,
+            })
+            .await?;
+        }
         Ok(())
     }
 

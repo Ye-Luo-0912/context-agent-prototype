@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{AgentResult, CancellationToken, ToolCall, ToolSpec};
+use crate::{AgentResult, CancellationToken, ToolCall, ToolOutput, ToolSpec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelRole {
@@ -18,6 +18,13 @@ pub struct ModelMessage {
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Assistant tool calls attached to this message (role == Assistant).
+    /// Part of the runtime turn frame, never part of the long-term working set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// Which assistant tool call this result answers (role == Tool).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ModelMessage {
@@ -26,6 +33,8 @@ impl ModelMessage {
             role: ModelRole::System,
             content: content.into(),
             name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -34,6 +43,8 @@ impl ModelMessage {
             role: ModelRole::User,
             content: content.into(),
             name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -42,6 +53,19 @@ impl ModelMessage {
             role: ModelRole::Assistant,
             content: content.into(),
             name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// Assistant message that carries one or more tool calls (empty content).
+    pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: ModelRole::Assistant,
+            content: String::new(),
+            name: None,
+            tool_calls: calls,
+            tool_call_id: None,
         }
     }
 
@@ -50,7 +74,129 @@ impl ModelMessage {
             role: ModelRole::Tool,
             content: content.into(),
             name: Some(name.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
+    }
+
+    /// Tool result paired with the assistant call it answers.
+    pub fn tool_result(
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: ModelRole::Tool,
+            content: content.into(),
+            name: Some(name.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(call_id.into()),
+        }
+    }
+}
+
+/// One ordered step of the current turn's execution stack: either the
+/// assistant's tool calls or the result that answers them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TurnFrameStep {
+    AssistantToolCalls { calls: Vec<ToolCall> },
+    ToolResult { output: ToolOutput },
+}
+
+/// The runtime-owned execution stack of one turn: the current user message
+/// followed by every assistant tool call / tool result in order.
+///
+/// This is not long-term memory. It is held by the runtime and never scored,
+/// garbage-collected or evicted while the turn is open; when the turn ends it
+/// is dropped, and the observations it carried are persisted to the context
+/// engine as the long-term record of the turn.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TurnFrame {
+    pub user_message: String,
+    pub steps: Vec<TurnFrameStep>,
+}
+
+impl TurnFrame {
+    pub fn new(user_message: impl Into<String>) -> Self {
+        Self {
+            user_message: user_message.into(),
+            steps: Vec::new(),
+        }
+    }
+
+    pub fn push_tool_calls(&mut self, calls: Vec<ToolCall>) {
+        if !calls.is_empty() {
+            self.steps.push(TurnFrameStep::AssistantToolCalls { calls });
+        }
+    }
+
+    pub fn push_tool_result(&mut self, output: ToolOutput) {
+        self.steps.push(TurnFrameStep::ToolResult { output });
+    }
+
+    pub fn has_tool_steps(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| matches!(step, TurnFrameStep::AssistantToolCalls { .. }))
+    }
+
+    /// Render the stack as protocol messages: the user message first, then
+    /// assistant(tool_calls) / tool(tool_call_id) pairs in execution order.
+    pub fn messages(&self) -> Vec<ModelMessage> {
+        let mut messages = vec![ModelMessage::user(self.user_message.clone())];
+        for step in &self.steps {
+            match step {
+                TurnFrameStep::AssistantToolCalls { calls } => {
+                    messages.push(ModelMessage::assistant_tool_calls(calls.clone()));
+                }
+                TurnFrameStep::ToolResult { output } => {
+                    messages.push(ModelMessage::tool_result(
+                        &output.call_id,
+                        &output.tool_name,
+                        &output.model_content,
+                    ));
+                }
+            }
+        }
+        messages
+    }
+}
+
+/// The five-layer model input assembled by the runtime for one model request:
+///
+/// ```text
+/// System Policy        - standing instructions for every request
+/// Focus Frame          - the current task/goal (structured in a later phase)
+/// Context Frame        - the long-term working set, from ContextEngine::build_snapshot
+/// Turn Frame           - the current turn's execution stack, owned by the runtime
+/// Active Tool Schemas  - tool definitions for this request (ModelRequest.tools)
+/// ```
+///
+/// Layers are kept separate so the context engine never has to understand the
+/// execution protocol, and the runtime never has to score long-term memory.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelInput {
+    pub system_policy: Vec<ModelMessage>,
+    pub focus_frame: Option<String>,
+    pub context_frame: Vec<ModelMessage>,
+    pub turn_frame: TurnFrame,
+    pub tool_schemas: Vec<ToolSpec>,
+}
+
+impl ModelInput {
+    /// Flatten the layers into the wire message sequence. Order matters for
+    /// OpenAI-style protocols: policy and context first, then the turn stack
+    /// (user -> assistant tool calls -> tool results), so the model sees the
+    /// current execution state as the most recent protocol messages.
+    pub fn into_messages(&self) -> Vec<ModelMessage> {
+        let mut messages = Vec::new();
+        messages.extend(self.system_policy.iter().cloned());
+        if let Some(focus) = &self.focus_frame {
+            messages.push(ModelMessage::system(focus));
+        }
+        messages.extend(self.context_frame.iter().cloned());
+        messages.extend(self.turn_frame.messages());
+        messages
     }
 }
 
@@ -148,5 +294,102 @@ pub trait ModelTransport: Send + Sync {
         }
         sink.on_chunk(ModelChunk::Done).await?;
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "fs.read".into(),
+            arguments: json!({"path": "src/main.rs"}),
+        }
+    }
+
+    #[test]
+    fn turn_frame_renders_protocol_order() {
+        let mut turn = TurnFrame::new("list the files");
+        turn.push_tool_calls(vec![tool_call("call-1")]);
+        turn.push_tool_result(ToolOutput {
+            call_id: "call-1".into(),
+            tool_name: "fs.read".into(),
+            ok: true,
+            summary: "read".into(),
+            model_content: "fn main() {}".into(),
+            artifact_ref: None,
+            metadata: json!({}),
+        });
+
+        let messages = turn.messages();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, ModelRole::User);
+        assert_eq!(messages[0].content, "list the files");
+
+        assert_eq!(messages[1].role, ModelRole::Assistant);
+        assert!(messages[1].content.is_empty());
+        assert_eq!(messages[1].tool_calls.len(), 1);
+        assert_eq!(messages[1].tool_calls[0].id, "call-1");
+
+        assert_eq!(messages[2].role, ModelRole::Tool);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(messages[2].content, "fn main() {}");
+    }
+
+    #[test]
+    fn model_input_flattens_five_layers_in_order() {
+        let mut turn = TurnFrame::new("continue");
+        turn.push_tool_calls(vec![tool_call("c2")]);
+        turn.push_tool_result(ToolOutput {
+            call_id: "c2".into(),
+            tool_name: "fs.read".into(),
+            ok: true,
+            summary: "read".into(),
+            model_content: "content".into(),
+            artifact_ref: None,
+            metadata: json!({}),
+        });
+        let input = ModelInput {
+            system_policy: vec![ModelMessage::system("policy")],
+            focus_frame: Some("goal text".into()),
+            context_frame: vec![ModelMessage::system("SELECTED WORKING CONTEXT")],
+            turn_frame: turn,
+            tool_schemas: Vec::new(),
+        };
+
+        let messages = input.into_messages();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| (m.role, m.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ModelRole::System, "policy"),
+                (ModelRole::System, "goal text"),
+                (ModelRole::System, "SELECTED WORKING CONTEXT"),
+                (ModelRole::User, "continue"),
+                (ModelRole::Assistant, ""),
+                (ModelRole::Tool, "content"),
+            ]
+        );
+    }
+
+    #[test]
+    fn message_serde_roundtrips_and_old_format_parses() {
+        let message = ModelMessage::tool_result("call-9", "fs.read", "ok");
+        let json = serde_json::to_string(&message).unwrap();
+        let parsed: ModelMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tool_call_id.as_deref(), Some("call-9"));
+
+        // A message serialized before tool frames existed still parses.
+        // ModelRole derives PascalCase wire names (e.g. "User", not "user").
+        let old = r#"{"role":"User","content":"hello"}"#;
+        let parsed: ModelMessage = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.role, ModelRole::User);
+        assert!(parsed.tool_calls.is_empty());
+        assert!(parsed.tool_call_id.is_none());
     }
 }

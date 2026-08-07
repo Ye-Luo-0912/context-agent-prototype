@@ -197,52 +197,59 @@ User input
 maintain(BeforeModel)
    │
    v
-build_snapshot()
-   │
-   ├─ system constraints
-   ├─ current FocusState
-   ├─ selected Working Set
-   └─ current user input
+build_snapshot()               ── the Context Frame (long-term working set)
    │
    v
-ModelTransport.complete()
+ModelInput = System Policy + Focus Frame + Context Frame + Turn Frame + Tool Schemas
    │
-   ├─ final answer ───────────────┐
-   │                              │
-   └─ tool calls                  │
-       │                          │
-       ├─ approval                │
-       ├─ ToolDispatcher.execute  │
-       ├─ artifact raw output     │
-       ├─ bounded ToolOutput      │
-       ├─ ContextEngine.ingest    │
-       └─ maintain(AfterTool)     │
-             │                    │
-             └──── next model ────┘
+   v
+ModelTransport.complete_stream()
+   │
+   ├─ final answer ──────────────────────┐
+   │                                     │
+   └─ tool calls                         │
+       │                                 │
+       ├─ approval                       │
+       ├─ ToolDispatcher.execute         │
+       ├─ artifact raw output            │
+       ├─ bounded ToolOutput ──▶ Turn Frame (execution stack, runtime-owned)
+       └─ not ingested during the turn   │
+             │                           │
+             └──── next model ───────────┘
 
 Final answer
+   ├─ persist turn: ingest(ToolObservation) x N + maintain(AfterTool)
    ├─ ingest(AssistantMessage)
    ├─ maintain(AfterModel)
    └─ TurnCompleted
 ```
 
+The tool result loop is the runtime's execution stack, not long-term memory:
+results ride in the `TurnFrame` and never touch the context engine until the
+turn ends, when they are persisted as observations and observed by one
+`maintain(AfterTool)` pass.
+
 ## 6. Context is rebuilt, not replayed
 
-The model-facing request is intentionally rebuilt from state instead of replaying an append-only transcript.
+The model-facing request is intentionally rebuilt from state instead of
+replaying an append-only transcript. The input is assembled in five layers:
 
 ```text
-System policy
-+
-Current FocusState
-+
-Selected Working Set
-+
-Current user input
+System Policy    - standing instructions (kernel-owned)
+Focus Frame      - the current task/goal (structured in a later phase)
+Context Frame    - the selected working set from ContextEngine::build_snapshot
+Turn Frame       - the current turn's execution stack (runtime-owned)
+Active Tool Schemas - tool definitions for this request
 ```
 
-This is the main architectural experiment.
+The split is deliberate. The context engine owns the long-term working set
+and knows nothing about the execution protocol; the runtime owns the turn
+stack and never scores or evicts it while the turn is open. This keeps the
+context engine from growing into a module that simultaneously does memory,
+execution protocol, prompt formatting and provider continuation.
 
-A `ContextSnapshot` is a disposable projection. It is not the source of truth and should never be persisted as the memory model.
+A `ContextSnapshot` is a disposable projection of the Context Frame. It is
+not the source of truth and should never be persisted as the memory model.
 
 ## 7. Tool output policy
 

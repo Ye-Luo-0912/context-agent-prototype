@@ -399,6 +399,84 @@ no ContextCore vocabulary leaks through the Agent API.
 
 ---
 
+## V1 — Turn Runtime and typed runtime framework
+
+### Goal
+
+Split the three responsibilities the prototype currently mixes: the execution
+protocol (runtime-owned turn stack), the long-term working set (context
+engine), and the composition of modules (a runtime framework). This follows
+the review that identified: model input is rebuilt from a `ContextSnapshot`,
+but nothing distinguishes the current turn's tool protocol from long-term
+memory; the context engine has grown too dense; the kernel orchestrates via
+`Mutex`es while the TUI spawns tasks that mutate shared state.
+
+### V1-M1: Turn Runtime ✅ (implemented)
+
+The model input is now assembled in five layers:
+
+```text
+System Policy    - standing instructions (kernel-owned)
+Focus Frame      - the current task/goal (structured in a later phase)
+Context Frame    - the selected working set from ContextEngine::build_snapshot
+Turn Frame       - the current turn's execution stack (runtime-owned)
+Active Tool Schemas - tool definitions for this request
+```
+
+Implemented:
+
+- `ModelMessage` gained `tool_calls` (assistant) and `tool_call_id` (tool
+  result pairing), so a turn renders as standard protocol messages instead of
+  text inside a system block;
+- `TurnFrame` — the runtime-owned execution stack (user message, assistant
+  tool calls, tool results, in order). It is never scored, garbage-collected
+  or evicted while the turn is open; it is dropped when the turn ends;
+- `ModelInput::into_messages()` flattens the five layers in protocol order
+  (policy, focus, context, then user -> assistant tool calls -> tool results);
+- the kernel turn loop keeps the `TurnFrame` and no longer ingests tool
+  results during the turn. When the model finishes, the turn's observations
+  are persisted at once (`ingest(ToolObservation)` x N + one
+  `maintain(AfterTool)`), then the final assistant message;
+- the OpenAI-compatible provider serializes assistant tool calls and
+  `tool_call_id`-paired tool results on the wire.
+
+Acceptance:
+
+- during a turn, the model sees tool results as protocol-paired messages
+  (`tool_call_id` matches the assistant call), and the context engine sees no
+  observation until the turn ends — covered by
+  `agent-kernel/tests/turn_frame.rs` and the contract/provider tests;
+- replay and the A/B/C comparison are unaffected (they drive the engines
+  directly, not the kernel);
+- `ContextEngine` contract unchanged: all four implementations, the process
+  boundary, the TUI and the replay harness still build.
+
+### V1-M2: Context runtime modules + Scope (next)
+
+- refactor `context-simple` into one crate with modules (`heap`, `item`,
+  `scope`, `residency`, `index/`, `policy/`, `gc/`, `materializer`,
+  `context_map`, `checkpoint`, `diagnostics`) — mechanism and policy
+  separated without splitting into dozens of crates;
+- add the `Scope` entity (`Session` / `Task` / `Focus` / `Tool`, states
+  Open / Active / Suspended / Closed) as the first-class unit of residency;
+  scope close promotes (decision, finding, constraint, open loop, artifact
+  ref, evidence ref) and evicts the rest.
+
+### V1-M3: Runtime framework (after M2)
+
+- `RuntimeHandle` -> `mpsc<RuntimeCommand>` -> `RuntimeActor` owning the
+  mutable `RunState`; long-running model/tool work returns
+  `OperationResult` tagged with run/task/turn/scope/operation ids and a
+  generation, so stale results from an old focus are dropped instead of
+  racing into the new one;
+- `ModuleHost` with a uniform lifecycle (register, dependency validation,
+  startup, shutdown, capability publication, service lookup) over typed
+  contracts — `ContextService`, `ModelProvider`, `ToolProvider`,
+  `ArtifactStore`, `EventStore`, `ApprovalPolicy`, `CapabilityProvider` —
+  not a universal `handle_event`.
+
+---
+
 ## Later, only after evidence
 
 - vector recall;

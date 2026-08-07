@@ -1,5 +1,5 @@
 use agent_contracts::{
-    AgentResult, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, ToolCall,
+    AgentResult, ModelCapabilities, ModelOutput, ModelRequest, ModelRole, ModelTransport, ToolCall,
 };
 use serde_json::json;
 
@@ -20,15 +20,17 @@ impl ModelTransport for MockModelTransport {
             .messages
             .iter()
             .rev()
-            .find(|message| message.role == agent_contracts::ModelRole::User)
+            .find(|message| message.role == ModelRole::User)
             .map(|message| message.content.as_str())
             .unwrap_or("");
-        let has_tool_observation = request
+        // A tool result is present when the runtime turn frame carried one
+        // (role == Tool), regardless of how the context engine rendered it.
+        let has_tool_result = request
             .messages
             .iter()
-            .any(|message| message.content.contains("ToolObservation"));
+            .any(|message| message.role == ModelRole::Tool);
 
-        if current.trim().eq_ignore_ascii_case("demo: list files") && !has_tool_observation {
+        if current.trim().eq_ignore_ascii_case("demo: list files") && !has_tool_result {
             return Ok(ModelOutput {
                 content: String::new(),
                 tool_calls: vec![ToolCall {

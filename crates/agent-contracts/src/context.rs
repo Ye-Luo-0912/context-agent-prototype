@@ -145,7 +145,7 @@ pub struct ScoreBreakdown {
     pub access: f32,
     pub scope_bonus: f32,
     pub retention_bonus: f32,
-    /// P4: reward for an item whose entities are hot in the current working
+    /// Reward for an item whose entities are hot in the current working
     /// set (user message + recent tool observations).
     #[serde(default)]
     pub entity_affinity: f32,
@@ -223,7 +223,7 @@ pub struct ContextItemSummary {
     pub created_turn: u64,
     pub last_access_turn: u64,
     pub access_count: u32,
-    /// P4: ids of prior items this item explicitly depends on (shared entities).
+    /// Ids of prior items this item explicitly depends on (shared entities).
     #[serde(default)]
     pub dependencies: Vec<ContextItemId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

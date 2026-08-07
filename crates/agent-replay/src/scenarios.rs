@@ -2,7 +2,7 @@
 //!
 //! Each scenario is a deterministic scripted `RuntimeEventEnvelope` sequence
 //! mirroring the kernel's event pattern (user message -> maintain -> model
-//! rounds with tool results -> assistant reply -> maintain). The P3 harness
+//! rounds with tool results -> assistant reply -> maintain). The replay harness
 //! replays every scenario through the three context engines and compares
 //! token cost, over-budget turns and lifecycle churn.
 
@@ -25,7 +25,7 @@ pub struct Scenario {
     pub events: Vec<RuntimeEventEnvelope>,
 }
 
-/// The seven P3 test scenarios from the roadmap.
+/// The seven comparison scenarios.
 pub fn all_scenarios() -> Vec<Scenario> {
     vec![
         long_refactor(),
@@ -590,9 +590,9 @@ mod tests {
 
     #[tokio::test]
     async fn supersession_reduces_cost_on_superseded_decisions() {
-        // P3 measured a regression on this scenario (C cost more than A/B
+        // The experiments measured a regression on this scenario (C cost more than A/B
         // because superseded decisions were re-ingested as fresh items).
-        // P4 supersession must fix that.
+        // Supersession must fix that.
         let config = compare_config();
         let scenario = all_scenarios()
             .into_iter()
