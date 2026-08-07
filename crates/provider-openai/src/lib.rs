@@ -37,6 +37,26 @@ pub struct OpenAiConfig {
     pub model: String,
     pub max_output_tokens: usize,
     pub timeout: Duration,
+    /// Send `stream_options: { "include_usage": true }`. Some compatible
+    /// providers reject the field; turn it off per provider.
+    pub send_stream_options: bool,
+    /// Send `max_tokens`. Some compatible providers reject it for certain
+    /// models (reasoning models may want `max_completion_tokens` instead).
+    pub send_max_tokens: bool,
+}
+
+/// Cap on the provider error body carried in the error string, so a huge
+/// HTML error page cannot blow up the failure message.
+const MAX_ERROR_BODY_CHARS: usize = 512;
+
+fn truncate_error_body(body: &str) -> String {
+    let trimmed = body.trim();
+    let total = trimmed.chars().count();
+    if total <= MAX_ERROR_BODY_CHARS {
+        return trimmed.to_string();
+    }
+    let head: String = trimmed.chars().take(MAX_ERROR_BODY_CHARS).collect();
+    format!("{head}... ({total} chars total)")
 }
 
 pub struct OpenAiProvider {
@@ -99,7 +119,7 @@ impl ModelTransport for OpenAiProvider {
             let retryable = status.is_server_error() || code == 429;
             return Err(AgentError::Transport {
                 retryable,
-                message: format!("HTTP {code}: {body}"),
+                message: format!("HTTP {code}: {}", truncate_error_body(&body)),
             });
         }
 
@@ -213,14 +233,21 @@ fn build_wire_request(request: &ModelRequest, config: &OpenAiConfig) -> Value {
         })
         .collect();
 
-    json!({
+    let mut wire = json!({
         "model": config.model,
         "messages": messages,
         "tools": tools,
         "stream": true,
-        "stream_options": { "include_usage": true },
-        "max_tokens": config.max_output_tokens,
-    })
+    });
+    // Per-provider wire negotiation: not every OpenAI-compatible endpoint
+    // accepts stream_options or max_tokens, so both are configurable.
+    if config.send_stream_options {
+        wire["stream_options"] = json!({ "include_usage": true });
+    }
+    if config.send_max_tokens {
+        wire["max_tokens"] = json!(config.max_output_tokens);
+    }
+    wire
 }
 
 fn role_name(role: ModelRole) -> &'static str {
@@ -274,10 +301,13 @@ mod tests {
             model: "deepseek-chat".into(),
             max_output_tokens: 2048,
             timeout: Duration::from_secs(30),
+            send_stream_options: true,
+            send_max_tokens: true,
         };
         let wire = build_wire_request(&request, &config);
         assert_eq!(wire["model"], "deepseek-chat");
         assert_eq!(wire["stream"], true);
+        assert_eq!(wire["stream_options"]["include_usage"], true);
         assert_eq!(wire["messages"][0]["role"], "system");
         assert_eq!(wire["messages"][1]["role"], "user");
         assert_eq!(wire["tools"][0]["function"]["name"], "fs.list");
@@ -299,5 +329,48 @@ mod tests {
         assert_eq!(tool["role"], "tool");
         assert_eq!(tool["tool_call_id"], "call-1");
         assert!(tool.get("name").is_none());
+    }
+
+    #[test]
+    fn wire_negotiation_drops_provider_rejected_fields() {
+        let request = ModelRequest {
+            messages: vec![ModelMessage::user("hi")],
+            tools: Vec::new(),
+            metadata: json!({}),
+            cancel: CancellationToken::new(),
+        };
+        let config = OpenAiConfig {
+            api_key: "secret".into(),
+            base_url: "https://example.com/v1".into(),
+            model: "strict-model".into(),
+            max_output_tokens: 2048,
+            timeout: Duration::from_secs(30),
+            send_stream_options: false,
+            send_max_tokens: false,
+        };
+        let wire = build_wire_request(&request, &config);
+        assert!(
+            wire.get("stream_options").is_none(),
+            "a provider that rejects stream_options must not receive it"
+        );
+        assert!(
+            wire.get("max_tokens").is_none(),
+            "a provider that rejects max_tokens must not receive it"
+        );
+        assert_eq!(wire["stream"], true);
+    }
+
+    #[test]
+    fn error_body_is_bounded() {
+        let huge = "x".repeat(10_000);
+        let bounded = truncate_error_body(&huge);
+        assert!(
+            bounded.chars().count() < 600,
+            "must truncate, got {}",
+            bounded.len()
+        );
+        assert!(bounded.contains("(10000 chars total)"));
+        let small = "boom";
+        assert_eq!(truncate_error_body(small), "boom");
     }
 }

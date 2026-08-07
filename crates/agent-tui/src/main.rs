@@ -382,6 +382,8 @@ fn build_model() -> Arc<dyn ModelTransport> {
         model,
         max_output_tokens: 4096,
         timeout: Duration::from_secs(120),
+        send_stream_options: true,
+        send_max_tokens: true,
     });
     Arc::new(RetryingTransport::new(
         provider,

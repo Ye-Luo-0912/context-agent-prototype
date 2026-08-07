@@ -871,16 +871,24 @@ ladder) is future work on top of this.
   bound (`max_frame_bytes`) so a wedged or broken service cannot hang a
   turn or grow the adapter's memory.
 
-## P2 backlog: provider/tool secondary issues (recorded, not scheduled)
+## P2: provider/tool secondary issues ✅ (implemented)
 
-- `RetryingTransport::complete_stream` retries into the same sink: if a
-  stream fails after emitting deltas, the retry can duplicate them. Needs
-  a replay-safe sink or a "no deltas emitted yet" retry guard.
-- The retry `sleep(backoff)` does not select on the cancellation token.
-- The provider stuffs HTTP error bodies into the error string.
-- The OpenAI-compatible interface always sends
-  `stream_options`/`include_usage`/`max_tokens`; per-provider
-  capability/config negotiation should eventually decide these.
+- **Stream retry can no longer duplicate output.** `RetryingTransport`
+  tracks whether anything reached the sink: a stream that failed *after*
+  emitting deltas surfaces the error instead of retrying into the same
+  sink (the live listener has no rewind); a failure before any delta is
+  still retried. Covered by sink-recording tests.
+- **Retry backoff is cancellation-aware.** Both `complete` and
+  `complete_stream` select the backoff sleep against the request's
+  cancellation token, so a cancelled request aborts immediately instead
+  of sleeping out the wait.
+- **Provider error bodies are bounded.** HTTP error bodies are truncated
+  to a fixed cap in the error string, so a huge HTML error page cannot
+  blow up the failure message.
+- **OpenAI-compatible wire fields are per-provider configurable.**
+  `OpenAiConfig::send_stream_options` and `send_max_tokens` control
+  whether `stream_options`/`include_usage` and `max_tokens` are sent, so
+  compatible providers that reject the fields work without code changes.
 
 ---
 
