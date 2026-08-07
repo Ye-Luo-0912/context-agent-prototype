@@ -72,6 +72,17 @@ async fn full_contract_round_trip_across_the_process_boundary() {
     let items: Vec<ContextItemSummary> = engine.inspect(100).await.unwrap();
     assert_eq!(items.len(), 2);
 
+    // Scope lifecycle crosses the wire: open a tool scope, close it.
+    let scope_id = engine
+        .open_scope(agent_contracts::ScopeKind::Tool, None)
+        .await
+        .unwrap();
+    let transitions = engine.close_scope(scope_id).await.unwrap();
+    assert!(
+        transitions.is_empty(),
+        "tool scope close produces no evictions"
+    );
+
     // Checkpoint/restore round-trip across the boundary.
     let checkpoint = engine.checkpoint().await.unwrap();
     let adapter2 = ContextServiceAdapter::connect(&ContextServiceConfig {
