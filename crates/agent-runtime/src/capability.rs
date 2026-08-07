@@ -57,17 +57,17 @@ impl CapabilityRegistry {
                 manifest.id
             )));
         }
-        for dependency in &manifest.dependencies {
-            if !inner.contains_key(dependency) {
+        for requirement in &manifest.requires {
+            if !inner.contains_key(requirement) {
                 return Err(AgentError::InvalidRequest(format!(
-                    "capability '{}' depends on '{}' which is not registered",
-                    manifest.id, dependency
+                    "capability '{}' requires '{}' which is not registered",
+                    manifest.id, requirement
                 )));
             }
         }
         // The maturity ladder is climbed, not declared: out-of-process
         // (external/LLM-authored) capabilities always start Experimental.
-        let status = if manifest.transport != CapabilityTransport::InProcess
+        let status = if manifest.transport != CapabilityTransport::Builtin
             && manifest.status != CapabilityStatus::Experimental
         {
             CapabilityStatus::Experimental

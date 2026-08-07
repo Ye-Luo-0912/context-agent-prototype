@@ -11,11 +11,18 @@ use agent_contracts::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Wire protocol version. Both sides echo it; a mismatch fails the handshake
+/// so a newer or older service is never misparsed.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// A single request. `id` is echoed by the response for correlation and
 /// debugging; the current adapter is strictly ping-pong (one in flight).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceRequest {
     pub id: u64,
+    /// Client protocol version, checked by the service.
+    #[serde(default)]
+    pub version: u32,
     #[serde(flatten)]
     pub op: ServiceOp,
 }
@@ -59,6 +66,10 @@ pub enum ServiceOp {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceResponse {
     pub id: u64,
+    /// Service protocol version, echoed on every response so the client can
+    /// detect a mismatch from the very first frame.
+    #[serde(default)]
+    pub version: u32,
     #[serde(default)]
     pub ok: bool,
     #[serde(default)]
@@ -71,6 +82,7 @@ impl ServiceResponse {
     pub fn ok(id: u64, value: Value) -> Self {
         Self {
             id,
+            version: PROTOCOL_VERSION,
             ok: true,
             value,
             error: None,
@@ -80,6 +92,7 @@ impl ServiceResponse {
     pub fn error(id: u64, error: impl Into<String>) -> Self {
         Self {
             id,
+            version: PROTOCOL_VERSION,
             ok: false,
             value: Value::Null,
             error: Some(error.into()),
@@ -96,6 +109,7 @@ mod tests {
     fn request_response_round_trip() {
         let request = ServiceRequest {
             id: 7,
+            version: PROTOCOL_VERSION,
             op: ServiceOp::Ingest {
                 ingress: ContextIngress::Pin {
                     content: "never touch generated files".into(),
@@ -105,6 +119,7 @@ mod tests {
         };
         let line = serde_json::to_string(&request).unwrap();
         let decoded: ServiceRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
         match decoded.op {
             ServiceOp::Ingest {
                 ingress: ContextIngress::Pin { content, kind },
@@ -120,6 +135,7 @@ mod tests {
         let decoded: ServiceResponse = serde_json::from_str(&line).unwrap();
         assert!(decoded.ok);
         assert_eq!(decoded.id, 7);
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
 
         let error = ServiceResponse::error(8, "boom");
         let decoded: ServiceResponse =
@@ -129,9 +145,21 @@ mod tests {
     }
 
     #[test]
+    fn version_mismatch_is_observable_on_the_wire() {
+        // A response from a future service carries a different version; the
+        // adapter rejects it instead of misparsing the payload.
+        let mut response = ServiceResponse::ok(1, serde_json::Value::Null);
+        response.version = PROTOCOL_VERSION + 1;
+        let decoded: ServiceResponse =
+            serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+        assert_ne!(decoded.version, PROTOCOL_VERSION);
+    }
+
+    #[test]
     fn op_tag_is_snake_case_on_the_wire() {
         let request = ServiceRequest {
             id: 1,
+            version: PROTOCOL_VERSION,
             op: ServiceOp::Materialize {
                 query: ContextQuery {
                     current_input: "i".into(),

@@ -281,10 +281,11 @@ impl DemoCapability {
                 name: "demo".into(),
                 summary: "demo capability".into(),
                 status: CapabilityStatus::Experimental,
+                provides: vec![agent_contracts::CapabilityKind::Tool],
                 permissions: vec!["workspace:read".into()],
-                dependencies: Vec::new(),
+                requires: Vec::new(),
                 lifecycle,
-                transport: CapabilityTransport::InProcess,
+                transport: CapabilityTransport::Builtin,
             },
             started,
         }
@@ -292,7 +293,7 @@ impl DemoCapability {
 
     fn with_dependency(id: &str, dependency: &str) -> Self {
         let mut capability = Self::new(id, CapabilityLifecycle::Eager, Arc::new(Mutex::new(false)));
-        capability.manifest.dependencies.push(dependency.into());
+        capability.manifest.requires.push(dependency.into());
         capability
     }
 
@@ -428,10 +429,10 @@ async fn capability_dependencies_are_validated() {
     let orphan = DemoCapability::with_dependency("orphan", "missing-capability");
     let error = host
         .register_capability(Arc::new(orphan))
-        .expect_err("a capability with an unmet dependency must be rejected");
+        .expect_err("a capability with an unmet requirement must be rejected");
     assert!(
-        error.to_string().contains("depends on"),
-        "the error must name the missing dependency: {error}"
+        error.to_string().contains("requires"),
+        "the error must name the missing requirement: {error}"
     );
 
     // Duplicate ids are rejected too.
@@ -497,7 +498,7 @@ async fn trusted_builtin_capabilities_keep_their_declared_status() {
     registry
         .register(Arc::new(DemoCapability::declared_stable(
             "trusted-core",
-            CapabilityTransport::InProcess,
+            CapabilityTransport::Builtin,
         )))
         .unwrap();
     assert_eq!(

@@ -30,7 +30,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::wire::{ServiceOp, ServiceRequest, ServiceResponse};
+use crate::wire::{PROTOCOL_VERSION, ServiceOp, ServiceRequest, ServiceResponse};
 
 /// Which engine the spawned service should run. The adapter is agnostic; the
 /// choice belongs to the composition root (same as `--context=` in the TUI).
@@ -60,6 +60,12 @@ pub struct ContextServiceConfig {
     pub program: Option<String>,
     pub engine: ServiceEngine,
     pub startup_timeout: Duration,
+    /// Deadline for every request after the handshake, so a wedged service
+    /// cannot hang a turn.
+    pub request_timeout: Duration,
+    /// Hard cap on one response frame, so a broken service cannot grow the
+    /// adapter's memory without bound.
+    pub max_frame_bytes: usize,
 }
 
 impl Default for ContextServiceConfig {
@@ -68,6 +74,8 @@ impl Default for ContextServiceConfig {
             program: None,
             engine: ServiceEngine::Dynamic,
             startup_timeout: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(30),
+            max_frame_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -101,6 +109,7 @@ impl ContextServiceConfig {
 /// A `ContextEngine` whose state lives in a separate process.
 pub struct ContextServiceAdapter {
     child: Child,
+    config: ContextServiceConfig,
     /// Strict ping-pong: one request in flight at a time. Held in a `Mutex`
     /// because the `ContextEngine` trait only gives `&self`.
     io: Mutex<AdapterIo>,
@@ -141,6 +150,7 @@ impl ContextServiceAdapter {
 
         let adapter = Self {
             child,
+            config: config.clone(),
             io: Mutex::new(AdapterIo {
                 stdin,
                 stdout: BufReader::new(stdout),
@@ -158,9 +168,21 @@ impl ContextServiceAdapter {
     }
 
     async fn call(&self, op: ServiceOp) -> AgentResult<Value> {
+        // Every request after the handshake has its own deadline, so a
+        // wedged service surfaces as an error instead of hanging the turn.
+        timeout(self.config.request_timeout, self.call_unbounded(op))
+            .await
+            .map_err(|_| AgentError::Context("context service request timed out".into()))?
+    }
+
+    async fn call_unbounded(&self, op: ServiceOp) -> AgentResult<Value> {
         let mut io = self.io.lock().await;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let request = ServiceRequest { id, op };
+        let request = ServiceRequest {
+            id,
+            version: PROTOCOL_VERSION,
+            op,
+        };
         let line = serde_json::to_string(&request)
             .map_err(|e| AgentError::Context(format!("serialize request: {e}")))?;
 
@@ -171,10 +193,12 @@ impl ContextServiceAdapter {
         io.stdin.write_all(b"\n").await.map_err(service_io_error)?;
         io.stdin.flush().await.map_err(service_io_error)?;
 
-        let mut line = String::new();
+        // Frame-bounded read: a broken service cannot grow the adapter's
+        // memory without bound.
+        let mut frame: Vec<u8> = Vec::with_capacity(256);
         let read = io
             .stdout
-            .read_line(&mut line)
+            .read_until(b'\n', &mut frame)
             .await
             .map_err(service_io_error)?;
         if read == 0 {
@@ -182,6 +206,15 @@ impl ContextServiceAdapter {
                 "context service closed its stdout (did it crash?)".into(),
             ));
         }
+        if frame.len() > self.config.max_frame_bytes {
+            return Err(AgentError::Context(format!(
+                "context service response frame of {} bytes exceeds the {} byte limit",
+                frame.len(),
+                self.config.max_frame_bytes
+            )));
+        }
+        let line = String::from_utf8(frame)
+            .map_err(|e| AgentError::Context(format!("service response is not UTF-8: {e}")))?;
         let response: ServiceResponse = serde_json::from_str(&line).map_err(|e| {
             AgentError::Context(format!("parse service response: {e} (line: {line})"))
         })?;
@@ -189,6 +222,12 @@ impl ContextServiceAdapter {
             return Err(AgentError::Context(format!(
                 "service response id mismatch: got {}, expected {id}",
                 response.id
+            )));
+        }
+        if response.version != PROTOCOL_VERSION {
+            return Err(AgentError::Context(format!(
+                "context service protocol version mismatch: service {}, client {PROTOCOL_VERSION}",
+                response.version
             )));
         }
         if !response.ok {

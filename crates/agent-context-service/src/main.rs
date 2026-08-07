@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use agent_contracts::{AgentError, ContextEngine};
 use context_baselines::{AppendOnlyEngine, RollingSummaryEngine};
-use context_contextcore::{ServiceOp, ServiceRequest, ServiceResponse};
+use context_contextcore::{PROTOCOL_VERSION, ServiceOp, ServiceRequest, ServiceResponse};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -117,6 +117,21 @@ async fn main() {
             }
         };
         let id = request.id;
+        if request.version != PROTOCOL_VERSION {
+            let response = ServiceResponse::error(
+                id,
+                format!(
+                    "protocol version mismatch: client {}, service {PROTOCOL_VERSION}",
+                    request.version
+                ),
+            );
+            let _ = writer
+                .write_all(serde_json::to_string(&response).unwrap().as_bytes())
+                .await;
+            let _ = writer.write_all(b"\n").await;
+            let _ = writer.flush().await;
+            continue;
+        }
         let shutdown = matches!(request.op, ServiceOp::Shutdown);
         let result = handle(request.op, engine).await;
         let response = match result {

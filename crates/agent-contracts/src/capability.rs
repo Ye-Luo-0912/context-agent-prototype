@@ -56,21 +56,43 @@ impl CapabilityStatus {
     }
 }
 
+/// What a capability provides to the platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityKind {
+    /// A callable tool the model can invoke.
+    Tool,
+    /// A multi-step, parameterized procedure built from tools.
+    Skill,
+    /// A background/typed service the runtime talks to.
+    Service,
+}
+
 /// How a capability's service is reached.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CapabilityTransport {
-    InProcess,
-    /// A separate process (reserved: the prototype resolves InProcess only).
-    Process {
-        program: String,
-    },
+    /// In-process trusted core. The first version keeps the trusted core
+    /// in-process and never loads Rust plugins: the ABI is not a stable
+    /// plugin boundary, and a crashed plugin must not take the runtime down.
+    #[serde(alias = "InProcess", alias = "in_process")]
+    Builtin,
+    /// A separate process speaking a framed protocol (the context-service
+    /// shape: versioned handshake, per-request deadlines, frame bounds).
+    /// The preferred plane for LLM/third-party extensions, with sandboxing
+    /// as a later concern.
+    #[serde(alias = "Process")]
+    Process { program: String },
+    // Future: Wasm — sandboxed in-process plugins. Deliberately not part of
+    // the first version.
 }
 
 /// The declarative part of a dynamic capability: stable identity, a human
-/// summary, declared permissions and dependencies, and its lifecycle and
-/// transport shape. The host validates dependencies at registration and
-/// treats permissions as declarations — the tools the capability advertises
-/// carry `ToolRisk` levels that the approval gate enforces.
+/// summary, what it provides and requires, declared permissions, and its
+/// lifecycle and transport shape. The host validates `requires` at
+/// registration and treats permissions as declarations — the tools the
+/// capability advertises carry `ToolRisk` levels that the approval gate
+/// enforces.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityManifest {
     pub id: String,
@@ -81,13 +103,17 @@ pub struct CapabilityManifest {
     /// are pinned to Experimental by the registry, whatever is declared here.
     #[serde(default)]
     pub status: CapabilityStatus,
+    /// What this capability provides to the platform.
+    #[serde(default)]
+    pub provides: Vec<CapabilityKind>,
     /// Declared permissions, e.g. "workspace:read", "process:run".
     #[serde(default)]
     pub permissions: Vec<String>,
-    /// Capability ids this one depends on; the host rejects registration
-    /// when a dependency is missing.
-    #[serde(default)]
-    pub dependencies: Vec<String>,
+    /// Capability ids this one requires; the host rejects registration when
+    /// a requirement is missing. The old field name `dependencies` still
+    /// deserializes for compatibility.
+    #[serde(default, alias = "dependencies")]
+    pub requires: Vec<String>,
     pub lifecycle: CapabilityLifecycle,
     pub transport: CapabilityTransport,
 }
