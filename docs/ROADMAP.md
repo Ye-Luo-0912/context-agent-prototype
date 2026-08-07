@@ -649,13 +649,44 @@ Acceptance:
   archived through the task close) and that a consumed tool scope returns
   the active pointer to its parent.
 
-### V1-P0-4: the module host becomes an extension platform (next)
+### V1-P0-4: the module host becomes an extension platform ✅ (implemented)
 
-- `ServiceRegistry` registration becomes public so external crates can
-  publish capabilities; core services stay typed;
-- a dynamic capability plane (manifest: id/version/name/summary/
-  permissions/dependencies/lifecycle/transport) so the LLM can register
-  new capabilities at runtime against a stable core ABI.
+Two extension planes, one stable core ABI:
+
+- **Trusted core services stay typed.** `ServiceRegistry::register` and
+  `get` are public, so modules from external crates can publish and
+  retrieve typed capabilities — the core ids (`context-service`,
+  `model-provider`, `tool-provider`, `approval-policy`, `event-store`,
+  `artifact-store`) are no longer the only things that can live in the
+  registry;
+- **Dynamic capability platform.** `agent-contracts` defines
+  `CapabilityManifest { id, version, name, summary, permissions,
+  dependencies, lifecycle, transport }` and the `Capability` trait. The
+  chain is `Service -> Capability -> Tool Schema -> LLM`: a registered
+  capability advertises tool schemas that join the runtime's tool
+  provider, and model calls route back to `invoke`:
+  - `CapabilityRegistry` (shared, runtime-mutable) accepts registrations
+    before start *and* mid-run — an LLM (or any external actor) can
+    publish new capabilities while the runtime is running;
+  - `CapabilityAwareDispatcher` merges the built-in tools with the
+    capabilities' tools, so the kernel keeps talking to one
+    `ToolDispatcher`;
+  - lifecycle is honored (`Eager` starts with the host, `Lazy` starts on
+    first invocation); declared dependencies are validated at
+    registration; permissions stay declarative — the advertised tools
+    carry `ToolRisk` levels the approval gate enforces;
+  - process transport is declared in the manifest but not yet resolved
+    (the prototype implements `InProcess`).
+- the TUI composition root wires the tool provider through the
+  `CapabilityAwareDispatcher`, so a capability registered at runtime is
+  callable by the model on the next request.
+
+Acceptance:
+
+- workspace tests green, including: an external-crate-shaped module
+  publishing a typed service through the public path; a capability whose
+  tool reaches the tool provider and routes calls; mid-run registration
+  with lazy start-on-first-use; dependency and duplicate-id validation.
 
 ---
 

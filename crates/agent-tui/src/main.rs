@@ -14,8 +14,8 @@ use agent_kernel::{
     AgentKernel, AgentKernelConfig, ApprovalBroker, InteractiveApprovalGate, PolicyApprovalGate,
 };
 use agent_runtime::{
-    ApprovalModule, ArtifactModule, ContextModule, EventModule, ModelModule, ModuleHost,
-    RuntimeHandle, ToolModule, spawn_runtime,
+    ApprovalModule, ArtifactModule, CapabilityAwareDispatcher, ContextModule, EventModule,
+    ModelModule, ModuleHost, RuntimeHandle, ToolModule, spawn_runtime,
 };
 use agent_storage::FileEventJournal;
 use agent_workspace::Workspace;
@@ -77,7 +77,6 @@ async fn main() -> anyhow::Result<()> {
             "unknown --context policy: {other} (expected append | rolling | dynamic | service)"
         ),
     };
-    let tool_dispatcher = Arc::new(BuiltinToolDispatcher::new(workspace.clone()));
     let model: Arc<dyn ModelTransport> = build_model();
     let (approval, interactive) = if read_only {
         (
@@ -101,7 +100,15 @@ async fn main() -> anyhow::Result<()> {
     let mut host = ModuleHost::new();
     host.add_module(Arc::new(ContextModule::new(context_engine)))?;
     host.add_module(Arc::new(ModelModule::new(model)))?;
-    host.add_module(Arc::new(ToolModule::new(tool_dispatcher)))?;
+    // The tool provider merges the built-in tools with dynamic capabilities:
+    // capabilities registered against the shared registry (even mid-run) are
+    // exposed to the model on the next request.
+    let capability_registry = host.capability_registry();
+    let dispatcher = Arc::new(CapabilityAwareDispatcher::new(
+        Arc::new(BuiltinToolDispatcher::new(workspace.clone())),
+        capability_registry,
+    ));
+    host.add_module(Arc::new(ToolModule::new(dispatcher)))?;
     host.add_module(Arc::new(ApprovalModule::new(approval.clone())))?;
     host.add_module(Arc::new(EventModule::new(journal.clone())))?;
     host.add_module(Arc::new(ArtifactModule::new(Arc::new(workspace.clone()))))?;

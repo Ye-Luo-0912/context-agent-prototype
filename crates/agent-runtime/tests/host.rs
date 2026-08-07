@@ -4,15 +4,18 @@
 use std::sync::{Arc, Mutex};
 
 use agent_contracts::{
-    AgentResult, ApprovalGate, ContextDiagnostics, ContextEngine, ContextIngress,
+    AgentResult, ApprovalGate, CancellationToken, Capability, CapabilityLifecycle,
+    CapabilityManifest, CapabilityTransport, ContextDiagnostics, ContextEngine, ContextIngress,
     ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
     ContextStateTransition, MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest,
-    ModelTransport, ScopeId, ScopeKind, ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
+    ModelTransport, RunId, ScopeId, ScopeKind, ToolCall, ToolDispatcher, ToolExecutionRequest,
+    ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_runtime::{
-    APPROVAL_POLICY, CapabilityId, ContextModule, ModelModule, Module, ModuleHost, ServiceRegistry,
-    ToolModule,
+    APPROVAL_POLICY, CapabilityAwareDispatcher, CapabilityId, ContextModule, ModelModule, Module,
+    ModuleHost, ServiceRegistry, ToolModule,
 };
+use serde_json::json;
 
 #[derive(Debug)]
 struct StubContextEngine;
@@ -210,6 +213,228 @@ async fn host_starts_in_order_and_stops_in_reverse() {
             "stop:context".to_string(),
         ]
     );
+}
+
+/// A capability id an external crate could publish, beyond the core set.
+const CUSTOM_SERVICE: CapabilityId = CapabilityId("custom-service");
+
+/// A typed service defined outside the core module set.
+#[derive(Debug)]
+struct CustomService;
+
+/// A module written like an external crate: it publishes a typed service
+/// through the public `ServiceRegistry::register` path.
+struct ExternalModule {
+    service: Arc<CustomService>,
+}
+
+#[async_trait::async_trait]
+impl Module for ExternalModule {
+    fn name(&self) -> &'static str {
+        "external"
+    }
+    fn capabilities(&self) -> Vec<CapabilityId> {
+        vec![CUSTOM_SERVICE]
+    }
+    fn register(&self, registry: &mut ServiceRegistry) -> AgentResult<()> {
+        registry.register(CUSTOM_SERVICE, self.name(), self.service.clone())
+    }
+}
+
+#[tokio::test]
+async fn external_modules_publish_typed_services_publicly() {
+    let mut host = ModuleHost::new();
+    host.add_module(Arc::new(ExternalModule {
+        service: Arc::new(CustomService),
+    }))
+    .unwrap();
+    host.start().await.unwrap();
+
+    // Any consumer can retrieve the typed service through the public get.
+    let service: Arc<CustomService> = host
+        .registry()
+        .get(CUSTOM_SERVICE, "custom service")
+        .unwrap();
+    let _ = service;
+    assert!(
+        host.registry()
+            .get::<CustomService>(CUSTOM_SERVICE, "custom service")
+            .is_ok()
+    );
+
+    host.stop().await.unwrap();
+}
+
+/// A demo dynamic capability: one read-only tool, echo-style invoke, and a
+/// shared started flag so tests can observe the lifecycle.
+struct DemoCapability {
+    manifest: CapabilityManifest,
+    started: Arc<Mutex<bool>>,
+}
+
+impl DemoCapability {
+    fn new(id: &str, lifecycle: CapabilityLifecycle, started: Arc<Mutex<bool>>) -> Self {
+        Self {
+            manifest: CapabilityManifest {
+                id: id.into(),
+                version: "1.0.0".into(),
+                name: "demo".into(),
+                summary: "demo capability".into(),
+                permissions: vec!["workspace:read".into()],
+                dependencies: Vec::new(),
+                lifecycle,
+                transport: CapabilityTransport::InProcess,
+            },
+            started,
+        }
+    }
+
+    fn with_dependency(id: &str, dependency: &str) -> Self {
+        let mut capability = Self::new(id, CapabilityLifecycle::Eager, Arc::new(Mutex::new(false)));
+        capability.manifest.dependencies.push(dependency.into());
+        capability
+    }
+}
+
+#[async_trait::async_trait]
+impl Capability for DemoCapability {
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+    fn tool_specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: format!("{}.demo", self.manifest.id),
+            description: "demo tool".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+        }]
+    }
+    async fn start(&self) -> AgentResult<()> {
+        *self.started.lock().unwrap() = true;
+        Ok(())
+    }
+    async fn invoke(&self, call: ToolCall) -> AgentResult<ToolOutput> {
+        Ok(ToolOutput {
+            call_id: call.id,
+            tool_name: call.name.clone(),
+            ok: true,
+            summary: "demo ran".into(),
+            model_content: format!("demo handled {}", call.name),
+            artifact_ref: None,
+            metadata: json!({}),
+        })
+    }
+}
+
+async fn execute(dispatcher: Arc<dyn ToolDispatcher>, tool: &str) -> ToolOutput {
+    dispatcher
+        .execute(ToolExecutionRequest {
+            run_id: RunId::new(),
+            call: ToolCall {
+                id: "c1".into(),
+                name: tool.into(),
+                arguments: json!({}),
+            },
+            cancel: CancellationToken::new(),
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn dynamic_capabilities_reach_the_model_and_route_calls() {
+    let mut host = ModuleHost::new();
+    let capability_registry = host.capability_registry();
+    let started = Arc::new(Mutex::new(false));
+    host.register_capability(Arc::new(DemoCapability::new(
+        "demo",
+        CapabilityLifecycle::Eager,
+        started.clone(),
+    )))
+    .unwrap();
+
+    let dispatcher = CapabilityAwareDispatcher::new(Arc::new(StubTools), capability_registry);
+    host.add_module(Arc::new(ToolModule::new(Arc::new(dispatcher))))
+        .unwrap();
+    host.start().await.unwrap();
+
+    // Eager capabilities start with the host.
+    assert!(
+        *started.lock().unwrap(),
+        "eager capability starts at host start"
+    );
+
+    // The tool provider exposes built-in tools plus the capability's tool.
+    let tools = host.registry().tool_provider().unwrap();
+    let names: Vec<String> = tools.specs().iter().map(|spec| spec.name.clone()).collect();
+    assert!(names.contains(&"demo.demo".to_string()));
+
+    // A call routed by name reaches the capability.
+    let output = execute(tools, "demo.demo").await;
+    assert!(output.ok);
+    assert_eq!(output.model_content, "demo handled demo.demo");
+
+    host.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn capabilities_can_be_registered_mid_run_and_lazy_start_on_use() {
+    let mut host = ModuleHost::new();
+    let capability_registry = host.capability_registry();
+    let dispatcher = CapabilityAwareDispatcher::new(Arc::new(StubTools), capability_registry);
+    host.add_module(Arc::new(ToolModule::new(Arc::new(dispatcher))))
+        .unwrap();
+    host.start().await.unwrap();
+
+    // Mid-run registration: the model sees the new tool on the next request.
+    let started = Arc::new(Mutex::new(false));
+    host.register_capability(Arc::new(DemoCapability::new(
+        "late",
+        CapabilityLifecycle::Lazy,
+        started.clone(),
+    )))
+    .unwrap();
+
+    let tools = host.registry().tool_provider().unwrap();
+    let names: Vec<String> = tools.specs().iter().map(|spec| spec.name.clone()).collect();
+    assert!(names.contains(&"late.demo".to_string()));
+    assert!(
+        !*started.lock().unwrap(),
+        "a lazy capability is not started at registration"
+    );
+
+    // First invocation starts it (lazy lifecycle), then routes the call.
+    let output = execute(tools, "late.demo").await;
+    assert!(output.ok);
+    assert!(
+        *started.lock().unwrap(),
+        "lazy capability starts on first use"
+    );
+
+    host.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn capability_dependencies_are_validated() {
+    let host = ModuleHost::new();
+    let orphan = DemoCapability::with_dependency("orphan", "missing-capability");
+    let error = host
+        .register_capability(Arc::new(orphan))
+        .expect_err("a capability with an unmet dependency must be rejected");
+    assert!(
+        error.to_string().contains("depends on"),
+        "the error must name the missing dependency: {error}"
+    );
+
+    // Duplicate ids are rejected too.
+    let started = Arc::new(Mutex::new(false));
+    let first = DemoCapability::new("dup", CapabilityLifecycle::Eager, started.clone());
+    let second = DemoCapability::new("dup", CapabilityLifecycle::Eager, started);
+    host.register_capability(Arc::new(first)).unwrap();
+    let error = host
+        .register_capability(Arc::new(second))
+        .expect_err("duplicate capability ids must be rejected");
+    assert!(error.to_string().contains("already registered"), "{error}");
 }
 
 #[tokio::test]

@@ -1,5 +1,6 @@
 pub mod approval;
 pub mod cancellation;
+pub mod capability;
 pub mod context;
 pub mod error;
 pub mod event;
@@ -11,6 +12,7 @@ pub mod tool;
 
 pub use approval::*;
 pub use cancellation::*;
+pub use capability::*;
 pub use context::*;
 pub use error::*;
 pub use event::*;

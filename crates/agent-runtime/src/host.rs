@@ -1,16 +1,20 @@
 //! The module host: a uniform lifecycle (register, validate, start, stop)
-//! over typed capabilities. There is no universal `handle_event` — modules
-//! publish typed services into the registry and consumers look them up by
-//! type.
+//! over two extension planes. The trusted core plane publishes typed
+//! capabilities into the registry (no universal `handle_event` — consumers
+//! look services up by type). The dynamic plane accepts `Capability`s at
+//! composition time or mid-run; their tools join the runtime's tool
+//! provider so the model can call them.
 
 use std::{any::Any, collections::HashMap, sync::Arc};
 
 use agent_contracts::{
-    AgentError, AgentResult, ApprovalGate, ContextEngine, EventJournal, ModelTransport,
+    AgentError, AgentResult, ApprovalGate, Capability, ContextEngine, EventJournal, ModelTransport,
     ToolDispatcher,
 };
 use agent_workspace::Workspace;
 use async_trait::async_trait;
+
+use crate::capability::CapabilityRegistry;
 
 /// Typed capability ids the module host knows about. Values in the registry
 /// are stored and looked up through typed accessors, so callers never pass
@@ -62,7 +66,9 @@ impl ServiceRegistry {
         self.claims.get(&id).map(String::as_str)
     }
 
-    pub(crate) fn register<T: Send + Sync + 'static + ?Sized>(
+    /// Publish a typed service. Public so modules from external crates can
+    /// extend the trusted core plane with their own typed capabilities.
+    pub fn register<T: Send + Sync + 'static + ?Sized>(
         &mut self,
         id: CapabilityId,
         module: &str,
@@ -78,7 +84,9 @@ impl ServiceRegistry {
         Ok(())
     }
 
-    pub(crate) fn get<T: Send + Sync + 'static + ?Sized>(
+    /// Look a typed service up. Public so consumers outside the crate can
+    /// retrieve capabilities they did not publish.
+    pub fn get<T: Send + Sync + 'static + ?Sized>(
         &self,
         id: CapabilityId,
         what: &str,
@@ -123,11 +131,14 @@ impl ServiceRegistry {
 
 /// Owns the module list and the registry. Modules are added before `start`,
 /// validated for capability conflicts, then started in order and stopped in
-/// reverse order.
+/// reverse order. Dynamic capabilities are registered against a shared
+/// registry that the composition root hands to the tool provider, so they
+/// can be published even after the host started.
 #[derive(Default)]
 pub struct ModuleHost {
     modules: Vec<Arc<dyn Module>>,
     registry: ServiceRegistry,
+    capabilities: Arc<CapabilityRegistry>,
     started: bool,
 }
 
@@ -138,6 +149,21 @@ impl ModuleHost {
 
     pub fn registry(&self) -> &ServiceRegistry {
         &self.registry
+    }
+
+    /// The shared dynamic-capability registry. Hand it to a
+    /// `CapabilityAwareDispatcher` at composition time so capabilities
+    /// registered later (even mid-run) are picked up by the tool provider.
+    pub fn capability_registry(&self) -> Arc<CapabilityRegistry> {
+        self.capabilities.clone()
+    }
+
+    /// Publish a dynamic capability. Unlike modules this is not gated on the
+    /// host lifecycle: the LLM or any external actor can register new
+    /// capabilities while the runtime is running, and their tools appear on
+    /// the next model request.
+    pub fn register_capability(&self, capability: Arc<dyn Capability>) -> AgentResult<()> {
+        self.capabilities.register(capability)
     }
 
     /// Register a module and publish its capabilities. Rejects duplicate
@@ -165,16 +191,18 @@ impl ModuleHost {
         for module in &self.modules {
             module.start().await?;
         }
+        self.capabilities.start_eager().await?;
         self.started = true;
         Ok(())
     }
 
     /// Stop modules in reverse registration order (dependents before
-    /// dependencies).
+    /// dependencies), then stop the dynamic capabilities.
     pub async fn stop(&mut self) -> AgentResult<()> {
         for module in self.modules.iter().rev() {
             module.stop().await?;
         }
+        self.capabilities.stop_all().await?;
         self.started = false;
         Ok(())
     }

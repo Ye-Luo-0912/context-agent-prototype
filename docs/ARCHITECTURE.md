@@ -375,7 +375,7 @@ state (items, focus, counters) to `.focus-agent/checkpoints/*.json`, separate
 from the event journal. `restore` reloads it. Traces are for learning/replay;
 checkpoints are for durable runtime state.
 
-## 8c. Runtime actor and module host (V1-M3, hardened V1-P0-1)
+## 8c. Runtime actor and module host (V1-M3, hardened V1-P0-1/V1-P0-4)
 
 Since V1-M3 the runtime is an actor (`agent-runtime`), not `Mutex`
 orchestration. Callers hold a cloneable `RuntimeHandle`:
@@ -420,6 +420,33 @@ There is no universal `handle_event`: modules publish typed capabilities
 `EventStore`, `ArtifactStore` — all `CapabilityProvider` markers in
 `agent-contracts`) and consumers look them up by type. The TUI composes the
 run through the host and reads the capabilities back into the kernel.
+
+Since V1-P0-4 the host is an extension platform with two planes:
+
+- **Trusted core (typed).** `ServiceRegistry::register` / `get` are public,
+  so external crates publish and retrieve typed services with their own
+  `CapabilityId`s — the core ids are the well-known set, not the only set.
+- **Dynamic capability plane.** A `Capability` (manifest + runtime object)
+  advertises tool schemas that join the runtime's tool provider:
+  `CapabilityRegistry` accepts registrations at composition time or mid-run
+  (an LLM can publish new capabilities while the runtime runs), and
+  `CapabilityAwareDispatcher` merges built-in and capability tools behind
+  one `ToolDispatcher`, routing calls by tool name. The manifest declares
+  id/version/name/summary/permissions/dependencies/lifecycle/transport;
+  dependencies are validated at registration, lifecycle is honored (eager
+  starts with the host, lazy on first use), permissions stay declarative
+  while the advertised tools carry `ToolRisk` levels the approval gate
+  enforces, and only `InProcess` transport is resolved in the prototype.
+
+```text
+ModuleHost
+   ├─ typed plane   : add_module -> ServiceRegistry (public register/get)
+   └─ dynamic plane : register_capability -> CapabilityRegistry (mid-run ok)
+                           │
+                     CapabilityAwareDispatcher (base tools + capability tools)
+                           │
+                     kernel tool_provider -> model tool schemas -> invoke
+```
 
 ## 9. ContextCore migration path
 

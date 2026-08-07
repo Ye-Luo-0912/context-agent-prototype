@@ -3,6 +3,7 @@
 //! host that composes typed capabilities with a uniform lifecycle.
 
 mod actor;
+mod capability;
 mod command;
 pub mod host;
 pub mod modules;
@@ -10,6 +11,7 @@ mod prompt;
 mod sink;
 
 pub use actor::{RuntimeActor, spawn_runtime};
+pub use capability::{CapabilityAwareDispatcher, CapabilityRegistry};
 pub use command::{Reply, RuntimeCommand, RuntimeHandle};
 pub use host::{
     APPROVAL_POLICY, ARTIFACT_STORE, CONTEXT_SERVICE, CapabilityId, EVENT_STORE, MODEL_PROVIDER,
