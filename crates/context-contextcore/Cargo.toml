@@ -18,3 +18,4 @@ agent-kernel.workspace = true
 agent-runtime.workspace = true
 context-simple.workspace = true
 serde_json.workspace = true
+tempfile = "3"

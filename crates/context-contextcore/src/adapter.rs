@@ -88,22 +88,43 @@ impl ContextServiceConfig {
         if let Ok(program) = std::env::var("CARGO_BIN_EXE_agent-context-service") {
             return program;
         }
-        if let Ok(current) = std::env::current_exe() {
-            let exe = current.file_name().unwrap_or_default().to_string_lossy();
-            let sibling_name = if exe.ends_with(".exe") {
-                "agent-context-service.exe".to_string()
-            } else {
-                "agent-context-service".to_string()
-            };
-            if let Some(parent) = current.parent() {
-                let sibling = parent.join(&sibling_name);
-                if sibling.exists() {
-                    return sibling.to_string_lossy().into_owned();
-                }
-            }
+        if let Ok(current) = std::env::current_exe()
+            && let Some(found) = probe_siblings(&current, service_binary_name(&current))
+        {
+            return found.to_string_lossy().into_owned();
         }
+        // Last resort: PATH lookup (cargo may inject the target dir into
+        // PATH for tests, but the explicit probes above should be enough).
         "agent-context-service".to_string()
     }
+}
+
+/// The service binary name matching the platform's executable suffix.
+fn service_binary_name(current_exe: &std::path::Path) -> &'static str {
+    if current_exe
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .ends_with(".exe")
+    {
+        "agent-context-service.exe"
+    } else {
+        "agent-context-service"
+    }
+}
+
+/// Probe the standard cargo layout around the current executable: a test
+/// binary lives in `target/<profile>/deps/` while the service binary lands
+/// in `target/<profile>/`, so check both instead of depending on cargo
+/// injecting the target dir into PATH (which not every runner does).
+fn probe_siblings(current_exe: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let parent = current_exe.parent()?;
+    [
+        parent.join(name),
+        parent.parent().map(|profile| profile.join(name))?,
+    ]
+    .into_iter()
+    .find(|candidate| candidate.exists())
 }
 
 /// A `ContextEngine` whose state lives in a separate process.
@@ -314,4 +335,57 @@ impl ContextEngine for ContextServiceAdapter {
 /// Convenience: `Arc<dyn ContextEngine>` for a spawned service.
 pub async fn connect_engine(config: &ContextServiceConfig) -> AgentResult<Arc<dyn ContextEngine>> {
     Ok(Arc::new(ContextServiceAdapter::connect(config).await?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn probe_finds_the_service_next_to_the_profile_dir() {
+        // Simulate the standard cargo layout for a test binary:
+        // target/<profile>/deps/<test-exe> with the service binary in
+        // target/<profile>/.
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("debug");
+        let deps = profile.join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let service = profile.join("agent-context-service");
+        std::fs::write(&service, "bin").unwrap();
+        let test_exe = deps.join("service-abc123");
+        std::fs::write(&test_exe, "test").unwrap();
+
+        assert_eq!(
+            probe_siblings(&test_exe, "agent-context-service"),
+            Some(service)
+        );
+    }
+
+    #[test]
+    fn probe_prefers_the_same_directory_then_the_profile_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = dir.path().join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let same_dir = deps.join("agent-context-service");
+        std::fs::write(&same_dir, "bin").unwrap();
+        let exe = deps.join("service-abc123");
+        std::fs::write(&exe, "test").unwrap();
+
+        assert_eq!(
+            probe_siblings(&exe, "agent-context-service"),
+            Some(same_dir)
+        );
+    }
+
+    #[test]
+    fn probe_returns_none_when_nowhere_to_be_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = PathBuf::from(dir.path())
+            .join("deps")
+            .join("service-abc123");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "test").unwrap();
+        assert_eq!(probe_siblings(&exe, "agent-context-service"), None);
+    }
 }
