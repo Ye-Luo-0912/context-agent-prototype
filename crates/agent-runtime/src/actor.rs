@@ -17,6 +17,7 @@ use agent_kernel::AgentKernel;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::budget::{DEFAULT_OUTPUT_RESERVE, ModelBudget, approx_layer_tokens};
 use crate::command::{Reply, RuntimeCommand, RuntimeHandle};
 use crate::prompt::PromptAssembler;
 use crate::sink::LiveSink;
@@ -363,17 +364,31 @@ impl RuntimeActor {
             }
         }
 
-        // The system prompt is the runtime's own overhead; the context
-        // engine budgets for the working set with the rest.
-        let budget = self
-            .kernel
-            .context_budget_tokens()
-            .saturating_sub(self.assembler.system_prompt_tokens());
+        // The engine only ever sees its own slice of the provider window:
+        // the output reserve, system policy, turn frame and active tool
+        // schemas are the runtime's share and are subtracted before the
+        // engine budgets the working set.
+        let capabilities = self.kernel.model_capabilities();
+        let turn_frame_tokens = approx_layer_tokens(&turn.turn_frame.messages());
+        let active_tools_tokens = approx_layer_tokens(&self.kernel.tool_specs());
+        let model_budget = ModelBudget::compute(
+            capabilities
+                .context_window
+                .unwrap_or_else(|| self.kernel.context_budget_tokens()),
+            if capabilities.max_output_tokens > 0 {
+                capabilities.max_output_tokens
+            } else {
+                DEFAULT_OUTPUT_RESERVE
+            },
+            self.assembler.system_prompt_tokens(),
+            turn_frame_tokens,
+            active_tools_tokens,
+        );
         let materialized = match self
             .kernel
             .context_materialize(ContextQuery {
                 current_input: current_input.clone(),
-                budget_tokens: budget,
+                budget_tokens: model_budget.context_frame_budget,
                 hints: ContextHints::default(),
             })
             .await

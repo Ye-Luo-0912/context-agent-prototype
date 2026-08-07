@@ -1286,3 +1286,82 @@ async fn max_selected_items_hint_caps_the_working_set() {
     );
     assert_eq!(capped.selected.len(), 2);
 }
+
+#[tokio::test]
+async fn pinned_items_get_priority_but_never_break_the_budget() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    {
+        let mut state = engine.state.lock().await;
+        let small_pin = ContextItem {
+            id: ContextItemId::new(),
+            task_id: None,
+            scope_id: None,
+            content: "small pin ".repeat(10), // ~25 tokens
+            kind: ContextKind::Constraint,
+            scope: ContextScope::Pinned,
+            retention: ContextRetention::Pinned,
+            state: ContextState::Active,
+            importance: 1.0,
+            relevance: 1.0,
+            created_tick: 1,
+            last_access_tick: 1,
+            access_count: 0,
+            created_turn: 1,
+            last_access_turn: 1,
+            dependencies: Vec::new(),
+            tags: Vec::new(),
+            source: Some("pinned".into()),
+        };
+        let oversized_pin = ContextItem {
+            id: ContextItemId::new(),
+            task_id: None,
+            scope_id: None,
+            content: "huge pinned data ".repeat(5_000), // ~7500 tokens
+            kind: ContextKind::Constraint,
+            scope: ContextScope::Pinned,
+            retention: ContextRetention::Pinned,
+            state: ContextState::Active,
+            importance: 1.0,
+            relevance: 1.0,
+            created_tick: 2,
+            last_access_tick: 2,
+            access_count: 0,
+            created_turn: 1,
+            last_access_turn: 1,
+            dependencies: Vec::new(),
+            tags: Vec::new(),
+            source: Some("pinned".into()),
+        };
+        state.items.push(small_pin);
+        state.items.push(oversized_pin);
+    }
+
+    let snapshot = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 4096,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        snapshot.approx_tokens <= 4096,
+        "the budget is a hard bound even for pinned items, got {}",
+        snapshot.approx_tokens
+    );
+    assert!(
+        snapshot
+            .items
+            .iter()
+            .any(|item| item.content.starts_with("small pin")),
+        "the small pin must be selected first"
+    );
+    assert!(
+        !snapshot
+            .items
+            .iter()
+            .any(|item| item.content.starts_with("huge pinned data")),
+        "an oversized pinned item must not blow the budget"
+    );
+}

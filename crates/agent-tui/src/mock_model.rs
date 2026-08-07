@@ -12,6 +12,7 @@ impl ModelTransport for MockModelTransport {
             streaming: true,
             tool_calls: true,
             max_output_tokens: 4096,
+            context_window: None,
         }
     }
 

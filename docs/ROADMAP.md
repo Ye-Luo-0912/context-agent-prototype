@@ -738,6 +738,37 @@ and overwrite cases with old content; a failed commit (rename over a
 non-empty directory) leaves unrelated targets untouched and cleans up
 the temp file.
 
+### V1-P0-7: the context budget becomes a real model budget ✅ (implemented)
+
+The engine's `budget_tokens` is now the *residual* of a full request
+budget computed at the runtime top level (`agent-runtime::budget`):
+
+```text
+Provider Context Window (ModelCapabilities.context_window, falls back to
+                         the kernel's configured budget)
+        - Output Reserve        (max_output_tokens, or a default reserve)
+        - System Policy         (the assembled system prompt)
+        - Turn Frame            (wire-form token estimate of the turn stack)
+        - Active Tool Schemas   (wire-form estimate of the tool specs)
+        = Context Frame Budget  (the only number the engine receives)
+```
+
+- `ModelCapabilities` gains `context_window: Option<usize>` (providers
+  leave it `None` until they declare one); the kernel exposes
+  `model_capabilities()`;
+- the engine stops deducting `current_input` from its budget — the
+  input rides in the runtime's turn frame and is charged there, so it is
+  never double-counted; focus remains engine-owned;
+- pinned items now get priority without exemption: selection is a
+  two-pass loop (pinned first, scored rest) and every item — pinned or
+  not — must fit the remaining budget, so the frame is a hard bound.
+
+Acceptance: budget arithmetic unit tests; an actor-level test records
+the `ContextQuery` and asserts the engine received exactly
+`window - output - system - turn - tools`; a materializer test pins a
+tiny and a huge item and asserts the huge one cannot blow the budget
+while the tiny one is always selected first.
+
 ---
 
 ## Later, only after evidence

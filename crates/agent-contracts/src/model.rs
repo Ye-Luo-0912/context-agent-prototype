@@ -216,6 +216,11 @@ pub struct ModelCapabilities {
     pub streaming: bool,
     pub tool_calls: bool,
     pub max_output_tokens: usize,
+    /// The provider's declared context window in tokens. When absent the
+    /// runtime falls back to its configured budget — the context engine only
+    /// ever sees the derived context-frame share either way.
+    #[serde(default)]
+    pub context_window: Option<usize>,
 }
 
 /// A bounded chunk of a streaming model response, normalized by the provider

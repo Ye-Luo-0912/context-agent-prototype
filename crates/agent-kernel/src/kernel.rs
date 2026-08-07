@@ -10,8 +10,8 @@ use agent_contracts::{
     AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, ContextEngine, ContextIngress,
     ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
     ContextQuery, ContextStateTransition, EventJournal, FocusState, MaterializedContext,
-    ModelEventSink, ModelOutput, ModelRequest, ModelTransport, RunId, RuntimeEvent,
-    RuntimeEventEnvelope, ScopeId, ScopeKind, TaskId, ToolCall, ToolDispatcher,
+    ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest, ModelTransport, RunId,
+    RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, TaskId, ToolCall, ToolDispatcher,
     ToolExecutionRequest, ToolOutput, ToolSpec,
 };
 use tokio::sync::broadcast;
@@ -107,6 +107,10 @@ impl AgentKernel {
 
     pub fn max_tool_rounds(&self) -> usize {
         self.config.max_tool_rounds
+    }
+
+    pub fn model_capabilities(&self) -> ModelCapabilities {
+        self.model.capabilities()
     }
 
     pub fn tool_specs(&self) -> Vec<ToolSpec> {

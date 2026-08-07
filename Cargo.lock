@@ -58,6 +58,7 @@ dependencies = [
  "agent-kernel",
  "agent-workspace",
  "async-trait",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

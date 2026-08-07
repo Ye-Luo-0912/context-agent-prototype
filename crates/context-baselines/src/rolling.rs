@@ -184,14 +184,13 @@ impl ContextEngine for RollingSummaryEngine {
         Ok(Vec::new())
     }
 
-    async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
         let state = self.state.lock().expect("rolling state poisoned");
         let items = materialized_items(&state.records, state.summary.as_ref());
         let approx_tokens_total: usize = items
             .iter()
             .map(|item| approx_tokens(&item.content))
-            .sum::<usize>()
-            + approx_tokens(&query.current_input);
+            .sum::<usize>();
         let mut selected: Vec<ContextSelection> = Vec::new();
         if let Some(summary) = &state.summary {
             selected.push(ContextSelection {

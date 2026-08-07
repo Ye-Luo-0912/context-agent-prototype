@@ -2,18 +2,19 @@
 //! stale-result dropping. Uses minimal stubs for context/tools/model so the
 //! actor is exercised against the engine contracts only.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
     AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
-    MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput, ModelRequest,
-    ModelTransport, RuntimeEvent, ScopeId, ScopeKind, ToolDispatcher, ToolExecutionRequest,
-    ToolOutput, ToolSpec,
+    MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage, ModelOutput,
+    ModelRequest, ModelTransport, RuntimeEvent, ScopeId, ScopeKind, ToolDispatcher,
+    ToolExecutionRequest, ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
-use agent_runtime::{RuntimeHandle, spawn_runtime};
+use agent_runtime::{ModelBudget, RuntimeHandle, approx_layer_tokens, spawn_runtime};
 
 #[derive(Debug)]
 struct TestContextEngine;
@@ -255,4 +256,143 @@ async fn stop_ends_the_actor_cleanly() {
         after.is_err(),
         "commands after stop must fail, got: {after:?}"
     );
+}
+
+/// Records every `ContextQuery` the actor hands to the engine, so a test can
+/// assert what slice of the provider window actually reaches the working set.
+#[derive(Debug, Default)]
+struct RecordingContextEngine {
+    queries: Mutex<Vec<ContextQuery>>,
+}
+
+#[async_trait::async_trait]
+impl ContextEngine for RecordingContextEngine {
+    async fn ingest(&self, _ingress: ContextIngress) -> AgentResult<()> {
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
+        self.queries.lock().unwrap().push(query);
+        Ok(MaterializedContext {
+            focus: None,
+            items: Vec::new(),
+            selected: Vec::new(),
+            approx_tokens: 0,
+            diagnostics: ContextDiagnostics::default(),
+        })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+}
+
+/// Declares a real provider window and max output so the derived frame
+/// budget is meaningful.
+#[derive(Debug)]
+struct BudgetModel;
+
+#[async_trait::async_trait]
+impl ModelTransport for BudgetModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            streaming: true,
+            tool_calls: true,
+            max_output_tokens: 2_000,
+            context_window: Some(30_000),
+        }
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        unreachable!("streaming model should be driven through complete_stream")
+    }
+    async fn complete_stream(
+        &self,
+        request: ModelRequest,
+        sink: &dyn ModelEventSink,
+    ) -> AgentResult<ModelOutput> {
+        if request.cancel.is_cancelled() {
+            return Err(agent_contracts::AgentError::Cancelled);
+        }
+        sink.on_chunk(ModelChunk::Done).await?;
+        Ok(ModelOutput {
+            content: "ok".into(),
+            tool_calls: Vec::new(),
+            usage: Default::default(),
+        })
+    }
+}
+
+/// One advertised tool, so the tool-schema layer of the budget is non-empty.
+#[derive(Debug)]
+struct OneToolDispatcher;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for OneToolDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "fs.read".into(),
+            description: "read a workspace file".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+        }]
+    }
+    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
+        Err(agent_contracts::AgentError::Tool(
+            "no tools configured".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn engine_receives_only_the_context_frame_budget() {
+    let context = Arc::new(RecordingContextEngine::default());
+    let kernel = Arc::new(AgentKernel::new(
+        AgentKernelConfig::default(),
+        context.clone(),
+        Arc::new(BudgetModel),
+        Arc::new(OneToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel.clone());
+    handle.start().await.unwrap();
+    handle.user_message("hello".into()).await.unwrap();
+
+    // The turn is a single model round; the engine query is recorded before
+    // the actor replies, so the budget is observable immediately.
+    let system_tokens = approx_tokens(&kernel.system_prompt());
+    let turn_tokens = approx_layer_tokens(&[ModelMessage::user("hello")]);
+    let tools_tokens = approx_layer_tokens(&kernel.tool_specs());
+    let expected = ModelBudget::compute(30_000, 2_000, system_tokens, turn_tokens, tools_tokens)
+        .context_frame_budget;
+
+    {
+        let queries = context.queries.lock().unwrap();
+        assert_eq!(queries.len(), 1, "one model round -> one materialization");
+        assert_eq!(
+            queries[0].budget_tokens, expected,
+            "the engine must receive the window minus output/system/turn/tools"
+        );
+    }
+
+    handle.stop().await.unwrap();
 }

@@ -51,11 +51,13 @@ pub(crate) fn materialize(
 
     candidates.sort_by(|a, b| b.1.total.partial_cmp(&a.1.total).unwrap_or(Ordering::Equal));
 
-    let fixed_tokens = approx_tokens(&query.current_input)
-        + focus
-            .as_ref()
-            .map(|f| approx_tokens(&f.goal) + approx_tokens(&f.current_query))
-            .unwrap_or_default();
+    // The engine owns the focus frame and the selected items; the current
+    // input rides in the runtime's turn frame and is charged there, so it is
+    // not deducted a second time here.
+    let fixed_tokens = focus
+        .as_ref()
+        .map(|f| approx_tokens(&f.goal) + approx_tokens(&f.current_query))
+        .unwrap_or_default();
     // A small slice of the budget is reserved for dependency expansion so
     // traceability items can follow the working set without letting the
     // snapshot exceed the budget.
@@ -65,17 +67,50 @@ pub(crate) fn materialize(
     let mut selected_indices = Vec::new();
     let mut selections = Vec::new();
 
-    for (index, breakdown, tokens) in candidates {
+    // Pinned items go first — priority, not exemption: every item, pinned or
+    // not, must fit the remaining budget, so the frame is a hard bound.
+    for (index, breakdown, tokens) in &candidates {
+        let item = &state.items[*index];
+        if item.retention != ContextRetention::Pinned {
+            continue;
+        }
         if let Some(max) = query.hints.max_selected_items
             && selections.len() >= max
         {
             break;
         }
-        let item = &state.items[index];
         if item.state == ContextState::Archived && breakdown.total < config.active_threshold {
             continue;
         }
-        if tokens > remaining && item.retention != ContextRetention::Pinned {
+        if *tokens > remaining {
+            continue;
+        }
+        remaining -= *tokens;
+        selected_indices.push(*index);
+        selections.push(ContextSelection {
+            item_id: item.id,
+            score: breakdown.total,
+            approx_tokens: *tokens,
+            reason: selection_reason(item, breakdown),
+            breakdown: breakdown.clone(),
+        });
+    }
+
+    // Then the scored candidates fill the rest of the frame.
+    for (index, breakdown, tokens) in candidates {
+        let item = &state.items[index];
+        if item.retention == ContextRetention::Pinned {
+            continue;
+        }
+        if let Some(max) = query.hints.max_selected_items
+            && selections.len() >= max
+        {
+            break;
+        }
+        if item.state == ContextState::Archived && breakdown.total < config.active_threshold {
+            continue;
+        }
+        if tokens > remaining {
             continue;
         }
 
@@ -188,9 +223,9 @@ pub(crate) fn materialize(
         })
         .collect();
 
-    // The engine-side token share: focus frame + selected items + the
-    // current user input. The system prompt and tool schemas are the
-    // runtime's share and are added by the prompt assembler.
+    // The engine-side token share: focus frame + selected items. The system
+    // prompt, turn frame and tool schemas are the runtime's share and are
+    // charged by the model budget before this snapshot is requested.
     let approx_tokens_total = focus
         .as_ref()
         .map(|f| approx_tokens(&f.goal) + approx_tokens(&f.current_query))
@@ -198,8 +233,7 @@ pub(crate) fn materialize(
         + items
             .iter()
             .map(|item| approx_tokens(&item.content))
-            .sum::<usize>()
-        + approx_tokens(&query.current_input);
+            .sum::<usize>();
 
     MaterializedContext {
         focus,

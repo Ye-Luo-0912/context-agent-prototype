@@ -9,6 +9,7 @@ agent-contracts = { workspace = true }
 agent-kernel = { workspace = true }
 agent-workspace = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

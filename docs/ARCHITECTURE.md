@@ -274,6 +274,29 @@ results ride in the `TurnFrame` and never touch the context engine until the
 turn ends, when they are persisted as observations and observed by one
 `maintain(AfterTool)` pass.
 
+### The model budget: the engine only sees its slice
+
+Since V1-P0-7 the budget handed to `ContextQuery::budget_tokens` is the
+residual of a full request budget computed at the runtime top level
+(`agent-runtime::budget::ModelBudget`):
+
+```text
+Provider Context Window (ModelCapabilities.context_window, falls back to
+                         the kernel's configured budget)
+        - Output Reserve        (max_output_tokens, or a default reserve)
+        - System Policy         (the assembled system prompt)
+        - Turn Frame            (wire-form estimate of the turn stack)
+        - Active Tool Schemas   (wire-form estimate of the tool specs)
+        = Context Frame Budget  (the only number the engine receives)
+```
+
+The engine never sees the window, the output reserve or the tool schemas —
+it just knows it has N tokens for the working set. The current user input is
+charged inside the turn frame (it rides there), so the engine does not
+deduct it a second time; the focus frame stays engine-owned. Pinned items
+get selection priority (they go first) but not exemption: every selected
+item must fit the remaining budget, so the frame is a hard bound.
+
 ## 6. Context is rebuilt, not replayed
 
 The model-facing request is intentionally rebuilt from state instead of

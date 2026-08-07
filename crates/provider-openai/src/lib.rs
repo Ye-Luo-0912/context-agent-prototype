@@ -61,6 +61,7 @@ impl ModelTransport for OpenAiProvider {
             streaming: true,
             tool_calls: true,
             max_output_tokens: self.config.max_output_tokens,
+            context_window: None,
         }
     }
 
