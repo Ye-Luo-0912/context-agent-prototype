@@ -358,6 +358,44 @@ state (items, focus, counters) to `.focus-agent/checkpoints/*.json`, separate
 from the event journal. `restore` reloads it. Traces are for learning/replay;
 checkpoints are for durable runtime state.
 
+## 8c. Runtime actor and module host (V1-M3)
+
+Since V1-M3 the runtime is an actor (`agent-runtime`), not `Mutex`
+orchestration. Callers hold a cloneable `RuntimeHandle`:
+
+```text
+RuntimeHandle ── mpsc<RuntimeCommand> ──▶ RuntimeActor (owns mutable state)
+                     │                        │
+                     │                        └── spawned turn task ──▶ OperationResult
+                     └──── events ◀── broadcast channel (kernel events)
+```
+
+- every mutation (user message, focus, pin, task completion, checkpoint)
+  is a command; the actor serializes them, so focus/pin/task commands can
+  no longer interleave with an in-flight turn (the previous structural
+  race);
+- a turn runs as a spawned operation that reports back an `OperationResult`
+  carrying run/turn/task/scope/operation ids and a generation; the actor
+  drops results whose generation moved on (cancel, stop) — stale results
+  never race into the new state;
+- the actor selects on both the command channel and the completion channel,
+  so `/cancel` is processed mid-turn and a new turn can start right after.
+
+Composition uses a module host over typed capabilities:
+
+```text
+ModuleHost ── add_module (register + validate) ──▶ ServiceRegistry (typed lookup)
+   │  ContextModule / ModelModule / ToolModule / ApprovalModule /
+   │  EventModule / ArtifactModule
+   └── start in order, stop in reverse
+```
+
+There is no universal `handle_event`: modules publish typed capabilities
+(`ContextService`, `ModelProvider`, `ToolProvider`, `ApprovalPolicy`,
+`EventStore`, `ArtifactStore` — all `CapabilityProvider` markers in
+`agent-contracts`) and consumers look them up by type. The TUI composes the
+run through the host and reads the capabilities back into the kernel.
+
 ## 9. ContextCore migration path
 
 The adapter pattern is implemented (P5):

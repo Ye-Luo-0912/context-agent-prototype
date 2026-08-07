@@ -11,8 +11,8 @@ use agent_contracts::{
     ContextBuildRequest, ContextEngine, ContextIngress, ContextItemSummary, ContextKind,
     ContextMaintenanceTrigger, ContextSnapshot, EventJournal, FocusState, ModelChunk,
     ModelEventSink, ModelInput, ModelMessage, ModelRequest, ModelRole, ModelTransport, RunId,
-    RuntimeEvent, RuntimeEventEnvelope, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutput,
-    TurnFrame, TurnFrameStep,
+    RuntimeEvent, RuntimeEventEnvelope, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest,
+    ToolOutput, TurnFrame, TurnFrameStep,
 };
 use serde_json::json;
 use tokio::sync::{Mutex, broadcast};
@@ -84,6 +84,17 @@ impl AgentKernel {
 
     pub fn subscribe(&self) -> broadcast::Receiver<RuntimeEventEnvelope> {
         self.event_tx.subscribe()
+    }
+
+    /// The broadcast sender behind `subscribe`, for the runtime actor to hand
+    /// out fresh subscriptions.
+    pub fn event_sender(&self) -> broadcast::Sender<RuntimeEventEnvelope> {
+        self.event_tx.clone()
+    }
+
+    /// Surface a runtime-level warning through the normal event stream.
+    pub async fn emit_warning(&self, message: String) -> AgentResult<()> {
+        self.emit(RuntimeEvent::Warning { message }).await
     }
 
     pub async fn start(&self) -> AgentResult<()> {
@@ -341,8 +352,12 @@ impl AgentKernel {
         Ok(())
     }
 
-    pub async fn set_focus(&self, goal: String) -> AgentResult<()> {
+    /// Switch the runtime's focus to a new goal, opening a fresh task scope
+    /// in the context engine. Returns the new task id so the runtime can tag
+    /// operations with the task they belong to.
+    pub async fn set_focus(&self, goal: String) -> AgentResult<TaskId> {
         let focus = FocusState::new(goal.clone());
+        let task_id = focus.task_id;
         self.context
             .ingest(ContextIngress::FocusChanged { focus })
             .await?;
@@ -355,7 +370,8 @@ impl AgentKernel {
             trigger: ContextMaintenanceTrigger::FocusChanged,
             report,
         })
-        .await
+        .await?;
+        Ok(task_id)
     }
 
     pub async fn pin(&self, content: String) -> AgentResult<()> {

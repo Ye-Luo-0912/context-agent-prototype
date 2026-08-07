@@ -51,6 +51,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-runtime"
+version = "0.1.0"
+dependencies = [
+ "agent-contracts",
+ "agent-kernel",
+ "agent-workspace",
+ "async-trait",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agent-storage"
 version = "0.1.0"
 dependencies = [
@@ -66,6 +79,7 @@ version = "0.1.0"
 dependencies = [
  "agent-contracts",
  "agent-kernel",
+ "agent-runtime",
  "agent-storage",
  "agent-workspace",
  "anyhow",

@@ -13,6 +13,10 @@ use agent_contracts::{ApprovalDecision, ContextEngine, ModelTransport};
 use agent_kernel::{
     AgentKernel, AgentKernelConfig, ApprovalBroker, InteractiveApprovalGate, PolicyApprovalGate,
 };
+use agent_runtime::{
+    ApprovalModule, ArtifactModule, ContextModule, EventModule, ModelModule, ModuleHost,
+    RuntimeHandle, ToolModule, spawn_runtime,
+};
 use agent_storage::FileEventJournal;
 use agent_workspace::Workspace;
 use anyhow::Context;
@@ -90,16 +94,33 @@ async fn main() -> anyhow::Result<()> {
     };
     let journal = Arc::new(journal);
 
+    // The module host publishes typed capabilities with a uniform lifecycle
+    // (register, validate, start, stop). The kernel consumes the same
+    // capabilities back from the registry, so composition conflicts fail
+    // fast before anything runs.
+    let mut host = ModuleHost::new();
+    host.add_module(Arc::new(ContextModule::new(context_engine)))?;
+    host.add_module(Arc::new(ModelModule::new(model)))?;
+    host.add_module(Arc::new(ToolModule::new(tool_dispatcher)))?;
+    host.add_module(Arc::new(ApprovalModule::new(approval.clone())))?;
+    host.add_module(Arc::new(EventModule::new(journal.clone())))?;
+    host.add_module(Arc::new(ArtifactModule::new(Arc::new(workspace.clone()))))?;
+    host.start().await?;
+
     let kernel = Arc::new(AgentKernel::new(
         AgentKernelConfig::default(),
-        context_engine,
-        model,
-        tool_dispatcher,
-        approval,
-        Some(journal),
+        host.registry().context_service()?,
+        host.registry().model_provider()?,
+        host.registry().tool_provider()?,
+        host.registry().approval_policy()?,
+        host.registry().event_store()?,
     ));
-    let mut runtime_events = kernel.subscribe();
-    kernel.start().await?;
+    // The runtime actor owns all subsequent mutation: commands are serialized
+    // and long-running turns report back as operations, so focus/pin/task
+    // commands can no longer race an in-flight turn.
+    let (handle, _runtime_task) = spawn_runtime(kernel);
+    let mut runtime_events = handle.subscribe();
+    handle.start().await?;
 
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
@@ -110,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
 
     let result = run_ui(
         &mut terminal,
-        kernel.clone(),
+        handle.clone(),
         &mut runtime_events,
         interactive,
         &context_policy,
@@ -118,7 +139,8 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
-    let _ = kernel.stop().await;
+    let _ = handle.stop().await;
+    let _ = host.stop().await;
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
@@ -128,13 +150,13 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_ui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    kernel: Arc<AgentKernel>,
+    handle: RuntimeHandle,
     runtime_events: &mut tokio::sync::broadcast::Receiver<agent_contracts::RuntimeEventEnvelope>,
     interactive: Option<InteractiveHandle>,
     context_policy: &str,
     checkpoint_dir: PathBuf,
 ) -> anyhow::Result<()> {
-    let mut app = AppState::new(kernel.run_id());
+    let mut app = AppState::new(handle.run_id());
     app.push_system(format!("context policy: {context_policy}"));
 
     // Requests that arrived before this loop started (e.g. during startup).
@@ -212,39 +234,39 @@ async fn run_ui(
                         break;
                     }
                     if let Some(goal) = trimmed.strip_prefix("/focus ") {
-                        let kernel = kernel.clone();
+                        let handle = handle.clone();
                         let goal = goal.trim().to_string();
                         tokio::spawn(async move {
-                            if let Err(error) = kernel.set_focus(goal).await {
+                            if let Err(error) = handle.set_focus(goal).await {
                                 tracing::error!(%error, "set focus failed");
                             }
                         });
                         continue;
                     }
                     if let Some(content) = trimmed.strip_prefix("/pin ") {
-                        let kernel = kernel.clone();
+                        let handle = handle.clone();
                         let content = content.trim().to_string();
                         tokio::spawn(async move {
-                            if let Err(error) = kernel.pin(content).await {
+                            if let Err(error) = handle.pin(content).await {
                                 tracing::error!(%error, "pin failed");
                             }
                         });
                         continue;
                     }
                     if let Some(summary) = trimmed.strip_prefix("/done ") {
-                        let kernel = kernel.clone();
+                        let handle = handle.clone();
                         let summary = summary.trim().to_string();
                         tokio::spawn(async move {
-                            if let Err(error) = kernel.complete_current_task(summary).await {
+                            if let Err(error) = handle.complete_current_task(summary).await {
                                 tracing::error!(%error, "complete task failed");
                             }
                         });
                         continue;
                     }
                     if trimmed == "/context" {
-                        let kernel = kernel.clone();
+                        let handle = handle.clone();
                         tokio::spawn(async move {
-                            if let Err(error) = kernel.emit_diagnostics().await {
+                            if let Err(error) = handle.emit_diagnostics().await {
                                 tracing::error!(%error, "context diagnostics failed");
                             }
                         });
@@ -252,8 +274,8 @@ async fn run_ui(
                     }
                     if trimmed == "/checkpoint" {
                         let path =
-                            checkpoint_dir.join(format!("{}-{}.json", kernel.run_id(), now_ms()));
-                        match kernel.checkpoint().await {
+                            checkpoint_dir.join(format!("{}-{}.json", handle.run_id(), now_ms()));
+                        match handle.checkpoint().await {
                             Ok(value) => {
                                 let bytes = match serde_json::to_vec_pretty(&value) {
                                     Ok(bytes) => bytes,
@@ -284,7 +306,7 @@ async fn run_ui(
                         continue;
                     }
                     if trimmed == "/cancel" {
-                        kernel.cancel_current_turn().await;
+                        handle.cancel_turn().await;
                         continue;
                     }
 
@@ -294,9 +316,9 @@ async fn run_ui(
                         );
                         continue;
                     }
-                    let kernel = kernel.clone();
+                    let handle = handle.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = kernel.handle_user_message(input).await {
+                        if let Err(error) = handle.user_message(input).await {
                             tracing::error!(%error, "agent turn failed");
                         }
                     });

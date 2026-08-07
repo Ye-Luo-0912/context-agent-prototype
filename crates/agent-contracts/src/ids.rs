@@ -30,3 +30,5 @@ id_type!(RunId);
 id_type!(TaskId);
 id_type!(ContextItemId);
 id_type!(ScopeId);
+id_type!(TurnId);
+id_type!(OperationId);

@@ -488,18 +488,42 @@ Acceptance:
 - `ContextEngine` contract unchanged (diagnostics gained serde-default
   scope fields only); replay/A/B/C harnesses unaffected.
 
-### V1-M3: Runtime framework (after M2)
+### V1-M3: Runtime framework ✅ (implemented)
 
-- `RuntimeHandle` -> `mpsc<RuntimeCommand>` -> `RuntimeActor` owning the
-  mutable `RunState`; long-running model/tool work returns
-  `OperationResult` tagged with run/task/turn/scope/operation ids and a
-  generation, so stale results from an old focus are dropped instead of
-  racing into the new one;
-- `ModuleHost` with a uniform lifecycle (register, dependency validation,
-  startup, shutdown, capability publication, service lookup) over typed
-  contracts — `ContextService`, `ModelProvider`, `ToolProvider`,
-  `ArtifactStore`, `EventStore`, `ApprovalPolicy`, `CapabilityProvider` —
-  not a universal `handle_event`.
+- new crate `agent-runtime`: `RuntimeHandle` -> `mpsc<RuntimeCommand>` ->
+  `RuntimeActor` owning the mutable runtime state. Every command (user
+  message, focus, pin, task completion, checkpoint, diagnostics, inspect,
+  cancel, stop) is serialized by the actor, so focus/pin/task commands can
+  no longer race an in-flight turn — the structural race where the TUI
+  spawned kernel calls directly is gone (the TUI now drives the handle);
+- long-running work (a turn) runs as a spawned operation reporting back an
+  `OperationResult` tagged with run/turn/task/scope/operation ids and a
+  generation. The actor drops results whose generation moved on (cancel,
+  stop) instead of letting them race into the new state — observable as a
+  `stale turn result dropped` warning;
+- the actor stays responsive while a turn runs (it selects on both the
+  command channel and the completion channel), so `/cancel` is processed
+  mid-turn and a new turn can start immediately after;
+- `ModuleHost` with a uniform lifecycle — `add_module` (register +
+  capability-claim validation), `start` (in order), `stop` (in reverse)
+  — over a typed `ServiceRegistry`: modules publish typed capabilities
+  (`ContextService`, `ModelProvider`, `ToolProvider`, `ApprovalPolicy`,
+  `EventStore`, `ArtifactStore`, all `CapabilityProvider` markers in
+  `agent-contracts`), consumers look them up by type. There is no
+  universal `handle_event`;
+- the TUI composes the run through the host (context/model/tools/approval/
+  events/artifacts modules) and reads the capabilities back into the
+  kernel; the actor owns start/stop.
+
+Acceptance:
+
+- workspace tests green (79): `agent-runtime` adds actor tests (busy
+  rejection, cancel + stale-result drop, clean stop) and host tests
+  (typed lookup, duplicate-claim rejection, lifecycle order, missing
+  capability);
+- the kernel contract is unchanged for replay/A/B/C (they drive engines
+  directly); `set_focus` now returns the new `TaskId` so the runtime can
+  tag operations with their task.
 
 ---
 
