@@ -801,6 +801,87 @@ tests assert the module lifecycle brackets the run (`start` ... `stop`),
 that `shutdown` aggregates a failing module stop into its error, and
 that shutdown never hangs when the actor was never started.
 
+## V1-P5: string tags become typed labels ✅ (implemented)
+
+Scope promotion and GC decide membership by enum values, not string
+matching (`agent-contracts::label`):
+
+- `CoreLabel` — the six content labels (decision, finding, constraint,
+  open-loop, artifact-ref, evidence-ref);
+- `LifecycleLabel` — the markers the GC/promotion machinery stamps
+  (promoted, superseded, verified-fixed);
+- `Label::Extension` — namespaced labels (`ext:github/pr`) for modules
+  that need their own vocabulary.
+
+`ContextItem.tags` is now `Vec<Label>`; labels serialize as their string
+form and accept any string back, so old checkpoints and future labels
+round-trip. A misspelled tag can no longer silently change lifecycle
+behavior.
+
+## V1-P6: builtin tools get a real lifecycle ✅ (implemented)
+
+`BuiltinToolDispatcher` becomes a catalog with an active set:
+
+```text
+ToolCatalog → capability discovery → ActiveToolSet → model request
+```
+
+- tools move through `Available → Loaded → Active → Warm → Unloaded`;
+  only loaded/active tools appear in `specs()`, so the model sees the
+  lean set, not all eight;
+- a lazy GC cools idle tools out of the surface (`Loaded → Warm →
+  Unloaded`) on every model request; core tools (`fs.list`, `fs.read`,
+  `search.grep`) never age out and cannot be unloaded;
+- the always-visible control tools `capability.search` /
+  `capability.load` / `capability.unload` let the model discover and
+  drive the lifecycle itself (load `git.status` when the task needs
+  git). Execution of a catalog tool is always permitted; the lifecycle
+  gates the model surface and the approval gate protects side effects.
+
+Acceptance: tests assert the default surface is the core set plus the
+control tools, load/unload changes the surface (core unload rejected),
+idle tools cool and unload under aggressive GC config, and the control
+tools execute end to end.
+
+## V1-P7: capability maturity is a ladder, not a declaration ✅ (implemented)
+
+`CapabilityManifest.status` carries `Experimental → Tested → Validated →
+Stable → Deprecated`. The registry pins every out-of-process registration
+to `Experimental` regardless of its declared status — an LLM cannot
+promote its own module — while trusted in-process capabilities keep their
+declaration. The registry exposes the effective status and a catalog
+snapshot for the discovery surface. The full self-improvement loop
+(`capability.inspect/install/test/enable/disable`, with the
+replay/evaluation infrastructure as the evaluator that climbs the
+ladder) is future work on top of this.
+
+## V1-P8: module host manifest restructure + process transport hardening ✅ (implemented)
+
+- `CapabilityTransport` is `Builtin | Process` (`Wasm` documented as
+  future). The trusted core stays in-process; the first version never
+  loads Rust plugins (the ABI is not a stable plugin boundary, and a
+  crashed plugin must not take the runtime down). LLM/third-party
+  extensions are out-of-process over a framed protocol.
+- The manifest declares `provides: Vec<CapabilityKind>` (tool/skill/
+  service) and `requires` (renamed from `dependencies`, still
+  deserializes under the old name).
+- The context-service process boundary is hardened into the reference
+  plugin IPC: a versioned handshake (`PROTOCOL_VERSION` echoed on every
+  response), a per-request deadline (`request_timeout`), and a frame-size
+  bound (`max_frame_bytes`) so a wedged or broken service cannot hang a
+  turn or grow the adapter's memory.
+
+## P2 backlog: provider/tool secondary issues (recorded, not scheduled)
+
+- `RetryingTransport::complete_stream` retries into the same sink: if a
+  stream fails after emitting deltas, the retry can duplicate them. Needs
+  a replay-safe sink or a "no deltas emitted yet" retry guard.
+- The retry `sleep(backoff)` does not select on the cancellation token.
+- The provider stuffs HTTP error bodies into the error string.
+- The OpenAI-compatible interface always sends
+  `stream_options`/`include_usage`/`max_tokens`; per-provider
+  capability/config negotiation should eventually decide these.
+
 ---
 
 ## Later, only after evidence

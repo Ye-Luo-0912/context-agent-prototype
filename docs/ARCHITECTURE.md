@@ -195,6 +195,33 @@ the target untouched. `fs.write` and `edit.replace` both use it —
 `fs.write` now journals every write instead of bypassing the change
 journal.
 
+### Tool lifecycle (V1-P6)
+
+The builtin dispatcher is a catalog with an active set, not a fixed list:
+
+```text
+ToolCatalog → capability discovery → ActiveToolSet → model request
+```
+
+Tools move through `Available → Loaded → Active → Warm → Unloaded`; only
+loaded/active tools appear in `specs()`, and a lazy GC cools idle tools
+out of the surface on every model request. The always-visible control
+tools `capability.search` / `capability.load` / `capability.unload` let
+the model discover and drive the lifecycle (load `git.status` when the
+task needs git). Execution of a catalog tool is always permitted — the
+lifecycle gates the model surface, and the approval gate protects side
+effects.
+
+### Typed labels (V1-P5)
+
+`ContextItem.tags` is `Vec<Label>`, never raw strings: `CoreLabel`
+(decision/finding/constraint/open-loop/artifact-ref/evidence-ref),
+`LifecycleLabel` (promoted/superseded/verified-fixed) and
+`Label::Extension` for namespaced module labels (`ext:github/pr`).
+Labels serialize as their string form and accept any string back, so old
+checkpoints and future labels round-trip; a misspelled tag can no longer
+silently change promotion or GC behavior.
+
 ### Approval flow
 
 `agent-kernel` owns the `ApprovalGate` contract. Two implementations exist:
@@ -493,11 +520,25 @@ Since V1-P0-4 the host is an extension platform with two planes:
   (an LLM can publish new capabilities while the runtime runs), and
   `CapabilityAwareDispatcher` merges built-in and capability tools behind
   one `ToolDispatcher`, routing calls by tool name. The manifest declares
-  id/version/name/summary/permissions/dependencies/lifecycle/transport;
-  dependencies are validated at registration, lifecycle is honored (eager
-  starts with the host, lazy on first use), permissions stay declarative
-  while the advertised tools carry `ToolRisk` levels the approval gate
-  enforces, and only `InProcess` transport is resolved in the prototype.
+  id/version/name/summary/status/provides/permissions/requires/lifecycle/
+  transport; requirements are validated at registration, lifecycle is
+  honored (eager starts with the host, lazy on first use), permissions
+  stay declarative while the advertised tools carry `ToolRisk` levels the
+  approval gate enforces, and `CapabilityTransport::Builtin` is the only
+  in-process plane.
+
+Since V1-P7 the maturity ladder is a registry rule, not a declaration:
+every out-of-process registration is pinned to `Experimental` (the LLM
+cannot promote its own module), while trusted in-process capabilities
+keep their declared status. The registry exposes the effective status and
+a catalog snapshot for the discovery surface.
+
+Since V1-P8 the manifest speaks `provides: Vec<CapabilityKind>`
+(tool/skill/service) and `requires` (the old `dependencies` name still
+deserializes). External extensions are out-of-process over a framed
+protocol; Rust plugins are deliberately out of scope — the ABI is not a
+stable plugin boundary, and a crashed plugin must not take the runtime
+down.
 
 ```text
 ModuleHost
@@ -552,6 +593,14 @@ ContextQuery        -> request op `materialize`
 MaterializedContext <- response payload
 Diagnostics         <- response payload
 ```
+
+Since V1-P8 the wire protocol is the reference plugin IPC shape: a
+versioned handshake (`PROTOCOL_VERSION` echoed on every response, so a
+newer or older service is never misparsed), a per-request deadline
+(`ContextServiceConfig::request_timeout`) so a wedged service cannot hang
+a turn, and a frame-size bound (`max_frame_bytes`) so a broken service
+cannot grow the adapter's memory. A future real ContextCore runtime only
+has to speak the same protocol — nothing on the agent side changes.
 
 The wire protocol carries only `agent-contracts` types — no ContextCore
 vocabulary leaks through the Agent API. A real ContextCore runtime replaces
