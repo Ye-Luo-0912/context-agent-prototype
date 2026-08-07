@@ -2,36 +2,11 @@ use std::collections::HashSet;
 
 use agent_contracts::{ContextItem, ContextRetention, ContextScope, FocusState, ScoreBreakdown};
 
-/// Entity extraction shared by the engine (hot-set maintenance, dependency
-/// linking, supersession) and by scoring (entity affinity). "Entity" is a
-/// cheap, explicit signature: a whitespace-separated token of length >= 3
-/// that carries a path/name/case marker (`.`, `/`, `::`, `_` or an uppercase
-/// letter). Sorted, deduplicated, bounded to 24 per text.
-pub(crate) fn extract_entities(text: &str) -> Vec<String> {
-    let mut entities: Vec<String> = text
-        .split_whitespace()
-        .map(|s| s.trim_matches(|c: char| ",;()[]{}<>\"'`".contains(c)))
-        .filter(|s| {
-            s.len() >= 3
-                && (s.contains('.')
-                    || s.contains('/')
-                    || s.contains("::")
-                    || s.contains('_')
-                    || s.chars().any(|c| c.is_ascii_uppercase()))
-        })
-        .take(24)
-        .map(ToOwned::to_owned)
-        .collect();
-    entities.sort();
-    entities.dedup();
-    entities
-}
-
 /// Explicit, feature-wise score. Each component is kept separate so selection
 /// reasons and replay traces can explain *why* an item scored what it did.
 ///
 /// `hot_entities` is the current working set of entities (named by the last
-/// user message and touched by recent tool observations). It feeds the P4
+/// user message and touched by recent tool observations). It feeds the
 /// `entity_affinity` component.
 pub(crate) fn score_item_with_breakdown(
     item: &ContextItem,
@@ -64,14 +39,14 @@ pub(crate) fn score_item_with_breakdown(
         same_task = item.task_id == Some(focus.task_id);
     }
 
-    // How much of this item's entity signature is hot right now. 0 when
-    // the item (or the hot set) has no entities. This complements focus_match:
+    // How much of this item's entity signature is hot right now. 0 when the
+    // item (or the hot set) has no entities. This complements focus_match:
     // focus entities come from the user message, hot_entities additionally
     // covers files/symbols the agent actually touched via tools.
     let entity_affinity = if hot_entities.is_empty() {
         0.0
     } else {
-        let item_entities = extract_entities(&item.content);
+        let item_entities = crate::index::entity::extract_entities(&item.content);
         if item_entities.is_empty() {
             0.0
         } else {
@@ -207,30 +182,5 @@ mod tests {
         let item = tool_item("all good", 0.5);
         let score = score_item_with_breakdown(&item, None, &["AuthService.rs".to_string()], 100);
         assert_eq!(score.entity_affinity, 0.0);
-    }
-
-    #[test]
-    fn extract_entities_detects_paths_and_case_signatures_only() {
-        assert_eq!(
-            extract_entities("fix AuthService.rs and check src/auth/mod.rs"),
-            vec!["AuthService.rs".to_string(), "src/auth/mod.rs".to_string()]
-        );
-        assert!(
-            extract_entities("all lowercase words without markers").is_empty(),
-            "plain words must not be entities"
-        );
-    }
-
-    #[test]
-    fn extract_entities_is_bounded_and_deduplicated() {
-        let text = (0..40)
-            .map(|i| format!("File{i}.rs"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let entities = extract_entities(&text);
-        assert_eq!(entities.len(), 24, "capped at 24");
-        let mut dedup = entities.clone();
-        dedup.dedup();
-        assert_eq!(entities, dedup, "sorted + deduplicated");
     }
 }

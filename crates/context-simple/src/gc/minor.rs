@@ -1,0 +1,102 @@
+use agent_contracts::{
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextRetention, ContextState,
+    ContextStateTransition,
+};
+
+use crate::diagnostics;
+use crate::engine::{SimpleContextConfig, State};
+use crate::gc::reachability::{drain_supersessions, drain_verifications};
+use crate::residency::next_residency;
+
+/// One maintenance pass over the whole heap: task-completion archival, then
+/// supersession / verification intents, then the per-item residency state
+/// machine. All resulting state changes are recorded as explainable
+/// transitions.
+pub(crate) fn run_minor(
+    state: &mut State,
+    config: &SimpleContextConfig,
+    trigger: ContextMaintenanceTrigger,
+    now_tick: u64,
+    turn: u64,
+) -> ContextMaintenanceReport {
+    let mut report = ContextMaintenanceReport {
+        turn,
+        ..ContextMaintenanceReport::default()
+    };
+    let focus = state.focus.clone();
+    // The hot set is capped at 24 entries and only changes on ingest; clone
+    // once so the loop can read it while items are mutated.
+    let hot_entities = state.hot_entities.clone();
+
+    // Task completion: the completed task's working set leaves active
+    // attention. Done here (not in ingest) so the archival is recorded as a
+    // lifecycle transition.
+    if matches!(trigger, ContextMaintenanceTrigger::TaskCompleted)
+        && let Some(completed) = state.completed_task_id.take()
+    {
+        for item in &mut state.items {
+            if item.task_id == Some(completed)
+                && item.retention != ContextRetention::Pinned
+                && item.state != ContextState::Dropped
+                && item.state != ContextState::Archived
+            {
+                report.archived += 1;
+                report.transitions.push(ContextStateTransition {
+                    item_id: item.id,
+                    kind: item.kind,
+                    scope: item.scope,
+                    from: item.state,
+                    to: ContextState::Archived,
+                    turn,
+                    reason: "task completed: working set archived".to_string(),
+                });
+                item.state = ContextState::Archived;
+            }
+        }
+    }
+
+    // Supersession and verification intents recorded by ingest become
+    // observable state changes here, with explainable reasons.
+    let superseded = drain_supersessions(state, turn);
+    report.archived += superseded.len();
+    report.transitions.extend(superseded);
+    let verified = drain_verifications(state, turn);
+    report.archived += verified.len();
+    report.transitions.extend(verified);
+
+    for item in &mut state.items {
+        let old_state = item.state;
+        let outcome = next_residency(
+            item,
+            config,
+            trigger,
+            now_tick,
+            turn,
+            focus.as_ref(),
+            &hot_entities,
+        );
+        item.state = outcome.state;
+        item.relevance = outcome.relevance;
+
+        if item.state != old_state {
+            match item.state {
+                ContextState::Active => report.promoted += 1,
+                ContextState::Cooling => report.cooled += 1,
+                ContextState::Archived => report.archived += 1,
+                ContextState::Dropped => report.dropped += 1,
+            }
+            report.transitions.push(ContextStateTransition {
+                item_id: item.id,
+                kind: item.kind,
+                scope: item.scope,
+                from: old_state,
+                to: item.state,
+                turn,
+                reason: outcome.reason,
+            });
+        }
+    }
+
+    report.diagnostics = diagnostics::compute(state);
+    report
+}

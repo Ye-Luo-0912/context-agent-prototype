@@ -1,4 +1,15 @@
+mod checkpoint;
+mod diagnostics;
 mod engine;
-mod scoring;
+mod gc;
+mod heap;
+mod index;
+mod item;
+mod materializer;
+mod policy;
+mod residency;
+
+#[cfg(test)]
+mod tests;
 
 pub use engine::{SimpleContextConfig, SimpleContextEngine};

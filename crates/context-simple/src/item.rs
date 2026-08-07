@@ -1,0 +1,67 @@
+use agent_contracts::{
+    ContextItem, ContextItemId, ContextKind, ContextRetention, ContextScope, ContextState,
+};
+
+use crate::engine::{SimpleContextConfig, State};
+
+/// Build a fresh item stamped with the current turn, tick and task. Content
+/// is truncated to the configured bound before it enters the heap.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn make_item(
+    state: &State,
+    config: &SimpleContextConfig,
+    content: String,
+    kind: ContextKind,
+    scope: ContextScope,
+    retention: ContextRetention,
+    importance: f32,
+    source: Option<String>,
+) -> ContextItem {
+    let content = truncate_chars(content, config.max_item_chars);
+    ContextItem {
+        id: ContextItemId::new(),
+        task_id: state.focus.as_ref().map(|f| f.task_id),
+        content,
+        kind,
+        scope,
+        retention,
+        state: ContextState::Active,
+        importance,
+        relevance: 0.5,
+        created_tick: state.tick,
+        last_access_tick: state.tick,
+        access_count: 0,
+        created_turn: state.turn,
+        last_access_turn: state.turn,
+        dependencies: Vec::new(),
+        tags: Vec::new(),
+        source,
+    }
+}
+
+/// Token estimate shared across the crate (ascii chars / 4 + non-ascii chars).
+pub(crate) fn approx_tokens(text: &str) -> usize {
+    let mut ascii = 0usize;
+    let mut non_ascii = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii += 1;
+        } else if !ch.is_whitespace() {
+            non_ascii += 1;
+        }
+    }
+    ascii.div_ceil(4) + non_ascii
+}
+
+pub(crate) fn truncate_chars(mut text: String, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    text = text.chars().take(max_chars).collect();
+    text.push_str("\n...[truncated by context engine]");
+    text
+}
+
+pub(crate) fn short_id(id: &ContextItemId) -> String {
+    id.to_string().chars().take(8).collect()
+}
