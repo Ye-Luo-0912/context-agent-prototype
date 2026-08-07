@@ -15,6 +15,7 @@ pub(crate) fn to_summaries(items: &[ContextItem]) -> Vec<ContextItemSummary> {
             id: item.id,
             kind: item.kind,
             scope: item.scope,
+            scope_id: item.scope_id,
             state: item.state,
             importance: item.importance,
             relevance: item.relevance,

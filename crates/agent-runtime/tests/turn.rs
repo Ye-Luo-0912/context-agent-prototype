@@ -12,10 +12,10 @@ use std::{
 
 use agent_contracts::{
     AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, MaterializedContext,
-    ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage, ModelOutput, ModelRequest,
-    ModelRole, ModelTransport, RuntimeEvent, ToolCall, ToolDispatcher, ToolExecutionRequest,
-    ToolOutput, ToolSpec,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
+    MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage, ModelOutput,
+    ModelRequest, ModelRole, ModelTransport, RuntimeEvent, ScopeId, ScopeKind, ToolCall,
+    ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
 use agent_runtime::{RuntimeHandle, spawn_runtime};
@@ -44,6 +44,12 @@ impl ContextEngine for TestContextEngine {
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),
         })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
     }
     async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
         Ok(ContextDiagnostics::default())
@@ -165,6 +171,12 @@ impl ContextEngine for RecordingContextEngine {
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),
         })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
     }
     async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
         Ok(ContextDiagnostics::default())
@@ -412,5 +424,121 @@ async fn turn_frame_is_execution_stack_not_long_term_memory() {
     assert!(
         after_model > after_tool,
         "AfterModel must run after AfterTool"
+    );
+}
+
+/// Records the scope lifecycle the actor drives and the scope ids carried
+/// by persisted tool observations, so the test can assert that tool scopes
+/// are execution frames — opened at tool start, closed when the model
+/// consumes the result, and that the observations stay tagged with them.
+#[derive(Debug, Default)]
+struct ScopeRecordingEngine {
+    opens: Arc<Mutex<Vec<(ScopeKind, ScopeId)>>>,
+    closes: Arc<Mutex<Vec<ScopeId>>>,
+    observation_scopes: Arc<Mutex<Vec<Option<ScopeId>>>>,
+}
+
+#[async_trait::async_trait]
+impl ContextEngine for ScopeRecordingEngine {
+    async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+        if let ContextIngress::ToolObservation { scope_id, .. } = ingress {
+            self.observation_scopes.lock().await.push(scope_id);
+        }
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            focus: None,
+            items: Vec::new(),
+            selected: Vec::new(),
+            approx_tokens: 0,
+            diagnostics: ContextDiagnostics::default(),
+        })
+    }
+    async fn open_scope(&self, kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        let id = ScopeId::new();
+        self.opens.lock().await.push((kind, id));
+        Ok(id)
+    }
+    async fn close_scope(&self, scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        self.closes.lock().await.push(scope_id);
+        Ok(Vec::new())
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn tool_scope_opens_at_tool_start_and_closes_when_consumed() {
+    let context = Arc::new(ScopeRecordingEngine::default());
+    let model = Arc::new(TwoRoundToolModel::default());
+    let handle = spawn_with(
+        model.clone() as Arc<dyn ModelTransport>,
+        context.clone() as Arc<dyn ContextEngine>,
+        Arc::new(OkToolDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+
+    handle.user_message("go".into()).await.unwrap();
+
+    // Wait for the turn to complete (two model rounds, one tool call).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let mut done = false;
+        while let Ok(envelope) = events.try_recv() {
+            if matches!(envelope.event, RuntimeEvent::TurnCompleted) {
+                done = true;
+            }
+        }
+        if done {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the turn did not complete in time"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Exactly one tool frame: opened at tool start, closed once the second
+    // model round consumed the result.
+    let opens = context.opens.lock().await;
+    assert_eq!(opens.len(), 1, "one tool call -> one tool scope");
+    assert_eq!(opens[0].0, ScopeKind::Tool);
+    let tool_scope = opens[0].1;
+    drop(opens);
+
+    let closes = context.closes.lock().await;
+    assert_eq!(
+        closes.as_slice(),
+        &[tool_scope],
+        "the consumed tool scope must close with its own id"
+    );
+    drop(closes);
+
+    // The persisted observation is tagged with the tool frame even though
+    // persistence happens at turn end, after the frame closed.
+    let observation_scopes = context.observation_scopes.lock().await;
+    assert_eq!(
+        observation_scopes.as_slice(),
+        &[Some(tool_scope)],
+        "the tool observation must carry its producing scope"
     );
 }

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{AgentResult, CancellationToken, ToolCall, ToolOutput, ToolSpec};
+use crate::{AgentResult, CancellationToken, ScopeId, ToolCall, ToolOutput, ToolSpec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelRole {
@@ -99,8 +99,16 @@ impl ModelMessage {
 /// assistant's tool calls or the result that answers them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TurnFrameStep {
-    AssistantToolCalls { calls: Vec<ToolCall> },
-    ToolResult { output: ToolOutput },
+    AssistantToolCalls {
+        calls: Vec<ToolCall>,
+    },
+    ToolResult {
+        output: ToolOutput,
+        /// The tool scope this result belongs to, opened by the runtime at
+        /// tool start; the persisted observation is tagged with it.
+        #[serde(default)]
+        scope_id: Option<ScopeId>,
+    },
 }
 
 /// The runtime-owned execution stack of one turn: the current user message
@@ -130,8 +138,9 @@ impl TurnFrame {
         }
     }
 
-    pub fn push_tool_result(&mut self, output: ToolOutput) {
-        self.steps.push(TurnFrameStep::ToolResult { output });
+    pub fn push_tool_result(&mut self, output: ToolOutput, scope_id: Option<ScopeId>) {
+        self.steps
+            .push(TurnFrameStep::ToolResult { output, scope_id });
     }
 
     pub fn has_tool_steps(&self) -> bool {
@@ -149,7 +158,7 @@ impl TurnFrame {
                 TurnFrameStep::AssistantToolCalls { calls } => {
                     messages.push(ModelMessage::assistant_tool_calls(calls.clone()));
                 }
-                TurnFrameStep::ToolResult { output } => {
+                TurnFrameStep::ToolResult { output, .. } => {
                     messages.push(ModelMessage::tool_result(
                         &output.call_id,
                         &output.tool_name,
@@ -314,15 +323,18 @@ mod tests {
     fn turn_frame_renders_protocol_order() {
         let mut turn = TurnFrame::new("list the files");
         turn.push_tool_calls(vec![tool_call("call-1")]);
-        turn.push_tool_result(ToolOutput {
-            call_id: "call-1".into(),
-            tool_name: "fs.read".into(),
-            ok: true,
-            summary: "read".into(),
-            model_content: "fn main() {}".into(),
-            artifact_ref: None,
-            metadata: json!({}),
-        });
+        turn.push_tool_result(
+            ToolOutput {
+                call_id: "call-1".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "fn main() {}".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            None,
+        );
 
         let messages = turn.messages();
         assert_eq!(messages.len(), 3);
@@ -343,15 +355,18 @@ mod tests {
     fn model_input_flattens_five_layers_in_order() {
         let mut turn = TurnFrame::new("continue");
         turn.push_tool_calls(vec![tool_call("c2")]);
-        turn.push_tool_result(ToolOutput {
-            call_id: "c2".into(),
-            tool_name: "fs.read".into(),
-            ok: true,
-            summary: "read".into(),
-            model_content: "content".into(),
-            artifact_ref: None,
-            metadata: json!({}),
-        });
+        turn.push_tool_result(
+            ToolOutput {
+                call_id: "c2".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "content".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            None,
+        );
         let input = ModelInput {
             system_policy: vec![ModelMessage::system("policy")],
             focus_frame: Some("goal text".into()),

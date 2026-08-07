@@ -9,9 +9,10 @@ use std::{
 use agent_contracts::{
     AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, ContextEngine, ContextIngress,
     ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextQuery, EventJournal, FocusState, MaterializedContext, ModelEventSink, ModelOutput,
-    ModelRequest, ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, TaskId, ToolCall,
-    ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
+    ContextQuery, ContextStateTransition, EventJournal, FocusState, MaterializedContext,
+    ModelEventSink, ModelOutput, ModelRequest, ModelTransport, RunId, RuntimeEvent,
+    RuntimeEventEnvelope, ScopeId, ScopeKind, TaskId, ToolCall, ToolDispatcher,
+    ToolExecutionRequest, ToolOutput, ToolSpec,
 };
 use tokio::sync::broadcast;
 
@@ -153,6 +154,23 @@ impl AgentKernel {
         query: ContextQuery,
     ) -> AgentResult<MaterializedContext> {
         self.context.materialize(query).await
+    }
+
+    /// Open a scope (runtime-driven, e.g. a tool scope at tool start).
+    pub async fn context_open_scope(
+        &self,
+        kind: ScopeKind,
+        parent: Option<ScopeId>,
+    ) -> AgentResult<ScopeId> {
+        self.context.open_scope(kind, parent).await
+    }
+
+    /// Close a scope the runtime opened; returns the close transitions.
+    pub async fn context_close_scope(
+        &self,
+        scope_id: ScopeId,
+    ) -> AgentResult<Vec<ContextStateTransition>> {
+        self.context.close_scope(scope_id).await
     }
 
     /// One model round: stream the request to the provider. The result is a

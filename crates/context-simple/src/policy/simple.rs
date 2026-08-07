@@ -130,6 +130,7 @@ mod tests {
         ContextItem {
             id: ContextItemId::new(),
             task_id: None,
+            scope_id: None,
             content: content.to_string(),
             kind: ContextKind::ToolObservation,
             scope: ContextScope::Turn,

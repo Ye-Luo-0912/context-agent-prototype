@@ -21,6 +21,7 @@ pub(crate) fn make_item(
     ContextItem {
         id: ContextItemId::new(),
         task_id: state.focus.as_ref().map(|f| f.task_id),
+        scope_id: state.active_scope_id,
         content,
         kind,
         scope,

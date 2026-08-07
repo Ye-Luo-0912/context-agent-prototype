@@ -13,7 +13,8 @@ use std::sync::Mutex as StdMutex;
 use agent_contracts::{
     AgentError, AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextKind,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextScope,
-    ContextSelection, ContextState, ContextStateTransition, MaterializedContext, ScoreBreakdown,
+    ContextSelection, ContextState, ContextStateTransition, MaterializedContext, ScopeId,
+    ScopeKind, ScoreBreakdown,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -115,7 +116,6 @@ impl ContextEngine for RollingSummaryEngine {
     ) -> AgentResult<ContextMaintenanceReport> {
         let mut state = self.state.lock().expect("rolling state poisoned");
         let mut transitions: Vec<ContextStateTransition> = Vec::new();
-
         while state.total_tokens() > self.config.summary_threshold_tokens {
             // How many oldest records fall outside the newest verbatim
             // window (measured in tokens, newest first)?
@@ -171,6 +171,17 @@ impl ContextEngine for RollingSummaryEngine {
             diagnostics: state.diagnostics(),
             ..ContextMaintenanceReport::default()
         })
+    }
+
+    // The baseline retains no scope tree: scope ids are accepted so the
+    // runtime's execution-frame protocol works against any engine, and
+    // closing is a no-op because nothing is ever scoped.
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
     }
 
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {

@@ -68,6 +68,7 @@ mod tests {
                     artifact_ref: None,
                     metadata: json!({}),
                 },
+                scope_id: None,
             })
             .await
             .unwrap();

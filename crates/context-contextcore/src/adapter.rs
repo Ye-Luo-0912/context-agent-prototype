@@ -18,7 +18,8 @@ use std::{
 
 use agent_contracts::{
     AgentError, AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, MaterializedContext,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
+    MaterializedContext, ScopeId, ScopeKind,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -235,6 +236,18 @@ impl ContextEngine for ContextServiceAdapter {
         let value = self.call(ServiceOp::Materialize { query }).await?;
         serde_json::from_value(value)
             .map_err(|e| AgentError::Context(format!("decode materialized context: {e}")))
+    }
+
+    async fn open_scope(&self, kind: ScopeKind, parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        let value = self.call(ServiceOp::OpenScope { kind, parent }).await?;
+        serde_json::from_value(value)
+            .map_err(|e| AgentError::Context(format!("decode scope id: {e}")))
+    }
+
+    async fn close_scope(&self, scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        let value = self.call(ServiceOp::CloseScope { scope_id }).await?;
+        serde_json::from_value(value)
+            .map_err(|e| AgentError::Context(format!("decode scope close: {e}")))
     }
 
     async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {

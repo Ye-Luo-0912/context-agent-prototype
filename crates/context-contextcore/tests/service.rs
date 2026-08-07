@@ -188,6 +188,7 @@ async fn service_equivalence_with_in_process_engine() {
                         artifact_ref: None,
                         metadata: json!({}),
                     },
+                    scope_id: None,
                 })
                 .await
                 .unwrap();

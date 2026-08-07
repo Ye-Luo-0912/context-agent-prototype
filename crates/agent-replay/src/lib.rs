@@ -169,6 +169,7 @@ pub async fn run_engine(
                 engine
                     .ingest(ContextIngress::ToolObservation {
                         output: output.clone(),
+                        scope_id: None,
                     })
                     .await?;
             }

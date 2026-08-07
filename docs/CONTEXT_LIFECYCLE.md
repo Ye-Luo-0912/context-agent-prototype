@@ -193,17 +193,23 @@ scope is the current attention container (`active_scope_id`).
 - `Focus` is the attention container of a task, active across turns;
   it opens with the first user message / focus change and closes when
   its task closes.
-- `Tool` opens per tool observation and closes at the next
-  `maintain(AfterModel)` — the model consumed the result. Tool scopes
-  are observational containers: their ephemeral results leave through
-  residency (§9), so closing one records the boundary without touching
-  items.
+- `Tool` is an execution frame driven by the runtime (V1-P0-3): it opens
+  when the tool starts (`ContextEngine::open_scope`) and closes when the
+  next model round consumes the result (`ContextEngine::close_scope`).
+  The observation persisted at turn end carries the tool scope id, so
+  membership is authoritative even though persistence is batched. Tool
+  scopes are containers, not eviction passes: durable members promote to
+  the parent, ephemeral/working results leave through residency (§9) and
+  error verification (§9b).
 
 Scope close is uniform: durable outcomes are promoted to the nearest
 open ancestor, the rest is released (a completed task's working set is
 evicted; a focus close returns its working set to the task and the
-normal lifecycle cools it). Scope counts are exposed through
-`ContextDiagnostics` and checkpoints round-trip the tree.
+normal lifecycle cools it). Since V1-P0-3 every item carries the
+`scope_id` of the scope that produced it — membership is no longer
+inferred from the `scope` marker, task id and creation time. Scope
+counts are exposed through `ContextDiagnostics` and checkpoints
+round-trip the tree.
 
 ## 9. Tool observations
 

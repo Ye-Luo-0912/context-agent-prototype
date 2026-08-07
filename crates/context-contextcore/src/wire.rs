@@ -5,7 +5,9 @@
 //! kernel contract unchanged when the service behind the socket is swapped
 //! for a real ContextCore runtime.
 
-use agent_contracts::{ContextIngress, ContextMaintenanceTrigger, ContextQuery};
+use agent_contracts::{
+    ContextIngress, ContextMaintenanceTrigger, ContextQuery, ScopeId, ScopeKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -32,6 +34,13 @@ pub enum ServiceOp {
     },
     Materialize {
         query: ContextQuery,
+    },
+    OpenScope {
+        kind: ScopeKind,
+        parent: Option<ScopeId>,
+    },
+    CloseScope {
+        scope_id: ScopeId,
     },
     Diagnostics,
     Inspect {

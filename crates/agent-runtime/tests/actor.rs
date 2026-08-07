@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use agent_contracts::{
     AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, MaterializedContext,
-    ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput, ModelRequest, ModelTransport,
-    RuntimeEvent, ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
+    MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput, ModelRequest,
+    ModelTransport, RuntimeEvent, ScopeId, ScopeKind, ToolDispatcher, ToolExecutionRequest,
+    ToolOutput, ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
 use agent_runtime::{RuntimeHandle, spawn_runtime};
@@ -36,6 +37,12 @@ impl ContextEngine for TestContextEngine {
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),
         })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
     }
     async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
         Ok(ContextDiagnostics::default())

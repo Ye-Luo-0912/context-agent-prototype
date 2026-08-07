@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use agent_contracts::{
     AgentResult, ApprovalGate, ContextDiagnostics, ContextEngine, ContextIngress,
     ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
-    MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport,
-    ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
+    ContextStateTransition, MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest,
+    ModelTransport, ScopeId, ScopeKind, ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
 };
 use agent_runtime::{
     APPROVAL_POLICY, CapabilityId, ContextModule, ModelModule, Module, ModuleHost, ServiceRegistry,
@@ -36,6 +36,12 @@ impl ContextEngine for StubContextEngine {
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),
         })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
     }
     async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
         Ok(ContextDiagnostics::default())

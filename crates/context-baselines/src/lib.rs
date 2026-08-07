@@ -65,6 +65,7 @@ mod tests {
             engine
                 .ingest(ContextIngress::ToolObservation {
                     output: tool_output(true, &format!("tool round {round} output")),
+                    scope_id: None,
                 })
                 .await
                 .unwrap();

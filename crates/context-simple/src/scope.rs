@@ -121,13 +121,15 @@ pub(crate) fn open_focus_scope(state: &mut State) -> ScopeId {
     id
 }
 
-/// Open a tool scope for one tool call, nested under the current attention
-/// scope (focus or task). The scope ends when the model consumes the result.
-pub(crate) fn open_tool_scope(state: &mut State) -> ScopeId {
+/// Open a fresh scope under `parent` (or the current active scope when
+/// `parent` is `None`) and make it the active scope. The runtime drives
+/// tool scopes this way: a scope opens when its tool starts, not when the
+/// observation is later persisted.
+pub(crate) fn open_scope(state: &mut State, kind: ScopeKind, parent: Option<ScopeId>) -> ScopeId {
     let scope = Scope {
         id: ScopeId::new(),
-        parent: state.active_scope_id,
-        kind: ScopeKind::Tool,
+        parent: parent.or(state.active_scope_id),
+        kind,
         state: ScopeState::Active,
         task_id: state.focus.as_ref().map(|f| f.task_id),
         goal: None,
@@ -141,15 +143,25 @@ pub(crate) fn open_tool_scope(state: &mut State) -> ScopeId {
     id
 }
 
-/// The model just consumed the previous round's tool results: queue every
-/// open tool scope for close. The ephemeral results themselves leave the
-/// heap through residency; this records the container boundary.
-pub(crate) fn queue_tool_scope_closes(state: &mut State) {
-    for scope in &state.scopes {
-        if scope.kind == ScopeKind::Tool && scope.state != ScopeState::Closed {
-            state.pending_closed_scopes.push(scope.id);
-        }
+/// Close a scope the runtime opened: mark it closed, promote its durable
+/// members to the nearest open ancestor, reactivate the parent, and return
+/// the transitions the close produced. Unknown or already-closed scopes are
+/// no-ops.
+pub(crate) fn close_scope(state: &mut State, scope_id: ScopeId) -> Vec<ContextStateTransition> {
+    let Some(index) = state.scopes.iter().position(|scope| scope.id == scope_id) else {
+        return Vec::new();
+    };
+    if state.scopes[index].state == ScopeState::Closed {
+        return Vec::new();
     }
+    state.scopes[index].state = ScopeState::Closed;
+    state.scopes[index].closed_tick = Some(state.tick);
+    let scope = state.scopes[index].clone();
+    let parent_id = nearest_open_parent(state, &scope);
+    if state.active_scope_id == Some(scope.id) {
+        state.active_scope_id = parent_id;
+    }
+    close_members(state, &scope, parent_id, state.turn)
 }
 
 /// Queue the completed task's scope, plus its focus child, for close. The
@@ -226,8 +238,10 @@ fn nearest_open_parent(state: &State, scope: &Scope) -> Option<ScopeId> {
 /// Move the scope's surviving items: durable outcomes are promoted to the
 /// parent scope, the rest of a completed task's working set is evicted.
 /// Focus closes only promote — the working set returns to the task scope and
-/// the normal lifecycle cools it. Tool scopes are observational containers
-/// whose ephemeral results leave via residency, so they touch no items.
+/// the normal lifecycle cools it. Tool scopes promote their durable outcomes
+/// and leave the ephemeral/working results to residency and error
+/// verification — a tool frame is a container boundary, not an eviction
+/// pass. Session scopes are never closed.
 fn close_members(
     state: &mut State,
     scope: &Scope,
@@ -235,7 +249,7 @@ fn close_members(
     turn: u64,
 ) -> Vec<ContextStateTransition> {
     let mut transitions = Vec::new();
-    if matches!(scope.kind, ScopeKind::Tool | ScopeKind::Session) {
+    if matches!(scope.kind, ScopeKind::Session) {
         return transitions;
     }
     let parent_scope = parent_id
@@ -245,8 +259,15 @@ fn close_members(
             ScopeKind::Task | ScopeKind::Focus => ContextScope::Task,
             ScopeKind::Tool => ContextScope::Turn,
         });
+    // A precomputed view of the tree so membership can be checked while
+    // items are mutated.
+    let scope_index: Vec<(ScopeId, ScopeKind, Option<ScopeId>)> = state
+        .scopes
+        .iter()
+        .map(|scope| (scope.id, scope.kind, scope.parent))
+        .collect();
     for item in &mut state.items {
-        if !belongs_to(item, scope) {
+        if !belongs_to(&scope_index, item, scope) {
             continue;
         }
         if matches!(item.state, ContextState::Dropped | ContextState::Archived) {
@@ -271,9 +292,41 @@ fn close_members(
     transitions
 }
 
-/// An item belongs to a scope when its own scope marker and task match the
-/// container, and for focus scopes it was created while the focus was open.
-fn belongs_to(item: &ContextItem, scope: &Scope) -> bool {
+/// An item belongs to a scope through its `scope_id` — the authoritative
+/// membership stamped when the item was created. Task and focus closes also
+/// see items of focus descendants (the work done under the task's focus),
+/// but tool frames stay out: their observations leave through residency and
+/// error verification, not scope close. Items without a `scope_id` (restored
+/// old checkpoints) fall back to the pre-scope inference.
+fn belongs_to(
+    scopes: &[(ScopeId, ScopeKind, Option<ScopeId>)],
+    item: &ContextItem,
+    scope: &Scope,
+) -> bool {
+    let Some(item_scope_id) = item.scope_id else {
+        return legacy_belongs_to(item, scope);
+    };
+    if scope.kind == ScopeKind::Tool {
+        return item_scope_id == scope.id;
+    }
+    let mut current = Some(item_scope_id);
+    while let Some(sid) = current {
+        if sid == scope.id {
+            return true;
+        }
+        let Some((_, kind, parent)) = scopes.iter().find(|(id, ..)| *id == sid) else {
+            return false;
+        };
+        if *kind == ScopeKind::Tool {
+            return false;
+        }
+        current = *parent;
+    }
+    false
+}
+
+/// The pre-`scope_id` membership rule, kept for items without a scope stamp.
+fn legacy_belongs_to(item: &ContextItem, scope: &Scope) -> bool {
     match scope.kind {
         ScopeKind::Task => item.scope == ContextScope::Task && item.task_id == scope.task_id,
         ScopeKind::Focus => {

@@ -261,15 +261,22 @@ A `MaterializedContext` is a disposable projection of the Context Frame. It
 is not the source of truth and should never be persisted as the memory
 model.
 
-Since V1-M2 the engine keeps a runtime **scope tree** (Session -> Task ->
-Focus -> Tool) as the first-class unit of residency. Scopes carry their own
-lifecycle (Open / Active / Suspended / Closed) and own the items created
-while they were active: closing a task scope promotes its durable outcomes
-(decisions, findings, constraints, open loops, artifact/evidence refs,
-pinned items) to the session and evicts the rest of the working set. The
-scope tree is engine state, exposed through `ContextDiagnostics` counts and
-round-tripped by checkpoints; the kernel drives it implicitly through
-`ingest`/`maintain`, never by touching scope internals.
+Since V1-M2 the engine keeps a **scope tree** (Session -> Task -> Focus ->
+Tool) as the first-class unit of residency, and since V1-P0-3 membership is
+authoritative: every item carries the `scope_id` of the scope it was
+produced in. Scopes carry their own lifecycle (Open / Active / Suspended /
+Closed) and own the items created while they were active: closing a task
+scope promotes its durable outcomes (decisions, findings, constraints, open
+loops, artifact/evidence refs, pinned items) to the session and evicts the
+rest of the working set. Tool scopes are execution frames driven by the
+runtime actor: opened at tool start (`ContextEngine::open_scope`), closed
+when the next model round consumes the result (`ContextEngine::close_scope`);
+the observation persisted at turn end stays tagged with the tool scope id.
+The scope tree is engine state, exposed through `ContextDiagnostics` counts
+and round-tripped by checkpoints; the runtime drives the timing-sensitive
+tool frames explicitly, while session/task/focus open from the focus-state
+ingests (`Start` / `set_focus`) and task close still flows through
+`maintain(TaskCompleted)` so promotion transitions stay observable.
 
 ## 7. Tool output policy
 

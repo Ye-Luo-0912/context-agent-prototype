@@ -10,7 +10,8 @@ use std::{collections::VecDeque, sync::Arc};
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, ContextHints, ContextIngress,
     ContextMaintenanceTrigger, ContextQuery, ModelRequest, OperationId, OperationOutcome,
-    OperationResult, RuntimeEvent, ScopeId, TaskId, ToolCall, TurnFrame, TurnFrameStep, TurnId,
+    OperationResult, RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall, TurnFrame, TurnFrameStep,
+    TurnId,
 };
 use agent_kernel::AgentKernel;
 use tokio::sync::mpsc;
@@ -33,6 +34,8 @@ struct InFlightOp {
     operation_id: OperationId,
     turn_id: TurnId,
     generation: u64,
+    /// The tool scope opened for this operation (tool ops only).
+    scope_id: Option<ScopeId>,
     cancel: CancellationToken,
 }
 
@@ -319,9 +322,14 @@ impl RuntimeActor {
         }
     }
 
-    /// Prepare + spawn one model round: maintenance, snapshot, model input
-    /// assembly, then the model call as an operation.
+    /// Prepare + spawn one model round: close the consumed tool frames,
+    /// maintenance, materialize, assemble, then the model call as an
+    /// operation.
     async fn spawn_model_operation(&mut self, op_tx: &mpsc::Sender<OperationCompletion>) {
+        // The previous round's tool frames end here: the model request below
+        // consumes their results (they ride in the turn frame).
+        self.close_tool_frames().await;
+
         let Some(turn) = self.state.turn.as_mut() else {
             return;
         };
@@ -401,6 +409,7 @@ impl RuntimeActor {
             operation_id,
             turn_id,
             generation,
+            scope_id: None,
             cancel: cancel.clone(),
         });
 
@@ -453,8 +462,8 @@ impl RuntimeActor {
         });
     }
 
-    /// Prepare + spawn one tool call: emit ToolStarted, then run approval +
-    /// dispatch as an operation.
+    /// Prepare + spawn one tool call: open the tool's execution frame, emit
+    /// ToolStarted, then run approval + dispatch as an operation.
     async fn spawn_tool_operation(
         &mut self,
         call: ToolCall,
@@ -464,6 +473,22 @@ impl RuntimeActor {
             return;
         };
         let turn_id = turn.turn_id;
+
+        // The tool scope opens when the tool starts — it is an execution
+        // frame, not a batch artifact of turn-end persistence.
+        let tool_scope = match self.kernel.context_open_scope(ScopeKind::Tool, None).await {
+            Ok(scope) => Some(scope),
+            Err(error) => {
+                let _ = self
+                    .kernel
+                    .emit_event(RuntimeEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                self.state.turn = None;
+                return;
+            }
+        };
         let _ = self
             .kernel
             .emit_event(RuntimeEvent::ToolStarted { call: call.clone() })
@@ -476,6 +501,7 @@ impl RuntimeActor {
             operation_id,
             turn_id,
             generation,
+            scope_id: tool_scope,
             cancel: cancel.clone(),
         });
 
@@ -483,7 +509,6 @@ impl RuntimeActor {
         let op_tx = op_tx.clone();
         let run_id = kernel.run_id();
         let task_id = self.state.task_id;
-        let scope_id = self.state.scope_id;
         tokio::spawn(async move {
             let output = kernel.execute_tool(call, cancel).await;
             let _ = op_tx
@@ -492,7 +517,7 @@ impl RuntimeActor {
                         run_id,
                         turn_id,
                         task_id,
-                        scope_id,
+                        scope_id: tool_scope,
                         operation_id,
                         generation,
                         outcome: OperationOutcome::ToolOutput(output),
@@ -527,6 +552,7 @@ impl RuntimeActor {
             return;
         }
 
+        let op_scope_id = completion.operation.scope_id;
         if let Some(turn) = self.state.turn.as_mut() {
             turn.op = None;
         }
@@ -547,7 +573,8 @@ impl RuntimeActor {
             }
             OperationOutcome::ToolOutput(output) => {
                 if let Some(turn) = self.state.turn.as_mut() {
-                    turn.turn_frame.push_tool_result(output.clone());
+                    turn.turn_frame
+                        .push_tool_result(output.clone(), op_scope_id);
                 }
                 let _ = self
                     .kernel
@@ -592,16 +619,18 @@ impl RuntimeActor {
     }
 
     /// When the model stops calling tools, the turn's tool observations
-    /// become the long-term record, then the final assistant message.
+    /// become the long-term record, then the final assistant message. Each
+    /// observation is tagged with the tool scope that produced it.
     async fn finalize_turn(&mut self, content: String) {
         let mut ingested = false;
         if let Some(turn) = self.state.turn.as_mut() {
             for step in &turn.turn_frame.steps {
-                if let TurnFrameStep::ToolResult { output } = step
+                if let TurnFrameStep::ToolResult { output, scope_id } = step
                     && self
                         .kernel
                         .context_ingest(ContextIngress::ToolObservation {
                             output: output.clone(),
+                            scope_id: *scope_id,
                         })
                         .await
                         .is_ok()
@@ -661,10 +690,37 @@ impl RuntimeActor {
         self.state.turn = None;
     }
 
+    /// Close every tool frame the turn opened (from committed results and
+    /// the in-flight op). Called before each model round — the request
+    /// consumes the previous results — and on cancellation, so no tool
+    /// scope outlives its execution frame. Already-closed scopes are no-ops.
+    async fn close_tool_frames(&mut self) {
+        let mut scope_ids: Vec<ScopeId> = Vec::new();
+        if let Some(turn) = self.state.turn.as_ref() {
+            for step in &turn.turn_frame.steps {
+                if let TurnFrameStep::ToolResult {
+                    scope_id: Some(id), ..
+                } = step
+                {
+                    scope_ids.push(*id);
+                }
+            }
+            if let Some(op) = turn.op.as_ref()
+                && let Some(id) = op.scope_id
+            {
+                scope_ids.push(id);
+            }
+        }
+        for scope_id in scope_ids {
+            let _ = self.kernel.context_close_scope(scope_id).await;
+        }
+    }
+
     /// Cancel the active turn: the cancellation decision is committed now
     /// (warning + TurnCompleted), the in-flight operation's late completion
     /// arrives stale and is dropped.
     async fn cancel_turn(&mut self) {
+        self.close_tool_frames().await;
         if let Some(turn) = self.state.turn.as_mut() {
             if let Some(op) = turn.op.take() {
                 op.cancel.cancel();

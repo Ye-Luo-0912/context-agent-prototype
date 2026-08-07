@@ -1,7 +1,8 @@
 use agent_contracts::{
     AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItem, ContextItemId,
     ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextQuery, ContextRetention, ContextScope, FocusState, MaterializedContext, Scope, ScopeId,
+    ContextQuery, ContextRetention, ContextScope, ContextStateTransition, FocusState,
+    MaterializedContext, Scope, ScopeId, ScopeKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -182,11 +183,8 @@ impl ContextEngine for SimpleContextEngine {
                 );
                 dependency::push_linked(&mut state, &self.config, item);
             }
-            ContextIngress::ToolObservation { output } => {
+            ContextIngress::ToolObservation { output, scope_id } => {
                 state.tool_round += 1;
-                // One tool scope per call, closed when the model consumes
-                // the result (maintain AfterModel).
-                scope::open_tool_scope(&mut state);
                 let mut content = output.model_content;
                 if let Some(artifact_ref) = output.artifact_ref {
                     content.push_str("\nartifact: ");
@@ -235,6 +233,13 @@ impl ContextEngine for SimpleContextEngine {
                     if ok { 0.58 } else { 0.82 },
                     Some(format!("tool:{}", output.tool_name)),
                 );
+                // The runtime opened the tool scope at tool start; the
+                // observation is tagged with that frame even though it is
+                // persisted at turn end.
+                let mut item = item;
+                if let Some(tool_scope_id) = scope_id {
+                    item.scope_id = Some(tool_scope_id);
+                }
                 dependency::push_linked(&mut state, &self.config, item);
             }
             ContextIngress::FocusChanged { mut focus } => {
@@ -310,6 +315,18 @@ impl ContextEngine for SimpleContextEngine {
         let mut state = self.state.lock().await;
         state.tick += 1;
         Ok(materializer::materialize(&mut state, &self.config, &query))
+    }
+
+    async fn open_scope(&self, kind: ScopeKind, parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        let mut state = self.state.lock().await;
+        state.tick += 1;
+        Ok(scope::open_scope(&mut state, kind, parent))
+    }
+
+    async fn close_scope(&self, scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        let mut state = self.state.lock().await;
+        state.tick += 1;
+        Ok(scope::close_scope(&mut state, scope_id))
     }
 
     async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {

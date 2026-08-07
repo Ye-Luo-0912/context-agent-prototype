@@ -53,6 +53,14 @@ async fn handle(op: ServiceOp, engine: &dyn ContextEngine) -> Result<Value, Agen
             let materialized = engine.materialize(query).await?;
             serde_json::to_value(materialized).map_err(|e| AgentError::Context(e.to_string()))
         }
+        ServiceOp::OpenScope { kind, parent } => {
+            let scope_id = engine.open_scope(kind, parent).await?;
+            serde_json::to_value(scope_id).map_err(|e| AgentError::Context(e.to_string()))
+        }
+        ServiceOp::CloseScope { scope_id } => {
+            let transitions = engine.close_scope(scope_id).await?;
+            serde_json::to_value(transitions).map_err(|e| AgentError::Context(e.to_string()))
+        }
         ServiceOp::Diagnostics => {
             let diagnostics = engine.diagnostics().await?;
             serde_json::to_value(diagnostics).map_err(|e| AgentError::Context(e.to_string()))

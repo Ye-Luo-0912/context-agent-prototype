@@ -46,6 +46,12 @@ pub enum ContextState {
 pub struct ContextItem {
     pub id: ContextItemId,
     pub task_id: Option<TaskId>,
+    /// The scope this item was produced in, from the runtime-driven scope
+    /// tree. Authoritative membership: a closed scope promotes/evicts the
+    /// items carrying its id. `None` only for items created before scope
+    /// tracking existed (e.g. restored old checkpoints).
+    #[serde(default)]
+    pub scope_id: Option<ScopeId>,
     pub content: String,
     pub kind: ContextKind,
     pub scope: ContextScope,
@@ -140,6 +146,11 @@ pub enum ContextIngress {
     },
     ToolObservation {
         output: ToolOutput,
+        /// The tool scope the observation belongs to, opened by the runtime
+        /// at tool start. `None` when the caller has no scope tracking
+        /// (replay, standalone use).
+        #[serde(default)]
+        scope_id: Option<ScopeId>,
     },
     FocusChanged {
         focus: FocusState,
@@ -288,6 +299,8 @@ pub struct ContextItemSummary {
     pub id: ContextItemId,
     pub kind: ContextKind,
     pub scope: ContextScope,
+    #[serde(default)]
+    pub scope_id: Option<ScopeId>,
     pub state: ContextState,
     pub importance: f32,
     pub relevance: f32,
@@ -315,6 +328,18 @@ pub trait ContextEngine: Send + Sync {
     /// and expand the selection, returning structured items. The runtime
     /// turns them into prompt text via its prompt assembler.
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext>;
+
+    /// Open a fresh scope under `parent` (or the current active scope when
+    /// `parent` is `None`) and make it the active scope. The runtime drives
+    /// tool scopes this way — a scope opens when its tool starts, not when
+    /// the observation is later persisted. Items created while the scope is
+    /// active carry its id.
+    async fn open_scope(&self, kind: ScopeKind, parent: Option<ScopeId>) -> AgentResult<ScopeId>;
+
+    /// Close a scope: mark it closed, promote its durable members to the
+    /// nearest open ancestor, reactivate the parent, and record the
+    /// transitions the close produced.
+    async fn close_scope(&self, scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>>;
 
     async fn diagnostics(&self) -> AgentResult<ContextDiagnostics>;
 

@@ -28,11 +28,10 @@ pub(crate) fn run_minor(
     // once so the loop can read it while items are mutated.
     let hot_entities = state.hot_entities.clone();
 
-    // The model consumed the last round's tool results: their scopes end
-    // here. Ephemeral results leave through the residency pass below.
-    if matches!(trigger, ContextMaintenanceTrigger::AfterModel) {
-        scope::queue_tool_scope_closes(state);
-    }
+    // The model consumed the last round's tool results. Their scopes are
+    // execution frames driven by the runtime (opened at tool start, closed
+    // when the next model round begins), so nothing to queue here; the
+    // ephemeral results leave through the residency pass below.
 
     // Scope closes queued by ingest (task completed) become observable state
     // changes here: durable outcomes are promoted to the parent scope, the

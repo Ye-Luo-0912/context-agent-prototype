@@ -11,7 +11,7 @@ use std::sync::Mutex as StdMutex;
 use agent_contracts::{
     AgentError, AgentResult, ContextDiagnostics, ContextEngine, ContextIngress,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextSelection,
-    MaterializedContext, ScoreBreakdown,
+    ContextStateTransition, MaterializedContext, ScopeId, ScopeKind, ScoreBreakdown,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,17 @@ impl ContextEngine for AppendOnlyEngine {
             turn: state.turn,
             ..ContextMaintenanceReport::default()
         })
+    }
+
+    // The baseline retains no scope tree: scope ids are accepted so the
+    // runtime's execution-frame protocol works against any engine, and
+    // closing is a no-op because nothing is ever scoped.
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
     }
 
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {

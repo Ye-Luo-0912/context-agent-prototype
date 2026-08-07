@@ -28,6 +28,7 @@ async fn successful_observation_is_ephemeral_but_failure_persists_until_verified
                 artifact_ref: Some("artifact://run/test.log".into()),
                 metadata: serde_json::Value::Null,
             },
+            scope_id: None,
         })
         .await
         .unwrap();
@@ -57,6 +58,7 @@ async fn successful_observation_is_ephemeral_but_failure_persists_until_verified
                 artifact_ref: None,
                 metadata: serde_json::Value::Null,
             },
+            scope_id: None,
         })
         .await
         .unwrap();
@@ -143,6 +145,7 @@ async fn maintenance_records_transitions_with_reasons() {
                 artifact_ref: None,
                 metadata: serde_json::Value::Null,
             },
+            scope_id: None,
         })
         .await
         .unwrap();
@@ -414,6 +417,7 @@ async fn recurring_failure_supersedes_prior_error() {
                     artifact_ref: None,
                     metadata: serde_json::Value::Null,
                 },
+                scope_id: None,
             })
             .await
             .unwrap();
@@ -487,6 +491,7 @@ async fn hot_entities_follow_user_then_tool_then_reset() {
                 artifact_ref: None,
                 metadata: serde_json::Value::Null,
             },
+            scope_id: None,
         })
         .await
         .unwrap();
@@ -536,6 +541,7 @@ async fn ingest_links_items_sharing_entities() {
                 artifact_ref: None,
                 metadata: serde_json::Value::Null,
             },
+            scope_id: None,
         })
         .await
         .unwrap();
@@ -571,6 +577,7 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
         let hub = ContextItem {
             id: hub_id,
             task_id: None,
+            scope_id: None,
             content: "hub data ".repeat(400), // ~2000 tokens
             kind: ContextKind::UserMessage,
             scope: ContextScope::Task,
@@ -590,6 +597,7 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
         let dep = ContextItem {
             id: dep_id,
             task_id: None,
+            scope_id: None,
             content: "dependency detail ".repeat(600), // ~10800 chars, ~2700 tokens
             kind: ContextKind::FileObservation,
             scope: ContextScope::Turn,
@@ -653,6 +661,7 @@ async fn dependency_expansion_can_be_disabled() {
         let hub = ContextItem {
             id: hub_id,
             task_id: None,
+            scope_id: None,
             content: "hub data ".repeat(400),
             kind: ContextKind::UserMessage,
             scope: ContextScope::Task,
@@ -672,6 +681,7 @@ async fn dependency_expansion_can_be_disabled() {
         let dep = ContextItem {
             id: dep_id,
             task_id: None,
+            scope_id: None,
             content: "dependency detail ".repeat(1200),
             kind: ContextKind::FileObservation,
             scope: ContextScope::Turn,
@@ -723,6 +733,7 @@ async fn archived_dependency_below_threshold_stays_out() {
         let hub = ContextItem {
             id: hub_id,
             task_id: None,
+            scope_id: None,
             content: "hub data ".repeat(400),
             kind: ContextKind::UserMessage,
             scope: ContextScope::Task,
@@ -742,6 +753,7 @@ async fn archived_dependency_below_threshold_stays_out() {
         let dep = ContextItem {
             id: dep_id,
             task_id: None,
+            scope_id: None,
             content: "stale dependency".into(),
             kind: ContextKind::FileObservation,
             scope: ContextScope::Turn,
@@ -874,7 +886,11 @@ async fn task_scope_suspends_when_focus_switches_task() {
 }
 
 #[tokio::test]
-async fn tool_scope_closes_when_model_consumes_result() {
+async fn tool_scope_lifecycle_is_runtime_driven() {
+    // The tool scope is an execution frame: the runtime opens it at tool
+    // start (not at observation ingest) and closes it once the model
+    // consumed the result. The observation persisted later carries the
+    // scope id, so membership stays authoritative.
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
     engine
         .ingest(ContextIngress::UserMessage {
@@ -882,20 +898,22 @@ async fn tool_scope_closes_when_model_consumes_result() {
         })
         .await
         .unwrap();
-    engine
-        .ingest(ContextIngress::ToolObservation {
-            output: ToolOutput {
-                call_id: "1".into(),
-                tool_name: "shell.exec".into(),
-                ok: true,
-                summary: "tests pass".into(),
-                model_content: "3 passed in Build.kt".into(),
-                artifact_ref: None,
-                metadata: serde_json::Value::Null,
-            },
-        })
-        .await
-        .unwrap();
+    let before = engine.diagnostics().await.unwrap();
+    assert!(before.active_scopes >= 3, "session + task + focus");
+
+    // Tool start: the runtime opens a fresh tool scope under the focus.
+    let tool_scope = engine.open_scope(ScopeKind::Tool, None).await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        let tool = state
+            .scopes
+            .iter()
+            .find(|scope| scope.id == tool_scope)
+            .expect("tool scope");
+        assert_eq!(tool.kind, ScopeKind::Tool);
+        assert_eq!(tool.state, ScopeState::Active);
+        assert_eq!(state.active_scope_id, Some(tool_scope));
+    }
 
     // AfterTool does not close the tool scope: the model has not consumed
     // the result yet.
@@ -908,25 +926,133 @@ async fn tool_scope_closes_when_model_consumes_result() {
         let tool = state
             .scopes
             .iter()
-            .find(|scope| scope.kind == ScopeKind::Tool)
+            .find(|scope| scope.id == tool_scope)
             .expect("tool scope");
         assert_eq!(tool.state, ScopeState::Active);
     }
 
+    // The observation is persisted with the tool scope id even though it
+    // happens after the frame's execution.
     engine
-        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "shell.exec".into(),
+                ok: true,
+                summary: "tests pass".into(),
+                model_content: "3 passed in Build.kt".into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+            scope_id: Some(tool_scope),
+        })
         .await
         .unwrap();
+    {
+        let state = engine.state.lock().await;
+        let observation = state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::ToolObservation)
+            .expect("tool observation item");
+        assert_eq!(
+            observation.scope_id,
+            Some(tool_scope),
+            "the observation is a member of the tool frame by scope_id"
+        );
+    }
+
+    // The model consumed the result: the runtime closes the tool scope.
+    let transitions = engine.close_scope(tool_scope).await.unwrap();
+    assert!(
+        transitions.is_empty(),
+        "successful tool results are ephemeral: nothing to promote or evict"
+    );
     {
         let state = engine.state.lock().await;
         let tool = state
             .scopes
             .iter()
-            .find(|scope| scope.kind == ScopeKind::Tool)
+            .find(|scope| scope.id == tool_scope)
             .expect("tool scope");
         assert_eq!(tool.state, ScopeState::Closed, "consumed tool scope closes");
         assert!(tool.closed_tick.is_some());
+        // The active scope returns to the focus.
+        assert_ne!(state.active_scope_id, Some(tool_scope));
     }
+
+    // Closing twice is a no-op.
+    let again = engine.close_scope(tool_scope).await.unwrap();
+    assert!(again.is_empty());
+}
+
+#[tokio::test]
+async fn task_close_processes_members_by_scope_id() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "refactor auth module".into(),
+        })
+        .await
+        .unwrap();
+
+    // The user message is a member of the focus scope (created while it was
+    // active), and through the tree a member of the task scope as well.
+    let state = engine.state.lock().await;
+    let task_scope = state
+        .scopes
+        .iter()
+        .find(|scope| scope.kind == ScopeKind::Task)
+        .expect("task scope");
+    let user_item = state
+        .items
+        .iter()
+        .find(|item| item.kind == ContextKind::UserMessage)
+        .expect("user message item");
+    assert!(
+        user_item.scope_id.is_some(),
+        "items must be stamped with their scope at creation"
+    );
+    let member_scope = user_item.scope_id.unwrap();
+    assert_ne!(
+        member_scope, task_scope.id,
+        "user items belong to the focus"
+    );
+    let focus = state
+        .scopes
+        .iter()
+        .find(|scope| scope.id == member_scope)
+        .expect("focus scope");
+    assert_eq!(focus.kind, ScopeKind::Focus);
+    drop(state);
+
+    // Completing the task archives the focus-scoped working set through the
+    // task scope close.
+    engine
+        .ingest(ContextIngress::TaskCompleted {
+            task_id: None,
+            summary: "auth refactor done".into(),
+        })
+        .await
+        .unwrap();
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::TaskCompleted)
+        .await
+        .unwrap();
+    let archive = report
+        .transitions
+        .iter()
+        .find(|transition| transition.to == ContextState::Archived);
+    assert!(
+        archive.is_some(),
+        "task close must archive the focus's working set, got: {:?}",
+        report.transitions
+    );
+    assert!(
+        archive.unwrap().reason.contains("task completed"),
+        "unexpected reason: {}",
+        archive.unwrap().reason
+    );
 }
 
 #[tokio::test]
@@ -1077,6 +1203,7 @@ async fn checkpoint_preserves_scope_tree() {
                 artifact_ref: None,
                 metadata: serde_json::Value::Null,
             },
+            scope_id: None,
         })
         .await
         .unwrap();

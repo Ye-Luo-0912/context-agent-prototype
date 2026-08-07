@@ -613,14 +613,41 @@ Acceptance:
 - the engine returns `Vec<MaterializedItem>` and the kernel/actor never
   reassemble prompt text from engine output.
 
-### V1-P0-3: scope ownership moves to the runtime (next)
+### V1-P0-3: scope ownership moves to the runtime ✅ (implemented)
 
-- `ContextItem` gains `scope_id`; scope membership is no longer inferred
-  from `ContextScope + task_id + created_tick`;
-- the runtime drives the scope tree (Session -> Task -> Focus -> Tool)
-  as execution frames; tool scopes open at tool start and close when the
-  model consumes the result; the context engine only applies the
-  promotion / warm / cold / externalize decision on close.
+Scope membership is now authoritative and tool scopes are execution frames:
+
+- `ContextItem.scope_id` (and `ContextItemSummary.scope_id`) stamp every item
+  with the scope it was produced in; `close_members` decides membership by
+  walking the `scope_id` tree (task and focus closes see focus descendants,
+  tool frames stay out — their observations leave through residency and
+  error verification), with a legacy fallback for items without a stamp
+  (restored old checkpoints);
+- tool scopes are runtime-driven: the actor opens a fresh tool scope at
+  tool start (`ContextEngine::open_scope`) and closes it when the next
+  model round consumes the result (`ContextEngine::close_scope`); the
+  observation persisted at turn end carries the tool scope id, so the
+  membership is authoritative even though persistence is batched;
+- `close_members` now processes tool scopes: durable members promote to the
+  parent, ephemeral/working results are left to residency and verification
+  (the ingest-time `open_tool_scope` and the `AfterModel` tool-close queue
+  are gone);
+- session/task/focus scopes stay focus-state-derived (opened by the
+  ingest the runtime already issues on `Start` / `set_focus`), and task
+  close keeps flowing through `maintain(TaskCompleted)` so the promotion
+  transitions stay observable;
+- the wire protocol carries `open_scope` / `close_scope`, so the
+  ContextCore service path drives the same frame lifecycle; the baselines
+  accept scope ids as no-ops (they retain no scope tree).
+
+Acceptance:
+
+- workspace tests green, including a new actor-level test asserting the
+  tool scope opens at tool start and closes with the same id when the model
+  consumes the result, with the observation tagged by that id;
+- engine tests assert membership by `scope_id` (focus-scoped working set
+  archived through the task close) and that a consumed tool scope returns
+  the active pointer to its parent.
 
 ### V1-P0-4: the module host becomes an extension platform (next)
 

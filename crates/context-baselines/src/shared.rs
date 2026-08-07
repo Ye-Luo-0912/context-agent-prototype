@@ -44,6 +44,7 @@ impl Record {
             id: self.id,
             kind: self.kind,
             scope: self.scope,
+            scope_id: None,
             state: ContextState::Active,
             importance: 0.0,
             relevance: 0.0,
@@ -76,7 +77,7 @@ pub(crate) fn records_for_ingress(ingress: &ContextIngress, turn: u64) -> Vec<Re
             created_turn: turn,
             source: Some("assistant message".into()),
         }],
-        ContextIngress::ToolObservation { output } => vec![Record {
+        ContextIngress::ToolObservation { output, .. } => vec![Record {
             id: ContextItemId::new(),
             kind: if output.ok {
                 ContextKind::ToolObservation
