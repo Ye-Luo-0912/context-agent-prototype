@@ -451,16 +451,42 @@ Acceptance:
 - `ContextEngine` contract unchanged: all four implementations, the process
   boundary, the TUI and the replay harness still build.
 
-### V1-M2: Context runtime modules + Scope (next)
+### V1-M2: Context runtime modules + Scope ✅ (implemented)
 
-- refactor `context-simple` into one crate with modules (`heap`, `item`,
-  `scope`, `residency`, `index/`, `policy/`, `gc/`, `materializer`,
-  `context_map`, `checkpoint`, `diagnostics`) — mechanism and policy
-  separated without splitting into dozens of crates;
-- add the `Scope` entity (`Session` / `Task` / `Focus` / `Tool`, states
-  Open / Active / Suspended / Closed) as the first-class unit of residency;
-  scope close promotes (decision, finding, constraint, open loop, artifact
-  ref, evidence ref) and evicts the rest.
+- `context-simple` is one crate with modules, mechanism and policy
+  separated without splitting into dozens of crates: `engine` (config +
+  state + ingest dispatch), `item`, `heap`, `scope`, `residency`,
+  `index/` (`entity`, `task`, `dependency`), `policy/` (`simple`),
+  `gc/` (`minor`, `reachability`), `materializer`, `diagnostics`,
+  `checkpoint`. The real id→index map for the heap is a later
+  optimization, so there is no separate `context_map` module yet.
+- the `Scope` entity is first-class in the contract: `ScopeId`,
+  `ScopeKind` (Session / Task / Focus / Tool), `ScopeState` (Open /
+  Active / Suspended / Closed) and `Scope` (id, parent, kind, state,
+  task_id, goal, opened / last-active / closed ticks). The engine keeps
+  a scope tree in `State` and drives it from ingest: session opens
+  lazily, task/focus open per task (old task suspends on a task
+  switch), one tool scope per tool call closes at `AfterModel`.
+- closing a task scope (on `TaskCompleted`) promotes its durable
+  outcomes — decisions, findings, constraints, open loops, artifact and
+  evidence references, pinned/durable items — to the session scope and
+  evicts the rest of the working set with an explainable `task
+  completed: scope closed, working set evicted` transition; promoted
+  findings can later reactivate when a related task touches the same
+  entities;
+- `ContextDiagnostics` exposes scope counts (open/active/suspended/
+  closed); checkpoints round-trip the scope tree.
+
+Acceptance:
+
+- all workspace tests green (74), including new ones: scope tree
+  layout, task-switch suspension, tool-scope close at `AfterModel`,
+  task close promote/evict, promoted-finding reactivation, checkpoint
+  scope round-trip;
+- behavior is otherwise preserved: item residency, supersession, error
+  verification and dependency expansion tests are unchanged and green;
+- `ContextEngine` contract unchanged (diagnostics gained serde-default
+  scope fields only); replay/A/B/C harnesses unaffected.
 
 ### V1-M3: Runtime framework (after M2)
 

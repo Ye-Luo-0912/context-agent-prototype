@@ -1,7 +1,8 @@
 use agent_contracts::{
     AgentResult, ContextBuildRequest, ContextDiagnostics, ContextEngine, ContextIngress,
     ContextItem, ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextRetention, ContextScope, ContextSnapshot, FocusState, TaskId,
+    ContextMaintenanceTrigger, ContextRetention, ContextScope, ContextSnapshot, FocusState, Scope,
+    ScopeId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,6 +15,7 @@ use crate::heap;
 use crate::index::{dependency, entity};
 use crate::item;
 use crate::materializer;
+use crate::scope;
 
 #[derive(Debug, Clone)]
 pub struct SimpleContextConfig {
@@ -73,7 +75,6 @@ pub(crate) struct State {
     pub(crate) turn: u64,
     pub(crate) tool_round: u64,
     pub(crate) focus: Option<FocusState>,
-    pub(crate) completed_task_id: Option<TaskId>,
     pub(crate) items: Vec<ContextItem>,
     /// (item_id, reason) queued by ingest, drained by maintenance so the
     /// resulting state change is recorded as a lifecycle transition.
@@ -86,6 +87,17 @@ pub(crate) struct State {
     /// observations. Reset on user message / focus change, extended by tools.
     #[serde(default)]
     pub(crate) hot_entities: Vec<String>,
+    /// Runtime scope tree: one session scope, one task scope per task, one
+    /// focus scope per task while it runs, one tool scope per tool call.
+    #[serde(default)]
+    pub(crate) scopes: Vec<Scope>,
+    /// Deepest scope currently receiving attention (tool > focus > task).
+    #[serde(default)]
+    pub(crate) active_scope_id: Option<ScopeId>,
+    /// Scopes queued for close by ingest (task completion, tool result
+    /// consumed); drained by maintenance so promotion/eviction is recorded.
+    #[serde(default)]
+    pub(crate) pending_closed_scopes: Vec<ScopeId>,
 }
 
 pub struct SimpleContextEngine {
@@ -125,6 +137,9 @@ impl ContextEngine for SimpleContextEngine {
                     focus.active_entities = entity::extract_entities(&content);
                     state.focus = Some(focus);
                 }
+                // The user message opens (or touches) the task and focus
+                // scopes of the current work.
+                scope::open_focus_scope(&mut state);
 
                 let mut item = item::make_item(
                     &state,
@@ -170,6 +185,9 @@ impl ContextEngine for SimpleContextEngine {
             }
             ContextIngress::ToolObservation { output } => {
                 state.tool_round += 1;
+                // One tool scope per call, closed when the model consumes
+                // the result (maintain AfterModel).
+                scope::open_tool_scope(&mut state);
                 let mut content = output.model_content;
                 if let Some(artifact_ref) = output.artifact_ref {
                     content.push_str("\nartifact: ");
@@ -225,8 +243,13 @@ impl ContextEngine for SimpleContextEngine {
                 // A new focus defines the hot set from its own active entities.
                 state.hot_entities = focus.active_entities.clone();
                 state.focus = Some(focus);
+                // The focus (and its task) scope opens or reactivates.
+                scope::open_focus_scope(&mut state);
             }
             ContextIngress::Pin { content, kind } => {
+                // A pin is session-level: it guarantees the session scope
+                // exists even when no task has started yet.
+                scope::ensure_session(&mut state);
                 let item = item::make_item(
                     &state,
                     &self.config,
@@ -240,14 +263,15 @@ impl ContextEngine for SimpleContextEngine {
                 dependency::push_linked(&mut state, &self.config, item);
             }
             ContextIngress::TaskCompleted { task_id, summary } => {
-                // Record which task completed; the archiving itself happens in
-                // maintain(TaskCompleted) so the transition is observable.
+                // Record which task completed; the scope close (promotion of
+                // durable outcomes, eviction of the working set) happens in
+                // maintain(TaskCompleted) so it is observable.
                 let completed_task = task_id.or_else(|| state.focus.as_ref().map(|f| f.task_id));
                 if let Some(completed_task) = completed_task {
-                    state.completed_task_id = Some(completed_task);
                     if state.focus.as_ref().map(|f| f.task_id) == Some(completed_task) {
                         state.focus = None;
                     }
+                    scope::queue_task_scope_close(&mut state, completed_task);
                 }
                 let item = item::make_item(
                     &state,

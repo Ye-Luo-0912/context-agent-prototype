@@ -251,6 +251,16 @@ execution protocol, prompt formatting and provider continuation.
 A `ContextSnapshot` is a disposable projection of the Context Frame. It is
 not the source of truth and should never be persisted as the memory model.
 
+Since V1-M2 the engine keeps a runtime **scope tree** (Session -> Task ->
+Focus -> Tool) as the first-class unit of residency. Scopes carry their own
+lifecycle (Open / Active / Suspended / Closed) and own the items created
+while they were active: closing a task scope promotes its durable outcomes
+(decisions, findings, constraints, open loops, artifact/evidence refs,
+pinned items) to the session and evicts the rest of the working set. The
+scope tree is engine state, exposed through `ContextDiagnostics` counts and
+round-tripped by checkpoints; the kernel drives it implicitly through
+`ingest`/`maintain`, never by touching scope internals.
+
 ## 7. Tool output policy
 
 `ToolOutput` separates:

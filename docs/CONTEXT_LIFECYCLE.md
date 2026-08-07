@@ -143,24 +143,66 @@ The first normal user message creates a focus. Later user messages update the cu
 
 ## 8. Completing a task
 
-`/done <summary>` performs the intended lifecycle transition:
+`/done <summary>` performs the intended lifecycle transition. Since V1-M2
+the completion is a **task scope close**:
 
 ```text
-active task items -> Archived   (recorded as a transition during maintain(TaskCompleted))
-active focus      -> cleared
-summary           -> Session + Durable
-next user task    -> new TaskId / new FocusState
+task scope (and its focus child) -> Closed
+durable outcomes (decision/finding/constraint/open-loop/
+  artifact-ref/evidence-ref, pinned, durable) -> promoted to Session
+the rest of the working set -> Archived
+active focus -> cleared
+summary -> Session + Durable
+next user task -> new TaskId / new FocusState / new task scope
 ```
 
-The archiving itself runs inside `maintain(TaskCompleted)` (not during ingest)
-so the journal records an observable `task completed: working set archived`
-transition for every affected item. Once archived, those items stay out of
-active attention for subsequent tasks (see the stale-task gate in §5) unless
-the new focus strongly reactivates them.
+The close runs inside `maintain(TaskCompleted)` (not during ingest) so the
+journal records an observable `task completed: scope closed, working set
+evicted` transition for every evicted item. Promoted items move to the
+session scope, become `Durable` and are tagged `promoted`; once their own
+task is stale they sit at `Archived` (see the stale-task gate in §5) and can
+be reactivated by a later task whose focus/entities match — recorded as a
+`reactivated: score ... >= active threshold` transition.
 
 This preserves the result while removing the completed task's detailed working set from active attention.
 
 Automatic summary generation should be added at the runtime/task-boundary layer, not buried inside the context store.
+
+## 8b. Scope tree (V1-M2)
+
+The engine tracks a runtime scope tree as the first-class unit of
+residency. It is separate from the item-level `scope` marker (§3): the
+marker says which container an item semantically belongs to, the tree is
+the container itself, with its own lifecycle.
+
+```text
+Session (one per run, opened lazily, never closed)
+  └─ Task (one per task_id)
+       └─ Focus (one per task while it runs)
+            └─ Tool (one per tool call)
+```
+
+States: `Open` -> `Active` -> `Suspended` / `Closed`. The deepest active
+scope is the current attention container (`active_scope_id`).
+
+- `Session` opens lazily on the first ingest and lives for the run.
+- `Task` opens with the focus; when the focus switches to another task
+  the old task scope (and its focus) suspends instead of closing, so a
+  later return re-activates them.
+- `Focus` is the attention container of a task, active across turns;
+  it opens with the first user message / focus change and closes when
+  its task closes.
+- `Tool` opens per tool observation and closes at the next
+  `maintain(AfterModel)` — the model consumed the result. Tool scopes
+  are observational containers: their ephemeral results leave through
+  residency (§9), so closing one records the boundary without touching
+  items.
+
+Scope close is uniform: durable outcomes are promoted to the nearest
+open ancestor, the rest is released (a completed task's working set is
+evicted; a focus close returns its working set to the task and the
+normal lifecycle cools it). Scope counts are exposed through
+`ContextDiagnostics` and checkpoints round-trip the tree.
 
 ## 9. Tool observations
 

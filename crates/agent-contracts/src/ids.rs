@@ -29,3 +29,4 @@ macro_rules! id_type {
 id_type!(RunId);
 id_type!(TaskId);
 id_type!(ContextItemId);
+id_type!(ScopeId);

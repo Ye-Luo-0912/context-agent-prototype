@@ -1,6 +1,7 @@
 use agent_contracts::{
     ContextBuildRequest, ContextEngine, ContextIngress, ContextItem, ContextItemId, ContextKind,
-    ContextMaintenanceTrigger, ContextRetention, ContextScope, ContextState, ToolOutput,
+    ContextMaintenanceTrigger, ContextRetention, ContextScope, ContextState, FocusState, ScopeKind,
+    ScopeState, ToolOutput,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -777,4 +778,339 @@ async fn archived_dependency_below_threshold_stays_out() {
             .any(|selection| selection.reason.contains("included as dependency")),
         "a cold archived dependency must not be resurrected by expansion"
     );
+}
+
+#[tokio::test]
+async fn scope_tree_opens_with_session_task_and_focus() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "refactor AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+
+    let diagnostics = engine.diagnostics().await.unwrap();
+    assert!(
+        diagnostics.active_scopes >= 3,
+        "session + task + focus scopes active, got {:?}",
+        diagnostics
+    );
+
+    let state = engine.state.lock().await;
+    assert_eq!(state.scopes.len(), 3);
+    let session = state
+        .scopes
+        .iter()
+        .find(|scope| scope.kind == ScopeKind::Session)
+        .expect("session scope");
+    let task = state
+        .scopes
+        .iter()
+        .find(|scope| scope.kind == ScopeKind::Task)
+        .expect("task scope");
+    let focus = state
+        .scopes
+        .iter()
+        .find(|scope| scope.kind == ScopeKind::Focus)
+        .expect("focus scope");
+    assert_eq!(task.parent, Some(session.id), "task nests under session");
+    assert_eq!(focus.parent, Some(task.id), "focus nests under task");
+    assert_eq!(state.active_scope_id, Some(focus.id));
+}
+
+#[tokio::test]
+async fn task_scope_suspends_when_focus_switches_task() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "task one: fix login".into(),
+        })
+        .await
+        .unwrap();
+    let first_task = {
+        let state = engine.state.lock().await;
+        state.focus.as_ref().unwrap().task_id
+    };
+
+    engine
+        .ingest(ContextIngress::FocusChanged {
+            focus: FocusState::new("task two: add tests"),
+        })
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    let first = state
+        .scopes
+        .iter()
+        .find(|scope| scope.kind == ScopeKind::Task && scope.task_id == Some(first_task))
+        .expect("first task scope");
+    assert_eq!(first.state, ScopeState::Suspended);
+    let second = state
+        .scopes
+        .iter()
+        .find(|scope| scope.kind == ScopeKind::Task && scope.task_id != Some(first_task))
+        .expect("second task scope");
+    assert_eq!(second.state, ScopeState::Active);
+    let second_focus = state
+        .scopes
+        .iter()
+        .find(|scope| scope.kind == ScopeKind::Focus && scope.parent == Some(second.id))
+        .expect("second task focus scope");
+    assert_eq!(
+        state.active_scope_id,
+        Some(second_focus.id),
+        "the deepest attention scope is the new task's focus"
+    );
+    assert!(
+        state.scopes.iter().all(|scope| {
+            scope.kind != ScopeKind::Focus
+                || scope.parent == Some(second.id)
+                || scope.state == ScopeState::Suspended
+        }),
+        "the old task's focus scope suspends with its task"
+    );
+}
+
+#[tokio::test]
+async fn tool_scope_closes_when_model_consumes_result() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "fix the build".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "shell.exec".into(),
+                ok: true,
+                summary: "tests pass".into(),
+                model_content: "3 passed in Build.kt".into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+        })
+        .await
+        .unwrap();
+
+    // AfterTool does not close the tool scope: the model has not consumed
+    // the result yet.
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterTool)
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        let tool = state
+            .scopes
+            .iter()
+            .find(|scope| scope.kind == ScopeKind::Tool)
+            .expect("tool scope");
+        assert_eq!(tool.state, ScopeState::Active);
+    }
+
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        let tool = state
+            .scopes
+            .iter()
+            .find(|scope| scope.kind == ScopeKind::Tool)
+            .expect("tool scope");
+        assert_eq!(tool.state, ScopeState::Closed, "consumed tool scope closes");
+        assert!(tool.closed_tick.is_some());
+    }
+}
+
+#[tokio::test]
+async fn task_close_promotes_decisions_and_evicts_the_rest() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    // A decision message (gets the durable "decision" tag) and a plain
+    // working message of the same task.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use TOML for config".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "add a cache note".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::TaskCompleted {
+            task_id: None,
+            summary: "config work done".into(),
+        })
+        .await
+        .unwrap();
+
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::TaskCompleted)
+        .await
+        .unwrap();
+    assert!(
+        report
+            .transitions
+            .iter()
+            .any(|t| t.to == ContextState::Archived && t.reason.contains("task completed")),
+        "the working set must be evicted with an explainable reason, got: {:?}",
+        report.transitions
+    );
+
+    let state = engine.state.lock().await;
+    let decision = state
+        .items
+        .iter()
+        .find(|item| item.content.contains("use TOML for config"))
+        .expect("decision item");
+    assert_eq!(
+        decision.scope,
+        ContextScope::Session,
+        "the decision must be promoted to the session scope"
+    );
+    assert_ne!(
+        decision.state,
+        ContextState::Dropped,
+        "a promoted outcome is never dropped"
+    );
+    let working = state
+        .items
+        .iter()
+        .find(|item| item.content.contains("cache note"))
+        .expect("working item");
+    assert_eq!(
+        working.state,
+        ContextState::Archived,
+        "the plain working message must be evicted from the closed task"
+    );
+}
+
+#[tokio::test]
+async fn promoted_finding_reactivates_for_a_related_task() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use TOML for config".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::TaskCompleted {
+            task_id: None,
+            summary: "config work done".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::TaskCompleted)
+        .await
+        .unwrap();
+
+    // The promoted decision keeps its durable markers; while its own entity
+    // is still hot it stays active, and a later task touching the same
+    // entity keeps it in the working set.
+    {
+        let state = engine.state.lock().await;
+        let decision = state
+            .items
+            .iter()
+            .find(|item| item.content.contains("use TOML for config"))
+            .expect("promoted decision");
+        assert_eq!(decision.scope, ContextScope::Session);
+        assert!(decision.tags.iter().any(|tag| tag == "promoted"));
+        assert_ne!(decision.state, ContextState::Dropped);
+    }
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "task two: read the TOML config".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    let snapshot = engine
+        .build_snapshot(ContextBuildRequest {
+            system_prompt: "s".into(),
+            current_input: "task two: read the TOML config".into(),
+            budget_tokens: 8192,
+        })
+        .await
+        .unwrap();
+    assert!(
+        snapshot
+            .messages
+            .iter()
+            .any(|m| m.content.contains("use TOML for config")),
+        "the promoted finding must re-enter the working set for a related task"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_preserves_scope_tree() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "refactor AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "shell.exec".into(),
+                ok: true,
+                summary: "ok".into(),
+                model_content: "compiles".into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+        })
+        .await
+        .unwrap();
+
+    let before = engine.diagnostics().await.unwrap();
+    let checkpoint = engine.checkpoint().await.unwrap();
+
+    let restored = SimpleContextEngine::new(SimpleContextConfig::default());
+    restored.restore(checkpoint).await.unwrap();
+    let after = restored.diagnostics().await.unwrap();
+    assert_eq!(before.total_items, after.total_items);
+    assert_eq!(before.active_scopes, after.active_scopes);
+    assert_eq!(before.closed_scopes, after.closed_scopes);
+
+    // The restored scope tree keeps working: another turn extends the same
+    // task and focus scopes instead of duplicating them.
+    restored
+        .ingest(ContextIngress::UserMessage {
+            content: "continue".into(),
+        })
+        .await
+        .unwrap();
+    let grown = restored.diagnostics().await.unwrap();
+    assert_eq!(grown.active_scopes, before.active_scopes);
+    {
+        let state = restored.state.lock().await;
+        assert_eq!(
+            state
+                .scopes
+                .iter()
+                .filter(|scope| scope.kind == ScopeKind::Task)
+                .count(),
+            1,
+            "one task scope, reused after restore"
+        );
+    }
 }

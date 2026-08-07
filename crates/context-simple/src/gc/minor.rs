@@ -1,17 +1,17 @@
 use agent_contracts::{
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextRetention, ContextState,
-    ContextStateTransition,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextState, ContextStateTransition,
 };
 
 use crate::diagnostics;
 use crate::engine::{SimpleContextConfig, State};
 use crate::gc::reachability::{drain_supersessions, drain_verifications};
 use crate::residency::next_residency;
+use crate::scope;
 
-/// One maintenance pass over the whole heap: task-completion archival, then
-/// supersession / verification intents, then the per-item residency state
-/// machine. All resulting state changes are recorded as explainable
-/// transitions.
+/// One maintenance pass over the whole heap: queued scope closes (task
+/// completion, tool results consumed), then supersession / verification
+/// intents, then the per-item residency state machine. All resulting state
+/// changes are recorded as explainable transitions.
 pub(crate) fn run_minor(
     state: &mut State,
     config: &SimpleContextConfig,
@@ -28,32 +28,18 @@ pub(crate) fn run_minor(
     // once so the loop can read it while items are mutated.
     let hot_entities = state.hot_entities.clone();
 
-    // Task completion: the completed task's working set leaves active
-    // attention. Done here (not in ingest) so the archival is recorded as a
-    // lifecycle transition.
-    if matches!(trigger, ContextMaintenanceTrigger::TaskCompleted)
-        && let Some(completed) = state.completed_task_id.take()
-    {
-        for item in &mut state.items {
-            if item.task_id == Some(completed)
-                && item.retention != ContextRetention::Pinned
-                && item.state != ContextState::Dropped
-                && item.state != ContextState::Archived
-            {
-                report.archived += 1;
-                report.transitions.push(ContextStateTransition {
-                    item_id: item.id,
-                    kind: item.kind,
-                    scope: item.scope,
-                    from: item.state,
-                    to: ContextState::Archived,
-                    turn,
-                    reason: "task completed: working set archived".to_string(),
-                });
-                item.state = ContextState::Archived;
-            }
-        }
+    // The model consumed the last round's tool results: their scopes end
+    // here. Ephemeral results leave through the residency pass below.
+    if matches!(trigger, ContextMaintenanceTrigger::AfterModel) {
+        scope::queue_tool_scope_closes(state);
     }
+
+    // Scope closes queued by ingest (task completed) become observable state
+    // changes here: durable outcomes are promoted to the parent scope, the
+    // rest of the working set is evicted.
+    let closed = scope::drain_closed_scopes(state, turn);
+    report.archived += closed.len();
+    report.transitions.extend(closed);
 
     // Supersession and verification intents recorded by ingest become
     // observable state changes here, with explainable reasons.

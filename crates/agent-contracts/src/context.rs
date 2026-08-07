@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentResult, ContextItemId, ModelMessage, TaskId, ToolOutput};
+use crate::{AgentResult, ContextItemId, ModelMessage, ScopeId, TaskId, ToolOutput};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContextKind {
@@ -91,6 +91,42 @@ impl FocusState {
             generation: 0,
         }
     }
+}
+
+/// Runtime scope entity: a container that owns items for one period of
+/// execution. Scopes form a tree — Session -> Task -> Focus -> Tool — and
+/// each carries its own lifecycle (open/active/suspended/closed). Closing a
+/// scope promotes its durable outcomes to the parent and releases the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScopeKind {
+    Session,
+    Task,
+    Focus,
+    Tool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScopeState {
+    Open,
+    Active,
+    Suspended,
+    Closed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Scope {
+    pub id: ScopeId,
+    pub parent: Option<ScopeId>,
+    pub kind: ScopeKind,
+    pub state: ScopeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    pub opened_tick: u64,
+    pub last_active_tick: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_tick: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +223,14 @@ pub struct ContextDiagnostics {
     pub turn: u64,
     #[serde(default)]
     pub tool_round: u64,
+    #[serde(default)]
+    pub open_scopes: usize,
+    #[serde(default)]
+    pub active_scopes: usize,
+    #[serde(default)]
+    pub suspended_scopes: usize,
+    #[serde(default)]
+    pub closed_scopes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
