@@ -38,5 +38,12 @@ jobs:
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # `cargo test` builds the context-service binary only as a hashed
+      # deps/ artifact; the adapter resolves it by the real name in
+      # target/<profile>/, so build it explicitly first (the adapter's own
+      # error message asks for exactly this).
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
       - name: cargo test --workspace
         run: cargo test --workspace
