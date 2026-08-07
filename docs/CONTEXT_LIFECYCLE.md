@@ -315,6 +315,13 @@ items sharing at least one entity (new item depends on prior). Edges are
 exposed via `ContextItemSummary.dependencies` and rendered by the replay
 report (`depends on: <id>`).
 
+Each item carries its **entity signature** (`ContextItem.entities`),
+precomputed once at ingest after truncation. Dependency linking, supersession
+/ verification queueing, entity-affinity scoring and GC root marking all
+read the signature instead of re-parsing item content on every pass — the
+ingest path is O(N) signature lookups, not O(N) re-extractions. Restore
+backfills items from checkpoints written before the field existed.
+
 At `materialize`, after primary selection, the working set is expanded
 with dependencies of selected items:
 
