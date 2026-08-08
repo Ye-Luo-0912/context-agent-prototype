@@ -909,6 +909,45 @@ ladder) is future work on top of this.
   bound (`max_frame_bytes`) so a wedged or broken service cannot hang a
   turn or grow the adapter's memory.
 
+## V1-M9: Adaptive Runtime — context meta-tools ✅ (implemented)
+
+The LLM can tune the runtime's working set, but cannot bypass the kernel:
+permissions, budgets and approval stay kernel-owned. Four read-only context
+meta-tools — `context.gc_hint` / `context.tag` / `context.lease` /
+`context.collect` — attach a typed `ContextAction` to their output that the
+runtime routes to the context engine; tools still never touch the engine
+(invariant 3).
+
+- contract seam: `ToolOutput.context_action: Option<ContextAction>`
+  (`agent-contracts`), with `ContextAction::{GcHint{item_id, keep_alive},
+  Tag{item_id, tag}, Lease{item_id, turns}, Collect}`;
+- engine application: `ContextIngress::ContextDirective { action }` —
+  `gc_hint` sets `keep_alive`, `tag` pushes a deduped
+  `Label::extension(tag)`, `lease` stamps `lease_until_turn = turn + turns`.
+  Directives search the heap *and* the eviction buffer, so a hint/lease on
+  an already-evicted item brings it back on the next GC pass; a stale
+  `item_id` is a silent no-op;
+- GC roots (`context-simple` `gc/full.rs`): `keep_alive` or a live lease
+  marks an item `model_directed_root`, and an explicit directive overrides
+  the consumed-ephemeral heuristic in the sweep — a spent turn observation
+  the model asked to keep stays resident. Reactivations report
+  `kept alive by a model gc_hint` / `leased by the model until turn N`;
+- actor routing (`finalize_turn`): each tool result routes `context_action`
+  *before* the observation ingest — `Collect` runs a full
+  `ContextEngine::gc()` mid-turn and emits `RuntimeEvent::ContextGc`,
+  everything else becomes a `ContextDirective` ingest;
+- the model can address items because the context frame exposes each item's
+  id (`id=<...>` per frame line in the prompt);
+- the meta-tools are always loaded with the core set
+  (`fs.list`/`fs.read`/`search.grep` + the four `context.*` tools).
+
+Acceptance: engine tests cover gc_hint keep/release on a consumed
+observation, a hint reaching an evicted buffer item (reactivates on the
+next GC), tag dedup, and lease expiry; turn tests cover collect →
+`ContextGc` event and a directive routed before the observation ingest;
+tool-runtime tests cover the four schemas and executions. Full workspace
+build/test/clippy/fmt green; A/B/C replay baseline unchanged.
+
 ## P2: provider/tool secondary issues ✅ (implemented)
 
 - **Stream retry can no longer duplicate output.** `RetryingTransport`

@@ -1,6 +1,6 @@
 use agent_contracts::{
-    AgentResult, ContextDiagnostics, ContextEngine, ContextGcReport, ContextIngress, ContextItem,
-    ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
+    AgentResult, ContextAction, ContextDiagnostics, ContextEngine, ContextGcReport, ContextIngress,
+    ContextItem, ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
     ContextMaintenanceTrigger, ContextQuery, ContextRetention, ContextScope,
     ContextStateTransition, CoreLabel, FocusState, Label, MaterializedContext, Scope, ScopeId,
     ScopeKind,
@@ -353,6 +353,9 @@ impl ContextEngine for SimpleContextEngine {
                 );
                 dependency::push_linked(&mut state, &self.config, item);
             }
+            ContextIngress::ContextDirective { action } => {
+                apply_directive(&mut state, action);
+            }
         }
 
         Ok(())
@@ -454,5 +457,50 @@ impl ContextEngine for SimpleContextEngine {
         state.tick += 1;
         let now_tick = state.tick;
         Ok(store::run_storage_gc(&mut state, &self.config, now_tick))
+    }
+}
+
+/// Apply one model/operator context directive to the current state. Every
+/// directive targets an existing item — in the heap or the reversible
+/// eviction buffer (a hint/lease on an evicted item is what brings it
+/// back on the next GC pass); a stale `item_id` (already externalized or
+/// superseded) is a silent no-op. GC reads the resulting fields, so every
+/// "kept because ..." is explainable in the eviction reasons.
+fn apply_directive(state: &mut State, action: ContextAction) {
+    let mut target = state
+        .items
+        .iter_mut()
+        .chain(state.eviction_buffer.iter_mut())
+        .find(|item| item.id == directive_item_id(&action));
+    if let Some(item) = target.as_mut() {
+        match action {
+            ContextAction::GcHint {
+                item_id: _,
+                keep_alive,
+            } => {
+                item.keep_alive = keep_alive;
+            }
+            ContextAction::Tag { tag, .. } => {
+                let label = Label::extension(tag);
+                if !item.tags.contains(&label) {
+                    item.tags.push(label);
+                }
+            }
+            ContextAction::Lease { turns, .. } => {
+                item.lease_until_turn = Some(state.turn.saturating_add(turns as u64));
+            }
+            // The runtime owns the GC pass; `context.collect` never arrives
+            // as an ingest directive (the actor calls `ContextEngine::gc`).
+            ContextAction::Collect => {}
+        }
+    }
+}
+
+fn directive_item_id(action: &ContextAction) -> ContextItemId {
+    match action {
+        ContextAction::GcHint { item_id, .. }
+        | ContextAction::Tag { item_id, .. }
+        | ContextAction::Lease { item_id, .. } => *item_id,
+        ContextAction::Collect => ContextItemId::new(),
     }
 }

@@ -151,17 +151,19 @@ See `docs/ROADMAP.md`. Current state at this head:
   task, scope-close promote-before-archive with `scope_id` kept in sync,
   `ToolSurfaceSnapshot` per model round, unified tool/capability catalog
   with one `ToolLifecycle` and unified `capability.search/inspect/load/
-  unload`).
+  unload`); V1-M9 part 2 (adaptive runtime: `context.gc_hint` / `tag` /
+  `lease` / `collect` meta-tools, `ToolOutput.context_action` +
+  `ContextIngress::ContextDirective`, item `keep_alive` / `lease_until_turn`
+  GC roots with buffer reactivation and consumed-ephemeral override,
+  collect routed to a mid-turn `ContextEngine::gc()` with the report
+  emitted as a `ContextGc` event).
 
 Next, in order:
 
-1. V1-M9 Adaptive Runtime — context/tool meta-tools, GC hints/tags/leases,
-   manual collect. The LLM can tune the runtime, but cannot bypass the
-   kernel (permissions, budgets, approval stay kernel-owned).
-2. V2 Self-Iteration — capability generation → sandbox test → replay →
+1. V2 Self-Iteration — capability generation → sandbox test → replay →
    evaluate → register/rollback. The LLM grows capabilities instead of
    editing production core.
-3. Evidence-gated (later, only after measurement): smarter non-vector
+2. Evidence-gated (later, only after measurement): smarter non-vector
    lifecycle policy, ContextCore adapter, vector recall / learned selection
    / cross-session memory (invariant 8).
 

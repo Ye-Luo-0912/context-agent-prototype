@@ -23,8 +23,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::tools::{
-    EditReplaceTool, FsListTool, FsReadTool, FsWriteTool, GitDiffTool, GitStatusTool,
-    SearchGrepTool, ShellExecTool, Tool,
+    ContextDirectiveTool, EditReplaceTool, FsListTool, FsReadTool, FsWriteTool, GitDiffTool,
+    GitStatusTool, SearchGrepTool, ShellExecTool, Tool,
 };
 
 /// Control tools are now defined by the unified catalog contract.
@@ -44,7 +44,18 @@ pub struct ToolLifecycleConfig {
 impl Default for ToolLifecycleConfig {
     fn default() -> Self {
         Self {
-            always_loaded: vec!["fs.list".into(), "fs.read".into(), "search.grep".into()],
+            always_loaded: vec![
+                "fs.list".into(),
+                "fs.read".into(),
+                "search.grep".into(),
+                // The context meta-tools are the model's handle on the
+                // context engine (gc hints, tags, leases, manual collect);
+                // they are cheap and always relevant.
+                "context.gc_hint".into(),
+                "context.tag".into(),
+                "context.lease".into(),
+                "context.collect".into(),
+            ],
             idle_to_warm_ticks: 8,
             warm_to_unload_ticks: 24,
         }
@@ -81,6 +92,10 @@ impl BuiltinToolDispatcher {
             Arc::new(GitStatusTool::new(workspace.clone())),
             Arc::new(GitDiffTool::new(workspace.clone())),
             Arc::new(ShellExecTool::new(workspace)),
+            Arc::new(ContextDirectiveTool::gc_hint()),
+            Arc::new(ContextDirectiveTool::tag()),
+            Arc::new(ContextDirectiveTool::lease()),
+            Arc::new(ContextDirectiveTool::collect()),
         ];
         let catalog = tools
             .into_iter()
@@ -361,6 +376,7 @@ impl BuiltinToolDispatcher {
             ),
             model_content: lines.join("\n"),
             artifact_ref: None,
+            context_action: None,
             metadata: json!({"total": entries.len(), "active": active}),
         })
     }
@@ -379,6 +395,7 @@ impl BuiltinToolDispatcher {
                 args.name
             ),
             artifact_ref: None,
+            context_action: None,
             metadata: json!({"tool": args.name}),
         })
     }
@@ -394,6 +411,7 @@ impl BuiltinToolDispatcher {
             summary: format!("tool unloaded: {}", args.name),
             model_content: format!("tool unloaded: {}", args.name),
             artifact_ref: None,
+            context_action: None,
             metadata: json!({"tool": args.name}),
         })
     }
@@ -402,7 +420,7 @@ impl BuiltinToolDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{CancellationToken, ToolCall, ToolExecutionRequest};
+    use agent_contracts::{CancellationToken, ContextAction, ToolCall, ToolExecutionRequest};
     use serde_json::Value;
 
     /// Open a throwaway workspace. The catalog only touches the disk on real
@@ -451,6 +469,80 @@ mod tests {
             !names.contains(&"fs.write".to_string()),
             "write tools must be loaded on demand: {names:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn context_meta_tools_attach_typed_directives() {
+        let dispatcher = dispatcher().await;
+        let names = surface(&dispatcher);
+        for name in [
+            "context.gc_hint",
+            "context.tag",
+            "context.lease",
+            "context.collect",
+        ] {
+            assert!(
+                names.contains(&name.to_string()),
+                "{name} must be on the default surface: {names:?}"
+            );
+        }
+
+        let item_id = "00000000-0000-0000-0000-000000000000";
+
+        let output = dispatcher
+            .execute(request(
+                "context.gc_hint",
+                json!({"item_id": item_id, "keep": true}),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            output.context_action,
+            Some(ContextAction::GcHint {
+                keep_alive: true,
+                ..
+            })
+        ));
+
+        let output = dispatcher
+            .execute(request(
+                "context.tag",
+                json!({"item_id": item_id, "tag": "urgent"}),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            output.context_action,
+            Some(ContextAction::Tag { ref tag, .. }) if tag == "urgent"
+        ));
+
+        let output = dispatcher
+            .execute(request(
+                "context.lease",
+                json!({"item_id": item_id, "turns": 3}),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            output.context_action,
+            Some(ContextAction::Lease { turns: 3, .. })
+        ));
+
+        let output = dispatcher
+            .execute(request("context.collect", json!({})))
+            .await
+            .unwrap();
+        assert!(matches!(
+            output.context_action,
+            Some(ContextAction::Collect)
+        ));
+
+        // Bad arguments are rejected like any other tool.
+        let error = dispatcher
+            .execute(request("context.gc_hint", json!({})))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("args"), "{error}");
     }
 
     #[tokio::test]

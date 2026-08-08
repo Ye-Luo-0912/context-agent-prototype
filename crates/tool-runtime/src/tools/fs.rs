@@ -127,6 +127,7 @@ impl Tool for FsListTool {
             ),
             model_content: format!("{}{}", visible.join("\n"), truncated_note),
             artifact_ref,
+            context_action: None,
             metadata: json!({"entry_count": entries.len()}),
         })
     }
@@ -233,6 +234,7 @@ impl Tool for FsReadTool {
             ),
             model_content: selected,
             artifact_ref: None,
+            context_action: None,
             metadata: json!({"line_count": lines.len(), "bytes": metadata.len()}),
         })
     }
@@ -299,6 +301,7 @@ impl Tool for FsWriteTool {
             ),
             model_content: format!("file updated: {}", display_relative(&self.workspace, &path)),
             artifact_ref: None,
+            context_action: None,
             metadata: json!({"bytes": args.content.len()}),
         })
     }

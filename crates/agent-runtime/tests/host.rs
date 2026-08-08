@@ -361,6 +361,7 @@ impl Capability for DemoCapability {
             summary: "demo ran".into(),
             model_content: format!("demo handled {}", call.name),
             artifact_ref: None,
+            context_action: None,
             metadata: json!({}),
         })
     }

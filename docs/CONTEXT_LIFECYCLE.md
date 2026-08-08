@@ -525,6 +525,42 @@ items are skipped; then `should_promote` wins and the item is promoted
 `scope` was rewritten while the authoritative `scope_id` kept pointing at
 the closed scope); everything else is archived/evicted as before.
 
+### 9f. V1-M9: adaptive runtime — the model can steer the working set
+
+The GC is reversible and explainable, but until now only the policy decided
+what survives. Since V1-M9 the model can *ask* the runtime to keep an item,
+attach a searchable tag, lease an item for a bounded number of turns, or run
+a full GC pass — without ever touching the engine (invariant 3: tools return
+`ToolOutput`; the kernel routes the directive).
+
+Four read-only meta-tools (`context.gc_hint` / `context.tag` /
+`context.lease` / `context.collect`, always loaded with the core tool set)
+produce a `ContextAction` attached to `ToolOutput.context_action`. The
+runtime routes each result at turn finalize, before the observation ingest
+(a hint never races the very observation it targets):
+
+- `Collect` — the actor calls `ContextEngine::gc()` mid-turn and emits
+  `RuntimeEvent::ContextGc { report }`. The runtime owns the GC pass; a
+  collect directive never enters the engine as ingest.
+- everything else — `ContextIngress::ContextDirective { action }`, applied
+  by `apply_directive`: `gc_hint` sets/clears `keep_alive`, `tag` pushes a
+  deduped `Label::extension(tag)`, `lease` stamps `lease_until_turn =
+  turn + turns`.
+
+The engine searches the heap *and* the eviction buffer for the target id,
+so a hint/lease on an already-evicted item reactivates it on the next GC
+pass (`kept alive by a model gc_hint` / `leased by the model until turn N`);
+a stale id (item already externalized or semantically dead) is a silent
+no-op — the tools are safe to call even when the target just left.
+
+GC treats model direction as a root claim: `keep_alive` or a live lease
+marks an item `model_directed_root` in the mark phase, and in the sweep an
+explicit directive overrides the consumed-ephemeral heuristic — a spent turn
+observation the model asked to keep stays resident. Everything stays
+explainable in the ledger (`kept because the model leased it until turn N /
+set keep_alive`), and the effect is visible to the model because the context
+frame exposes each item's id (`id=<...>`), so the next request can target it.
+
 ## 10. What should become durable later
 
 A later policy can promote only structured outcomes such as:

@@ -1,7 +1,7 @@
 use agent_contracts::{
-    AttentionState, ContextEngine, ContextHints, ContextIngress, ContextItem, ContextItemId,
-    ContextKind, ContextMaintenanceTrigger, ContextQuery, ContextRetention, ContextScope,
-    FocusState, LifecycleLabel, ScopeKind, ScopeState, SemanticState, ToolOutput,
+    AttentionState, ContextAction, ContextEngine, ContextHints, ContextIngress, ContextItem,
+    ContextItemId, ContextKind, ContextMaintenanceTrigger, ContextQuery, ContextRetention,
+    ContextScope, FocusState, LifecycleLabel, ScopeKind, ScopeState, SemanticState, ToolOutput,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -26,6 +26,7 @@ async fn successful_observation_is_ephemeral_but_failure_persists_until_verified
                 summary: "test failed".into(),
                 model_content: "error in AuthService.rs:42".into(),
                 artifact_ref: Some("artifact://run/test.log".into()),
+                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: None,
@@ -56,6 +57,7 @@ async fn successful_observation_is_ephemeral_but_failure_persists_until_verified
                 summary: "tests passed".into(),
                 model_content: "tests passed in AuthService.rs".into(),
                 artifact_ref: None,
+                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: None,
@@ -150,6 +152,7 @@ async fn maintenance_records_transitions_with_reasons() {
                 summary: "tests ok".into(),
                 model_content: "3 passed, 0 failed".into(),
                 artifact_ref: None,
+                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: None,
@@ -424,6 +427,7 @@ async fn recurring_failure_supersedes_prior_error() {
                     summary: format!("round {round} failed"),
                     model_content: "error in Build.kt (module build failed)".into(),
                     artifact_ref: None,
+                    context_action: None,
                     metadata: serde_json::Value::Null,
                 },
                 scope_id: None,
@@ -500,6 +504,7 @@ async fn hot_entities_follow_user_then_tool_then_reset() {
                 summary: "read".into(),
                 model_content: "CacheStore.rs is hot now".into(),
                 artifact_ref: None,
+                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: None,
@@ -550,6 +555,7 @@ async fn ingest_links_items_sharing_entities() {
                 summary: "ok".into(),
                 model_content: "tests passed in AuthService.rs".into(),
                 artifact_ref: None,
+                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: None,
@@ -604,6 +610,8 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
             last_access_turn: 1,
             dependencies: vec![dep_id],
             tags: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
             source: None,
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
@@ -629,6 +637,8 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
             last_access_turn: 1,
             dependencies: Vec::new(),
             tags: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
             source: None,
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
@@ -698,6 +708,8 @@ async fn dependency_expansion_can_be_disabled() {
             last_access_turn: 1,
             dependencies: vec![dep_id],
             tags: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
             source: None,
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
@@ -723,6 +735,8 @@ async fn dependency_expansion_can_be_disabled() {
             last_access_turn: 1,
             dependencies: Vec::new(),
             tags: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
             source: None,
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
@@ -780,6 +794,8 @@ async fn archived_dependency_below_threshold_stays_out() {
             last_access_turn: 1,
             dependencies: vec![dep_id],
             tags: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
             source: None,
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
@@ -805,6 +821,8 @@ async fn archived_dependency_below_threshold_stays_out() {
             last_access_turn: 1,
             dependencies: Vec::new(),
             tags: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
             source: None,
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
@@ -983,6 +1001,7 @@ async fn tool_scope_lifecycle_is_runtime_driven() {
                 summary: "tests pass".into(),
                 model_content: "3 passed in Build.kt".into(),
                 artifact_ref: None,
+                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: Some(tool_scope),
@@ -1249,6 +1268,7 @@ async fn checkpoint_preserves_scope_tree() {
                 summary: "ok".into(),
                 model_content: "compiles".into(),
                 artifact_ref: None,
+                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: None,
@@ -1359,6 +1379,8 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
             last_access_turn: 1,
             dependencies: Vec::new(),
             tags: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
             source: Some("pinned".into()),
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
@@ -1384,6 +1406,8 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
             last_access_turn: 1,
             dependencies: Vec::new(),
             tags: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
             source: Some("pinned".into()),
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,
@@ -1443,6 +1467,7 @@ async fn task_close_promotes_archived_durable_outcomes_and_resyncs_scope_id() {
                 summary: "ok".into(),
                 model_content: "touched AuthService.rs".into(),
                 artifact_ref: None,
+                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: None,
@@ -1536,4 +1561,254 @@ async fn task_close_promotes_archived_durable_outcomes_and_resyncs_scope_id() {
         .find(|scope| scope.kind == ScopeKind::Task)
         .expect("task scope");
     assert_eq!(task_scope.state, ScopeState::Closed);
+}
+
+// ---------------------------------------------------------------------------
+// Model/operator context directives: `ContextIngress::ContextDirective`
+// applies gc hints, tags and leases; GC treats the targeted items as roots
+// until the hint is cleared or the lease expires. Every protection is
+// explainable in the eviction/reactivation reasons.
+// ---------------------------------------------------------------------------
+
+fn observation_output(id: &str, ok: bool, content: &str) -> ToolOutput {
+    ToolOutput {
+        call_id: id.into(),
+        tool_name: "shell.exec".into(),
+        ok,
+        summary: "ok".into(),
+        model_content: content.into(),
+        artifact_ref: None,
+        context_action: None,
+        metadata: serde_json::json!({}),
+    }
+}
+
+/// A consumed observation (Archived + Ephemeral + Turn) outside the focus
+/// scope chain: the default GC heuristic evicts it, so a directive's
+/// protection is the only thing keeping it resident.
+async fn consumed_observation_outside_focus(engine: &SimpleContextEngine) -> ContextItemId {
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "fix AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: observation_output("1", true, "tests passed in AuthService.rs"),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let items = engine.inspect(usize::MAX).await.unwrap();
+    let observation_id = items
+        .iter()
+        .find(|item| item.kind == ContextKind::ToolObservation)
+        .expect("the observation exists")
+        .id;
+    {
+        let mut state = engine.state.lock().await;
+        for item in &mut state.items {
+            if item.id == observation_id {
+                item.scope_id = None; // outside the focus scope chain
+                item.content = "fix CacheStore.rs".into();
+                item.entities = crate::index::entity::extract_entities(&item.content);
+            }
+        }
+    }
+    observation_id
+}
+
+#[tokio::test]
+async fn gc_hint_keeps_a_consumed_observation_resident_until_cleared() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let observation_id = consumed_observation_outside_focus(&engine).await;
+
+    // A keep_alive hint protects the consumed observation: the model asked
+    // for the item to stay, so it is a GC root despite being consumed.
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::GcHint {
+                item_id: observation_id,
+                keep_alive: true,
+            },
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert_eq!(
+        report.evicted, 0,
+        "the hinted item must be a GC root: {report:?}"
+    );
+
+    // Clearing the hint releases it again.
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::GcHint {
+                item_id: observation_id,
+                keep_alive: false,
+            },
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.evicted >= 1,
+        "a released item is evictable again: {report:?}"
+    );
+}
+
+#[tokio::test]
+async fn hint_on_an_evicted_item_brings_it_back_on_the_next_gc() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let observation_id = consumed_observation_outside_focus(&engine).await;
+
+    // The item is evicted by the first GC pass...
+    let report = engine.gc().await.unwrap();
+    assert!(report.evicted >= 1, "baseline: consumed observation evicts");
+    let warm = engine.diagnostics().await.unwrap().warm_items;
+    assert_eq!(warm, 1, "the observation sits in the reversible buffer");
+
+    // ...and a hint applied afterwards reactivates it: directives reach
+    // buffer items, and GC treats the hint as a root claim.
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::GcHint {
+                item_id: observation_id,
+                keep_alive: true,
+            },
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert_eq!(
+        report.reactivated, 1,
+        "the hinted buffer item must come back: {report:?}"
+    );
+    assert!(
+        report
+            .reactivations
+            .iter()
+            .any(|r| r.reason.contains("kept alive")),
+        "the reactivation must be explainable: {:?}",
+        report.reactivations
+    );
+}
+
+#[tokio::test]
+async fn lease_protects_an_item_until_it_expires() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let observation_id = consumed_observation_outside_focus(&engine).await;
+    // state.turn == 1 here (one user message so far).
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Lease {
+                item_id: observation_id,
+                turns: 1,
+            },
+        })
+        .await
+        .unwrap();
+
+    // Protected at lease time and one turn later (inclusive until_turn).
+    let report = engine.gc().await.unwrap();
+    assert_eq!(report.evicted, 0, "leased until the next turn: {report:?}");
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "continue working".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert_eq!(report.evicted, 0, "lease covers turn 2 too: {report:?}");
+
+    // One turn after the lease ran out, the item is evictable again.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "next task".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.evicted >= 1,
+        "an expired lease no longer protects: {report:?}"
+    );
+}
+
+#[tokio::test]
+async fn tag_directive_attaches_an_extension_label_to_the_target() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let observation_id = consumed_observation_outside_focus(&engine).await;
+
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Tag {
+                item_id: observation_id,
+                tag: "urgent".into(),
+            },
+        })
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    let item = state
+        .items
+        .iter()
+        .find(|item| item.id == observation_id)
+        .expect("the tagged item exists");
+    assert!(
+        item.tags.iter().any(|tag| tag.as_str() == "ext:urgent"),
+        "the extension tag must be attached: {:?}",
+        item.tags
+    );
+}
+
+#[tokio::test]
+async fn directive_with_unknown_item_id_is_a_silent_noop() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "fix AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    let before = engine.diagnostics().await.unwrap().total_items;
+
+    for action in [
+        ContextAction::GcHint {
+            item_id: ContextItemId::new(),
+            keep_alive: true,
+        },
+        ContextAction::Tag {
+            item_id: ContextItemId::new(),
+            tag: "gone".into(),
+        },
+        ContextAction::Lease {
+            item_id: ContextItemId::new(),
+            turns: 3,
+        },
+    ] {
+        engine
+            .ingest(ContextIngress::ContextDirective { action })
+            .await
+            .unwrap();
+    }
+    let after = engine.diagnostics().await.unwrap();
+    assert_eq!(
+        after.total_items, before,
+        "a stale directive must not create or destroy items"
+    );
 }

@@ -234,6 +234,7 @@ impl Tool for ShellExecTool {
             ),
             model_content: format!("{model_content}\n\nFull output: {artifact_ref}"),
             artifact_ref: Some(artifact_ref),
+            context_action: None,
             metadata: json!({
                 "exit_code": exit_code,
                 "timeout_ms": timeout_ms,

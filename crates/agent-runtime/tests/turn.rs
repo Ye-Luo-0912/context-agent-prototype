@@ -136,11 +136,13 @@ impl ModelTransport for HangingModel {
 }
 
 /// Records every ingest and maintain call the runtime makes, so the test can
-/// assert *when* observations reached the long-term context.
+/// assert *when* observations reached the long-term context. Also counts
+/// full GC passes, so `context.collect` routing is observable.
 #[derive(Debug, Default)]
 struct RecordingContextEngine {
     ingests: Arc<Mutex<Vec<String>>>,
     maintains: Arc<Mutex<Vec<ContextMaintenanceTrigger>>>,
+    gcs: Arc<Mutex<usize>>,
 }
 
 #[async_trait::async_trait]
@@ -153,9 +155,14 @@ impl ContextEngine for RecordingContextEngine {
             ContextIngress::FocusChanged { .. } => "FocusChanged",
             ContextIngress::Pin { .. } => "Pin",
             ContextIngress::TaskCompleted { .. } => "TaskCompleted",
+            ContextIngress::ContextDirective { .. } => "ContextDirective",
         };
         self.ingests.lock().await.push(label.to_string());
         Ok(())
+    }
+    async fn gc(&self) -> AgentResult<agent_contracts::ContextGcReport> {
+        *self.gcs.lock().await += 1;
+        Ok(agent_contracts::ContextGcReport::default())
     }
     async fn maintain(
         &self,
@@ -251,6 +258,7 @@ impl ToolDispatcher for OkToolDispatcher {
             summary: "ok".into(),
             model_content: "ok from fs.read".into(),
             artifact_ref: None,
+            context_action: None,
             metadata: json!({}),
         })
     }
@@ -545,3 +553,177 @@ async fn tool_scope_opens_at_tool_start_and_closes_when_consumed() {
         "the tool observation must carry its producing scope"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Context directive routing: the actor reads `ToolOutput::context_action`
+// and turns it into a `ContextIngress::ContextDirective` ingest (gc hint /
+// tag / lease) or a full GC pass (`context.collect`). Tools never touch the
+// engine — the runtime routes.
+// ---------------------------------------------------------------------------
+
+/// Emits one tool call (`name`) with the given arguments, then plain text.
+#[derive(Debug)]
+struct DirectiveModel {
+    tool_name: &'static str,
+    rounds: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for DirectiveModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        if round == 0 {
+            Ok(ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: self.tool_name.into(),
+                    arguments: json!({}),
+                }],
+                usage: Default::default(),
+            })
+        } else {
+            Ok(ModelOutput {
+                content: "done".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            })
+        }
+    }
+}
+
+/// Serves the context meta-tools: each returns a `ToolOutput` carrying the
+/// matching `ContextAction`, exactly like the real `context.*` tools.
+#[derive(Debug)]
+struct DirectiveToolDispatcher;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for DirectiveToolDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![
+            ToolSpec {
+                name: "context.lease".into(),
+                description: "lease an item".into(),
+                input_schema: json!({"type": "object"}),
+                risk: agent_contracts::ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "context.collect".into(),
+                description: "run GC now".into(),
+                input_schema: json!({"type": "object"}),
+                risk: agent_contracts::ToolRisk::ReadOnly,
+            },
+        ]
+    }
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
+        let action = match request.call.name.as_str() {
+            "context.lease" => Some(agent_contracts::ContextAction::Lease {
+                item_id: agent_contracts::ContextItemId::new(),
+                turns: 3,
+            }),
+            "context.collect" => Some(agent_contracts::ContextAction::Collect),
+            other => {
+                return Err(agent_contracts::AgentError::Tool(format!(
+                    "unknown tool: {other}"
+                )));
+            }
+        };
+        Ok(ToolOutput {
+            call_id: request.call.id,
+            tool_name: request.call.name,
+            ok: true,
+            summary: "directive queued".into(),
+            model_content: "directive queued".into(),
+            artifact_ref: None,
+            context_action: action,
+            metadata: json!({}),
+        })
+    }
+}
+
+#[tokio::test]
+async fn actor_routes_lease_directive_into_the_context_engine() {
+    let context = Arc::new(RecordingContextEngine::default());
+    let handle = spawn_with(
+        Arc::new(DirectiveModel {
+            tool_name: "context.lease",
+            rounds: AtomicUsize::new(0),
+        }),
+        context.clone(),
+        Arc::new(DirectiveToolDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("lease something".into()).await.unwrap();
+    let mut seen: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            seen.push(format!("{:?}", envelope.event));
+            if matches!(envelope.event, RuntimeEvent::TurnCompleted) {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        seen.iter().any(|e| e.contains("TurnCompleted")),
+        "the turn must complete; saw: {seen:?}"
+    );
+
+    let ingests = context.ingests.lock().await;
+    assert!(
+        ingests.iter().any(|label| label == "ContextDirective"),
+        "the tool's context_action must be routed as a ContextDirective ingest, got: {ingests:?}"
+    );
+}
+
+#[tokio::test]
+async fn actor_routes_collect_directive_into_a_full_gc_pass() {
+    let context = Arc::new(RecordingContextEngine::default());
+    let handle = spawn_with(
+        Arc::new(DirectiveModel {
+            tool_name: "context.collect",
+            rounds: AtomicUsize::new(0),
+        }),
+        context.clone(),
+        Arc::new(DirectiveToolDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("collect now".into()).await.unwrap();
+    let mut seen: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            seen.push(format!("{:?}", envelope.event));
+            if matches!(envelope.event, RuntimeEvent::TurnCompleted) {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        seen.iter().any(|e| e.contains("TurnCompleted")),
+        "the turn must complete; saw: {seen:?}"
+    );
+
+    // `context.collect` bypasses ingest entirely: it is the one directive
+    // the runtime executes itself (it owns the GC pass).
+    let ingests = context.ingests.lock().await;
+    assert!(
+        !ingests.iter().any(|label| label == "ContextDirective"),
+        "collect is not an ingest directive, got: {ingests:?}"
+    );
+    drop(ingests);
+    let gcs = context.gcs.lock().await;
+    assert_eq!(
+        *gcs, 2,
+        "the manual collect adds one GC pass on top of the regular turn-boundary pass"
+    );
+}
+
+// ---------------------------------------------------------------------------

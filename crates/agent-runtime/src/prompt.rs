@@ -52,8 +52,13 @@ impl PromptAssembler {
             );
             for item in &materialized.items {
                 working.push_str(&format!(
-                    "\n[{:?} | {:?} | attention={:?} | semantic={:?}]\n{}\n",
-                    item.kind, item.scope, item.attention, item.semantic, item.content
+                    "\n[{:?} | {:?} | id={} | attention={:?} | semantic={:?}]\n{}\n",
+                    item.kind,
+                    item.scope,
+                    item.item_id,
+                    item.attention,
+                    item.semantic,
+                    item.content
                 ));
             }
             context_frame.push(ModelMessage::system(working));

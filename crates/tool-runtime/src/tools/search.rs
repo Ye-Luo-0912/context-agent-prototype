@@ -207,6 +207,7 @@ impl Tool for SearchGrepTool {
                 format!("{}{}", model_hits.join("\n"), truncated_note)
             },
             artifact_ref,
+            context_action: None,
             metadata: json!({"hits": hits.len(), "files_scanned": scanned_files}),
         })
     }

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{AgentError, AgentResult, CancellationToken, RunId};
+use crate::{AgentError, AgentResult, CancellationToken, ContextAction, RunId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolRisk {
@@ -38,6 +38,11 @@ pub struct ToolOutput {
     /// Raw/large output should live here instead of in the prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_ref: Option<String>,
+    /// A structured context directive the tool attached to its output
+    /// (gc hint, tag, lease, collect). The runtime routes it to the context
+    /// engine — tools never touch the engine themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_action: Option<ContextAction>,
     #[serde(default)]
     pub metadata: Value,
 }

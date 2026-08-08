@@ -25,6 +25,8 @@ pub(crate) fn to_summaries(items: &[ContextItem]) -> Vec<ContextItemSummary> {
             last_access_turn: item.last_access_turn,
             access_count: item.access_count,
             dependencies: item.dependencies.clone(),
+            keep_alive: item.keep_alive,
+            lease_until_turn: item.lease_until_turn,
             source: item.source.clone(),
         })
         .collect()

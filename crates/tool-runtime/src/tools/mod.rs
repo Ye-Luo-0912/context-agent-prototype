@@ -1,9 +1,11 @@
+mod context;
 mod edit;
 mod fs;
 mod git;
 mod search;
 mod shell;
 
+pub(crate) use context::ContextDirectiveTool;
 pub(crate) use edit::EditReplaceTool;
 pub(crate) use fs::{FsListTool, FsReadTool, FsWriteTool};
 pub(crate) use git::{GitDiffTool, GitStatusTool};

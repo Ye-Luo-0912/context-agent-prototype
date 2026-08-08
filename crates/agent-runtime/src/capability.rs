@@ -815,6 +815,7 @@ impl CapabilityAwareDispatcher {
             ),
             model_content: lines.join("\n"),
             artifact_ref: None,
+            context_action: None,
             metadata: json!({"total": entries.len(), "active": active}),
         })
     }
@@ -830,6 +831,7 @@ impl CapabilityAwareDispatcher {
                 summary: format!("unknown tool: {}", args.name),
                 model_content: format!("unknown tool: {}", args.name),
                 artifact_ref: None,
+                context_action: None,
                 metadata: json!({}),
             });
         };
@@ -872,6 +874,7 @@ impl CapabilityAwareDispatcher {
                 spec.name, owner, activation, state, spec.description, spec.input_schema
             ),
             artifact_ref: None,
+            context_action: None,
             metadata: json!({
                 "name": spec.name,
                 "owner": owner,
@@ -896,6 +899,7 @@ impl CapabilityAwareDispatcher {
                 args.name
             ),
             artifact_ref: None,
+            context_action: None,
             metadata: json!({"tool": args.name}),
         })
     }
@@ -911,6 +915,7 @@ impl CapabilityAwareDispatcher {
             summary: format!("tool unloaded: {}", args.name),
             model_content: format!("tool unloaded: {}", args.name),
             artifact_ref: None,
+            context_action: None,
             metadata: json!({"tool": args.name}),
         })
     }

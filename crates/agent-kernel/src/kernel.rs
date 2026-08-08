@@ -363,6 +363,7 @@ fn tool_error_output(call: &ToolCall, message: String) -> ToolOutput {
         summary: message.clone(),
         model_content: format!("tool error: {message}"),
         artifact_ref: None,
+        context_action: None,
         metadata: serde_json::Value::Null,
     }
 }

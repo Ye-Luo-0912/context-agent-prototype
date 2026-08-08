@@ -57,6 +57,7 @@ async fn server_loop() {
                     summary: "process ran".into(),
                     model_content: "process capability handled the call".into(),
                     artifact_ref: None,
+                    context_action: None,
                     metadata: json!({}),
                 })
                 .expect("ToolOutput serializes");

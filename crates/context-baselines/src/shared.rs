@@ -54,6 +54,8 @@ impl Record {
             last_access_turn: self.created_turn,
             access_count: 0,
             dependencies: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
             source: self.source.clone(),
         }
     }
@@ -114,6 +116,9 @@ pub(crate) fn records_for_ingress(ingress: &ContextIngress, turn: u64) -> Vec<Re
             created_turn: turn,
             source: Some("task summary".into()),
         }],
+        // Directives modify existing items; they produce no records in the
+        // append/rolling baselines (which only accumulate history).
+        ContextIngress::ContextDirective { .. } => Vec::new(),
     }
 }
 

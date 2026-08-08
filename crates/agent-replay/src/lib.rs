@@ -416,6 +416,7 @@ mod tests {
             summary: if ok { "ok" } else { "failed" }.into(),
             model_content: model_content.into(),
             artifact_ref: Some("artifact://run/test.log".into()),
+            context_action: None,
             metadata: json!({}),
         }
     }

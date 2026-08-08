@@ -42,6 +42,8 @@ pub(crate) fn make_item(
         last_access_turn: state.turn,
         dependencies: Vec::new(),
         tags: Vec::new(),
+        keep_alive: false,
+        lease_until_turn: None,
         source,
         residency: ContextResidency::Resident,
         gc_generation: 0,

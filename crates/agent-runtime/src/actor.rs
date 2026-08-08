@@ -678,8 +678,33 @@ impl RuntimeActor {
         let mut ingested = false;
         if let Some(turn) = self.state.turn.as_mut() {
             for step in &turn.turn_frame.steps {
-                if let TurnFrameStep::ToolResult { output, scope_id } = step
-                    && self
+                if let TurnFrameStep::ToolResult { output, scope_id } = step {
+                    // Route the tool's context directive first: gc hints,
+                    // tags and leases target existing items, and the
+                    // observation ingest below must not race them.
+                    if let Some(action) = &output.context_action {
+                        match action {
+                            agent_contracts::ContextAction::Collect => {
+                                // Manual collect: the model asked for a
+                                // full GC pass now, mid-turn.
+                                if let Ok(report) = self.kernel.context_gc().await {
+                                    let _ = self
+                                        .kernel
+                                        .emit_event(RuntimeEvent::ContextGc { report })
+                                        .await;
+                                }
+                            }
+                            other => {
+                                let _ = self
+                                    .kernel
+                                    .context_ingest(ContextIngress::ContextDirective {
+                                        action: other.clone(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    if self
                         .kernel
                         .context_ingest(ContextIngress::ToolObservation {
                             output: output.clone(),
@@ -687,8 +712,9 @@ impl RuntimeActor {
                         })
                         .await
                         .is_ok()
-                {
-                    ingested = true;
+                    {
+                        ingested = true;
+                    }
                 }
             }
         }

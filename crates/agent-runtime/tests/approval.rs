@@ -101,6 +101,7 @@ impl ToolDispatcher for RiskToolDispatcher {
             summary: format!("ran {name}"),
             model_content: format!("ran {name}"),
             artifact_ref: None,
+            context_action: None,
             metadata: json!({}),
         })
     }

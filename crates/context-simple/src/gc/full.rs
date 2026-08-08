@@ -70,12 +70,19 @@ pub(crate) fn run_full_gc(
         // A consumed ephemeral observation left attention (Archived) even
         // though it is still a member of the focus scope: root protection
         // is for the working set, not for spent turn observations — they
-        // leave the heap and stay recallable from the buffer.
+        // leave the heap and stay recallable from the buffer. An explicit
+        // model directive (`context.gc_hint` / `context.lease`) overrides
+        // that heuristic: the model asked for the item to stay.
+        let model_directed = item.keep_alive
+            || item
+                .lease_until_turn
+                .is_some_and(|until| state.turn <= until);
         let consumed_ephemeral = item.attention == AttentionState::Archived
             && item.retention == ContextRetention::Ephemeral
             && item.scope == ContextScope::Turn;
-        let alive_root =
-            item.semantic.is_live() && !consumed_ephemeral && marked.contains(&item.id);
+        let alive_root = item.semantic.is_live()
+            && marked.contains(&item.id)
+            && (model_directed || !consumed_ephemeral);
         if alive_root {
             // A root is currently relevant: "young" again.
             let mut root = item;
@@ -196,12 +203,22 @@ fn mark_roots(
         let durable_session_memory =
             item.retention == ContextRetention::Durable && item.scope == ContextScope::Session;
         let hot = !hot_entities.is_empty() && entities_match(&item.entities, hot_entities);
+        // Model/operator-directed protection (`context.gc_hint` /
+        // `context.lease`): the model asked for this item to stay, so GC
+        // treats it as a root until the hint is cleared or the lease runs
+        // out. Explainable like every other root: "kept because the model
+        // leased it until turn N / set keep_alive".
+        let model_directed_root = item.keep_alive
+            || item
+                .lease_until_turn
+                .is_some_and(|until| state.turn <= until);
         if is_pin
             || in_active_focus_scope
             || durable_task_constraint
             || legacy_active_task_member
             || durable_session_memory
             || hot
+            || model_directed_root
         {
             marked.push(item.id);
         }
@@ -368,9 +385,14 @@ fn reactivate(
             // however hot it looks.
             continue;
         }
-        let Some(reason) =
-            reactivation_reason(item, config, focus.as_ref(), &hot_entities, now_tick)
-        else {
+        let Some(reason) = reactivation_reason(
+            item,
+            config,
+            focus.as_ref(),
+            &hot_entities,
+            now_tick,
+            state.turn,
+        ) else {
             continue;
         };
         let mut item = state.eviction_buffer.remove(index);
@@ -456,9 +478,20 @@ fn reactivation_reason(
     focus: Option<&FocusState>,
     hot_entities: &[String],
     now_tick: u64,
+    current_turn: u64,
 ) -> Option<String> {
     if item.retention == ContextRetention::Pinned || item.scope == ContextScope::Pinned {
         return Some("explicitly pinned again".to_string());
+    }
+    // Model-directed protection brings an evicted item back: the hint or
+    // lease is a root claim, so the buffer item re-enters the heap.
+    if item.keep_alive {
+        return Some("kept alive by a model gc_hint".to_string());
+    }
+    if let Some(until) = item.lease_until_turn
+        && current_turn <= until
+    {
+        return Some(format!("leased by the model until turn {until}"));
     }
     if !hot_entities.is_empty() && entities_match(&item.entities, hot_entities) {
         return Some("entities are hot again in the working set".to_string());
@@ -507,6 +540,7 @@ mod tests {
                     summary: "ok".into(),
                     model_content: "tests passed in AuthService.rs".into(),
                     artifact_ref: None,
+                    context_action: None,
                     metadata: json!({}),
                 },
                 scope_id: None,
@@ -600,6 +634,7 @@ mod tests {
                     summary: "ok".into(),
                     model_content: "touched AuthService.rs".into(),
                     artifact_ref: None,
+                    context_action: None,
                     metadata: json!({}),
                 },
                 scope_id: None,
@@ -669,6 +704,7 @@ mod tests {
                         summary: "ok".into(),
                         model_content: format!("touched File{i}.rs round {i}"),
                         artifact_ref: None,
+                        context_action: None,
                         metadata: json!({}),
                     },
                     scope_id: None,
@@ -715,6 +751,7 @@ mod tests {
                     summary: "fail".into(),
                     model_content: "error in CacheStore.rs:42".into(),
                     artifact_ref: None,
+                    context_action: None,
                     metadata: json!({}),
                 },
                 scope_id: None,
@@ -773,6 +810,7 @@ mod tests {
                     summary: "ok".into(),
                     model_content: "touched AuthService.rs".into(),
                     artifact_ref: None,
+                    context_action: None,
                     metadata: json!({}),
                 },
                 scope_id: None,

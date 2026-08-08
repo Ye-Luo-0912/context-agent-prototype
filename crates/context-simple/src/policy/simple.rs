@@ -144,6 +144,8 @@ mod tests {
             last_access_turn: 0,
             dependencies: Vec::new(),
             tags: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
             source: Some("tool:shell.exec".to_string()),
             residency: agent_contracts::ContextResidency::Resident,
             gc_generation: 0,

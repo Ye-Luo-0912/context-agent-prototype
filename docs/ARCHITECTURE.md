@@ -181,6 +181,18 @@ capabilities under one catalog:
   tools (`capability.search/inspect/load/unload`, always visible) drive the
   active set.
 
+Since V1-M9 the model can also steer the *context* surface through
+read-only meta-tools (`context.gc_hint` / `context.tag` / `context.lease` /
+`context.collect`, always loaded with the core set). They do no work
+themselves: each attaches a typed `ContextAction` to
+`ToolOutput.context_action` that the runtime routes to the context engine
+(`Collect` runs the GC pass; the rest become a `ContextDirective` ingest) —
+tools still never touch the engine or memory stores (invariant 3), and the
+kernel stays the only authority over how a directive is applied. The model
+addresses items by the ids exposed in the materialized context frame
+(`id=<...>` per item), and the engine silently ignores directives whose
+target item is gone.
+
 `ToolExecutionRequest` carries a `CancellationToken` (`cancel`), so long-running
 work (searches, shell processes) can be aborted cooperatively by the caller.
 Tool risk classes (`ReadOnly` / `WorkspaceWrite` / `ProcessExecution`) drive
@@ -522,6 +534,12 @@ RuntimeHandle ── mpsc<RuntimeCommand> ──▶ RuntimeActor (owns mutable s
 - `AgentKernel` is now a stateless executor/helper: context/model/tool
   primitives plus event plumbing (journal, sequence, broadcast). Its
   turn loop, turn locks and `TurnFrame` ownership are gone;
+- since V1-M9, a tool result can carry a context directive: at turn
+  finalize the actor routes `ToolOutput.context_action` *before* the
+  observation ingest — `Collect` runs `ContextEngine::gc()` mid-turn and
+  emits `RuntimeEvent::ContextGc`, everything else becomes a
+  `ContextDirective` ingest, so a hint/lease/tag lands before the
+  observation it targets (see the meta-tools under §4 ToolDispatcher);
 - the actor selects on both the command channel and the operation
   completion channel, so `/cancel` is processed mid-operation and a new
   turn can start right after; cancellation is committed by the actor

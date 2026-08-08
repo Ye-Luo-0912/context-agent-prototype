@@ -162,6 +162,15 @@ pub struct ContextItem {
     /// raw string matching.
     #[serde(default)]
     pub tags: Vec<crate::label::Label>,
+    /// Model/operator-directed GC hint (`context.gc_hint`): while set, the
+    /// item is treated as a root by every GC pass until a later directive
+    /// clears it.
+    #[serde(default)]
+    pub keep_alive: bool,
+    /// Model/operator-directed lease (`context.lease`): the item is treated
+    /// as a GC root until this turn (inclusive); `None` means no lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_until_turn: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// GC dimension: whether the item is in the model-visible heap or in the
@@ -266,6 +275,13 @@ pub enum ContextIngress {
         #[serde(default)]
         scope_id: Option<ScopeId>,
     },
+    /// A structured context directive from a tool's output (gc hint, tag,
+    /// lease). Tools never touch the engine — the runtime routes the
+    /// directive here and the engine applies it or ignores it when the
+    /// target item is gone.
+    ContextDirective {
+        action: ContextAction,
+    },
     FocusChanged {
         focus: FocusState,
     },
@@ -277,6 +293,31 @@ pub enum ContextIngress {
         task_id: Option<TaskId>,
         summary: String,
     },
+}
+
+/// A structured context directive a tool may attach to its output
+/// (`ToolOutput::context_action`). The runtime routes it to the context
+/// engine; the engine applies it or silently ignores it when the target
+/// item is gone. Every directive must be explainable in the lifecycle
+/// ledger: "item kept alive because ...", "item leased until turn N ...",
+/// "item tagged because ...".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContextAction {
+    /// Keep an item resident across GC passes until a later directive
+    /// clears the hint (`context.gc_hint`).
+    GcHint {
+        item_id: ContextItemId,
+        keep_alive: bool,
+    },
+    /// Attach an extension tag to an item (`context.tag`).
+    Tag { item_id: ContextItemId, tag: String },
+    /// Protect an item from GC for the next `turns` turns
+    /// (`context.lease`).
+    Lease { item_id: ContextItemId, turns: u32 },
+    /// Run a full GC pass now (`context.collect`). Handled by the runtime
+    /// — it owns the GC pass — not by `ContextIngress::ContextDirective`.
+    Collect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -576,6 +617,12 @@ pub struct ContextItemSummary {
     /// Ids of prior items this item explicitly depends on (shared entities).
     #[serde(default)]
     pub dependencies: Vec<ContextItemId>,
+    /// Model/operator-directed GC hint (see `ContextItem::keep_alive`).
+    #[serde(default)]
+    pub keep_alive: bool,
+    /// Model/operator-directed lease (see `ContextItem::lease_until_turn`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_until_turn: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
