@@ -1,14 +1,14 @@
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 use agent_contracts::{
     AttentionState, ContextItem, ContextItemId, ContextQuery, ContextRetention, ContextSelection,
-    MaterializedContext, MaterializedItem, ScoreBreakdown,
+    MaterializedContext, MaterializedItem, ScopeId, ScopeKind, ScoreBreakdown,
 };
 
 use crate::diagnostics;
 use crate::engine::{SimpleContextConfig, State};
 use crate::gc::reachability::is_excluded;
-use crate::heap::find_index;
 use crate::item::{approx_tokens, short_id};
 use crate::policy::score_item_with_breakdown;
 
@@ -31,23 +31,43 @@ pub(crate) fn materialize(
     let now_tick = state.tick;
     let focus = state.focus.clone();
 
-    let mut candidates: Vec<(usize, ScoreBreakdown, usize)> = state
-        .items
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| {
-            item.semantic.is_live()
-                && !(item.kind == agent_contracts::ContextKind::UserMessage
-                    && item.content == query.current_input)
-                && !is_excluded(item)
-        })
-        .map(|(index, item)| {
-            let breakdown =
-                score_item_with_breakdown(item, focus.as_ref(), &state.hot_entities, now_tick);
-            let tokens = approx_tokens(&item.content);
-            (index, breakdown, tokens)
-        })
-        .collect();
+    // Candidate generation via the indexes instead of a full-heap scan: the
+    // active scope subtree (session + the current task's scopes, including
+    // closed tool frames of that task) plus hot-entity matches plus legacy
+    // unscoped items. The selection universe is explainable: an item is
+    // scoreable when it is a member of the current task's scope lineage, is
+    // pinned/durable in the session scope, or its entities are hot.
+    state.indexes.ensure_consistent(&state.items);
+    let active_task_id = focus.as_ref().map(|f| f.task_id);
+    let mut active_scopes: HashSet<ScopeId> = HashSet::new();
+    for scope in &state.scopes {
+        let in_active_task = scope.task_id.is_some_and(|id| Some(id) == active_task_id);
+        if scope.kind == ScopeKind::Session || in_active_task {
+            active_scopes.insert(scope.id);
+        }
+    }
+
+    let mut candidates: Vec<(usize, ScoreBreakdown, usize)> = Vec::new();
+    for id in state
+        .indexes
+        .candidate_ids(&active_scopes, &state.hot_entities)
+    {
+        let Some(index) = state.indexes.get(id) else {
+            continue;
+        };
+        let item = &state.items[index];
+        if !item.semantic.is_live()
+            || (item.kind == agent_contracts::ContextKind::UserMessage
+                && item.content == query.current_input)
+            || is_excluded(item)
+        {
+            continue;
+        }
+        let breakdown =
+            score_item_with_breakdown(item, focus.as_ref(), &state.hot_entities, now_tick);
+        let tokens = approx_tokens(&item.content);
+        candidates.push((index, breakdown, tokens));
+    }
 
     candidates.sort_by(|a, b| b.1.total.partial_cmp(&a.1.total).unwrap_or(Ordering::Equal));
 
@@ -143,7 +163,7 @@ pub(crate) fn materialize(
                 if selected_ids.contains(&dep_id) {
                     continue;
                 }
-                let Some(dep_index) = find_index(&state.items, dep_id) else {
+                let Some(dep_index) = state.indexes.get(dep_id) else {
                     continue;
                 };
                 let dep = &state.items[dep_index];
@@ -180,7 +200,10 @@ pub(crate) fn materialize(
             }
             seen.push(dep_index);
             let item = &state.items[dep_index];
-            if item.retention != ContextRetention::Pinned && tokens > expansion_budget {
+            // The expansion slice is a hard bound for every item — pinned
+            // dependencies included. Priority is a selection-order concern,
+            // not a budget exemption.
+            if tokens > expansion_budget {
                 continue;
             }
             expansion_budget = expansion_budget.saturating_sub(tokens);
@@ -219,6 +242,7 @@ pub(crate) fn materialize(
                 scope: item.scope,
                 attention: item.attention,
                 semantic: item.semantic,
+                retention: item.retention,
                 content: item.content.clone(),
                 source: item.source.clone(),
             }

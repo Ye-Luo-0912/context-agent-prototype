@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use agent_contracts::{AgentError, AgentResult, RunId};
+use agent_contracts::{AgentError, AgentResult, Effect, RunId};
 use serde::Serialize;
 use tokio::fs;
 use uuid::Uuid;
@@ -9,23 +9,58 @@ mod handles;
 
 pub use handles::{ArtifactStoreHandle, ConfinedWorkspaceHandle};
 
-/// One recorded workspace mutation, appended to `.focus-agent/changes.jsonl`.
-/// Kept bounded: old content is captured only for small files so the journal
-/// stays reviewable without duplicating the whole repository.
+/// One record in the workspace change journal (`.focus-agent/changes.jsonl`).
+///
+/// Mutations are journaled as a three-phase transaction so a recovery tool
+/// can tell exactly what happened: `MutationPrepared` (staged, target not
+/// touched), then `MutationCommitted` (atomic rename landed) or
+/// `MutationRolledBack` (staged file removed, target untouched). The
+/// prepared record carries both content hashes, so a later recovery pass can
+/// verify the target still matches what was committed. Kept bounded: old
+/// content is captured only for small files so the journal stays reviewable
+/// without duplicating the whole repository.
 #[derive(Debug, Clone, Serialize)]
-pub struct WorkspaceChange {
-    pub timestamp_ms: u64,
-    pub tool: String,
-    pub path: String,
-    pub action: String,
-    pub bytes_before: u64,
-    pub bytes_after: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub old_content: Option<String>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChangeRecord {
+    MutationPrepared {
+        tx_id: String,
+        timestamp_ms: u64,
+        tool: String,
+        path: String,
+        action: String,
+        bytes_before: u64,
+        bytes_after: u64,
+        before_hash: String,
+        after_hash: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        old_content: Option<String>,
+    },
+    MutationCommitted {
+        tx_id: String,
+        timestamp_ms: u64,
+    },
+    MutationRolledBack {
+        tx_id: String,
+        timestamp_ms: u64,
+        reason: String,
+    },
 }
 
-/// Old-content capture limit for `WorkspaceChange` (bounded journal).
+/// Old-content capture limit for `ChangeRecord::MutationPrepared` (bounded
+/// journal).
 pub const CHANGE_CAPTURE_LIMIT: usize = 256 * 1024;
+
+/// FNV-1a 64-bit content hash: deterministic across runs and platforms, so
+/// a journaled `before_hash`/`after_hash` can be re-derived later without a
+/// hash dependency in the workspace crate.
+fn content_hash(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:016x}", hash)
+}
 
 fn artifact_ref(root: &Path, path: &Path) -> String {
     let relative = path
@@ -203,8 +238,7 @@ impl Workspace {
             action: action.to_string(),
             bytes_before,
             old_content,
-            temp: None,
-            finished: false,
+            tx_id: Uuid::new_v4().to_string(),
         })
     }
 
@@ -294,9 +328,9 @@ impl Workspace {
     }
 
     /// Append a mutation record to the workspace change journal
-    /// (`.focus-agent/changes.jsonl`). Mutating tools call this so every write
-    /// is visible and reviewable.
-    pub async fn record_change(&self, change: WorkspaceChange) -> AgentResult<()> {
+    /// (`.focus-agent/changes.jsonl`). Mutating tools call this so every
+    /// write is visible and reviewable.
+    pub async fn record_change(&self, change: ChangeRecord) -> AgentResult<()> {
         let journal = self.state_dir.join("changes.jsonl");
         let line = serde_json::to_string(&change)
             .map_err(|e| AgentError::Storage(format!("serialize change: {e}")))?;
@@ -320,13 +354,19 @@ impl Workspace {
     }
 }
 
-/// A single journaled, atomic file mutation.
+/// A single journaled, atomic file mutation, split into prepare and commit.
 ///
-/// Ordering contract: the change journal entry is written *before* the target
-/// file is swapped in, so a journal failure never leaves the target
-/// half-mutated and a caller retrying the tool cannot double-apply a mutation
-/// that already landed. The content is staged in a hidden temporary file next
-/// to the target and swapped in with an atomic rename.
+/// Ordering contract: `prepare` stages the new content in a hidden
+/// temporary file next to the target and records `MutationPrepared` *before*
+/// the target is swapped in, so a journal failure never leaves the target
+/// half-mutated and a caller retrying the tool cannot double-apply a
+/// mutation that already landed. `commit` then atomically renames the staged
+/// file over the target and records `MutationCommitted`; a commit failure
+/// rolls the staging back and records `MutationRolledBack`, so the journal
+/// never claims a mutation that did not land. The runtime owns the
+/// commit/rollback decision: it validates the operation is still current
+/// (generation fence) before committing, and rolls back when a stale
+/// operation's prepared effect would otherwise leak.
 pub struct MutationTransaction {
     workspace: Workspace,
     target: PathBuf,
@@ -335,15 +375,14 @@ pub struct MutationTransaction {
     action: String,
     bytes_before: u64,
     old_content: Option<String>,
-    temp: Option<PathBuf>,
-    finished: bool,
+    tx_id: String,
 }
 
 impl MutationTransaction {
-    /// Stage `content`, record the journal entry, then atomically replace the
-    /// target. On any failure the temporary file is removed and the target is
-    /// left untouched.
-    pub async fn apply(mut self, content: &[u8]) -> AgentResult<()> {
+    /// Stage `content`: write the temporary file and record
+    /// `MutationPrepared`. The target is not touched. Returns the prepared
+    /// mutation the runtime commits or rolls back.
+    pub async fn prepare(mut self, content: &[u8]) -> AgentResult<PreparedMutation> {
         let parent = self.target.parent().ok_or_else(|| {
             AgentError::InvalidRequest(format!("no parent for {}", self.target.display()))
         })?;
@@ -373,44 +412,133 @@ impl MutationTransaction {
             return Err(AgentError::Io(format!("flush temp file: {e}")));
         }
         drop(file);
-        self.temp = Some(temp.clone());
 
-        let change = WorkspaceChange {
+        let before_hash = content_hash(
+            self.old_content
+                .as_deref()
+                .map(str::as_bytes)
+                .unwrap_or_default(),
+        );
+        let record = ChangeRecord::MutationPrepared {
+            tx_id: self.tx_id.clone(),
             timestamp_ms: now_ms(),
             tool: self.tool.clone(),
             path: self.relative.clone(),
             action: self.action.clone(),
             bytes_before: self.bytes_before,
             bytes_after: content.len() as u64,
+            before_hash,
+            after_hash: content_hash(content),
             old_content: self.old_content.take(),
         };
-        if let Err(e) = self.workspace.record_change(change).await {
+        if let Err(e) = self.workspace.record_change(record).await {
             let _ = fs::remove_file(&temp).await;
-            self.temp = None;
             return Err(e);
         }
 
+        Ok(PreparedMutation {
+            workspace: self.workspace,
+            target: self.target,
+            tx_id: self.tx_id,
+            temp: Some(temp),
+            finished: false,
+        })
+    }
+
+    /// Convenience: prepare then commit immediately (used where the caller
+    /// is itself the only judge of the operation's validity).
+    pub async fn apply(self, content: &[u8]) -> AgentResult<()> {
+        let prepared = self.prepare(content).await?;
+        prepared.commit().await
+    }
+}
+
+/// A staged mutation whose commit is owned by the runtime: commit after the
+/// generation fence passes, roll back when the operation turned stale.
+pub struct PreparedMutation {
+    workspace: Workspace,
+    target: PathBuf,
+    tx_id: String,
+    temp: Option<PathBuf>,
+    finished: bool,
+}
+
+impl PreparedMutation {
+    /// The journal transaction id of this staged mutation.
+    pub fn tx_id(&self) -> &str {
+        &self.tx_id
+    }
+
+    /// Atomically replace the target and record `MutationCommitted`. On
+    /// failure the staged file is removed and `MutationRolledBack` is
+    /// recorded, so the journal reflects reality.
+    pub async fn commit(mut self) -> AgentResult<()> {
+        let Some(temp) = self.temp.take() else {
+            return Ok(());
+        };
         if let Err(e) = fs::rename(&temp, &self.target).await {
             let _ = fs::remove_file(&temp).await;
-            self.temp = None;
+            self.record_rolled_back(format!("commit failed: {e}")).await;
             return Err(AgentError::Io(format!(
                 "commit {}: {e}",
                 self.target.display()
             )));
         }
-        self.temp = None;
+        let record = ChangeRecord::MutationCommitted {
+            tx_id: self.tx_id.clone(),
+            timestamp_ms: now_ms(),
+        };
+        // The rename landed but the commit record could not be written:
+        // surface it — the target state and the journal now disagree.
+        self.workspace.record_change(record).await?;
         self.finished = true;
         Ok(())
     }
+
+    /// Remove the staged file and record `MutationRolledBack` (best effort).
+    /// Called when the owning operation is stale and the mutation must not
+    /// land.
+    pub async fn rollback(mut self, reason: &str) {
+        self.temp = None;
+        self.record_rolled_back(reason.to_string()).await;
+    }
+
+    async fn record_rolled_back(&self, reason: String) {
+        let record = ChangeRecord::MutationRolledBack {
+            tx_id: self.tx_id.clone(),
+            timestamp_ms: now_ms(),
+            reason,
+        };
+        let _ = self.workspace.record_change(record).await;
+    }
 }
 
-impl Drop for MutationTransaction {
+impl Drop for PreparedMutation {
     fn drop(&mut self) {
         if !self.finished
             && let Some(temp) = &self.temp
         {
             let _ = std::fs::remove_file(temp);
         }
+    }
+}
+
+/// The contract seam for effect commit: a staged workspace mutation is an
+/// `Effect` the runtime commits (after the generation fence) or rolls back
+/// (stale operation). The runtime only ever sees the trait — it never knows
+/// about temp files or the journal.
+#[async_trait::async_trait]
+impl Effect for PreparedMutation {
+    fn describe(&self) -> String {
+        format!("workspace mutation {}", self.tx_id)
+    }
+
+    async fn commit(self: Box<Self>) -> AgentResult<()> {
+        (*self).commit().await
+    }
+
+    async fn rollback(self: Box<Self>, reason: &str) {
+        (*self).rollback(reason).await;
     }
 }
 
@@ -552,11 +680,25 @@ mod tests {
         let journal = fs::read_to_string(workspace.state_dir().join("changes.jsonl"))
             .await
             .unwrap();
-        let record: serde_json::Value = serde_json::from_str(journal.trim()).unwrap();
-        assert_eq!(record["tool"], "fs.write");
-        assert_eq!(record["action"], "write");
-        assert_eq!(record["bytes_before"], 0);
-        assert_eq!(record["bytes_after"], 5);
+        let lines: Vec<&str> = journal.lines().collect();
+        let prepared: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(prepared["kind"], "mutation_prepared");
+        assert_eq!(prepared["tool"], "fs.write");
+        assert_eq!(prepared["action"], "write");
+        assert_eq!(prepared["bytes_before"], 0);
+        assert_eq!(prepared["bytes_after"], 5);
+        assert!(
+            prepared["before_hash"].as_str().unwrap().len() == 16,
+            "before hash must be present"
+        );
+        let committed: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(committed["kind"], "mutation_committed");
+        assert_eq!(committed["tx_id"], prepared["tx_id"]);
+        assert_eq!(
+            prepared["after_hash"],
+            content_hash(b"hello"),
+            "the journaled hash must re-derive from the written content"
+        );
 
         // Overwriting captures the old content in the journal backup.
         let tx = workspace
@@ -570,13 +712,51 @@ mod tests {
             .await
             .unwrap();
         let lines: Vec<&str> = journal.lines().collect();
-        let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        let record: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(record["kind"], "mutation_prepared");
         assert_eq!(record["bytes_before"], 5);
         assert_eq!(record["old_content"], "hello");
+        assert_eq!(record["before_hash"], content_hash(b"hello"));
+        assert_eq!(record["after_hash"], content_hash(b"world"));
     }
 
     #[tokio::test]
-    async fn failed_apply_leaves_target_untouched() {
+    async fn prepared_mutation_rolls_back_without_touching_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let target = workspace.resolve_relative("notes.txt").await.unwrap();
+        fs::write(&target, "original").await.unwrap();
+
+        let tx = workspace
+            .begin_mutation("fs.write", "write", "notes.txt")
+            .await
+            .unwrap();
+        let prepared = tx.prepare(b"staged but rolled back").await.unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).await.unwrap(),
+            "original",
+            "prepare must not touch the target"
+        );
+        prepared.rollback("stale operation").await;
+
+        assert_eq!(
+            fs::read_to_string(&target).await.unwrap(),
+            "original",
+            "rollback must leave the target untouched"
+        );
+        let journal = fs::read_to_string(workspace.state_dir().join("changes.jsonl"))
+            .await
+            .unwrap();
+        let lines: Vec<&str> = journal.lines().collect();
+        let prepared_record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let rolled_back: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(rolled_back["kind"], "mutation_rolled_back");
+        assert_eq!(rolled_back["tx_id"], prepared_record["tx_id"]);
+        assert_eq!(rolled_back["reason"], "stale operation");
+    }
+
+    #[tokio::test]
+    async fn failed_apply_leaves_target_untouched_and_records_rollback() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let target = workspace.resolve_relative("dir/file.txt").await.unwrap();
@@ -598,5 +778,16 @@ mod tests {
             "original",
             "unrelated target must be untouched"
         );
+
+        // The journal must tell the truth: prepared, then rolled back.
+        let journal = fs::read_to_string(workspace.state_dir().join("changes.jsonl"))
+            .await
+            .unwrap();
+        let lines: Vec<&str> = journal.lines().collect();
+        let prepared: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(prepared["kind"], "mutation_prepared");
+        let rolled_back: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(rolled_back["kind"], "mutation_rolled_back");
+        assert_eq!(rolled_back["tx_id"], prepared["tx_id"]);
     }
 }

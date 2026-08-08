@@ -1,6 +1,6 @@
 use agent_contracts::{
-    ContextDiagnostics, ContextSelection, ContextStateTransition, RunId, RuntimeEvent,
-    RuntimeEventEnvelope,
+    ContextDiagnostics, ContextSelection, ContextStateTransition, OperationId, RunId, RuntimeEvent,
+    RuntimeEventEnvelope, TurnId,
 };
 use agent_kernel::ApprovalRequest;
 
@@ -42,6 +42,11 @@ pub struct AppState {
     pub busy: bool,
     pub scroll: u16,
     pub pending_approval: Option<PendingApproval>,
+    /// The model operation whose streamed deltas are currently being
+    /// rendered. A delta that does not match this identity belongs to a
+    /// superseded turn and is dropped — the fence against a cancelled
+    /// turn's late text leaking into the next turn's transcript.
+    current_op: Option<(TurnId, OperationId, u64)>,
 }
 
 impl AppState {
@@ -63,6 +68,7 @@ impl AppState {
             busy: false,
             scroll: 0,
             pending_approval: None,
+            current_op: None,
         }
     }
 
@@ -120,8 +126,11 @@ impl AppState {
                     content,
                 });
             }
-            RuntimeEvent::FocusChanged { goal } => {
-                self.push_system(format!("focus -> {goal}"));
+            RuntimeEvent::FocusChanged { task_id, goal } => {
+                self.push_system(format!("focus -> task {task_id}: {goal}"));
+            }
+            RuntimeEvent::FocusCleared => {
+                self.push_system("focus cleared (task suspended)".into());
             }
             RuntimeEvent::Pinned { content } => {
                 self.push_system(format!("pinned: {content}"));
@@ -186,12 +195,27 @@ impl AppState {
                     ));
                 }
             }
-            RuntimeEvent::ModelStarted => {
+            RuntimeEvent::ModelStarted {
+                turn_id,
+                operation_id,
+                generation,
+            } => {
+                self.current_op = Some((turn_id, operation_id, generation));
                 self.busy = true;
                 self.streaming = false;
                 self.status = "model".into();
             }
-            RuntimeEvent::ModelDelta { delta } => {
+            RuntimeEvent::ModelDelta {
+                turn_id,
+                operation_id,
+                generation,
+                delta,
+            } => {
+                // Generation fence: only the current operation's stream may
+                // render. A late delta from a cancelled turn is dropped.
+                if self.current_op != Some((turn_id, operation_id, generation)) {
+                    return;
+                }
                 self.streaming = true;
                 self.status = "model (streaming)".into();
                 match self.messages.last_mut() {
@@ -251,6 +275,9 @@ impl AppState {
                 self.push_system(format!("task completed: {summary}"));
             }
             RuntimeEvent::TurnCompleted => {
+                // The turn is over: any delta still in flight belongs to a
+                // superseded operation and must not render.
+                self.current_op = None;
                 self.busy = false;
                 self.streaming = false;
                 self.status = "idle".into();
@@ -261,5 +288,77 @@ impl AppState {
                 self.status = "stopped".into();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_contracts::RuntimeEventEnvelope;
+
+    fn envelope(event: RuntimeEvent) -> RuntimeEventEnvelope {
+        RuntimeEventEnvelope {
+            run_id: RunId::new(),
+            seq: 1,
+            timestamp_ms: 0,
+            event,
+        }
+    }
+
+    fn delta(turn: TurnId, op: OperationId, generation: u64, text: &str) -> RuntimeEvent {
+        RuntimeEvent::ModelDelta {
+            turn_id: turn,
+            operation_id: op,
+            generation,
+            delta: text.into(),
+        }
+    }
+
+    #[test]
+    fn late_deltas_from_a_superseded_operation_are_dropped() {
+        let mut app = AppState::new(RunId::new());
+
+        let turn = TurnId::new();
+        let op_a = OperationId::new();
+        let op_b = OperationId::new();
+        app.apply_runtime_event(envelope(RuntimeEvent::ModelStarted {
+            turn_id: turn,
+            operation_id: op_a,
+            generation: 3,
+        }));
+
+        // The current operation's deltas render.
+        app.apply_runtime_event(envelope(delta(turn, op_a, 3, "hello ")));
+        app.apply_runtime_event(envelope(delta(turn, op_a, 3, "world")));
+        let rendered: String = app
+            .messages
+            .iter()
+            .filter(|m| m.role == UiRole::Assistant)
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(rendered, "hello world");
+
+        // A delta from a superseded operation (a cancelled turn's provider
+        // still flushing) must not leak into the transcript.
+        app.apply_runtime_event(envelope(delta(turn, op_b, 3, "LATE")));
+        let rendered: String = app
+            .messages
+            .iter()
+            .filter(|m| m.role == UiRole::Assistant)
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(rendered, "hello world", "stale deltas must be dropped");
+
+        // After the turn ends, even the old operation's own late deltas are
+        // dropped.
+        app.apply_runtime_event(envelope(RuntimeEvent::TurnCompleted));
+        app.apply_runtime_event(envelope(delta(turn, op_a, 3, "STALE")));
+        let rendered: String = app
+            .messages
+            .iter()
+            .filter(|m| m.role == UiRole::Assistant)
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(rendered, "hello world", "post-turn deltas must be dropped");
     }
 }

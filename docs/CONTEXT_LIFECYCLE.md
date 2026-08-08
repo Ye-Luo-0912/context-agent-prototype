@@ -127,7 +127,58 @@ append everything
 
 The budget is a hard physical constraint, not the memory policy.
 
+Dependency expansion respects it too: the expansion slice is spent only
+from the reserved budget, with no pinned exemption — a pinned dependency
+cannot break the frame. And the engine's budget is a *target*: the
+runtime re-estimates the fully assembled request (system + focus +
+context + turn + tool schemas, including the rendering overhead the
+engine never sees) and trims the context frame if the wire estimate
+exceeds the provider window. The engine proposes; the runtime disposes.
+
+## 6b. The selection universe: secondary indexes
+
+Since V1-M9 the engine keeps slot-based secondary indexes beside the
+heap (`IdIndex` item-id → slot, `EntityIndex` entity → item ids,
+`ScopeIndex` scope id → item ids, plus the unscoped bucket for legacy
+checkpoints). They answer the two questions the hot path used to scan
+the whole heap for:
+
+- **dependency ingest** previously matched a fresh item against every
+  prior item (O(heap) with string parsing per pair); it now reads the
+  entity buckets directly — O(entities × bucket), newest-first via slot
+  order, capped per entity and per item. Precomputed entity signatures
+  mean no content is re-parsed during ingest;
+- **materializer candidate generation** no longer walks the full heap.
+  The selection universe is explicit: items of the active task's scope
+  subtree (session scope + the current task's scopes, including closed
+  tool frames of that task), items whose entities are hot, and legacy
+  unscoped items. Everything else is not scoreable this snapshot.
+
+The index is a cache over the heap, kept consistent at every structural
+mutation (insert on push, wholesale rebuild after a GC sweep, scope
+re-stamp on promotion). `ensure_consistent` re-derives it when a caller
+mutated the heap without the helpers, so a stale index can never
+silently drop candidates.
+
 ## 7. Focus transitions
+
+Since V1-M9 the runtime separates **tasks** from **focus**: a `TaskManager`
+(`agent-runtime::task`) owns the long-lived execution entities — `TaskRecord
+{ id, goal, status, timestamps }` with `create_task` / `activate_task` /
+`suspend_task` / `complete_task`, and dedupe by goal so re-focusing a
+previous goal resumes the same task id. Focus is only the current attention
+*inside* a task; `set_focus(task_id, focus)` names an existing task and
+never mints a new one.
+
+```text
+/focus A  → create_task("A")  → Task 1 active, focus on Task 1
+/focus B  → create_task("B")  → Task 2 active, Task 1 suspended
+/focus A  → activate_task(Task 1) → Task 1 active again, Task 2 suspended
+```
+
+This is what scope suspension/resume and the GC rely on: a resumed task
+re-activates its scope instead of opening a fresh one, and completed tasks
+stay completed instead of being re-created by a later focus.
 
 A FocusState contains:
 

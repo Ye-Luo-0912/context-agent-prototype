@@ -9,8 +9,8 @@ use agent_contracts::{
     CapabilityTransport, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
     MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, RunId,
-    ScopeId, ScopeKind, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutput,
-    ToolRisk, ToolSpec,
+    ScopeId, ScopeKind, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome,
+    ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_runtime::{
     APPROVAL_POLICY, CapabilityAwareDispatcher, CapabilityId, ContextModule, ModelModule, Module,
@@ -97,7 +97,7 @@ impl ToolDispatcher for StubTools {
             description: "stub builtin tool".into(),
         }]
     }
-    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
+    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         Err(agent_contracts::AgentError::Tool("stub".into()))
     }
 }
@@ -368,7 +368,7 @@ impl Capability for DemoCapability {
 }
 
 async fn execute(dispatcher: Arc<dyn ToolDispatcher>, tool: &str) -> ToolOutput {
-    dispatcher
+    let outcome = dispatcher
         .execute(ToolExecutionRequest {
             run_id: RunId::new(),
             call: ToolCall {
@@ -379,7 +379,11 @@ async fn execute(dispatcher: Arc<dyn ToolDispatcher>, tool: &str) -> ToolOutput 
             cancel: CancellationToken::new(),
         })
         .await
-        .unwrap()
+        .unwrap();
+    match outcome {
+        ToolOutcome::Value(output) => output,
+        ToolOutcome::PreparedEffect { .. } => panic!("test dispatcher returns plain values"),
+    }
 }
 
 #[tokio::test]
@@ -748,4 +752,243 @@ async fn execute_raw(dispatcher: Arc<dyn ToolDispatcher>, tool: &str) -> String 
         .await
         .unwrap_err()
         .to_string()
+}
+
+/// A module that records lifecycle calls and can be told to fail its start
+/// or stop.
+struct ScriptedModule {
+    name: &'static str,
+    log: Arc<Mutex<Vec<String>>>,
+    fail_start: bool,
+    fail_stop: bool,
+}
+
+#[async_trait::async_trait]
+impl Module for ScriptedModule {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn capabilities(&self) -> Vec<CapabilityId> {
+        Vec::new()
+    }
+    fn register(&self, _registry: &mut ServiceRegistry) -> AgentResult<()> {
+        Ok(())
+    }
+    async fn start(&self) -> AgentResult<()> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("start:{}", self.name));
+        if self.fail_start {
+            return Err(agent_contracts::AgentError::Internal(format!(
+                "{} start failed",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+    async fn stop(&self) -> AgentResult<()> {
+        self.log.lock().unwrap().push(format!("stop:{}", self.name));
+        if self.fail_stop {
+            return Err(agent_contracts::AgentError::Internal(format!(
+                "{} stop failed",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// A capability that records its stop (and can fail it).
+struct RecordingCapability {
+    log: Arc<Mutex<Vec<String>>>,
+    fail_stop: bool,
+}
+
+impl RecordingCapability {
+    fn new(log: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            log,
+            fail_stop: false,
+        }
+    }
+    fn failing_stop(log: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            log,
+            fail_stop: true,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Capability for RecordingCapability {
+    fn manifest(&self) -> &CapabilityManifest {
+        static MANIFEST: std::sync::OnceLock<CapabilityManifest> = std::sync::OnceLock::new();
+        MANIFEST.get_or_init(|| CapabilityManifest {
+            id: "recording".into(),
+            version: "1.0.0".into(),
+            name: "recording".into(),
+            summary: "records lifecycle".into(),
+            status: CapabilityStatus::Experimental,
+            provides: vec![agent_contracts::CapabilityKind::Tool],
+            permissions: Vec::new(),
+            requires: Vec::new(),
+            tools: Vec::new(),
+            lifecycle: CapabilityLifecycle::Eager,
+            transport: CapabilityTransport::Builtin,
+        })
+    }
+    async fn start(&self) -> AgentResult<()> {
+        self.log.lock().unwrap().push("start:capability".into());
+        Ok(())
+    }
+    async fn invoke(
+        &self,
+        call: ToolCall,
+        _ctx: CapabilityInvocationContext,
+    ) -> AgentResult<ToolOutput> {
+        Ok(ToolOutput {
+            call_id: call.id,
+            tool_name: call.name,
+            ok: true,
+            summary: "ok".into(),
+            model_content: "ok".into(),
+            artifact_ref: None,
+            context_action: None,
+            metadata: json!({}),
+        })
+    }
+    async fn stop(&self) -> AgentResult<()> {
+        self.log.lock().unwrap().push("stop:capability".into());
+        if self.fail_stop {
+            return Err(agent_contracts::AgentError::Internal(
+                "capability stop failed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn host_stops_capabilities_before_typed_modules() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut host = ModuleHost::new();
+    host.register_capability(Arc::new(RecordingCapability::new(log.clone())))
+        .unwrap();
+    host.add_module(Arc::new(ScriptedModule {
+        name: "context",
+        log: log.clone(),
+        fail_start: false,
+        fail_stop: false,
+    }))
+    .unwrap();
+    host.add_module(Arc::new(ScriptedModule {
+        name: "model",
+        log: log.clone(),
+        fail_start: false,
+        fail_stop: false,
+    }))
+    .unwrap();
+
+    host.start().await.unwrap();
+    host.stop().await.unwrap();
+
+    let order = log.lock().unwrap().clone();
+    // The capability may depend on a typed service (EventStore etc.), so it
+    // must be stopped before the modules are.
+    assert!(
+        order.iter().position(|s| s == "stop:capability")
+            < order.iter().position(|s| s == "stop:model"),
+        "capabilities stop before typed modules: {order:?}"
+    );
+    assert_eq!(
+        order,
+        vec![
+            "start:context".to_string(),
+            "start:model".to_string(),
+            "start:capability".to_string(),
+            "stop:capability".to_string(),
+            "stop:model".to_string(),
+            "stop:context".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn host_start_rolls_back_everything_when_a_later_module_fails() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut host = ModuleHost::new();
+    for name in ["a", "b"] {
+        host.add_module(Arc::new(ScriptedModule {
+            name,
+            log: log.clone(),
+            fail_start: false,
+            fail_stop: false,
+        }))
+        .unwrap();
+    }
+    host.add_module(Arc::new(ScriptedModule {
+        name: "c",
+        log: log.clone(),
+        fail_start: true,
+        fail_stop: false,
+    }))
+    .unwrap();
+
+    let error = host.start().await.expect_err("start must fail");
+    assert!(
+        error.to_string().contains("c start failed"),
+        "the original failure must be reported: {error}"
+    );
+
+    // A and B started, so the transaction must stop them again (reverse).
+    let order = log.lock().unwrap().clone();
+    assert_eq!(
+        order,
+        vec![
+            "start:a".to_string(),
+            "start:b".to_string(),
+            "start:c".to_string(),
+            "stop:b".to_string(),
+            "stop:a".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn host_stop_runs_every_stop_and_aggregates_all_errors() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut host = ModuleHost::new();
+    host.register_capability(Arc::new(RecordingCapability::failing_stop(log.clone())))
+        .unwrap();
+    host.add_module(Arc::new(ScriptedModule {
+        name: "a",
+        log: log.clone(),
+        fail_start: false,
+        fail_stop: true,
+    }))
+    .unwrap();
+    host.add_module(Arc::new(ScriptedModule {
+        name: "b",
+        log: log.clone(),
+        fail_start: false,
+        fail_stop: false,
+    }))
+    .unwrap();
+
+    host.start().await.unwrap();
+    let error = host.stop().await.expect_err("stop must aggregate errors");
+    let message = error.to_string();
+    assert!(
+        message.contains("capability stop failed") && message.contains("a stop failed"),
+        "every stop failure must be reported: {message}"
+    );
+
+    // Every stop ran even though the first one failed.
+    let order = log.lock().unwrap().clone();
+    assert_eq!(
+        order.iter().filter(|s| s.starts_with("stop:")).count(),
+        3,
+        "all stops run best effort: {order:?}"
+    );
 }

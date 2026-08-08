@@ -12,7 +12,7 @@ use std::time::Duration;
 use agent_contracts::{
     AgentResult, ContextEngine, ContextIngress, ContextItemSummary, ContextMaintenanceReport,
     ContextMaintenanceTrigger, ContextQuery, MaterializedContext, ModelCapabilities, ModelOutput,
-    ModelRequest, ModelTransport, RuntimeEvent, ToolOutput,
+    ModelRequest, ModelTransport, RuntimeEvent, ToolOutcome, ToolOutput,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
 use context_contextcore::{ContextServiceAdapter, ContextServiceConfig, ServiceEngine};
@@ -166,7 +166,7 @@ impl agent_contracts::ToolDispatcher for ToolDispatcherStub {
     async fn execute(
         &self,
         _request: agent_contracts::ToolExecutionRequest,
-    ) -> AgentResult<ToolOutput> {
+    ) -> AgentResult<ToolOutcome> {
         unreachable!("no tools in this test")
     }
 }

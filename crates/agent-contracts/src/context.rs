@@ -285,6 +285,10 @@ pub enum ContextIngress {
     FocusChanged {
         focus: FocusState,
     },
+    /// The current focus is cleared: the active task is suspended (not
+    /// completed), its scopes stay open for a later resume, and subsequent
+    /// turns run without a task until a `FocusChanged` reactivates one.
+    FocusCleared,
     Pin {
         content: String,
         kind: ContextKind,
@@ -448,9 +452,20 @@ pub struct MaterializedItem {
     pub attention: AttentionState,
     #[serde(default)]
     pub semantic: SemanticState,
+    /// Retention is exposed so the runtime's final budget guard can keep
+    /// pinned items while trimming the context frame, and so the model can
+    /// see which entries are durable.
+    #[serde(default = "default_retention")]
+    pub retention: ContextRetention,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+}
+
+/// Missing `retention` on old wire/checkpoint data means a normal working
+/// item, not a pinned one.
+fn default_retention() -> ContextRetention {
+    ContextRetention::Working
 }
 
 /// The structured result of one `ContextEngine::materialize` call: the

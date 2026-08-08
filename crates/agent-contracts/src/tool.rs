@@ -57,6 +57,54 @@ pub struct ToolExecutionRequest {
     pub cancel: CancellationToken,
 }
 
+/// A side effect a tool prepared but did not yet apply.
+///
+/// The tool's *computation* (reading, diffing, staging a temp file) happens
+/// inside execution; the *side-effect commit* is owned by the runtime. The
+/// actor validates the operation against the generation fence and only then
+/// calls `commit`; a stale operation (cancelled or superseded) must call
+/// `rollback` so the staged effect never lands. This is what makes tool
+/// cancellation safe: the actor can stop a stale mutation before it touches
+/// the filesystem, the git index, an outbox or an external API.
+#[async_trait::async_trait]
+pub trait Effect: Send + Sync {
+    /// Human-readable description for events and logs.
+    fn describe(&self) -> String;
+    /// Apply the prepared effect (atomic rename, outbox send, ...). The
+    /// journal must reflect the outcome either way.
+    async fn commit(self: Box<Self>) -> AgentResult<()>;
+    /// Undo the preparation: the effect must not land.
+    async fn rollback(self: Box<Self>, reason: &str);
+}
+
+/// What a tool execution produced: either a plain bounded output (a value —
+/// reads, searches, already-applied behavior like a spawned process), or an
+/// output plus a staged side effect the runtime must commit (or roll back)
+/// after validating the operation is still current.
+pub enum ToolOutcome {
+    /// The execution produced only an output; there is nothing to commit.
+    Value(ToolOutput),
+    /// The computation finished and a side effect is staged. `output` is
+    /// what the model sees after the runtime commits the effect.
+    PreparedEffect {
+        output: ToolOutput,
+        effect: Box<dyn Effect>,
+    },
+}
+
+impl std::fmt::Debug for ToolOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolOutcome::Value(output) => f.debug_tuple("Value").field(output).finish(),
+            ToolOutcome::PreparedEffect { output, .. } => f
+                .debug_struct("PreparedEffect")
+                .field("output", output)
+                .field("effect", &"<staged effect>")
+                .finish(),
+        }
+    }
+}
+
 /// One immutable view of the tool surface captured at a runtime safe point.
 /// A model round captures exactly one snapshot after the tool lifecycle GC
 /// and uses it for everything: the budget, the prompt and tool-call
@@ -174,5 +222,5 @@ pub trait ToolDispatcher: Send + Sync {
         None
     }
 
-    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput>;
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome>;
 }

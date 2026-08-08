@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use agent_contracts::{
     ContextDiagnostics, ContextEngine, ContextMaintenanceReport, ContextMaintenanceTrigger, RunId,
-    RuntimeEvent, RuntimeEventEnvelope, ToolOutput,
+    RuntimeEvent, RuntimeEventEnvelope, TaskId, ToolOutput,
 };
 use context_baselines::{AppendOnlyEngine, RollingConfig, RollingSummaryEngine};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
@@ -119,6 +119,10 @@ struct Script {
     run: RunId,
     seq: u64,
     events: Vec<RuntimeEventEnvelope>,
+    /// Stable task identity per goal, mirroring the runtime's TaskManager:
+    /// re-focusing a goal resumes the same task instead of minting a new
+    /// one, so replay exercises the real suspension/resume semantics.
+    tasks: std::collections::HashMap<String, TaskId>,
 }
 
 impl Script {
@@ -127,6 +131,7 @@ impl Script {
             run: RunId::new(),
             seq: 0,
             events: Vec::new(),
+            tasks: std::collections::HashMap::new(),
         }
     }
 
@@ -179,7 +184,11 @@ impl Script {
     }
 
     fn focus(&mut self, goal: &str) {
-        self.push(RuntimeEvent::FocusChanged { goal: goal.into() });
+        let task_id = self.tasks.entry(goal.to_string()).or_default().to_owned();
+        self.push(RuntimeEvent::FocusChanged {
+            task_id,
+            goal: goal.into(),
+        });
         self.push(RuntimeEvent::ContextMaintained {
             trigger: ContextMaintenanceTrigger::FocusChanged,
             report: dummy_report(),

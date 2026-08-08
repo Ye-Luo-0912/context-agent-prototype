@@ -142,7 +142,11 @@ The P1 contract adds:
   and ends a cancelled turn cleanly (`Warning` + `TurnCompleted`).
 - Streaming deltas are live-only: `RuntimeEvent::ModelDelta` is broadcast to
   UI subscribers but never journaled — the final `AssistantMessage` carries
-  the complete content for replay.
+  the complete content for replay. Since V1-M9 each delta carries
+  `turn_id`/`operation_id`/`generation` and the UI's `RunStateAggregator`
+  accepts deltas only for the operation it currently renders, so a late
+  delta from a cancelled turn can never leak into the next turn's view —
+  the live stream is fenced the same way the final `OperationResult` is.
 - Retry/backoff lives at the transport boundary: `provider-openai` ships a
   generic `RetryingTransport` wrapper that retries only
   `AgentError::Transport { retryable: true }` errors (network, timeout, 5xx,
@@ -235,6 +239,23 @@ already-landed mutation); any failure removes the temp file and leaves
 the target untouched. `fs.write` and `edit.replace` both use it —
 `fs.write` now journals every write instead of bypassing the change
 journal.
+
+Since V1-M9 the journal is tri-state so recovery can tell what actually
+happened:
+
+```text
+MutationPrepared { tx_id, target, before_hash, after_hash }
+        │
+        ├─ atomic rename ok → MutationCommitted { tx_id }
+        └─ rename failed / stale operation → MutationRolledBack { tx_id }
+```
+
+`before_hash`/`after_hash` are content hashes captured at prepare time,
+so a later recovery pass can distinguish "prepared but never committed"
+(no rename landed) from "committed" (the target now carries
+`after_hash`). The single-record variant that claimed a mutation without
+proof is gone: a rename failure now rolls the transaction back instead of
+leaving the journal describing a mutation that never landed.
 
 ### Tool lifecycle (V1-P6)
 
@@ -368,6 +389,22 @@ charged inside the turn frame (it rides there), so the engine does not
 deduct it a second time; the focus frame stays engine-owned. Pinned items
 get selection priority (they go first) but not exemption: every selected
 item must fit the remaining budget, so the frame is a hard bound.
+
+Two refinements since V1-M9 close the accounting gap:
+
+- **Dependency expansion is a hard cap.** The reserved expansion slice was
+  the last place a pinned dependency could exceed its budget; the pinned
+  exemption is gone — expansion spends only the reserved slice, for every
+  item.
+- **The runtime is the final referee.** `ContextEngine` budgets are targets,
+  not verdicts. After `PromptAssembler` renders the full five-layer request
+  (system policy, focus frame, context frame, turn frame, tool schemas —
+  including the `SELECTED WORKING CONTEXT` / `CURRENT FOCUS` rendering
+  overhead, which the engine never accounts), the runtime estimates the
+  wire tokens and trims the context frame (largest unpinned item first)
+  until the assembled request fits the provider window. A request can
+  therefore never go out over budget, no matter what the engine's estimate
+  missed.
 
 ## 6. Context is rebuilt, not replayed
 
@@ -524,13 +561,32 @@ RuntimeHandle ── mpsc<RuntimeCommand> ──▶ RuntimeActor (owns mutable s
 - every mutation (user message, focus, pin, task completion, checkpoint)
   is a command; the actor serializes them, so focus/pin/task commands can
   no longer interleave with an in-flight turn;
+- since V1-M9 the runtime owns a `TaskManager`: tasks are long-lived
+  execution entities with their own lifecycle
+  (`create_task` / `activate_task` / `suspend_task` / `complete_task`),
+  and focus is only the *current attention inside* a task —
+  `set_focus(task_id, focus)` never mints a task. Re-focusing a previous
+  goal resumes the same task (`/focus A → /focus B → /focus A` is
+  Task A → Task B → Task A, not three fresh tasks), which is what scope
+  suspension/resume and the GC can rely on;
 - since V1-P0-1 the actor *is* the runtime: it owns the turn execution
   state machine and the `TurnFrame`. Model rounds and tool calls are
   spawned operations that report an `OperationResult` (run/turn/task/
   scope/operation ids + generation); the actor validates the generation
   and only then commits (turn-frame push, context ingest/maintenance,
-  events). Stale results are dropped before they can cause side effects —
-  `is_stale` no longer protects only "after the whole kernel turn ran";
+  events). Stale results are dropped before they can change runtime
+  state — `is_stale` no longer protects only "after the whole kernel
+  turn ran";
+- since V1-M9, tool side effects are two-phase. Tool *computation* and
+  tool *side-effect commit* are separate: `ToolOutcome` is either a
+  plain `Value(ToolOutput)` or a `PreparedEffect { output, effect }`
+  where the effect is a staged, rollback-able mutation (today:
+  `agent-workspace`'s `PreparedMutation` with its journal
+  transaction). The actor checks the generation *between* the two
+  phases — a stale tool operation has its prepared effect rolled back
+  (temp file removed, `MutationRolledBack` journaled) instead of
+  committed, so an external side effect cannot slip through the fence
+  that protects model state;
 - `AgentKernel` is now a stateless executor/helper: context/model/tool
   primitives plus event plumbing (journal, sequence, broadcast). Its
   turn loop, turn locks and `TurnFrame` ownership are gone;
@@ -551,7 +607,7 @@ Composition uses a module host over typed capabilities:
 ModuleHost ── add_module (register + validate) ──▶ ServiceRegistry (typed lookup)
    │  ContextModule / ModelModule / ToolModule / ApprovalModule /
    │  EventModule / ArtifactModule
-   └── start in order, stop in reverse
+   └── start transactional, stop: capabilities first, then modules reverse
 ```
 
 There is no universal `handle_event`: modules publish typed capabilities
@@ -559,6 +615,15 @@ There is no universal `handle_event`: modules publish typed capabilities
 `EventStore`, `ArtifactStore` — all `CapabilityProvider` markers in
 `agent-contracts`) and consumers look them up by type. The TUI composes the
 run through the host and reads the capabilities back into the kernel.
+
+Since V1-M9 the host lifecycle is transactional. Start is all-or-nothing
+in order (a failing module rolls back the already-started ones), and stop
+is dependency-safe and best-effort: dynamic capabilities are stopped
+*first* — a capability that depends on a typed service must die before
+the service it uses — then the typed modules in reverse order, and every
+stop error is aggregated into one result instead of aborting at the
+first failure. `RuntimeInstance` already aggregates Runtime/Host/Actor
+layers; the host applies the same rule inside its own plane.
 
 Since V1-P0-4 the host is an extension platform with two planes:
 
@@ -609,7 +674,8 @@ Shutdown is a single ordered step with aggregated errors:
 runtime.shutdown()
   cancel any turn
     → stop the actor (kernel stop: flush journal, emit RunCompleted)
-    → stop the module host (reverse registration order)
+    → stop the module host (dynamic capabilities first, then
+      typed modules reverse — each step best-effort, errors aggregated)
     → join the actor task
     → aggregate errors
 ```

@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentResult, ContextDiagnostics, ContextGcReport, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextSelection, RunId, ToolCall, ToolOutput,
+    ContextMaintenanceTrigger, ContextSelection, OperationId, RunId, TaskId, ToolCall, ToolOutput,
+    TurnId,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,8 +23,10 @@ pub enum RuntimeEvent {
         content: String,
     },
     FocusChanged {
+        task_id: TaskId,
         goal: String,
     },
+    FocusCleared,
     Pinned {
         content: String,
     },
@@ -43,10 +46,23 @@ pub enum RuntimeEvent {
     ContextGc {
         report: ContextGcReport,
     },
-    ModelStarted,
+    /// A model round started. Carries the operation identity so live
+    /// consumers (the UI's run-state aggregator) can fence streamed deltas:
+    /// a delta whose turn/operation/generation no longer matches the
+    /// current round belongs to a superseded turn and must be dropped.
+    ModelStarted {
+        turn_id: TurnId,
+        operation_id: OperationId,
+        generation: u64,
+    },
     /// Live streamed text delta. Never journaled (the final `AssistantMessage`
     /// carries the complete content); only forwarded to live subscribers.
+    /// The operation identity is the fence: a late delta from a cancelled
+    /// turn must not be rendered into the next turn's transcript.
     ModelDelta {
+        turn_id: TurnId,
+        operation_id: OperationId,
+        generation: u64,
         delta: String,
     },
     AssistantMessage {

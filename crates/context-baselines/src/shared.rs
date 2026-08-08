@@ -8,7 +8,7 @@
 
 use agent_contracts::{
     AttentionState, ContextDiagnostics, ContextIngress, ContextItemId, ContextItemSummary,
-    ContextKind, ContextScope, MaterializedItem, SemanticState,
+    ContextKind, ContextRetention, ContextScope, MaterializedItem, SemanticState,
 };
 
 /// Token estimator shared by the baseline engines. Must match the convention
@@ -100,6 +100,8 @@ pub(crate) fn records_for_ingress(ingress: &ContextIngress, turn: u64) -> Vec<Re
             created_turn: turn,
             source: Some("focus".into()),
         }],
+        // Suspension produces no history record in the baselines.
+        ContextIngress::FocusCleared => Vec::new(),
         ContextIngress::Pin { content, kind } => vec![Record {
             id: ContextItemId::new(),
             kind: *kind,
@@ -137,6 +139,7 @@ pub(crate) fn materialized_items(
             scope: summary.scope,
             attention: AttentionState::Active,
             semantic: SemanticState::Live,
+            retention: ContextRetention::Durable,
             content: summary.content.clone(),
             source: summary.source.clone(),
         });
@@ -147,6 +150,7 @@ pub(crate) fn materialized_items(
         scope: record.scope,
         attention: AttentionState::Active,
         semantic: SemanticState::Live,
+        retention: ContextRetention::Working,
         content: record.content.clone(),
         source: record.source.clone(),
     }));

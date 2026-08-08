@@ -11,7 +11,8 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentResult, ModelChunk, ModelEventSink, RunId, RuntimeEvent, RuntimeEventEnvelope,
+    AgentResult, ModelChunk, ModelEventSink, OperationId, RunId, RuntimeEvent,
+    RuntimeEventEnvelope, TurnId,
 };
 use tokio::sync::broadcast;
 
@@ -20,6 +21,11 @@ pub(crate) struct LiveSink {
     event_tx: broadcast::Sender<RuntimeEventEnvelope>,
     seq: Arc<AtomicU64>,
     run_id: RunId,
+    /// The operation this sink belongs to. Every streamed delta carries this
+    /// identity so a consumer can drop deltas from a superseded turn.
+    turn_id: TurnId,
+    operation_id: OperationId,
+    generation: u64,
 }
 
 impl LiveSink {
@@ -27,11 +33,17 @@ impl LiveSink {
         event_tx: broadcast::Sender<RuntimeEventEnvelope>,
         seq: Arc<AtomicU64>,
         run_id: RunId,
+        turn_id: TurnId,
+        operation_id: OperationId,
+        generation: u64,
     ) -> Self {
         Self {
             event_tx,
             seq,
             run_id,
+            turn_id,
+            operation_id,
+            generation,
         }
     }
 
@@ -51,7 +63,12 @@ impl ModelEventSink for LiveSink {
     async fn on_chunk(&self, chunk: ModelChunk) -> AgentResult<()> {
         match chunk {
             ModelChunk::TextDelta { delta } => {
-                self.emit_live(RuntimeEvent::ModelDelta { delta });
+                self.emit_live(RuntimeEvent::ModelDelta {
+                    turn_id: self.turn_id,
+                    operation_id: self.operation_id,
+                    generation: self.generation,
+                    delta,
+                });
                 Ok(())
             }
             // Tool-call argument deltas are internal to the model round; the

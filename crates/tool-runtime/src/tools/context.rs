@@ -9,8 +9,8 @@
 //! so the tools are safe to call even when the target just left.
 
 use agent_contracts::{
-    AgentResult, CancellationToken, ContextAction, ContextItemId, RunId, ToolOutput, ToolRisk,
-    ToolSpec,
+    AgentResult, CancellationToken, ContextAction, ContextItemId, RunId, ToolOutcome, ToolOutput,
+    ToolRisk, ToolSpec,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -141,7 +141,7 @@ impl Tool for ContextDirectiveTool {
         call_id: &str,
         arguments: Value,
         _cancel: CancellationToken,
-    ) -> AgentResult<ToolOutput> {
+    ) -> AgentResult<ToolOutcome> {
         let action = match self.kind {
             ContextDirectiveKind::GcHint => {
                 let args: IdKeepArgs = serde_json::from_value(arguments).map_err(|e| {
@@ -182,7 +182,7 @@ impl Tool for ContextDirectiveTool {
             ContextDirectiveKind::Collect => ContextAction::Collect,
         };
         let description = describe(&action);
-        Ok(ToolOutput {
+        Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
             tool_name: self.name().into(),
             ok: true,
@@ -191,7 +191,7 @@ impl Tool for ContextDirectiveTool {
             artifact_ref: None,
             context_action: Some(action.clone()),
             metadata: json!({"context_action": action}),
-        })
+        }))
     }
 }
 

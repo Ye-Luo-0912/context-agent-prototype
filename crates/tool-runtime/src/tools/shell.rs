@@ -8,7 +8,7 @@
 use std::{collections::VecDeque, process::Stdio};
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, RunId, ToolOutput, ToolRisk, ToolSpec,
+    AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_workspace::Workspace;
 use async_trait::async_trait;
@@ -78,7 +78,7 @@ impl Tool for ShellExecTool {
         call_id: &str,
         arguments: Value,
         cancel: CancellationToken,
-    ) -> AgentResult<ToolOutput> {
+    ) -> AgentResult<ToolOutcome> {
         let args: ShellArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("shell.exec args: {e}")))?;
         let timeout_ms = args.timeout_ms.clamp(100, MAX_TIMEOUT_MS);
@@ -224,7 +224,7 @@ impl Tool for ShellExecTool {
             }
         });
 
-        Ok(ToolOutput {
+        Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
             tool_name: "shell.exec".into(),
             ok,
@@ -241,7 +241,7 @@ impl Tool for ShellExecTool {
                 "lines": total_lines,
                 "outcome": outcome,
             }),
-        })
+        }))
     }
 }
 
@@ -295,6 +295,14 @@ mod tests {
     use agent_contracts::ToolExecutionRequest;
     use serde_json::json;
 
+    /// Unwrap a plain tool value (shell.exec never stages an effect).
+    fn value(outcome: ToolOutcome) -> ToolOutput {
+        match outcome {
+            ToolOutcome::Value(output) => output,
+            ToolOutcome::PreparedEffect { .. } => panic!("shell.exec must return a plain value"),
+        }
+    }
+
     fn long_command() -> String {
         #[cfg(windows)]
         {
@@ -326,6 +334,7 @@ mod tests {
             .execute(run_id, "c", request.call.arguments, request.cancel)
             .await
             .unwrap();
+        let output = value(output);
         assert!(output.ok, "command failed: {}", output.summary);
         assert!(
             output.artifact_ref.is_some(),
@@ -379,6 +388,7 @@ mod tests {
             .await
             .expect("tool did not stop after cancellation")
             .unwrap();
+        let output = value(output);
         assert!(!output.ok, "cancelled command must report failure");
         assert!(
             output.summary.contains("cancel"),

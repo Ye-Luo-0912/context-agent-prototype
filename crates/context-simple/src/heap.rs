@@ -1,11 +1,4 @@
-use agent_contracts::{ContextItem, ContextItemId, ContextItemSummary};
-
-/// Locate an item by id. Linear scan is fine for the bounded heap sizes this
-/// engine targets; a real id -> index map is a later optimization, not a
-/// requirement at this scale.
-pub(crate) fn find_index(items: &[ContextItem], id: ContextItemId) -> Option<usize> {
-    items.iter().position(|item| item.id == id)
-}
+use agent_contracts::{ContextItem, ContextItemSummary};
 
 /// Project items into bounded UI/replay summaries.
 pub(crate) fn to_summaries(items: &[ContextItem]) -> Vec<ContextItemSummary> {

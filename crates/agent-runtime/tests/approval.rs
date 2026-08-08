@@ -13,7 +13,7 @@ use agent_contracts::{
     ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
     ContextStateTransition, MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest,
     ModelTransport, RuntimeEvent, ScopeId, ScopeKind, ToolCall, ToolDispatcher,
-    ToolExecutionRequest, ToolOutput, ToolRisk, ToolSpec,
+    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, ApprovalBroker, InteractiveApprovalGate};
 use agent_runtime::{RuntimeHandle, spawn_runtime};
@@ -92,9 +92,9 @@ impl ToolDispatcher for RiskToolDispatcher {
             },
         ]
     }
-    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         let name = request.call.name.clone();
-        Ok(ToolOutput {
+        Ok(ToolOutcome::Value(ToolOutput {
             call_id: request.call.id,
             tool_name: name.clone(),
             ok: true,
@@ -103,7 +103,7 @@ impl ToolDispatcher for RiskToolDispatcher {
             artifact_ref: None,
             context_action: None,
             metadata: json!({}),
-        })
+        }))
     }
 }
 

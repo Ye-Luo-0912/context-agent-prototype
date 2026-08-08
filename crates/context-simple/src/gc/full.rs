@@ -116,6 +116,8 @@ pub(crate) fn run_full_gc(
         }
     }
     state.items = survivors;
+    // The sweep rebuilt the heap wholesale; the indexes follow.
+    state.indexes.rebuild(&state.items);
 
     // ----- Reactivate phase: items that became relevant again ------
     // Warm buffer items and Cold store entries both get a second chance:
@@ -414,7 +416,15 @@ fn reactivate(
         reactivated.push(item);
         remaining -= 1;
     }
+    let reactivated_count = reactivated.len();
     state.items.extend(reactivated);
+    // The reactivation pass appended items to the heap; index them so the
+    // next materialize and ingest see them through the indexes. The sweep
+    // rebuilt the index from survivors only, so these slots are new — the
+    // insert overwrites any stale entry the rebuild cannot have left.
+    for slot in state.items.len().saturating_sub(reactivated_count)..state.items.len() {
+        state.indexes.insert(&state.items[slot], slot);
+    }
 
     // Cold store entries: content lives in the store; only hot-entity
     // matches earn a recall (no content, so no score-based fallback).
@@ -456,6 +466,7 @@ fn reactivate(
             kept.push(entry);
         }
         state.external = kept;
+        let mut recalled_count = 0usize;
         for mut item in recalled {
             item.attention = AttentionState::Active;
             item.relevance = item.relevance.max(0.5);
@@ -464,6 +475,12 @@ fn reactivate(
             item.evicted_at_tick = None;
             item.last_access_tick = now_tick;
             state.items.push(item);
+            recalled_count += 1;
+        }
+        // Recalled store entries are heap members again; index them the
+        // same way as the buffer reactivations above.
+        for slot in state.items.len().saturating_sub(recalled_count)..state.items.len() {
+            state.indexes.insert(&state.items[slot], slot);
         }
     }
 }

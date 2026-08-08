@@ -16,8 +16,8 @@ use agent_contracts::{
     AgentError, AgentResult, ArtifactHandle, CAPABILITY_INSPECT, CAPABILITY_LOAD,
     CAPABILITY_SEARCH, CAPABILITY_UNLOAD, Capability, CapabilityActivation,
     CapabilityInvocationContext, CapabilityLifecycle, CapabilityStatus, CapabilityTransport,
-    ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutput, ToolSpec,
-    ToolSurfaceSnapshot, WorkspaceHandle,
+    ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput,
+    ToolSpec, ToolSurfaceSnapshot, WorkspaceHandle,
 };
 use agent_workspace::{ArtifactStoreHandle, ConfinedWorkspaceHandle, Workspace};
 use async_trait::async_trait;
@@ -469,6 +469,8 @@ impl CapabilityRegistry {
     }
 
     /// Stop every capability and reset the started flags (host stop).
+    /// Best effort: every capability gets its stop call even when an
+    /// earlier one fails, and all errors are aggregated into one result.
     pub async fn stop_all(&self) -> AgentResult<()> {
         let capabilities: Vec<Arc<dyn Capability>> = self
             .inner
@@ -477,8 +479,11 @@ impl CapabilityRegistry {
             .values()
             .map(|entry| entry.capability.clone())
             .collect();
+        let mut errors = Vec::new();
         for capability in capabilities {
-            capability.stop().await?;
+            if let Err(error) = capability.stop().await {
+                errors.push(error);
+            }
         }
         for entry in self
             .inner
@@ -488,8 +493,23 @@ impl CapabilityRegistry {
         {
             entry.started = false;
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(aggregate_errors(errors))
+        }
     }
+}
+
+/// Join multiple errors into one message so a best-effort teardown can
+/// report every failure instead of the first one it hit.
+fn aggregate_errors(errors: Vec<AgentError>) -> AgentError {
+    let message = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    AgentError::Internal(message)
 }
 
 /// A `ToolDispatcher` that merges the trusted core's tools with the dynamic
@@ -663,13 +683,13 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
             .or_else(|| self.base.inspect_tool(name))
     }
 
-    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         let name = request.call.name.clone();
         match name.as_str() {
-            CAPABILITY_SEARCH => self.run_search(request).await,
-            CAPABILITY_INSPECT => self.run_inspect(request).await,
-            CAPABILITY_LOAD => self.run_load(request).await,
-            CAPABILITY_UNLOAD => self.run_unload(request).await,
+            CAPABILITY_SEARCH => self.run_search(request).await.map(ToolOutcome::Value),
+            CAPABILITY_INSPECT => self.run_inspect(request).await.map(ToolOutcome::Value),
+            CAPABILITY_LOAD => self.run_load(request).await.map(ToolOutcome::Value),
+            CAPABILITY_UNLOAD => self.run_unload(request).await.map(ToolOutcome::Value),
             _ => {
                 if self.capabilities.owner_of(&name).is_some() {
                     let capability = self
@@ -694,7 +714,10 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
                     let ctx = self.invocation_context(&capability, &request);
                     let output = capability.invoke(request.call, ctx).await;
                     self.capabilities.mark_idle(&name);
-                    return output;
+                    // An out-of-process capability applies its own side
+                    // effects inside the subprocess; the runtime only ever
+                    // sees a completed value across the wire.
+                    return output.map(ToolOutcome::Value);
                 }
                 self.base.execute(request).await
             }

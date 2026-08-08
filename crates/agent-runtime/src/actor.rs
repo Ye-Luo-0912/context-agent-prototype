@@ -7,11 +7,12 @@
 
 use std::{collections::VecDeque, sync::Arc};
 
+use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, ContextHints, ContextIngress,
-    ContextMaintenanceTrigger, ContextQuery, ModelRequest, OperationId, OperationOutcome,
-    OperationResult, RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall, ToolSurfaceSnapshot,
-    TurnFrame, TurnFrameStep, TurnId,
+    ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect, ModelRequest, OperationId,
+    OperationOutcome, OperationResult, RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall,
+    ToolOutcome, ToolOutput, ToolSurfaceSnapshot, TurnFrame, TurnFrameStep, TurnId,
 };
 use agent_kernel::AgentKernel;
 use tokio::sync::mpsc;
@@ -21,6 +22,7 @@ use crate::budget::{DEFAULT_OUTPUT_RESERVE, ModelBudget, approx_layer_tokens};
 use crate::command::{Reply, RuntimeCommand, RuntimeHandle};
 use crate::prompt::PromptAssembler;
 use crate::sink::LiveSink;
+use crate::task::TaskManager;
 
 /// Which operation a spawned task is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +63,11 @@ struct ActiveTurn {
 pub(crate) struct OperationCompletion {
     operation: OperationResult,
     kind: OpKind,
+    /// A staged side effect the tool prepared but did not apply. The actor
+    /// commits it only after the generation fence passes; a stale operation
+    /// must roll it back so the effect never lands (tool computation is
+    /// separate from side-effect commit).
+    effect: Option<Box<dyn Effect>>,
 }
 
 /// Mutable runtime state, owned exclusively by the actor loop. Callers never
@@ -72,6 +79,8 @@ struct ActorState {
     generation: u64,
     /// The task the runtime believes is current (updated by `set_focus`).
     task_id: Option<TaskId>,
+    /// Long-lived task records; focus is attention inside the current task.
+    tasks: TaskManager,
     /// The runtime's view of the current scope (filled once the context
     /// engine exposes its scope tree through the contract).
     scope_id: Option<ScopeId>,
@@ -158,17 +167,72 @@ impl RuntimeActor {
             }
             RuntimeCommand::SetFocus { goal, reply } => {
                 let result = match self.ensure_idle() {
-                    Ok(()) => match self.kernel.set_focus(goal).await {
-                        Ok(task_id) => {
-                            self.state.task_id = Some(task_id);
-                            self.state.generation += 1;
-                            Ok(())
+                    Ok(()) => {
+                        // A task is the long-lived entity; focus is the
+                        // attention inside it. `create_task` resumes a
+                        // non-completed task with the same goal, so
+                        // re-focusing returns to the same task id.
+                        let task_id = self.state.tasks.create_task(goal.clone());
+                        match self.kernel.set_focus(task_id, goal).await {
+                            Ok(()) => {
+                                self.state.task_id = Some(task_id);
+                                self.state.generation += 1;
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
                         }
-                        Err(error) => Err(error),
-                    },
+                    }
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
+            }
+            RuntimeCommand::ActivateTask { task_id, reply } => {
+                let result = match self.ensure_idle() {
+                    Ok(()) => {
+                        if self.state.tasks.activate_task(task_id).is_none() {
+                            Err(AgentError::InvalidRequest(format!(
+                                "task {task_id} does not exist or is completed"
+                            )))
+                        } else {
+                            let goal = self
+                                .state
+                                .tasks
+                                .get(task_id)
+                                .map(|task| task.goal.clone())
+                                .unwrap_or_default();
+                            match self.kernel.set_focus(task_id, goal).await {
+                                Ok(()) => {
+                                    self.state.task_id = Some(task_id);
+                                    self.state.generation += 1;
+                                    Ok(())
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            RuntimeCommand::SuspendTask { reply } => {
+                let result = match self.ensure_idle() {
+                    Ok(()) => {
+                        self.state.tasks.suspend_active();
+                        match self.kernel.clear_focus().await {
+                            Ok(()) => {
+                                self.state.task_id = None;
+                                self.state.generation += 1;
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            RuntimeCommand::ListTasks { reply } => {
+                let _ = reply.send(Ok(self.state.tasks.list()));
             }
             RuntimeCommand::Pin { content, reply } => {
                 let result = match self.ensure_idle() {
@@ -179,7 +243,15 @@ impl RuntimeActor {
             }
             RuntimeCommand::CompleteTask { summary, reply } => {
                 let result = match self.ensure_idle() {
-                    Ok(()) => self.kernel.complete_current_task(summary).await,
+                    Ok(()) => {
+                        // The engine resolves the completed task from the
+                        // current focus; the TaskManager just closes its
+                        // record so the id is never resumed.
+                        if let Some(active) = self.state.tasks.active() {
+                            self.state.tasks.complete_task(active);
+                        }
+                        self.kernel.complete_current_task(summary).await
+                    }
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
@@ -444,14 +516,69 @@ impl RuntimeActor {
                 selected: materialized.selected.clone(),
             })
             .await;
-        let _ = self.kernel.emit_event(RuntimeEvent::ModelStarted).await;
-
-        let input =
-            self.assembler
-                .assemble(&materialized, &turn.turn_frame, tool_surface.specs.clone());
-        let cancel = CancellationToken::new();
         let operation_id = OperationId::new();
         let generation = self.state.generation;
+        let _ = self
+            .kernel
+            .emit_event(RuntimeEvent::ModelStarted {
+                turn_id,
+                operation_id,
+                generation,
+            })
+            .await;
+
+        // Runtime final guard: the engine priced the working-set content,
+        // but the assembler's rendering overhead (section headers, per-item
+        // frame labels) is the runtime's share and must also fit the
+        // provider window. Re-estimate the full wire request and trim the
+        // context frame until it fits — the runtime, not the engine, is the
+        // final judge of the budget.
+        let provider_window = capabilities
+            .context_window
+            .unwrap_or_else(|| self.kernel.context_budget_tokens());
+        let mut materialized = materialized;
+        let mut input =
+            self.assembler
+                .assemble(&materialized, &turn.turn_frame, tool_surface.specs.clone());
+        while approx_layer_tokens(&input.into_messages()) + approx_layer_tokens(&input.tool_schemas)
+            > provider_window
+            && !materialized.items.is_empty()
+        {
+            // Drop the largest unpinned item first (pinned items keep
+            // priority); when only pinned items remain, drop the largest
+            // anyway rather than overshoot the window.
+            let drop_index = materialized
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item.retention != ContextRetention::Pinned)
+                .max_by_key(|(_, item)| approx_tokens(&item.content))
+                .or_else(|| {
+                    materialized
+                        .items
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, item)| approx_tokens(&item.content))
+                })
+                .map(|(index, _)| index);
+            let Some(drop_index) = drop_index else {
+                break;
+            };
+            let dropped = materialized.items.remove(drop_index);
+            materialized
+                .selected
+                .retain(|selection| selection.item_id != dropped.item_id);
+            materialized.approx_tokens = materialized
+                .approx_tokens
+                .saturating_sub(approx_tokens(&dropped.content));
+            input = self.assembler.assemble(
+                &materialized,
+                &turn.turn_frame,
+                tool_surface.specs.clone(),
+            );
+        }
+
+        let cancel = CancellationToken::new();
         turn.op = Some(InFlightOp {
             operation_id,
             turn_id,
@@ -461,7 +588,14 @@ impl RuntimeActor {
         });
 
         let kernel = self.kernel.clone();
-        let sink = LiveSink::new(kernel.event_sender(), kernel.seq(), kernel.run_id());
+        let sink = LiveSink::new(
+            kernel.event_sender(),
+            kernel.seq(),
+            kernel.run_id(),
+            turn_id,
+            operation_id,
+            generation,
+        );
         let op_tx = op_tx.clone();
         let run_id = kernel.run_id();
         let task_id = self.state.task_id;
@@ -504,6 +638,7 @@ impl RuntimeActor {
                         outcome,
                     },
                     kind: OpKind::Model,
+                    effect: None,
                 })
                 .await;
         });
@@ -563,10 +698,10 @@ impl RuntimeActor {
         let run_id = kernel.run_id();
         let task_id = self.state.task_id;
         tokio::spawn(async move {
-            let output = kernel.execute_tool(call, cancel, &surface).await;
-            let _ = op_tx
-                .send(OperationCompletion {
-                    operation: OperationResult {
+            let outcome = kernel.execute_tool(call, cancel, &surface).await;
+            let (operation, effect) = match outcome {
+                ToolOutcome::Value(output) => (
+                    OperationResult {
                         run_id,
                         turn_id,
                         task_id,
@@ -575,7 +710,26 @@ impl RuntimeActor {
                         generation,
                         outcome: OperationOutcome::ToolOutput(output),
                     },
+                    None,
+                ),
+                ToolOutcome::PreparedEffect { output, effect } => (
+                    OperationResult {
+                        run_id,
+                        turn_id,
+                        task_id,
+                        scope_id: tool_scope,
+                        operation_id,
+                        generation,
+                        outcome: OperationOutcome::ToolOutput(output),
+                    },
+                    Some(effect),
+                ),
+            };
+            let _ = op_tx
+                .send(OperationCompletion {
+                    operation,
                     kind: OpKind::Tool,
+                    effect,
                 })
                 .await;
         });
@@ -583,13 +737,31 @@ impl RuntimeActor {
 
     /// Verify a finished operation still belongs to the current turn and
     /// generation. Stale completions (cancelled or superseded) are dropped
-    /// and surfaced as a warning; live ones are committed.
+    /// and surfaced as a warning; live ones are committed. A prepared side
+    /// effect follows the same fence: roll back when stale, commit when
+    /// live — the tool's computation already happened, but its side effect
+    /// only lands here.
     async fn on_operation_completed(
         &mut self,
         completion: OperationCompletion,
         op_tx: &mpsc::Sender<OperationCompletion>,
     ) {
         if self.is_stale(&completion) {
+            // The operation turned stale before its side effect was
+            // committed: roll the staged effect back so a cancelled or
+            // superseded tool never mutates the workspace.
+            if let Some(effect) = completion.effect {
+                let reason = format!(
+                    "stale {} result dropped (turn {}, generation {})",
+                    match completion.kind {
+                        OpKind::Model => "model",
+                        OpKind::Tool => "tool",
+                    },
+                    completion.operation.turn_id,
+                    completion.operation.generation
+                );
+                effect.rollback(&reason).await;
+            }
             let message = format!(
                 "stale {} result dropped (turn {}, generation {})",
                 match completion.kind {
@@ -625,6 +797,24 @@ impl RuntimeActor {
                 }
             }
             OperationOutcome::ToolOutput(output) => {
+                // The generation fence passed: commit the staged effect
+                // before the result enters the turn frame. A commit failure
+                // is surfaced as a failed tool result — the model must not
+                // see "edit applied" when the rename never landed.
+                let output = match completion.effect {
+                    Some(effect) => match effect.commit().await {
+                        Ok(()) => output,
+                        Err(error) => ToolOutput {
+                            ok: false,
+                            summary: format!("effect commit failed: {error}"),
+                            model_content: format!(
+                                "the change was prepared but could not be committed: {error}"
+                            ),
+                            ..output
+                        },
+                    },
+                    None => output,
+                };
                 if let Some(turn) = self.state.turn.as_mut() {
                     turn.turn_frame
                         .push_tool_result(output.clone(), op_scope_id);

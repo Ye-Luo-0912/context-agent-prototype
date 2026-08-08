@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, RunId, ToolOutput, ToolRisk, ToolSpec,
+    AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_workspace::Workspace;
 use async_trait::async_trait;
@@ -131,7 +131,7 @@ impl Tool for SearchGrepTool {
         call_id: &str,
         arguments: Value,
         _cancel: CancellationToken,
-    ) -> AgentResult<ToolOutput> {
+    ) -> AgentResult<ToolOutcome> {
         let args: GrepArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("search.grep args: {e}")))?;
         let regex = Regex::new(&args.pattern)
@@ -191,7 +191,7 @@ impl Tool for SearchGrepTool {
             })
             .unwrap_or_default();
 
-        Ok(ToolOutput {
+        Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
             tool_name: "search.grep".into(),
             ok: true,
@@ -209,7 +209,7 @@ impl Tool for SearchGrepTool {
             artifact_ref,
             context_action: None,
             metadata: json!({"hits": hits.len(), "files_scanned": scanned_files}),
-        })
+        }))
     }
 }
 
@@ -225,6 +225,14 @@ mod tests {
     use super::*;
     use agent_contracts::{CancellationToken, ToolExecutionRequest};
     use serde_json::json;
+
+    /// Unwrap a plain tool value (search.grep never stages an effect).
+    fn value(outcome: ToolOutcome) -> ToolOutput {
+        match outcome {
+            ToolOutcome::Value(output) => output,
+            ToolOutcome::PreparedEffect { .. } => panic!("search.grep must return a plain value"),
+        }
+    }
 
     async fn temp_workspace() -> (Workspace, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -269,6 +277,7 @@ mod tests {
             .execute(run_id, "c", request.call.arguments, request.cancel)
             .await
             .unwrap();
+        let output = value(output);
         assert!(output.ok);
         let content = output.model_content;
         assert!(
@@ -300,6 +309,7 @@ mod tests {
             .execute(run_id, "c", request.call.arguments, request.cancel)
             .await
             .unwrap();
+        let output = value(output);
         assert!(
             output.artifact_ref.is_some(),
             "overflow must go to an artifact"

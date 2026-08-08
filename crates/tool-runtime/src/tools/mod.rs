@@ -12,7 +12,7 @@ pub(crate) use git::{GitDiffTool, GitStatusTool};
 pub(crate) use search::SearchGrepTool;
 pub(crate) use shell::ShellExecTool;
 
-use agent_contracts::{AgentResult, CancellationToken, RunId, ToolOutput, ToolSpec};
+use agent_contracts::{AgentResult, CancellationToken, RunId, ToolOutcome, ToolSpec};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -25,5 +25,5 @@ pub(crate) trait Tool: Send + Sync {
         call_id: &str,
         arguments: Value,
         cancel: CancellationToken,
-    ) -> AgentResult<ToolOutput>;
+    ) -> AgentResult<ToolOutcome>;
 }

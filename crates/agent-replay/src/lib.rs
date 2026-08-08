@@ -140,12 +140,18 @@ pub async fn run_engine(
                     })
                     .await?;
             }
-            RuntimeEvent::FocusChanged { goal } => {
+            RuntimeEvent::FocusChanged { task_id, goal } => {
+                // Replay preserves the task identity: re-focusing a task
+                // with the same id resumes its scopes exactly like the live
+                // runtime, instead of minting a fresh task per event.
+                let mut focus = FocusState::new(goal.clone());
+                focus.task_id = *task_id;
                 engine
-                    .ingest(ContextIngress::FocusChanged {
-                        focus: FocusState::new(goal.clone()),
-                    })
+                    .ingest(ContextIngress::FocusChanged { focus })
                     .await?;
+            }
+            RuntimeEvent::FocusCleared => {
+                engine.ingest(ContextIngress::FocusCleared).await?;
             }
             RuntimeEvent::Pinned { content } => {
                 engine

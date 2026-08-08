@@ -11,7 +11,7 @@ use agent_contracts::{
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
     MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage, ModelOutput,
     ModelRequest, ModelTransport, RuntimeEvent, ScopeId, ScopeKind, ToolDispatcher,
-    ToolExecutionRequest, ToolOutput, ToolRisk, ToolSpec,
+    ToolExecutionRequest, ToolOutcome, ToolRisk, ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
 use agent_runtime::{ModelBudget, RuntimeHandle, approx_layer_tokens, spawn_runtime};
@@ -68,7 +68,7 @@ impl ToolDispatcher for TestToolDispatcher {
     fn specs(&self) -> Vec<ToolSpec> {
         Vec::new()
     }
-    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
+    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         Err(agent_contracts::AgentError::Tool(
             "no tools configured".into(),
         ))
@@ -357,7 +357,7 @@ impl ToolDispatcher for OneToolDispatcher {
             risk: ToolRisk::ReadOnly,
         }]
     }
-    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
+    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         Err(agent_contracts::AgentError::Tool(
             "no tools configured".into(),
         ))

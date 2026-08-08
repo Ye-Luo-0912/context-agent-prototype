@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, RunId, ToolOutput, ToolRisk, ToolSpec,
+    AgentError, AgentResult, CancellationToken, Effect, RunId, ToolOutcome, ToolOutput, ToolRisk,
+    ToolSpec,
 };
 use agent_workspace::Workspace;
 use async_trait::async_trait;
@@ -60,7 +61,7 @@ impl Tool for FsListTool {
         call_id: &str,
         arguments: Value,
         _cancel: CancellationToken,
-    ) -> AgentResult<ToolOutput> {
+    ) -> AgentResult<ToolOutcome> {
         let args: ListArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("fs.list args: {e}")))?;
         let path = self.workspace.resolve_relative(&args.path).await?;
@@ -116,7 +117,7 @@ impl Tool for FsListTool {
             })
             .unwrap_or_default();
 
-        Ok(ToolOutput {
+        Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
             tool_name: "fs.list".into(),
             ok: true,
@@ -129,7 +130,7 @@ impl Tool for FsListTool {
             artifact_ref,
             context_action: None,
             metadata: json!({"entry_count": entries.len()}),
-        })
+        }))
     }
 }
 
@@ -185,7 +186,7 @@ impl Tool for FsReadTool {
         call_id: &str,
         arguments: Value,
         _cancel: CancellationToken,
-    ) -> AgentResult<ToolOutput> {
+    ) -> AgentResult<ToolOutcome> {
         let args: ReadArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("fs.read args: {e}")))?;
         if args.start_line == 0 || args.end_line < args.start_line {
@@ -222,7 +223,7 @@ impl Tool for FsReadTool {
             .collect::<Vec<_>>()
             .join("\n");
 
-        Ok(ToolOutput {
+        Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
             tool_name: "fs.read".into(),
             ok: true,
@@ -236,7 +237,7 @@ impl Tool for FsReadTool {
             artifact_ref: None,
             context_action: None,
             metadata: json!({"line_count": lines.len(), "bytes": metadata.len()}),
-        })
+        }))
     }
 }
 
@@ -280,7 +281,7 @@ impl Tool for FsWriteTool {
         call_id: &str,
         arguments: Value,
         _cancel: CancellationToken,
-    ) -> AgentResult<ToolOutput> {
+    ) -> AgentResult<ToolOutcome> {
         let args: WriteArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("fs.write args: {e}")))?;
         let path = self.workspace.resolve_mutation(&args.path).await?;
@@ -288,22 +289,22 @@ impl Tool for FsWriteTool {
             .workspace
             .begin_mutation("fs.write", "write", &args.path)
             .await?;
-        transaction.apply(args.content.as_bytes()).await?;
-
-        Ok(ToolOutput {
+        // Computation is staged, the side effect is not applied yet: the
+        // runtime owns the commit after the generation fence.
+        let prepared = transaction.prepare(args.content.as_bytes()).await?;
+        let effect: Box<dyn Effect> = Box::new(prepared);
+        let relative = display_relative(&self.workspace, &path);
+        let output = ToolOutput {
             call_id: call_id.into(),
             tool_name: "fs.write".into(),
             ok: true,
-            summary: format!(
-                "wrote {} bytes to {}",
-                args.content.len(),
-                display_relative(&self.workspace, &path)
-            ),
-            model_content: format!("file updated: {}", display_relative(&self.workspace, &path)),
+            summary: format!("wrote {} bytes to {}", args.content.len(), relative),
+            model_content: format!("file updated: {relative}"),
             artifact_ref: None,
             context_action: None,
             metadata: json!({"bytes": args.content.len()}),
-        })
+        };
+        Ok(ToolOutcome::PreparedEffect { output, effect })
     }
 }
 
@@ -340,9 +341,14 @@ mod tests {
             }
         };
 
-        // Writing a new file records the mutation with zero bytes before.
-        let output = write("notes.txt", "first").await.unwrap();
+        // Writing a new file stages the mutation; the runtime would commit
+        // it after validating the operation — the test plays that role.
+        let outcome = write("notes.txt", "first").await.unwrap();
+        let ToolOutcome::PreparedEffect { output, effect } = outcome else {
+            panic!("fs.write must prepare a committed effect");
+        };
         assert!(output.ok);
+        effect.commit().await.unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join("notes.txt"))
                 .await
@@ -352,7 +358,9 @@ mod tests {
         let journal = fs::read_to_string(workspace.state_dir().join("changes.jsonl"))
             .await
             .unwrap();
-        let record: serde_json::Value = serde_json::from_str(journal.trim()).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+        assert_eq!(record["kind"], "mutation_prepared");
         assert_eq!(record["tool"], "fs.write");
         assert_eq!(record["action"], "write");
         assert_eq!(record["path"], "notes.txt");
@@ -360,12 +368,16 @@ mod tests {
         assert_eq!(record["bytes_after"], 5);
 
         // Overwriting captures the previous content as the journal backup.
-        write("notes.txt", "second").await.unwrap();
+        let outcome = write("notes.txt", "second").await.unwrap();
+        let ToolOutcome::PreparedEffect { effect, .. } = outcome else {
+            panic!("fs.write must prepare a committed effect");
+        };
+        effect.commit().await.unwrap();
         let journal = fs::read_to_string(workspace.state_dir().join("changes.jsonl"))
             .await
             .unwrap();
         let lines: Vec<&str> = journal.lines().collect();
-        let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        let record: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(record["old_content"], "first");
     }
 

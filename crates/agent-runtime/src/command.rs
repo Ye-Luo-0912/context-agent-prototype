@@ -1,7 +1,11 @@
 //! Runtime commands and the handle callers use to drive the actor.
 
-use agent_contracts::{AgentError, AgentResult, ContextItemSummary, RunId, RuntimeEventEnvelope};
+use agent_contracts::{
+    AgentError, AgentResult, ContextItemSummary, RunId, RuntimeEventEnvelope, TaskId,
+};
 use tokio::sync::{broadcast, mpsc, oneshot};
+
+use crate::task::TaskInfo;
 
 /// Reply channel back to the caller of a command.
 pub type Reply<T> = oneshot::Sender<T>;
@@ -21,6 +25,19 @@ pub enum RuntimeCommand {
     SetFocus {
         goal: String,
         reply: Reply<AgentResult<()>>,
+    },
+    /// Activate an existing task by id (resuming its scopes in the engine).
+    ActivateTask {
+        task_id: TaskId,
+        reply: Reply<AgentResult<()>>,
+    },
+    /// Suspend the active task without completing it (focus cleared).
+    SuspendTask {
+        reply: Reply<AgentResult<()>>,
+    },
+    /// List the tasks the runtime knows (for the UI's `/tasks`).
+    ListTasks {
+        reply: Reply<AgentResult<Vec<TaskInfo>>>,
     },
     Pin {
         content: String,
@@ -96,6 +113,23 @@ impl RuntimeHandle {
     pub async fn set_focus(&self, goal: String) -> AgentResult<()> {
         self.call(|reply| RuntimeCommand::SetFocus { goal, reply })
             .await
+    }
+
+    /// Activate an existing task, resuming its scopes in the context engine.
+    pub async fn activate_task(&self, task_id: TaskId) -> AgentResult<()> {
+        self.call(|reply| RuntimeCommand::ActivateTask { task_id, reply })
+            .await
+    }
+
+    /// Suspend the active task without completing it.
+    pub async fn suspend_task(&self) -> AgentResult<()> {
+        self.call(|reply| RuntimeCommand::SuspendTask { reply })
+            .await
+    }
+
+    /// Snapshot of the tasks the runtime knows.
+    pub async fn list_tasks(&self) -> AgentResult<Vec<TaskInfo>> {
+        self.call(|reply| RuntimeCommand::ListTasks { reply }).await
     }
 
     pub async fn pin(&self, content: String) -> AgentResult<()> {

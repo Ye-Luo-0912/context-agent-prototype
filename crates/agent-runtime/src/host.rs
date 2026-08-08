@@ -187,23 +187,77 @@ impl ModuleHost {
         Ok(())
     }
 
+    /// Start every module in registration order, then the eager dynamic
+    /// capabilities. Transactional: if any module or capability fails to
+    /// start, everything that already started is stopped again (best
+    /// effort) and all errors — the original failure plus every rollback
+    /// failure — are aggregated into one result.
     pub async fn start(&mut self) -> AgentResult<()> {
+        let mut started: Vec<Arc<dyn Module>> = Vec::new();
         for module in &self.modules {
-            module.start().await?;
+            if let Err(first) = module.start().await {
+                return Err(self.rollback_start(started, first).await);
+            }
+            started.push(module.clone());
         }
-        self.capabilities.start_eager().await?;
+        if let Err(first) = self.capabilities.start_eager().await {
+            return Err(self.rollback_start(started, first).await);
+        }
         self.started = true;
         Ok(())
     }
 
-    /// Stop modules in reverse registration order (dependents before
-    /// dependencies), then stop the dynamic capabilities.
-    pub async fn stop(&mut self) -> AgentResult<()> {
-        for module in self.modules.iter().rev() {
-            module.stop().await?;
+    /// Undo a partially completed start: stop the eager capabilities and
+    /// every module that already started, aggregating all failures with the
+    /// original start error.
+    async fn rollback_start(
+        &mut self,
+        started: Vec<Arc<dyn Module>>,
+        first: AgentError,
+    ) -> AgentError {
+        let mut errors = vec![first];
+        if let Err(error) = self.capabilities.stop_all().await {
+            errors.push(error);
         }
-        self.capabilities.stop_all().await?;
-        self.started = false;
-        Ok(())
+        for module in started.iter().rev() {
+            if let Err(error) = module.stop().await {
+                errors.push(error);
+            }
+        }
+        aggregate_errors(errors)
     }
+
+    /// Stop the dynamic capabilities first — a capability may depend on a
+    /// typed service (EventStore / ArtifactStore), so the services must
+    /// outlive their consumers — then stop the typed modules in reverse
+    /// registration order. Best effort: every stop runs even when an
+    /// earlier one fails, and all errors are aggregated into one result.
+    pub async fn stop(&mut self) -> AgentResult<()> {
+        let mut errors = Vec::new();
+        if let Err(error) = self.capabilities.stop_all().await {
+            errors.push(error);
+        }
+        for module in self.modules.iter().rev() {
+            if let Err(error) = module.stop().await {
+                errors.push(error);
+            }
+        }
+        self.started = false;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(aggregate_errors(errors))
+        }
+    }
+}
+
+/// Join multiple errors into one message so a best-effort start/stop can
+/// report every failure instead of the first one it hit.
+fn aggregate_errors(errors: Vec<AgentError>) -> AgentError {
+    let message = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    AgentError::Internal(message)
 }

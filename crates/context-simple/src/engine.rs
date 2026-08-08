@@ -3,7 +3,7 @@ use agent_contracts::{
     ContextItem, ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
     ContextMaintenanceTrigger, ContextQuery, ContextRetention, ContextScope,
     ContextStateTransition, CoreLabel, FocusState, Label, MaterializedContext, Scope, ScopeId,
-    ScopeKind,
+    ScopeKind, ScopeState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -151,6 +151,10 @@ pub(crate) struct State {
     pub(crate) gc_externalized_total: u64,
     #[serde(default)]
     pub(crate) gc_storage_deleted_total: u64,
+    /// Slot/entity/scope indexes over `items`, kept consistent by every
+    /// structural mutation. Never serialized: restored state rebuilds it.
+    #[serde(skip)]
+    pub(crate) indexes: crate::index::indexes::Indexes,
 }
 
 pub struct SimpleContextEngine {
@@ -314,6 +318,28 @@ impl ContextEngine for SimpleContextEngine {
                 // The focus (and its task) scope opens or reactivates.
                 scope::open_focus_scope(&mut state);
             }
+            ContextIngress::FocusCleared => {
+                // Suspend (not complete) the active task: its scopes stay
+                // open so a later FocusChanged with the same task id
+                // resumes them; focus returns to None until then.
+                let task_id = state.focus.as_ref().map(|focus| focus.task_id);
+                state.focus = None;
+                state.hot_entities.clear();
+                if let Some(task_id) = task_id {
+                    for scope in &mut state.scopes {
+                        if scope.task_id == Some(task_id) && scope.state == ScopeState::Active {
+                            scope.state = ScopeState::Suspended;
+                        }
+                    }
+                }
+                if let Some(session) = state
+                    .scopes
+                    .iter()
+                    .find(|scope| scope.kind == ScopeKind::Session)
+                {
+                    state.active_scope_id = Some(session.id);
+                }
+            }
             ContextIngress::Pin { content, kind } => {
                 // A pin is session-level: it guarantees the session scope
                 // exists even when no task has started yet.
@@ -449,6 +475,14 @@ impl ContextEngine for SimpleContextEngine {
                 }
             }
         }
+        // Restored state never carries the in-memory indexes (they are not
+        // serialized); rebuild them so materialize and dependency ingest
+        // see the restored heap through the indexes. The guard's deref does
+        // not split field borrows, so the heap is taken out, rebuilt
+        // against, and put back (O(1) for the Vec).
+        let items = std::mem::take(&mut state.items);
+        state.indexes.rebuild(&items);
+        state.items = items;
         Ok(())
     }
 

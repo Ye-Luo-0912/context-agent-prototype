@@ -11,6 +11,7 @@ mod instance;
 pub mod modules;
 mod prompt;
 mod sink;
+pub mod task;
 
 pub use actor::{RuntimeActor, spawn_runtime};
 pub use budget::{DEFAULT_OUTPUT_RESERVE, ModelBudget, approx_layer_tokens};
@@ -25,3 +26,4 @@ pub use modules::{
     ApprovalModule, ArtifactModule, ContextModule, EventModule, ModelModule, ToolModule,
 };
 pub use prompt::PromptAssembler;
+pub use task::{TaskInfo, TaskManager, TaskRecord, TaskStatus};

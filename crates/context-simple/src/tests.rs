@@ -1812,3 +1812,70 @@ async fn directive_with_unknown_item_id_is_a_silent_noop() {
         "a stale directive must not create or destroy items"
     );
 }
+
+#[tokio::test]
+async fn pinned_dependency_cannot_break_the_expansion_budget() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+
+    // A huge pinned constraint: it shares an entity with the observation
+    // below, so the observation links to it as a dependency.
+    let huge_pin = format!("AuthService.rs pinned constraint {}", "x".repeat(8000));
+    engine
+        .ingest(ContextIngress::Pin {
+            content: huge_pin,
+            kind: ContextKind::Constraint,
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "shell.exec".into(),
+                ok: true,
+                summary: "ok".into(),
+                model_content: "AuthService.rs tests passed".into(),
+                artifact_ref: None,
+                context_action: None,
+                metadata: serde_json::json!({}),
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+
+    // Budget big enough for the small observation (primary pass) but far
+    // below the pin's token cost: the pin must be reachable only through
+    // dependency expansion, where it no longer gets a pinned exemption.
+    let snapshot = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 1100,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+
+    let ids: Vec<ContextItemId> = snapshot.items.iter().map(|item| item.item_id).collect();
+    assert!(
+        snapshot
+            .items
+            .iter()
+            .any(|item| item.kind == ContextKind::ToolObservation),
+        "the small observation must be selected"
+    );
+    let pin_in_frame = snapshot
+        .items
+        .iter()
+        .any(|item| item.retention == ContextRetention::Pinned);
+    assert!(
+        !pin_in_frame,
+        "an oversized pinned dependency must not break the expansion budget"
+    );
+    assert!(
+        snapshot.approx_tokens <= 1100 + 512,
+        "the frame must stay near the budget (got {})",
+        snapshot.approx_tokens
+    );
+    let _ = ids;
+}

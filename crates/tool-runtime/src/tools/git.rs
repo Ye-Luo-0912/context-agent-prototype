@@ -4,7 +4,7 @@
 //! and store the full output as an artifact when it overflows.
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, RunId, ToolOutput, ToolRisk, ToolSpec,
+    AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_workspace::Workspace;
 use async_trait::async_trait;
@@ -161,15 +161,16 @@ impl Tool for GitStatusTool {
         call_id: &str,
         _arguments: Value,
         _cancel: CancellationToken,
-    ) -> AgentResult<ToolOutput> {
-        run_git(
+    ) -> AgentResult<ToolOutcome> {
+        let output = run_git(
             &self.workspace,
             &["status", "--short"],
             run_id,
             call_id,
             "git.status",
         )
-        .await
+        .await?;
+        Ok(ToolOutcome::Value(output))
     }
 }
 
@@ -198,7 +199,7 @@ impl Tool for GitDiffTool {
         call_id: &str,
         arguments: Value,
         _cancel: CancellationToken,
-    ) -> AgentResult<ToolOutput> {
+    ) -> AgentResult<ToolOutcome> {
         let args: DiffArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("git.diff args: {e}")))?;
         let mut git_args: Vec<String> = vec!["diff".into()];
@@ -211,6 +212,7 @@ impl Tool for GitDiffTool {
             git_args.push(path);
         }
         let refs: Vec<&str> = git_args.iter().map(String::as_str).collect();
-        run_git(&self.workspace, &refs, run_id, call_id, "git.diff").await
+        let output = run_git(&self.workspace, &refs, run_id, call_id, "git.diff").await?;
+        Ok(ToolOutcome::Value(output))
     }
 }

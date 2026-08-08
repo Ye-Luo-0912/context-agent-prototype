@@ -1,6 +1,6 @@
 use agent_contracts::{
-    AttentionState, ContextItem, ContextRetention, ContextScope, ContextStateTransition, Label,
-    LifecycleLabel, Scope, ScopeId, ScopeKind, ScopeState, TaskId,
+    AttentionState, ContextItem, ContextItemId, ContextRetention, ContextScope,
+    ContextStateTransition, Label, LifecycleLabel, Scope, ScopeId, ScopeKind, ScopeState, TaskId,
 };
 
 use crate::engine::State;
@@ -264,6 +264,10 @@ fn close_members(
         .iter()
         .map(|scope| (scope.id, scope.kind, scope.parent))
         .collect();
+    // Promotions re-stamp `scope_id`; the matching index moves are queued
+    // here and applied after the heap loop (the loop holds `state.items`
+    // mutably, so the index cannot be touched inside it).
+    let mut scope_updates: Vec<(ContextItemId, Option<ScopeId>, Option<ScopeId>)> = Vec::new();
     for item in &mut state.items {
         if !belongs_to(&scope_index, item, scope) {
             continue;
@@ -277,14 +281,16 @@ fn close_members(
             continue;
         }
         if should_promote(item) {
-            promote(
+            if let Some(update) = promote(
                 item,
                 parent_scope,
                 parent_id,
                 scope.kind,
                 turn,
                 &mut transitions,
-            );
+            ) {
+                scope_updates.push(update);
+            }
         } else if scope.kind == ScopeKind::Task {
             transitions.push(ContextStateTransition {
                 item_id: item.id,
@@ -298,6 +304,9 @@ fn close_members(
             item.attention = AttentionState::Archived;
             item.relevance = 0.0;
         }
+    }
+    for (id, from, to) in scope_updates {
+        state.indexes.update_scope(id, from, to);
     }
     transitions
 }
@@ -352,7 +361,8 @@ fn legacy_belongs_to(item: &ContextItem, scope: &Scope) -> bool {
 /// durable outcomes of the scope. Promotion moves the item to the nearest
 /// open ancestor: both the descriptive `scope` and the authoritative
 /// `scope_id` membership stamp are updated, so later closes of the parent
-/// scope still see the item.
+/// scope still see the item. The caller applies the returned index move
+/// (`item_id`, old scope, new scope) after its heap loop.
 fn promote(
     item: &mut ContextItem,
     parent_scope: ContextScope,
@@ -360,13 +370,13 @@ fn promote(
     kind: ScopeKind,
     turn: u64,
     transitions: &mut Vec<ContextStateTransition>,
-) {
+) -> Option<(ContextItemId, Option<ScopeId>, Option<ScopeId>)> {
     if item
         .tags
         .iter()
         .any(|tag| tag.is_lifecycle(LifecycleLabel::Promoted))
     {
-        return;
+        return None;
     }
     let from = item.attention;
     if matches!(
@@ -375,6 +385,8 @@ fn promote(
     ) {
         item.retention = ContextRetention::Durable;
     }
+    // Keep the authoritative membership stamp and the scope index in sync.
+    let scope_update = (item.id, item.scope_id, parent_id);
     item.scope = parent_scope;
     item.scope_id = parent_id;
     item.tags.push(Label::lifecycle(LifecycleLabel::Promoted));
@@ -391,6 +403,7 @@ fn promote(
             reason: format!("promoted by {} scope close", kind_name(kind)),
         });
     }
+    Some(scope_update)
 }
 
 fn kind_name(kind: ScopeKind) -> &'static str {

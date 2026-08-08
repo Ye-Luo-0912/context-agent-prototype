@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use agent_contracts::{
-    AgentError, AgentResult, ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolOutput,
-    ToolRisk, ToolSpec, ToolSurfaceSnapshot,
+    AgentError, AgentResult, ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolOutcome,
+    ToolOutput, ToolRisk, ToolSpec, ToolSurfaceSnapshot,
 };
 use agent_workspace::Workspace;
 use serde::Deserialize;
@@ -312,12 +312,12 @@ impl ToolDispatcher for BuiltinToolDispatcher {
         catalog.get(name).map(|entry| entry.tool.spec())
     }
 
-    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         let name = request.call.name.clone();
         match name.as_str() {
-            CAPABILITY_SEARCH => self.run_search(request).await,
-            CAPABILITY_LOAD => self.run_load(request).await,
-            CAPABILITY_UNLOAD => self.run_unload(request).await,
+            CAPABILITY_SEARCH => self.run_search(request).await.map(ToolOutcome::Value),
+            CAPABILITY_LOAD => self.run_load(request).await.map(ToolOutcome::Value),
+            CAPABILITY_UNLOAD => self.run_unload(request).await.map(ToolOutcome::Value),
             _ => {
                 let tick = self.tick_now();
                 let tool = {
@@ -423,6 +423,14 @@ mod tests {
     use agent_contracts::{CancellationToken, ContextAction, ToolCall, ToolExecutionRequest};
     use serde_json::Value;
 
+    /// Unwrap a plain tool value (control tools never stage an effect).
+    fn value(outcome: ToolOutcome) -> ToolOutput {
+        match outcome {
+            ToolOutcome::Value(output) => output,
+            ToolOutcome::PreparedEffect { .. } => panic!("control tools return plain values"),
+        }
+    }
+
     /// Open a throwaway workspace. The catalog only touches the disk on real
     /// tool execution, which these tests never trigger.
     async fn open_workspace() -> Workspace {
@@ -496,6 +504,7 @@ mod tests {
             ))
             .await
             .unwrap();
+        let output = value(output);
         assert!(matches!(
             output.context_action,
             Some(ContextAction::GcHint {
@@ -511,6 +520,7 @@ mod tests {
             ))
             .await
             .unwrap();
+        let output = value(output);
         assert!(matches!(
             output.context_action,
             Some(ContextAction::Tag { ref tag, .. }) if tag == "urgent"
@@ -523,6 +533,7 @@ mod tests {
             ))
             .await
             .unwrap();
+        let output = value(output);
         assert!(matches!(
             output.context_action,
             Some(ContextAction::Lease { turns: 3, .. })
@@ -532,6 +543,7 @@ mod tests {
             .execute(request("context.collect", json!({})))
             .await
             .unwrap();
+        let output = value(output);
         assert!(matches!(
             output.context_action,
             Some(ContextAction::Collect)
@@ -599,6 +611,7 @@ mod tests {
             .execute(request(CAPABILITY_SEARCH, json!({"query": "git"})))
             .await
             .unwrap();
+        let search = value(search);
         assert!(search.ok);
         assert!(search.model_content.contains("git.status"));
 
@@ -606,6 +619,7 @@ mod tests {
             .execute(request(CAPABILITY_LOAD, json!({"name": "git.status"})))
             .await
             .unwrap();
+        let load = value(load);
         assert!(load.ok);
         assert!(surface(&dispatcher).contains(&"git.status".to_string()));
     }

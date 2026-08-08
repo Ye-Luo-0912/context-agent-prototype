@@ -14,8 +14,8 @@ use agent_contracts::{
     AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
     MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage, ModelOutput,
-    ModelRequest, ModelRole, ModelTransport, RuntimeEvent, ScopeId, ScopeKind, ToolCall,
-    ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
+    ModelRequest, ModelRole, ModelTransport, OperationId, RuntimeEvent, ScopeId, ScopeKind, TaskId,
+    ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput, ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
 use agent_runtime::{RuntimeHandle, spawn_runtime};
@@ -74,7 +74,7 @@ impl ToolDispatcher for TestToolDispatcher {
     fn specs(&self) -> Vec<ToolSpec> {
         Vec::new()
     }
-    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
+    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         Err(agent_contracts::AgentError::Tool(
             "no tools configured".into(),
         ))
@@ -153,6 +153,7 @@ impl ContextEngine for RecordingContextEngine {
             ContextIngress::AssistantMessage { .. } => "AssistantMessage",
             ContextIngress::ToolObservation { .. } => "ToolObservation",
             ContextIngress::FocusChanged { .. } => "FocusChanged",
+            ContextIngress::FocusCleared => "FocusCleared",
             ContextIngress::Pin { .. } => "Pin",
             ContextIngress::TaskCompleted { .. } => "TaskCompleted",
             ContextIngress::ContextDirective { .. } => "ContextDirective",
@@ -250,8 +251,8 @@ impl ToolDispatcher for OkToolDispatcher {
             risk: agent_contracts::ToolRisk::ReadOnly,
         }]
     }
-    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
-        Ok(ToolOutput {
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        Ok(ToolOutcome::Value(ToolOutput {
             call_id: request.call.id,
             tool_name: request.call.name,
             ok: true,
@@ -260,7 +261,7 @@ impl ToolDispatcher for OkToolDispatcher {
             artifact_ref: None,
             context_action: None,
             metadata: json!({}),
-        })
+        }))
     }
 }
 
@@ -300,7 +301,16 @@ async fn actor_streams_model_deltas_to_subscribers() {
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
             match envelope.event {
-                RuntimeEvent::ModelDelta { delta } => deltas.push(delta),
+                RuntimeEvent::ModelDelta {
+                    delta,
+                    operation_id,
+                    ..
+                } => {
+                    // Every delta must belong to the round that emitted it:
+                    // the fence identity is present, not defaulted.
+                    assert!(operation_id != OperationId::default());
+                    deltas.push(delta);
+                }
                 RuntimeEvent::AssistantMessage { content } => final_content = Some(content),
                 RuntimeEvent::TurnCompleted => turn_completed = true,
                 _ => {}
@@ -618,7 +628,7 @@ impl ToolDispatcher for DirectiveToolDispatcher {
             },
         ]
     }
-    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         let action = match request.call.name.as_str() {
             "context.lease" => Some(agent_contracts::ContextAction::Lease {
                 item_id: agent_contracts::ContextItemId::new(),
@@ -631,7 +641,7 @@ impl ToolDispatcher for DirectiveToolDispatcher {
                 )));
             }
         };
-        Ok(ToolOutput {
+        Ok(ToolOutcome::Value(ToolOutput {
             call_id: request.call.id,
             tool_name: request.call.name,
             ok: true,
@@ -640,7 +650,7 @@ impl ToolDispatcher for DirectiveToolDispatcher {
             artifact_ref: None,
             context_action: action,
             metadata: json!({}),
-        })
+        }))
     }
 }
 
@@ -723,6 +733,225 @@ async fn actor_routes_collect_directive_into_a_full_gc_pass() {
     assert_eq!(
         *gcs, 2,
         "the manual collect adds one GC pass on top of the regular turn-boundary pass"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task vs focus: the TaskManager keeps long-lived task identity stable, so
+// re-focusing a goal resumes the same task instead of minting a new one.
+// ---------------------------------------------------------------------------
+
+async fn collect_focus_events(handle: &RuntimeHandle, goal: &str) -> (TaskId, u64) {
+    let mut events = handle.subscribe();
+    handle.set_focus(goal.into()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::FocusChanged { task_id, .. } = envelope.event {
+                return (task_id, envelope.seq);
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no FocusChanged event arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn refocusing_the_same_goal_resumes_the_same_task() {
+    let handle = spawn_with(
+        Arc::new(StreamingModel),
+        Arc::new(TestContextEngine),
+        Arc::new(TestToolDispatcher),
+    )
+    .await;
+
+    let (task_a, _) = collect_focus_events(&handle, "fix AuthService").await;
+    let (task_b, _) = collect_focus_events(&handle, "write docs").await;
+    let (task_a_again, _) = collect_focus_events(&handle, "fix AuthService").await;
+
+    assert_ne!(task_a, task_b, "different goals are different tasks");
+    assert_eq!(
+        task_a, task_a_again,
+        "re-focusing the same goal must resume the original task"
+    );
+}
+
+#[tokio::test]
+async fn suspend_then_refocus_resumes_the_same_task() {
+    let handle = spawn_with(
+        Arc::new(StreamingModel),
+        Arc::new(TestContextEngine),
+        Arc::new(TestToolDispatcher),
+    )
+    .await;
+    let (task_a, _) = collect_focus_events(&handle, "fix AuthService").await;
+
+    let mut events = handle.subscribe();
+    handle.suspend_task().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_cleared = false;
+    loop {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::FocusCleared = envelope.event {
+                saw_cleared = true;
+            }
+        }
+        if saw_cleared {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "suspend must emit FocusCleared"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Re-focusing the same goal resumes the suspended task, not a new one.
+    let (resumed, _) = collect_focus_events(&handle, "fix AuthService").await;
+    assert_eq!(resumed, task_a, "suspend -> refocus must resume the task");
+}
+
+// ---------------------------------------------------------------------------
+// Effect commit: a tool's computation is separate from its side-effect
+// commit. The actor commits after the generation fence and rolls back a
+// stale operation's prepared effect.
+// ---------------------------------------------------------------------------
+
+/// A staged effect whose commit/rollback calls are observable.
+struct FlagEffect {
+    committed: Arc<AtomicUsize>,
+    rolled_back: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl agent_contracts::Effect for FlagEffect {
+    fn describe(&self) -> String {
+        "test effect".into()
+    }
+    async fn commit(self: Box<Self>) -> AgentResult<()> {
+        self.committed.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn rollback(self: Box<Self>, _reason: &str) {
+        self.rolled_back.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A dispatcher whose (read-only) tool stages a `FlagEffect` instead of
+/// returning a plain value. `release` lets a test hold the execution open.
+struct EffectToolDispatcher {
+    committed: Arc<AtomicUsize>,
+    rolled_back: Arc<AtomicUsize>,
+    release: Option<Arc<tokio::sync::Notify>>,
+}
+
+#[async_trait::async_trait]
+impl ToolDispatcher for EffectToolDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "fs.read".into(),
+            description: "stages an effect".into(),
+            input_schema: json!({"type": "object"}),
+            risk: agent_contracts::ToolRisk::ReadOnly,
+        }]
+    }
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        if let Some(release) = &self.release {
+            release.notified().await;
+        }
+        Ok(ToolOutcome::PreparedEffect {
+            output: ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "staged".into(),
+                model_content: "staged".into(),
+                artifact_ref: None,
+                context_action: None,
+                metadata: json!({}),
+            },
+            effect: Box::new(FlagEffect {
+                committed: self.committed.clone(),
+                rolled_back: self.rolled_back.clone(),
+            }),
+        })
+    }
+}
+
+#[tokio::test]
+async fn committed_effect_lands_after_the_generation_fence() {
+    let committed = Arc::new(AtomicUsize::new(0));
+    let rolled_back = Arc::new(AtomicUsize::new(0));
+    let handle = spawn_with(
+        Arc::new(TwoRoundToolModel::default()),
+        Arc::new(TestContextEngine),
+        Arc::new(EffectToolDispatcher {
+            committed: committed.clone(),
+            rolled_back: rolled_back.clone(),
+            release: None,
+        }),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("go".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::TurnCompleted = envelope.event {
+                assert_eq!(committed.load(Ordering::SeqCst), 1);
+                assert_eq!(rolled_back.load(Ordering::SeqCst), 0);
+                return;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the turn did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn stale_tool_rolls_back_its_prepared_effect() {
+    let committed = Arc::new(AtomicUsize::new(0));
+    let rolled_back = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handle = spawn_with(
+        Arc::new(TwoRoundToolModel::default()),
+        Arc::new(TestContextEngine),
+        Arc::new(EffectToolDispatcher {
+            committed: committed.clone(),
+            rolled_back: rolled_back.clone(),
+            release: Some(release.clone()),
+        }),
+    )
+    .await;
+    handle.user_message("go".into()).await.unwrap();
+
+    // Give the tool operation time to start and block inside execute.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.cancel_turn().await;
+
+    // The tool finishes after the cancel: the generation fence has moved, so
+    // the actor must roll the prepared effect back instead of committing it.
+    release.notify_one();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline && rolled_back.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        rolled_back.load(Ordering::SeqCst),
+        1,
+        "stale effect must roll back"
+    );
+    assert_eq!(
+        committed.load(Ordering::SeqCst),
+        0,
+        "stale effect must never commit"
     );
 }
 

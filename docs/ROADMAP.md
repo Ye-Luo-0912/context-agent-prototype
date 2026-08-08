@@ -457,10 +457,12 @@ Acceptance:
 - `context-simple` is one crate with modules, mechanism and policy
   separated without splitting into dozens of crates: `engine` (config +
   state + ingest dispatch), `item`, `heap`, `scope`, `residency`,
-  `index/` (`entity`, `task`, `dependency`), `policy/` (`simple`),
-  `gc/` (`minor`, `reachability`), `materializer`, `diagnostics`,
-  `checkpoint`. The real id→index map for the heap is a later
-  optimization, so there is no separate `context_map` module yet.
+  `index/` (`entity`, `task`, `dependency`, `indexes`), `policy/`
+  (`simple`), `gc/` (`minor`, `reachability`), `materializer`,
+  `diagnostics`, `checkpoint`. Since V1-M9 the slot-based secondary
+  indexes (`index/indexes.rs`: id→slot, entity→ids, scope→ids) back
+  dependency ingest and materializer candidate generation — the
+  id→index map is no longer a later optimization, it is the hot path.
 - the `Scope` entity is first-class in the contract: `ScopeId`,
   `ScopeKind` (Session / Task / Focus / Tool), `ScopeState` (Open /
   Active / Suspended / Closed) and `Scope` (id, parent, kind, state,

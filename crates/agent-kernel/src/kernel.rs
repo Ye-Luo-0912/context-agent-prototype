@@ -12,7 +12,8 @@ use agent_contracts::{
     ContextMaintenanceTrigger, ContextQuery, ContextStateTransition, EventJournal, FocusState,
     MaterializedContext, ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest,
     ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, TaskId,
-    ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec, ToolSurfaceSnapshot,
+    ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput, ToolSpec,
+    ToolSurfaceSnapshot,
 };
 use tokio::sync::broadcast;
 
@@ -214,32 +215,40 @@ impl AgentKernel {
     /// Execute one tool call: validate it against the round's tool surface
     /// snapshot (the same surface the model saw and the budget used), run
     /// approval, dispatch. Emits nothing — ToolStarted/ToolFinished are
-    /// committed by the actor.
+    /// committed by the actor. Returns the tool outcome: either a plain
+    /// value or a staged effect the actor commits/rolls back after the
+    /// generation fence.
     pub async fn execute_tool(
         &self,
         call: ToolCall,
         cancel: CancellationToken,
         surface: &ToolSurfaceSnapshot,
-    ) -> ToolOutput {
+    ) -> ToolOutcome {
         let spec = surface
             .specs
             .iter()
             .find(|spec| spec.name == call.name)
             .cloned();
         let Some(spec) = spec else {
-            return tool_error_output(&call, format!("unknown tool: {}", call.name));
+            return ToolOutcome::Value(tool_error_output(
+                &call,
+                format!("unknown tool: {}", call.name),
+            ));
         };
 
         match self.approval.authorize(&call, &spec).await {
             Ok(ApprovalDecision::Allow) => {}
             Ok(ApprovalDecision::Deny) => {
-                return tool_error_output(
+                return ToolOutcome::Value(tool_error_output(
                     &call,
                     format!("tool denied by approval policy: {}", call.name),
-                );
+                ));
             }
             Err(error) => {
-                return tool_error_output(&call, format!("approval check failed: {error}"));
+                return ToolOutcome::Value(tool_error_output(
+                    &call,
+                    format!("approval check failed: {error}"),
+                ));
             }
         }
 
@@ -252,21 +261,23 @@ impl AgentKernel {
             })
             .await
         {
-            Ok(output) => output,
-            Err(error) => tool_error_output(&call, error.to_string()),
+            Ok(outcome) => outcome,
+            Err(error) => ToolOutcome::Value(tool_error_output(&call, error.to_string())),
         }
     }
 
-    /// Switch the runtime's focus to a new goal, opening a fresh task scope
-    /// in the context engine. Returns the new task id so the runtime can tag
-    /// operations with the task they belong to.
-    pub async fn set_focus(&self, goal: String) -> AgentResult<TaskId> {
-        let focus = FocusState::new(goal.clone());
-        let task_id = focus.task_id;
+    /// Switch the runtime's focus to a task's goal. The task id comes from
+    /// the runtime's `TaskManager` — re-focusing an existing task resumes
+    /// its scopes in the context engine (suspension/resume is keyed on the
+    /// task id), while a fresh task id opens a fresh task scope.
+    pub async fn set_focus(&self, task_id: TaskId, goal: String) -> AgentResult<()> {
+        let mut focus = FocusState::new(goal.clone());
+        focus.task_id = task_id;
         self.context
             .ingest(ContextIngress::FocusChanged { focus })
             .await?;
-        self.emit(RuntimeEvent::FocusChanged { goal }).await?;
+        self.emit(RuntimeEvent::FocusChanged { task_id, goal })
+            .await?;
         let report = self
             .context
             .maintain(ContextMaintenanceTrigger::FocusChanged)
@@ -276,7 +287,25 @@ impl AgentKernel {
             report,
         })
         .await?;
-        Ok(task_id)
+        Ok(())
+    }
+
+    /// Suspend the current focus without completing the task: the engine
+    /// clears its focus and suspends the active task's scopes, so a later
+    /// `set_focus` with the same task id resumes them.
+    pub async fn clear_focus(&self) -> AgentResult<()> {
+        self.context.ingest(ContextIngress::FocusCleared).await?;
+        self.emit(RuntimeEvent::FocusCleared).await?;
+        let report = self
+            .context
+            .maintain(ContextMaintenanceTrigger::FocusChanged)
+            .await?;
+        self.emit(RuntimeEvent::ContextMaintained {
+            trigger: ContextMaintenanceTrigger::FocusChanged,
+            report,
+        })
+        .await?;
+        Ok(())
     }
 
     pub async fn pin(&self, content: String) -> AgentResult<()> {

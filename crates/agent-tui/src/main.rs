@@ -262,6 +262,50 @@ async fn run_ui(
                         });
                         continue;
                     }
+                    if let Some(id_text) = trimmed.strip_prefix("/task ") {
+                        // Activate an existing task by id (resume its
+                        // scopes). Task ids come from `/tasks`.
+                        match id_text.trim().parse::<agent_contracts::TaskId>() {
+                            Ok(task_id) => {
+                                let handle = handle.clone();
+                                tokio::spawn(async move {
+                                    if let Err(error) = handle.activate_task(task_id).await {
+                                        tracing::error!(%error, "activate task failed");
+                                    }
+                                });
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, "invalid task id: {id_text}");
+                            }
+                        }
+                        continue;
+                    }
+                    if trimmed == "/tasks" {
+                        let handle = handle.clone();
+                        tokio::spawn(async move {
+                            match handle.list_tasks().await {
+                                Ok(tasks) => {
+                                    for task in tasks {
+                                        println!(
+                                            "task {} [{:?}] {}",
+                                            task.id, task.status, task.goal
+                                        );
+                                    }
+                                }
+                                Err(error) => tracing::error!(%error, "list tasks failed"),
+                            }
+                        });
+                        continue;
+                    }
+                    if trimmed == "/suspend" {
+                        let handle = handle.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = handle.suspend_task().await {
+                                tracing::error!(%error, "suspend task failed");
+                            }
+                        });
+                        continue;
+                    }
                     if let Some(content) = trimmed.strip_prefix("/pin ") {
                         let handle = handle.clone();
                         let content = content.trim().to_string();

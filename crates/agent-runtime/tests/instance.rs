@@ -10,7 +10,7 @@ use agent_contracts::{
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
     MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput, ModelRequest,
     ModelTransport, RuntimeEvent, ScopeId, ScopeKind, ToolDispatcher, ToolExecutionRequest,
-    ToolOutput, ToolSpec,
+    ToolOutcome, ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
 use agent_runtime::{CapabilityId, Module, ModuleHost, RuntimeInstance, ServiceRegistry};
@@ -67,7 +67,7 @@ impl ToolDispatcher for EmptyTools {
     fn specs(&self) -> Vec<ToolSpec> {
         Vec::new()
     }
-    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
+    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         Err(agent_contracts::AgentError::Tool(
             "no tools configured".into(),
         ))

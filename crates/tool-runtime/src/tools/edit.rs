@@ -6,7 +6,8 @@
 //! workspace change journal (`.focus-agent/changes.jsonl`).
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, RunId, ToolOutput, ToolRisk, ToolSpec,
+    AgentError, AgentResult, CancellationToken, Effect, RunId, ToolOutcome, ToolOutput, ToolRisk,
+    ToolSpec,
 };
 use agent_workspace::Workspace;
 use async_trait::async_trait;
@@ -74,7 +75,7 @@ impl Tool for EditReplaceTool {
         call_id: &str,
         arguments: Value,
         _cancel: CancellationToken,
-    ) -> AgentResult<ToolOutput> {
+    ) -> AgentResult<ToolOutcome> {
         let args: ReplaceArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("edit.replace args: {e}")))?;
         if args.old.is_empty() {
@@ -136,7 +137,7 @@ impl Tool for EditReplaceTool {
         };
 
         if updated == original {
-            return Ok(ToolOutput {
+            return Ok(ToolOutcome::Value(ToolOutput {
                 call_id: call_id.into(),
                 tool_name: "edit.replace".into(),
                 ok: true,
@@ -145,34 +146,42 @@ impl Tool for EditReplaceTool {
                 artifact_ref: None,
                 context_action: None,
                 metadata: json!({"changed": false, "occurrences": count}),
-            });
+            }));
         }
 
         let transaction = self
             .workspace
             .begin_mutation("edit.replace", "replace", &args.path)
             .await?;
-        transaction.apply(updated.as_bytes()).await?;
+        // The new content is staged and journaled as prepared; the atomic
+        // rename (the side effect) is committed by the runtime after the
+        // generation fence, so a stale operation rolls back instead of
+        // silently modifying the file.
+        let prepared = transaction.prepare(updated.as_bytes()).await?;
+        let effect: Box<dyn Effect> = Box::new(prepared);
 
-        Ok(ToolOutput {
-            call_id: call_id.into(),
-            tool_name: "edit.replace".into(),
-            ok: true,
-            summary: format!(
-                "replaced {} occurrence(s) in {}",
-                count.min(1),
-                display_relative(&self.workspace, &path)
-            ),
-            model_content: format!(
-                "edit applied: {} ({} occurrence(s) of old text; bytes {} -> {})",
-                display_relative(&self.workspace, &path),
-                count,
-                metadata.len(),
-                updated.len()
-            ),
-            artifact_ref: None,
-            context_action: None,
-            metadata: json!({"changed": true, "occurrences": count, "bytes_before": metadata.len(), "bytes_after": updated.len()}),
+        Ok(ToolOutcome::PreparedEffect {
+            output: ToolOutput {
+                call_id: call_id.into(),
+                tool_name: "edit.replace".into(),
+                ok: true,
+                summary: format!(
+                    "replaced {} occurrence(s) in {}",
+                    count.min(1),
+                    display_relative(&self.workspace, &path)
+                ),
+                model_content: format!(
+                    "edit applied: {} ({} occurrence(s) of old text; bytes {} -> {})",
+                    display_relative(&self.workspace, &path),
+                    count,
+                    metadata.len(),
+                    updated.len()
+                ),
+                artifact_ref: None,
+                context_action: None,
+                metadata: json!({"changed": true, "occurrences": count, "bytes_before": metadata.len(), "bytes_after": updated.len()}),
+            },
+            effect,
         })
     }
 }
@@ -211,11 +220,15 @@ mod tests {
             run_id,
             json!({"path": "lib.rs", "old": "auth() {}", "new": "auth() -> bool { true }"}),
         );
-        let output = tool
+        let outcome = tool
             .execute(run_id, "c", request.call.arguments, request.cancel)
             .await
             .unwrap();
+        let ToolOutcome::PreparedEffect { output, effect } = outcome else {
+            panic!("edit.replace must prepare a committed effect");
+        };
         assert!(output.ok);
+        effect.commit().await.unwrap();
 
         let content = tfs::read_to_string(&file).await.unwrap();
         assert!(content.contains("auth() -> bool { true }"));
@@ -228,7 +241,9 @@ mod tests {
         let journal = tfs::read_to_string(dir.path().join(".focus-agent/changes.jsonl"))
             .await
             .unwrap();
-        let record: serde_json::Value = serde_json::from_str(journal.trim()).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+        assert_eq!(record["kind"], "mutation_prepared");
         assert_eq!(record["tool"], "edit.replace");
         assert_eq!(record["path"], "lib.rs");
         assert!(
@@ -260,16 +275,21 @@ mod tests {
             .await;
         assert!(result.is_err(), "ambiguous match must be rejected");
 
-        // With replace_all it succeeds.
+        // With replace_all it succeeds (staged, then committed like the
+        // runtime would).
         let request = request(
             run_id,
             json!({"path": "f.txt", "old": "a", "new": "x", "replace_all": true}),
         );
-        let output = tool
+        let outcome = tool
             .execute(run_id, "c", request.call.arguments, request.cancel)
             .await
             .unwrap();
+        let ToolOutcome::PreparedEffect { output, effect } = outcome else {
+            panic!("edit.replace must prepare a committed effect");
+        };
         assert!(output.ok);
+        effect.commit().await.unwrap();
         assert_eq!(tfs::read_to_string(&file).await.unwrap(), "x b x\n");
     }
 }
