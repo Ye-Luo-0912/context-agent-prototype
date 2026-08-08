@@ -4,6 +4,7 @@ use agent_contracts::{
 };
 
 use crate::engine::State;
+use crate::gc::reachability::is_excluded;
 
 /// Pinned or durable items, and items carrying a core content label, are the
 /// durable outcomes of the scope. Everything else in a closed scope is
@@ -267,11 +268,23 @@ fn close_members(
         if !belongs_to(&scope_index, item, scope) {
             continue;
         }
-        if matches!(item.state, ContextState::Dropped | ContextState::Archived) {
+        // Terminal semantic death always wins: a dropped or semantically
+        // invalid (superseded / verified-fixed) item stays dead through a
+        // scope close. Everything else — including items the residency
+        // machine already cooled to Archived — may still be a durable
+        // outcome of the scope and must get its promotion chance.
+        if item.state == ContextState::Dropped || is_excluded(item) {
             continue;
         }
         if should_promote(item) {
-            promote(item, parent_scope, scope.kind, turn, &mut transitions);
+            promote(
+                item,
+                parent_scope,
+                parent_id,
+                scope.kind,
+                turn,
+                &mut transitions,
+            );
         } else if scope.kind == ScopeKind::Task {
             transitions.push(ContextStateTransition {
                 item_id: item.id,
@@ -336,10 +349,14 @@ fn legacy_belongs_to(item: &ContextItem, scope: &Scope) -> bool {
 }
 
 /// Pinned or durable items, and items carrying a core content label, are the
-/// durable outcomes of the scope.
+/// durable outcomes of the scope. Promotion moves the item to the nearest
+/// open ancestor: both the descriptive `scope` and the authoritative
+/// `scope_id` membership stamp are updated, so later closes of the parent
+/// scope still see the item.
 fn promote(
     item: &mut ContextItem,
     parent_scope: ContextScope,
+    parent_id: Option<ScopeId>,
     kind: ScopeKind,
     turn: u64,
     transitions: &mut Vec<ContextStateTransition>,
@@ -359,6 +376,7 @@ fn promote(
         item.retention = ContextRetention::Durable;
     }
     item.scope = parent_scope;
+    item.scope_id = parent_id;
     item.tags.push(Label::lifecycle(LifecycleLabel::Promoted));
     if item.state != ContextState::Active {
         item.state = ContextState::Active;

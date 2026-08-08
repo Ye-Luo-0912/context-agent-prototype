@@ -1,7 +1,7 @@
 use agent_contracts::{
     ContextEngine, ContextHints, ContextIngress, ContextItem, ContextItemId, ContextKind,
     ContextMaintenanceTrigger, ContextQuery, ContextRetention, ContextScope, ContextState,
-    FocusState, ScopeKind, ScopeState, ToolOutput,
+    FocusState, LifecycleLabel, ScopeKind, ScopeState, ToolOutput,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -1401,4 +1401,118 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
             .any(|item| item.content.starts_with("huge pinned data")),
         "an oversized pinned item must not blow the budget"
     );
+}
+
+#[tokio::test]
+async fn task_close_promotes_archived_durable_outcomes_and_resyncs_scope_id() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs as the auth layer".into(),
+        })
+        .await
+        .unwrap();
+    // A working observation in the same task: ephemeral, must not promote.
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "shell.exec".into(),
+                ok: true,
+                summary: "ok".into(),
+                model_content: "touched AuthService.rs".into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+
+    // The durable decision cooled to Archived while the task ran. The close
+    // must still promote it: Archived is an attention state, not semantic
+    // death.
+    let decision_id = {
+        let state = engine.state.lock().await;
+        state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::UserMessage)
+            .expect("decision item")
+            .id
+    };
+    {
+        let mut state = engine.state.lock().await;
+        for item in &mut state.items {
+            if item.id == decision_id {
+                item.state = ContextState::Archived;
+                item.relevance = 0.0;
+                // A high-value durable outcome; the residency pass after the
+                // close must not immediately demote it again.
+                item.importance = 1.0;
+            }
+        }
+    }
+
+    let task_id = engine.state.lock().await.focus.as_ref().unwrap().task_id;
+    engine
+        .ingest(ContextIngress::TaskCompleted {
+            task_id: Some(task_id),
+            summary: "auth layer decided".into(),
+        })
+        .await
+        .unwrap();
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::TaskCompleted)
+        .await
+        .unwrap();
+    assert!(
+        report.transitions.iter().any(|t| {
+            t.item_id == decision_id
+                && t.from == ContextState::Archived
+                && t.to == ContextState::Active
+        }),
+        "the archived durable outcome must promote on close, got: {:?}",
+        report.transitions
+    );
+
+    let state = engine.state.lock().await;
+    let decision = state
+        .items
+        .iter()
+        .find(|item| item.id == decision_id)
+        .expect("decision item");
+    assert_eq!(
+        decision.state,
+        ContextState::Active,
+        "promoted outcomes return to the active set"
+    );
+    assert_eq!(
+        decision.scope,
+        ContextScope::Session,
+        "promoted to the nearest open ancestor"
+    );
+    let session = state
+        .scopes
+        .iter()
+        .find(|scope| scope.kind == ScopeKind::Session)
+        .expect("session scope");
+    assert_eq!(
+        decision.scope_id,
+        Some(session.id),
+        "the authoritative scope_id membership must follow the promotion"
+    );
+    assert!(
+        decision
+            .tags
+            .iter()
+            .any(|tag| tag.is_lifecycle(LifecycleLabel::Promoted)),
+        "the promotion is labeled and explainable"
+    );
+    let task_scope = state
+        .scopes
+        .iter()
+        .find(|scope| scope.kind == ScopeKind::Task)
+        .expect("task scope");
+    assert_eq!(task_scope.state, ScopeState::Closed);
 }

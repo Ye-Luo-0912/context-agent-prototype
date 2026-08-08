@@ -165,6 +165,13 @@ task is stale they sit at `Archived` (see the stale-task gate in §5) and can
 be reactivated by a later task whose focus/entities match — recorded as a
 `reactivated: score ... >= active threshold` transition.
 
+Promotion is decided before the attention state is consulted: an item the
+residency machine already cooled to `Archived` still gets its promotion
+chance when it is a durable outcome of the closing scope (only
+`Dropped` and semantically excluded items are skipped). The promotion also
+rewrites the authoritative `scope_id` membership to the parent scope, so a
+later close of the parent still sees the item.
+
 This preserves the result while removing the completed task's detailed working set from active attention.
 
 Automatic summary generation should be added at the runtime/task-boundary layer, not buried inside the context store.
@@ -380,7 +387,10 @@ Roots are the current attention and are never swept while alive:
 - items whose entity signature overlaps the hot set (last user message +
   recent tool observations);
 - a bounded transitive slice of their dependency edges (`+8`), so a working
-  item keeps the items it depends on.
+  item keeps the items it *depends on*: the traversal follows
+  `item.dependencies` (new → old) outward from the roots. Dependents of a
+  root are not protected — a root's descendants carry no evidence the
+  working set relies on.
 
 ### Sweep phase
 
@@ -407,7 +417,11 @@ again:
 
 Reactivation restores the item to the heap as `Active` and resets its
 generation. Items evicted by the *current* pass are skipped, so nothing
-bounces out and back in one GC. Only a buffer overflow is irreversible, and
+bounces out and back in one GC. Semantically dead items never resurrect:
+a superseded decision or a verified-fixed error (both label-excluded from
+the model) stays in the buffer however hot its entities look — reviving
+them to `Active + Resident` while `is_excluded` blocks them forever would
+be a state-space inconsistency. Only a buffer overflow is irreversible, and
 it is bounded and counted (`purged`).
 
 ### Explainability

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use agent_contracts::{
     ContextEviction, ContextGcReport, ContextItem, ContextItemId, ContextReactivation,
     ContextResidency, ContextRetention, ContextScope, ContextState, FocusState,
@@ -5,6 +7,7 @@ use agent_contracts::{
 
 use crate::diagnostics;
 use crate::engine::{SimpleContextConfig, State};
+use crate::gc::reachability::is_excluded;
 use crate::index::entity::entities_match;
 use crate::policy::score_item_with_breakdown;
 
@@ -128,22 +131,27 @@ fn mark_roots(
         }
     }
 
-    // Reachability through dependency edges, bounded: a working item pulls
-    // in the items it depends on, so dependencies of roots are protected too.
+    // Reachability through dependency edges, bounded: a root pulls in the
+    // items it *depends on*, so the evidence behind a working item stays
+    // protected. The traversal follows `item.dependencies` (new -> old)
+    // outward from the roots; dependents of a root are not protected — a
+    // root's descendants carry no evidence the working set relies on.
     if config.dependency_expansion && !marked.is_empty() {
+        let mut seen: HashSet<ContextItemId> = marked.iter().copied().collect();
+        let mut queue: Vec<ContextItemId> = marked.clone();
         let mut added = 0usize;
-        let mut changed = true;
-        while changed && added < MAX_MARKED_DEPENDENCIES {
-            changed = false;
-            for item in &state.items {
-                if marked.contains(&item.id) {
-                    continue;
-                }
-                let reachable = item.dependencies.iter().any(|dep| marked.contains(dep));
-                if reachable {
-                    marked.push(item.id);
+        while let Some(id) = queue.pop() {
+            if added >= MAX_MARKED_DEPENDENCIES {
+                break;
+            }
+            let Some(item) = state.items.iter().find(|item| item.id == id) else {
+                continue;
+            };
+            for dependency in &item.dependencies {
+                if seen.insert(*dependency) {
+                    marked.push(*dependency);
+                    queue.push(*dependency);
                     added += 1;
-                    changed = true;
                 }
             }
         }
@@ -210,7 +218,10 @@ fn eviction_reason(
 /// Bring evicted items back when they are relevant again: a pin, hot
 /// entities in the working set, or a score that clears the active threshold.
 /// Newest evictions first, bounded per pass. Items evicted by the current
-/// pass are skipped so eviction stays effective.
+/// pass are skipped so eviction stays effective, and semantically dead
+/// items (superseded decisions, verified-fixed errors) never resurrect —
+/// their labels exclude them from the model, so an Active + Resident
+/// revival would be a state-space inconsistency.
 fn reactivate(
     state: &mut State,
     config: &SimpleContextConfig,
@@ -227,6 +238,11 @@ fn reactivate(
         index -= 1;
         let item = &state.eviction_buffer[index];
         if item.evicted_at_tick == Some(now_tick) {
+            continue;
+        }
+        if is_excluded(item) {
+            // Semantic death is terminal: a superseded decision or a
+            // verified-fixed error stays evicted however hot it looks.
             continue;
         }
         let Some(reason) =
@@ -293,7 +309,8 @@ mod tests {
     use crate::engine::SimpleContextEngine;
     use crate::index::entity::extract_entities;
     use agent_contracts::{
-        ContextEngine, ContextIngress, ContextKind, ContextMaintenanceTrigger, TaskId, ToolOutput,
+        ContextEngine, ContextIngress, ContextItemId, ContextKind, ContextMaintenanceTrigger,
+        ContextRetention, LifecycleLabel, TaskId, ToolOutput,
     };
     use serde_json::json;
 
@@ -545,5 +562,187 @@ mod tests {
         let (pass, generation) = evicted_at_cap.expect("the cooling item is evicted at the cap");
         assert_eq!(generation, 3, "eviction happens once generation 3 >= max 3");
         assert_eq!(pass, 3, "it takes the full generational ladder to evict");
+    }
+
+    #[tokio::test]
+    async fn gc_protects_dependencies_of_roots_forward_along_the_edges() {
+        let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+        // A: an old decision; B: the current finding that depends on A.
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "use AuthService.rs as the auth layer".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                output: ToolOutput {
+                    call_id: "1".into(),
+                    tool_name: "shell.exec".into(),
+                    ok: true,
+                    summary: "ok".into(),
+                    model_content: "touched AuthService.rs".into(),
+                    artifact_ref: None,
+                    metadata: json!({}),
+                },
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+        let (a_id, b_id) = {
+            let state = engine.state.lock().await;
+            let a = state
+                .items
+                .iter()
+                .find(|item| item.kind == ContextKind::UserMessage)
+                .expect("decision item");
+            let b = state
+                .items
+                .iter()
+                .find(|item| item.kind == ContextKind::ToolObservation)
+                .expect("finding item");
+            assert!(
+                b.dependencies.contains(&a.id),
+                "the finding must depend on the decision it builds on"
+            );
+            (a.id, b.id)
+        };
+        {
+            let mut state = engine.state.lock().await;
+            for item in &mut state.items {
+                if item.id == a_id {
+                    // Cold and unmarked: another task, entities outside the
+                    // hot set, past the generation cap — only the dependency
+                    // edge from the root can protect it now.
+                    item.task_id = Some(TaskId::new());
+                    item.content = "use OldStore.rs instead".into();
+                    item.entities = extract_entities(&item.content);
+                    item.state = ContextState::Archived;
+                    item.relevance = 0.0;
+                    item.gc_generation = 99;
+                }
+                if item.id == b_id {
+                    // The root: pinned, so nothing else can protect A.
+                    item.retention = ContextRetention::Pinned;
+                }
+            }
+        }
+
+        let report = engine.gc().await.unwrap();
+        assert!(
+            report.marked_roots >= 2,
+            "the root and its dependency must be marked, got {:?}",
+            report.evictions
+        );
+        assert!(
+            !report.evictions.iter().any(|e| e.item_id == a_id),
+            "the dependency of a root must be protected by the forward edge, got: {:?}",
+            report.evictions
+        );
+        let diagnostics = engine.diagnostics().await.unwrap();
+        assert!(
+            state_has(&engine, a_id).await,
+            "the old decision must still be resident; diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_never_resurrects_superseded_items() {
+        // Dependency expansion is off so the (correctly protected) old
+        // decision is not rooted through the new decision's dependency edge;
+        // this test isolates the reactivation exclusion.
+        let engine = SimpleContextEngine::new(SimpleContextConfig {
+            dependency_expansion: false,
+            ..SimpleContextConfig::default()
+        });
+        // A decision, then a newer decision supersedes it.
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "use AuthService.rs as the auth layer".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "use AuthService.rs instead".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        let old_id = {
+            let state = engine.state.lock().await;
+            state
+                .items
+                .iter()
+                .find(|item| item.content.contains("as the auth layer"))
+                .expect("the superseded decision")
+                .id
+        };
+        {
+            let mut state = engine.state.lock().await;
+            for item in &mut state.items {
+                if item.id == old_id {
+                    assert!(
+                        item.tags
+                            .iter()
+                            .any(|tag| tag.is_lifecycle(LifecycleLabel::Superseded)),
+                        "the older decision must be superseded"
+                    );
+                    // Evictable: past the generation cap, another task, and
+                    // its entities leave the hot set so nothing roots it.
+                    item.task_id = Some(TaskId::new());
+                    item.content = "use OldStore.rs instead".into();
+                    item.entities = extract_entities(&item.content);
+                    item.gc_generation = 99;
+                }
+            }
+        }
+        let first = engine.gc().await.unwrap();
+        assert!(
+            first.evictions.iter().any(|e| e.item_id == old_id),
+            "the superseded item must be evicted first"
+        );
+
+        // Its old entities become hot again — but semantic death is
+        // terminal: the item must stay in the reversible buffer.
+        {
+            let mut state = engine.state.lock().await;
+            for item in &mut state.items {
+                if item.id == old_id {
+                    item.entities = extract_entities("AuthService.rs");
+                }
+            }
+        }
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "what about AuthService.rs?".into(),
+            })
+            .await
+            .unwrap();
+        let second = engine.gc().await.unwrap();
+        assert!(
+            !second.reactivations.iter().any(|r| r.item_id == old_id),
+            "a superseded item must never resurrect, got: {:?}",
+            second.reactivations
+        );
+        let diagnostics = engine.diagnostics().await.unwrap();
+        assert_eq!(
+            diagnostics.evicted_items, 1,
+            "the superseded item stays in the buffer: {diagnostics:?}"
+        );
+    }
+
+    /// Whether the engine still holds the item in its resident heap.
+    async fn state_has(engine: &SimpleContextEngine, id: ContextItemId) -> bool {
+        engine
+            .state
+            .lock()
+            .await
+            .items
+            .iter()
+            .any(|item| item.id == id)
     }
 }
