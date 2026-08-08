@@ -4,12 +4,13 @@
 use std::sync::{Arc, Mutex};
 
 use agent_contracts::{
-    AgentResult, ApprovalGate, CancellationToken, Capability, CapabilityLifecycle,
-    CapabilityManifest, CapabilityStatus, CapabilityTransport, ContextDiagnostics, ContextEngine,
-    ContextIngress, ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextQuery, ContextStateTransition, MaterializedContext, ModelCapabilities, ModelOutput,
-    ModelRequest, ModelTransport, RunId, ScopeId, ScopeKind, ToolCall, ToolDispatcher,
-    ToolExecutionRequest, ToolLifecycle, ToolOutput, ToolRisk, ToolSpec,
+    AgentResult, ApprovalGate, CancellationToken, Capability, CapabilityActivation,
+    CapabilityInvocationContext, CapabilityLifecycle, CapabilityManifest, CapabilityStatus,
+    CapabilityTransport, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
+    MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, RunId,
+    ScopeId, ScopeKind, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutput,
+    ToolRisk, ToolSpec,
 };
 use agent_runtime::{
     APPROVAL_POLICY, CapabilityAwareDispatcher, CapabilityId, ContextModule, ModelModule, Module,
@@ -85,6 +86,16 @@ struct StubTools;
 impl ToolDispatcher for StubTools {
     fn specs(&self) -> Vec<ToolSpec> {
         Vec::new()
+    }
+    /// One builtin tool in the catalog, so the dispatcher's reserved-name
+    /// claim has something to reserve.
+    fn catalog(&self) -> Vec<agent_contracts::ToolCatalogEntry> {
+        vec![agent_contracts::ToolCatalogEntry {
+            name: "fs.read".into(),
+            state: ToolLifecycle::Available,
+            owner: "builtin".into(),
+            description: "stub builtin tool".into(),
+        }]
     }
     async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
         Err(agent_contracts::AgentError::Tool("stub".into()))
@@ -266,10 +277,11 @@ async fn external_modules_publish_typed_services_publicly() {
     host.stop().await.unwrap();
 }
 
-/// A demo dynamic capability: one read-only tool, echo-style invoke, and a
+/// A demo dynamic capability: read-only tools, echo-style invoke, and a
 /// shared started flag so tests can observe the lifecycle.
 struct DemoCapability {
     manifest: CapabilityManifest,
+    tool_names: Vec<String>,
     started: Arc<Mutex<bool>>,
 }
 
@@ -285,9 +297,11 @@ impl DemoCapability {
                 provides: vec![agent_contracts::CapabilityKind::Tool],
                 permissions: vec!["workspace:read".into()],
                 requires: Vec::new(),
+                tools: Vec::new(),
                 lifecycle,
                 transport: CapabilityTransport::Builtin,
             },
+            tool_names: vec![format!("{id}.demo")],
             started,
         }
     }
@@ -304,6 +318,15 @@ impl DemoCapability {
         capability.manifest.transport = transport;
         capability
     }
+
+    /// A capability serving exactly the given tool names (for collision and
+    /// activation tests).
+    fn with_tool_names(id: &str, tool_names: &[&str], transport: CapabilityTransport) -> Self {
+        let mut capability = Self::new(id, CapabilityLifecycle::Lazy, Arc::new(Mutex::new(false)));
+        capability.manifest.transport = transport;
+        capability.tool_names = tool_names.iter().map(|name| name.to_string()).collect();
+        capability
+    }
 }
 
 #[async_trait::async_trait]
@@ -312,18 +335,25 @@ impl Capability for DemoCapability {
         &self.manifest
     }
     fn tool_specs(&self) -> Vec<ToolSpec> {
-        vec![ToolSpec {
-            name: format!("{}.demo", self.manifest.id),
-            description: "demo tool".into(),
-            input_schema: json!({"type": "object"}),
-            risk: ToolRisk::ReadOnly,
-        }]
+        self.tool_names
+            .iter()
+            .map(|name| ToolSpec {
+                name: name.clone(),
+                description: "demo tool".into(),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            })
+            .collect()
     }
     async fn start(&self) -> AgentResult<()> {
         *self.started.lock().unwrap() = true;
         Ok(())
     }
-    async fn invoke(&self, call: ToolCall) -> AgentResult<ToolOutput> {
+    async fn invoke(
+        &self,
+        call: ToolCall,
+        _ctx: CapabilityInvocationContext,
+    ) -> AgentResult<ToolOutput> {
         Ok(ToolOutput {
             call_id: call.id,
             tool_name: call.name.clone(),
@@ -510,15 +540,31 @@ async fn external_capabilities_start_experimental_regardless_of_declared_status(
         Some(CapabilityStatus::Experimental),
         "external capabilities enter at the bottom of the maturity ladder"
     );
+    assert_eq!(
+        registry.activation("ext-llm-module"),
+        Some(CapabilityActivation::Disabled),
+        "external capabilities enter disabled; enabling is an operator action"
+    );
 
-    // The catalog reports the effective status, not the declaration.
+    // The catalog reports the effective status and activation, not the
+    // declaration.
     let entry = registry
         .catalog()
         .into_iter()
         .find(|entry| entry.id == "ext-llm-module")
         .expect("registered capability must appear in the catalog");
     assert_eq!(entry.status, CapabilityStatus::Experimental);
+    assert_eq!(entry.activation, CapabilityActivation::Disabled);
     assert_eq!(entry.tools, vec!["ext-llm-module.demo".to_string()]);
+
+    // A disabled capability cannot put its tools on the model surface.
+    let error = registry
+        .load_tool("ext-llm-module.demo")
+        .expect_err("loading a disabled capability's tools must fail");
+    assert!(
+        error.to_string().contains("disabled"),
+        "the error must name the activation: {error}"
+    );
 }
 
 #[tokio::test]
@@ -536,4 +582,169 @@ async fn trusted_builtin_capabilities_keep_their_declared_status() {
         Some(CapabilityStatus::Stable),
         "the trusted core declares its own maturity"
     );
+    assert_eq!(
+        registry.activation("trusted-core"),
+        Some(CapabilityActivation::Enabled),
+        "the trusted in-process core is usable immediately"
+    );
+}
+
+#[tokio::test]
+async fn capabilities_cannot_shadow_reserved_core_tool_names() {
+    let host = ModuleHost::new();
+    let registry = host.capability_registry();
+    // The dispatcher claims the builtin catalog plus the control tools.
+    let _dispatcher = CapabilityAwareDispatcher::new(Arc::new(StubTools), registry.clone());
+
+    // Declaring a builtin tool name must be rejected at registration: the
+    // route would otherwise be hijackable by declaration.
+    let hijack = DemoCapability::with_tool_names(
+        "shadow-builtin",
+        &["fs.read"],
+        CapabilityTransport::Builtin,
+    );
+    let error = registry
+        .register(Arc::new(hijack))
+        .expect_err("shadowing a builtin tool name must be rejected");
+    assert!(
+        error.to_string().contains("reserved"),
+        "the error must name the reservation: {error}"
+    );
+
+    // Control tools are reserved too.
+    let control = DemoCapability::with_tool_names(
+        "shadow-control",
+        &[agent_contracts::CAPABILITY_SEARCH],
+        CapabilityTransport::Builtin,
+    );
+    let error = registry
+        .register(Arc::new(control))
+        .expect_err("shadowing a control tool must be rejected");
+    assert!(error.to_string().contains("reserved"), "{error}");
+}
+
+#[tokio::test]
+async fn capabilities_cannot_duplicate_each_others_tool_names() {
+    let host = ModuleHost::new();
+    let registry = host.capability_registry();
+    registry
+        .register(Arc::new(DemoCapability::with_tool_names(
+            "first",
+            &["shared.tool"],
+            CapabilityTransport::Builtin,
+        )))
+        .unwrap();
+    let error = registry
+        .register(Arc::new(DemoCapability::with_tool_names(
+            "second",
+            &["shared.tool"],
+            CapabilityTransport::Builtin,
+        )))
+        .expect_err("a second owner of the same tool name must be rejected");
+    assert!(
+        error.to_string().contains("already owned"),
+        "the error must name the existing owner: {error}"
+    );
+}
+
+#[tokio::test]
+async fn disabled_capabilities_cannot_load_or_run_until_enabled() {
+    let mut host = ModuleHost::new();
+    let registry = host.capability_registry();
+    let dispatcher = Arc::new(CapabilityAwareDispatcher::new(
+        Arc::new(StubTools),
+        registry.clone(),
+    ));
+    host.add_module(Arc::new(ToolModule::new(dispatcher.clone())))
+        .unwrap();
+    host.start().await.unwrap();
+
+    // An external capability is registered Disabled: nothing may load or
+    // run it.
+    host.register_capability(Arc::new(DemoCapability::with_tool_names(
+        "ext-gated",
+        &["ext-gated.run"],
+        CapabilityTransport::Process {
+            program: "plugin".into(),
+        },
+    )))
+    .unwrap();
+
+    let tools = host.registry().tool_provider().unwrap();
+    let error = dispatcher
+        .load_tool("ext-gated.run")
+        .expect_err("loading a disabled capability must fail");
+    assert!(error.to_string().contains("disabled"), "{error}");
+
+    // Enabling makes it loadable and runnable.
+    registry.enable("ext-gated").unwrap();
+    dispatcher.load_tool("ext-gated.run").unwrap();
+    let output = execute(tools, "ext-gated.run").await;
+    assert!(output.ok);
+    assert_eq!(output.model_content, "demo handled ext-gated.run");
+
+    host.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn activation_can_be_disabled_and_quarantined_after_use() {
+    let mut host = ModuleHost::new();
+    let registry = host.capability_registry();
+    let dispatcher = Arc::new(CapabilityAwareDispatcher::new(
+        Arc::new(StubTools),
+        registry.clone(),
+    ));
+    host.add_module(Arc::new(ToolModule::new(dispatcher.clone())))
+        .unwrap();
+    host.start().await.unwrap();
+
+    // Trusted builtin capability starts Enabled and usable.
+    host.register_capability(Arc::new(DemoCapability::with_tool_names(
+        "flaky",
+        &["flaky.run"],
+        CapabilityTransport::Builtin,
+    )))
+    .unwrap();
+    let tools = host.registry().tool_provider().unwrap();
+    dispatcher.load_tool("flaky.run").unwrap();
+    assert!(execute(tools.clone(), "flaky.run").await.ok);
+
+    // After misbehavior the operator disables it: tools leave the surface
+    // and calls are blocked at the gate.
+    registry.disable("flaky").unwrap();
+    let names: Vec<String> = tools.specs().iter().map(|spec| spec.name.clone()).collect();
+    assert!(
+        !names.contains(&"flaky.run".to_string()),
+        "a disabled capability must leave the model surface"
+    );
+    let error = execute_raw(tools.clone(), "flaky.run").await;
+    assert!(
+        error.contains("disabled"),
+        "invoking a disabled capability must fail at the gate: {error}"
+    );
+
+    // Quarantine is the same gate, with its own label.
+    registry.enable("flaky").unwrap();
+    registry.quarantine("flaky").unwrap();
+    let error = execute_raw(tools, "flaky.run").await;
+    assert!(error.contains("quarantined"), "{error}");
+
+    host.stop().await.unwrap();
+}
+
+/// Execute a tool and return the error text, for asserting on the gate.
+async fn execute_raw(dispatcher: Arc<dyn ToolDispatcher>, tool: &str) -> String {
+    dispatcher
+        .execute(ToolExecutionRequest {
+            run_id: RunId::new(),
+            call: ToolCall {
+                id: "c1".into(),
+                name: tool.into(),
+                arguments: json!({}),
+            },
+            cancel: CancellationToken::new(),
+        })
+        .await
+        .unwrap_err()
+        .to_string()
 }

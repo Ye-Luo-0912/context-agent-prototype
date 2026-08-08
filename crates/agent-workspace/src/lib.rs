@@ -5,6 +5,10 @@ use serde::Serialize;
 use tokio::fs;
 use uuid::Uuid;
 
+mod handles;
+
+pub use handles::{ArtifactStoreHandle, ConfinedWorkspaceHandle};
+
 /// One recorded workspace mutation, appended to `.focus-agent/changes.jsonl`.
 /// Kept bounded: old content is captured only for small files so the journal
 /// stays reviewable without duplicating the whole repository.

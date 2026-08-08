@@ -294,9 +294,7 @@ impl ToolDispatcher for BuiltinToolDispatcher {
 
     fn inspect_tool(&self, name: &str) -> Option<ToolSpec> {
         let catalog = self.catalog.read().expect("tool catalog poisoned");
-        catalog
-            .get(name)
-            .map(|entry| entry.tool.spec())
+        catalog.get(name).map(|entry| entry.tool.spec())
     }
 
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {

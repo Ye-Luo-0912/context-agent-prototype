@@ -19,3 +19,8 @@ agent-runtime.workspace = true
 context-simple.workspace = true
 serde_json.workspace = true
 tempfile = "3"
+
+[[test]]
+name = "mock_host"
+path = "tests/mock_host.rs"
+harness = false

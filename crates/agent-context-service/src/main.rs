@@ -49,6 +49,10 @@ async fn handle(op: ServiceOp, engine: &dyn ContextEngine) -> Result<Value, Agen
             let report = engine.maintain(trigger).await?;
             serde_json::to_value(report).map_err(|e| AgentError::Context(e.to_string()))
         }
+        ServiceOp::Gc => {
+            let report = engine.gc().await?;
+            serde_json::to_value(report).map_err(|e| AgentError::Context(e.to_string()))
+        }
         ServiceOp::Materialize { query } => {
             let materialized = engine.materialize(query).await?;
             serde_json::to_value(materialized).map_err(|e| AgentError::Context(e.to_string()))

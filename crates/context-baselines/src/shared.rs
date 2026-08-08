@@ -7,8 +7,8 @@
 //! the point of the A/B/C experiment.
 
 use agent_contracts::{
-    ContextDiagnostics, ContextIngress, ContextItemId, ContextItemSummary, ContextKind,
-    ContextScope, AttentionState, SemanticState, MaterializedItem,
+    AttentionState, ContextDiagnostics, ContextIngress, ContextItemId, ContextItemSummary,
+    ContextKind, ContextScope, MaterializedItem, SemanticState,
 };
 
 /// Token estimator shared by the baseline engines. Must match the convention
@@ -141,7 +141,7 @@ pub(crate) fn materialized_items(
         kind: record.kind,
         scope: record.scope,
         attention: AttentionState::Active,
-            semantic: SemanticState::Live,
+        semantic: SemanticState::Live,
         content: record.content.clone(),
         source: record.source.clone(),
     }));

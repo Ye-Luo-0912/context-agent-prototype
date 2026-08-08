@@ -1,0 +1,102 @@
+//! A standalone JSON-lines mock child used by `host.rs`'s tests.
+//!
+//! Declared as a `[[test]]` target with `harness = false`, so it is built
+//! and run by `cargo test` but never ships with the library: without the
+//! `--serve` flag it does nothing and exits 0 (cargo's test runner requires
+//! that), and the tests spawn it with `--serve` to drive the framing and
+//! failure scenarios against a real process.
+//!
+//! It also refuses to serve unless `MOCK_MARKER=1` was injected by the
+//! parent — that doubles as the test that `ProcessHostConfig.env` actually
+//! reaches the child.
+
+use std::time::Duration;
+
+use agent_contracts::ToolOutput;
+use context_contextcore::PROTOCOL_VERSION;
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+
+fn main() {
+    if !std::env::args().any(|arg| arg == "--serve") {
+        return; // plain `cargo test` run: nothing to do
+    }
+    let marker = std::env::var("MOCK_MARKER").unwrap_or_default();
+    if marker != "1" {
+        eprintln!("mock host requires MOCK_MARKER=1 (env injection test)");
+        std::process::exit(1);
+    }
+    let runtime = tokio::runtime::Runtime::new().expect("mock runtime");
+    runtime.block_on(server_loop());
+}
+
+/// Mock child protocol. Speaks the same shape as the real service
+/// (`{id, version, ok, value}`) plus two deliberate failure modes:
+/// - `big` streams an oversized line without a newline (bounded-read test);
+/// - `silent` never answers (request-deadline test).
+async fn server_loop() {
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let stdout = tokio::io::stdout();
+    let mut writer = BufWriter::new(stdout);
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        let request: Value = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(_) => continue,
+        };
+        let id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
+        match request.get("op").and_then(Value::as_str).unwrap_or("") {
+            "ping" => reply(&mut writer, id, json!("pong")).await,
+            "invoke" => {
+                // A canned `ToolOutput` so the process-capability adapter's
+                // round trip is testable against a real process.
+                let output = serde_json::to_value(ToolOutput {
+                    call_id: "c1".into(),
+                    tool_name: "process-demo.invoke".into(),
+                    ok: true,
+                    summary: "process ran".into(),
+                    model_content: "process capability handled the call".into(),
+                    artifact_ref: None,
+                    metadata: json!({}),
+                })
+                .expect("ToolOutput serializes");
+                reply(&mut writer, id, output).await;
+            }
+            "big" => {
+                // Stream far more than any test's `max_frame_bytes` without
+                // a newline: the client must reject while reading, not grow
+                // a multi-megabyte buffer first and check it afterwards.
+                let payload = "x".repeat(4 * 1024 * 1024);
+                let _ = writer.write_all(payload.as_bytes()).await;
+                let _ = writer.flush().await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            "silent" => {
+                // Never answer: the client's request deadline must fire and
+                // poison the connection (the request may have been written,
+                // so a late response must never be mistaken for the next
+                // request's answer).
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            "shutdown" => {
+                reply(&mut writer, id, Value::Null).await;
+                return;
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn reply(writer: &mut BufWriter<tokio::io::Stdout>, id: u64, value: Value) {
+    let response = json!({
+        "id": id,
+        "version": PROTOCOL_VERSION,
+        "ok": true,
+        "value": value,
+    });
+    let _ = writer
+        .write_all(serde_json::to_string(&response).unwrap().as_bytes())
+        .await;
+    let _ = writer.write_all(b"\n").await;
+    let _ = writer.flush().await;
+}

@@ -64,9 +64,11 @@ pub(crate) fn queue_decision_supersessions(
         }
         if entities_match(&entities, &item.entities) {
             let snippet: String = item.content.chars().take(60).collect();
-            state
-                .pending_supersessions
-                .push((item.id, by_id, format!("{reason_prefix}: '{snippet}'")));
+            state.pending_supersessions.push((
+                item.id,
+                by_id,
+                format!("{reason_prefix}: '{snippet}'"),
+            ));
         }
     }
 }
@@ -102,7 +104,12 @@ pub(crate) fn queue_error_verifications(
 /// Queue recurrence-supersession for every live error item that shares an
 /// entity with a new failure: one live error per failure site, the latest
 /// one. `by_id` is the new failure that supersedes the earlier one.
-pub(crate) fn queue_error_recurrence(state: &mut State, content: &str, round: u64, by_id: ContextItemId) {
+pub(crate) fn queue_error_recurrence(
+    state: &mut State,
+    content: &str,
+    round: u64,
+    by_id: ContextItemId,
+) {
     let entities = extract_entities(content);
     if entities.is_empty() {
         return;

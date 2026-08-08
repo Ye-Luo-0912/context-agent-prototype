@@ -11,10 +11,10 @@
 use std::sync::Mutex as StdMutex;
 
 use agent_contracts::{
-    AgentError, AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextKind,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextScope,
-    ContextSelection, AttentionState, ContextStateTransition, MaterializedContext, ScopeId,
-    ScopeKind, ScoreBreakdown,
+    AgentError, AgentResult, AttentionState, ContextDiagnostics, ContextEngine, ContextIngress,
+    ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextScope,
+    ContextSelection, ContextStateTransition, MaterializedContext, ScopeId, ScopeKind,
+    ScoreBreakdown,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

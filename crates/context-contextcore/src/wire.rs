@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Wire protocol version. Both sides echo it; a mismatch fails the handshake
-/// so a newer or older service is never misparsed.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// so a newer or older service is never misparsed. Defined by the shared
+/// process host so every protocol over a JSON-lines pipe speaks one version.
+pub use crate::host::PROTOCOL_VERSION;
 
 /// A single request. `id` is echoed by the response for correlation and
 /// debugging; the current adapter is strictly ping-pong (one in flight).
@@ -39,6 +40,7 @@ pub enum ServiceOp {
     Maintain {
         trigger: ContextMaintenanceTrigger,
     },
+    Gc,
     Materialize {
         query: ContextQuery,
     },

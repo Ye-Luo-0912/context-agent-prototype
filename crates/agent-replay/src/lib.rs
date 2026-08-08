@@ -21,9 +21,9 @@ mod scenarios;
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use agent_contracts::{
-    ContextDiagnostics, ContextEngine, ContextHints, ContextIngress, ContextItemId,
-    ContextItemSummary, ContextKind, ContextQuery, AttentionState, FocusState, RuntimeEvent,
-    RuntimeEventEnvelope, tokens,
+    AttentionState, ContextDiagnostics, ContextEngine, ContextHints, ContextIngress, ContextItemId,
+    ContextItemSummary, ContextKind, ContextQuery, FocusState, RuntimeEvent, RuntimeEventEnvelope,
+    tokens,
 };
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 

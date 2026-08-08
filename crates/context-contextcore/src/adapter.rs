@@ -3,34 +3,26 @@
 //! This is the ContextCore integration shape: the kernel keeps talking to the
 //! `ContextEngine` contract, and this adapter translates each call into a
 //! JSON line on the service's stdin and awaits the response on its stdout.
+//! The framed transport, deadlines and poisoned-connection policy live in
+//! the shared `ProcessHost`; this module is only the protocol layer that
+//! maps `ContextEngine` operations onto the service's wire operations.
 //! Swapping the process behind the pipe (today: `agent-context-service`
 //! running an in-process engine; tomorrow: a real ContextCore runtime) is a
 //! composition-root detail — no kernel, tool, provider or UI code changes.
 
-use std::{
-    io::ErrorKind,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::sync::Arc;
+use std::time::Duration;
 
 use agent_contracts::{
-    AgentError, AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
-    MaterializedContext, ScopeId, ScopeKind,
+    AgentError, AgentResult, ContextDiagnostics, ContextEngine, ContextGcReport, ContextIngress,
+    ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
+    ContextStateTransition, MaterializedContext, ScopeId, ScopeKind,
 };
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
-    time::timeout,
-};
 
-use crate::wire::{PROTOCOL_VERSION, ServiceOp, ServiceRequest, ServiceResponse};
+use crate::host::{ProcessHost, ProcessHostConfig, resolve_program};
+use crate::wire::ServiceOp;
 
 /// Which engine the spawned service should run. The adapter is agnostic; the
 /// choice belongs to the composition root (same as `--context=` in the TUI).
@@ -85,194 +77,50 @@ impl ContextServiceConfig {
         if let Some(program) = &self.program {
             return program.clone();
         }
-        if let Ok(program) = std::env::var("CARGO_BIN_EXE_agent-context-service") {
-            return program;
-        }
-        if let Ok(current) = std::env::current_exe()
-            && let Some(found) = probe_siblings(&current, service_binary_name(&current))
-        {
-            return found.to_string_lossy().into_owned();
-        }
-        // Last resort: PATH lookup (cargo may inject the target dir into
-        // PATH for tests, but the explicit probes above should be enough).
-        "agent-context-service".to_string()
+        let name = if cfg!(windows) {
+            "agent-context-service.exe"
+        } else {
+            "agent-context-service"
+        };
+        resolve_program(Some("CARGO_BIN_EXE_agent-context-service"), name)
     }
-}
-
-/// The service binary name matching the platform's executable suffix.
-fn service_binary_name(current_exe: &std::path::Path) -> &'static str {
-    if current_exe
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .ends_with(".exe")
-    {
-        "agent-context-service.exe"
-    } else {
-        "agent-context-service"
-    }
-}
-
-/// Probe the standard cargo layout around the current executable: a test
-/// binary lives in `target/<profile>/deps/` while the service binary lands
-/// in `target/<profile>/`, so check both instead of depending on cargo
-/// injecting the target dir into PATH (which not every runner does).
-fn probe_siblings(current_exe: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
-    let parent = current_exe.parent()?;
-    [
-        parent.join(name),
-        parent.parent().map(|profile| profile.join(name))?,
-    ]
-    .into_iter()
-    .find(|candidate| candidate.exists())
 }
 
 /// A `ContextEngine` whose state lives in a separate process.
 pub struct ContextServiceAdapter {
-    child: Child,
-    config: ContextServiceConfig,
-    /// Strict ping-pong: one request in flight at a time. Held in a `Mutex`
-    /// because the `ContextEngine` trait only gives `&self`.
-    io: Mutex<AdapterIo>,
-    next_id: AtomicU64,
-}
-
-struct AdapterIo {
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    host: ProcessHost,
 }
 
 impl ContextServiceAdapter {
     /// Spawn the service, handshake, and return a ready adapter.
     pub async fn connect(config: &ContextServiceConfig) -> AgentResult<Self> {
         let program = config.resolve_program();
-        let mut child = Command::new(&program)
-            .arg("--engine")
-            .arg(config.engine.as_arg())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                AgentError::Context(format!(
-                    "spawn context service '{program}': {e} (build it with `cargo build -p agent-context-service`)"
-                ))
-            })?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| AgentError::Context("context service stdin unavailable".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| AgentError::Context("context service stdout unavailable".into()))?;
-
-        let adapter = Self {
-            child,
-            config: config.clone(),
-            io: Mutex::new(AdapterIo {
-                stdin,
-                stdout: BufReader::new(stdout),
-            }),
-            next_id: AtomicU64::new(1),
-        };
-
-        // Fail fast on a missing/broken service instead of on the first turn.
-        timeout(config.startup_timeout, adapter.call(ServiceOp::Ping))
-            .await
-            .map_err(|_| AgentError::Context("context service did not respond to ping".into()))?
-            .map_err(|e| AgentError::Context(format!("context service handshake: {e}")))?;
-
-        Ok(adapter)
+        let host = ProcessHost::connect(ProcessHostConfig {
+            program: program.clone(),
+            args: vec!["--engine".into(), config.engine.as_arg().into()],
+            env: Vec::new(),
+            startup_timeout: config.startup_timeout,
+            request_timeout: config.request_timeout,
+            max_frame_bytes: config.max_frame_bytes,
+        })
+        .await
+        .map_err(|e| {
+            AgentError::Context(format!(
+                "spawn context service '{program}': {e} (build it with `cargo build -p agent-context-service`)"
+            ))
+        })?;
+        Ok(Self { host })
     }
 
     async fn call(&self, op: ServiceOp) -> AgentResult<Value> {
-        // Every request after the handshake has its own deadline, so a
-        // wedged service surfaces as an error instead of hanging the turn.
-        timeout(self.config.request_timeout, self.call_unbounded(op))
-            .await
-            .map_err(|_| AgentError::Context("context service request timed out".into()))?
-    }
-
-    async fn call_unbounded(&self, op: ServiceOp) -> AgentResult<Value> {
-        let mut io = self.io.lock().await;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let request = ServiceRequest {
-            id,
-            version: PROTOCOL_VERSION,
-            op,
-        };
-        let line = serde_json::to_string(&request)
+        let op_value = serde_json::to_value(op)
             .map_err(|e| AgentError::Context(format!("serialize request: {e}")))?;
-
-        io.stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(service_io_error)?;
-        io.stdin.write_all(b"\n").await.map_err(service_io_error)?;
-        io.stdin.flush().await.map_err(service_io_error)?;
-
-        // Frame-bounded read: a broken service cannot grow the adapter's
-        // memory without bound.
-        let mut frame: Vec<u8> = Vec::with_capacity(256);
-        let read = io
-            .stdout
-            .read_until(b'\n', &mut frame)
-            .await
-            .map_err(service_io_error)?;
-        if read == 0 {
-            return Err(AgentError::Context(
-                "context service closed its stdout (did it crash?)".into(),
-            ));
-        }
-        if frame.len() > self.config.max_frame_bytes {
-            return Err(AgentError::Context(format!(
-                "context service response frame of {} bytes exceeds the {} byte limit",
-                frame.len(),
-                self.config.max_frame_bytes
-            )));
-        }
-        let line = String::from_utf8(frame)
-            .map_err(|e| AgentError::Context(format!("service response is not UTF-8: {e}")))?;
-        let response: ServiceResponse = serde_json::from_str(&line).map_err(|e| {
-            AgentError::Context(format!("parse service response: {e} (line: {line})"))
-        })?;
-        if response.id != id {
-            return Err(AgentError::Context(format!(
-                "service response id mismatch: got {}, expected {id}",
-                response.id
-            )));
-        }
-        if response.version != PROTOCOL_VERSION {
-            return Err(AgentError::Context(format!(
-                "context service protocol version mismatch: service {}, client {PROTOCOL_VERSION}",
-                response.version
-            )));
-        }
-        if !response.ok {
-            return Err(AgentError::Context(
-                response
-                    .error
-                    .unwrap_or_else(|| "unknown service error".into()),
-            ));
-        }
-        Ok(response.value)
+        self.host.call(op_value).await
     }
 
     /// Graceful stop: ask the service to exit, then reap it.
-    pub async fn shutdown(mut self) {
-        let _ = self.call(ServiceOp::Shutdown).await;
-        let _ = self.child.wait().await;
-    }
-}
-
-fn service_io_error(e: std::io::Error) -> AgentError {
-    if e.kind() == ErrorKind::BrokenPipe || e.kind() == ErrorKind::UnexpectedEof {
-        AgentError::Context(format!("context service connection closed: {e}"))
-    } else {
-        AgentError::Io(format!("context service io: {e}"))
+    pub async fn shutdown(self) {
+        self.host.shutdown().await;
     }
 }
 
@@ -290,6 +138,12 @@ impl ContextEngine for ContextServiceAdapter {
         let value = self.call(ServiceOp::Maintain { trigger }).await?;
         serde_json::from_value(value)
             .map_err(|e| AgentError::Context(format!("decode maintain report: {e}")))
+    }
+
+    async fn gc(&self) -> AgentResult<ContextGcReport> {
+        let value = self.call(ServiceOp::Gc).await?;
+        serde_json::from_value(value)
+            .map_err(|e| AgentError::Context(format!("decode gc report: {e}")))
     }
 
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
@@ -335,57 +189,4 @@ impl ContextEngine for ContextServiceAdapter {
 /// Convenience: `Arc<dyn ContextEngine>` for a spawned service.
 pub async fn connect_engine(config: &ContextServiceConfig) -> AgentResult<Arc<dyn ContextEngine>> {
     Ok(Arc::new(ContextServiceAdapter::connect(config).await?))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn probe_finds_the_service_next_to_the_profile_dir() {
-        // Simulate the standard cargo layout for a test binary:
-        // target/<profile>/deps/<test-exe> with the service binary in
-        // target/<profile>/.
-        let dir = tempfile::tempdir().unwrap();
-        let profile = dir.path().join("debug");
-        let deps = profile.join("deps");
-        std::fs::create_dir_all(&deps).unwrap();
-        let service = profile.join("agent-context-service");
-        std::fs::write(&service, "bin").unwrap();
-        let test_exe = deps.join("service-abc123");
-        std::fs::write(&test_exe, "test").unwrap();
-
-        assert_eq!(
-            probe_siblings(&test_exe, "agent-context-service"),
-            Some(service)
-        );
-    }
-
-    #[test]
-    fn probe_prefers_the_same_directory_then_the_profile_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let deps = dir.path().join("deps");
-        std::fs::create_dir_all(&deps).unwrap();
-        let same_dir = deps.join("agent-context-service");
-        std::fs::write(&same_dir, "bin").unwrap();
-        let exe = deps.join("service-abc123");
-        std::fs::write(&exe, "test").unwrap();
-
-        assert_eq!(
-            probe_siblings(&exe, "agent-context-service"),
-            Some(same_dir)
-        );
-    }
-
-    #[test]
-    fn probe_returns_none_when_nowhere_to_be_found() {
-        let dir = tempfile::tempdir().unwrap();
-        let exe = PathBuf::from(dir.path())
-            .join("deps")
-            .join("service-abc123");
-        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-        std::fs::write(&exe, "test").unwrap();
-        assert_eq!(probe_siblings(&exe, "agent-context-service"), None);
-    }
 }

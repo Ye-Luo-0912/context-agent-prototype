@@ -167,8 +167,7 @@ async fn maintenance_records_transitions_with_reasons() {
         !after_tool
             .transitions
             .iter()
-            .any(|t| t.to == AttentionState::Archived
-                && t.reason.contains("observation consumed")),
+            .any(|t| t.to == AttentionState::Archived && t.reason.contains("observation consumed")),
         "fresh observation must not be consumed at AfterTool: {:?}",
         after_tool.transitions
     );
@@ -449,7 +448,9 @@ async fn recurring_failure_supersedes_prior_error() {
     let items = engine.inspect(usize::MAX).await.unwrap();
     let live_errors = items
         .iter()
-        .filter(|item| item.kind == ContextKind::Error && item.attention != AttentionState::Archived)
+        .filter(|item| {
+            item.kind == ContextKind::Error && item.attention != AttentionState::Archived
+        })
         .count();
     assert_eq!(
         live_errors, 1,
@@ -1199,9 +1200,9 @@ async fn promoted_finding_reactivates_for_a_related_task() {
                 .any(|tag| tag.is_lifecycle(agent_contracts::LifecycleLabel::Promoted))
         );
         assert!(
-        decision.semantic.is_live(),
-        "a promoted outcome stays semantically live"
-    );
+            decision.semantic.is_live(),
+            "a promoted outcome stays semantically live"
+        );
     }
     engine
         .ingest(ContextIngress::UserMessage {

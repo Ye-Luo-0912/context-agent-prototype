@@ -223,6 +223,81 @@ async fn service_equivalence_with_in_process_engine() {
 }
 
 #[tokio::test]
+async fn gc_parity_between_in_process_and_service_boundary() {
+    // The same scripted lifecycle must produce the same GC report whether
+    // the engine runs in-process or behind the service boundary. This is
+    // the regression test for the GC dimension of the wire protocol: a
+    // service that drops `gc()` silently would diverge here.
+    let service = connect().await;
+    let local: Arc<dyn ContextEngine> = Arc::new(context_simple::SimpleContextEngine::new(
+        context_simple::SimpleContextConfig::default(),
+    ));
+
+    let mut reports = Vec::new();
+    for engine in [service, local] {
+        for turn in 0..3 {
+            engine
+                .ingest(ContextIngress::UserMessage {
+                    content: format!("turn {turn}: fix AuthService.rs"),
+                })
+                .await
+                .unwrap();
+            engine
+                .ingest(ContextIngress::ToolObservation {
+                    output: ToolOutput {
+                        call_id: format!("{turn}"),
+                        tool_name: "shell.exec".into(),
+                        ok: true,
+                        summary: "ok".into(),
+                        model_content: format!("tests passed in AuthService.rs ({turn})"),
+                        artifact_ref: None,
+                        metadata: json!({}),
+                    },
+                    scope_id: None,
+                })
+                .await
+                .unwrap();
+            engine
+                .maintain(ContextMaintenanceTrigger::AfterModel)
+                .await
+                .unwrap();
+        }
+        let report = engine.gc().await.unwrap();
+        assert!(
+            report.evicted >= 1,
+            "the consumed observations must be evictable, got {report:?}"
+        );
+        let mut report = serde_json::to_value(report).unwrap();
+        strip_random_item_ids(&mut report);
+        reports.push(report);
+    }
+    assert_eq!(
+        reports[0], reports[1],
+        "GC must behave identically across the process boundary"
+    );
+}
+
+/// Item ids are random UUIDs generated per engine instance, so they can
+/// never match across two runs; strip them before comparing the reports.
+/// Everything else (kinds, reasons, ticks, counts, diagnostics) must match.
+fn strip_random_item_ids(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove("item_id");
+            for nested in map.values_mut() {
+                strip_random_item_ids(nested);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for nested in items {
+                strip_random_item_ids(nested);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[tokio::test]
 async fn missing_service_fails_fast_with_clear_error() {
     let config = ContextServiceConfig {
         program: Some("definitely-not-a-real-binary-xyz".into()),

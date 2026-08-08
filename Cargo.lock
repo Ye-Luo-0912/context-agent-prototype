@@ -102,6 +102,7 @@ name = "agent-workspace"
 version = "0.1.0"
 dependencies = [
  "agent-contracts",
+ "async-trait",
  "serde",
  "serde_json",
  "tempfile",

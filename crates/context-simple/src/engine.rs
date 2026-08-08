@@ -281,7 +281,12 @@ impl ContextEngine for SimpleContextEngine {
                 // heap only after queueing so intents never see it.
                 let observation_id = item.id;
                 if self.config.error_verification && !ok {
-                    reachability::queue_error_recurrence(&mut state, &content, round, observation_id);
+                    reachability::queue_error_recurrence(
+                        &mut state,
+                        &content,
+                        round,
+                        observation_id,
+                    );
                 }
                 if self.config.error_verification && ok {
                     reachability::queue_error_verifications(

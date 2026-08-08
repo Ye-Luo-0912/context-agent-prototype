@@ -446,9 +446,9 @@ impl RuntimeActor {
             .await;
         let _ = self.kernel.emit_event(RuntimeEvent::ModelStarted).await;
 
-        let input = self
-            .assembler
-            .assemble(&materialized, &turn.turn_frame, tool_surface.specs.clone());
+        let input =
+            self.assembler
+                .assemble(&materialized, &turn.turn_frame, tool_surface.specs.clone());
         let cancel = CancellationToken::new();
         let operation_id = OperationId::new();
         let generation = self.state.generation;

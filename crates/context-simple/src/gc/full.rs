@@ -74,9 +74,8 @@ pub(crate) fn run_full_gc(
         let consumed_ephemeral = item.attention == AttentionState::Archived
             && item.retention == ContextRetention::Ephemeral
             && item.scope == ContextScope::Turn;
-        let alive_root = item.semantic.is_live()
-            && !consumed_ephemeral
-            && marked.contains(&item.id);
+        let alive_root =
+            item.semantic.is_live() && !consumed_ephemeral && marked.contains(&item.id);
         if alive_root {
             // A root is currently relevant: "young" again.
             let mut root = item;
@@ -397,7 +396,9 @@ fn reactivate(
 
     // Cold store entries: content lives in the store; only hot-entity
     // matches earn a recall (no content, so no score-based fallback).
-    if remaining > 0 && !hot_entities.is_empty() {
+    // Skip the whole pass when no store directory exists yet — every
+    // `read_item` would only fail a per-entry file stat.
+    if remaining > 0 && !hot_entities.is_empty() && store::store_ready(config) {
         let dir = store::store_dir(config);
         let mut recalled: Vec<ContextItem> = Vec::new();
         let mut kept: Vec<agent_contracts::ExternalizedContext> = Vec::new();
@@ -408,9 +409,8 @@ fn reactivate(
             }
             let recallable = entry.semantic.is_live() && store::recallable(&entry);
             let recalled_item = if recallable {
-                store::read_item(&dir, entry.item_id).filter(|item| {
-                    entities_match(&item.entities, &hot_entities)
-                })
+                store::read_item(&dir, entry.item_id)
+                    .filter(|item| entities_match(&item.entities, &hot_entities))
             } else {
                 None
             };
@@ -483,7 +483,7 @@ mod tests {
     use crate::index::entity::extract_entities;
     use agent_contracts::{
         ContextEngine, ContextIngress, ContextItemId, ContextKind, ContextMaintenanceTrigger,
-        ContextRetention, LifecycleLabel, TaskId, ToolOutput,
+        ContextRetention, TaskId, ToolOutput,
     };
     use serde_json::json;
 
@@ -522,7 +522,10 @@ mod tests {
         assert!(before.archived_items >= 1, "ephemeral observation consumed");
 
         let report = engine.gc().await.unwrap();
-        assert!(report.evicted >= 1, "gc must evict the consumed observation");
+        assert!(
+            report.evicted >= 1,
+            "gc must evict the consumed observation"
+        );
         assert!(
             report
                 .evictions

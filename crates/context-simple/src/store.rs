@@ -157,7 +157,8 @@ pub(crate) fn run_storage_gc(
     let mut kept: Vec<ExternalizedContext> = Vec::with_capacity(state.external.len());
     for entry in state.external.drain(..) {
         let referenced_now = referenced.contains(&entry.item_id);
-        let Some(reason) = storage_candidate(&entry, now_tick, config.storage_ttl_ticks, referenced_now)
+        let Some(reason) =
+            storage_candidate(&entry, now_tick, config.storage_ttl_ticks, referenced_now)
         else {
             kept.push(entry);
             continue;
@@ -165,10 +166,9 @@ pub(crate) fn run_storage_gc(
         if delete_file(&dir, entry.item_id) {
             report.deleted += 1;
             state.gc_storage_deleted_total += 1;
-            report.reasons.push(format!(
-                "deleted {} ({})",
-                entry.context_ref.uri, reason
-            ));
+            report
+                .reasons
+                .push(format!("deleted {} ({})", entry.context_ref.uri, reason));
         } else {
             // No file behind the entry (already gone): drop the entry too.
             report.deleted += 1;
@@ -231,8 +231,10 @@ mod tests {
     }
 
     fn test_item(id: ContextItemId, content: &str) -> ContextItem {
-        let mut state = State::default();
-        state.tick = 1;
+        let state = State {
+            tick: 1,
+            ..State::default()
+        };
         let mut item = make_item(
             &state,
             &SimpleContextConfig::default(),
@@ -290,33 +292,25 @@ mod tests {
             report.deleted, 1,
             "only the dead, unreferenced, unpinned orphan is deleted"
         );
-        assert!(report.reasons[0].contains("no references"), "{:?}", report.reasons);
         assert!(
-            state
-                .external
-                .iter()
-                .any(|e| e.item_id == dead_id),
+            report.reasons[0].contains("no references"),
+            "{:?}",
+            report.reasons
+        );
+        assert!(
+            state.external.iter().any(|e| e.item_id == dead_id),
             "referenced dead entry must survive"
         );
         assert!(
-            state
-                .external
-                .iter()
-                .any(|e| e.item_id == pinned_id),
+            state.external.iter().any(|e| e.item_id == pinned_id),
             "pinned entries are never deleted"
         );
         assert!(
-            state
-                .external
-                .iter()
-                .any(|e| e.item_id == live_id),
+            state.external.iter().any(|e| e.item_id == live_id),
             "live entries are never deleted"
         );
         assert!(
-            state
-                .external
-                .iter()
-                .all(|e| e.item_id != orphan_id),
+            state.external.iter().all(|e| e.item_id != orphan_id),
             "the deletable orphan leaves the map"
         );
         assert_eq!(state.gc_storage_deleted_total, 1);

@@ -8,7 +8,11 @@
 //! ContextCore runtime is a deployment detail.
 
 mod adapter;
+mod capability_host;
+mod host;
 mod wire;
 
 pub use adapter::{ContextServiceAdapter, ContextServiceConfig, ServiceEngine, connect_engine};
-pub use wire::{PROTOCOL_VERSION, ServiceOp, ServiceRequest, ServiceResponse};
+pub use capability_host::{ProcessCapabilityAdapter, load_process_capability};
+pub use host::{PROTOCOL_VERSION, ProcessHost, ProcessHostConfig, probe_siblings, resolve_program};
+pub use wire::{ServiceOp, ServiceRequest, ServiceResponse};

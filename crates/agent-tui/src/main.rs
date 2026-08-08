@@ -104,9 +104,12 @@ async fn main() -> anyhow::Result<()> {
     // capabilities registered against the shared registry (even mid-run) are
     // exposed to the model on the next request.
     let capability_registry = host.capability_registry();
-    let dispatcher = Arc::new(CapabilityAwareDispatcher::new(
+    let dispatcher = Arc::new(CapabilityAwareDispatcher::with_workspace(
         Arc::new(BuiltinToolDispatcher::new(workspace.clone())),
         capability_registry,
+        // Capabilities that declare workspace/artifact permissions receive
+        // confined handles into the same workspace the builtin tools use.
+        Some(Arc::new(workspace.clone())),
     ));
     host.add_module(Arc::new(ToolModule::new(dispatcher)))?;
     host.add_module(Arc::new(ApprovalModule::new(approval.clone())))?;

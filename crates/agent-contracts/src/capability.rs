@@ -9,10 +9,13 @@
 //! advertised schemas into part of the runtime's tool provider, so a
 //! registered capability is immediately callable by the model.
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentResult, ToolCall, ToolOutput, ToolSpec};
+use crate::{AgentResult, CancellationToken, ToolCall, ToolOutput, ToolSpec};
 
 /// When a capability's service is started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +59,42 @@ impl CapabilityStatus {
     }
 }
 
+/// Whether a registered capability is usable at all. Maturity
+/// (`CapabilityStatus`) says how good a capability is; activation says
+/// whether the runtime will run it. The two are independent axes: an
+/// external capability enters as `Experimental` + `Disabled`, so an LLM
+/// cannot publish a module and immediately run it inside the agent —
+/// enabling is an operator/evaluator action, and a misbehaving capability
+/// can be suspended without unregistering it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityActivation {
+    /// Registered but not usable until explicitly enabled. The default for
+    /// external (out-of-process) capabilities.
+    #[default]
+    Disabled,
+    /// Usable: tools can be loaded onto the model surface and invoked.
+    Enabled,
+    /// Suspended after misbehavior or operator action; nothing runs until
+    /// an explicit re-enable.
+    Quarantined,
+}
+
+impl CapabilityActivation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Enabled => "enabled",
+            Self::Quarantined => "quarantined",
+        }
+    }
+
+    /// Whether the runtime may load and run this capability right now.
+    pub const fn usable(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
 /// What a capability provides to the platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -90,9 +129,9 @@ pub enum CapabilityTransport {
 /// The declarative part of a dynamic capability: stable identity, a human
 /// summary, what it provides and requires, declared permissions, and its
 /// lifecycle and transport shape. The host validates `requires` at
-/// registration and treats permissions as declarations — the tools the
-/// capability advertises carry `ToolRisk` levels that the approval gate
-/// enforces.
+/// registration; declared permissions become enforced `WorkspaceHandle` /
+/// `ArtifactHandle` views inside each invocation's context (the tools also
+/// carry `ToolRisk` levels that the approval gate enforces).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityManifest {
     pub id: String,
@@ -114,8 +153,70 @@ pub struct CapabilityManifest {
     /// deserializes for compatibility.
     #[serde(default, alias = "dependencies")]
     pub requires: Vec<String>,
+    /// The tool schemas this capability serves. In-process capabilities
+    /// implement `Capability::tool_specs` directly; an out-of-process
+    /// capability declares them here so the adapter can advertise them
+    /// without starting the process (the trait's default `tool_specs`
+    /// returns this list).
+    #[serde(default)]
+    pub tools: Vec<ToolSpec>,
     pub lifecycle: CapabilityLifecycle,
     pub transport: CapabilityTransport,
+}
+
+/// A confined view of the agent's workspace handed to a capability for one
+/// invocation. Capabilities never hold the workspace, the engine or the
+/// memory stores directly — everything they can touch is granted here, and
+/// the runtime-owned implementation enforces the boundary (path confinement
+/// against the workspace root, mutation through the journaled transaction,
+/// no access to the runtime state directory).
+#[async_trait]
+pub trait WorkspaceHandle: Send + Sync {
+    /// The confined root every resolved path stays under.
+    fn root(&self) -> &Path;
+
+    /// Resolve a relative path against the workspace root; absolute paths,
+    /// `..` escapes and symlink redirects are rejected.
+    async fn resolve(&self, relative: &str) -> AgentResult<PathBuf>;
+
+    /// Read a file, confined like `resolve`.
+    async fn read(&self, relative: &str) -> AgentResult<Vec<u8>>;
+
+    /// Write a file through the runtime's journaled, atomic mutation
+    /// transaction, confined like `resolve`.
+    async fn write(&self, relative: &str, content: &[u8]) -> AgentResult<()>;
+}
+
+/// A confined view of the artifact store: large outputs land under the
+/// run's artifact directory and come back as `artifact://` references
+/// (bounded model-facing output, invariant 4).
+#[async_trait]
+pub trait ArtifactHandle: Send + Sync {
+    /// Store bytes under the run's artifact directory and return the
+    /// artifact reference for `ToolOutput::artifact_ref`.
+    async fn store(&self, name: &str, bytes: &[u8]) -> AgentResult<String>;
+}
+
+/// Everything a capability may touch during one invocation. Built by the
+/// runtime at execute time from the manifest's declared permissions and the
+/// handles the composition root wired in; capabilities receive this instead
+/// of raw process/engine access, so declared permissions are enforced by
+/// construction, not by trust.
+#[derive(Clone)]
+pub struct CapabilityInvocationContext {
+    /// The permissions granted for this invocation (the manifest's declared
+    /// permissions, as approved by the runtime). Informational — the
+    /// enforcement is the handles below plus the kernel's approval gate.
+    pub granted_permissions: Vec<String>,
+    /// Confined workspace access; present only when the manifest declared
+    /// `workspace:read` (read-only view) or `workspace:write` (journaled
+    /// writes allowed).
+    pub workspace: Option<Arc<dyn WorkspaceHandle>>,
+    /// Confined artifact-store access; present only when declared.
+    pub artifacts: Option<Arc<dyn ArtifactHandle>>,
+    /// Cooperative cancellation for this invocation (the execution
+    /// request's token), so long-running capability calls can be aborted.
+    pub cancel: CancellationToken,
 }
 
 /// The runtime object behind a capability: a manifest, the tool schemas it
@@ -127,11 +228,21 @@ pub struct CapabilityManifest {
 pub trait Capability: Send + Sync {
     fn manifest(&self) -> &CapabilityManifest;
 
-    /// The tool schemas this capability contributes to the model.
-    fn tool_specs(&self) -> Vec<ToolSpec>;
+    /// The tool schemas this capability contributes to the model. Defaults
+    /// to the manifest's declared `tools` — the shape an out-of-process
+    /// capability uses; in-process capabilities override it.
+    fn tool_specs(&self) -> Vec<ToolSpec> {
+        self.manifest().tools.clone()
+    }
 
-    /// Handle one tool call routed to this capability.
-    async fn invoke(&self, call: ToolCall) -> AgentResult<ToolOutput>;
+    /// Handle one tool call routed to this capability. The context carries
+    /// the granted permissions and confined handles; the capability must
+    /// route all workspace/artifact access through them.
+    async fn invoke(
+        &self,
+        call: ToolCall,
+        ctx: CapabilityInvocationContext,
+    ) -> AgentResult<ToolOutput>;
 
     async fn start(&self) -> AgentResult<()> {
         Ok(())
