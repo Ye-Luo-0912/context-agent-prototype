@@ -1,6 +1,6 @@
 use agent_contracts::{
-    ContextItem, ContextItemId, ContextKind, ContextResidency, ContextRetention, ContextScope,
-    ContextState,
+    AttentionState, ContextItem, ContextItemId, ContextKind, ContextResidency, ContextRetention,
+    ContextScope, SemanticState,
 };
 
 use crate::engine::{SimpleContextConfig, State};
@@ -31,7 +31,8 @@ pub(crate) fn make_item(
         kind,
         scope,
         retention,
-        state: ContextState::Active,
+        attention: AttentionState::Active,
+        semantic: SemanticState::Live,
         importance,
         relevance: 0.5,
         created_tick: state.tick,

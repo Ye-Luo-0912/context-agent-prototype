@@ -121,7 +121,7 @@ fn tokens(text: &str) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{ContextItemId, ContextKind, ContextState};
+    use agent_contracts::{AttentionState, ContextItemId, ContextKind, SemanticState};
 
     fn tool_item(content: &str, importance: f32) -> ContextItem {
         let entities = crate::index::entity::extract_entities(content);
@@ -133,7 +133,8 @@ mod tests {
             kind: ContextKind::ToolObservation,
             scope: ContextScope::Turn,
             retention: ContextRetention::Working,
-            state: ContextState::Active,
+            attention: AttentionState::Active,
+            semantic: SemanticState::Live,
             importance,
             relevance: 0.5,
             created_tick: 0,

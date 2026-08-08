@@ -12,7 +12,7 @@ use agent_contracts::{
     ContextMaintenanceTrigger, ContextQuery, ContextStateTransition, EventJournal, FocusState,
     MaterializedContext, ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest,
     ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, TaskId,
-    ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec,
+    ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolSpec, ToolSurfaceSnapshot,
 };
 use tokio::sync::broadcast;
 
@@ -117,6 +117,15 @@ impl AgentKernel {
         self.tools.specs()
     }
 
+    /// Capture the tool surface for one model round: the runtime calls this
+    /// once per round right after `tool_gc()`, then threads the snapshot
+    /// through the budget, the prompt and tool-call validation so the model
+    /// always sees — and the runtime always validates against — the same
+    /// surface.
+    pub fn tool_snapshot(&self) -> ToolSurfaceSnapshot {
+        self.tools.snapshot()
+    }
+
     /// Run the tool lifecycle GC at a runtime safe point. `specs()` is pure;
     /// the actor ages the tool catalog exactly once per model round, before
     /// the surface is captured for the budget and the prompt.
@@ -202,14 +211,21 @@ impl AgentKernel {
         self.model.complete_stream(request, sink).await
     }
 
-    /// Execute one tool call: look up the spec, run approval, dispatch.
-    /// Emits nothing — ToolStarted/ToolFinished are committed by the actor.
-    pub async fn execute_tool(&self, call: ToolCall, cancel: CancellationToken) -> ToolOutput {
-        let spec = self
-            .tools
-            .specs()
-            .into_iter()
-            .find(|spec| spec.name == call.name);
+    /// Execute one tool call: validate it against the round's tool surface
+    /// snapshot (the same surface the model saw and the budget used), run
+    /// approval, dispatch. Emits nothing — ToolStarted/ToolFinished are
+    /// committed by the actor.
+    pub async fn execute_tool(
+        &self,
+        call: ToolCall,
+        cancel: CancellationToken,
+        surface: &ToolSurfaceSnapshot,
+    ) -> ToolOutput {
+        let spec = surface
+            .specs
+            .iter()
+            .find(|spec| spec.name == call.name)
+            .cloned();
         let Some(spec) = spec else {
             return tool_error_output(&call, format!("unknown tool: {}", call.name));
         };

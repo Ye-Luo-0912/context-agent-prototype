@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use agent_contracts::{
-    AgentError, AgentResult, ToolDispatcher, ToolExecutionRequest, ToolOutput, ToolRisk, ToolSpec,
+    AgentError, AgentResult, ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolOutput,
+    ToolRisk, ToolSpec, ToolSurfaceSnapshot,
 };
 use agent_workspace::Workspace;
 use serde::Deserialize;
@@ -26,42 +27,8 @@ use crate::tools::{
     SearchGrepTool, ShellExecTool, Tool,
 };
 
-/// Control tools that are always visible, so the model can discover and
-/// change the active set no matter what else is loaded.
-pub const CAPABILITY_SEARCH: &str = "capability.search";
-pub const CAPABILITY_LOAD: &str = "capability.load";
-pub const CAPABILITY_UNLOAD: &str = "capability.unload";
-
-/// Lifecycle state of one catalog tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolLifecycle {
-    /// Registered in the catalog but never loaded.
-    Available,
-    /// In the active set: its schema is exposed to the model.
-    Loaded,
-    /// Executing a call right now.
-    Active,
-    /// Idle; kept only for a fast reload.
-    Warm,
-    /// Removed from the model surface by the GC.
-    Unloaded,
-}
-
-impl ToolLifecycle {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Available => "available",
-            Self::Loaded => "loaded",
-            Self::Active => "active",
-            Self::Warm => "warm",
-            Self::Unloaded => "unloaded",
-        }
-    }
-
-    fn in_surface(self) -> bool {
-        matches!(self, Self::Loaded | Self::Active)
-    }
-}
+/// Control tools are now defined by the unified catalog contract.
+pub use agent_contracts::{CAPABILITY_LOAD, CAPABILITY_SEARCH, CAPABILITY_UNLOAD, ToolLifecycle};
 
 /// Tuning knobs for the catalog lifecycle.
 #[derive(Debug, Clone)]
@@ -84,14 +51,6 @@ impl Default for ToolLifecycleConfig {
     }
 }
 
-/// One row of `capability.search`.
-#[derive(Debug, Clone)]
-pub struct ToolCatalogEntry {
-    pub name: String,
-    pub state: ToolLifecycle,
-    pub description: String,
-}
-
 struct ToolEntry {
     tool: Arc<dyn Tool>,
     state: ToolLifecycle,
@@ -102,6 +61,9 @@ pub struct BuiltinToolDispatcher {
     catalog: RwLock<HashMap<String, ToolEntry>>,
     config: ToolLifecycleConfig,
     tick: AtomicU64,
+    /// Bumped on every lifecycle change (load/unload/gc transitions), so a
+    /// `ToolSurfaceSnapshot` is auditably identifiable.
+    generation: AtomicU64,
 }
 
 impl BuiltinToolDispatcher {
@@ -143,6 +105,7 @@ impl BuiltinToolDispatcher {
             catalog: RwLock::new(catalog),
             config,
             tick: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -156,6 +119,7 @@ impl BuiltinToolDispatcher {
         })?;
         entry.state = ToolLifecycle::Loaded;
         entry.last_used_tick = tick;
+        self.generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -172,7 +136,17 @@ impl BuiltinToolDispatcher {
             AgentError::Tool(format!("unknown tool: {name} (see capability.search)"))
         })?;
         entry.state = ToolLifecycle::Unloaded;
+        self.generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Capture the current tool surface for one model round, with the
+    /// catalog generation at capture time. The runtime calls this once per
+    /// round, right after `gc()`.
+    pub fn surface(&self) -> ToolSurfaceSnapshot {
+        let specs = self.specs();
+        let generation = self.generation.load(Ordering::Relaxed);
+        ToolSurfaceSnapshot { specs, generation }
     }
 
     /// Snapshot of the catalog for `capability.search`.
@@ -183,6 +157,7 @@ impl BuiltinToolDispatcher {
             .map(|(name, entry)| ToolCatalogEntry {
                 name: name.clone(),
                 state: entry.state,
+                owner: "builtin".to_string(),
                 description: entry.tool.spec().description.clone(),
             })
             .collect();
@@ -203,6 +178,7 @@ impl BuiltinToolDispatcher {
     pub fn gc(&self) {
         let tick = self.tick_now();
         let mut catalog = self.catalog.write().expect("tool catalog poisoned");
+        let mut changed = false;
         for (name, entry) in catalog.iter_mut() {
             if self.config.always_loaded.iter().any(|core| core == name) {
                 continue;
@@ -211,12 +187,17 @@ impl BuiltinToolDispatcher {
             match entry.state {
                 ToolLifecycle::Loaded if idle >= self.config.idle_to_warm_ticks as u64 => {
                     entry.state = ToolLifecycle::Warm;
+                    changed = true;
                 }
                 ToolLifecycle::Warm if idle >= self.config.warm_to_unload_ticks as u64 => {
                     entry.state = ToolLifecycle::Unloaded;
+                    changed = true;
                 }
                 _ => {}
             }
+        }
+        if changed {
+            self.generation.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -293,6 +274,29 @@ impl ToolDispatcher for BuiltinToolDispatcher {
         // model round; delegates to the inherent method so callers on the
         // concrete type and through the trait observe the same aging.
         Self::gc(self);
+    }
+
+    fn snapshot(&self) -> ToolSurfaceSnapshot {
+        self.surface()
+    }
+
+    fn catalog(&self) -> Vec<ToolCatalogEntry> {
+        Self::catalog(self)
+    }
+
+    fn load_tool(&self, name: &str) -> AgentResult<()> {
+        self.load(name)
+    }
+
+    fn unload_tool(&self, name: &str) -> AgentResult<()> {
+        self.unload(name)
+    }
+
+    fn inspect_tool(&self, name: &str) -> Option<ToolSpec> {
+        let catalog = self.catalog.read().expect("tool catalog poisoned");
+        catalog
+            .get(name)
+            .map(|entry| entry.tool.spec())
     }
 
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {

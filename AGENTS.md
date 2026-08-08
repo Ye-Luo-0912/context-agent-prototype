@@ -101,10 +101,17 @@ item reactivated because ...      # GC pass: why it came back
 model turn N consumed it
 ```
 
-Since V1-M6 the GC dimension is explicit: `ContextItem` carries
-`residency` (Resident/Evicted), `gc_generation` and an eviction stamp, and
-`ContextEngine::gc()` runs a mark/roots + sweep + reversible-eviction pass
-that reports a reason for every eviction and reactivation.
+Since V1-M9 the GC dimensions are explicit and orthogonal:
+`ContextItem` carries `attention` (Active/Cooling/Archived), `semantic`
+(Live/Superseded/VerifiedFixed/Tombstoned — terminal states never
+resurrect), `residency` (Resident/Warm/Cold/External) and `gc_generation`,
+and `ContextEngine::gc()` runs a mark/roots + sweep + reversible-eviction
+pass that reports a reason for every eviction and reactivation. Eviction
+is store-backed, never destructive: a full buffer writes the oldest
+eviction to the `ContextStore` as an `ExternalizedContext` (`ContextRef` +
+artifact links) instead of purging it; permanent deletion is reserved for a
+future storage GC with conservative triggers (no live references + retention
+expiry + non-audit + not pinned/durable).
 
 Prefer explicit features before opaque learned scoring:
 
@@ -137,7 +144,14 @@ See `docs/ROADMAP.md`. Current state at this head:
   prompt split, scope ownership, extension platform, workspace path
   confinement, mutation transaction, model budget, shutdown ownership,
   tool lifecycle, capability maturity ladder, capability manifest +
-  process transport hardening).
+  process transport hardening); V1-M9 part 1 (attention/semantic state
+  split with tombstones that never resurrect, dependency-mark direction
+  fixed, store-backed eviction via `ContextEngine::store`/`restore`
+  instead of purge, GC roots tightened to not include the whole active
+  task, scope-close promote-before-archive with `scope_id` kept in sync,
+  `ToolSurfaceSnapshot` per model round, unified tool/capability catalog
+  with one `ToolLifecycle` and unified `capability.search/inspect/load/
+  unload`).
 
 Next, in order:
 

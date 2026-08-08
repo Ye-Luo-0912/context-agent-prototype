@@ -1,4 +1,4 @@
-use agent_contracts::{ContextItem, ContextItemId, ContextState};
+use agent_contracts::{ContextItem, ContextItemId};
 
 use crate::engine::{SimpleContextConfig, State};
 use crate::index::entity::entities_match;
@@ -22,7 +22,7 @@ pub(crate) fn push_linked(
         if !entities.is_empty() {
             let mut edges = 0usize;
             for prior in state.items.iter().rev() {
-                if prior.state == ContextState::Dropped {
+                if prior.semantic.is_dead() {
                     continue;
                 }
                 if prior.entities.is_empty() {

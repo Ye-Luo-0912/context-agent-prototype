@@ -33,6 +33,7 @@ impl ContextEngine for TestContextEngine {
         Ok(MaterializedContext {
             focus: None,
             items: Vec::new(),
+            external: Vec::new(),
             selected: Vec::new(),
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),

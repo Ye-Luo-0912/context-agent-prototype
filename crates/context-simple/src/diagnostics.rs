@@ -1,10 +1,11 @@
-use agent_contracts::{ContextDiagnostics, ContextState, ScopeState};
+use agent_contracts::{AttentionState, ContextDiagnostics, ScopeState, SemanticState};
 
 use crate::engine::State;
 use crate::item::approx_tokens;
 
-/// Counts of the current heap by state, the active token estimate, the scope
-/// tree by lifecycle state and the GC residency split.
+/// Counts of the current heap by attention state and semantic death, the
+/// active token estimate, the scope tree by lifecycle state and the GC
+/// residency split (resident / warm buffer / cold store / external).
 pub(crate) fn compute(state: &State) -> ContextDiagnostics {
     let mut diagnostics = ContextDiagnostics {
         total_items: state.items.len(),
@@ -12,21 +13,35 @@ pub(crate) fn compute(state: &State) -> ContextDiagnostics {
         turn: state.turn,
         tool_round: state.tool_round,
         resident_items: state.items.len(),
-        evicted_items: state.eviction_buffer.len(),
+        warm_items: state.eviction_buffer.len(),
+        cold_items: state
+            .external
+            .iter()
+            .filter(|entry| entry.residency == agent_contracts::ContextResidency::Cold)
+            .count(),
+        external_items: state
+            .external
+            .iter()
+            .filter(|entry| entry.residency == agent_contracts::ContextResidency::External)
+            .count(),
         gc_evicted_total: state.gc_evicted_total,
         gc_reactivated_total: state.gc_reactivated_total,
+        gc_externalized_total: state.gc_externalized_total,
+        gc_storage_deleted_total: state.gc_storage_deleted_total,
         ..ContextDiagnostics::default()
     };
 
     for item in &state.items {
-        match item.state {
-            ContextState::Active => diagnostics.active_items += 1,
-            ContextState::Cooling => diagnostics.cooling_items += 1,
-            ContextState::Archived => diagnostics.archived_items += 1,
-            ContextState::Dropped => diagnostics.dropped_items += 1,
+        match item.attention {
+            AttentionState::Active => diagnostics.active_items += 1,
+            AttentionState::Cooling => diagnostics.cooling_items += 1,
+            AttentionState::Archived => diagnostics.archived_items += 1,
+        }
+        if matches!(item.semantic, SemanticState::Tombstoned) {
+            diagnostics.tombstoned_items += 1;
         }
 
-        if item.state == ContextState::Active {
+        if item.attention == AttentionState::Active {
             diagnostics.approx_active_tokens += approx_tokens(&item.content);
         }
     }

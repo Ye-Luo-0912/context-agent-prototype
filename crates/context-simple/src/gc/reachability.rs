@@ -1,6 +1,6 @@
 use agent_contracts::{
-    ContextItem, ContextItemId, ContextKind, ContextState, ContextStateTransition, CoreLabel,
-    Label, LifecycleLabel,
+    AttentionState, ContextItem, ContextItemId, ContextKind, ContextStateTransition, CoreLabel,
+    LifecycleLabel, SemanticState,
 };
 
 use crate::engine::State;
@@ -28,60 +28,64 @@ pub(crate) fn classify_decision(text: &str) -> bool {
 }
 
 /// True when the item is permanently excluded from model requests: a
-/// superseded decision or a verified-fixed error, whatever its score.
+/// superseded decision or a verified-fixed error, whatever its score. The
+/// semantic state is authoritative; the legacy lifecycle labels are only
+/// honored for pre-split checkpoints until restore migrates them.
 pub(crate) fn is_excluded(item: &ContextItem) -> bool {
-    item.tags.iter().any(|tag| {
-        tag.is_lifecycle(LifecycleLabel::Superseded)
-            || tag.is_lifecycle(LifecycleLabel::VerifiedFixed)
-    })
+    item.semantic.is_dead()
+        || item.tags.iter().any(|tag| {
+            tag.is_lifecycle(LifecycleLabel::Superseded)
+                || tag.is_lifecycle(LifecycleLabel::VerifiedFixed)
+        })
 }
 
-/// Queue supersession for every non-dropped decision item that shares an
-/// entity with the incoming decision (except `except_id`, the new item).
+/// Queue supersession for every live decision item that shares an entity
+/// with the incoming decision. `by_id` is the new decision's id: it both
+/// excludes the new item itself and becomes the `by` of the Superseded
+/// semantic state.
 pub(crate) fn queue_decision_supersessions(
     state: &mut State,
     content: &str,
     reason_prefix: &str,
-    except_id: Option<ContextItemId>,
+    by_id: ContextItemId,
 ) {
     let entities = extract_entities(content);
     if entities.is_empty() {
         return;
     }
     for item in &mut state.items {
-        if Some(item.id) == except_id {
+        if item.id == by_id {
             continue;
         }
         let is_decision = item.kind == ContextKind::Decision
             || item.tags.iter().any(|tag| tag.is_core(CoreLabel::Decision));
-        if !is_decision || item.state == ContextState::Dropped {
-            continue;
-        }
-        if item
-            .tags
-            .iter()
-            .any(|tag| tag.is_lifecycle(LifecycleLabel::Superseded))
-        {
+        if !is_decision || item.semantic.is_dead() {
             continue;
         }
         if entities_match(&entities, &item.entities) {
             let snippet: String = item.content.chars().take(60).collect();
             state
                 .pending_supersessions
-                .push((item.id, format!("{reason_prefix}: '{snippet}'")));
+                .push((item.id, by_id, format!("{reason_prefix}: '{snippet}'")));
         }
     }
 }
 
-/// Queue verification for every non-dropped, unverified error item that
-/// shares an entity with a successful observation.
-pub(crate) fn queue_error_verifications(state: &mut State, content: &str, reason: &str) {
+/// Queue verification for every live, unverified error item that shares an
+/// entity with a successful observation. `by_id` is the successful
+/// observation that verified the error.
+pub(crate) fn queue_error_verifications(
+    state: &mut State,
+    content: &str,
+    reason: &str,
+    by_id: ContextItemId,
+) {
     let entities = extract_entities(content);
     if entities.is_empty() {
         return;
     }
     for item in &mut state.items {
-        if item.kind != ContextKind::Error || item.state == ContextState::Dropped {
+        if item.kind != ContextKind::Error || item.semantic.is_dead() {
             continue;
         }
         if is_excluded(item) {
@@ -90,21 +94,24 @@ pub(crate) fn queue_error_verifications(state: &mut State, content: &str, reason
         if entities_match(&entities, &item.entities) {
             state
                 .pending_verifications
-                .push((item.id, reason.to_string()));
+                .push((item.id, by_id, reason.to_string()));
         }
     }
 }
 
-/// Queue recurrence-supersession for every non-dropped error item that
-/// shares an entity with a new failure: one live error per failure site,
-/// the latest one.
-pub(crate) fn queue_error_recurrence(state: &mut State, content: &str, round: u64) {
+/// Queue recurrence-supersession for every live error item that shares an
+/// entity with a new failure: one live error per failure site, the latest
+/// one. `by_id` is the new failure that supersedes the earlier one.
+pub(crate) fn queue_error_recurrence(state: &mut State, content: &str, round: u64, by_id: ContextItemId) {
     let entities = extract_entities(content);
     if entities.is_empty() {
         return;
     }
     for item in &mut state.items {
-        if item.kind != ContextKind::Error || item.state == ContextState::Dropped {
+        if item.kind != ContextKind::Error || item.semantic.is_dead() {
+            continue;
+        }
+        if item.id == by_id {
             continue;
         }
         if is_excluded(item) {
@@ -113,6 +120,7 @@ pub(crate) fn queue_error_recurrence(state: &mut State, content: &str, round: u6
         if entities_match(&entities, &item.entities) {
             state.pending_supersessions.push((
                 item.id,
+                by_id,
                 format!(
                     "recurring failure supersedes earlier error (round {round}, same entities)"
                 ),
@@ -121,61 +129,63 @@ pub(crate) fn queue_error_recurrence(state: &mut State, content: &str, round: u6
     }
 }
 
-/// Apply queued supersession intents as observable state changes.
+/// Apply queued supersession intents as observable state changes: the older
+/// decision is archived and its semantic state becomes
+/// `Superseded { by }` — terminal, never resurrected by Context GC.
 pub(crate) fn drain_supersessions(state: &mut State, turn: u64) -> Vec<ContextStateTransition> {
     let mut transitions = Vec::new();
     let supersessions = std::mem::take(&mut state.pending_supersessions);
-    for (item_id, reason) in supersessions {
+    for (item_id, by_id, reason) in supersessions {
         let Some(item) = state.items.iter_mut().find(|item| item.id == item_id) else {
             continue;
         };
-        if item.state == ContextState::Dropped {
+        if item.semantic.is_dead() {
             continue;
         }
-        if item.state != ContextState::Archived {
+        if item.attention != AttentionState::Archived {
             transitions.push(ContextStateTransition {
                 item_id: item.id,
                 kind: item.kind,
                 scope: item.scope,
-                from: item.state,
-                to: ContextState::Archived,
+                from: item.attention,
+                to: AttentionState::Archived,
                 turn,
                 reason: reason.clone(),
             });
         }
-        item.state = ContextState::Archived;
+        item.attention = AttentionState::Archived;
         item.relevance = 0.0;
-        item.tags.push(Label::lifecycle(LifecycleLabel::Superseded));
+        item.semantic = SemanticState::Superseded { by: Some(by_id) };
     }
     transitions
 }
 
-/// Apply queued verification intents as observable state changes.
+/// Apply queued verification intents as observable state changes: the error
+/// is archived and its semantic state becomes `VerifiedFixed { by }`.
 pub(crate) fn drain_verifications(state: &mut State, turn: u64) -> Vec<ContextStateTransition> {
     let mut transitions = Vec::new();
     let verifications = std::mem::take(&mut state.pending_verifications);
-    for (item_id, reason) in verifications {
+    for (item_id, by_id, reason) in verifications {
         let Some(item) = state.items.iter_mut().find(|item| item.id == item_id) else {
             continue;
         };
-        if item.state == ContextState::Dropped {
+        if item.semantic.is_dead() {
             continue;
         }
-        if item.state != ContextState::Archived {
+        if item.attention != AttentionState::Archived {
             transitions.push(ContextStateTransition {
                 item_id: item.id,
                 kind: item.kind,
                 scope: item.scope,
-                from: item.state,
-                to: ContextState::Archived,
+                from: item.attention,
+                to: AttentionState::Archived,
                 turn,
                 reason: reason.clone(),
             });
         }
-        item.state = ContextState::Archived;
+        item.attention = AttentionState::Archived;
         item.relevance = 0.0;
-        item.tags
-            .push(Label::lifecycle(LifecycleLabel::VerifiedFixed));
+        item.semantic = SemanticState::VerifiedFixed { by: Some(by_id) };
     }
     transitions
 }

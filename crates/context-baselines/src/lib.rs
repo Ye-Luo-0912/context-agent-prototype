@@ -101,7 +101,7 @@ mod tests {
         // Everything is retained and active: 20 user + 20 assistant + 40 tools.
         assert_eq!(diagnostics.total_items, 80);
         assert_eq!(diagnostics.active_items, 80);
-        assert_eq!(diagnostics.dropped_items, 0);
+        assert_eq!(diagnostics.tombstoned_items, 0);
         assert!(
             tokens_late > tokens_early,
             "append-only history must keep growing: {tokens_early} -> {tokens_late}"
@@ -121,9 +121,9 @@ mod tests {
         // Collapses happened during the turn-level maintenance passes.
         let diagnostics = engine.diagnostics().await.unwrap();
         assert!(
-            diagnostics.dropped_items > 0,
+            diagnostics.tombstoned_items > 0,
             "old history must be collapsed, dropped={}",
-            diagnostics.dropped_items
+            diagnostics.tombstoned_items
         );
         assert!(
             diagnostics.total_items < 80,
@@ -182,8 +182,8 @@ mod tests {
             diagnostics_after.total_items
         );
         assert_eq!(
-            diagnostics_before.dropped_items,
-            diagnostics_after.dropped_items
+            diagnostics_before.tombstoned_items,
+            diagnostics_after.tombstoned_items
         );
     }
 }

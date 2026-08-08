@@ -1,15 +1,16 @@
 use std::collections::HashSet;
 
 use agent_contracts::{
-    ContextEviction, ContextGcReport, ContextItem, ContextItemId, ContextReactivation,
-    ContextResidency, ContextRetention, ContextScope, ContextState, FocusState,
+    AttentionState, ContextEviction, ContextGcReport, ContextItem, ContextItemId,
+    ContextReactivation, ContextResidency, ContextRetention, ContextScope, FocusState, ScopeId,
+    ScopeKind, ScopeState,
 };
 
 use crate::diagnostics;
 use crate::engine::{SimpleContextConfig, State};
-use crate::gc::reachability::is_excluded;
 use crate::index::entity::entities_match;
 use crate::policy::score_item_with_breakdown;
+use crate::store;
 
 /// Cap on transitive dependency expansion during the mark phase: the root
 /// set stays a bounded, cheap reachability view.
@@ -17,17 +18,21 @@ const MAX_MARKED_DEPENDENCIES: usize = 8;
 
 /// One full GC pass: mark roots, sweep unmarked items into the bounded
 /// reversible eviction buffer, reactivate items that became relevant again,
-/// purge only when the buffer overflows.
+/// and — when the buffer overflows — externalize to the context store
+/// instead of purging.
 ///
-/// The three GC dimensions are separated:
-/// - `residency` (Resident / Evicted) says where the item physically lives;
+/// The GC dimensions are separated:
+/// - `residency` (Resident / Warm / Cold / External) says where the item
+///   physically lives;
 /// - `gc_generation` counts how many passes an item survived without being
 ///   a root (the generational heuristic);
-/// - the semantic `ContextState` (Active/Cooling/Archived/Dropped) is owned
-///   by the per-event residency machine, not by GC.
+/// - the attention `ContextState` (Active/Cooling/Archived) is owned by the
+///   per-event residency machine, not by GC;
+/// - semantic death (`SemanticState`) is terminal: dead items are evicted
+///   and never reactivated — only Storage GC may delete them.
 ///
-/// Every eviction and reactivation carries an explicit reason, so the report
-/// can explain *why* an item is Resident, Evicted or Reactivated.
+/// Every eviction, reactivation and externalization carries an explicit
+/// reason, so the report can explain *why* an item moved where it did.
 pub(crate) fn run_full_gc(
     state: &mut State,
     config: &SimpleContextConfig,
@@ -44,21 +49,34 @@ pub(crate) fn run_full_gc(
     }
 
     // ----- Mark phase: the root set --------------------------------
-    // Roots are the current attention: pins, members of the active
-    // task/focus scopes, durable session memory, items whose entities are
-    // hot, plus a bounded slice of their dependencies.
+    // Roots are the current attention: pins, members of the active focus
+    // scope (including open tool frames under it), durable task
+    // constraints, durable session memory, items whose entities are hot,
+    // plus a bounded slice of their dependencies. The task id alone is a
+    // boundary, not a root — a long task's cooled history is not protected
+    // just because it shares the task id.
     let focus = state.focus.clone();
     let hot_entities = state.hot_entities.clone();
     let marked = mark_roots(state, config, focus.as_ref(), &hot_entities);
 
     // ----- Sweep phase: unmarked items ------------------------------
-    // Roots protect *live* items. A semantically Dropped item is dead no
-    // matter how reachable it looks — the residency machine decided it is
-    // gone, so GC physically removes it (into the reversible buffer) instead
-    // of letting it linger in the heap and checkpoints forever.
+    // Roots protect *live* items. A semantically dead item is dead no
+    // matter how reachable it looks — the residency machine decided its
+    // lifecycle ended, so GC physically removes it (into the reversible
+    // buffer, then the store) instead of letting it linger in the heap and
+    // checkpoints forever.
     let mut survivors: Vec<ContextItem> = Vec::with_capacity(state.items.len());
     for item in state.items.drain(..) {
-        let alive_root = item.state != ContextState::Dropped && marked.contains(&item.id);
+        // A consumed ephemeral observation left attention (Archived) even
+        // though it is still a member of the focus scope: root protection
+        // is for the working set, not for spent turn observations — they
+        // leave the heap and stay recallable from the buffer.
+        let consumed_ephemeral = item.attention == AttentionState::Archived
+            && item.retention == ContextRetention::Ephemeral
+            && item.scope == ContextScope::Turn;
+        let alive_root = item.semantic.is_live()
+            && !consumed_ephemeral
+            && marked.contains(&item.id);
         if alive_root {
             // A root is currently relevant: "young" again.
             let mut root = item;
@@ -80,7 +98,7 @@ pub(crate) fn run_full_gc(
             report.evicted += 1;
             state.gc_evicted_total += 1;
             let mut evicted = item;
-            evicted.residency = ContextResidency::Evicted;
+            evicted.residency = ContextResidency::Warm;
             evicted.evicted_at_tick = Some(now_tick);
             state.eviction_buffer.push(evicted);
         } else {
@@ -93,14 +111,38 @@ pub(crate) fn run_full_gc(
     }
     state.items = survivors;
 
-    // ----- Reactivate phase: evicted items that became relevant -----
+    // ----- Reactivate phase: items that became relevant again ------
+    // Warm buffer items and Cold store entries both get a second chance:
+    // hot entities or a high score (buffer) / hot entities (store recall).
     reactivate(state, config, now_tick, &mut report);
 
-    // ----- Purge: the buffer is bounded -----------------------------
+    // ----- Externalize phase: the buffer is bounded -----------------
+    // Context GC never purges: overflow writes the item to the context
+    // store and keeps only a lightweight entry (Cold), which later ages to
+    // External. Only Storage GC may delete store files.
     while state.eviction_buffer.len() > config.gc_buffer_capacity {
-        state.eviction_buffer.remove(0);
-        report.purged += 1;
+        let item = state.eviction_buffer.remove(0);
+        match store::externalize(&store::store_dir(config), &item) {
+            Ok(context_ref) => {
+                state
+                    .external
+                    .push(store::to_external_entry(&item, context_ref, now_tick));
+                report.externalized += 1;
+                state.gc_externalized_total += 1;
+            }
+            Err(_) => {
+                // Store unavailable: keep the item in the buffer and retry
+                // next pass (the default store directory is writable, so
+                // this is a degraded-mode fallback, not the norm).
+                state.eviction_buffer.insert(0, item);
+                break;
+            }
+        }
     }
+
+    // Cold -> External aging: entries untouched for the configured number
+    // of passes become references only.
+    report.aged_external = store::age_external_entries(state, config, now_tick);
 
     report.marked_roots = marked.len();
     report.resident = state.items.len();
@@ -108,8 +150,9 @@ pub(crate) fn run_full_gc(
     report
 }
 
-/// Mark the root set: pins, active-scope members, durable session memory,
-/// hot-entity matches, and a bounded transitive slice of their dependencies.
+/// Mark the root set: pins, members of the active focus scope tree, durable
+/// task constraints, durable session memory, hot-entity matches, and a
+/// bounded transitive slice of their dependencies.
 fn mark_roots(
     state: &State,
     config: &SimpleContextConfig,
@@ -117,16 +160,50 @@ fn mark_roots(
     hot_entities: &[String],
 ) -> Vec<ContextItemId> {
     let active_task = focus.map(|f| f.task_id);
+    // The active focus scope of the current task: the attention container.
+    // Members of the whole open subtree under it (open tool frames) are
+    // roots; a closed frame drops out of the chain and loses protection.
+    let active_focus_id = focus.as_ref().and_then(|f| {
+        state
+            .scopes
+            .iter()
+            .find(|scope| {
+                scope.kind == ScopeKind::Focus
+                    && scope.task_id == Some(f.task_id)
+                    && scope.state == ScopeState::Active
+            })
+            .map(|scope| scope.id)
+    });
     let mut marked: Vec<ContextItemId> = Vec::new();
 
     for item in &state.items {
         let is_pin =
             item.retention == ContextRetention::Pinned || item.scope == ContextScope::Pinned;
-        let in_active_scope = active_task.is_some_and(|task| item.task_id == Some(task));
+        let in_active_focus_scope =
+            active_focus_id.is_some_and(|focus_id| in_scope_chain(state, item, focus_id));
+        // Durable task constraints (decisions, constraints of the current
+        // task) are roots; the task itself is a boundary, not a root.
+        let durable_task_constraint = active_task.is_some_and(|task| {
+            item.task_id == Some(task)
+                && item.retention == ContextRetention::Durable
+                && item.scope == ContextScope::Task
+        });
+        // Pre-scope legacy items: only *active* working items of the current
+        // task are protected (narrowed, so a long task's cooled history is
+        // not rooted forever).
+        let legacy_active_task_member = item.scope_id.is_none()
+            && active_task.is_some_and(|task| item.task_id == Some(task))
+            && item.attention == AttentionState::Active;
         let durable_session_memory =
             item.retention == ContextRetention::Durable && item.scope == ContextScope::Session;
         let hot = !hot_entities.is_empty() && entities_match(&item.entities, hot_entities);
-        if is_pin || in_active_scope || durable_session_memory || hot {
+        if is_pin
+            || in_active_focus_scope
+            || durable_task_constraint
+            || legacy_active_task_member
+            || durable_session_memory
+            || hot
+        {
             marked.push(item.id);
         }
     }
@@ -159,22 +236,54 @@ fn mark_roots(
     marked
 }
 
+/// Whether the item's authoritative scope membership chain (up to the root)
+/// contains `target_id` without crossing a closed scope. Open tool frames
+/// under the active focus are included; closed frames drop out.
+fn in_scope_chain(state: &State, item: &ContextItem, target_id: ScopeId) -> bool {
+    let mut current = item.scope_id;
+    while let Some(sid) = current {
+        if sid == target_id {
+            return true;
+        }
+        let Some(scope) = state.scopes.iter().find(|scope| scope.id == sid) else {
+            return false;
+        };
+        if scope.state == ScopeState::Closed {
+            return false;
+        }
+        current = scope.parent;
+    }
+    false
+}
+
 /// Whether an unmarked item is an eviction candidate this pass. GC only
-/// evicts what the semantic machine already demoted (or dropped), so GC
-/// never fights the policy: active items stay until residency cools them.
+/// evicts what the semantic machine already demoted (or killed), so GC
+/// never fights the policy: active items stay until attention cools them,
+/// and semantically dead items leave the heap unconditionally.
 fn eviction_candidate(
     item: &ContextItem,
     config: &SimpleContextConfig,
     now_tick: u64,
     generation: u32,
 ) -> bool {
-    match item.state {
-        // The semantic machine already dropped it: leave the heap now
-        // instead of lingering in checkpoints forever.
-        ContextState::Dropped => true,
+    // Semantic death is terminal: leave the heap now (into the reversible
+    // buffer, then the store) instead of lingering in checkpoints forever.
+    if item.semantic.is_dead() {
+        return true;
+    }
+    // A consumed ephemeral observation leaves attention immediately; it
+    // stays semantically Live in the buffer so a hot-entity match can
+    // recall it.
+    if item.attention == AttentionState::Archived
+        && item.retention == ContextRetention::Ephemeral
+        && item.scope == ContextScope::Turn
+    {
+        return true;
+    }
+    match item.attention {
         // Never evict what the policy keeps active.
-        ContextState::Active => false,
-        ContextState::Cooling | ContextState::Archived => {
+        AttentionState::Active => false,
+        AttentionState::Cooling | AttentionState::Archived => {
             let age = now_tick.saturating_sub(item.created_tick);
             // Long past every TTL, or old enough in generations.
             if item.retention != ContextRetention::Durable && age > config.turn_ttl_ticks * 4 {
@@ -191,11 +300,22 @@ fn eviction_reason(
     now_tick: u64,
     generation: u32,
 ) -> String {
-    match item.state {
-        ContextState::Dropped => {
-            format!("semantically dropped; evicted to reversible buffer (generation {generation})")
-        }
-        ContextState::Cooling | ContextState::Archived => {
+    if item.semantic.is_dead() {
+        return format!(
+            "semantically dead ({:?}); evicted to reversible buffer (generation {generation})",
+            item.semantic
+        );
+    }
+    if item.attention == AttentionState::Archived
+        && item.retention == ContextRetention::Ephemeral
+        && item.scope == ContextScope::Turn
+    {
+        return format!(
+            "ephemeral observation consumed; evicted to reversible buffer (generation {generation})"
+        );
+    }
+    match item.attention {
+        AttentionState::Cooling | AttentionState::Archived => {
             let age = now_tick.saturating_sub(item.created_tick);
             if item.retention != ContextRetention::Durable && age > config.turn_ttl_ticks * 4 {
                 format!(
@@ -209,7 +329,7 @@ fn eviction_reason(
                 )
             }
         }
-        ContextState::Active => {
+        AttentionState::Active => {
             format!("unreachable from roots despite active state (generation {generation})")
         }
     }
@@ -219,9 +339,11 @@ fn eviction_reason(
 /// entities in the working set, or a score that clears the active threshold.
 /// Newest evictions first, bounded per pass. Items evicted by the current
 /// pass are skipped so eviction stays effective, and semantically dead
-/// items (superseded decisions, verified-fixed errors) never resurrect —
-/// their labels exclude them from the model, so an Active + Resident
-/// revival would be a state-space inconsistency.
+/// items (superseded decisions, verified-fixed errors, tombstoned) never
+/// resurrect — their labels exclude them from the model, so an Active +
+/// Resident revival would be a state-space inconsistency. Cold store
+/// entries get the same second chance via hot-entity recall (content is
+/// read back from the store).
 fn reactivate(
     state: &mut State,
     config: &SimpleContextConfig,
@@ -230,19 +352,21 @@ fn reactivate(
 ) {
     let focus = state.focus.clone();
     let hot_entities = state.hot_entities.clone();
-    let mut reactivated: Vec<ContextItem> = Vec::new();
     let mut remaining = config.gc_reactivate_per_pass;
-    let mut index = state.eviction_buffer.len();
 
+    // Warm buffer entries (content still in memory).
+    let mut reactivated: Vec<ContextItem> = Vec::new();
+    let mut index = state.eviction_buffer.len();
     while index > 0 && remaining > 0 {
         index -= 1;
         let item = &state.eviction_buffer[index];
         if item.evicted_at_tick == Some(now_tick) {
             continue;
         }
-        if is_excluded(item) {
-            // Semantic death is terminal: a superseded decision or a
-            // verified-fixed error stays evicted however hot it looks.
+        if !item.semantic.is_live() {
+            // Semantic death is terminal: a superseded decision, a
+            // verified-fixed error or a tombstoned item stays evicted
+            // however hot it looks.
             continue;
         }
         let Some(reason) =
@@ -251,7 +375,7 @@ fn reactivate(
             continue;
         };
         let mut item = state.eviction_buffer.remove(index);
-        item.state = ContextState::Active;
+        item.attention = AttentionState::Active;
         item.relevance = item.relevance.max(0.5);
         item.residency = ContextResidency::Resident;
         item.gc_generation = 0;
@@ -269,8 +393,57 @@ fn reactivate(
         reactivated.push(item);
         remaining -= 1;
     }
-
     state.items.extend(reactivated);
+
+    // Cold store entries: content lives in the store; only hot-entity
+    // matches earn a recall (no content, so no score-based fallback).
+    if remaining > 0 && !hot_entities.is_empty() {
+        let dir = store::store_dir(config);
+        let mut recalled: Vec<ContextItem> = Vec::new();
+        let mut kept: Vec<agent_contracts::ExternalizedContext> = Vec::new();
+        for entry in state.external.drain(..) {
+            if remaining == 0 {
+                kept.push(entry);
+                continue;
+            }
+            let recallable = entry.semantic.is_live() && store::recallable(&entry);
+            let recalled_item = if recallable {
+                store::read_item(&dir, entry.item_id).filter(|item| {
+                    entities_match(&item.entities, &hot_entities)
+                })
+            } else {
+                None
+            };
+            if let Some(item) = recalled_item {
+                let reason =
+                    "entities are hot again in the working set (recalled from the context store)"
+                        .to_string();
+                report.reactivations.push(ContextReactivation {
+                    item_id: item.id,
+                    kind: item.kind,
+                    scope: item.scope,
+                    reactivated_at_tick: now_tick,
+                    reason,
+                });
+                report.reactivated += 1;
+                state.gc_reactivated_total += 1;
+                recalled.push(item);
+                remaining -= 1;
+                continue;
+            }
+            kept.push(entry);
+        }
+        state.external = kept;
+        for mut item in recalled {
+            item.attention = AttentionState::Active;
+            item.relevance = item.relevance.max(0.5);
+            item.residency = ContextResidency::Resident;
+            item.gc_generation = 0;
+            item.evicted_at_tick = None;
+            item.last_access_tick = now_tick;
+            state.items.push(item);
+        }
+    }
 }
 
 /// Why an evicted item earns a second chance. `None` keeps it in the buffer.
@@ -315,7 +488,7 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn gc_evicts_dropped_items_from_the_heap_with_a_reason() {
+    async fn gc_evicts_consumed_ephemeral_observations_with_a_reason() {
         let engine = SimpleContextEngine::new(SimpleContextConfig::default());
         engine
             .ingest(ContextIngress::UserMessage {
@@ -323,7 +496,8 @@ mod tests {
             })
             .await
             .unwrap();
-        // A successful observation is ephemeral and drops after the turn.
+        // A successful observation is ephemeral and leaves attention after
+        // the turn (consumed, not tombstoned — it stays recallable).
         engine
             .ingest(ContextIngress::ToolObservation {
                 output: ToolOutput {
@@ -345,23 +519,23 @@ mod tests {
             .unwrap();
 
         let before = engine.diagnostics().await.unwrap();
-        assert!(before.dropped_items >= 1, "ephemeral observation drops");
+        assert!(before.archived_items >= 1, "ephemeral observation consumed");
 
         let report = engine.gc().await.unwrap();
-        assert!(report.evicted >= 1, "gc must evict the dropped item");
+        assert!(report.evicted >= 1, "gc must evict the consumed observation");
         assert!(
             report
                 .evictions
                 .iter()
-                .any(|e| e.reason.contains("semantically dropped")),
+                .any(|e| e.reason.contains("observation consumed")),
             "eviction must be explainable, got: {:?}",
             report.evictions
         );
 
         let after = engine.diagnostics().await.unwrap();
         assert_eq!(
-            after.evicted_items, before.dropped_items,
-            "dropped items leave the heap for the reversible buffer"
+            after.warm_items, 1,
+            "the consumed observation leaves the heap for the reversible buffer"
         );
         assert_eq!(after.total_items, 1, "only the user message stays resident");
     }
@@ -376,16 +550,17 @@ mod tests {
             .await
             .unwrap();
 
-        // Archive a cold item from another task: unmarked, past the
-        // generation cap, entities not hot.
+        // Archive a cold item from another task, outside the active focus
+        // scope tree: unmarked, past the generation cap, entities not hot.
         {
             let mut state = engine.state.lock().await;
             for item in &mut state.items {
                 if item.kind == ContextKind::UserMessage {
                     item.task_id = Some(TaskId::new());
+                    item.scope_id = None; // no focus-scope membership
                     item.content = "fix CacheStore.rs".into();
                     item.entities = extract_entities(&item.content);
-                    item.state = ContextState::Archived;
+                    item.attention = AttentionState::Archived;
                     item.relevance = 0.0;
                     item.gc_generation = 99; // already past the cap
                 }
@@ -403,7 +578,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_reactivates_evicted_items_whose_entities_become_hot_again() {
+    async fn gc_reactivates_warm_items_whose_entities_become_hot_again() {
         let engine = SimpleContextEngine::new(SimpleContextConfig::default());
         // Round 1: the agent works on AuthService.rs; the successful
         // observation drops after the turn and gc evicts it.
@@ -462,15 +637,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_buffer_is_bounded_and_purges_oldest() {
+    async fn gc_buffer_overflow_externalizes_instead_of_purging() {
+        let store = tempfile::tempdir().unwrap();
         let config = SimpleContextConfig {
             gc_buffer_capacity: 2,
+            context_store_dir: Some(store.path().to_path_buf()),
             ..SimpleContextConfig::default()
         };
         let engine = SimpleContextEngine::new(config);
 
-        // Three turns on distinct files: each successful observation drops,
-        // is evicted, and stays evicted (its entities are not hot again).
+        // Three turns on distinct files: each successful observation is
+        // consumed, evicted, and stays evicted (its entities are not hot
+        // again).
         let mut last = None;
         for i in 0..3 {
             engine
@@ -502,9 +680,16 @@ mod tests {
         }
 
         let last = last.expect("three gc passes ran");
-        assert_eq!(last.purged, 1, "overflow purges the oldest eviction");
+        assert_eq!(
+            last.externalized, 1,
+            "overflow externalizes the oldest eviction instead of purging"
+        );
         let diagnostics = engine.diagnostics().await.unwrap();
-        assert_eq!(diagnostics.evicted_items, 2, "buffer stays bounded");
+        assert_eq!(diagnostics.warm_items, 2, "buffer stays bounded");
+        assert_eq!(diagnostics.cold_items, 1, "the externalized item is Cold");
+        // The store keeps the full content: nothing was deleted.
+        let files = std::fs::read_dir(store.path()).unwrap().count();
+        assert_eq!(files, 1, "the externalized item's content lives on disk");
     }
 
     #[tokio::test]
@@ -537,13 +722,15 @@ mod tests {
             let mut state = engine.state.lock().await;
             for item in &mut state.items {
                 if item.kind == ContextKind::Error {
-                    // Cold and unmarked: another task, entities outside the
-                    // hot set (the error itself contributed CacheStore.rs to
-                    // the hot set at ingest, so the content must change).
+                    // Cold and unmarked: another task, outside the active
+                    // focus scope tree, entities outside the hot set (the
+                    // error itself contributed CacheStore.rs to the hot set
+                    // at ingest, so the content must change).
                     item.task_id = Some(TaskId::new());
+                    item.scope_id = None;
                     item.content = "error in TempStore.rs:7".into();
                     item.entities = extract_entities(&item.content);
-                    item.state = ContextState::Cooling;
+                    item.attention = AttentionState::Cooling;
                 }
             }
         }
@@ -611,13 +798,15 @@ mod tests {
             let mut state = engine.state.lock().await;
             for item in &mut state.items {
                 if item.id == a_id {
-                    // Cold and unmarked: another task, entities outside the
-                    // hot set, past the generation cap — only the dependency
-                    // edge from the root can protect it now.
+                    // Cold and unmarked: another task, outside the focus
+                    // scope tree, entities outside the hot set, past the
+                    // generation cap — only the dependency edge from the
+                    // root can protect it now.
                     item.task_id = Some(TaskId::new());
+                    item.scope_id = None;
                     item.content = "use OldStore.rs instead".into();
                     item.entities = extract_entities(&item.content);
-                    item.state = ContextState::Archived;
+                    item.attention = AttentionState::Archived;
                     item.relevance = 0.0;
                     item.gc_generation = 99;
                 }
@@ -686,14 +875,18 @@ mod tests {
             for item in &mut state.items {
                 if item.id == old_id {
                     assert!(
-                        item.tags
-                            .iter()
-                            .any(|tag| tag.is_lifecycle(LifecycleLabel::Superseded)),
-                        "the older decision must be superseded"
+                        matches!(
+                            item.semantic,
+                            agent_contracts::SemanticState::Superseded { .. }
+                        ),
+                        "the older decision must be superseded, got {:?}",
+                        item.semantic
                     );
-                    // Evictable: past the generation cap, another task, and
-                    // its entities leave the hot set so nothing roots it.
+                    // Evictable: past the generation cap, another task,
+                    // outside the focus scope tree, and its entities leave
+                    // the hot set so nothing roots it.
                     item.task_id = Some(TaskId::new());
+                    item.scope_id = None;
                     item.content = "use OldStore.rs instead".into();
                     item.entities = extract_entities(&item.content);
                     item.gc_generation = 99;
@@ -730,7 +923,7 @@ mod tests {
         );
         let diagnostics = engine.diagnostics().await.unwrap();
         assert_eq!(
-            diagnostics.evicted_items, 1,
+            diagnostics.warm_items, 1,
             "the superseded item stays in the buffer: {diagnostics:?}"
         );
     }

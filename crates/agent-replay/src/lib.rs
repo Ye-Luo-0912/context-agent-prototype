@@ -22,7 +22,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use agent_contracts::{
     ContextDiagnostics, ContextEngine, ContextHints, ContextIngress, ContextItemId,
-    ContextItemSummary, ContextKind, ContextQuery, ContextState, FocusState, RuntimeEvent,
+    ContextItemSummary, ContextKind, ContextQuery, AttentionState, FocusState, RuntimeEvent,
     RuntimeEventEnvelope, tokens,
 };
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
@@ -54,8 +54,8 @@ impl Default for ReplayConfig {
 #[derive(Debug, Clone)]
 pub struct ReplayedTransition {
     pub turn: u64,
-    pub from: ContextState,
-    pub to: ContextState,
+    pub from: AttentionState,
+    pub to: AttentionState,
     pub reason: String,
 }
 
@@ -64,7 +64,7 @@ pub struct ReplayedItem {
     pub id: ContextItemId,
     pub kind: ContextKind,
     pub scope: agent_contracts::ContextScope,
-    pub state: ContextState,
+    pub attention: AttentionState,
     pub source: Option<String>,
     pub created_turn: u64,
     pub access_count: u32,
@@ -289,7 +289,7 @@ fn build_replayed_items(
             id: summary.id,
             kind: summary.kind,
             scope: summary.scope,
-            state: summary.state,
+            attention: summary.attention,
             source: summary.source,
             created_turn: summary.created_turn,
             access_count: summary.access_count,
@@ -314,10 +314,10 @@ pub fn render_report(outcome: &ReplayOutcome) -> String {
         diagnostics.active_items,
         diagnostics.cooling_items,
         diagnostics.archived_items,
-        diagnostics.dropped_items,
+        diagnostics.tombstoned_items,
         diagnostics.approx_active_tokens,
         diagnostics.resident_items,
-        diagnostics.evicted_items,
+        diagnostics.warm_items,
         outcome.gc_evictions,
         outcome.gc_reactivations,
     ));
@@ -328,7 +328,7 @@ pub fn render_report(outcome: &ReplayOutcome) -> String {
             short_id(&item.id),
             debug_kind(item.kind),
             item.scope,
-            item.state,
+            item.attention,
             item.created_turn,
             item.source.as_deref().unwrap_or("-"),
         ));
@@ -354,7 +354,7 @@ pub fn render_report(outcome: &ReplayOutcome) -> String {
                 transition.turn, transition.from, transition.to, transition.reason
             ));
         }
-        out.push_str(&format!("  final state: {:?}\n", item.state));
+        out.push_str(&format!("  final state: {:?}\n", item.attention));
     }
     out
 }
@@ -667,7 +667,7 @@ mod tests {
             .iter()
             .find(|item| item.kind == ContextKind::Constraint)
             .expect("pinned constraint should exist");
-        assert_eq!(pinned.state, ContextState::Active, "pinned survives");
+        assert_eq!(pinned.attention, AttentionState::Active, "pinned survives");
 
         let task_one = outcome
             .items
@@ -675,14 +675,14 @@ mod tests {
             .find(|item| item.kind == ContextKind::UserMessage && item.created_turn == 1)
             .expect("task-one user message should exist");
         assert_eq!(
-            task_one.state,
-            ContextState::Archived,
+            task_one.attention,
+            AttentionState::Archived,
             "completed task details should be archived"
         );
         let archive = task_one
             .transitions
             .iter()
-            .find(|t| t.to == ContextState::Archived)
+            .find(|t| t.to == AttentionState::Archived)
             .expect("archival must be recorded as a transition");
         assert!(
             archive.reason.contains("task completed"),
@@ -853,8 +853,8 @@ mod tests {
             .expect("failed tool observation should be an Error item");
         assert_eq!(tool_item.created_turn, 1);
         assert_eq!(
-            tool_item.state,
-            ContextState::Archived,
+            tool_item.attention,
+            AttentionState::Archived,
             "verified error should be archived, not dropped"
         );
         let verify = tool_item
@@ -862,22 +862,23 @@ mod tests {
             .iter()
             .find(|t| t.reason.contains("verified fixed"))
             .expect("verification must be recorded as a transition");
-        assert!(verify.to == ContextState::Archived);
+        assert!(verify.to == AttentionState::Archived);
         assert!(
             tool_item.consumed_turns.contains(&1),
             "observation must be consumed before being archived"
         );
 
-        // The successful observation is ephemeral: dropped after the model turn.
+        // The successful observation is ephemeral: consumed after the model
+        // turn — leaves attention (Archived), stays semantically live.
         let ok_item = outcome
             .items
             .iter()
             .find(|item| item.kind == ContextKind::ToolObservation)
             .expect("successful observation should exist");
         assert_eq!(
-            ok_item.state,
-            ContextState::Dropped,
-            "successful observation should stay ephemeral"
+            ok_item.attention,
+            AttentionState::Archived,
+            "successful observation leaves attention after consumption"
         );
         // Dependency graph: the successful observation shares the
         // AuthService.rs entity with the earlier error, so it must depend on it.

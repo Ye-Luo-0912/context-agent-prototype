@@ -581,8 +581,8 @@ mod tests {
                 "{label}: pinned constraint must exist as an item"
             );
             assert_eq!(
-                pinned.unwrap().state,
-                agent_contracts::ContextState::Active,
+                pinned.unwrap().attention,
+                agent_contracts::AttentionState::Active,
                 "{label}: pinned constraint must stay active"
             );
         }

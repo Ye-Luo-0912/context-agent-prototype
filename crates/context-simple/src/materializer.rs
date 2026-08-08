@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 
 use agent_contracts::{
-    ContextItem, ContextItemId, ContextQuery, ContextRetention, ContextSelection, ContextState,
+    AttentionState, ContextItem, ContextItemId, ContextQuery, ContextRetention, ContextSelection,
     MaterializedContext, MaterializedItem, ScoreBreakdown,
 };
 
@@ -36,7 +36,7 @@ pub(crate) fn materialize(
         .iter()
         .enumerate()
         .filter(|(_, item)| {
-            item.state != ContextState::Dropped
+            item.semantic.is_live()
                 && !(item.kind == agent_contracts::ContextKind::UserMessage
                     && item.content == query.current_input)
                 && !is_excluded(item)
@@ -79,7 +79,7 @@ pub(crate) fn materialize(
         {
             break;
         }
-        if item.state == ContextState::Archived && breakdown.total < config.active_threshold {
+        if item.attention == AttentionState::Archived && breakdown.total < config.active_threshold {
             continue;
         }
         if *tokens > remaining {
@@ -107,7 +107,7 @@ pub(crate) fn materialize(
         {
             break;
         }
-        if item.state == ContextState::Archived && breakdown.total < config.active_threshold {
+        if item.attention == AttentionState::Archived && breakdown.total < config.active_threshold {
             continue;
         }
         if tokens > remaining {
@@ -147,12 +147,13 @@ pub(crate) fn materialize(
                     continue;
                 };
                 let dep = &state.items[dep_index];
-                if dep.state == ContextState::Dropped || is_excluded(dep) {
+                if dep.semantic.is_dead() || is_excluded(dep) {
                     continue;
                 }
                 let breakdown =
                     score_item_with_breakdown(dep, focus.as_ref(), &state.hot_entities, now_tick);
-                if dep.state == ContextState::Archived && breakdown.total < config.active_threshold
+                if dep.attention == AttentionState::Archived
+                    && breakdown.total < config.active_threshold
                 {
                     continue;
                 }
@@ -216,7 +217,8 @@ pub(crate) fn materialize(
                 item_id: item.id,
                 kind: item.kind,
                 scope: item.scope,
-                state: item.state,
+                attention: item.attention,
+                semantic: item.semantic,
                 content: item.content.clone(),
                 source: item.source.clone(),
             }
@@ -238,6 +240,10 @@ pub(crate) fn materialize(
     MaterializedContext {
         focus,
         items,
+        // The lightweight context map: externalized items are visible only
+        // as references, never as content — the model sees `context://...`
+        // entries and can deliberately pull them with a future context tool.
+        external: state.external.clone(),
         selected: selections,
         approx_tokens: approx_tokens_total,
         diagnostics: diagnostics::compute(state),

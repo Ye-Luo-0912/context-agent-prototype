@@ -34,24 +34,94 @@ pub enum ContextRetention {
     Pinned,
 }
 
+/// The attention dimension of an item: how present it is in the current
+/// working set. Owned by the per-event residency machine (`maintain`), not
+/// by GC. Semantic death lives in `SemanticState`, physical placement in
+/// `ContextResidency` — attention alone never means an item is gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ContextState {
+pub enum AttentionState {
     Active,
     Cooling,
     Archived,
-    Dropped,
+}
+
+/// The semantic dimension of an item: is it still *true* in the run's
+/// decision/error history, or has a newer item replaced it? `Live` items can
+/// be recalled when attention or GC brings them back; every non-Live state
+/// is terminal — the materializer excludes them and Context GC never
+/// resurrects them. `Tombstoned` replaces the old `Dropped` overload (which
+/// mixed ephemeral attention loss with semantic death).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SemanticState {
+    #[default]
+    Live,
+    /// A newer decision superseded this one.
+    Superseded {
+        /// The decision that replaced it; `None` only for items migrated
+        /// from pre-semantic checkpoints.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<ContextItemId>,
+    },
+    /// A successful tool result verified the error fixed.
+    VerifiedFixed {
+        /// The observation that verified it; `None` for migrated items.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<ContextItemId>,
+    },
+    /// The item's information lifecycle ended (TTL/staleness). Permanently
+    /// dead from the runtime's perspective; only Storage GC may delete it.
+    Tombstoned,
+}
+
+impl SemanticState {
+    /// Live items can be recalled by attention or GC.
+    pub fn is_live(self) -> bool {
+        matches!(self, SemanticState::Live)
+    }
+
+    /// Superseded, verified-fixed and tombstoned items are semantically dead:
+    /// excluded from the model and never resurrected by Context GC.
+    pub fn is_dead(self) -> bool {
+        !self.is_live()
+    }
 }
 
 /// Where an item physically lives. `Resident` means the item sits in the
-/// model-visible heap; `Evicted` means it was moved to the bounded,
-/// reversible eviction buffer by GC and can be reactivated when it becomes
-/// relevant again. This is the GC dimension, orthogonal to the semantic
-/// `ContextState` (Active/Cooling/Archived/Dropped).
+/// model-visible heap; `Warm` means it was moved to the bounded, reversible
+/// eviction buffer by GC and can be reactivated when it becomes relevant
+/// again; `Cold` means the buffer overflowed and the item's content now
+/// lives in the external context store (a lightweight entry with a
+/// `ContextRef` stays visible); `External` means the entry has aged out of
+/// the working set entirely and only the store retains it. This is the GC
+/// dimension, orthogonal to `AttentionState` and `SemanticState`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ContextResidency {
     #[default]
     Resident,
-    Evicted,
+    Warm,
+    Cold,
+    External,
+}
+
+/// Named generational stage of an item, derived from how many full GC
+/// passes it survived without being a root. Nursery items are young, Stable
+/// items have outlived the generational ladder. The underlying pass count
+/// stays observable as `ContextItem::gc_generation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Generation {
+    Nursery,
+    Working,
+    Stable,
+}
+
+impl Generation {
+    pub fn of(passes: u32) -> Self {
+        match passes {
+            0..=1 => Generation::Nursery,
+            2 => Generation::Working,
+            _ => Generation::Stable,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +138,14 @@ pub struct ContextItem {
     pub kind: ContextKind,
     pub scope: ContextScope,
     pub retention: ContextRetention,
-    pub state: ContextState,
+    /// Attention state (Active/Cooling/Archived), owned by the residency
+    /// machine. `alias = "state"` keeps pre-split checkpoints loadable.
+    #[serde(alias = "state")]
+    pub attention: AttentionState,
+    /// Semantic state (Live/Superseded/VerifiedFixed/Tombstoned): terminal
+    /// death is expressed here, never in attention.
+    #[serde(default)]
+    pub semantic: SemanticState,
     pub importance: f32,
     pub relevance: f32,
     pub created_tick: u64,
@@ -262,8 +339,8 @@ pub struct ContextStateTransition {
     pub item_id: ContextItemId,
     pub kind: ContextKind,
     pub scope: ContextScope,
-    pub from: ContextState,
-    pub to: ContextState,
+    pub from: AttentionState,
+    pub to: AttentionState,
     pub turn: u64,
     pub reason: String,
 }
@@ -274,7 +351,10 @@ pub struct ContextDiagnostics {
     pub active_items: usize,
     pub cooling_items: usize,
     pub archived_items: usize,
-    pub dropped_items: usize,
+    /// Items whose semantic lifecycle ended (TTL/staleness): permanently
+    /// dead, never resurrected by Context GC.
+    #[serde(default)]
+    pub tombstoned_items: usize,
     pub approx_active_tokens: usize,
     pub focus_generation: u64,
     #[serde(default)]
@@ -294,13 +374,26 @@ pub struct ContextDiagnostics {
     pub resident_items: usize,
     /// GC dimension: items sitting in the reversible eviction buffer.
     #[serde(default)]
-    pub evicted_items: usize,
-    /// Cumulative evictions / reactivations since the engine started, so a
-    /// run's GC behavior is explainable without replaying every report.
+    pub warm_items: usize,
+    /// GC dimension: items externalized to the context store, still tracked
+    /// in memory with a lightweight entry (`Cold`, content in the store).
+    #[serde(default)]
+    pub cold_items: usize,
+    /// GC dimension: externalized entries that aged out of the working set;
+    /// only the store retains them (`External`).
+    #[serde(default)]
+    pub external_items: usize,
+    /// Cumulative evictions / reactivations / externalizations since the
+    /// engine started, so a run's GC behavior is explainable without
+    /// replaying every report.
     #[serde(default)]
     pub gc_evicted_total: u64,
     #[serde(default)]
     pub gc_reactivated_total: u64,
+    #[serde(default)]
+    pub gc_externalized_total: u64,
+    #[serde(default)]
+    pub gc_storage_deleted_total: u64,
 }
 
 /// One structured entry of the materialized working set. The engine returns
@@ -311,19 +404,27 @@ pub struct MaterializedItem {
     pub item_id: ContextItemId,
     pub kind: ContextKind,
     pub scope: ContextScope,
-    pub state: ContextState,
+    pub attention: AttentionState,
+    #[serde(default)]
+    pub semantic: SemanticState,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
 
 /// The structured result of one `ContextEngine::materialize` call: the
-/// focus, the selected working set and its selections/diagnostics. Prompt
-/// rendering is deliberately absent — that is the prompt assembler's job.
+/// focus, the selected working set, the lightweight external context map
+/// (externalized items visible only by `ContextRef`) and the
+/// selections/diagnostics. Prompt rendering is deliberately absent — that
+/// is the prompt assembler's job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaterializedContext {
     pub focus: Option<FocusState>,
     pub items: Vec<MaterializedItem>,
+    /// The lightweight context map: externalized items the model can only
+    /// see as references (`context://...`), never as full content.
+    #[serde(default)]
+    pub external: ContextMap,
     pub selected: Vec<ContextSelection>,
     pub approx_tokens: usize,
     pub diagnostics: ContextDiagnostics,
@@ -334,7 +435,9 @@ pub struct ContextMaintenanceReport {
     pub promoted: usize,
     pub cooled: usize,
     pub archived: usize,
-    pub dropped: usize,
+    /// Items whose semantic lifecycle ended this pass (TTL/staleness).
+    #[serde(default)]
+    pub tombstoned: usize,
     #[serde(default)]
     pub turn: u64,
     #[serde(default)]
@@ -372,7 +475,9 @@ pub struct ContextReactivation {
 
 /// The result of one full `ContextEngine::gc` pass: mark roots, sweep
 /// unmarked items into the reversible eviction buffer, reactivate items
-/// that became relevant again, purge only when the buffer overflows.
+/// that became relevant again. Context GC never deletes information: buffer
+/// overflow *externalizes* items to the context store (`Cold`), and only
+/// the separate, conservative Storage GC may delete store files.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextGcReport {
     /// Items marked as roots this pass (pins, active scopes, hot entities,
@@ -384,14 +489,71 @@ pub struct ContextGcReport {
     pub evicted: usize,
     /// Items moved back from the buffer into the heap this pass.
     pub reactivated: usize,
-    /// Items permanently removed because the eviction buffer overflowed.
-    /// The only irreversible GC action, and it is bounded and counted.
-    pub purged: usize,
+    /// Items moved from the buffer to the external context store this pass
+    /// (buffer overflow). Their content is not deleted — it lives on under
+    /// a `ContextRef`, visible through the lightweight context map.
+    #[serde(default)]
+    pub externalized: usize,
+    /// Warm -> Cold aging in the other direction: externalized entries that
+    /// became `External` this pass (only the store retains them).
+    #[serde(default)]
+    pub aged_external: usize,
     #[serde(default)]
     pub evictions: Vec<ContextEviction>,
     #[serde(default)]
     pub reactivations: Vec<ContextReactivation>,
     pub diagnostics: ContextDiagnostics,
+}
+
+/// A reference to an externalized item in the context store. The model only
+/// ever sees these lightweight references for `Cold`/`External` items, never
+/// their full content — reading an externalized item back is a deliberate
+/// operation (e.g. a future context tool), not a passive materialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextRef {
+    /// Stable, addressable uri, e.g. `context://run/<item-id>`.
+    pub uri: String,
+    pub item_id: ContextItemId,
+    pub kind: ContextKind,
+    pub scope: ContextScope,
+    /// Bounded summary (content truncated at externalization time).
+    pub summary: String,
+    pub created_tick: u64,
+}
+
+/// One entry of the external context map: a lightweight record of an item
+/// whose content lives in the context store. `Cold` entries can still be
+/// recalled by hot-entity matches (the store is read back); `External`
+/// entries only exist as references until a future context tool pulls them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalizedContext {
+    pub item_id: ContextItemId,
+    pub kind: ContextKind,
+    pub scope: ContextScope,
+    pub retention: ContextRetention,
+    pub attention: AttentionState,
+    pub semantic: SemanticState,
+    pub context_ref: ContextRef,
+    pub externalized_at_tick: u64,
+    pub last_access_tick: u64,
+    pub residency: ContextResidency,
+}
+
+/// The lightweight context map the model sees for externalized items:
+/// references, never content.
+pub type ContextMap = Vec<ExternalizedContext>;
+
+/// The result of one `ContextEngine::storage_gc` pass. Storage GC is the
+/// only place information is permanently deleted, and it is deliberately
+/// conservative: nothing is deleted while a resident/warm item still
+/// depends on it, pinned/durable items are never touched, and only items
+/// whose semantic lifecycle ended are candidates.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StorageGcReport {
+    pub scanned: usize,
+    pub deleted: usize,
+    #[serde(default)]
+    pub reasons: Vec<String>,
 }
 
 /// A bounded, UI/replay-friendly projection of one context item.
@@ -402,7 +564,9 @@ pub struct ContextItemSummary {
     pub scope: ContextScope,
     #[serde(default)]
     pub scope_id: Option<ScopeId>,
-    pub state: ContextState,
+    pub attention: AttentionState,
+    #[serde(default)]
+    pub semantic: SemanticState,
     pub importance: f32,
     pub relevance: f32,
     pub created_tick: u64,
@@ -453,6 +617,16 @@ pub trait ContextEngine: Send + Sync {
     async fn close_scope(&self, scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>>;
 
     async fn diagnostics(&self) -> AgentResult<ContextDiagnostics>;
+
+    /// Run the conservative Storage GC: permanently delete context-store
+    /// entries whose semantic lifecycle ended and that nothing references
+    /// anymore. This is the *only* place information is deleted — Context
+    /// GC externalizes, it never purges. Default implementation does
+    /// nothing, so engines without a store (baselines, adapters) keep
+    /// working unchanged.
+    async fn storage_gc(&self) -> AgentResult<StorageGcReport> {
+        Ok(StorageGcReport::default())
+    }
 
     /// Bounded projection of live items, oldest first, capped at `limit`.
     async fn inspect(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>>;

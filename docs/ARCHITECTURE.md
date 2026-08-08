@@ -159,9 +159,27 @@ Tools receive a `ToolExecutionRequest` and return `ToolOutput`.
 
 They do not receive a ContextEngine, memory store, or conversation transcript.
 
-The trait has three members: `specs()` (pure — the stable model surface for
-one round), `gc()` (the explicit lifecycle safe point the runtime calls once
-per model round; default no-op) and `execute`.
+The trait has four members: `specs()`/`snapshot()` (pure — the stable model
+surface for one round), `gc()` (the explicit lifecycle safe point the runtime
+calls once per model round; default no-op) and `execute`. A model round uses
+exactly one `ToolSurfaceSnapshot` (`specs` + `generation`) for the budget,
+the prompt and tool-call validation, so a tool GC'd between the budget and
+the call can never change what the model saw.
+
+Since V1-M9 the lifecycle contract is unified for builtin tools and dynamic
+capabilities under one catalog:
+
+- `catalog()` — every known tool (builtin + capability) with lifecycle state
+  and owner, for `capability.search` / `capability.inspect`;
+- `load_tool(name)` / `unload_tool(name)` — move a tool (or the capability
+  owning it) on/off the model surface;
+- `inspect_tool(name)` — one tool's full spec;
+- `ToolLifecycle::{Available, Loaded, Active, Warm, Unloaded}` is the one
+  lifecycle shared by both planes: registered-but-not-loaded capability
+  tools are `Available` and do not grow the prompt, the builtin catalog
+  cools `Loaded -> Warm -> Unloaded` on idle ticks, and the unified control
+  tools (`capability.search/inspect/load/unload`, always visible) drive the
+  active set.
 
 `ToolExecutionRequest` carries a `CancellationToken` (`cancel`), so long-running
 work (searches, shell processes) can be aborted cooperatively by the caller.

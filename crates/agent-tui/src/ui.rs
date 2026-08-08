@@ -67,7 +67,7 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
         app.context.active_items,
         app.context.cooling_items,
         app.context.archived_items,
-        app.context.dropped_items,
+        app.context.tombstoned_items,
         app.context.total_items,
         app.context.approx_active_tokens,
         app.context.focus_generation,

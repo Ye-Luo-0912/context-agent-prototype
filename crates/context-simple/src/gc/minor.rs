@@ -1,5 +1,6 @@
 use agent_contracts::{
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextState, ContextStateTransition,
+    AttentionState, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextStateTransition,
+    SemanticState,
 };
 
 use crate::diagnostics;
@@ -50,7 +51,7 @@ pub(crate) fn run_minor(
     report.transitions.extend(verified);
 
     for item in &mut state.items {
-        let old_state = item.state;
+        let old_attention = item.attention;
         let outcome = next_residency(
             item,
             config,
@@ -60,24 +61,46 @@ pub(crate) fn run_minor(
             focus.as_ref(),
             &hot_entities,
         );
-        item.state = outcome.state;
+        item.attention = outcome.attention;
         item.relevance = outcome.relevance;
 
-        if item.state != old_state {
-            match item.state {
-                ContextState::Active => report.promoted += 1,
-                ContextState::Cooling => report.cooled += 1,
-                ContextState::Archived => report.archived += 1,
-                ContextState::Dropped => report.dropped += 1,
+        // Semantic transitions are terminal and explicit: TTL/staleness
+        // tombstone the item; GC and promotion respect that forever. (The
+        // residency machine only proposes a semantic transition for live
+        // items — semantically dead ones are short-circuited above.)
+        let tombstoned = match outcome.semantic {
+            Some(SemanticState::Tombstoned) => {
+                item.semantic = SemanticState::Tombstoned;
+                true
+            }
+            Some(other) => {
+                item.semantic = other;
+                true
+            }
+            None => false,
+        };
+
+        if item.attention != old_attention || tombstoned {
+            match item.attention {
+                AttentionState::Active => report.promoted += 1,
+                AttentionState::Cooling => report.cooled += 1,
+                AttentionState::Archived => report.archived += 1,
+            }
+            if tombstoned {
+                report.tombstoned += 1;
+            }
+            let mut reason = outcome.reason;
+            if tombstoned {
+                reason.push_str(" [semantic]");
             }
             report.transitions.push(ContextStateTransition {
                 item_id: item.id,
                 kind: item.kind,
                 scope: item.scope,
-                from: old_state,
-                to: item.state,
+                from: old_attention,
+                to: item.attention,
                 turn,
-                reason: outcome.reason,
+                reason,
             });
         }
     }

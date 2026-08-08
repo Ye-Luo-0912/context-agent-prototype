@@ -362,6 +362,11 @@ dependency_expansion }` (default on);
 
 ## 9d. V1-M6: full GC pass (residency / generation / semantic state)
 
+> Historical snapshot of the M6 design. V1-M9 (§9e) supersedes three parts:
+> the `ContextState` enum (split into attention/semantic axes), the root set
+> (task membership removed) and the buffer overflow behavior (store-backed
+> instead of purge). The rest of this section still describes the pass.
+
 The per-event `maintain()` pass is the **semantic** machine: it decides
 Active/Cooling/Archived/Dropped and records every transition with a reason.
 The full GC pass (`ContextEngine::gc`, run by the runtime actor at turn
@@ -446,6 +451,79 @@ replayable end to end. `SimpleContextConfig { gc_enabled, gc_max_generation,
 gc_buffer_capacity, gc_reactivate_per_pass }` (all on by default) tune the
 pass; `ContextEngine::gc` has a default no-op implementation, so baselines
 and the wire adapter keep working unchanged.
+
+## 9e. V1-M9: attention / semantic split, store-backed eviction, tightened roots
+
+The M6 pass kept one `ContextState` enum; the V1-M9 rework splits the
+dimensions the way M6 intended, fixes the mark direction, and removes the
+last "permanent delete" from the context GC.
+
+### State model: three orthogonal axes
+
+`ContextState` is gone. `ContextItem` now carries:
+
+```text
+attention  AttentionState::Active | Cooling | Archived
+           owned by the residency machine (maintain); GC never moves it
+semantic   SemanticState::Live | Superseded{by} | VerifiedFixed{by} |
+           Tombstoned
+           owned by the policy; once terminal (Superseded / VerifiedFixed /
+           Tombstoned) it is permanent — nothing ever sets it back to Live
+residency  Residency::Resident | Warm | Cold | External
+           where the item physically lives (heap / buffer / store)
+generation gc_generation: u32   full passes survived without being a root
+```
+
+`Dropped` no longer exists. Ephemeral observations are `Archived` after
+their turn (consumed) but stay semantically `Live`; semantic death is
+expressed only by `SemanticState`, and **a tombstone never resurrects**:
+reactivation skips any item whose semantic state is terminal, however hot
+its entities look — `is_excluded()` and the state machine can no longer
+disagree (`Resident + Active` but never visible is impossible now).
+
+### Mark phase: dependency direction fixed
+
+Roots are marked, then the traversal follows **`item.dependencies`
+(new → old)** outward: a root's *dependencies* are the evidence it relies
+on and are protected; its dependents are not. (The M6 text described this
+direction but the implementation walked `dependencies` backwards — dependents
+got marked while the roots' actual evidence was swept. The implementation
+now matches: `queue = roots; pop id; mark item[id].dependencies; push them`.)
+The root set is also tightened — **the active task is a scope boundary, not
+a root**: an item does not survive because its `task_id` matches the active
+task. Roots are only pinned items, the current focus scope, open loops,
+durable task constraints, hot entities and explicit references (plus a
+bounded `+8` transitive slice of their dependency edges). Old turns of a
+long task therefore cool and evict like any other working-set item.
+
+### Eviction is reversible all the way down: ContextStore
+
+The bounded eviction buffer no longer purges on overflow. The residency
+ladder is:
+
+```text
+Resident -> Warm -> Cold -> External   (context GC)
+External -> Storage GC -> Delete       (a future, separate pass)
+```
+
+`ContextEngine` gains a `store` surface (`ContextStore`): when the buffer is
+full, the oldest eviction is written to the store as an `ExternalizedContext`
+(a `ContextRef` like `context://run/task/item-id`, plus `artifact://` /
+`decision://` / `evidence://` links when the item carries them) and its
+residency becomes `External`. The model never sees the body — only the light
+`ContextRef` in the materialized view — and the full item can be restored
+with `ContextEngine::restore(ref)` (a `materialize`-visible `Restored` item
+whose body lives in an artifact, or back into the heap when it is hot again).
+
+### Scope close: promote before archive, and keep membership in sync
+
+Closing a scope used to skip `Archived` items outright, so a durable outcome
+(decision / finding / constraint / open loop) that had cooled could miss
+promotion to the parent scope. The order is now: terminal-semantic-invalid
+items are skipped; then `should_promote` wins and the item is promoted
+(updating **both** `scope` and `scope_id` to the parent — previously only
+`scope` was rewritten while the authoritative `scope_id` kept pointing at
+the closed scope); everything else is archived/evicted as before.
 
 ## 10. What should become durable later
 

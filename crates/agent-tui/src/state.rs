@@ -139,7 +139,7 @@ impl AppState {
                 self.record_transitions(report.transitions);
             }
             RuntimeEvent::ContextGc { report } => {
-                let evicted_buffer = report.diagnostics.evicted_items;
+                let evicted_buffer = report.diagnostics.warm_items;
                 self.context = report.diagnostics;
                 // Evictions and reactivations are lifecycle events worth
                 // showing in the panel: GC must be explainable.
@@ -148,8 +148,8 @@ impl AppState {
                         item_id: eviction.item_id,
                         kind: eviction.kind,
                         scope: eviction.scope,
-                        from: agent_contracts::ContextState::Archived,
-                        to: agent_contracts::ContextState::Archived,
+                        from: agent_contracts::AttentionState::Archived,
+                        to: agent_contracts::AttentionState::Archived,
                         turn: self.context.turn,
                         reason: format!(
                             "evicted (gen {}): {}",
@@ -162,8 +162,8 @@ impl AppState {
                         item_id: reactivation.item_id,
                         kind: reactivation.kind,
                         scope: reactivation.scope,
-                        from: agent_contracts::ContextState::Archived,
-                        to: agent_contracts::ContextState::Active,
+                        from: agent_contracts::AttentionState::Archived,
+                        to: agent_contracts::AttentionState::Active,
                         turn: self.context.turn,
                         reason: format!("reactivated: {}", reactivation.reason),
                     });
@@ -235,7 +235,7 @@ impl AppState {
                     diagnostics.active_items,
                     diagnostics.cooling_items,
                     diagnostics.archived_items,
-                    diagnostics.dropped_items,
+                    diagnostics.tombstoned_items,
                     diagnostics.approx_active_tokens,
                     diagnostics.turn,
                     diagnostics.tool_round,

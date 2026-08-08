@@ -17,6 +17,7 @@ use crate::index::{dependency, entity};
 use crate::item;
 use crate::materializer;
 use crate::scope;
+use crate::store;
 
 #[derive(Debug, Clone)]
 pub struct SimpleContextConfig {
@@ -41,10 +42,22 @@ pub struct SimpleContextConfig {
     /// Items surviving this many full passes without root reachability are
     /// eviction candidates (the generational dimension of GC).
     pub gc_max_generation: u32,
-    /// Cap on the reversible eviction buffer; overflow purges oldest.
+    /// Cap on the reversible eviction buffer; overflow no longer purges —
+    /// items are externalized to the context store instead.
     pub gc_buffer_capacity: usize,
     /// Max items reactivated per GC pass (newest first).
     pub gc_reactivate_per_pass: usize,
+    /// Directory of the external context store: eviction-buffer overflow
+    /// writes full items here and keeps only a lightweight `ContextRef`
+    /// entry. `None` defaults to `.focus-agent/context-store` under the
+    /// current working directory.
+    pub context_store_dir: Option<std::path::PathBuf>,
+    /// Full GC passes an externalized (`Cold`) entry may sit in memory
+    /// before it ages to `External` (only the store retains it).
+    pub gc_external_ttl_passes: u32,
+    /// Storage GC only deletes store entries whose semantic lifecycle ended
+    /// at least this many ticks ago and that nothing references.
+    pub storage_ttl_ticks: u64,
 }
 
 impl Default for SimpleContextConfig {
@@ -62,6 +75,9 @@ impl Default for SimpleContextConfig {
             gc_max_generation: 3,
             gc_buffer_capacity: 256,
             gc_reactivate_per_pass: 8,
+            context_store_dir: None,
+            gc_external_ttl_passes: 4,
+            storage_ttl_ticks: 40,
         }
     }
 }
@@ -91,13 +107,14 @@ pub(crate) struct State {
     pub(crate) tool_round: u64,
     pub(crate) focus: Option<FocusState>,
     pub(crate) items: Vec<ContextItem>,
-    /// (item_id, reason) queued by ingest, drained by maintenance so the
-    /// resulting state change is recorded as a lifecycle transition.
+    /// (item_id, by_id, reason) queued by ingest for superseded decisions,
+    /// drained by maintenance so the resulting semantic state change is
+    /// recorded as a lifecycle transition.
     #[serde(default)]
-    pub(crate) pending_supersessions: Vec<(ContextItemId, String)>,
-    /// (item_id, reason) queued by ingest for verified-fixed errors.
+    pub(crate) pending_supersessions: Vec<(ContextItemId, ContextItemId, String)>,
+    /// (item_id, by_id, reason) queued by ingest for verified-fixed errors.
     #[serde(default)]
-    pub(crate) pending_verifications: Vec<(ContextItemId, String)>,
+    pub(crate) pending_verifications: Vec<(ContextItemId, ContextItemId, String)>,
     /// Entities named by the last user message or touched by recent tool
     /// observations. Reset on user message / focus change, extended by tools.
     #[serde(default)]
@@ -115,15 +132,25 @@ pub(crate) struct State {
     pub(crate) pending_closed_scopes: Vec<ScopeId>,
     /// Items evicted by the full GC pass. Bounded by
     /// `gc_buffer_capacity`; eviction is reversible — items re-enter the
-    /// heap when they become roots again. Overflow purges the oldest.
+    /// heap when they become roots again. Overflow externalizes to the
+    /// context store (never purged).
     #[serde(default)]
     pub(crate) eviction_buffer: Vec<ContextItem>,
+    /// The external context map: lightweight entries for items whose content
+    /// lives in the context store. `Cold` entries can still be recalled by
+    /// hot-entity matches; `External` entries only exist as references.
+    #[serde(default)]
+    pub(crate) external: Vec<agent_contracts::ExternalizedContext>,
     /// Cumulative GC counters, so diagnostics explain a run's eviction and
     /// reactivation behavior without replaying every report.
     #[serde(default)]
     pub(crate) gc_evicted_total: u64,
     #[serde(default)]
     pub(crate) gc_reactivated_total: u64,
+    #[serde(default)]
+    pub(crate) gc_externalized_total: u64,
+    #[serde(default)]
+    pub(crate) gc_storage_deleted_total: u64,
 }
 
 pub struct SimpleContextEngine {
@@ -192,7 +219,7 @@ impl ContextEngine for SimpleContextEngine {
                         &mut state,
                         &content,
                         &format!("superseded by decision at turn {turn}: '{snippet}'"),
-                        Some(item_id),
+                        item_id,
                     );
                 }
             }
@@ -218,24 +245,6 @@ impl ContextEngine for SimpleContextEngine {
                 }
                 let ok = output.ok;
                 let round = state.tool_round;
-                if self.config.error_verification && !ok {
-                    reachability::queue_error_recurrence(&mut state, &content, round);
-                }
-                if self.config.error_verification && ok {
-                    reachability::queue_error_verifications(
-                        &mut state,
-                        &content,
-                        &format!("error verified fixed by successful tool result (round {round})"),
-                    );
-                }
-                // Entities the agent actually touched via tools extend the
-                // hot set for the rest of this turn.
-                if self.config.entity_affinity {
-                    entity::merge_hot_entities(
-                        &mut state.hot_entities,
-                        entity::extract_entities(&content),
-                    );
-                }
                 let kind = if ok {
                     ContextKind::ToolObservation
                 } else {
@@ -249,10 +258,10 @@ impl ContextEngine for SimpleContextEngine {
                 } else {
                     ContextRetention::Working
                 };
-                let item = item::make_item(
+                let mut item = item::make_item(
                     &state,
                     &self.config,
-                    content,
+                    content.clone(),
                     kind,
                     ContextScope::Turn,
                     retention,
@@ -262,9 +271,33 @@ impl ContextEngine for SimpleContextEngine {
                 // The runtime opened the tool scope at tool start; the
                 // observation is tagged with that frame even though it is
                 // persisted at turn end.
-                let mut item = item;
                 if let Some(tool_scope_id) = scope_id {
                     item.scope_id = Some(tool_scope_id);
+                }
+                // The observation itself is the `by` of the intents it
+                // queues: verification (success) or recurrence supersession
+                // (failure). It must exist with its id before queueing so
+                // the semantic state can name it, but it is pushed to the
+                // heap only after queueing so intents never see it.
+                let observation_id = item.id;
+                if self.config.error_verification && !ok {
+                    reachability::queue_error_recurrence(&mut state, &content, round, observation_id);
+                }
+                if self.config.error_verification && ok {
+                    reachability::queue_error_verifications(
+                        &mut state,
+                        &content,
+                        &format!("error verified fixed by successful tool result (round {round})"),
+                        observation_id,
+                    );
+                }
+                // Entities the agent actually touched via tools extend the
+                // hot set for the rest of this turn.
+                if self.config.entity_affinity {
+                    entity::merge_hot_entities(
+                        &mut state.hot_entities,
+                        entity::extract_entities(&content),
+                    );
                 }
                 dependency::push_linked(&mut state, &self.config, item);
             }
@@ -389,7 +422,32 @@ impl ContextEngine for SimpleContextEngine {
             if item.entities.is_empty() {
                 item.entities = entity::extract_entities(&item.content);
             }
+            // Pre-split checkpoints expressed semantic death as lifecycle
+            // labels; migrate them to the SemanticState dimension so GC and
+            // the materializer treat restored items like live ones.
+            if item.semantic.is_live() {
+                if item
+                    .tags
+                    .iter()
+                    .any(|tag| tag.is_lifecycle(agent_contracts::LifecycleLabel::Superseded))
+                {
+                    item.semantic = agent_contracts::SemanticState::Superseded { by: None };
+                } else if item
+                    .tags
+                    .iter()
+                    .any(|tag| tag.is_lifecycle(agent_contracts::LifecycleLabel::VerifiedFixed))
+                {
+                    item.semantic = agent_contracts::SemanticState::VerifiedFixed { by: None };
+                }
+            }
         }
         Ok(())
+    }
+
+    async fn storage_gc(&self) -> AgentResult<agent_contracts::StorageGcReport> {
+        let mut state = self.state.lock().await;
+        state.tick += 1;
+        let now_tick = state.tick;
+        Ok(store::run_storage_gc(&mut state, &self.config, now_tick))
     }
 }

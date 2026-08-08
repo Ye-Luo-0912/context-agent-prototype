@@ -8,7 +8,7 @@
 
 use agent_contracts::{
     ContextDiagnostics, ContextIngress, ContextItemId, ContextItemSummary, ContextKind,
-    ContextScope, ContextState, MaterializedItem,
+    ContextScope, AttentionState, SemanticState, MaterializedItem,
 };
 
 /// Token estimator shared by the baseline engines. Must match the convention
@@ -45,7 +45,8 @@ impl Record {
             kind: self.kind,
             scope: self.scope,
             scope_id: None,
-            state: ContextState::Active,
+            attention: AttentionState::Active,
+            semantic: SemanticState::Live,
             importance: 0.0,
             relevance: 0.0,
             created_tick: 0,
@@ -129,7 +130,8 @@ pub(crate) fn materialized_items(
             item_id: summary.id,
             kind: summary.kind,
             scope: summary.scope,
-            state: ContextState::Active,
+            attention: AttentionState::Active,
+            semantic: SemanticState::Live,
             content: summary.content.clone(),
             source: summary.source.clone(),
         });
@@ -138,7 +140,8 @@ pub(crate) fn materialized_items(
         item_id: record.id,
         kind: record.kind,
         scope: record.scope,
-        state: ContextState::Active,
+        attention: AttentionState::Active,
+            semantic: SemanticState::Live,
         content: record.content.clone(),
         source: record.source.clone(),
     }));
@@ -165,7 +168,7 @@ pub(crate) fn active_diagnostics(
         active_items: total,
         cooling_items: 0,
         archived_items: 0,
-        dropped_items: dropped,
+        tombstoned_items: dropped,
         approx_active_tokens,
         ..ContextDiagnostics::default()
     }

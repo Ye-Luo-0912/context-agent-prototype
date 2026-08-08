@@ -9,6 +9,7 @@ mod materializer;
 mod policy;
 mod residency;
 mod scope;
+mod store;
 
 #[cfg(test)]
 mod tests;

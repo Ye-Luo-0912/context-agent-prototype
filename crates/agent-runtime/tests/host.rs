@@ -9,7 +9,7 @@ use agent_contracts::{
     ContextIngress, ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger,
     ContextQuery, ContextStateTransition, MaterializedContext, ModelCapabilities, ModelOutput,
     ModelRequest, ModelTransport, RunId, ScopeId, ScopeKind, ToolCall, ToolDispatcher,
-    ToolExecutionRequest, ToolOutput, ToolRisk, ToolSpec,
+    ToolExecutionRequest, ToolLifecycle, ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_runtime::{
     APPROVAL_POLICY, CapabilityAwareDispatcher, CapabilityId, ContextModule, ModelModule, Module,
@@ -35,6 +35,7 @@ impl ContextEngine for StubContextEngine {
         Ok(MaterializedContext {
             focus: None,
             items: Vec::new(),
+            external: Vec::new(),
             selected: Vec::new(),
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),
@@ -362,8 +363,11 @@ async fn dynamic_capabilities_reach_the_model_and_route_calls() {
     )))
     .unwrap();
 
-    let dispatcher = CapabilityAwareDispatcher::new(Arc::new(StubTools), capability_registry);
-    host.add_module(Arc::new(ToolModule::new(Arc::new(dispatcher))))
+    let dispatcher = Arc::new(CapabilityAwareDispatcher::new(
+        Arc::new(StubTools),
+        capability_registry,
+    ));
+    host.add_module(Arc::new(ToolModule::new(dispatcher.clone())))
         .unwrap();
     host.start().await.unwrap();
 
@@ -373,8 +377,24 @@ async fn dynamic_capabilities_reach_the_model_and_route_calls() {
         "eager capability starts at host start"
     );
 
-    // The tool provider exposes built-in tools plus the capability's tool.
+    // Registration alone keeps the capability's tools off the model
+    // surface: they are catalog-visible but Available.
     let tools = host.registry().tool_provider().unwrap();
+    let names: Vec<String> = tools.specs().iter().map(|spec| spec.name.clone()).collect();
+    assert!(
+        !names.contains(&"demo.demo".to_string()),
+        "unloaded capability tools must not be on the surface"
+    );
+    let catalog = dispatcher.catalog();
+    let row = catalog
+        .iter()
+        .find(|entry| entry.name == "demo.demo")
+        .expect("capability tools are discoverable in the catalog");
+    assert_eq!(row.state, ToolLifecycle::Available);
+    assert_eq!(row.owner, "demo");
+
+    // Explicit load puts the capability's tools on the surface.
+    dispatcher.load_tool("demo.demo").unwrap();
     let names: Vec<String> = tools.specs().iter().map(|spec| spec.name.clone()).collect();
     assert!(names.contains(&"demo.demo".to_string()));
 
@@ -390,12 +410,16 @@ async fn dynamic_capabilities_reach_the_model_and_route_calls() {
 async fn capabilities_can_be_registered_mid_run_and_lazy_start_on_use() {
     let mut host = ModuleHost::new();
     let capability_registry = host.capability_registry();
-    let dispatcher = CapabilityAwareDispatcher::new(Arc::new(StubTools), capability_registry);
-    host.add_module(Arc::new(ToolModule::new(Arc::new(dispatcher))))
+    let dispatcher = Arc::new(CapabilityAwareDispatcher::new(
+        Arc::new(StubTools),
+        capability_registry,
+    ));
+    host.add_module(Arc::new(ToolModule::new(dispatcher.clone())))
         .unwrap();
     host.start().await.unwrap();
 
-    // Mid-run registration: the model sees the new tool on the next request.
+    // Mid-run registration: the tool is discoverable but not on the
+    // surface until it is loaded.
     let started = Arc::new(Mutex::new(false));
     host.register_capability(Arc::new(DemoCapability::new(
         "late",
@@ -406,13 +430,19 @@ async fn capabilities_can_be_registered_mid_run_and_lazy_start_on_use() {
 
     let tools = host.registry().tool_provider().unwrap();
     let names: Vec<String> = tools.specs().iter().map(|spec| spec.name.clone()).collect();
-    assert!(names.contains(&"late.demo".to_string()));
+    assert!(
+        !names.contains(&"late.demo".to_string()),
+        "unloaded capability tools must not be on the surface"
+    );
     assert!(
         !*started.lock().unwrap(),
         "a lazy capability is not started at registration"
     );
 
-    // First invocation starts it (lazy lifecycle), then routes the call.
+    // Load it, then the first invocation starts it (lazy lifecycle).
+    dispatcher.load_tool("late.demo").unwrap();
+    let names: Vec<String> = tools.specs().iter().map(|spec| spec.name.clone()).collect();
+    assert!(names.contains(&"late.demo".to_string()));
     let output = execute(tools, "late.demo").await;
     assert!(output.ok);
     assert!(

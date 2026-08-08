@@ -1,5 +1,5 @@
 use agent_contracts::{
-    ContextItem, ContextRetention, ContextScope, ContextState, ContextStateTransition, Label,
+    AttentionState, ContextItem, ContextRetention, ContextScope, ContextStateTransition, Label,
     LifecycleLabel, Scope, ScopeId, ScopeKind, ScopeState, TaskId,
 };
 
@@ -268,12 +268,12 @@ fn close_members(
         if !belongs_to(&scope_index, item, scope) {
             continue;
         }
-        // Terminal semantic death always wins: a dropped or semantically
-        // invalid (superseded / verified-fixed) item stays dead through a
+        // Terminal semantic death always wins: a semantically dead item
+        // (tombstoned, superseded, verified-fixed) stays dead through a
         // scope close. Everything else — including items the residency
         // machine already cooled to Archived — may still be a durable
         // outcome of the scope and must get its promotion chance.
-        if item.state == ContextState::Dropped || is_excluded(item) {
+        if !item.semantic.is_live() || is_excluded(item) {
             continue;
         }
         if should_promote(item) {
@@ -290,12 +290,12 @@ fn close_members(
                 item_id: item.id,
                 kind: item.kind,
                 scope: item.scope,
-                from: item.state,
-                to: ContextState::Archived,
+                from: item.attention,
+                to: AttentionState::Archived,
                 turn,
                 reason: "task completed: scope closed, working set evicted".to_string(),
             });
-            item.state = ContextState::Archived;
+            item.attention = AttentionState::Archived;
             item.relevance = 0.0;
         }
     }
@@ -368,7 +368,7 @@ fn promote(
     {
         return;
     }
-    let from = item.state;
+    let from = item.attention;
     if matches!(
         item.retention,
         ContextRetention::Ephemeral | ContextRetention::Working
@@ -378,15 +378,15 @@ fn promote(
     item.scope = parent_scope;
     item.scope_id = parent_id;
     item.tags.push(Label::lifecycle(LifecycleLabel::Promoted));
-    if item.state != ContextState::Active {
-        item.state = ContextState::Active;
+    if item.attention != AttentionState::Active {
+        item.attention = AttentionState::Active;
         item.relevance = 0.5;
         transitions.push(ContextStateTransition {
             item_id: item.id,
             kind: item.kind,
             scope: item.scope,
             from,
-            to: ContextState::Active,
+            to: AttentionState::Active,
             turn,
             reason: format!("promoted by {} scope close", kind_name(kind)),
         });

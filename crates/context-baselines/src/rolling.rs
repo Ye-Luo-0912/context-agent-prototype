@@ -13,7 +13,7 @@ use std::sync::Mutex as StdMutex;
 use agent_contracts::{
     AgentError, AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextKind,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextScope,
-    ContextSelection, ContextState, ContextStateTransition, MaterializedContext, ScopeId,
+    ContextSelection, AttentionState, ContextStateTransition, MaterializedContext, ScopeId,
     ScopeKind, ScoreBreakdown,
 };
 use async_trait::async_trait;
@@ -140,8 +140,8 @@ impl ContextEngine for RollingSummaryEngine {
                     item_id: record.id,
                     kind: record.kind,
                     scope: record.scope,
-                    from: ContextState::Active,
-                    to: ContextState::Dropped,
+                    from: AttentionState::Active,
+                    to: AttentionState::Archived,
                     turn: state.turn,
                     reason: "collapsed into rolling summary (baseline B)".into(),
                 });
@@ -165,7 +165,7 @@ impl ContextEngine for RollingSummaryEngine {
         }
 
         Ok(ContextMaintenanceReport {
-            dropped: transitions.len(),
+            archived: transitions.len(),
             turn: state.turn,
             transitions,
             diagnostics: state.diagnostics(),
@@ -211,6 +211,7 @@ impl ContextEngine for RollingSummaryEngine {
         Ok(MaterializedContext {
             focus: None,
             items,
+            external: Vec::new(),
             selected,
             approx_tokens: approx_tokens_total,
             diagnostics: state.diagnostics(),

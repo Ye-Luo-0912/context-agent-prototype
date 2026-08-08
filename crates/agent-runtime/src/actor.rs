@@ -10,8 +10,8 @@ use std::{collections::VecDeque, sync::Arc};
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, ContextHints, ContextIngress,
     ContextMaintenanceTrigger, ContextQuery, ModelRequest, OperationId, OperationOutcome,
-    OperationResult, RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall, TurnFrame, TurnFrameStep,
-    TurnId,
+    OperationResult, RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall, ToolSurfaceSnapshot,
+    TurnFrame, TurnFrameStep, TurnId,
 };
 use agent_kernel::AgentKernel;
 use tokio::sync::mpsc;
@@ -42,12 +42,18 @@ struct InFlightOp {
 
 /// The runtime's view of the active turn: the execution stack (TurnFrame),
 /// how many model rounds ran, tool calls still waiting to run, and the
-/// in-flight operation.
+/// One turn's mutable state: the model round counter, the tool calls the
+/// model queued for execution, the in-flight operation, and the tool
+/// surface snapshot captured at the round start — budget, prompt and
+/// tool-call validation all share it.
 struct ActiveTurn {
     turn_id: TurnId,
     turn_frame: TurnFrame,
     model_round: usize,
     pending_tools: VecDeque<ToolCall>,
+    /// The tool surface of the current model round, captured once after the
+    /// tool lifecycle GC. `None` only before the first round starts.
+    tool_surface: Option<ToolSurfaceSnapshot>,
     op: Option<InFlightOp>,
 }
 
@@ -281,6 +287,7 @@ impl RuntimeActor {
             turn_frame: TurnFrame::new(content),
             model_round: 0,
             pending_tools: VecDeque::new(),
+            tool_surface: None,
             op: None,
         });
         self.advance_turn(op_tx).await;
@@ -381,10 +388,13 @@ impl RuntimeActor {
         }
 
         // Tool lifecycle safe point: age the tool catalog exactly once per
-        // model round, before the surface is captured for the budget and the
-        // prompt. `specs()` stays pure, so budget, prompt and tool-call
-        // validation all see the same surface within the round.
+        // model round, then capture the round's tool surface snapshot. The
+        // budget, the prompt and tool-call validation all use this one
+        // snapshot, so the model sees — and the runtime validates against —
+        // exactly the surface that was priced.
         self.kernel.tool_gc();
+        let tool_surface = self.kernel.tool_snapshot();
+        turn.tool_surface = Some(tool_surface.clone());
 
         // The engine only ever sees its own slice of the provider window:
         // the output reserve, system policy, turn frame and active tool
@@ -392,7 +402,7 @@ impl RuntimeActor {
         // engine budgets the working set.
         let capabilities = self.kernel.model_capabilities();
         let turn_frame_tokens = approx_layer_tokens(&turn.turn_frame.messages());
-        let active_tools_tokens = approx_layer_tokens(&self.kernel.tool_specs());
+        let active_tools_tokens = approx_layer_tokens(&tool_surface.specs);
         let model_budget = ModelBudget::compute(
             capabilities
                 .context_window
@@ -436,9 +446,9 @@ impl RuntimeActor {
             .await;
         let _ = self.kernel.emit_event(RuntimeEvent::ModelStarted).await;
 
-        let input =
-            self.assembler
-                .assemble(&materialized, &turn.turn_frame, self.kernel.tool_specs());
+        let input = self
+            .assembler
+            .assemble(&materialized, &turn.turn_frame, tool_surface.specs.clone());
         let cancel = CancellationToken::new();
         let operation_id = OperationId::new();
         let generation = self.state.generation;
@@ -510,6 +520,12 @@ impl RuntimeActor {
             return;
         };
         let turn_id = turn.turn_id;
+        let surface = turn.tool_surface.clone();
+        let Some(surface) = surface else {
+            // No round has run yet; nothing legitimately queues a tool call
+            // before the first model round.
+            return;
+        };
 
         // The tool scope opens when the tool starts — it is an execution
         // frame, not a batch artifact of turn-end persistence.
@@ -547,7 +563,7 @@ impl RuntimeActor {
         let run_id = kernel.run_id();
         let task_id = self.state.task_id;
         tokio::spawn(async move {
-            let output = kernel.execute_tool(call, cancel).await;
+            let output = kernel.execute_tool(call, cancel, &surface).await;
             let _ = op_tx
                 .send(OperationCompletion {
                     operation: OperationResult {

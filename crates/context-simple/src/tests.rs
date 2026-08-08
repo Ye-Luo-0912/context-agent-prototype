@@ -1,7 +1,7 @@
 use agent_contracts::{
-    ContextEngine, ContextHints, ContextIngress, ContextItem, ContextItemId, ContextKind,
-    ContextMaintenanceTrigger, ContextQuery, ContextRetention, ContextScope, ContextState,
-    FocusState, LifecycleLabel, ScopeKind, ScopeState, ToolOutput,
+    AttentionState, ContextEngine, ContextHints, ContextIngress, ContextItem, ContextItemId,
+    ContextKind, ContextMaintenanceTrigger, ContextQuery, ContextRetention, ContextScope,
+    FocusState, LifecycleLabel, ScopeKind, ScopeState, SemanticState, ToolOutput,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -42,7 +42,7 @@ async fn successful_observation_is_ephemeral_but_failure_persists_until_verified
         .unwrap();
     let diagnostics = engine.diagnostics().await.unwrap();
     assert_eq!(
-        diagnostics.dropped_items, 0,
+        diagnostics.tombstoned_items, 0,
         "a failed observation must persist until verified"
     );
 
@@ -79,15 +79,22 @@ async fn successful_observation_is_ephemeral_but_failure_persists_until_verified
             .collect::<Vec<_>>()
     );
 
-    // The successful observation itself stays ephemeral and leaves after
-    // the model turn.
+    // The successful observation itself stays ephemeral and leaves
+    // attention after the model turn — consumed, not tombstoned: it stays
+    // semantically live and recallable.
     engine
         .maintain(ContextMaintenanceTrigger::AfterModel)
         .await
         .unwrap();
     let after = engine.diagnostics().await.unwrap();
-    assert!(after.dropped_items >= 1, "successful observation drops");
-    assert!(after.archived_items >= 1, "verified error stays archived");
+    assert!(
+        after.archived_items >= 2,
+        "the consumed observation and the verified error are both archived"
+    );
+    assert_eq!(
+        after.tombstoned_items, 0,
+        "consumption is attention loss, not semantic death"
+    );
 }
 
 #[tokio::test]
@@ -150,7 +157,7 @@ async fn maintenance_records_transitions_with_reasons() {
         .await
         .unwrap();
 
-    // First maintenance (AfterTool) must not drop the fresh observation
+    // First maintenance (AfterTool) must not consume the fresh observation
     // (the user message may decay to Cooling; that is normal, not a drop).
     let after_tool = engine
         .maintain(ContextMaintenanceTrigger::AfterTool)
@@ -160,32 +167,35 @@ async fn maintenance_records_transitions_with_reasons() {
         !after_tool
             .transitions
             .iter()
-            .any(|t| t.to == ContextState::Dropped),
-        "fresh observation must not be dropped at AfterTool: {:?}",
+            .any(|t| t.to == AttentionState::Archived
+                && t.reason.contains("observation consumed")),
+        "fresh observation must not be consumed at AfterTool: {:?}",
         after_tool.transitions
     );
 
-    // AfterModel with age >= 1 drops the ephemeral turn observation.
+    // AfterModel with age >= 1 consumes the ephemeral turn observation: it
+    // leaves attention (Archived) but stays semantically live and
+    // recallable.
     let after_model = engine
         .maintain(ContextMaintenanceTrigger::AfterModel)
         .await
         .unwrap();
-    let drop = after_model
+    let consumed = after_model
         .transitions
         .iter()
-        .find(|t| t.to == ContextState::Dropped);
+        .find(|t| t.to == AttentionState::Archived && t.reason.contains("observation consumed"));
     assert!(
-        drop.is_some(),
-        "expected a drop transition, got: {:?}",
+        consumed.is_some(),
+        "expected a consume transition, got: {:?}",
         after_model.transitions
     );
-    let drop = drop.unwrap();
-    assert_eq!(drop.kind, ContextKind::ToolObservation);
-    assert_eq!(drop.turn, 1);
+    let consumed = consumed.unwrap();
+    assert_eq!(consumed.kind, ContextKind::ToolObservation);
+    assert_eq!(consumed.turn, 1);
     assert!(
-        drop.reason.contains("after model turn"),
+        consumed.reason.contains("after model turn"),
         "unexpected reason: {}",
-        drop.reason
+        consumed.reason
     );
     assert_eq!(after_model.turn, 1);
 }
@@ -297,7 +307,7 @@ async fn completed_task_working_set_is_archived_and_stays_out() {
     let archive = report
         .transitions
         .iter()
-        .find(|t| t.to == ContextState::Archived);
+        .find(|t| t.to == AttentionState::Archived);
     assert!(
         archive.is_some(),
         "expected an archived transition, got: {:?}",
@@ -439,7 +449,7 @@ async fn recurring_failure_supersedes_prior_error() {
     let items = engine.inspect(usize::MAX).await.unwrap();
     let live_errors = items
         .iter()
-        .filter(|item| item.kind == ContextKind::Error && item.state != ContextState::Archived)
+        .filter(|item| item.kind == ContextKind::Error && item.attention != AttentionState::Archived)
         .count();
     assert_eq!(
         live_errors, 1,
@@ -582,7 +592,8 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
             kind: ContextKind::UserMessage,
             scope: ContextScope::Task,
             retention: ContextRetention::Working,
-            state: ContextState::Active,
+            attention: AttentionState::Active,
+            semantic: SemanticState::Live,
             importance: 1.0,
             relevance: 0.5,
             created_tick: 1,
@@ -606,7 +617,8 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
             kind: ContextKind::FileObservation,
             scope: ContextScope::Turn,
             retention: ContextRetention::Working,
-            state: ContextState::Active,
+            attention: AttentionState::Active,
+            semantic: SemanticState::Live,
             importance: 0.0,
             relevance: 0.0,
             created_tick: 2,
@@ -674,7 +686,8 @@ async fn dependency_expansion_can_be_disabled() {
             kind: ContextKind::UserMessage,
             scope: ContextScope::Task,
             retention: ContextRetention::Working,
-            state: ContextState::Active,
+            attention: AttentionState::Active,
+            semantic: SemanticState::Live,
             importance: 1.0,
             relevance: 0.5,
             created_tick: 1,
@@ -698,7 +711,8 @@ async fn dependency_expansion_can_be_disabled() {
             kind: ContextKind::FileObservation,
             scope: ContextScope::Turn,
             retention: ContextRetention::Working,
-            state: ContextState::Active,
+            attention: AttentionState::Active,
+            semantic: SemanticState::Live,
             importance: 0.0,
             relevance: 0.0,
             created_tick: 2,
@@ -754,7 +768,8 @@ async fn archived_dependency_below_threshold_stays_out() {
             kind: ContextKind::UserMessage,
             scope: ContextScope::Task,
             retention: ContextRetention::Working,
-            state: ContextState::Active,
+            attention: AttentionState::Active,
+            semantic: SemanticState::Live,
             importance: 1.0,
             relevance: 0.5,
             created_tick: 1,
@@ -778,7 +793,8 @@ async fn archived_dependency_below_threshold_stays_out() {
             kind: ContextKind::FileObservation,
             scope: ContextScope::Turn,
             retention: ContextRetention::Working,
-            state: ContextState::Archived,
+            attention: AttentionState::Archived,
+            semantic: SemanticState::Live,
             importance: 0.0,
             relevance: 0.0,
             created_tick: 2,
@@ -1066,7 +1082,7 @@ async fn task_close_processes_members_by_scope_id() {
     let archive = report
         .transitions
         .iter()
-        .find(|transition| transition.to == ContextState::Archived);
+        .find(|transition| transition.to == AttentionState::Archived);
     assert!(
         archive.is_some(),
         "task close must archive the focus's working set, got: {:?}",
@@ -1112,7 +1128,7 @@ async fn task_close_promotes_decisions_and_evicts_the_rest() {
         report
             .transitions
             .iter()
-            .any(|t| t.to == ContextState::Archived && t.reason.contains("task completed")),
+            .any(|t| t.to == AttentionState::Archived && t.reason.contains("task completed")),
         "the working set must be evicted with an explainable reason, got: {:?}",
         report.transitions
     );
@@ -1128,10 +1144,9 @@ async fn task_close_promotes_decisions_and_evicts_the_rest() {
         ContextScope::Session,
         "the decision must be promoted to the session scope"
     );
-    assert_ne!(
-        decision.state,
-        ContextState::Dropped,
-        "a promoted outcome is never dropped"
+    assert!(
+        decision.semantic.is_live(),
+        "a promoted outcome stays semantically live"
     );
     let working = state
         .items
@@ -1139,8 +1154,8 @@ async fn task_close_promotes_decisions_and_evicts_the_rest() {
         .find(|item| item.content.contains("cache note"))
         .expect("working item");
     assert_eq!(
-        working.state,
-        ContextState::Archived,
+        working.attention,
+        AttentionState::Archived,
         "the plain working message must be evicted from the closed task"
     );
 }
@@ -1183,7 +1198,10 @@ async fn promoted_finding_reactivates_for_a_related_task() {
                 .iter()
                 .any(|tag| tag.is_lifecycle(agent_contracts::LifecycleLabel::Promoted))
         );
-        assert_ne!(decision.state, ContextState::Dropped);
+        assert!(
+        decision.semantic.is_live(),
+        "a promoted outcome stays semantically live"
+    );
     }
     engine
         .ingest(ContextIngress::UserMessage {
@@ -1329,7 +1347,8 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
             kind: ContextKind::Constraint,
             scope: ContextScope::Pinned,
             retention: ContextRetention::Pinned,
-            state: ContextState::Active,
+            attention: AttentionState::Active,
+            semantic: SemanticState::Live,
             importance: 1.0,
             relevance: 1.0,
             created_tick: 1,
@@ -1353,7 +1372,8 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
             kind: ContextKind::Constraint,
             scope: ContextScope::Pinned,
             retention: ContextRetention::Pinned,
-            state: ContextState::Active,
+            attention: AttentionState::Active,
+            semantic: SemanticState::Live,
             importance: 1.0,
             relevance: 1.0,
             created_tick: 2,
@@ -1445,7 +1465,7 @@ async fn task_close_promotes_archived_durable_outcomes_and_resyncs_scope_id() {
         let mut state = engine.state.lock().await;
         for item in &mut state.items {
             if item.id == decision_id {
-                item.state = ContextState::Archived;
+                item.attention = AttentionState::Archived;
                 item.relevance = 0.0;
                 // A high-value durable outcome; the residency pass after the
                 // close must not immediately demote it again.
@@ -1469,8 +1489,8 @@ async fn task_close_promotes_archived_durable_outcomes_and_resyncs_scope_id() {
     assert!(
         report.transitions.iter().any(|t| {
             t.item_id == decision_id
-                && t.from == ContextState::Archived
-                && t.to == ContextState::Active
+                && t.from == AttentionState::Archived
+                && t.to == AttentionState::Active
         }),
         "the archived durable outcome must promote on close, got: {:?}",
         report.transitions
@@ -1483,8 +1503,8 @@ async fn task_close_promotes_archived_durable_outcomes_and_resyncs_scope_id() {
         .find(|item| item.id == decision_id)
         .expect("decision item");
     assert_eq!(
-        decision.state,
-        ContextState::Active,
+        decision.attention,
+        AttentionState::Active,
         "promoted outcomes return to the active set"
     );
     assert_eq!(
