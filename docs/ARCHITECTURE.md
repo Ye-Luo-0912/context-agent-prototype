@@ -159,6 +159,10 @@ Tools receive a `ToolExecutionRequest` and return `ToolOutput`.
 
 They do not receive a ContextEngine, memory store, or conversation transcript.
 
+The trait has three members: `specs()` (pure — the stable model surface for
+one round), `gc()` (the explicit lifecycle safe point the runtime calls once
+per model round; default no-op) and `execute`.
+
 `ToolExecutionRequest` carries a `CancellationToken` (`cancel`), so long-running
 work (searches, shell processes) can be aborted cooperatively by the caller.
 Tool risk classes (`ReadOnly` / `WorkspaceWrite` / `ProcessExecution`) drive
@@ -211,8 +215,12 @@ ToolCatalog → capability discovery → ActiveToolSet → model request
 ```
 
 Tools move through `Available → Loaded → Active → Warm → Unloaded`; only
-loaded/active tools appear in `specs()`, and a lazy GC cools idle tools
-out of the surface on every model request. The always-visible control
+loaded/active tools appear in `specs()`. `specs()` is pure: the actor runs
+`ToolDispatcher::gc()` once per model round at an explicit safe point
+(start of the round, before the budget), so budget, prompt assembly and
+tool-call validation all observe one stable surface per round — a tool
+cannot age out from under the model between seeing its schema and calling
+it. The always-visible control
 tools `capability.search` / `capability.load` / `capability.unload` let
 the model discover and drive the lifecycle (load `git.status` when the
 task needs git). Execution of a catalog tool is always permitted — the

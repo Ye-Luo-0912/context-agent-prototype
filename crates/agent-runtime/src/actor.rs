@@ -380,6 +380,12 @@ impl RuntimeActor {
             }
         }
 
+        // Tool lifecycle safe point: age the tool catalog exactly once per
+        // model round, before the surface is captured for the budget and the
+        // prompt. `specs()` stays pure, so budget, prompt and tool-call
+        // validation all see the same surface within the round.
+        self.kernel.tool_gc();
+
         // The engine only ever sees its own slice of the provider window:
         // the output reserve, system policy, turn frame and active tool
         // schemas are the runtime's share and are subtracted before the

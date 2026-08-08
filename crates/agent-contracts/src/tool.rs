@@ -54,6 +54,15 @@ pub struct ToolExecutionRequest {
 
 #[async_trait]
 pub trait ToolDispatcher: Send + Sync {
+    /// The current tool surface. MUST be pure: a model round reads it for
+    /// the budget, the prompt and tool-call validation, so the surface has
+    /// to stay stable within a round.
     fn specs(&self) -> Vec<ToolSpec>;
+
+    /// Explicit lifecycle maintenance safe point, called by the runtime
+    /// once per model round. Dispatchers with mutable tool lifecycles
+    /// (idle aging, unloading) run their GC here — never inside `specs()`.
+    fn gc(&self) {}
+
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput>;
 }

@@ -194,10 +194,13 @@ impl BuiltinToolDispatcher {
         self.tick.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Age transitions on every model request: idle tools cool Loaded ->
-    /// Warm and then Warm -> Unloaded, so the model surface tracks recent
-    /// use. Core tools never age out.
-    fn gc(&self) {
+    /// Age transitions at an explicit runtime safe point: idle tools cool
+    /// Loaded -> Warm and then Warm -> Unloaded, so the model surface
+    /// tracks recent use. Core tools never age out. Called once per model
+    /// round by the runtime — never implicitly from `specs()`, which must
+    /// stay pure so budget, prompt and tool-call validation all observe one
+    /// stable surface per round.
+    pub fn gc(&self) {
         let tick = self.tick_now();
         let mut catalog = self.catalog.write().expect("tool catalog poisoned");
         for (name, entry) in catalog.iter_mut() {
@@ -271,7 +274,9 @@ struct SearchArgs {
 #[async_trait::async_trait]
 impl ToolDispatcher for BuiltinToolDispatcher {
     fn specs(&self) -> Vec<ToolSpec> {
-        self.gc();
+        // Pure read: lifecycle aging happens only at the explicit runtime
+        // safe point (`gc()`), never here, so one model round sees a stable
+        // tool surface for budget, prompt and validation alike.
         let catalog = self.catalog.read().expect("tool catalog poisoned");
         let mut specs: Vec<ToolSpec> = catalog
             .iter()
@@ -281,6 +286,13 @@ impl ToolDispatcher for BuiltinToolDispatcher {
         specs.extend(Self::meta_specs());
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         specs
+    }
+
+    fn gc(&self) {
+        // The explicit lifecycle safe point the runtime calls once per
+        // model round; delegates to the inherent method so callers on the
+        // concrete type and through the trait observe the same aging.
+        Self::gc(self);
     }
 
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
@@ -468,9 +480,17 @@ mod tests {
         );
         dispatcher.load("fs.write").unwrap();
         assert!(surface(&dispatcher).contains(&"fs.write".to_string()));
-        // Each specs() call advances the GC tick.
+        // specs() is pure: reading the surface must not age the lifecycle.
         for _ in 0..3 {
             let _ = surface(&dispatcher);
+        }
+        assert!(
+            surface(&dispatcher).contains(&"fs.write".to_string()),
+            "specs() must never mutate the tool lifecycle"
+        );
+        // Only an explicit gc() at the runtime safe point ages the catalog.
+        for _ in 0..4 {
+            dispatcher.gc();
         }
         assert!(
             !surface(&dispatcher).contains(&"fs.write".to_string()),

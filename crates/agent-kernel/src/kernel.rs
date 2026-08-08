@@ -117,6 +117,13 @@ impl AgentKernel {
         self.tools.specs()
     }
 
+    /// Run the tool lifecycle GC at a runtime safe point. `specs()` is pure;
+    /// the actor ages the tool catalog exactly once per model round, before
+    /// the surface is captured for the budget and the prompt.
+    pub fn tool_gc(&self) {
+        self.tools.gc();
+    }
+
     pub async fn start(&self) -> AgentResult<()> {
         self.emit(RuntimeEvent::RunStarted).await
     }

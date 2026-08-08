@@ -240,6 +240,10 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
         specs
     }
 
+    fn gc(&self) {
+        self.base.gc();
+    }
+
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
         if let Some(capability) = self.capabilities.by_tool(&request.call.name) {
             self.capabilities
