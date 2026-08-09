@@ -4,15 +4,13 @@
 //! line each, see `context-contextcore::wire`). It runs a real in-process
 //! `ContextEngine` chosen with `--engine`; the adapter crate is the client.
 //! A future real ContextCore runtime only has to speak the same protocol —
-//! nothing on the agent side changes.
+//! nothing on the agent side changes. The protocol handling lives in
+//! `agent_context_service::handle`; this binary is only the stdio loop.
 
-use std::sync::Arc;
-
-use agent_contracts::{AgentError, ContextEngine};
-use context_baselines::{AppendOnlyEngine, RollingSummaryEngine};
-use context_contextcore::{PROTOCOL_VERSION, ServiceOp, ServiceRequest, ServiceResponse};
-use context_simple::{SimpleContextConfig, SimpleContextEngine};
-use serde_json::Value;
+use agent_context_service::{build_engine, handle};
+use agent_contracts::ContextEngine;
+use agent_process::PROTOCOL_VERSION;
+use context_contextcore::{ServiceOp, ServiceRequest, ServiceResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 
 fn usage() -> ! {
@@ -22,64 +20,6 @@ fn usage() -> ! {
          Speaks the context-contextcore wire protocol on stdin/stdout.\n"
     );
     std::process::exit(2);
-}
-
-fn build_engine(engine: &str) -> Arc<dyn ContextEngine> {
-    match engine {
-        "dynamic" => Arc::new(SimpleContextEngine::new(SimpleContextConfig::default())),
-        "append" => Arc::new(AppendOnlyEngine::new()),
-        "rolling" => Arc::new(RollingSummaryEngine::with_config(
-            context_baselines::RollingConfig::default(),
-        )),
-        other => {
-            eprintln!("unknown engine: {other}");
-            usage();
-        }
-    }
-}
-
-async fn handle(op: ServiceOp, engine: &dyn ContextEngine) -> Result<Value, AgentError> {
-    match op {
-        ServiceOp::Ping => Ok(Value::String("pong".into())),
-        ServiceOp::Ingest { ingress } => {
-            engine.ingest(ingress).await?;
-            Ok(Value::Null)
-        }
-        ServiceOp::Maintain { trigger } => {
-            let report = engine.maintain(trigger).await?;
-            serde_json::to_value(report).map_err(|e| AgentError::Context(e.to_string()))
-        }
-        ServiceOp::Gc => {
-            let report = engine.gc().await?;
-            serde_json::to_value(report).map_err(|e| AgentError::Context(e.to_string()))
-        }
-        ServiceOp::Materialize { query } => {
-            let materialized = engine.materialize(query).await?;
-            serde_json::to_value(materialized).map_err(|e| AgentError::Context(e.to_string()))
-        }
-        ServiceOp::OpenScope { kind, parent } => {
-            let scope_id = engine.open_scope(kind, parent).await?;
-            serde_json::to_value(scope_id).map_err(|e| AgentError::Context(e.to_string()))
-        }
-        ServiceOp::CloseScope { scope_id } => {
-            let transitions = engine.close_scope(scope_id).await?;
-            serde_json::to_value(transitions).map_err(|e| AgentError::Context(e.to_string()))
-        }
-        ServiceOp::Diagnostics => {
-            let diagnostics = engine.diagnostics().await?;
-            serde_json::to_value(diagnostics).map_err(|e| AgentError::Context(e.to_string()))
-        }
-        ServiceOp::Inspect { limit } => {
-            let items = engine.inspect(limit).await?;
-            serde_json::to_value(items).map_err(|e| AgentError::Context(e.to_string()))
-        }
-        ServiceOp::Checkpoint => engine.checkpoint().await,
-        ServiceOp::Restore { data } => {
-            engine.restore(data).await?;
-            Ok(Value::Null)
-        }
-        ServiceOp::Shutdown => Ok(Value::Null),
-    }
 }
 
 #[tokio::main]

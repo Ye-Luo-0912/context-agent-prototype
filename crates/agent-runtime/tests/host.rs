@@ -1,10 +1,13 @@
 //! Module host tests: typed capability registration and lookup, duplicate
 //! rejection, and lifecycle ordering.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use agent_contracts::{
-    AgentResult, ApprovalGate, CancellationToken, Capability, CapabilityActivation,
+    AgentError, AgentResult, ApprovalGate, CancellationToken, Capability, CapabilityActivation,
     CapabilityInvocationContext, CapabilityLifecycle, CapabilityManifest, CapabilityOutcome,
     CapabilityStatus, CapabilityTransport, ContextDiagnostics, ContextEngine, ContextIngress,
     ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
@@ -13,8 +16,8 @@ use agent_contracts::{
     ToolLifecycle, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_runtime::{
-    APPROVAL_POLICY, CapabilityAwareDispatcher, CapabilityId, ContextModule, ModelModule, Module,
-    ModuleHost, ServiceRegistry, ToolModule,
+    APPROVAL_POLICY, CapabilityAwareDispatcher, CapabilityId, CapabilityRunState, ContextModule,
+    ModelModule, Module, ModuleHost, ServiceRegistry, ToolModule,
 };
 use serde_json::json;
 
@@ -1140,5 +1143,139 @@ async fn unified_search_pages_and_spills_to_the_workspace() {
     assert_eq!(
         output.metadata["total"], 4,
         "fs.read + three capability tools"
+    );
+}
+
+/// A capability whose `start()` is slow on purpose and fails on the first
+/// attempt, so lifecycle tests can exercise the race window and the
+/// Failed -> retry path.
+struct InstrumentedCapability {
+    manifest: CapabilityManifest,
+    starts: Arc<AtomicUsize>,
+    fail_first: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Capability for InstrumentedCapability {
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+    fn tool_specs(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+    async fn start(&self) -> AgentResult<()> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        // Give a concurrent caller time to observe the pre-start state.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        if self.fail_first.swap(false, Ordering::SeqCst) {
+            return Err(AgentError::Internal("instrumented start failure".into()));
+        }
+        Ok(())
+    }
+    async fn invoke(
+        &self,
+        call: ToolCall,
+        _ctx: CapabilityInvocationContext,
+    ) -> AgentResult<CapabilityOutcome> {
+        Ok(CapabilityOutcome::Value(ToolOutput {
+            call_id: call.id,
+            tool_name: call.name.clone(),
+            ok: true,
+            summary: "ran".into(),
+            model_content: "ran".into(),
+            artifact_ref: None,
+            metadata: json!({}),
+        }))
+    }
+}
+
+fn instrumented_manifest(id: &str) -> CapabilityManifest {
+    CapabilityManifest {
+        id: id.into(),
+        version: "1.0.0".into(),
+        name: id.into(),
+        summary: "instrumented".into(),
+        status: CapabilityStatus::Experimental,
+        provides: vec![agent_contracts::CapabilityKind::Tool],
+        permissions: vec!["workspace:read".into()],
+        requires: Vec::new(),
+        tools: Vec::new(),
+        lifecycle: CapabilityLifecycle::Lazy,
+        transport: CapabilityTransport::Builtin,
+    }
+}
+
+#[tokio::test]
+async fn concurrent_ensure_started_serializes_to_a_single_start() {
+    let host = ModuleHost::new();
+    let registry = host.capability_registry();
+    let starts = Arc::new(AtomicUsize::new(0));
+    host.register_capability(Arc::new(InstrumentedCapability {
+        manifest: instrumented_manifest("slow"),
+        starts: starts.clone(),
+        fail_first: Arc::new(AtomicBool::new(false)),
+    }))
+    .unwrap();
+
+    // Both callers race the same transition; the per-capability lifecycle
+    // lock must collapse them into exactly one `start()`.
+    let (a, b) = tokio::join!(
+        registry.ensure_started("slow"),
+        registry.ensure_started("slow"),
+    );
+    a.unwrap();
+    b.unwrap();
+
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "concurrent ensure_started calls must produce exactly one start()"
+    );
+    let entry = registry
+        .catalog()
+        .into_iter()
+        .find(|entry| entry.id == "slow")
+        .expect("catalog must list the capability");
+    assert_eq!(
+        entry.run_state,
+        CapabilityRunState::Started,
+        "a successful start must leave the capability Started"
+    );
+}
+
+#[tokio::test]
+async fn failed_start_is_observable_and_a_later_start_retries() {
+    let host = ModuleHost::new();
+    let registry = host.capability_registry();
+    let starts = Arc::new(AtomicUsize::new(0));
+    host.register_capability(Arc::new(InstrumentedCapability {
+        manifest: instrumented_manifest("flaky"),
+        starts: starts.clone(),
+        fail_first: Arc::new(AtomicBool::new(true)),
+    }))
+    .unwrap();
+
+    let first = registry.ensure_started("flaky").await;
+    assert!(first.is_err(), "the instrumented first start must fail");
+    assert_eq!(
+        registry
+            .catalog()
+            .into_iter()
+            .find(|entry| entry.id == "flaky")
+            .map(|entry| entry.run_state),
+        Some(CapabilityRunState::Failed),
+        "a failed start must be observable as Failed"
+    );
+
+    // The failure is not sticky: a later start retries the transition.
+    registry.ensure_started("flaky").await.unwrap();
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        registry
+            .catalog()
+            .into_iter()
+            .find(|entry| entry.id == "flaky")
+            .map(|entry| entry.run_state),
+        Some(CapabilityRunState::Started)
     );
 }

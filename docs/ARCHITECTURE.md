@@ -53,9 +53,10 @@ agent-contracts
       ├──────── agent-workspace
       ├──────── tool-runtime
       ├──────── agent-storage
+      ├──────── agent-process          (framed IPC / child lifecycle / sandbox)
       └──────── agent-kernel
-                    ^
-                    │
+                    ^                  ├── agent-capability-process -> agent-process
+                    │                  └── context-contextcore      -> agent-process
                  agent-tui
 ```
 
@@ -64,6 +65,10 @@ Important consequences:
 - `agent-kernel` does not import `context-simple`.
 - `tool-runtime` does not import `context-simple` or any memory implementation.
 - `agent-tui` is the composition root and chooses concrete implementations.
+- `context-contextcore` implements `ContextEngine` over a process without
+  changing the kernel; the framed transport it uses is the shared
+  `agent-process` host, so every process boundary (context service and
+  process capabilities) speaks one framing/deadline/sandbox policy.
 - Future `context-contextcore` can implement `ContextEngine` without changing the kernel.
 
 ## 4. Stable contracts
@@ -796,8 +801,8 @@ Do not move Agent Kernel, tools, approvals, TUI, or provider code into ContextCo
 A process capability is not sandboxed by *telling* the child what it may
 do — the manifest's `permissions` array is informational, not
 enforcement. Since V1-M9 every out-of-process child runs inside an
-explicit `ProcessSandbox` (shared `ProcessHost`,
-`context-contextcore::host`):
+explicit `ProcessSandbox` (shared `ProcessHost`, since the crate split in
+`agent-process::host`, consumed by `agent-capability-process`):
 
 - **Environment whitelist** — `env_whitelist: Option<Vec<String>>`: when
   set, the child inherits *only* the listed parent variables, plus the
@@ -881,6 +886,57 @@ once (before the lock) and caches both on the entry; every catalog query
 ...) reads the cache. A slow, re-entrant or panicking capability
 implementation can only misbehave at register time — never while holding
 the registry's `RwLock`.
+
+## 9d. Durable turn commit + serialized capability lifecycle (V1-M10 start)
+
+Three consistency gaps closed before V2:
+
+**Turn finalization is a commit, not a fire-and-forget cleanup.** The
+actor's `finalize_turn` walks `TurnState` — `Running` → `ModelFinished` →
+`Committing` → `Committed` — and every mandatory state write must succeed
+before `TurnCompleted` is emitted: tool-observation ingest, the `AfterTool`
+and `AfterModel` maintenance passes, the full GC, and the journal events
+for each (`ContextMaintained`, `ContextGc`, `AssistantMessage`,
+`TurnCompleted`). On the first failure the commit aborts — later writes
+would build on an inconsistent state — the turn frame is dropped, and the
+runtime journals `TurnCommitFailed { phase, message }` (naming the exact
+step) plus `RecoveryRequired` instead of pretending the turn completed.
+"The model answered" and "the runtime durably committed this turn" are two
+different facts; this is the foundation for crash recovery.
+
+**Capability start/stop is serialized per capability.** The registry no
+longer stores a `started: bool`; each entry carries a `CapabilityRunState`
+(`Stopped` / `Starting` / `Started` / `Stopping` / `Failed`) and an async
+`run_lock` held across the `start()`/`stop()` call. Two concurrent
+`ensure_started` calls collapse into exactly one `start()`: the second
+caller either observes `Started` on the fast path or waits on the lock and
+re-checks. A failed start leaves the capability observably `Failed` and a
+later start retries; `stop_all` takes the same lock, so a stop can never
+race an in-flight start. The state is exposed on the catalog rows.
+
+**Every `ContextEngine` method has process-boundary parity by test.** The
+context-service wire gained `ServiceOp::StorageGc` (the conservative
+storage GC is the only place information is deleted, so a wire gap there
+would silently diverge). More importantly, `full_contract_parity_across_
+the_process_boundary` drives a scripted lifecycle covering *every* contract
+method — ingest, maintain, gc, materialize, scope lifecycle, diagnostics,
+inspect, `search_external` / `inspect_external` / `fetch_external`,
+`storage_gc`, checkpoint/restore — through both an in-process engine and
+the service boundary, and asserts the normalized outcomes are identical.
+The checklist lives in one `contract_snapshot` helper: a new trait method
+must be added there, and the parity test then verifies the wire op, the
+service handling and the adapter override automatically. The service is a
+dev-dependency of the adapter crate, so the binary is rebuilt whenever the
+wire protocol changes — a stale service can never masquerade as the
+current protocol.
+
+**Trusted Core direction.** The kernel is not headed toward retirement by
+merging into the runtime. Its stateless primitives — permission/approval,
+effect brokering, event/audit/durability, resource budgets, capability
+authority, sandbox authority, runtime integrity — are the seed of an
+`agent-core` the agent cannot modify, while everything evolvable (actor,
+task manager, scope scheduling, prompt assembly, materialization, adaptive
+policy) stays in `agent-runtime`. Runtime evolves, Core stays trusted.
 
 ## 10. Explicit non-goals for v0.1
 

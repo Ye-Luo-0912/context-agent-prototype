@@ -16,7 +16,9 @@ pub mod task;
 
 pub use actor::{RuntimeActor, spawn_runtime};
 pub use budget::{DEFAULT_OUTPUT_RESERVE, ModelBudget, approx_layer_tokens};
-pub use capability::{CapabilityAwareDispatcher, CapabilityCatalogEntry, CapabilityRegistry};
+pub use capability::{
+    CapabilityAwareDispatcher, CapabilityCatalogEntry, CapabilityRegistry, CapabilityRunState,
+};
 pub use checkpoint::{
     CapabilitySnapshot, RUNTIME_CHECKPOINT_VERSION, RunMetadata, RuntimeCheckpoint,
     TaskManagerSnapshot, TaskRecordSnapshot,

@@ -830,3 +830,16 @@ Consequences:
 - `AfterTool` maintenance now runs once per turn (at persist time) instead
   of once per tool call. The replay/A/B/C harnesses drive the engines
   directly and are unaffected by the kernel's timing.
+
+### 12.1 The turn end is a durable commit (V1-M10)
+
+Persisting the turn is not best-effort cleanup: `finalize_turn` walks
+`Running → ModelFinished → Committing → Committed`, and every mandatory
+write (observation ingest, `AfterTool`/`AfterModel` maintenance, the full
+GC, and their journal events) must succeed before `TurnCompleted` is
+emitted. On the first failure the commit aborts and the runtime journals
+`TurnCommitFailed { phase, message }` + `RecoveryRequired` — the model
+answered, but the context frame was not durably updated. This is what makes
+the long-term record trustworthy: "the model said X" and "the context frame
+reflects X" can only diverge when an explicit recovery-required signal says
+so, never silently.

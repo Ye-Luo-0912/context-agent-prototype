@@ -21,8 +21,8 @@ use agent_contracts::{
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::host::{ProcessHost, ProcessHostConfig, resolve_program};
 use crate::wire::ServiceOp;
+use agent_process::{ProcessHost, ProcessHostConfig, resolve_program};
 
 /// Which engine the spawned service should run. The adapter is agnostic; the
 /// choice belongs to the composition root (same as `--context=` in the TUI).
@@ -104,8 +104,8 @@ impl ContextServiceAdapter {
             max_frame_bytes: config.max_frame_bytes,
             // The context service is the runtime's own trusted sidecar; it
             // keeps the historical inherit-all behavior. The strict sandbox
-            // is applied to *capabilities* (see ProcessCapabilityAdapter).
-            sandbox: crate::host::ProcessSandbox::default(),
+            // is applied to *capabilities* (see agent-capability-process).
+            sandbox: agent_process::ProcessSandbox::default(),
         })
         .await
         .map_err(|e| {
@@ -148,6 +148,12 @@ impl ContextEngine for ContextServiceAdapter {
         let value = self.call(ServiceOp::Gc).await?;
         serde_json::from_value(value)
             .map_err(|e| AgentError::Context(format!("decode gc report: {e}")))
+    }
+
+    async fn storage_gc(&self) -> AgentResult<agent_contracts::StorageGcReport> {
+        let value = self.call(ServiceOp::StorageGc).await?;
+        serde_json::from_value(value)
+            .map_err(|e| AgentError::Context(format!("decode storage gc report: {e}")))
     }
 
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {

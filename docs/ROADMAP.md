@@ -1028,6 +1028,63 @@ stopped trusting declarations:
   membership alone (they come back via retention, affinity or dependency),
   matching the GC mark phase's closed-scope boundary.
 
+## V1-M10 start: durable turn commit, serialized capability lifecycle, process-boundary parity ✅ (implemented)
+
+Three consistency gaps closed before V2:
+
+- **Turn finalization is a commit.** `finalize_turn` walks `Running` →
+  `ModelFinished` → `Committing` → `Committed`; every mandatory state write
+  (observation ingest, `AfterTool`/`AfterModel` maintenance, GC, and their
+  journal events) must succeed before `TurnCompleted` is emitted. On the
+  first failure the commit aborts and the runtime journals
+  `TurnCommitFailed { phase, message }` + `RecoveryRequired` — "the model
+  answered" and "the runtime durably committed this turn" are two facts.
+  This is the crash-recovery foundation.
+- **Capability lifecycle is serialized.** Each registry entry carries a
+  `CapabilityRunState` (`Stopped`/`Starting`/`Started`/`Stopping`/`Failed`)
+  plus a per-capability async run lock held across `start()`/`stop()`:
+  concurrent `ensure_started` calls collapse into one `start()`, a failed
+  start is observably `Failed` and retryable, and stops cannot race starts.
+- **Process host split out of the ContextCore adapter.** The generic host
+  moved to `agent-process` (framed IPC, child lifecycle, sandbox hooks) and
+  the process-capability adapter to `agent-capability-process`;
+  `context-contextcore` is now only the ContextEngine adapter + wire.
+- **Storage GC parity, enforced by test.** `ServiceOp::StorageGc` is on the
+  wire, the adapter overrides `storage_gc`, and a full-contract parity test
+  drives *every* `ContextEngine` method through both an in-process engine
+  and the service boundary, asserting identical normalized outcomes. The
+  checklist is one `contract_snapshot` helper; the service binary is a
+  dev-dependency of the adapter crate so it is rebuilt whenever the
+  protocol changes.
+
+## Next: V1-M10 → V2 (ordered)
+
+1. **V1-M10 Runtime Consistency** — task authority, transactional task
+   transitions, RuntimeCheckpoint, Turn commit. Acceptance: the runtime and
+   the context never drift into a task/state split-brain.
+2. **V1-M11 Context Recall** — store injection, ContextMapView,
+   `context.search`/`fetch`, `gc_epoch`, async store. Acceptance: external
+   information can be pulled back on demand without polluting the prompt.
+3. **V1-M12 Effect Runtime** — every capability routes side effects through
+   one unified EffectRequest/Effect commit. Acceptance: a cancelled
+   operation produces no avoidable stale mutation.
+4. **V1-M13 Extension Sandbox** — process sandbox, env scrub, brokered
+   FS/network, cancel. Acceptance: experimental code cannot exceed the
+   permissions granted to it.
+5. **V1-M14 Resource Policy** — tool schema budget, context hint quota,
+   RiskClass, PermissionSet. Acceptance: the LLM cannot exhaust runtime
+   resources through meta-tools.
+6. **V1-M15 Real Evaluation** — coding workload A/B/C + lifecycle metrics.
+   Acceptance: the dynamic runtime saves tokens without lowering task
+   success rate.
+7. **V2 Self-Iteration** — generate → sandbox → test → replay → evaluate →
+   canary → stable. The LLM grows capabilities, but cannot modify the
+   evaluation or permission Core.
+
+M12/M13 strictly precede Self-Iteration: a capability that can already
+stage effects and a sandbox that can contain it are prerequisites for
+letting the LLM grow capabilities autonomously.
+
 ## P2: provider/tool secondary issues ✅ (implemented)
 
 - **Stream retry can no longer duplicate output.** `RetryingTransport`

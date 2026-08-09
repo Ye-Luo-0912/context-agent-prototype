@@ -87,6 +87,21 @@ pub enum RuntimeEvent {
         summary: String,
     },
     TurnCompleted,
+    /// A mandatory turn-commit step failed: the model answered, but the
+    /// runtime did not durably commit the turn (observation ingest,
+    /// maintenance, GC or a journal event failed). The turn is NOT
+    /// completed; `phase` names the exact step recovery must look at. The
+    /// runtime drops the turn frame on the first failure — later writes
+    /// would compound the inconsistency.
+    TurnCommitFailed {
+        phase: String,
+        message: String,
+    },
+    /// The runtime detected state it cannot reconcile by itself (a failed
+    /// turn commit, a journal/effect disagreement). Operators and future
+    /// crash-recovery machinery must intervene before normal operation
+    /// resumes with full consistency guarantees.
+    RecoveryRequired,
     RunCompleted,
 }
 

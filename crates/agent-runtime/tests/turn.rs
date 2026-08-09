@@ -977,4 +977,125 @@ async fn stale_tool_rolls_back_its_prepared_effect() {
     );
 }
 
+/// A context engine whose `AssistantMessage` ingest always fails: the
+/// finalization commit must surface `TurnCommitFailed` + `RecoveryRequired`
+/// instead of swallowing the error and clearing the turn silently.
+#[derive(Debug)]
+struct FailingAssistantIngestEngine;
+
+#[async_trait::async_trait]
+impl ContextEngine for FailingAssistantIngestEngine {
+    async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+        if matches!(ingress, ContextIngress::AssistantMessage { .. }) {
+            return Err(agent_contracts::AgentError::Context(
+                "journal backend unavailable".into(),
+            ));
+        }
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            focus: None,
+            items: Vec::new(),
+            external: Vec::new(),
+            selected: Vec::new(),
+            approx_tokens: 0,
+            diagnostics: ContextDiagnostics::default(),
+        })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+}
+
+/// A plain, non-streaming model: one fixed assistant reply, no tool calls.
+#[derive(Debug)]
+struct PlainModel;
+
+#[async_trait::async_trait]
+impl ModelTransport for PlainModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        Ok(ModelOutput {
+            content: "final answer".into(),
+            tool_calls: Vec::new(),
+            usage: Default::default(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn failed_turn_commit_emits_turn_commit_failed_and_recovery_required() {
+    let handle = spawn_with(
+        Arc::new(PlainModel),
+        Arc::new(FailingAssistantIngestEngine),
+        Arc::new(TestToolDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("hello".into()).await.unwrap();
+
+    let mut commit_failed = None;
+    let mut recovery_required = false;
+    let mut turn_completed = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::TurnCommitFailed { phase, message } => {
+                    commit_failed = Some((phase, message));
+                }
+                RuntimeEvent::RecoveryRequired => recovery_required = true,
+                RuntimeEvent::TurnCompleted => turn_completed = true,
+                _ => {}
+            }
+        }
+        if commit_failed.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (phase, message) = commit_failed.expect("the failed commit must be journaled");
+    assert_eq!(
+        phase, "assistant_message_ingest",
+        "the failing step must be named"
+    );
+    assert!(
+        message.contains("journal backend unavailable"),
+        "the journaled failure must carry the engine error: {message}"
+    );
+    assert!(
+        recovery_required,
+        "a failed turn commit must require recovery"
+    );
+    assert!(
+        !turn_completed,
+        "a turn whose commit failed must never emit TurnCompleted"
+    );
+}
+
 // ---------------------------------------------------------------------------

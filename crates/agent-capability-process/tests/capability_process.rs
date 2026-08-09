@@ -1,19 +1,21 @@
 //! Process-capability adapter tests: `Capability` served by a separate
-//! process over the shared `ProcessHost`, driven by the `mock_host` test
-//! target. This is the generic shape every process capability reuses — no
-//! per-capability stdio adapter, exactly like the context-service adapter.
+//! process over the shared `ProcessHost` (from `agent-process`), driven by
+//! the `mock_host` bin. This is the generic shape every process capability
+//! reuses — no per-capability stdio adapter, exactly like the
+//! context-service adapter.
 
 mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent_capability_process::ProcessCapabilityAdapter;
 use agent_contracts::{
     AgentResult, CancellationToken, Capability, CapabilityInvocationContext, CapabilityKind,
     CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
     CapabilityTransport, ToolCall, ToolRisk, ToolSpec,
 };
-use context_contextcore::{ProcessCapabilityAdapter, ProcessHostConfig};
+use agent_process::ProcessHostConfig;
 use serde_json::json;
 
 fn manifest_with_program(program: &str) -> CapabilityManifest {

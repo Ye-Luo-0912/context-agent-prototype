@@ -3,10 +3,22 @@
 version = 4
 
 [[package]]
+name = "agent-capability-process"
+version = "0.1.0"
+dependencies = [
+ "agent-contracts",
+ "agent-process",
+ "async-trait",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "agent-context-service"
 version = "0.1.0"
 dependencies = [
  "agent-contracts",
+ "agent-process",
  "context-baselines",
  "context-contextcore",
  "context-simple",
@@ -36,6 +48,17 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "agent-process"
+version = "0.1.0"
+dependencies = [
+ "agent-contracts",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -312,17 +335,16 @@ dependencies = [
 name = "context-contextcore"
 version = "0.1.0"
 dependencies = [
+ "agent-context-service",
  "agent-contracts",
  "agent-kernel",
+ "agent-process",
  "agent-runtime",
  "async-trait",
  "context-simple",
- "libc",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
- "tracing",
 ]
 
 [[package]]

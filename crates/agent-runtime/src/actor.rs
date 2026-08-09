@@ -67,7 +67,61 @@ struct ActiveTurn {
     /// The tool surface of the current model round, captured once after the
     /// tool lifecycle GC. `None` only before the first round starts.
     tool_surface: Option<ToolSurfaceSnapshot>,
+    /// Where the turn is in its commit lifecycle (see `TurnState`).
+    turn_state: TurnState,
     op: Option<InFlightOp>,
+}
+
+/// The commit lifecycle of a turn. `ModelFinished` means the model has
+/// answered but the runtime has not persisted this turn yet; only after
+/// every mandatory state write succeeds does the turn reach `Committed`
+/// and `TurnCompleted` is emitted. A turn that fails mid-commit is dropped
+/// and `RecoveryRequired` is journaled — "the model answered" and "the
+/// runtime durably committed this turn" are two different facts, and the
+/// latter is the only one that completes a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnState {
+    /// The turn is executing (model round or tool loop in flight).
+    Running,
+    /// The model produced its final message; finalization has not started.
+    ModelFinished,
+    /// Finalization is writing the mandatory state (ingest/maintain/GC).
+    Committing,
+    /// Every mandatory state write succeeded; the turn is durable.
+    Committed,
+}
+
+/// Which mandatory finalization step failed, so the journaled
+/// `TurnCommitFailed` names the exact place recovery must look at.
+#[derive(Debug, Clone, Copy)]
+enum TurnCommitPhase {
+    ToolObservationIngest,
+    AfterToolMaintain,
+    AfterToolMaintainedEvent,
+    AssistantMessageIngest,
+    AssistantMessageEvent,
+    AfterModelMaintain,
+    AfterModelMaintainedEvent,
+    Gc,
+    GcEvent,
+    TurnCompletedEvent,
+}
+
+impl TurnCommitPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            TurnCommitPhase::ToolObservationIngest => "tool_observation_ingest",
+            TurnCommitPhase::AfterToolMaintain => "after_tool_maintain",
+            TurnCommitPhase::AfterToolMaintainedEvent => "after_tool_maintained_event",
+            TurnCommitPhase::AssistantMessageIngest => "assistant_message_ingest",
+            TurnCommitPhase::AssistantMessageEvent => "assistant_message_event",
+            TurnCommitPhase::AfterModelMaintain => "after_model_maintain",
+            TurnCommitPhase::AfterModelMaintainedEvent => "after_model_maintained_event",
+            TurnCommitPhase::Gc => "gc",
+            TurnCommitPhase::GcEvent => "gc_event",
+            TurnCommitPhase::TurnCompletedEvent => "turn_completed_event",
+        }
+    }
 }
 
 /// What a spawned operation reports when it finishes.
@@ -442,6 +496,7 @@ impl RuntimeActor {
             model_round: 0,
             pending_tools: VecDeque::new(),
             tool_surface: None,
+            turn_state: TurnState::Running,
             op: None,
         });
         self.advance_turn(op_tx).await;
@@ -1098,37 +1153,67 @@ impl RuntimeActor {
     /// observation is tagged with the tool scope that produced it. Context
     /// directives were already executed at operation-commit time (see
     /// `execute_directive`), so finalization only persists observations.
+    ///
+    /// Finalization is a commit: every mandatory state write (observation
+    /// ingest, the maintenance passes, GC and their journal events) must
+    /// succeed before the turn is `Committed` and `TurnCompleted` is
+    /// emitted. On the first failure the commit aborts — later writes would
+    /// build on a state that is already inconsistent — and the runtime
+    /// journals `TurnCommitFailed` (naming the phase) plus
+    /// `RecoveryRequired` instead of pretending the turn completed.
     async fn finalize_turn(&mut self, content: String) {
+        if let Some(turn) = self.state.turn.as_mut() {
+            turn.turn_state = TurnState::ModelFinished;
+        }
         let mut ingested = false;
         if let Some(turn) = self.state.turn.as_mut() {
             for step in &turn.turn_frame.steps {
-                if let TurnFrameStep::ToolResult { output, scope_id } = step
-                    && self
-                        .kernel
-                        .context_ingest(ContextIngress::ToolObservation {
-                            output: output.clone(),
-                            scope_id: *scope_id,
-                        })
-                        .await
-                        .is_ok()
+                let TurnFrameStep::ToolResult { output, scope_id } = step else {
+                    continue;
+                };
+                if let Err(error) = self
+                    .kernel
+                    .context_ingest(ContextIngress::ToolObservation {
+                        output: output.clone(),
+                        scope_id: *scope_id,
+                    })
+                    .await
                 {
-                    ingested = true;
+                    return self
+                        .commit_failed(TurnCommitPhase::ToolObservationIngest, error)
+                        .await;
                 }
+                ingested = true;
             }
         }
-        if ingested
-            && let Ok(report) = self
+        if let Some(turn) = self.state.turn.as_mut() {
+            turn.turn_state = TurnState::Committing;
+        }
+        if ingested {
+            let report = match self
                 .kernel
                 .context_maintain(ContextMaintenanceTrigger::AfterTool)
                 .await
-        {
-            let _ = self
+            {
+                Ok(report) => report,
+                Err(error) => {
+                    return self
+                        .commit_failed(TurnCommitPhase::AfterToolMaintain, error)
+                        .await;
+                }
+            };
+            if let Err(error) = self
                 .kernel
                 .emit_event(RuntimeEvent::ContextMaintained {
                     trigger: ContextMaintenanceTrigger::AfterTool,
                     report,
                 })
-                .await;
+                .await
+            {
+                return self
+                    .commit_failed(TurnCommitPhase::AfterToolMaintainedEvent, error)
+                    .await;
+            }
         }
         if let Err(error) = self
             .kernel
@@ -1137,42 +1222,85 @@ impl RuntimeActor {
             })
             .await
         {
-            let _ = self
-                .kernel
-                .emit_event(RuntimeEvent::Error {
-                    message: error.to_string(),
-                })
+            return self
+                .commit_failed(TurnCommitPhase::AssistantMessageIngest, error)
                 .await;
-            self.state.turn = None;
-            return;
         }
-        let _ = self
+        if let Err(error) = self
             .kernel
             .emit_event(RuntimeEvent::AssistantMessage { content })
-            .await;
-        if let Ok(report) = self
+            .await
+        {
+            return self
+                .commit_failed(TurnCommitPhase::AssistantMessageEvent, error)
+                .await;
+        }
+        let report = match self
             .kernel
             .context_maintain(ContextMaintenanceTrigger::AfterModel)
             .await
         {
-            let _ = self
-                .kernel
-                .emit_event(RuntimeEvent::ContextMaintained {
-                    trigger: ContextMaintenanceTrigger::AfterModel,
-                    report,
-                })
+            Ok(report) => report,
+            Err(error) => {
+                return self
+                    .commit_failed(TurnCommitPhase::AfterModelMaintain, error)
+                    .await;
+            }
+        };
+        if let Err(error) = self
+            .kernel
+            .emit_event(RuntimeEvent::ContextMaintained {
+                trigger: ContextMaintenanceTrigger::AfterModel,
+                report,
+            })
+            .await
+        {
+            return self
+                .commit_failed(TurnCommitPhase::AfterModelMaintainedEvent, error)
                 .await;
         }
         // Turn boundary: the full GC pass compacts what the per-event
         // residency machine demoted. Eviction is reversible, and the report
         // explains every eviction and reactivation.
-        if let Ok(report) = self.kernel.context_gc().await {
-            let _ = self
-                .kernel
-                .emit_event(RuntimeEvent::ContextGc { report })
+        let report = match self.kernel.context_gc().await {
+            Ok(report) => report,
+            Err(error) => {
+                return self.commit_failed(TurnCommitPhase::Gc, error).await;
+            }
+        };
+        if let Err(error) = self
+            .kernel
+            .emit_event(RuntimeEvent::ContextGc { report })
+            .await
+        {
+            return self.commit_failed(TurnCommitPhase::GcEvent, error).await;
+        }
+        // Every mandatory state write is durable: the turn is Committed,
+        // and the completion itself is journaled.
+        if let Err(error) = self.kernel.emit_event(RuntimeEvent::TurnCompleted).await {
+            return self
+                .commit_failed(TurnCommitPhase::TurnCompletedEvent, error)
                 .await;
         }
-        let _ = self.kernel.emit_event(RuntimeEvent::TurnCompleted).await;
+        if let Some(turn) = self.state.turn.as_mut() {
+            turn.turn_state = TurnState::Committed;
+        }
+        self.state.turn = None;
+    }
+
+    /// Abort the turn commit: journal the failed phase and the recovery
+    /// requirement, then drop the turn frame. No further mandatory writes
+    /// happen after a failure — they would build on a state that is already
+    /// inconsistent.
+    async fn commit_failed(&mut self, phase: TurnCommitPhase, error: AgentError) {
+        let _ = self
+            .kernel
+            .emit_event(RuntimeEvent::TurnCommitFailed {
+                phase: phase.as_str().into(),
+                message: error.to_string(),
+            })
+            .await;
+        let _ = self.kernel.emit_event(RuntimeEvent::RecoveryRequired).await;
         self.state.turn = None;
     }
 

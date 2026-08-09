@@ -4,6 +4,8 @@ members = [
     "crates/context-simple",
     "crates/context-baselines",
     "crates/context-contextcore",
+    "crates/agent-process",
+    "crates/agent-capability-process",
     "crates/agent-context-service",
     "crates/agent-workspace",
     "crates/tool-runtime",
@@ -26,6 +28,8 @@ agent-contracts = { path = "crates/agent-contracts" }
 context-simple = { path = "crates/context-simple" }
 context-baselines = { path = "crates/context-baselines" }
 context-contextcore = { path = "crates/context-contextcore" }
+agent-process = { path = "crates/agent-process" }
+agent-capability-process = { path = "crates/agent-capability-process" }
 agent-workspace = { path = "crates/agent-workspace" }
 tool-runtime = { path = "crates/tool-runtime" }
 agent-storage = { path = "crates/agent-storage" }

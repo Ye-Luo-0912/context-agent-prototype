@@ -15,11 +15,10 @@ use agent_contracts::{
     AgentError, AgentResult, Capability, CapabilityInvocationContext, CapabilityManifest,
     CapabilityOutcome, CapabilityTransport, ToolCall, ToolOutput,
 };
+use agent_process::{ProcessHost, ProcessHostConfig, ProcessSandbox};
 use async_trait::async_trait;
 use serde_json::json;
 use tokio::sync::Mutex;
-
-use crate::host::{ProcessHost, ProcessHostConfig};
 
 /// A `Capability` whose service is a separate process. The manifest's
 /// declared `tools` are served to the model without starting the process;
@@ -51,7 +50,7 @@ impl ProcessCapabilityAdapter {
             startup_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
             max_frame_bytes: 16 * 1024 * 1024,
-            sandbox: crate::host::ProcessSandbox {
+            sandbox: ProcessSandbox {
                 // No parent secrets: only the non-secret platform essentials
                 // are inherited; anything else must be granted explicitly
                 // via `env` overrides. OPENAI_API_KEY, HOME, credentials and

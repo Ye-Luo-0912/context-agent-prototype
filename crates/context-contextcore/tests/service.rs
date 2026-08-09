@@ -313,3 +313,248 @@ async fn missing_service_fails_fast_with_clear_error() {
         "unexpected error: {error}"
     );
 }
+
+/// Drive every `ContextEngine` contract method through a fixed script and
+/// collect the observable outcome as a normalized JSON snapshot.
+///
+/// This is the process-boundary parity checklist: when a new method is
+/// added to `ContextEngine`, extend this script and the parity test below
+/// automatically verifies that the wire op, the service handling and the
+/// adapter override all exist and agree with the in-process engine. No new
+/// trait method may land without a corresponding entry here.
+async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "refactor AuthService".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::Pin {
+            content: "never touch generated files".into(),
+            kind: agent_contracts::ContextKind::Constraint,
+        })
+        .await
+        .unwrap();
+    let maintain = engine
+        .maintain(ContextMaintenanceTrigger::UserInput)
+        .await
+        .unwrap();
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "continue the refactor".into(),
+            budget_tokens: 4096,
+            hints: Default::default(),
+        })
+        .await
+        .unwrap();
+    let scope_id = engine
+        .open_scope(agent_contracts::ScopeKind::Tool, None)
+        .await
+        .unwrap();
+    // Fill the working set so the later gc() has something to evict and the
+    // store has entries to externalize — retrieval and storage GC need data.
+    for turn in 0..4 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: format!("turn {turn}: fix AuthService.rs"),
+            })
+            .await
+            .unwrap();
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                output: ToolOutput {
+                    call_id: format!("c{turn}"),
+                    tool_name: "shell.exec".into(),
+                    ok: turn % 2 == 0,
+                    summary: "ran".into(),
+                    model_content: format!("AuthService.rs line {turn}"),
+                    artifact_ref: None,
+                    metadata: json!({}),
+                },
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterTool)
+            .await
+            .unwrap();
+    }
+    let gc = engine.gc().await.unwrap();
+    let transitions = engine.close_scope(scope_id).await.unwrap();
+    let inspect = engine.inspect(100).await.unwrap();
+    let search = engine
+        .search_external(agent_contracts::ContextSearchQuery {
+            query: "AuthService".into(),
+            kind: None,
+            scope: None,
+            task_id: None,
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    // Pull one externalized entry by the id the search just returned, so
+    // inspect_external / fetch_external also cross the boundary.
+    let first_id = search.first().map(|entry| entry.item_id);
+    let inspect_external = match first_id {
+        Some(id) => engine.inspect_external(id).await.unwrap(),
+        None => None,
+    };
+    let fetch_external = match first_id {
+        Some(id) => engine.fetch_external(id).await.unwrap(),
+        None => None,
+    };
+    let storage_gc = engine.storage_gc().await.unwrap();
+    let diagnostics = engine.diagnostics().await.unwrap();
+    // Checkpoint/restore round-trip as the last step: the restored engine
+    // must report the same diagnostics it did before the round-trip.
+    let checkpoint = engine.checkpoint().await.unwrap();
+    engine.restore(checkpoint.clone()).await.unwrap();
+    let post_restore_diagnostics = engine.diagnostics().await.unwrap();
+
+    let mut snapshot = json!({
+        "maintain": maintain,
+        "materialized_item_count": materialized.items.len(),
+        "materialized_approx_tokens": materialized.approx_tokens,
+        "gc": gc,
+        "scope_close_transitions": transitions.len(),
+        "inspect": inspect,
+        "search_external": search,
+        "inspect_external": inspect_external,
+        "fetch_external": fetch_external,
+        "storage_gc": storage_gc,
+        "diagnostics": diagnostics,
+        "checkpoint": checkpoint,
+        "post_restore_diagnostics": post_restore_diagnostics,
+    });
+    // Item/scope/run ids are random per engine instance and can never match
+    // across two runs; everything else must.
+    strip_random_uuids(&mut snapshot);
+    snapshot
+}
+
+/// Replace every UUID-shaped string in the JSON tree with a placeholder, so
+/// two engine instances (which mint random item/scope ids) can be compared
+/// on everything that is actually deterministic. Works for plain ids and
+/// for uris embedding one (`context://run/<uuid>`).
+fn strip_random_uuids(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            let bytes = text.as_bytes();
+            let mut out = String::with_capacity(text.len());
+            let mut i = 0;
+            while i < bytes.len() {
+                if i + 36 <= bytes.len() && is_uuid_window(&bytes[i..i + 36]) {
+                    out.push_str("<uuid>");
+                    i += 36;
+                } else {
+                    let ch = text[i..].chars().next().unwrap();
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+            *text = out;
+        }
+        serde_json::Value::Object(map) => {
+            for nested in map.values_mut() {
+                strip_random_uuids(nested);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for nested in items {
+                strip_random_uuids(nested);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A 36-byte window with dashes at 8/13/18/23 and hex elsewhere is a UUID.
+fn is_uuid_window(bytes: &[u8]) -> bool {
+    bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+        && bytes.iter().enumerate().all(|(i, b)| {
+            if i == 8 || i == 13 || i == 18 || i == 23 {
+                true
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+}
+
+#[tokio::test]
+async fn full_contract_parity_across_the_process_boundary() {
+    // The same scripted lifecycle must produce the same observable outcome
+    // whether the engine runs in-process or behind the service boundary —
+    // for *every* contract method at once. A wire op dropped in the
+    // service, or an adapter method left to its default no-op, diverges
+    // here.
+    let service = connect().await;
+    let local: Arc<dyn ContextEngine> = Arc::new(context_simple::SimpleContextEngine::new(
+        context_simple::SimpleContextConfig::default(),
+    ));
+
+    let service_snapshot = contract_snapshot(service.as_ref()).await;
+    let local_snapshot = contract_snapshot(local.as_ref()).await;
+    assert_eq!(
+        service_snapshot, local_snapshot,
+        "every ContextEngine contract method must behave identically across the process boundary"
+    );
+}
+
+#[tokio::test]
+async fn storage_gc_parity_between_in_process_and_service_boundary() {
+    // The storage GC is the only place information is deleted; a service
+    // that drops `storage_gc()` silently (or an adapter that leaves the
+    // default no-op in place) would diverge here.
+    let service = connect().await;
+    let local: Arc<dyn ContextEngine> = Arc::new(context_simple::SimpleContextEngine::new(
+        context_simple::SimpleContextConfig::default(),
+    ));
+
+    let mut reports = Vec::new();
+    for engine in [service, local] {
+        for turn in 0..3 {
+            engine
+                .ingest(ContextIngress::UserMessage {
+                    content: format!("turn {turn}: fix AuthService.rs"),
+                })
+                .await
+                .unwrap();
+            engine
+                .ingest(ContextIngress::ToolObservation {
+                    output: ToolOutput {
+                        call_id: format!("{turn}"),
+                        tool_name: "shell.exec".into(),
+                        ok: true,
+                        summary: "ok".into(),
+                        model_content: format!("tests passed in AuthService.rs ({turn})"),
+                        artifact_ref: None,
+                        metadata: json!({}),
+                    },
+                    scope_id: None,
+                })
+                .await
+                .unwrap();
+            engine
+                .maintain(ContextMaintenanceTrigger::AfterModel)
+                .await
+                .unwrap();
+        }
+        // Externalize the consumed observations, then run the conservative
+        // storage GC over the store.
+        engine.gc().await.unwrap();
+        let report = engine.storage_gc().await.unwrap();
+        let mut report = serde_json::to_value(report).unwrap();
+        strip_random_uuids(&mut report);
+        reports.push(report);
+    }
+    assert_eq!(
+        reports[0], reports[1],
+        "Storage GC must behave identically across the process boundary"
+    );
+}

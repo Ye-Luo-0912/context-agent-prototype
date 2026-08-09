@@ -1,13 +1,13 @@
-//! A generic JSON-lines process host shared by every process-boundary
-//! integration: spawning the child, the startup handshake, bounded framed
-//! request/response, per-request deadlines, and a poisoned-connection
-//! policy so a wedged or malicious child can never be reused or grow the
-//! parent's memory without bound.
+//! The generic JSON-lines process host: spawning the child, the startup
+//! handshake, bounded framed request/response, per-request deadlines,
+//! cancellation, and a poisoned-connection policy so a wedged or malicious
+//! child can never be reused or grow the parent's memory without bound.
 //!
-//! Both the context-service adapter (`ContextEngine` over a process) and
-//! the process capability adapter (a `Capability` over a process) are thin
-//! protocol layers on top of this host — the framing, deadline and failure
-//! policy lives here once.
+//! Both the context-service adapter (`ContextEngine` over a process, in
+//! `context-contextcore`) and the process capability adapter (a `Capability`
+//! over a process, in `agent-capability-process`) are thin protocol layers
+//! on top of this host — the framing, deadline, sandbox and failure policy
+//! lives here once.
 
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -441,9 +441,9 @@ pub fn resolve_program(env_var: Option<&str>, binary_name: &str) -> String {
 }
 
 /// Probe the standard cargo layout around the current executable: a test
-/// binary lives in `target/<profile>/deps/` while the service binary lands
-/// in `target/<profile>/`, so check both instead of depending on cargo
-/// injecting the target dir into PATH (which not every runner does).
+/// binary lives in `target/<profile>/deps/` while a helper/service binary
+/// lands in `target/<profile>/`, so check both instead of depending on
+/// cargo injecting the target dir into PATH (which not every runner does).
 pub fn probe_siblings(current_exe: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     let parent = current_exe.parent()?;
     [

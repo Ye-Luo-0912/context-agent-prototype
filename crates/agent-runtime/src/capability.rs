@@ -27,6 +27,36 @@ use agent_workspace::{ArtifactStoreHandle, ConfinedWorkspaceHandle, Workspace};
 use async_trait::async_trait;
 use serde_json::json;
 
+/// The asynchronous lifecycle of a capability, from registration through
+/// start/stop. Transitions are serialized per capability: a per-capability
+/// async `run_lock` guards the transition, so concurrent `ensure_started`
+/// calls cannot double-start, and a stop cannot race an in-flight start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityRunState {
+    /// Registered but never started (or stopped since).
+    Stopped,
+    /// A `start()` is in flight.
+    Starting,
+    /// `start()` returned Ok; the capability is running.
+    Started,
+    /// A `stop()` is in flight.
+    Stopping,
+    /// The last start/stop transition failed; a later start may retry.
+    Failed,
+}
+
+impl CapabilityRunState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CapabilityRunState::Stopped => "stopped",
+            CapabilityRunState::Starting => "starting",
+            CapabilityRunState::Started => "started",
+            CapabilityRunState::Stopping => "stopping",
+            CapabilityRunState::Failed => "failed",
+        }
+    }
+}
+
 struct Entry {
     capability: Arc<dyn Capability>,
     /// Manifest snapshot captured once at registration. The registry never
@@ -36,7 +66,11 @@ struct Entry {
     /// later query reads the cache.
     manifest: CapabilityManifest,
     tool_specs: Vec<ToolSpec>,
-    started: bool,
+    /// Lifecycle state. The lock is held across the async `start()`/`stop()`
+    /// call, so a capability's start/stop must not re-enter the registry
+    /// for the same capability (that would deadlock).
+    run_state: CapabilityRunState,
+    run_lock: Arc<tokio::sync::Mutex<()>>,
     /// The effective maturity. External (out-of-process) capabilities are
     /// pinned to Experimental regardless of their declared status, so an LLM
     /// cannot promote its own module to Stable.
@@ -126,6 +160,7 @@ pub struct CapabilityCatalogEntry {
     pub activation: CapabilityActivation,
     pub transport: CapabilityTransport,
     pub tools: Vec<String>,
+    pub run_state: CapabilityRunState,
 }
 
 /// Runtime-mutable registry of dynamic capabilities, shared between the
@@ -246,7 +281,8 @@ impl CapabilityRegistry {
                 capability,
                 manifest,
                 tool_specs,
-                started: false,
+                run_state: CapabilityRunState::Stopped,
+                run_lock: Arc::new(tokio::sync::Mutex::new(())),
                 status,
                 activation,
                 loaded: false,
@@ -326,6 +362,7 @@ impl CapabilityRegistry {
                     activation: entry.activation,
                     transport: manifest.transport.clone(),
                     tools: entry.tool_specs.iter().map(|s| s.name.clone()).collect(),
+                    run_state: entry.run_state,
                 }
             })
             .collect();
@@ -546,7 +583,10 @@ impl CapabilityRegistry {
                 .filter(|(_, entry)| {
                     entry.activation.usable()
                         && entry.manifest.lifecycle == CapabilityLifecycle::Eager
-                        && !entry.started
+                        && matches!(
+                            entry.run_state,
+                            CapabilityRunState::Stopped | CapabilityRunState::Failed
+                        )
                 })
                 .map(|(id, _)| id.clone())
                 .collect()
@@ -557,72 +597,142 @@ impl CapabilityRegistry {
         Ok(())
     }
 
-    /// Start a capability on first use (lazy lifecycle) and mark it started.
-    /// A disabled/quarantined capability is rejected: the start is the point
-    /// where "not usable" would otherwise turn into a running process.
+    /// Start a capability on first use (lazy lifecycle) and drive it to
+    /// `Started`. A disabled/quarantined capability is rejected: the start
+    /// is the point where "not usable" would otherwise turn into a running
+    /// process.
+    ///
+    /// The transition is serialized per capability: a second concurrent
+    /// caller either observes `Started` (and returns immediately) or waits
+    /// for the in-flight transition to finish, then re-checks — it never
+    /// issues a second `start()`. The per-capability lock is held across the
+    /// async `start()` call, so the capability's `start` must not re-enter
+    /// the registry for the same capability.
     pub async fn ensure_started(&self, id: &str) -> AgentResult<()> {
-        let already_started = self
+        // Fast path: already running — no lock round-trip.
+        if self
             .inner
             .read()
             .expect("capability registry poisoned")
             .get(id)
-            .is_some_and(|entry| entry.started);
-        if already_started {
+            .is_some_and(|entry| entry.run_state == CapabilityRunState::Started)
+        {
             return Ok(());
         }
-        let capability = self
-            .inner
-            .read()
-            .expect("capability registry poisoned")
-            .get(id)
-            .map(|entry| {
-                if !entry.activation.usable() {
+        let run_lock = {
+            let inner = self.inner.read().expect("capability registry poisoned");
+            inner
+                .get(id)
+                .ok_or_else(|| {
+                    AgentError::InvalidRequest(format!("capability '{id}' is not registered"))
+                })?
+                .run_lock
+                .clone()
+        };
+        // Serialize the transition: only one caller drives
+        // Stopped/Failed -> Starting -> Started/Failed at a time.
+        let _guard = run_lock.lock().await;
+        let capability = {
+            let inner = self.inner.read().expect("capability registry poisoned");
+            let entry = inner.get(id).ok_or_else(|| {
+                AgentError::InvalidRequest(format!("capability '{id}' is not registered"))
+            })?;
+            match entry.run_state {
+                CapabilityRunState::Started => return Ok(()),
+                // Unreachable while holding the run lock (the other caller
+                // finished before we acquired it), kept defensive.
+                CapabilityRunState::Starting | CapabilityRunState::Stopping => {
                     return Err(AgentError::InvalidRequest(format!(
-                        "capability '{id}' is {}; enable it before use",
-                        entry.activation.as_str()
+                        "capability '{id}' is {}; cannot start now",
+                        entry.run_state.as_str()
                     )));
                 }
-                Ok(entry.capability.clone())
-            })
-            .ok_or_else(|| {
-                AgentError::InvalidRequest(format!("capability '{id}' is not registered"))
-            })??;
-        capability.start().await?;
-        if let Some(entry) = self
-            .inner
-            .write()
-            .expect("capability registry poisoned")
-            .get_mut(id)
+                CapabilityRunState::Stopped | CapabilityRunState::Failed => {}
+            }
+            if !entry.activation.usable() {
+                return Err(AgentError::InvalidRequest(format!(
+                    "capability '{id}' is {}; enable it before use",
+                    entry.activation.as_str()
+                )));
+            }
+            entry.capability.clone()
+        };
         {
-            entry.started = true;
+            let mut inner = self.inner.write().expect("capability registry poisoned");
+            if let Some(entry) = inner.get_mut(id) {
+                entry.run_state = CapabilityRunState::Starting;
+            }
         }
-        Ok(())
+        match capability.start().await {
+            Ok(()) => {
+                let mut inner = self.inner.write().expect("capability registry poisoned");
+                if let Some(entry) = inner.get_mut(id) {
+                    entry.run_state = CapabilityRunState::Started;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let mut inner = self.inner.write().expect("capability registry poisoned");
+                if let Some(entry) = inner.get_mut(id) {
+                    entry.run_state = CapabilityRunState::Failed;
+                }
+                Err(error)
+            }
+        }
     }
 
-    /// Stop every capability and reset the started flags (host stop).
+    /// Stop every capability and drive it back to `Stopped` (host stop).
     /// Best effort: every capability gets its stop call even when an
     /// earlier one fails, and all errors are aggregated into one result.
+    /// Each stop transition takes the per-capability run lock, so it cannot
+    /// race an in-flight start of the same capability; a stop failure
+    /// leaves the capability `Failed` (observable, retryable).
     pub async fn stop_all(&self) -> AgentResult<()> {
-        let capabilities: Vec<Arc<dyn Capability>> = self
+        let ids: Vec<String> = self
             .inner
             .read()
             .expect("capability registry poisoned")
-            .values()
-            .map(|entry| entry.capability.clone())
+            .keys()
+            .cloned()
             .collect();
         let mut errors = Vec::new();
-        for capability in capabilities {
-            if let Err(error) = capability.stop().await {
-                errors.push(error);
+        for id in ids {
+            let run_lock = {
+                let inner = self.inner.read().expect("capability registry poisoned");
+                match inner.get(&id) {
+                    Some(entry) => entry.run_lock.clone(),
+                    None => continue,
+                }
+            };
+            let _guard = run_lock.lock().await;
+            let capability = {
+                let inner = self.inner.read().expect("capability registry poisoned");
+                match inner.get(&id) {
+                    Some(entry) => entry.capability.clone(),
+                    None => continue,
+                }
+            };
+            {
+                let mut inner = self.inner.write().expect("capability registry poisoned");
+                if let Some(entry) = inner.get_mut(&id) {
+                    entry.run_state = CapabilityRunState::Stopping;
+                }
             }
-        }
-        for entry in self
-            .inner
-            .write()
-            .expect("capability registry poisoned")
-            .values_mut()
-        {
-            entry.started = false;
+            match capability.stop().await {
+                Ok(()) => {
+                    let mut inner = self.inner.write().expect("capability registry poisoned");
+                    if let Some(entry) = inner.get_mut(&id) {
+                        entry.run_state = CapabilityRunState::Stopped;
+                    }
+                }
+                Err(error) => {
+                    let mut inner = self.inner.write().expect("capability registry poisoned");
+                    if let Some(entry) = inner.get_mut(&id) {
+                        entry.run_state = CapabilityRunState::Failed;
+                    }
+                    errors.push(error);
+                }
+            }
         }
         if errors.is_empty() {
             Ok(())

@@ -52,8 +52,11 @@ agent-contracts
   +-- agent-workspace
   +-- tool-runtime (also -> agent-workspace)
   +-- agent-storage
+  +-- agent-process        (framed IPC, child lifecycle, sandbox hooks)
   +-- agent-kernel
 
+agent-capability-process -> agent-process (+ agent-contracts)
+context-contextcore      -> agent-process (+ agent-contracts)
 agent-runtime -> agent-kernel + agent-workspace
 agent-tui -> composition of all implementations
 ```
@@ -63,10 +66,19 @@ approval, event publication, model/tool/context wiring through traits —
 no turn state). `agent-runtime` owns the turn state machine (`RuntimeActor`),
 the scope lifecycle, prompt assembly, capability registry and module host,
 and is the only orchestrator. Keep it that way: never add turn state back to
-the kernel, and never let a second orchestrator appear. The long-term
-direction is to fold the kernel's remaining responsibilities into
-`agent-runtime` and retire the kernel crate — but only by moving them, not
-by resurrecting a parallel orchestrator.
+the kernel, and never let a second orchestrator appear.
+
+The long-term direction is a **Trusted Core**, not a merged-then-retired
+kernel: as self-iteration, process capabilities, effect commit, permissions,
+sandboxing and evaluation land, the system needs a core the agent cannot
+modify. The kernel's stateless primitives (permission/approval, effect
+brokering, event/audit/durability, resource budgets, capability authority,
+sandbox authority, runtime integrity) grow into `agent-core`; everything
+evolvable (the `RuntimeActor`, task manager, scope scheduling, prompt
+assembly, tool/context materialization, adaptive policy) stays in
+`agent-runtime`. **Runtime evolves, Core stays trusted** — the fold is into
+`agent-core`, never into the orchestrator, and never by resurrecting a
+parallel orchestrator.
 
 The runtime stays implementation-agnostic: concrete context engines
 (`context-simple`, `context-baselines`) and tool dispatchers (`tool-runtime`)
@@ -156,14 +168,47 @@ See `docs/ROADMAP.md`. Current state at this head:
   `ContextIngress::ContextDirective`, item `keep_alive` / `lease_until_turn`
   GC roots with buffer reactivation and consumed-ephemeral override,
   collect routed to a mid-turn `ContextEngine::gc()` with the report
-  emitted as a `ContextGc` event).
+  emitted as a `ContextGc` event); V1-M9 part 3 (merged control surface
+  `fs.list`/`fs.read`/`search.grep`/`context.manage`/`capability.manage`
+  with paged, artifact-spilling search, registration caps for
+  capability-declared tool schemas, input-budget final guard that
+  auto-unloads optional tools instead of shrinking the prompt, capability
+  registry surface generation, validated manifest/tool-spec caching at
+  registration); V1-M10 first step (per-capability async lifecycle state
+  machine — Stopped/Starting/Started/Stopping/Failed with serialized
+  start/stop, so concurrent `ensure_started` calls never double-start;
+  process host split into `agent-process` (host/framing/sandbox) +
+  `agent-capability-process` (adapter) with `context-contextcore` reduced
+  to the ContextEngine adapter; `StorageGc` wire op with a full-contract
+  process-boundary parity test that exercises every `ContextEngine` method;
+  turn finalization as a durable commit — Running → ModelFinished →
+  Committing → Committed, `TurnCompleted` only after every mandatory state
+  write, `TurnCommitFailed`/`RecoveryRequired` on the first failure).
 
-Next, in order:
+Next, in order (M12/M13 strictly before Self-Iteration):
 
-1. V2 Self-Iteration — capability generation → sandbox test → replay →
-   evaluate → register/rollback. The LLM grows capabilities instead of
-   editing production core.
-2. Evidence-gated (later, only after measurement): smarter non-vector
+1. V1-M10 Runtime Consistency — task authority, transactional task
+   transitions, RuntimeCheckpoint, Turn commit. Acceptance: the runtime and
+   the context never drift into a task/state split-brain.
+2. V1-M11 Context Recall — store injection, ContextMapView,
+   `context.search`/`fetch`, `gc_epoch`, async store. Acceptance: external
+   information can be pulled back on demand without polluting the prompt.
+3. V1-M12 Effect Runtime — every capability routes side effects through one
+   unified EffectRequest/Effect commit. Acceptance: a cancelled operation
+   produces no avoidable stale mutation.
+4. V1-M13 Extension Sandbox — process sandbox, env scrub, brokered
+   FS/network, cancel. Acceptance: experimental code cannot exceed the
+   permissions granted to it.
+5. V1-M14 Resource Policy — tool schema budget, context hint quota,
+   RiskClass, PermissionSet. Acceptance: the LLM cannot exhaust runtime
+   resources through meta-tools.
+6. V1-M15 Real Evaluation — coding workload A/B/C + lifecycle metrics.
+   Acceptance: the dynamic runtime saves tokens without lowering task
+   success rate.
+7. V2 Self-Iteration — generate → sandbox → test → replay → evaluate →
+   canary → stable. The LLM grows capabilities, but cannot modify the
+   evaluation or permission Core.
+8. Evidence-gated (later, only after measurement): smarter non-vector
    lifecycle policy, ContextCore adapter, vector recall / learned selection
    / cross-session memory (invariant 8).
 

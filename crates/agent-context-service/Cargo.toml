@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 agent-contracts.workspace = true
+agent-process.workspace = true
 context-baselines.workspace = true
 context-contextcore.workspace = true
 context-simple.workspace = true

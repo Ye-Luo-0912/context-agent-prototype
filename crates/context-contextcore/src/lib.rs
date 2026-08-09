@@ -6,16 +6,13 @@
 //! kernel, tools, provider and UI are untouched — only the composition root
 //! picks which engine to run. Swapping the service behind the pipe for a real
 //! ContextCore runtime is a deployment detail.
+//!
+//! The shared framed transport lives in `agent-process`; this crate is only
+//! the protocol layer mapping `ContextEngine` operations onto the service's
+//! wire operations.
 
 mod adapter;
-mod capability_host;
-mod host;
 mod wire;
 
 pub use adapter::{ContextServiceAdapter, ContextServiceConfig, ServiceEngine, connect_engine};
-pub use capability_host::{ProcessCapabilityAdapter, load_process_capability};
-pub use host::{
-    PROTOCOL_VERSION, ProcessHost, ProcessHostConfig, ProcessSandbox, probe_siblings,
-    resolve_program,
-};
-pub use wire::{ServiceOp, ServiceRequest, ServiceResponse};
+pub use wire::{PROTOCOL_VERSION, ServiceOp, ServiceRequest, ServiceResponse};

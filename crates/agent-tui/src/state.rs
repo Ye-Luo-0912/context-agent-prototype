@@ -283,6 +283,22 @@ impl AppState {
                 self.status = "idle".into();
                 self.tool_status = "none".into();
             }
+            RuntimeEvent::TurnCommitFailed { phase, message } => {
+                // The model answered, but the runtime did not durably commit
+                // the turn: surface the failure instead of an idle state.
+                self.current_op = None;
+                self.busy = false;
+                self.streaming = false;
+                self.status = "commit_failed".into();
+                self.tool_status = "none".into();
+                self.push_system(format!(
+                    "turn commit failed at {phase}: {message} — recovery required"
+                ));
+            }
+            RuntimeEvent::RecoveryRequired => {
+                self.busy = false;
+                self.status = "recovery_required".into();
+            }
             RuntimeEvent::RunCompleted => {
                 self.busy = false;
                 self.status = "stopped".into();

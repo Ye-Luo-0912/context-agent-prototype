@@ -14,7 +14,7 @@ use serde_json::Value;
 /// Wire protocol version. Both sides echo it; a mismatch fails the handshake
 /// so a newer or older service is never misparsed. Defined by the shared
 /// process host so every protocol over a JSON-lines pipe speaks one version.
-pub use crate::host::PROTOCOL_VERSION;
+pub use agent_process::PROTOCOL_VERSION;
 
 /// A single request. `id` is echoed by the response for correlation and
 /// debugging; the current adapter is strictly ping-pong (one in flight).
@@ -41,6 +41,10 @@ pub enum ServiceOp {
         trigger: ContextMaintenanceTrigger,
     },
     Gc,
+    /// Conservative Storage GC: permanently delete store entries whose
+    /// semantic lifecycle ended and nothing references anymore (the only
+    /// place information is deleted; the in-memory GC only externalizes).
+    StorageGc,
     Materialize {
         query: ContextQuery,
     },

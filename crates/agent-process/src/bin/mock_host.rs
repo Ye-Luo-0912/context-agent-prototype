@@ -1,19 +1,19 @@
-//! A standalone JSON-lines mock child used by `host.rs`'s tests.
+//! A standalone JSON-lines mock child used by `agent-process`'s tests.
 //!
-//! Declared as a `[[test]]` target with `harness = false`, so it is built
-//! and run by `cargo test` but never ships with the library: without the
-//! `--serve` flag it does nothing and exits 0 (cargo's test runner requires
-//! that), and the tests spawn it with `--serve` to drive the framing and
-//! failure scenarios against a real process.
+//! Lives in the package's bin targets, so `cargo test -p agent-process`
+//! builds it next to the test binaries (`target/<profile>/mock_host`) and
+//! the tests spawn it with `--serve` to drive the framing and failure
+//! scenarios against a real process. Without `--serve` it does nothing and
+//! exits 0, so it can also be run directly.
 //!
-//! It also refuses to serve unless `MOCK_MARKER=1` was injected by the
-//! parent — that doubles as the test that `ProcessHostConfig.env` actually
-//! reaches the child.
+//! It refuses to serve unless `MOCK_MARKER=1` was injected by the parent —
+//! that doubles as the test that `ProcessHostConfig.env` actually reaches
+//! the child.
 
 use std::time::Duration;
 
 use agent_contracts::ToolOutput;
-use context_contextcore::PROTOCOL_VERSION;
+use agent_process::PROTOCOL_VERSION;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 

@@ -1,7 +1,7 @@
 //! End-to-end tests for the shared `ProcessHost`: bounded response frames,
 //! per-request deadlines, and the poisoned-connection policy.
 //!
-//! The child is the `mock_host` test target (see `mock_host.rs`) — a real
+//! The child is the `mock_host` bin (see `src/bin/mock_host.rs`) — a real
 //! process speaking the same JSON-lines shape as the context service, with
 //! two deliberate failure modes (`big` streams an oversized frame, `silent`
 //! never answers). The mock also requires `MOCK_MARKER=1`, so the handshake
@@ -11,17 +11,17 @@ mod common;
 
 use std::time::Duration;
 
-use context_contextcore::{ProcessHost, ProcessHostConfig, ProcessSandbox};
+use agent_process::{ProcessHost, ProcessHostConfig, ProcessSandbox};
 use serde_json::json;
 
-/// Spawn the `mock_host` test target with `--serve` and the env marker.
-/// Note: run `cargo test -p context-contextcore` (not `--test host`) so the
-/// mock target is built alongside this one.
+/// Spawn the `mock_host` bin with `--serve` and the env marker.
+/// Note: run `cargo test -p agent-process` (not `--test host`) so the mock
+/// bin is built alongside this one.
 async fn spawn_mock(tune: impl FnOnce(&mut ProcessHostConfig)) -> ProcessHost {
     let program = common::locate_mock_host()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| {
-            panic!("cannot locate the mock_host binary; run `cargo test -p context-contextcore`")
+            panic!("cannot locate the mock_host bin; run `cargo test -p agent-process`")
         });
     let mut config = ProcessHostConfig {
         program,
