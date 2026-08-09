@@ -2,15 +2,17 @@
 //! stale-result dropping. Uses minimal stubs for context/tools/model so the
 //! actor is exercised against the engine contracts only.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
-    AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
-    MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage, ModelOutput,
-    ModelRequest, ModelTransport, RuntimeEvent, ScopeId, ScopeKind, ToolDispatcher,
+    AgentResult, AttentionState, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemId,
+    ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
+    ContextQuery, ContextRetention, ContextScope, ContextStateTransition, MaterializedContext,
+    MaterializedItem, ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage, ModelOutput,
+    ModelRequest, ModelTransport, RuntimeEvent, ScopeId, ScopeKind, SemanticState, ToolDispatcher,
     ToolExecutionRequest, ToolOutcome, ToolRisk, ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
@@ -527,4 +529,226 @@ async fn failed_focus_never_mutates_the_task_table() {
         handle.list_tasks().await.unwrap().is_empty(),
         "an implicit task exists only after its focus committed"
     );
+}
+
+/// Records every request it receives and finishes immediately, so the test
+/// can assert on exactly what the final budget guard let through.
+#[derive(Debug, Default)]
+struct RecordingModel {
+    requests: Mutex<Vec<ModelRequest>>,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for RecordingModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            streaming: true,
+            tool_calls: true,
+            max_output_tokens: 4_000,
+            context_window: Some(10_000),
+        }
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        unreachable!("streaming model should be driven through complete_stream")
+    }
+    async fn complete_stream(
+        &self,
+        request: ModelRequest,
+        sink: &dyn ModelEventSink,
+    ) -> AgentResult<ModelOutput> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if request.cancel.is_cancelled() {
+            return Err(agent_contracts::AgentError::Cancelled);
+        }
+        self.requests.lock().unwrap().push(request);
+        sink.on_chunk(ModelChunk::Done).await?;
+        Ok(ModelOutput {
+            content: "ok".into(),
+            tool_calls: Vec::new(),
+            usage: Default::default(),
+        })
+    }
+}
+
+/// A context engine whose materialization returns three large working-set
+/// items — enough to overshoot the input budget once assembled.
+#[derive(Debug)]
+struct BigContextEngine;
+
+#[async_trait::async_trait]
+impl ContextEngine for BigContextEngine {
+    async fn ingest(&self, _ingress: ContextIngress) -> AgentResult<()> {
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        // ~3_000 tokens per item (ASCII estimate: 4 chars per token).
+        let items: Vec<MaterializedItem> = (0..3)
+            .map(|i| MaterializedItem {
+                item_id: ContextItemId::new(),
+                kind: ContextKind::FileObservation,
+                scope: ContextScope::Task,
+                attention: AttentionState::Active,
+                semantic: SemanticState::Live,
+                retention: ContextRetention::Working,
+                content: format!("{}:{}", "data ".repeat(2400), i),
+                source: None,
+            })
+            .collect();
+        Ok(MaterializedContext {
+            focus: None,
+            items,
+            external: Vec::new(),
+            selected: Vec::new(),
+            approx_tokens: 9_000,
+            diagnostics: ContextDiagnostics::default(),
+        })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+}
+
+/// A model whose window is almost entirely reserved for output: the input
+/// budget is tiny, so any request is refused by the final guard.
+#[derive(Debug, Default)]
+struct TinyWindowModel {
+    calls: AtomicUsize,
+}
+
+impl TinyWindowModel {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for TinyWindowModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            streaming: true,
+            tool_calls: true,
+            max_output_tokens: 2_000,
+            context_window: Some(1_000),
+        }
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        unreachable!("streaming model should be driven through complete_stream")
+    }
+    async fn complete_stream(
+        &self,
+        request: ModelRequest,
+        sink: &dyn ModelEventSink,
+    ) -> AgentResult<ModelOutput> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if request.cancel.is_cancelled() {
+            return Err(agent_contracts::AgentError::Cancelled);
+        }
+        sink.on_chunk(ModelChunk::Done).await?;
+        Ok(ModelOutput {
+            content: "ok".into(),
+            tool_calls: Vec::new(),
+            usage: Default::default(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn final_guard_trims_to_the_input_budget_not_the_window() {
+    // Window 10_000, output reserve 4_000 -> max input budget 6_000. Three
+    // large context items assemble to ~9_000 + fixed layers, so the guard
+    // must trim (the old guard compared against the window and let the
+    // request eat into the output reserve).
+    let model = Arc::new(RecordingModel::default());
+    let kernel = Arc::new(AgentKernel::new(
+        AgentKernelConfig::default(),
+        Arc::new(BigContextEngine),
+        model.clone(),
+        Arc::new(OneToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel.clone());
+    handle.start().await.unwrap();
+    handle.user_message("hello".into()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    {
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "the turn must send exactly one request");
+        let request = &requests[0];
+        let total = approx_layer_tokens(&request.messages) + approx_layer_tokens(&request.tools);
+        assert!(
+            total <= 6_000,
+            "the assembled request must fit window - output_reserve (got {total})"
+        );
+        assert!(
+            total > 3_000,
+            "the guard must trim, not empty the context frame (got {total})"
+        );
+    }
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn final_guard_refuses_an_unshrinkable_over_budget_request() {
+    // Window 1_000, output reserve 2_000 -> max input budget 0. The fixed
+    // layers alone (system prompt, turn frame, tool schema) overshoot, so
+    // no amount of trimming or unloading helps: the runtime must refuse to
+    // send instead of silently over-budgeting the provider.
+    let model = Arc::new(TinyWindowModel::default());
+    let kernel = Arc::new(AgentKernel::new(
+        AgentKernelConfig::default(),
+        Arc::new(TestContextEngine),
+        model.clone(),
+        Arc::new(OneToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel.clone());
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle.user_message("hello".into()).await.unwrap();
+
+    let mut saw_error = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if matches!(envelope.event, RuntimeEvent::Error { .. }) {
+                saw_error = true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        saw_error,
+        "an unshrinkable over-budget request must surface a hard error"
+    );
+    assert_eq!(
+        model.calls(),
+        0,
+        "an over-budget request must never reach the provider"
+    );
+    handle.stop().await.unwrap();
 }

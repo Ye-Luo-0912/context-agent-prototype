@@ -3,7 +3,8 @@ use std::collections::HashSet;
 
 use agent_contracts::{
     AttentionState, ContextItem, ContextItemId, ContextMap, ContextQuery, ContextRetention,
-    ContextSelection, MaterializedContext, MaterializedItem, ScopeId, ScopeKind, ScoreBreakdown,
+    ContextSelection, MaterializedContext, MaterializedItem, ScopeId, ScopeKind, ScopeState,
+    ScoreBreakdown,
 };
 
 use crate::diagnostics;
@@ -32,17 +33,35 @@ pub(crate) fn materialize(
     let focus = state.focus.clone();
 
     // Candidate generation via the indexes instead of a full-heap scan: the
-    // active scope subtree (session + the current task's scopes, including
-    // closed tool frames of that task) plus hot-entity matches plus legacy
+    // active scope subtree (session + the active task's open task/focus
+    // scopes + open tool frames) plus hot-entity matches plus legacy
     // unscoped items. The selection universe is explainable: an item is
-    // scoreable when it is a member of the current task's scope lineage, is
-    // pinned/durable in the session scope, or its entities are hot.
+    // scoreable when it is a member of the current task's open scope
+    // lineage, is pinned/durable in the session scope, or its entities are
+    // hot. A *closed* scope is not a candidate — a closed tool frame's
+    // observations re-enter through retention, affinity or dependency
+    // edges, not task membership (the same rule the GC mark phase enforces
+    // by never crossing a closed scope).
     state.items.ensure_consistent();
     let active_task_id = focus.as_ref().map(|f| f.task_id);
     let mut active_scopes: HashSet<ScopeId> = HashSet::new();
     for scope in &state.scopes {
-        let in_active_task = scope.task_id.is_some_and(|id| Some(id) == active_task_id);
-        if scope.kind == ScopeKind::Session || in_active_task {
+        let open = scope.state != ScopeState::Closed;
+        let candidate = match scope.kind {
+            // The session scope is always a candidate: durable session
+            // memory and pins live there; scoring and the budget decide
+            // what actually reaches the frame.
+            ScopeKind::Session => true,
+            // The active task's own task/focus scopes are the working-set
+            // container; a suspended or closed task's scopes are not.
+            ScopeKind::Task | ScopeKind::Focus => {
+                open && scope.task_id.is_some_and(|id| Some(id) == active_task_id)
+            }
+            // A tool frame is a candidate only while it is open — it is an
+            // execution frame, not a task membership claim.
+            ScopeKind::Tool => open,
+        };
+        if candidate {
             active_scopes.insert(scope.id);
         }
     }

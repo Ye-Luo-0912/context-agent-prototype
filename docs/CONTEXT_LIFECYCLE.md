@@ -716,6 +716,29 @@ direct pushes; the production mutation surface no longer needs it.
 Checkpoints serialize only the items; the indexes are derived state and
 rebuild on restore.
 
+### 9i. V1-M9: the selection universe respects scope state
+
+The materializer's candidate set previously admitted every scope belonging
+to the active task — including already-*closed* tool frames — while the GC
+mark phase correctly refused to cross a closed scope when walking a scope
+chain. Those two rules disagreed, and the looser one let a closed tool
+frame's observations re-enter the prompt purely because they carried the
+active task's id. The candidate scopes now mirror the GC root rule:
+
+- the session scope (always — scoring and the budget decide what reaches
+  the frame);
+- the active task's own task/focus scopes while they are open;
+- tool scopes only while the frame is open.
+
+A closed tool frame's observations leave the working-set lineage, exactly
+like GC's closed-scope boundary. They are not lost — they re-enter through
+the same channels every other cooled item uses: retention (a durable
+outcome promoted on close), affinity (their entities are hot again) or an
+explicit dependency edge. `closed_tool_scopes_are_not_candidates_but_hot_
+entities_still_reach_them` pins both halves: the observation is absent
+from the frame while nothing references it, and returns the moment its
+entity is hot again.
+
 ## 10. What should become durable later
 
 A later policy can promote only structured outcomes such as:

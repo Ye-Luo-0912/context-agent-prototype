@@ -11,9 +11,9 @@ use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, ContextHints, ContextIngress,
     ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect, EffectCommitError,
-    ModelRequest, OperationId, OperationOutcome, OperationResult, RuntimeDirective, RuntimeEvent,
-    ScopeId, ScopeKind, TaskId, ToolCall, ToolOutcome, ToolOutput, ToolSurfaceSnapshot, TurnFrame,
-    TurnFrameStep, TurnId,
+    ModelInput, ModelRequest, OperationId, OperationOutcome, OperationResult, RuntimeDirective,
+    RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall, ToolOutcome, ToolOutput,
+    ToolSurfaceSnapshot, TurnFrame, TurnFrameStep, TurnId,
 };
 use agent_kernel::AgentKernel;
 use tokio::sync::mpsc;
@@ -557,15 +557,19 @@ impl RuntimeActor {
         let capabilities = self.kernel.model_capabilities();
         let turn_frame_tokens = approx_layer_tokens(&turn.turn_frame.messages());
         let active_tools_tokens = approx_layer_tokens(&tool_surface.specs);
+        let provider_window = capabilities
+            .context_window
+            .unwrap_or_else(|| self.kernel.context_budget_tokens());
+        // The output reserve is a hard subtraction: the answer must always
+        // have room, and rendering overhead must never eat into it.
+        let output_reserve = if capabilities.max_output_tokens > 0 {
+            capabilities.max_output_tokens
+        } else {
+            DEFAULT_OUTPUT_RESERVE
+        };
         let model_budget = ModelBudget::compute(
-            capabilities
-                .context_window
-                .unwrap_or_else(|| self.kernel.context_budget_tokens()),
-            if capabilities.max_output_tokens > 0 {
-                capabilities.max_output_tokens
-            } else {
-                DEFAULT_OUTPUT_RESERVE
-            },
+            provider_window,
+            output_reserve,
             self.assembler.system_prompt_tokens(),
             turn_frame_tokens,
             active_tools_tokens,
@@ -611,24 +615,26 @@ impl RuntimeActor {
 
         // Runtime final guard: the engine priced the working-set content,
         // but the assembler's rendering overhead (section headers, per-item
-        // frame labels) is the runtime's share and must also fit the
-        // provider window. Re-estimate the full wire request and trim the
-        // context frame until it fits — the runtime, not the engine, is the
-        // final judge of the budget.
-        let provider_window = capabilities
-            .context_window
-            .unwrap_or_else(|| self.kernel.context_budget_tokens());
+        // frame labels) is the runtime's share. The assembled request must
+        // fit the *input* budget — the window minus the output reserve —
+        // because the answer must always have room. Trim the context frame
+        // until it fits; if the fixed layers alone (system + turn + tools)
+        // still overshoot, unload the largest optional tools; a request
+        // that still does not fit is a hard error, never a silently
+        // over-budget send.
+        let max_input_budget = provider_window.saturating_sub(output_reserve);
         let mut materialized = materialized;
+        let mut tool_surface = tool_surface;
         let mut input =
             self.assembler
                 .assemble(&materialized, &turn.turn_frame, tool_surface.specs.clone());
-        while approx_layer_tokens(&input.into_messages()) + approx_layer_tokens(&input.tool_schemas)
-            > provider_window
-            && !materialized.items.is_empty()
-        {
+        let assembled_total = |input: &ModelInput| {
+            approx_layer_tokens(&input.into_messages()) + approx_layer_tokens(&input.tool_schemas)
+        };
+        while assembled_total(&input) > max_input_budget && !materialized.items.is_empty() {
             // Drop the largest unpinned item first (pinned items keep
             // priority); when only pinned items remain, drop the largest
-            // anyway rather than overshoot the window.
+            // anyway rather than overshoot the input budget.
             let drop_index = materialized
                 .items
                 .iter()
@@ -658,6 +664,48 @@ impl RuntimeActor {
                 &turn.turn_frame,
                 tool_surface.specs.clone(),
             );
+        }
+
+        // The context frame is empty but the fixed layers still overshoot:
+        // unload the largest optional tools one by one (core tools refuse
+        // and are skipped) so the request goes out with the leanest
+        // surface, then re-snapshot so the round validates against exactly
+        // the surface that was priced.
+        let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while assembled_total(&input) > max_input_budget {
+            let Some((name, _)) = tool_surface
+                .specs
+                .iter()
+                .filter(|spec| !tried.contains(&spec.name))
+                .map(|spec| (spec.name.clone(), approx_layer_tokens(spec)))
+                .max_by_key(|(_, tokens)| *tokens)
+            else {
+                break;
+            };
+            tried.insert(name.clone());
+            if self.kernel.tool_unload(&name).is_ok() {
+                tool_surface = self.kernel.tool_snapshot();
+                turn.tool_surface = Some(tool_surface.clone());
+                input = self.assembler.assemble(
+                    &materialized,
+                    &turn.turn_frame,
+                    tool_surface.specs.clone(),
+                );
+            }
+        }
+        if assembled_total(&input) > max_input_budget {
+            let _ = self
+                .kernel
+                .emit_event(RuntimeEvent::Error {
+                    message: format!(
+                        "model input exceeds the provider window even with the context frame emptied and optional tools unloaded ({} > {} input tokens); refusing to send",
+                        assembled_total(&input),
+                        max_input_budget
+                    ),
+                })
+                .await;
+            self.state.turn = None;
+            return;
         }
 
         let cancel = CancellationToken::new();

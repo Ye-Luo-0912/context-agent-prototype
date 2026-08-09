@@ -134,6 +134,13 @@ impl AgentKernel {
         self.tools.gc();
     }
 
+    /// Unload an optional tool from the model surface (used by the final
+    /// budget guard when the fixed layers overshoot the input budget).
+    /// Core tools refuse to unload — they are part of the minimal surface.
+    pub fn tool_unload(&self, name: &str) -> AgentResult<()> {
+        self.tools.unload_tool(name)
+    }
+
     pub async fn start(&self) -> AgentResult<()> {
         self.emit(RuntimeEvent::RunStarted).await
     }

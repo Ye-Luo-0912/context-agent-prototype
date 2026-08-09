@@ -70,7 +70,7 @@ impl PromptAssembler {
             // the on-demand half of the lifecycle: externalized is not
             // deleted, and the agent knows how to pull it back.
             let mut external = String::from(
-                "EXTERNAL CONTEXT (refs only)\nThese items were archived to the context store. Use context.inspect for metadata or context.fetch to pull the full content back on demand.",
+                "EXTERNAL CONTEXT (refs only)\nThese items were archived to the context store. Use context.manage op=inspect for metadata or op=fetch to pull the full content back on demand.",
             );
             for entry in &materialized.external {
                 external.push_str(&format!(

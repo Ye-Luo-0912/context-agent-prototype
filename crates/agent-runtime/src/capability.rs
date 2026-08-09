@@ -9,13 +9,16 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use agent_contracts::{
-    AgentError, AgentResult, ArtifactHandle, CAPABILITY_INSPECT, CAPABILITY_LOAD,
-    CAPABILITY_SEARCH, CAPABILITY_UNLOAD, Capability, CapabilityActivation,
-    CapabilityInvocationContext, CapabilityLifecycle, CapabilityOutcome, CapabilityStatus,
+    AgentError, AgentResult, ArtifactHandle, CAPABILITY_MANAGE, CAPABILITY_SEARCH_DEFAULT_LIMIT,
+    CAPABILITY_SEARCH_MAX_LIMIT, Capability, CapabilityActivation, CapabilityInvocationContext,
+    CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
     CapabilityTransport, Effect, RUNTIME_CONTEXT_CONTROL, ToolCatalogEntry, ToolDispatcher,
     ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolSpec, ToolSurfaceSnapshot,
     WorkspaceHandle,
@@ -26,6 +29,13 @@ use serde_json::json;
 
 struct Entry {
     capability: Arc<dyn Capability>,
+    /// Manifest snapshot captured once at registration. The registry never
+    /// calls back into the capability object while holding its lock: a slow
+    /// or re-entrant `manifest()`/`tool_specs()` must not stall (or deadlock)
+    /// a catalog read. Registration validates and caches both, and every
+    /// later query reads the cache.
+    manifest: CapabilityManifest,
+    tool_specs: Vec<ToolSpec>,
     started: bool,
     /// The effective maturity. External (out-of-process) capabilities are
     /// pinned to Experimental regardless of their declared status, so an LLM
@@ -41,6 +51,71 @@ struct Entry {
     loaded: bool,
     /// A tool of this capability is executing right now.
     active: bool,
+}
+
+/// Registration limits for capability-declared tool schemas: a single
+/// capability must not be able to grow the model surface without bound — a
+/// huge schema, a huge description or a huge tool count is itself context
+/// pollution. The limits are enforced at registration (validated once, then
+/// cached), so a runaway capability is rejected before it ever reaches the
+/// catalog.
+pub const MAX_TOOLS_PER_CAPABILITY: usize = 32;
+pub const MAX_TOOL_NAME_CHARS: usize = 64;
+pub const MAX_TOOL_DESCRIPTION_CHARS: usize = 200;
+pub const MAX_TOOL_SCHEMA_BYTES: usize = 4 * 1024;
+
+/// Validate the tool schemas a capability declares at registration: name
+/// shape/length, description length, per-schema byte size, duplicate names
+/// within the capability, and the per-capability tool count.
+fn validate_tool_specs(manifest_id: &str, specs: &[ToolSpec]) -> AgentResult<()> {
+    if specs.len() > MAX_TOOLS_PER_CAPABILITY {
+        return Err(AgentError::InvalidRequest(format!(
+            "capability '{manifest_id}' declares {} tools, above the {MAX_TOOLS_PER_CAPABILITY} per-capability cap",
+            specs.len()
+        )));
+    }
+    let mut names = std::collections::HashSet::new();
+    for spec in specs {
+        if spec.name.is_empty() || spec.name.len() > MAX_TOOL_NAME_CHARS {
+            return Err(AgentError::InvalidRequest(format!(
+                "capability '{manifest_id}' declares a tool name of {} chars (allowed 1..={MAX_TOOL_NAME_CHARS})",
+                spec.name.len()
+            )));
+        }
+        let well_formed = spec
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'));
+        if !well_formed {
+            return Err(AgentError::InvalidRequest(format!(
+                "capability '{manifest_id}' declares tool name '{}': only [A-Za-z0-9._:-] are allowed",
+                spec.name
+            )));
+        }
+        if !names.insert(spec.name.clone()) {
+            return Err(AgentError::InvalidRequest(format!(
+                "capability '{manifest_id}' declares tool '{name}' twice",
+                name = spec.name
+            )));
+        }
+        if spec.description.len() > MAX_TOOL_DESCRIPTION_CHARS {
+            return Err(AgentError::InvalidRequest(format!(
+                "capability '{manifest_id}' tool '{}' description is {} chars, above the {MAX_TOOL_DESCRIPTION_CHARS} cap",
+                spec.name,
+                spec.description.len()
+            )));
+        }
+        let bytes = serde_json::to_vec(&spec.input_schema)
+            .unwrap_or_default()
+            .len();
+        if bytes > MAX_TOOL_SCHEMA_BYTES {
+            return Err(AgentError::InvalidRequest(format!(
+                "capability '{manifest_id}' tool '{}' input schema is {bytes} bytes, above the {MAX_TOOL_SCHEMA_BYTES} cap",
+                spec.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// One row of the platform's capability catalog (the discovery surface).
@@ -64,11 +139,23 @@ pub struct CapabilityRegistry {
     /// control tools). A capability may never shadow them: routing would
     /// otherwise be hijackable by declaration.
     reserved: RwLock<HashSet<String>>,
+    /// The registry's surface generation: bumped on every capability
+    /// surface change (register / activation / load / unload), so the
+    /// unified dispatcher snapshot's `generation` reflects dynamic
+    /// capability changes — not just the builtin catalog's.
+    generation: AtomicU64,
 }
 
 impl CapabilityRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The registry's surface generation: any capability surface change
+    /// (register / activation / load / unload) bumps it, so an auditor can
+    /// tell that a dynamic capability changed the model surface.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     /// Claim tool names the runtime owns. Called by the tool dispatcher
@@ -84,10 +171,18 @@ impl CapabilityRegistry {
     /// Register a capability. Rejects duplicate ids, missing declared
     /// dependencies, tool names that shadow the runtime's own tools, and
     /// tool names already owned by another capability — the model must
-    /// never see a half-wired tool or an ambiguous route.
+    /// never see a half-wired tool or an ambiguous route. The manifest and
+    /// tool schemas are read and validated *once*, before the lock, and
+    /// cached on the entry: the registry never calls back into the
+    /// capability object while holding its lock.
     pub fn register(&self, capability: Arc<dyn Capability>) -> AgentResult<()> {
-        let manifest = capability.manifest();
+        // Lock-free validation up front: manifest + tool schemas are read
+        // exactly once per registration and cached. A slow, re-entrant or
+        // panicking capability implementation can only do so at register
+        // time — never under the registry's lock.
+        let manifest = capability.manifest().clone();
         let tool_specs = capability.tool_specs();
+        validate_tool_specs(&manifest.id, &tool_specs)?;
         let tool_names: Vec<&str> = tool_specs.iter().map(|spec| spec.name.as_str()).collect();
 
         let mut inner = self.inner.write().expect("capability registry poisoned");
@@ -118,8 +213,7 @@ impl CapabilityRegistry {
         for name in &tool_names {
             if let Some((owner, _)) = inner.iter().find(|(_, entry)| {
                 entry
-                    .capability
-                    .tool_specs()
+                    .tool_specs
                     .iter()
                     .any(|spec| spec.name.as_str() == *name)
             }) {
@@ -150,6 +244,8 @@ impl CapabilityRegistry {
             manifest.id.clone(),
             Entry {
                 capability,
+                manifest,
+                tool_specs,
                 started: false,
                 status,
                 activation,
@@ -157,6 +253,9 @@ impl CapabilityRegistry {
                 active: false,
             },
         );
+        // A new capability changes the catalog; surface-related flags are
+        // covered by their own bumps below.
+        self.generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -194,6 +293,8 @@ impl CapabilityRegistry {
         if !activation.usable() {
             entry.loaded = false;
         }
+        // Activation flips the usable surface: bump the generation.
+        self.generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -218,18 +319,13 @@ impl CapabilityRegistry {
         let mut entries: Vec<_> = inner
             .values()
             .map(|entry| {
-                let manifest = entry.capability.manifest();
+                let manifest = &entry.manifest;
                 CapabilityCatalogEntry {
                     id: manifest.id.clone(),
                     status: entry.status,
                     activation: entry.activation,
                     transport: manifest.transport.clone(),
-                    tools: entry
-                        .capability
-                        .tool_specs()
-                        .iter()
-                        .map(|s| s.name.clone())
-                        .collect(),
+                    tools: entry.tool_specs.iter().map(|s| s.name.clone()).collect(),
                 }
             })
             .collect();
@@ -246,7 +342,7 @@ impl CapabilityRegistry {
         inner
             .values()
             .filter(|entry| entry.loaded && entry.activation.usable())
-            .flat_map(|entry| entry.capability.tool_specs())
+            .flat_map(|entry| entry.tool_specs.iter().cloned())
             .collect()
     }
 
@@ -255,8 +351,7 @@ impl CapabilityRegistry {
         let inner = self.inner.read().expect("capability registry poisoned");
         inner.values().find_map(|entry| {
             entry
-                .capability
-                .tool_specs()
+                .tool_specs
                 .iter()
                 .any(|spec| spec.name == tool_name)
                 .then(|| entry.capability.clone())
@@ -268,8 +363,7 @@ impl CapabilityRegistry {
         let inner = self.inner.read().expect("capability registry poisoned");
         inner.iter().find_map(|(id, entry)| {
             entry
-                .capability
-                .tool_specs()
+                .tool_specs
                 .iter()
                 .any(|spec| spec.name == tool_name)
                 .then(|| id.clone())
@@ -295,6 +389,8 @@ impl CapabilityRegistry {
             )));
         }
         entry.loaded = true;
+        // A load puts tools on the surface: bump the generation.
+        self.generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -308,6 +404,8 @@ impl CapabilityRegistry {
         if let Some(entry) = inner.get_mut(&owner) {
             entry.loaded = false;
         }
+        // An unload takes tools off the surface: bump the generation.
+        self.generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -319,8 +417,7 @@ impl CapabilityRegistry {
         let inner = self.inner.read().expect("capability registry poisoned");
         inner.values().find_map(|entry| {
             entry
-                .capability
-                .tool_specs()
+                .tool_specs
                 .iter()
                 .any(|spec| spec.name == tool_name)
                 .then(|| {
@@ -340,8 +437,7 @@ impl CapabilityRegistry {
         let inner = self.inner.read().expect("capability registry poisoned");
         inner.values().find_map(|entry| {
             entry
-                .capability
-                .tool_specs()
+                .tool_specs
                 .iter()
                 .find(|spec| spec.name == tool_name)
                 .cloned()
@@ -357,7 +453,7 @@ impl CapabilityRegistry {
             let owner = id.clone();
             let active = entry.active;
             let usable = entry.loaded && entry.activation.usable();
-            for spec in entry.capability.tool_specs() {
+            for spec in &entry.tool_specs {
                 let state = if active {
                     ToolLifecycle::Active
                 } else if usable {
@@ -449,7 +545,7 @@ impl CapabilityRegistry {
                 .iter()
                 .filter(|(_, entry)| {
                     entry.activation.usable()
-                        && entry.capability.manifest().lifecycle == CapabilityLifecycle::Eager
+                        && entry.manifest.lifecycle == CapabilityLifecycle::Eager
                         && !entry.started
                 })
                 .map(|(id, _)| id.clone())
@@ -583,12 +679,7 @@ impl CapabilityAwareDispatcher {
         // capabilities may never shadow them (registration rejects them).
         let mut reserved: Vec<String> =
             base.catalog().into_iter().map(|entry| entry.name).collect();
-        reserved.extend([
-            CAPABILITY_SEARCH.to_string(),
-            CAPABILITY_INSPECT.to_string(),
-            CAPABILITY_LOAD.to_string(),
-            CAPABILITY_UNLOAD.to_string(),
-        ]);
+        reserved.push(CAPABILITY_MANAGE.to_string());
         capabilities.reserve_names(reserved);
         Self {
             base,
@@ -601,53 +692,20 @@ impl CapabilityAwareDispatcher {
     fn control_specs() -> Vec<ToolSpec> {
         vec![
             ToolSpec {
-                name: CAPABILITY_SEARCH.into(),
-                description:
-                    "List every known tool (builtin and dynamic capability) with its lifecycle state and owner."
-                        .into(),
+                name: CAPABILITY_MANAGE.into(),
+                description: "Manage the tool catalog in one call (builtin tools and dynamic capabilities). ops: search (list known tools with lifecycle state and owner), inspect (one tool's schema, risk, owner and state), load (put a tool — or the capability owning it — on the model surface), unload (take it off; core builtin tools cannot be unloaded).".into(),
                 input_schema: json!({
                     "type": "object",
+                    "required": ["op"],
                     "properties": {
-                        "query": {"type": "string", "description": "Optional name filter"}
+                        "op": {"type": "string", "enum": ["search", "inspect", "load", "unload"]},
+                        "name": {"type": "string", "description": "Tool name for inspect/load/unload"},
+                        "query": {"type": "string", "description": "search: optional name filter"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "search: max rows in the model-facing page (default 20)"},
+                        "cursor": {"type": "string", "description": "search: last tool name of the previous page"}
                     }
                 }),
                 risk: agent_contracts::ToolRisk::ReadOnly,
-            },
-            ToolSpec {
-                name: CAPABILITY_INSPECT.into(),
-                description:
-                    "Inspect one tool: its schema, risk class, owner and lifecycle state."
-                        .into(),
-                input_schema: json!({
-                    "type": "object",
-                    "required": ["name"],
-                    "properties": {"name": {"type": "string"}}
-                }),
-                risk: agent_contracts::ToolRisk::ReadOnly,
-            },
-            ToolSpec {
-                name: CAPABILITY_LOAD.into(),
-                description:
-                    "Load a tool (or the capability owning it) into the active set so its schema appears in the model's tool schemas."
-                        .into(),
-                input_schema: json!({
-                    "type": "object",
-                    "required": ["name"],
-                    "properties": {"name": {"type": "string"}}
-                }),
-                risk: agent_contracts::ToolRisk::WorkspaceWrite,
-            },
-            ToolSpec {
-                name: CAPABILITY_UNLOAD.into(),
-                description:
-                    "Unload a tool (or the capability owning it) from the active set; its schema stops being offered. Core builtin tools cannot be unloaded."
-                        .into(),
-                input_schema: json!({
-                    "type": "object",
-                    "required": ["name"],
-                    "properties": {"name": {"type": "string"}}
-                }),
-                risk: agent_contracts::ToolRisk::WorkspaceWrite,
             },
         ]
     }
@@ -668,14 +726,9 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
             .base
             .specs()
             .into_iter()
-            // The unified control tools live here; drop the builtin's own
-            // copies so the surface has no duplicates.
-            .filter(|spec| {
-                !matches!(
-                    spec.name.as_str(),
-                    CAPABILITY_SEARCH | CAPABILITY_LOAD | CAPABILITY_UNLOAD
-                )
-            })
+            // The unified control tool lives here; drop the builtin's own
+            // copy so the surface has no duplicate.
+            .filter(|spec| spec.name != CAPABILITY_MANAGE)
             .collect();
         specs.extend(self.capabilities.loaded_tool_specs());
         specs.extend(Self::control_specs());
@@ -686,7 +739,17 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
     fn snapshot(&self) -> ToolSurfaceSnapshot {
         ToolSurfaceSnapshot {
             specs: self.specs(),
-            generation: self.base.snapshot().generation,
+            // The unified surface generation: the base catalog's generation
+            // (its own load/unload/gc transitions) combined with the
+            // capability registry's (register/activation/load/unload), so a
+            // dynamic capability change is auditably visible in the
+            // snapshot — the generation tracks the whole surface, not just
+            // the builtin half of it.
+            generation: self
+                .base
+                .snapshot()
+                .generation
+                .wrapping_add(self.capabilities.generation()),
         }
     }
 
@@ -721,10 +784,7 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         let name = request.call.name.clone();
         match name.as_str() {
-            CAPABILITY_SEARCH => self.run_search(request).await.map(ToolOutcome::Value),
-            CAPABILITY_INSPECT => self.run_inspect(request).await.map(ToolOutcome::Value),
-            CAPABILITY_LOAD => self.run_load(request).await.map(ToolOutcome::Value),
-            CAPABILITY_UNLOAD => self.run_unload(request).await.map(ToolOutcome::Value),
+            CAPABILITY_MANAGE => self.run_manage(request).await.map(ToolOutcome::Value),
             _ => {
                 if self.capabilities.owner_of(&name).is_some() {
                     let capability = self
@@ -869,20 +929,40 @@ impl CapabilityAwareDispatcher {
 }
 
 #[derive(serde::Deserialize)]
-struct NameArgs {
-    name: String,
+struct ManageArgs {
+    op: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct SearchArgs {
     #[serde(default)]
     query: Option<String>,
+    /// Max rows in the model-facing page (default 20, capped at 50).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Opaque cursor for paging: the last tool name of the previous page.
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 impl CapabilityAwareDispatcher {
-    async fn run_search(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
-        let args: SearchArgs = serde_json::from_value(request.call.arguments)
-            .map_err(|e| AgentError::InvalidRequest(format!("capability.search args: {e}")))?;
+    async fn run_search(
+        &self,
+        request: ToolExecutionRequest,
+        args: SearchArgs,
+    ) -> AgentResult<ToolOutput> {
+        let page_size = args
+            .limit
+            .unwrap_or(CAPABILITY_SEARCH_DEFAULT_LIMIT)
+            .clamp(1, CAPABILITY_SEARCH_MAX_LIMIT);
         let mut entries = self.unified_catalog();
         if let Some(query) = args.query.as_deref() {
             entries.retain(|entry| entry.name.contains(query));
@@ -891,7 +971,48 @@ impl CapabilityAwareDispatcher {
             .iter()
             .filter(|entry| entry.state.in_surface())
             .count();
-        let lines: Vec<String> = entries
+        let total = entries.len();
+        // A catalog that does not fit the page spills its full listing to
+        // an artifact — the model only ever sees the bounded page, so a
+        // 1000-capability catalog cannot itself become context pollution.
+        let artifact_ref = if total > page_size {
+            match &self.workspace {
+                Some(workspace) => {
+                    let all: String = entries
+                        .iter()
+                        .map(|entry| {
+                            format!(
+                                "{}\t{}\t[{}]",
+                                entry.state.as_str(),
+                                entry.name,
+                                entry.owner
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Some(
+                        workspace
+                            .write_artifact(
+                                request.run_id,
+                                "capability-search",
+                                "txt",
+                                all.as_bytes(),
+                            )
+                            .await?,
+                    )
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        if let Some(cursor) = args.cursor.as_deref() {
+            entries.retain(|entry| entry.name.as_str() > cursor);
+        }
+        let remaining = entries.len();
+        let page: Vec<_> = entries.into_iter().take(page_size).collect();
+        let has_more = remaining > page.len();
+        let lines: Vec<String> = page
             .iter()
             .map(|entry| {
                 format!(
@@ -904,67 +1025,74 @@ impl CapabilityAwareDispatcher {
             .collect();
         Ok(ToolOutput {
             call_id: request.call.id,
-            tool_name: CAPABILITY_SEARCH.into(),
+            tool_name: CAPABILITY_MANAGE.into(),
             ok: true,
-            summary: format!(
-                "{} tools matched ({} on the model surface)",
-                entries.len(),
-                active
-            ),
-            model_content: lines.join("\n"),
-            artifact_ref: None,
-            metadata: json!({"total": entries.len(), "active": active}),
+            summary: format!("{} tools matched ({} on the model surface)", total, active),
+            model_content: if lines.is_empty() {
+                "no tools match".to_string()
+            } else {
+                lines.join("\n")
+            },
+            artifact_ref,
+            metadata: json!({
+                "total": total,
+                "active": active,
+                "returned": page.len(),
+                "has_more": has_more,
+            }),
         })
     }
 
-    async fn run_inspect(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
-        let args: NameArgs = serde_json::from_value(request.call.arguments)
-            .map_err(|e| AgentError::InvalidRequest(format!("capability.inspect args: {e}")))?;
-        let Some(spec) = self.inspect_tool(&args.name) else {
+    async fn run_inspect(
+        &self,
+        request: ToolExecutionRequest,
+        name: String,
+    ) -> AgentResult<ToolOutput> {
+        let Some(spec) = self.inspect_tool(&name) else {
             return Ok(ToolOutput {
                 call_id: request.call.id,
-                tool_name: CAPABILITY_INSPECT.into(),
+                tool_name: CAPABILITY_MANAGE.into(),
                 ok: false,
-                summary: format!("unknown tool: {}", args.name),
-                model_content: format!("unknown tool: {}", args.name),
+                summary: format!("unknown tool: {name}"),
+                model_content: format!("unknown tool: {name}"),
                 artifact_ref: None,
                 metadata: json!({}),
             });
         };
         let state = self
             .capabilities
-            .tool_state(&args.name)
+            .tool_state(&name)
             .or_else(|| {
                 self.base
                     .catalog()
                     .into_iter()
-                    .find(|entry| entry.name == args.name)
+                    .find(|entry| entry.name == name)
                     .map(|entry| entry.state)
             })
             .map(|s| s.as_str().to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let owner = self
             .capabilities
-            .owner_of(&args.name)
+            .owner_of(&name)
             .or_else(|| {
                 self.base
                     .catalog()
                     .into_iter()
-                    .find(|entry| entry.name == args.name)
+                    .find(|entry| entry.name == name)
                     .map(|entry| entry.owner)
             })
             .unwrap_or_else(|| "builtin".to_string());
         let activation = self
             .capabilities
-            .owner_of(&args.name)
+            .owner_of(&name)
             .and_then(|owner_id| self.capabilities.activation(&owner_id))
             .map(|activation| activation.as_str().to_string())
             .unwrap_or_else(|| "n/a".to_string());
         Ok(ToolOutput {
             call_id: request.call.id,
-            tool_name: CAPABILITY_INSPECT.into(),
+            tool_name: CAPABILITY_MANAGE.into(),
             ok: true,
-            summary: format!("tool {}: {}", args.name, state),
+            summary: format!("tool {name}: {state}"),
             model_content: format!(
                 "name: {}\nowner: {}\nactivation: {}\nstate: {}\ndescription: {}\nschema: {}",
                 spec.name, owner, activation, state, spec.description, spec.input_schema
@@ -980,36 +1108,74 @@ impl CapabilityAwareDispatcher {
         })
     }
 
-    async fn run_load(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
-        let args: NameArgs = serde_json::from_value(request.call.arguments)
-            .map_err(|e| AgentError::InvalidRequest(format!("capability.load args: {e}")))?;
-        self.load_tool(&args.name)?;
+    async fn run_load(
+        &self,
+        request: ToolExecutionRequest,
+        name: String,
+    ) -> AgentResult<ToolOutput> {
+        self.load_tool(&name)?;
         Ok(ToolOutput {
             call_id: request.call.id,
-            tool_name: CAPABILITY_LOAD.into(),
+            tool_name: CAPABILITY_MANAGE.into(),
             ok: true,
-            summary: format!("tool loaded: {}", args.name),
-            model_content: format!(
-                "tool loaded: {} — its schema is now offered to the model",
-                args.name
-            ),
+            summary: format!("tool loaded: {name}"),
+            model_content: format!("tool loaded: {name} — its schema is now offered to the model"),
             artifact_ref: None,
-            metadata: json!({"tool": args.name}),
+            metadata: json!({"tool": name}),
         })
     }
 
-    async fn run_unload(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
-        let args: NameArgs = serde_json::from_value(request.call.arguments)
-            .map_err(|e| AgentError::InvalidRequest(format!("capability.unload args: {e}")))?;
-        self.unload_tool(&args.name)?;
+    async fn run_unload(
+        &self,
+        request: ToolExecutionRequest,
+        name: String,
+    ) -> AgentResult<ToolOutput> {
+        self.unload_tool(&name)?;
         Ok(ToolOutput {
             call_id: request.call.id,
-            tool_name: CAPABILITY_UNLOAD.into(),
+            tool_name: CAPABILITY_MANAGE.into(),
             ok: true,
-            summary: format!("tool unloaded: {}", args.name),
-            model_content: format!("tool unloaded: {}", args.name),
+            summary: format!("tool unloaded: {name}"),
+            model_content: format!("tool unloaded: {name}"),
             artifact_ref: None,
-            metadata: json!({"tool": args.name}),
+            metadata: json!({"tool": name}),
         })
+    }
+
+    /// Dispatch `capability.manage` ops: search / inspect / load / unload.
+    async fn run_manage(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
+        let args: ManageArgs = serde_json::from_value(request.call.arguments.clone())
+            .map_err(|e| AgentError::InvalidRequest(format!("capability.manage args: {e}")))?;
+        match args.op.as_str() {
+            "search" => {
+                let search = SearchArgs {
+                    query: args.query,
+                    limit: args.limit,
+                    cursor: args.cursor,
+                };
+                self.run_search(request, search).await
+            }
+            "inspect" => {
+                let name = args.name.ok_or_else(|| {
+                    AgentError::InvalidRequest("capability.manage inspect: missing 'name'".into())
+                })?;
+                self.run_inspect(request, name).await
+            }
+            "load" => {
+                let name = args.name.ok_or_else(|| {
+                    AgentError::InvalidRequest("capability.manage load: missing 'name'".into())
+                })?;
+                self.run_load(request, name).await
+            }
+            "unload" => {
+                let name = args.name.ok_or_else(|| {
+                    AgentError::InvalidRequest("capability.manage unload: missing 'name'".into())
+                })?;
+                self.run_unload(request, name).await
+            }
+            other => Err(AgentError::InvalidRequest(format!(
+                "capability.manage: unknown op '{other}' (expected search/inspect/load/unload)"
+            ))),
+        }
     }
 }

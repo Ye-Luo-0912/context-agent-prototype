@@ -335,6 +335,11 @@ impl Capability for DemoCapability {
         &self.manifest
     }
     fn tool_specs(&self) -> Vec<ToolSpec> {
+        // Declared schemas win (a real capability can serve custom
+        // schemas); the plain name-generated shapes are the fallback.
+        if !self.manifest.tools.is_empty() {
+            return self.manifest.tools.clone();
+        }
         self.tool_names
             .iter()
             .map(|name| ToolSpec {
@@ -620,7 +625,7 @@ async fn capabilities_cannot_shadow_reserved_core_tool_names() {
     // Control tools are reserved too.
     let control = DemoCapability::with_tool_names(
         "shadow-control",
-        &[agent_contracts::CAPABILITY_SEARCH],
+        &[agent_contracts::CAPABILITY_MANAGE],
         CapabilityTransport::Builtin,
     );
     let error = registry
@@ -990,5 +995,150 @@ async fn host_stop_runs_every_stop_and_aggregates_all_errors() {
         order.iter().filter(|s| s.starts_with("stop:")).count(),
         3,
         "all stops run best effort: {order:?}"
+    );
+}
+
+#[tokio::test]
+async fn registration_rejects_oversized_or_malformed_tool_schemas() {
+    let host = ModuleHost::new();
+    let registry = host.capability_registry();
+
+    // An oversized input schema (above the 4 KB cap) is rejected at
+    // registration — a single capability must not be able to blow up the
+    // model surface with one giant schema.
+    let mut big = DemoCapability::new(
+        "big-schema",
+        CapabilityLifecycle::Lazy,
+        Arc::new(Mutex::new(false)),
+    );
+    big.tool_names = vec!["big.tool".into()];
+    big.manifest.tools = vec![ToolSpec {
+        name: "big.tool".into(),
+        description: "x".into(),
+        input_schema: json!({"padding": "x".repeat(5 * 1024)}),
+        risk: ToolRisk::ReadOnly,
+    }];
+    let error = registry
+        .register(Arc::new(big))
+        .expect_err("an oversized schema must be rejected");
+    assert!(error.to_string().contains("schema"), "{error}");
+
+    // Too many tools per capability (above the 32-tool cap).
+    let mut many = DemoCapability::new(
+        "many-tools",
+        CapabilityLifecycle::Lazy,
+        Arc::new(Mutex::new(false)),
+    );
+    many.tool_names = (0..40).map(|i| format!("many.tool{i}")).collect();
+    let error = registry
+        .register(Arc::new(many))
+        .expect_err("a tool count above the cap must be rejected");
+    assert!(error.to_string().contains("per-capability cap"), "{error}");
+
+    // A malformed tool name is rejected.
+    let mut bad = DemoCapability::new(
+        "bad-name",
+        CapabilityLifecycle::Lazy,
+        Arc::new(Mutex::new(false)),
+    );
+    bad.tool_names = vec!["bad name!".into()];
+    let error = registry
+        .register(Arc::new(bad))
+        .expect_err("a malformed tool name must be rejected");
+    assert!(error.to_string().contains("[A-Za-z0-9._:-]"), "{error}");
+}
+
+#[tokio::test]
+async fn snapshot_generation_tracks_dynamic_capability_changes() {
+    let host = ModuleHost::new();
+    let registry = host.capability_registry();
+    let dispatcher = CapabilityAwareDispatcher::new(Arc::new(StubTools), registry.clone());
+
+    let before = dispatcher.snapshot().generation;
+    let capability = DemoCapability::new(
+        "gen-a",
+        CapabilityLifecycle::Lazy,
+        Arc::new(Mutex::new(false)),
+    );
+    registry.register(Arc::new(capability)).unwrap();
+    let after_register = dispatcher.snapshot().generation;
+    assert!(
+        after_register > before,
+        "registration must bump the surface generation"
+    );
+
+    registry.load_tool("gen-a.demo").unwrap();
+    let after_load = dispatcher.snapshot().generation;
+    assert!(
+        after_load > after_register,
+        "loading must bump the generation"
+    );
+
+    registry.unload_tool("gen-a.demo").unwrap();
+    let after_unload = dispatcher.snapshot().generation;
+    assert!(
+        after_unload > after_load,
+        "unloading must bump the generation"
+    );
+
+    registry.enable("gen-a").unwrap();
+    let after_activate = dispatcher.snapshot().generation;
+    assert!(
+        after_activate > after_unload,
+        "activation changes must bump the generation"
+    );
+}
+
+#[tokio::test]
+async fn unified_search_pages_and_spills_to_the_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    let host = ModuleHost::new();
+    let registry = host.capability_registry();
+    for id in ["ext.a", "ext.b", "ext.c"] {
+        registry
+            .register(Arc::new(DemoCapability::new(
+                id,
+                CapabilityLifecycle::Lazy,
+                Arc::new(Mutex::new(false)),
+            )))
+            .unwrap();
+    }
+    let dispatcher = CapabilityAwareDispatcher::with_workspace(
+        Arc::new(StubTools),
+        registry.clone(),
+        Some(workspace.clone()),
+    );
+
+    let output = dispatcher
+        .execute(ToolExecutionRequest {
+            run_id: RunId::new(),
+            call: ToolCall {
+                id: "c".into(),
+                name: agent_contracts::CAPABILITY_MANAGE.into(),
+                arguments: json!({"op": "search", "limit": 2}),
+            },
+            cancel: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+    let output = match output {
+        ToolOutcome::Value(output) => output,
+        other => panic!("capability.manage search must return a plain value, got {other:?}"),
+    };
+    assert!(output.ok);
+    assert!(
+        output.artifact_ref.is_some(),
+        "a catalog larger than the page must spill to an artifact"
+    );
+    assert!(
+        output.model_content.lines().count() <= 2,
+        "the model must only see the bounded page: {}",
+        output.model_content
+    );
+    assert_eq!(output.metadata["has_more"], true);
+    assert_eq!(
+        output.metadata["total"], 4,
+        "fs.read + three capability tools"
     );
 }

@@ -1,20 +1,26 @@
-//! Context meta-tools: `context.gc_hint` / `context.tag` / `context.lease` /
-//! `context.collect` (directives) and `context.search` / `context.inspect` /
-//! `context.fetch` (read-only engine queries).
+//! The merged context meta-tool: one `context.manage` entry point with an
+//! `op` dispatch covering the four directives (`gc_hint` / `tag` / `lease` /
+//! `collect`) and the three retrieval queries (`search` / `inspect` /
+//! `fetch`).
 //!
-//! The directive tools do no work themselves — each attaches a typed
+//! The directive ops do no work themselves — each attaches a typed
 //! `ContextAction` to its output that the runtime routes to the context
 //! engine (invariant 3: tools never touch the engine, and the kernel
-//! decides how the directive is applied). The query tools attach a typed
+//! decides how the directive is applied). The query ops attach a typed
 //! `EngineQuery` that the kernel resolves against the engine — same
 //! invariant, same direction: the tool only names *what* it wants, the
 //! runtime answers. The model targets items by the ids it sees in the
 //! materialized context frame; a stale id is a silent no-op in the engine,
-//! so the tools are safe to call even when the target just left.
+//! so the tool is safe to call even when the target just left.
+//!
+//! One schema instead of seven keeps the always-visible tool surface
+//! small: a dozen single-purpose meta-tools would cost more model input
+//! than the runtime control they provide.
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, ContextAction, ContextItemId, ContextKind,
-    ContextScope, EngineQuery, RunId, TaskId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    AgentError, AgentResult, CONTEXT_MANAGE, CancellationToken, ContextAction, ContextItemId,
+    ContextKind, ContextScope, EngineQuery, RunId, TaskId, ToolOutcome, ToolOutput, ToolRisk,
+    ToolSpec,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -22,119 +28,97 @@ use serde_json::{Value, json};
 
 use super::Tool;
 
-/// Which of the four meta-tools this instance serves. One struct, four
-/// names — the schemas and the produced directive differ, nothing else.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ContextDirectiveKind {
+/// Which operation `context.manage` serves this call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ManageOp {
+    /// Keep an item resident across GC passes until a later `keep=false`.
     GcHint,
+    /// Attach an extension tag to an item so later inspection can find it.
     Tag,
+    /// Protect an item from GC for the next N turns.
     Lease,
+    /// Run a full GC pass now (manual collect).
     Collect,
-}
-
-pub(crate) struct ContextDirectiveTool {
-    kind: ContextDirectiveKind,
-}
-
-impl ContextDirectiveTool {
-    pub(crate) fn gc_hint() -> Self {
-        Self {
-            kind: ContextDirectiveKind::GcHint,
-        }
-    }
-
-    pub(crate) fn tag() -> Self {
-        Self {
-            kind: ContextDirectiveKind::Tag,
-        }
-    }
-
-    pub(crate) fn lease() -> Self {
-        Self {
-            kind: ContextDirectiveKind::Lease,
-        }
-    }
-
-    pub(crate) fn collect() -> Self {
-        Self {
-            kind: ContextDirectiveKind::Collect,
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        match self.kind {
-            ContextDirectiveKind::GcHint => "context.gc_hint",
-            ContextDirectiveKind::Tag => "context.tag",
-            ContextDirectiveKind::Lease => "context.lease",
-            ContextDirectiveKind::Collect => "context.collect",
-        }
-    }
+    /// Deterministic search over externalized refs.
+    Search,
+    /// Metadata of one externalized ref by item id (no store read).
+    Inspect,
+    /// Pull the full content of one externalized item back from the store.
+    Fetch,
 }
 
 #[derive(Deserialize)]
-struct IdKeepArgs {
-    item_id: ContextItemId,
-    keep: bool,
+struct ManageArgs {
+    op: ManageOp,
+    // Directives
+    #[serde(default)]
+    item_id: Option<ContextItemId>,
+    #[serde(default)]
+    keep: Option<bool>,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    turns: Option<u32>,
+    // Retrieval
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    kind: Option<ContextKind>,
+    #[serde(default)]
+    scope: Option<ContextScope>,
+    #[serde(default)]
+    task_id: Option<TaskId>,
 }
 
-#[derive(Deserialize)]
-struct IdTagArgs {
-    item_id: ContextItemId,
-    tag: String,
+pub(crate) struct ContextManageTool;
+
+impl ContextManageTool {
+    pub(crate) fn new() -> Self {
+        Self
+    }
 }
 
-#[derive(Deserialize)]
-struct IdTurnsArgs {
-    item_id: ContextItemId,
-    turns: u32,
+fn require<T>(value: Option<T>, op: &str, field: &str) -> AgentResult<T> {
+    value.ok_or_else(|| {
+        AgentError::InvalidRequest(format!("context.manage {op}: missing '{field}'"))
+    })
 }
 
 #[async_trait]
-impl Tool for ContextDirectiveTool {
+impl Tool for ContextManageTool {
     fn spec(&self) -> ToolSpec {
-        let (description, input_schema) = match self.kind {
-            ContextDirectiveKind::GcHint => (
-                "Ask the context engine to keep an item resident across GC passes until a later gc_hint with keep=false clears it.",
-                json!({
-                    "type": "object",
-                    "required": ["item_id", "keep"],
-                    "properties": {
-                        "item_id": {"type": "string", "description": "Item id from the materialized context frame"},
-                        "keep": {"type": "boolean", "description": "true protects the item, false releases it"}
-                    }
-                }),
-            ),
-            ContextDirectiveKind::Tag => (
-                "Attach an extension tag to an item so later inspection can find it.",
-                json!({
-                    "type": "object",
-                    "required": ["item_id", "tag"],
-                    "properties": {
-                        "item_id": {"type": "string", "description": "Item id from the materialized context frame"},
-                        "tag": {"type": "string", "description": "Tag text (stored under the ext: namespace)"}
-                    }
-                }),
-            ),
-            ContextDirectiveKind::Lease => (
-                "Protect an item from GC for the next N turns (the item stays resident while leased).",
-                json!({
-                    "type": "object",
-                    "required": ["item_id", "turns"],
-                    "properties": {
-                        "item_id": {"type": "string", "description": "Item id from the materialized context frame"},
-                        "turns": {"type": "integer", "minimum": 1, "description": "How many turns the item stays protected"}
-                    }
-                }),
-            ),
-            ContextDirectiveKind::Collect => (
-                "Run a full GC pass now (manual collect): evicts what the working set no longer needs, reversibly.",
-                json!({"type": "object"}),
-            ),
-        };
         ToolSpec {
-            name: self.name().into(),
-            description: description.into(),
-            input_schema,
+            name: CONTEXT_MANAGE.into(),
+            description: concat!(
+                "One entry point for runtime context control and the externalized-ref retrieval loop. ",
+                "Directive ops (gc_hint/tag/lease/collect) ask the runtime to change context state; ",
+                "query ops (search/inspect/fetch) read externalized refs — search lists refs matching ",
+                "an entity/kind/scope/task query, inspect shows one ref's metadata, fetch pulls its ",
+                "full content back on demand. Item ids come from the materialized context frame."
+            )
+            .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["op"],
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": ["gc_hint", "tag", "lease", "collect", "search", "inspect", "fetch"]
+                    },
+                    "item_id": {"type": "string", "description": "Target item (gc_hint/tag/lease/inspect/fetch)"},
+                    "keep": {"type": "boolean", "description": "gc_hint: true protects, false releases"},
+                    "tag": {"type": "string", "description": "tag: tag text (stored under the ext: namespace)"},
+                    "turns": {"type": "integer", "minimum": 1, "description": "lease: how many turns the item stays protected"},
+                    "query": {"type": "string", "description": "search: free text matched against entity signatures and summaries"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 64, "description": "search: max refs to return (default 16)"},
+                    "kind": {"type": "string", "description": "search: optional ContextKind filter"},
+                    "scope": {"type": "string", "description": "search: optional ContextScope filter"},
+                    "task_id": {"type": "string", "description": "search: optional TaskId filter"}
+                }
+            }),
             risk: ToolRisk::ReadOnly,
         }
     }
@@ -146,62 +130,136 @@ impl Tool for ContextDirectiveTool {
         arguments: Value,
         _cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
-        let action = match self.kind {
-            ContextDirectiveKind::GcHint => {
-                let args: IdKeepArgs = serde_json::from_value(arguments).map_err(|e| {
-                    agent_contracts::AgentError::InvalidRequest(format!(
-                        "{} args: {e}",
-                        self.name()
-                    ))
-                })?;
-                ContextAction::GcHint {
-                    item_id: args.item_id,
-                    keep_alive: args.keep,
-                }
+        let args: ManageArgs = serde_json::from_value(arguments)
+            .map_err(|e| AgentError::InvalidRequest(format!("context.manage args: {e}")))?;
+        match args.op {
+            // ---- Directives: a typed ContextAction the runtime routes ----
+            ManageOp::GcHint => {
+                let item_id = require(args.item_id, "gc_hint", "item_id")?;
+                let keep_alive = require(args.keep, "gc_hint", "keep")?;
+                let action = ContextAction::GcHint {
+                    item_id,
+                    keep_alive,
+                };
+                let description = describe(&action);
+                Ok(ToolOutcome::RuntimeDirective {
+                    output: ToolOutput {
+                        call_id: call_id.into(),
+                        tool_name: CONTEXT_MANAGE.into(),
+                        ok: true,
+                        summary: description.clone(),
+                        model_content: description,
+                        artifact_ref: None,
+                        metadata: json!({"context_action": action}),
+                    },
+                    directive: agent_contracts::RuntimeDirective::Context(action),
+                })
             }
-            ContextDirectiveKind::Tag => {
-                let args: IdTagArgs = serde_json::from_value(arguments).map_err(|e| {
-                    agent_contracts::AgentError::InvalidRequest(format!(
-                        "{} args: {e}",
-                        self.name()
-                    ))
-                })?;
-                ContextAction::Tag {
-                    item_id: args.item_id,
-                    tag: args.tag,
-                }
+            ManageOp::Tag => {
+                let item_id = require(args.item_id, "tag", "item_id")?;
+                let tag = require(args.tag, "tag", "tag")?;
+                let action = ContextAction::Tag { item_id, tag };
+                let description = describe(&action);
+                Ok(ToolOutcome::RuntimeDirective {
+                    output: ToolOutput {
+                        call_id: call_id.into(),
+                        tool_name: CONTEXT_MANAGE.into(),
+                        ok: true,
+                        summary: description.clone(),
+                        model_content: description,
+                        artifact_ref: None,
+                        metadata: json!({"context_action": action}),
+                    },
+                    directive: agent_contracts::RuntimeDirective::Context(action),
+                })
             }
-            ContextDirectiveKind::Lease => {
-                let args: IdTurnsArgs = serde_json::from_value(arguments).map_err(|e| {
-                    agent_contracts::AgentError::InvalidRequest(format!(
-                        "{} args: {e}",
-                        self.name()
-                    ))
-                })?;
-                ContextAction::Lease {
-                    item_id: args.item_id,
-                    turns: args.turns,
-                }
+            ManageOp::Lease => {
+                let item_id = require(args.item_id, "lease", "item_id")?;
+                let turns = require(args.turns, "lease", "turns")?;
+                let action = ContextAction::Lease { item_id, turns };
+                let description = describe(&action);
+                Ok(ToolOutcome::RuntimeDirective {
+                    output: ToolOutput {
+                        call_id: call_id.into(),
+                        tool_name: CONTEXT_MANAGE.into(),
+                        ok: true,
+                        summary: description.clone(),
+                        model_content: description,
+                        artifact_ref: None,
+                        metadata: json!({"context_action": action}),
+                    },
+                    directive: agent_contracts::RuntimeDirective::Context(action),
+                })
             }
-            ContextDirectiveKind::Collect => ContextAction::Collect,
-        };
-        let description = describe(&action);
-        // The meta-tools produce a `RuntimeDirective`, not a plain output:
-        // context control is a distinct `ToolOutcome` variant so only
-        // trusted tools (and capabilities granted `runtime:context-control`)
-        // can ask the runtime to change context state.
-        Ok(ToolOutcome::RuntimeDirective {
-            output: ToolOutput {
-                call_id: call_id.into(),
-                tool_name: self.name().into(),
-                ok: true,
-                summary: description.clone(),
-                model_content: description,
-                artifact_ref: None,
-                metadata: json!({"context_action": action}),
-            },
-            directive: agent_contracts::RuntimeDirective::Context(action),
-        })
+            ManageOp::Collect => {
+                let action = ContextAction::Collect;
+                let description = describe(&action);
+                Ok(ToolOutcome::RuntimeDirective {
+                    output: ToolOutput {
+                        call_id: call_id.into(),
+                        tool_name: CONTEXT_MANAGE.into(),
+                        ok: true,
+                        summary: description.clone(),
+                        model_content: description,
+                        artifact_ref: None,
+                        metadata: json!({"context_action": action}),
+                    },
+                    directive: agent_contracts::RuntimeDirective::Context(action),
+                })
+            }
+            // ---- Retrieval: a typed EngineQuery the kernel resolves ----
+            ManageOp::Search => {
+                let query = require(args.query, "search", "query")?;
+                Ok(ToolOutcome::EngineQuery {
+                    output: ToolOutput {
+                        call_id: call_id.into(),
+                        tool_name: CONTEXT_MANAGE.into(),
+                        ok: true,
+                        summary: "querying the context engine".into(),
+                        model_content: "resolving...".into(),
+                        artifact_ref: None,
+                        metadata: json!({"engine_query": true}),
+                    },
+                    query: EngineQuery::SearchExternal {
+                        query,
+                        kind: args.kind,
+                        scope: args.scope,
+                        task_id: args.task_id,
+                        limit: args.limit.unwrap_or(16),
+                    },
+                })
+            }
+            ManageOp::Inspect => {
+                let item_id = require(args.item_id, "inspect", "item_id")?;
+                Ok(ToolOutcome::EngineQuery {
+                    output: ToolOutput {
+                        call_id: call_id.into(),
+                        tool_name: CONTEXT_MANAGE.into(),
+                        ok: true,
+                        summary: "querying the context engine".into(),
+                        model_content: "resolving...".into(),
+                        artifact_ref: None,
+                        metadata: json!({"engine_query": true}),
+                    },
+                    query: EngineQuery::InspectExternal { item_id },
+                })
+            }
+            ManageOp::Fetch => {
+                let item_id = require(args.item_id, "fetch", "item_id")?;
+                Ok(ToolOutcome::EngineQuery {
+                    output: ToolOutput {
+                        call_id: call_id.into(),
+                        tool_name: CONTEXT_MANAGE.into(),
+                        ok: true,
+                        summary: "querying the context engine".into(),
+                        model_content: "resolving...".into(),
+                        artifact_ref: None,
+                        metadata: json!({"engine_query": true}),
+                    },
+                    query: EngineQuery::FetchExternal { item_id },
+                })
+            }
+        }
     }
 }
 
@@ -217,170 +275,5 @@ fn describe(action: &ContextAction) -> String {
             format!("lease: item {item_id} protected for {turns} turns")
         }
         ContextAction::Collect => "collect: full GC pass requested".to_string(),
-    }
-}
-
-/// Which read-only engine query this instance serves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ContextQueryKind {
-    Search,
-    Inspect,
-    Fetch,
-}
-
-/// `context.search` / `context.inspect` / `context.fetch`: the on-demand
-/// retrieval loop for externalized refs. These tools produce an
-/// `EngineQuery` the kernel resolves against the context engine — they do
-/// not touch the engine themselves and carry no side effects, so they are
-/// plain `ReadOnly` tools (no `runtime:context-control` permission needed;
-/// unlike directives they cannot change runtime state).
-pub(crate) struct ContextQueryTool {
-    kind: ContextQueryKind,
-}
-
-impl ContextQueryTool {
-    pub(crate) fn search() -> Self {
-        Self {
-            kind: ContextQueryKind::Search,
-        }
-    }
-
-    pub(crate) fn inspect() -> Self {
-        Self {
-            kind: ContextQueryKind::Inspect,
-        }
-    }
-
-    pub(crate) fn fetch() -> Self {
-        Self {
-            kind: ContextQueryKind::Fetch,
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        match self.kind {
-            ContextQueryKind::Search => "context.search",
-            ContextQueryKind::Inspect => "context.inspect",
-            ContextQueryKind::Fetch => "context.fetch",
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct SearchArgs {
-    query: String,
-    #[serde(default)]
-    limit: Option<usize>,
-    #[serde(default)]
-    kind: Option<ContextKind>,
-    #[serde(default)]
-    scope: Option<ContextScope>,
-    #[serde(default)]
-    task_id: Option<TaskId>,
-}
-
-#[derive(Deserialize)]
-struct IdArgs {
-    item_id: ContextItemId,
-}
-
-#[async_trait]
-impl Tool for ContextQueryTool {
-    fn spec(&self) -> ToolSpec {
-        let (description, input_schema) = match self.kind {
-            ContextQueryKind::Search => (
-                "Deterministic search over externalized context refs (items whose content was archived to the context store). Matches entity signatures, kind, scope and task, ranked by entity match then recency. Returns refs only — fetch one to see the full content.",
-                json!({
-                    "type": "object",
-                    "required": ["query"],
-                    "properties": {
-                        "query": {"type": "string", "description": "Free text; matched against entity signatures and summaries"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 64, "description": "Max refs to return (default 16)"},
-                        "kind": {"type": "string", "description": "Optional ContextKind filter"},
-                        "scope": {"type": "string", "description": "Optional ContextScope filter"},
-                        "task_id": {"type": "string", "description": "Optional TaskId filter"}
-                    }
-                }),
-            ),
-            ContextQueryKind::Inspect => (
-                "Metadata of one externalized ref by item id (kind, scope, task, residency, semantic state, tags, entities). No store read.",
-                json!({
-                    "type": "object",
-                    "required": ["item_id"],
-                    "properties": {
-                        "item_id": {"type": "string", "description": "Item id from the materialized external refs or context.search"}
-                    }
-                }),
-            ),
-            ContextQueryKind::Fetch => (
-                "Pull the full content of one externalized item back from the context store. The item stays externalized — this is a deliberate read, not a working-set reactivation.",
-                json!({
-                    "type": "object",
-                    "required": ["item_id"],
-                    "properties": {
-                        "item_id": {"type": "string", "description": "Item id from the materialized external refs or context.search"}
-                    }
-                }),
-            ),
-        };
-        ToolSpec {
-            name: self.name().into(),
-            description: description.into(),
-            input_schema,
-            risk: ToolRisk::ReadOnly,
-        }
-    }
-
-    async fn execute(
-        &self,
-        _run_id: RunId,
-        call_id: &str,
-        arguments: Value,
-        _cancel: CancellationToken,
-    ) -> AgentResult<ToolOutcome> {
-        let query = match self.kind {
-            ContextQueryKind::Search => {
-                let args: SearchArgs = serde_json::from_value(arguments).map_err(|e| {
-                    AgentError::InvalidRequest(format!("{} args: {e}", self.name()))
-                })?;
-                EngineQuery::SearchExternal {
-                    query: args.query,
-                    kind: args.kind,
-                    scope: args.scope,
-                    task_id: args.task_id,
-                    limit: args.limit.unwrap_or(16),
-                }
-            }
-            ContextQueryKind::Inspect => {
-                let args: IdArgs = serde_json::from_value(arguments).map_err(|e| {
-                    AgentError::InvalidRequest(format!("{} args: {e}", self.name()))
-                })?;
-                EngineQuery::InspectExternal {
-                    item_id: args.item_id,
-                }
-            }
-            ContextQueryKind::Fetch => {
-                let args: IdArgs = serde_json::from_value(arguments).map_err(|e| {
-                    AgentError::InvalidRequest(format!("{} args: {e}", self.name()))
-                })?;
-                EngineQuery::FetchExternal {
-                    item_id: args.item_id,
-                }
-            }
-        };
-        Ok(ToolOutcome::EngineQuery {
-            // Placeholder: the kernel replaces the content with the
-            // engine's answer (call id / tool name survive).
-            output: ToolOutput {
-                call_id: call_id.into(),
-                tool_name: self.name().into(),
-                ok: true,
-                summary: "querying the context engine".into(),
-                model_content: "resolving...".into(),
-                artifact_ref: None,
-                metadata: json!({"engine_query": true}),
-            },
-            query,
-        })
     }
 }

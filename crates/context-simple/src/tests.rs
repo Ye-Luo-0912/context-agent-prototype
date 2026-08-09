@@ -2366,3 +2366,111 @@ async fn pinned_dependency_cannot_break_the_expansion_budget() {
     );
     let _ = ids;
 }
+
+#[tokio::test]
+async fn closed_tool_scopes_are_not_candidates_but_hot_entities_still_reach_them() {
+    // A low active threshold so the assertion targets *candidacy* (scope
+    // membership) rather than the scoring cutoff.
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        active_threshold: 0.1,
+        ..SimpleContextConfig::default()
+    });
+    let _task_id = open_focus(&engine, "refactor AuthService.rs").await;
+    let task_id = _task_id;
+
+    // A tool frame opens, an observation lands in it, the frame closes.
+    // The observation keeps its scope stamp — it is not promoted or
+    // evicted by the tool close, it just loses its candidacy.
+    let tool_scope = engine.open_scope(ScopeKind::Tool, None).await.unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "shell.exec".into(),
+                ok: true,
+                summary: "ok".into(),
+                model_content: "touched AuthService.rs".into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+            scope_id: Some(tool_scope),
+        })
+        .await
+        .unwrap();
+    engine.close_scope(tool_scope).await.unwrap();
+
+    // Without hot entities the closed frame's observation is not a
+    // candidate: it is no longer part of the open working-set lineage,
+    // even though it still belongs to the active task. The observation
+    // itself seeded the hot set at ingest, so re-focus with an empty hot
+    // set first.
+    engine
+        .ingest(ContextIngress::FocusChanged {
+            focus: FocusState::for_task(task_id, "refactor AuthService.rs"),
+        })
+        .await
+        .unwrap();
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 10_000,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !materialized
+            .items
+            .iter()
+            .any(|item| item.content.contains("touched")),
+        "a closed tool scope's observation must not be a candidate: {:?}",
+        materialized
+            .items
+            .iter()
+            .map(|item| &item.content)
+            .collect::<Vec<_>>()
+    );
+
+    // When the entity is hot again the same item becomes a candidate
+    // again — closed scope membership is not a one-way door; affinity
+    // recalls it, exactly like the GC's hot-entity reactivation.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "recall what we changed in AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        let observation = state
+            .items
+            .iter()
+            .find(|item| item.content.contains("touched"))
+            .expect("the observation is still in the heap");
+        assert!(
+            state.hot_entities.iter().any(|e| e == "AuthService.rs"),
+            "hot entities after the user message: {:?}",
+            state.hot_entities
+        );
+        assert!(
+            observation.entities.iter().any(|e| e == "AuthService.rs"),
+            "observation entities: {:?}",
+            observation.entities
+        );
+    }
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "recall what we changed in AuthService.rs".into(),
+            budget_tokens: 10_000,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        materialized
+            .items
+            .iter()
+            .any(|item| item.content.contains("touched")),
+        "hot entities must recall the closed frame's observation"
+    );
+}

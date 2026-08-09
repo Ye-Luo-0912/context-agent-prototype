@@ -23,12 +23,12 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::tools::{
-    ContextDirectiveTool, ContextQueryTool, EditReplaceTool, FsListTool, FsReadTool, FsWriteTool,
-    GitDiffTool, GitStatusTool, SearchGrepTool, ShellExecTool, Tool,
+    ContextManageTool, EditReplaceTool, FsListTool, FsReadTool, FsWriteTool, GitDiffTool,
+    GitStatusTool, SearchGrepTool, ShellExecTool, Tool,
 };
 
 /// Control tools are now defined by the unified catalog contract.
-pub use agent_contracts::{CAPABILITY_LOAD, CAPABILITY_SEARCH, CAPABILITY_UNLOAD, ToolLifecycle};
+pub use agent_contracts::{CAPABILITY_MANAGE, CONTEXT_MANAGE, ToolLifecycle};
 
 /// Tuning knobs for the catalog lifecycle.
 #[derive(Debug, Clone)]
@@ -48,17 +48,14 @@ impl Default for ToolLifecycleConfig {
                 "fs.list".into(),
                 "fs.read".into(),
                 "search.grep".into(),
-                // The context meta-tools are the model's handle on the
-                // context engine (gc hints, tags, leases, manual collect,
-                // and the on-demand retrieval loop over externalized refs);
-                // they are cheap and always relevant.
-                "context.gc_hint".into(),
-                "context.tag".into(),
-                "context.lease".into(),
-                "context.collect".into(),
-                "context.search".into(),
-                "context.inspect".into(),
-                "context.fetch".into(),
+                // The merged control surface: one `context.manage` (gc hints,
+                // tags, leases, manual collect, and the on-demand retrieval
+                // loop over externalized refs) and one `capability.manage`
+                // (catalog search/inspect/load/unload). A dozen
+                // single-purpose meta-tools would cost more model input than
+                // the runtime control they provide.
+                CONTEXT_MANAGE.into(),
+                CAPABILITY_MANAGE.into(),
             ],
             idle_to_warm_ticks: 8,
             warm_to_unload_ticks: 24,
@@ -75,6 +72,9 @@ struct ToolEntry {
 pub struct BuiltinToolDispatcher {
     catalog: RwLock<HashMap<String, ToolEntry>>,
     config: ToolLifecycleConfig,
+    /// Kept for `capability.search` artifact spill: a catalog that does not
+    /// fit the model-facing page writes its full listing here.
+    workspace: Workspace,
     tick: AtomicU64,
     /// Bumped on every lifecycle change (load/unload/gc transitions), so a
     /// `ToolSurfaceSnapshot` is auditably identifiable.
@@ -95,14 +95,8 @@ impl BuiltinToolDispatcher {
             Arc::new(EditReplaceTool::new(workspace.clone())),
             Arc::new(GitStatusTool::new(workspace.clone())),
             Arc::new(GitDiffTool::new(workspace.clone())),
-            Arc::new(ShellExecTool::new(workspace)),
-            Arc::new(ContextDirectiveTool::gc_hint()),
-            Arc::new(ContextDirectiveTool::tag()),
-            Arc::new(ContextDirectiveTool::lease()),
-            Arc::new(ContextDirectiveTool::collect()),
-            Arc::new(ContextQueryTool::search()),
-            Arc::new(ContextQueryTool::inspect()),
-            Arc::new(ContextQueryTool::fetch()),
+            Arc::new(ShellExecTool::new(workspace.clone())),
+            Arc::new(ContextManageTool::new()),
         ];
         let catalog = tools
             .into_iter()
@@ -126,6 +120,7 @@ impl BuiltinToolDispatcher {
         Self {
             catalog: RwLock::new(catalog),
             config,
+            workspace,
             tick: AtomicU64::new(0),
             generation: AtomicU64::new(0),
         }
@@ -226,52 +221,48 @@ impl BuiltinToolDispatcher {
     fn meta_specs() -> Vec<ToolSpec> {
         vec![
             ToolSpec {
-                name: CAPABILITY_SEARCH.into(),
-                description:
-                    "List the tools known to the runtime and their lifecycle state (available/loaded/active/warm/unloaded).".into(),
+                name: CAPABILITY_MANAGE.into(),
+                description: "Manage the tool catalog in one call. ops: search (list known tools with lifecycle state and owner), inspect (one tool's schema and state), load (put a tool on the model surface, e.g. git.status), unload (take a tool off the surface; core tools cannot be unloaded).".into(),
                 input_schema: json!({
                     "type": "object",
+                    "required": ["op"],
                     "properties": {
-                        "query": {"type": "string", "description": "Optional name filter"}
+                        "op": {"type": "string", "enum": ["search", "inspect", "load", "unload"]},
+                        "name": {"type": "string", "description": "Tool name for inspect/load/unload"},
+                        "query": {"type": "string", "description": "search: optional name filter"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "search: max rows in the model-facing page (default 20)"},
+                        "cursor": {"type": "string", "description": "search: last tool name of the previous page"}
                     }
                 }),
                 risk: ToolRisk::ReadOnly,
-            },
-            ToolSpec {
-                name: CAPABILITY_LOAD.into(),
-                description:
-                    "Load a tool into the active set so it appears in the model's tool schemas (e.g. load git.status when the task needs git).".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "required": ["name"],
-                    "properties": {"name": {"type": "string"}}
-                }),
-                risk: ToolRisk::WorkspaceWrite,
-            },
-            ToolSpec {
-                name: CAPABILITY_UNLOAD.into(),
-                description:
-                    "Unload a tool from the active set; its schema stops being offered to the model. Core tools cannot be unloaded.".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "required": ["name"],
-                    "properties": {"name": {"type": "string"}}
-                }),
-                risk: ToolRisk::WorkspaceWrite,
             },
         ]
     }
 }
 
 #[derive(Deserialize)]
-struct NameArgs {
-    name: String,
+struct ManageArgs {
+    op: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct SearchArgs {
     #[serde(default)]
     query: Option<String>,
+    /// Max rows in the model-facing page (default 20, capped at 50).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Opaque cursor for paging: the last tool name of the previous page.
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -322,9 +313,7 @@ impl ToolDispatcher for BuiltinToolDispatcher {
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
         let name = request.call.name.clone();
         match name.as_str() {
-            CAPABILITY_SEARCH => self.run_search(request).await.map(ToolOutcome::Value),
-            CAPABILITY_LOAD => self.run_load(request).await.map(ToolOutcome::Value),
-            CAPABILITY_UNLOAD => self.run_unload(request).await.map(ToolOutcome::Value),
+            CAPABILITY_MANAGE => self.run_manage(request).await.map(ToolOutcome::Value),
             _ => {
                 let tick = self.tick_now();
                 let tool = {
@@ -357,9 +346,15 @@ impl ToolDispatcher for BuiltinToolDispatcher {
 }
 
 impl BuiltinToolDispatcher {
-    async fn run_search(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
-        let args: SearchArgs = serde_json::from_value(request.call.arguments)
-            .map_err(|e| AgentError::InvalidRequest(format!("capability.search args: {e}")))?;
+    async fn run_search(
+        &self,
+        request: ToolExecutionRequest,
+        args: SearchArgs,
+    ) -> AgentResult<ToolOutput> {
+        let page_size = args
+            .limit
+            .unwrap_or(agent_contracts::CAPABILITY_SEARCH_DEFAULT_LIMIT)
+            .clamp(1, agent_contracts::CAPABILITY_SEARCH_MAX_LIMIT);
         let mut entries = self.catalog();
         if let Some(query) = args.query.as_deref() {
             entries.retain(|entry| entry.name.contains(query));
@@ -368,56 +363,159 @@ impl BuiltinToolDispatcher {
             .iter()
             .filter(|entry| entry.state.in_surface())
             .count();
-        let lines: Vec<String> = entries
+        let total = entries.len();
+        // A catalog that does not fit the page spills its full listing to
+        // an artifact — the model only ever sees the bounded page, so a
+        // large tool catalog cannot itself become context pollution.
+        let artifact_ref = if total > page_size {
+            let all: String = entries
+                .iter()
+                .map(|entry| format!("{}\t{}", entry.state.as_str(), entry.name))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(
+                self.workspace
+                    .write_artifact(request.run_id, "capability-search", "txt", all.as_bytes())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        if let Some(cursor) = args.cursor.as_deref() {
+            entries.retain(|entry| entry.name.as_str() > cursor);
+        }
+        let remaining = entries.len();
+        let page: Vec<_> = entries.into_iter().take(page_size).collect();
+        let has_more = remaining > page.len();
+        let lines: Vec<String> = page
             .iter()
             .map(|entry| format!("{}\t{}", entry.state.as_str(), entry.name))
             .collect();
         Ok(ToolOutput {
             call_id: request.call.id,
-            tool_name: CAPABILITY_SEARCH.into(),
+            tool_name: CAPABILITY_MANAGE.into(),
             ok: true,
-            summary: format!(
-                "{} tools matched ({} in the active set)",
-                entries.len(),
-                active
-            ),
-            model_content: lines.join("\n"),
-            artifact_ref: None,
-            metadata: json!({"total": entries.len(), "active": active}),
+            summary: format!("{} tools matched ({} in the active set)", total, active),
+            model_content: if lines.is_empty() {
+                "no tools match".to_string()
+            } else {
+                lines.join("\n")
+            },
+            artifact_ref,
+            metadata: json!({
+                "total": total,
+                "active": active,
+                "returned": page.len(),
+                "has_more": has_more,
+            }),
         })
     }
 
-    async fn run_load(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
-        let args: NameArgs = serde_json::from_value(request.call.arguments)
-            .map_err(|e| AgentError::InvalidRequest(format!("capability.load args: {e}")))?;
-        self.load(&args.name)?;
+    async fn run_load(
+        &self,
+        request: ToolExecutionRequest,
+        name: String,
+    ) -> AgentResult<ToolOutput> {
+        self.load(&name)?;
         Ok(ToolOutput {
             call_id: request.call.id,
-            tool_name: CAPABILITY_LOAD.into(),
+            tool_name: CAPABILITY_MANAGE.into(),
             ok: true,
-            summary: format!("tool loaded: {}", args.name),
+            summary: format!("tool loaded: {name}"),
+            model_content: format!("tool loaded: {name} — its schema is now offered to the model"),
+            artifact_ref: None,
+            metadata: json!({"tool": name}),
+        })
+    }
+
+    async fn run_unload(
+        &self,
+        request: ToolExecutionRequest,
+        name: String,
+    ) -> AgentResult<ToolOutput> {
+        self.unload(&name)?;
+        Ok(ToolOutput {
+            call_id: request.call.id,
+            tool_name: CAPABILITY_MANAGE.into(),
+            ok: true,
+            summary: format!("tool unloaded: {name}"),
+            model_content: format!("tool unloaded: {name}"),
+            artifact_ref: None,
+            metadata: json!({"tool": name}),
+        })
+    }
+
+    async fn run_inspect(
+        &self,
+        request: ToolExecutionRequest,
+        name: String,
+    ) -> AgentResult<ToolOutput> {
+        let Some(spec) = self.inspect_tool(&name) else {
+            return Ok(ToolOutput {
+                call_id: request.call.id,
+                tool_name: CAPABILITY_MANAGE.into(),
+                ok: false,
+                summary: format!("unknown tool: {name}"),
+                model_content: format!("unknown tool: {name}"),
+                artifact_ref: None,
+                metadata: json!({}),
+            });
+        };
+        let state = self
+            .catalog()
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.state.as_str().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok(ToolOutput {
+            call_id: request.call.id,
+            tool_name: CAPABILITY_MANAGE.into(),
+            ok: true,
+            summary: format!("tool {name}: {state}"),
             model_content: format!(
-                "tool loaded: {} — its schema is now offered to the model",
-                args.name
+                "name: {}\nowner: builtin\nstate: {}\ndescription: {}\nschema: {}",
+                spec.name, state, spec.description, spec.input_schema
             ),
             artifact_ref: None,
-            metadata: json!({"tool": args.name}),
+            metadata: json!({"name": spec.name, "owner": "builtin", "state": state}),
         })
     }
 
-    async fn run_unload(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
-        let args: NameArgs = serde_json::from_value(request.call.arguments)
-            .map_err(|e| AgentError::InvalidRequest(format!("capability.unload args: {e}")))?;
-        self.unload(&args.name)?;
-        Ok(ToolOutput {
-            call_id: request.call.id,
-            tool_name: CAPABILITY_UNLOAD.into(),
-            ok: true,
-            summary: format!("tool unloaded: {}", args.name),
-            model_content: format!("tool unloaded: {}", args.name),
-            artifact_ref: None,
-            metadata: json!({"tool": args.name}),
-        })
+    /// Dispatch `capability.manage` ops: search / inspect / load / unload.
+    async fn run_manage(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutput> {
+        let args: ManageArgs = serde_json::from_value(request.call.arguments.clone())
+            .map_err(|e| AgentError::InvalidRequest(format!("capability.manage args: {e}")))?;
+        match args.op.as_str() {
+            "search" => {
+                let search = SearchArgs {
+                    query: args.query,
+                    limit: args.limit,
+                    cursor: args.cursor,
+                };
+                self.run_search(request, search).await
+            }
+            "inspect" => {
+                let name = args.name.ok_or_else(|| {
+                    AgentError::InvalidRequest("capability.manage inspect: missing 'name'".into())
+                })?;
+                self.run_inspect(request, name).await
+            }
+            "load" => {
+                let name = args.name.ok_or_else(|| {
+                    AgentError::InvalidRequest("capability.manage load: missing 'name'".into())
+                })?;
+                self.run_load(request, name).await
+            }
+            "unload" => {
+                let name = args.name.ok_or_else(|| {
+                    AgentError::InvalidRequest("capability.manage unload: missing 'name'".into())
+                })?;
+                self.run_unload(request, name).await
+            }
+            other => Err(AgentError::InvalidRequest(format!(
+                "capability.manage: unknown op '{other}' (expected search/inspect/load/unload)"
+            ))),
+        }
     }
 }
 
@@ -474,8 +572,16 @@ mod tests {
         let dispatcher = dispatcher().await;
         let names = surface(&dispatcher);
         assert!(names.contains(&"fs.read".to_string()));
-        assert!(names.contains(&"capability.search".to_string()));
-        assert!(names.contains(&"capability.load".to_string()));
+        assert!(names.contains(&"context.manage".to_string()));
+        assert!(names.contains(&"capability.manage".to_string()));
+        assert!(
+            !names.contains(&"context.gc_hint".to_string()),
+            "the meta-tools must be merged into context.manage: {names:?}"
+        );
+        assert!(
+            !names.contains(&"capability.search".to_string()),
+            "the catalog control tools must be merged into capability.manage: {names:?}"
+        );
         assert!(
             !names.contains(&"git.status".to_string()),
             "git tools must not be loaded by default: {names:?}"
@@ -487,24 +593,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_meta_tools_attach_typed_directives() {
+    async fn context_manage_attaches_typed_directives() {
         let dispatcher = dispatcher().await;
         let names = surface(&dispatcher);
-        for name in [
-            "context.gc_hint",
-            "context.tag",
-            "context.lease",
-            "context.collect",
-        ] {
-            assert!(
-                names.contains(&name.to_string()),
-                "{name} must be on the default surface: {names:?}"
-            );
-        }
+        assert!(
+            names.contains(&"context.manage".to_string()),
+            "context.manage must be on the default surface: {names:?}"
+        );
 
         let item_id = "00000000-0000-0000-0000-000000000000";
 
-        // The context meta-tools return a `RuntimeDirective` (a distinct
+        // The directive ops return a `RuntimeDirective` (a distinct
         // `ToolOutcome` variant), not a field on the output.
         let directive = |outcome: ToolOutcome| match outcome {
             ToolOutcome::RuntimeDirective { directive, .. } => directive,
@@ -513,8 +612,8 @@ mod tests {
 
         let output = dispatcher
             .execute(request(
-                "context.gc_hint",
-                json!({"item_id": item_id, "keep": true}),
+                "context.manage",
+                json!({"op": "gc_hint", "item_id": item_id, "keep": true}),
             ))
             .await
             .unwrap();
@@ -528,8 +627,8 @@ mod tests {
 
         let output = dispatcher
             .execute(request(
-                "context.tag",
-                json!({"item_id": item_id, "tag": "urgent"}),
+                "context.manage",
+                json!({"op": "tag", "item_id": item_id, "tag": "urgent"}),
             ))
             .await
             .unwrap();
@@ -541,8 +640,8 @@ mod tests {
 
         let output = dispatcher
             .execute(request(
-                "context.lease",
-                json!({"item_id": item_id, "turns": 3}),
+                "context.manage",
+                json!({"op": "lease", "item_id": item_id, "turns": 3}),
             ))
             .await
             .unwrap();
@@ -552,7 +651,7 @@ mod tests {
         ));
 
         let output = dispatcher
-            .execute(request("context.collect", json!({})))
+            .execute(request("context.manage", json!({"op": "collect"})))
             .await
             .unwrap();
         assert!(matches!(
@@ -562,18 +661,18 @@ mod tests {
 
         // Bad arguments are rejected like any other tool.
         let error = dispatcher
-            .execute(request("context.gc_hint", json!({})))
+            .execute(request("context.manage", json!({"op": "gc_hint"})))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("args"), "{error}");
+        assert!(error.to_string().contains("missing"), "{error}");
     }
 
     #[tokio::test]
-    async fn context_query_tools_emit_engine_queries() {
+    async fn context_manage_query_ops_emit_engine_queries() {
         let dispatcher = dispatcher().await;
 
-        // The retrieval loop is read-only and engine-serviced: the tools
-        // name what they want (`EngineQuery`), the kernel resolves it.
+        // The retrieval loop is read-only and engine-serviced: the tool
+        // names what it wants (`EngineQuery`), the kernel resolves it.
         let query = |outcome: ToolOutcome| match outcome {
             ToolOutcome::EngineQuery { query, .. } => query,
             other => panic!("context query tools must emit an engine query, got {other:?}"),
@@ -581,8 +680,8 @@ mod tests {
 
         let outcome = dispatcher
             .execute(request(
-                "context.search",
-                json!({"query": "AuthService", "limit": 8}),
+                "context.manage",
+                json!({"op": "search", "query": "AuthService", "limit": 8}),
             ))
             .await
             .unwrap();
@@ -603,7 +702,10 @@ mod tests {
 
         let item_id = "00000000-0000-0000-0000-000000000000";
         let outcome = dispatcher
-            .execute(request("context.inspect", json!({"item_id": item_id})))
+            .execute(request(
+                "context.manage",
+                json!({"op": "inspect", "item_id": item_id}),
+            ))
             .await
             .unwrap();
         assert!(matches!(
@@ -612,7 +714,10 @@ mod tests {
         ));
 
         let outcome = dispatcher
-            .execute(request("context.fetch", json!({"item_id": item_id})))
+            .execute(request(
+                "context.manage",
+                json!({"op": "fetch", "item_id": item_id}),
+            ))
             .await
             .unwrap();
         assert!(matches!(
@@ -622,10 +727,15 @@ mod tests {
 
         // Bad arguments are rejected like any other tool.
         let error = dispatcher
-            .execute(request("context.search", json!({})))
+            .execute(request("context.manage", json!({})))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("args"), "{error}");
+        let error = dispatcher
+            .execute(request("context.manage", json!({"op": "gc_hint"})))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing"), "{error}");
     }
 
     #[tokio::test]
@@ -679,19 +789,250 @@ mod tests {
     async fn control_tools_execute() {
         let dispatcher = dispatcher().await;
         let search = dispatcher
-            .execute(request(CAPABILITY_SEARCH, json!({"query": "git"})))
+            .execute(request(
+                CAPABILITY_MANAGE,
+                json!({"op": "search", "query": "git"}),
+            ))
             .await
             .unwrap();
         let search = value(search);
         assert!(search.ok);
         assert!(search.model_content.contains("git.status"));
 
+        let inspect = dispatcher
+            .execute(request(
+                CAPABILITY_MANAGE,
+                json!({"op": "inspect", "name": "fs.read"}),
+            ))
+            .await
+            .unwrap();
+        let inspect = value(inspect);
+        assert!(inspect.ok);
+        assert!(inspect.model_content.contains("fs.read"));
+
         let load = dispatcher
-            .execute(request(CAPABILITY_LOAD, json!({"name": "git.status"})))
+            .execute(request(
+                CAPABILITY_MANAGE,
+                json!({"op": "load", "name": "git.status"}),
+            ))
             .await
             .unwrap();
         let load = value(load);
         assert!(load.ok);
         assert!(surface(&dispatcher).contains(&"git.status".to_string()));
+
+        // Unknown ops are rejected.
+        let bad = dispatcher
+            .execute(request(CAPABILITY_MANAGE, json!({"op": "explode"})))
+            .await
+            .unwrap_err();
+        assert!(bad.to_string().contains("unknown op"), "{bad}");
+    }
+
+    #[tokio::test]
+    async fn capability_search_pages_and_spills_large_catalogs() {
+        let dispatcher = dispatcher().await;
+        // A small catalog fits the default page: no artifact, rows in line.
+        let small = dispatcher
+            .execute(request(CAPABILITY_MANAGE, json!({"op": "search"})))
+            .await
+            .unwrap();
+        let small = value(small);
+        assert!(small.ok);
+        assert!(small.artifact_ref.is_none(), "small catalogs stay inline");
+        assert!(small.model_content.contains("fs.read"));
+
+        // A tiny page forces the spill: the full listing goes to an
+        // artifact and only the bounded page reaches the model.
+        let paged = dispatcher
+            .execute(request(
+                CAPABILITY_MANAGE,
+                json!({"op": "search", "limit": 2}),
+            ))
+            .await
+            .unwrap();
+        let paged = value(paged);
+        assert!(paged.ok);
+        assert!(
+            paged.artifact_ref.is_some(),
+            "a catalog larger than the page must spill to an artifact"
+        );
+        assert!(
+            paged.model_content.lines().count() <= 2,
+            "the model must only see the bounded page, got: {}",
+            paged.model_content
+        );
+        assert_eq!(
+            paged.metadata["has_more"], true,
+            "more rows must be reported"
+        );
+
+        // The cursor pages past the first two rows: the second page must
+        // start where the first ended and must not repeat it.
+        let cursor = paged
+            .model_content
+            .lines()
+            .last()
+            .map(|line| line.split('\t').nth(1).unwrap_or("").to_string())
+            .unwrap_or_default();
+        assert!(!cursor.is_empty(), "a cursor must be extractable");
+        let next = dispatcher
+            .execute(request(
+                CAPABILITY_MANAGE,
+                json!({"op": "search", "limit": 2, "cursor": cursor}),
+            ))
+            .await
+            .unwrap();
+        let next = value(next);
+        assert!(next.ok);
+        assert!(
+            !next.model_content.contains(&cursor),
+            "the first page must not repeat; got: {}",
+            next.model_content
+        );
+    }
+
+    /// Token benchmark for the merged control surface: the always-visible
+    /// schemas must be measurably cheaper than the old dozen
+    /// single-purpose meta-tools. The numbers are the evidence for keeping
+    /// the merge — "less context" is the design goal, measured, not assumed.
+    #[test]
+    fn merged_control_surface_costs_fewer_schema_tokens() {
+        use agent_contracts::tokens::approx_tokens;
+
+        let old_surface: Vec<ToolSpec> = vec![
+            ToolSpec {
+                name: "fs.list".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "fs.read".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "search.grep".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "context.gc_hint".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "context.tag".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "context.lease".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "context.collect".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "context.search".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "context.inspect".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "context.fetch".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "capability.search".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "capability.inspect".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "capability.load".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "capability.unload".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+        ];
+        let merged_surface: Vec<ToolSpec> = vec![
+            ToolSpec {
+                name: "fs.list".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "fs.read".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "search.grep".into(),
+                description: "x".repeat(60),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "context.manage".into(),
+                description: "x".repeat(120),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolSpec {
+                name: "capability.manage".into(),
+                description: "x".repeat(120),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            },
+        ];
+        let old_tokens: usize = old_surface
+            .iter()
+            .map(|spec| approx_tokens(&serde_json::to_string(spec).unwrap_or_default()))
+            .sum();
+        let merged_tokens: usize = merged_surface
+            .iter()
+            .map(|spec| approx_tokens(&serde_json::to_string(spec).unwrap_or_default()))
+            .sum();
+        assert!(
+            merged_tokens < old_tokens,
+            "the merged control surface must cost fewer schema tokens: merged {merged_tokens} vs separate {old_tokens}"
+        );
+        assert!(
+            merged_tokens * 2 < old_tokens,
+            "the merge must be a decisive win (merged {merged_tokens}, separate {old_tokens})"
+        );
     }
 }

@@ -267,6 +267,20 @@ pub const CAPABILITY_LOAD: &str = "capability.load";
 pub const CAPABILITY_UNLOAD: &str = "capability.unload";
 pub const CAPABILITY_INSPECT: &str = "capability.inspect";
 
+/// The merged control surface: one `capability.manage` entry point (op =
+/// search/inspect/load/unload) and one `context.manage` entry point (op =
+/// gc_hint/tag/lease/collect/search/inspect/fetch) keep the always-visible
+/// schema count small — a dozen single-purpose meta-tools would cost more
+/// model input than the runtime control they provide.
+pub const CAPABILITY_MANAGE: &str = "capability.manage";
+pub const CONTEXT_MANAGE: &str = "context.manage";
+
+/// `capability.search` paging bounds. A large catalog (hundreds of
+/// capabilities) must never become context pollution: the model-facing
+/// page is capped, and the full listing spills to an artifact.
+pub const CAPABILITY_SEARCH_DEFAULT_LIMIT: usize = 20;
+pub const CAPABILITY_SEARCH_MAX_LIMIT: usize = 50;
+
 #[async_trait]
 pub trait ToolDispatcher: Send + Sync {
     /// The current tool surface. MUST be pure: a model round reads it for

@@ -435,15 +435,20 @@ Two refinements since V1-M9 close the accounting gap:
   the last place a pinned dependency could exceed its budget; the pinned
   exemption is gone — expansion spends only the reserved slice, for every
   item.
-- **The runtime is the final referee.** `ContextEngine` budgets are targets,
-  not verdicts. After `PromptAssembler` renders the full five-layer request
-  (system policy, focus frame, context frame, turn frame, tool schemas —
-  including the `SELECTED WORKING CONTEXT` / `CURRENT FOCUS` rendering
-  overhead, which the engine never accounts), the runtime estimates the
-  wire tokens and trims the context frame (largest unpinned item first)
-  until the assembled request fits the provider window. A request can
-  therefore never go out over budget, no matter what the engine's estimate
-  missed.
+- **The runtime is the final referee, against the input budget.** `ContextEngine`
+  budgets are targets, not verdicts. After `PromptAssembler` renders the
+  full five-layer request (system policy, focus frame, context frame, turn
+  frame, tool schemas — including the `SELECTED WORKING CONTEXT` /
+  `CURRENT FOCUS` rendering overhead, which the engine never accounts),
+  the runtime estimates the wire tokens and trims the context frame
+  (largest unpinned item first) until the assembled request fits
+  `context_window - output_reserve` — the *input* budget. Rendering
+  overhead may never eat into the space reserved for the answer. When the
+  context frame is emptied and the fixed layers (system + turn + tools)
+  still overshoot, the runtime auto-unloads the largest optional tools
+  (core tools refuse) and re-snapshots; a request that still does not fit
+  is a **hard error** — the runtime refuses to send instead of silently
+  over-budgeting the provider.
 
 ## 6. Context is rebuilt, not replayed
 
@@ -827,6 +832,55 @@ an explicit network policy are still open (a future dedicated capability
 sandbox); until then **V2 autonomous capability generation stays gated** —
 a generated capability only runs after explicit `enable`, and only inside
 the sandbox above.
+
+## 9c. The tool surface: merged meta-tools, a bounded catalog, one generation (V1-M9)
+
+The always-visible tool schemas are themselves context. Since V1-M9 the
+runtime control surface is two merged entry points instead of a dozen
+single-purpose meta-tools:
+
+- `context.manage` — `op` dispatch over the four directives (`gc_hint` /
+  `tag` / `lease` / `collect`, producing a `RuntimeDirective`) and the
+  three retrieval queries (`search` / `inspect` / `fetch`, producing an
+  `EngineQuery`). One schema, one description, same invariants: the tool
+  never touches the engine.
+- `capability.manage` — `op` dispatch over `search` / `inspect` / `load` /
+  `unload`, provided identically by the builtin dispatcher and the
+  capability-aware dispatcher (which filters out the builtin copy).
+
+The default model surface is now five schemas — `fs.list`, `fs.read`,
+`search.grep`, `context.manage`, `capability.manage` — down from fourteen.
+The merge is evidence-backed, not assumed: `merged_control_surface_costs_
+fewer_schema_tokens` measures the always-visible schema cost of the merged
+surface against the old separate tools and asserts a decisive win.
+
+The catalog is bounded, so a growing capability universe cannot itself
+become context pollution:
+
+- `capability.manage op=search` pages (default 20, capped at 50, with a
+  name-sorted `cursor`) and spills the full listing to an artifact when the
+  page is not the whole catalog — the model only ever sees the bounded
+  page.
+- Registration validates and caps a capability's declared schemas:
+  `MAX_TOOLS_PER_CAPABILITY` (32), `MAX_TOOL_NAME_CHARS` (64, names
+  restricted to `[A-Za-z0-9._:-]`), `MAX_TOOL_DESCRIPTION_CHARS` (200),
+  `MAX_TOOL_SCHEMA_BYTES` (4 KiB) — a single capability cannot blow up the
+  model surface with one giant schema.
+
+`ToolSurfaceSnapshot.generation` is unified: the builtin catalog's
+generation (its load/unload/gc transitions) is combined with the
+capability registry's own counter, which bumps on every capability surface
+change — `register` / `set_activation` / `load_tool` / `unload_tool` — so
+a dynamic capability change is auditably visible in the snapshot instead of
+masquerading as the builtin catalog's generation.
+
+The registry never calls back into a capability object under its lock.
+Registration reads and validates the manifest and tool schemas exactly
+once (before the lock) and caches both on the entry; every catalog query
+(`catalog`, `loaded_tool_specs`, `owner_of`, `tool_state`, `catalog_rows`,
+...) reads the cache. A slow, re-entrant or panicking capability
+implementation can only misbehave at register time — never while holding
+the registry's `RwLock`.
 
 ## 10. Explicit non-goals for v0.1
 

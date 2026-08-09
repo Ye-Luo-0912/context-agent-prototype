@@ -5,7 +5,7 @@ mod git;
 mod search;
 mod shell;
 
-pub(crate) use context::{ContextDirectiveTool, ContextQueryTool};
+pub(crate) use context::ContextManageTool;
 pub(crate) use edit::EditReplaceTool;
 pub(crate) use fs::{FsListTool, FsReadTool, FsWriteTool};
 pub(crate) use git::{GitDiffTool, GitStatusTool};

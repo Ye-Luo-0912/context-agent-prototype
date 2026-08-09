@@ -992,6 +992,42 @@ Two review blockers cleared before V2 autonomous capability generation:
   so real IO errors keep entries; `ContextHeap` makes index consistency
   structural (a stale index is a type error, not a length guard).
 
+## V1-M9: merged tool surface + hardened capability plane ✅ (implemented)
+
+The always-visible schemas are context too, and the capability plane
+stopped trusting declarations:
+
+- **Merged meta-tools.** `context.manage` (op: gc_hint/tag/lease/collect/
+  search/inspect/fetch) and `capability.manage` (op: search/inspect/load/
+  unload) replace a dozen single-purpose control tools; the default model
+  surface drops from fourteen schemas to five (fs.list / fs.read /
+  search.grep / context.manage / capability.manage). The merge is
+  measured, not assumed: a token benchmark asserts the merged
+  always-visible surface costs decisively fewer schema tokens.
+- **Bounded catalog.** `capability.manage op=search` pages (default 20,
+  cap 50, name-sorted cursor) and spills the full listing to an artifact;
+  registration caps tools per capability (32), tool-name length/character
+  set, description length and per-schema bytes (4 KiB) — a single
+  capability cannot blow up the model surface.
+- **Unified surface generation.** The capability registry carries its own
+  counter bumped on register/activation/load/unload; the dispatcher
+  snapshot combines it with the builtin catalog's generation, so dynamic
+  capability changes are auditably visible.
+- **No callbacks under the registry lock.** Registration reads and
+  validates the manifest + tool schemas once, then caches them; every
+  catalog query reads the cache. A slow or re-entrant capability can only
+  misbehave at register time.
+- **Final budget guard is the input budget.** The assembled request must
+  fit `context_window - output_reserve` (rendering overhead may not eat
+  the answer's reserve); with the context frame emptied it auto-unloads
+  optional tools, and an unshrinkable request is a hard error — never a
+  silently over-budget send.
+- **Selection respects scope state.** The materializer's candidate scopes
+  are the session, the active task's open task/focus scopes and open tool
+  frames — closed tool frames no longer re-enter the prompt by task
+  membership alone (they come back via retention, affinity or dependency),
+  matching the GC mark phase's closed-scope boundary.
+
 ## P2: provider/tool secondary issues ✅ (implemented)
 
 - **Stream retry can no longer duplicate output.** `RetryingTransport`
