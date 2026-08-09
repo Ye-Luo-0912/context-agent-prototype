@@ -824,11 +824,19 @@ of the buffer so overflow retries next pass). The tail latency of a
 growing store stops being synchronous with the state lock.
 
 Storage GC is the only place information is permanently deleted, and it is
-now a *reachability closure* rather than a single incoming-edge check:
-roots are the dependency edges of resident/warm items, and every reachable
-external entry contributes its own `dependencies`, so external -> external
-chains, semantic links and future audit/evidence/OpenLoop edges keep their
-targets alive transitively. `delete_file` returns
+now a *strong-edge reachability closure* rather than a single
+incoming-edge check. The dependency graph is typed, and the closure
+distinguishes deliberate citations from weak affinity: `SharesEntities`
+(the auto-minted entity-overlap link recorded at ingest) is never a
+permanent-delete guard, while `EvidenceFor | DerivedFrom | VerifiedBy |
+ArtifactOf | Continuation` are strong edges that keep their targets alive.
+Roots are the strong-edge targets of resident/warm items **and every
+non-deletable stored record itself** — a Live, Pinned or Durable record is
+never a candidate, and its strong edges must keep its evidence targets
+alive even when nothing resident references the record. From any
+referenced record the closure traverses strong edges only, so
+external -> external chains survive exactly when each hop is a strong
+citation. `delete_file` returns
 `Result<DeleteOutcome>` (`Deleted` / `NotFound`): a real IO error
 (permission, disk) keeps the in-memory entry and surfaces in
 `StorageGcReport.io_errors`, instead of being mistaken for "the file is
@@ -903,11 +911,14 @@ of the context-service boundary.
 The dependency graph is typed. `ContextItem.dependencies` (and the
 externalized entry's captured edges, which the Storage GC reachability
 closure reads) are now `Vec<DependencyEdge>` — `{ target, kind }` —
-instead of bare ids, so GC reachability and future supersession/evidence
-policies can distinguish *why* an item is referenced. Today every edge is
-`SharesEntities` (the entity-overlap link recorded at ingest,
-new -> prior); the wire deserializer accepts the pre-typed bare-id form,
-so checkpoints written before the graph was typed keep loading.
+instead of bare ids, so GC reachability and supersession/evidence
+policies can distinguish *why* an item is referenced. The kind taxonomy
+separates weak affinity from strong citations: `SharesEntities` (the
+entity-overlap link recorded at ingest, new -> prior — a ranking signal,
+never a permanent-delete guard) versus the strong kinds `DerivedFrom`
+(minted by `context.derive`), `EvidenceFor`, `VerifiedBy`, `ArtifactOf`
+and `Continuation`. The wire deserializer accepts the pre-typed bare-id
+form, so checkpoints written before the graph was typed keep loading.
 `ContextItemSummary.dependencies` remains a projection of target ids
 only, so replay and the UI are untouched.
 

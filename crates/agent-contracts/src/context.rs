@@ -131,7 +131,9 @@ impl Generation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum DependencyKind {
     /// The item was created with an entity overlap with the target: the
-    /// default link edge recorded at ingest (new item -> prior item).
+    /// default link edge recorded at ingest (new item -> prior item). This
+    /// is weak affinity, not a citation — it ranks and links, but it is
+    /// never a permanent-delete guard.
     #[default]
     #[serde(rename = "shares_entities")]
     SharesEntities,
@@ -140,6 +142,32 @@ pub enum DependencyKind {
     /// back to the ref it came from, so traceability survives storage GC.
     #[serde(rename = "derived_from")]
     DerivedFrom,
+    /// The item is evidence for the target (a test result, a log, a
+    /// reproduction that supports a claim about the target).
+    #[serde(rename = "evidence_for")]
+    EvidenceFor,
+    /// The item verified the target (a later success that verified an
+    /// earlier error, a check that confirmed a fix).
+    #[serde(rename = "verified_by")]
+    VerifiedBy,
+    /// The target is an artifact this item produced or consumed (a file,
+    /// a trace, a report the item references).
+    #[serde(rename = "artifact_of")]
+    ArtifactOf,
+    /// The item continues the target's line of work (an open loop, a
+    /// follow-up that extends the target's outcome).
+    #[serde(rename = "continuation")]
+    Continuation,
+}
+
+impl DependencyKind {
+    /// Whether this edge is a *strong* citation: a deliberate,
+    /// content-preserving reference that must survive permanent deletion.
+    /// Weak affinity (`SharesEntities`) is auto-minted from entity
+    /// overlap at ingest and must not pin terminal records forever.
+    pub fn is_strong(self) -> bool {
+        !matches!(self, DependencyKind::SharesEntities)
+    }
 }
 
 /// One explicit dependency edge: the item depends on `target` for the

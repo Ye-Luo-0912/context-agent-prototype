@@ -300,34 +300,57 @@ fn storage_candidate(
 /// closure over the reference graph, then retention/semantic/TTL checks —
 /// so the plan itself never touches the disk.
 ///
-/// Reachability is a closure, not a single incoming-edge check: roots are
-/// the dependency edges of resident/warm items, and every external entry
-/// whose id becomes reachable contributes its own dependencies — so
-/// external -> external chains, semantic links that surface as
-/// dependencies, and any future audit/evidence/OpenLoop edges keep their
-/// targets alive transitively.
+/// Reachability is a closure over *strong* edges only. `SharesEntities` is
+/// weak affinity (auto-minted from entity overlap at ingest) and is never a
+/// permanent-delete guard: two stored facts sharing a topic must not pin
+/// each other's terminal history forever. Roots are:
+///
+/// - the strong-edge targets of resident/warm items (a live working-set
+///   member's deliberate citation);
+/// - every non-deletable stored record itself — Live, Pinned or Durable
+///   records are never candidates, and their strong edges must keep their
+///   evidence targets alive even when nothing resident references the
+///   record (a Live stored fact citing a terminal evidence file must not
+///   lose that file to permanent deletion).
+///
+/// From any referenced record the closure traverses strong edges only, so
+/// external -> external chains survive exactly when each hop is a strong
+/// citation.
 pub(crate) fn plan_storage_gc(
     state: &State,
     config: &SimpleContextConfig,
     now_tick: u64,
 ) -> StorageGcPlan {
+    fn non_deletable(entry: &ExternalizedContext) -> bool {
+        !entry.semantic.is_dead()
+            || matches!(
+                entry.retention,
+                ContextRetention::Pinned | ContextRetention::Durable
+            )
+    }
+
     let mut referenced: std::collections::HashSet<ContextItemId> = state
         .items
         .iter()
         .chain(state.eviction_buffer.iter())
-        .flat_map(|item| item.dependencies.iter().map(|edge| edge.target))
+        .flat_map(|item| {
+            item.dependencies
+                .iter()
+                .filter(|edge| edge.kind.is_strong())
+                .map(|edge| edge.target)
+        })
         .collect();
     loop {
         let mut grew = false;
         for entry in &state.external {
-            if referenced.contains(&entry.item_id)
-                && entry
-                    .dependencies
-                    .iter()
-                    .any(|edge| !referenced.contains(&edge.target))
-            {
-                referenced.extend(entry.dependencies.iter().map(|edge| edge.target));
-                grew = true;
+            let contributes = referenced.contains(&entry.item_id) || non_deletable(entry);
+            if !contributes {
+                continue;
+            }
+            for edge in &entry.dependencies {
+                if edge.kind.is_strong() && referenced.insert(edge.target) {
+                    grew = true;
+                }
             }
         }
         if !grew {
@@ -837,9 +860,15 @@ mod tests {
                 .external
                 .push(to_external_entry(item, reference, 1, 1, None));
         }
-        // A resident item depends on the dead entry: it must survive.
+        // A resident item strongly cites the dead entry (evidence): it must
+        // survive. The weak-affinity case (auto-minted entity overlap) is
+        // covered by the dedicated test below — `SharesEntities` is never a
+        // permanent-delete guard.
         let mut holder = test_item(ContextItemId::new(), "holder");
-        holder.dependencies.push(DependencyEdge::shares(dead_id));
+        holder.dependencies.push(DependencyEdge {
+            target: dead_id,
+            kind: agent_contracts::DependencyKind::EvidenceFor,
+        });
         state.items.push(holder);
 
         let report = run_storage_gc(&mut state, &config, 100);
@@ -899,18 +928,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = store_config(dir.path());
         let mut state = State::default();
-        // target <- chain <- resident: the resident item only references
-        // the chain entry, and the chain entry references the target. The
-        // target must survive through the external -> external edge.
+        // target <- chain <- resident, with a strong edge at every hop: the
+        // resident item cites the chain entry, and the chain entry cites
+        // the target as evidence. The target must survive through the
+        // external -> external edge.
         let target_id = ContextItemId::new();
         let chain_id = ContextItemId::new();
         let mut target = test_item(target_id, "deeply referenced dead content");
         target.semantic = SemanticState::Tombstoned;
         let mut chain = test_item(chain_id, "chain dead content");
         chain.semantic = SemanticState::Tombstoned;
-        chain.dependencies.push(DependencyEdge::shares(target_id));
+        chain.dependencies.push(DependencyEdge {
+            target: target_id,
+            kind: agent_contracts::DependencyKind::EvidenceFor,
+        });
         let mut holder = test_item(ContextItemId::new(), "resident holder");
-        holder.dependencies.push(DependencyEdge::shares(chain_id));
+        holder.dependencies.push(DependencyEdge {
+            target: chain_id,
+            kind: agent_contracts::DependencyKind::DerivedFrom,
+        });
         state.items.push(holder);
         for item in [&target, &chain] {
             let reference = externalize(dir.path(), item).unwrap();
@@ -922,10 +958,131 @@ mod tests {
         let report = run_storage_gc(&mut state, &config, 100);
         assert_eq!(
             report.deleted, 0,
-            "the whole reachable chain survives: {report:?}"
+            "the whole strong-edge chain survives: {report:?}"
         );
         assert!(state.external.iter().any(|e| e.item_id == target_id));
         assert!(state.external.iter().any(|e| e.item_id == chain_id));
+    }
+
+    /// `SharesEntities` is weak affinity, never a permanent-delete guard:
+    /// a resident item's auto-minted entity-overlap link, or a stored
+    /// record's entity overlap with a terminal neighbor, must not pin that
+    /// neighbor forever. Only strong edges protect.
+    #[test]
+    fn weak_shares_edges_never_protect_from_permanent_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = store_config(dir.path());
+        let mut state = State::default();
+
+        // (a) A resident item shares entities with a dead stored entry
+        // (the ingest-time auto edge): the entry is still deletable.
+        let resident_weak_id = ContextItemId::new();
+        let mut resident_weak = test_item(resident_weak_id, "weak resident target");
+        resident_weak.semantic = SemanticState::Tombstoned;
+        let mut weak_holder = test_item(ContextItemId::new(), "weak holder");
+        weak_holder
+            .dependencies
+            .push(DependencyEdge::shares(resident_weak_id));
+        state.items.push(weak_holder);
+
+        // (b) A terminal entry shares entities with a live stored record:
+        // the live record is a root, but its weak edge must not protect the
+        // terminal neighbor.
+        let stored_weak_id = ContextItemId::new();
+        let mut stored_weak = test_item(stored_weak_id, "stored weak target");
+        stored_weak.semantic = SemanticState::Tombstoned;
+        let mut live_anchor = test_item(ContextItemId::new(), "live anchor");
+        live_anchor
+            .dependencies
+            .push(DependencyEdge::shares(stored_weak_id));
+
+        for item in [&resident_weak, &stored_weak, &live_anchor] {
+            let reference = externalize(dir.path(), item).unwrap();
+            state
+                .external
+                .push(to_external_entry(item, reference, 1, 1, None));
+        }
+
+        let report = run_storage_gc(&mut state, &config, 100);
+        assert_eq!(
+            report.deleted, 2,
+            "both weak targets are deletable: {report:?}"
+        );
+        assert!(
+            state.external.iter().all(|e| e.item_id != resident_weak_id),
+            "a resident weak edge must not pin the target"
+        );
+        assert!(
+            state.external.iter().all(|e| e.item_id != stored_weak_id),
+            "a stored weak edge must not pin the target"
+        );
+        assert!(
+            state.external.iter().any(|e| e.item_id == live_anchor.id),
+            "the live anchor itself survives"
+        );
+    }
+
+    /// A Live stored record that nothing resident references is still a
+    /// root: it cannot be deleted, and its strong edges must keep its
+    /// evidence targets alive — the CTX-05 defect. The weak-edge
+    /// counterpart is covered by `weak_shares_edges_never_protect...`.
+    #[test]
+    fn storage_gc_roots_live_stored_records_through_strong_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = store_config(dir.path());
+        let mut state = State::default();
+
+        // A live stored decision cites a terminal evidence file.
+        let evidence_id = ContextItemId::new();
+        let mut evidence = test_item(evidence_id, "terminal evidence log");
+        evidence.semantic = SemanticState::Tombstoned;
+        let mut decision = test_item(ContextItemId::new(), "live stored decision");
+        decision.dependencies.push(DependencyEdge {
+            target: evidence_id,
+            kind: agent_contracts::DependencyKind::EvidenceFor,
+        });
+        // A second live stored record only *shares entities* with another
+        // terminal file: affinity, not a citation — the file stays
+        // deletable.
+        let affinity_id = ContextItemId::new();
+        let mut affinity_target = test_item(affinity_id, "terminal affinity target");
+        affinity_target.semantic = SemanticState::Tombstoned;
+        let mut affinity_anchor = test_item(ContextItemId::new(), "live affinity anchor");
+        affinity_anchor
+            .dependencies
+            .push(DependencyEdge::shares(affinity_id));
+
+        for item in [&evidence, &decision, &affinity_target, &affinity_anchor] {
+            let reference = externalize(dir.path(), item).unwrap();
+            state
+                .external
+                .push(to_external_entry(item, reference, 1, 1, None));
+        }
+
+        let report = run_storage_gc(&mut state, &config, 100);
+        assert_eq!(
+            report.deleted, 1,
+            "only the weak-affinity terminal target is deleted: {report:?}"
+        );
+        assert!(
+            state.external.iter().any(|e| e.item_id == evidence_id),
+            "a live stored record's evidence must survive permanent deletion"
+        );
+        assert!(
+            state.external.iter().any(|e| e.item_id == decision.id),
+            "the live decision survives"
+        );
+        assert!(
+            state.external.iter().all(|e| e.item_id != affinity_id),
+            "a live record's weak affinity must not pin the terminal file"
+        );
+        assert!(
+            state
+                .external
+                .iter()
+                .any(|e| e.item_id == affinity_anchor.id),
+            "the live affinity anchor survives"
+        );
     }
 
     #[test]
@@ -1297,5 +1454,173 @@ mod tests {
             !dir.path().join(format!("{id}.json")).exists(),
             "the corrupted blob no longer masquerades as a formal blob"
         );
+    }
+
+    /// Deterministic PRNG for the graph property test (no external
+    /// dependency): a simple xorshift64*.
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next_u64() % bound as u64) as usize
+        }
+    }
+
+    /// Random-graph property test across every body location: the Storage
+    /// GC plan must equal a manually computed strong-edge closure, and the
+    /// delete pass must leave exactly the closure survivors alive — every
+    /// strong-edge-reachable record (from resident roots or from
+    /// non-deletable stored records) survives, and every weak-affinity
+    /// link is ignored.
+    #[test]
+    fn storage_gc_strong_edge_closure_matches_manual_reachability() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = store_config(dir.path());
+        let mut rng = TestRng(0xC7C0_5EED_1234_5678); // deterministic seed
+        let entry_count = 60;
+
+        // Build the graph: every entry is external; semantics/retention
+        // random; edges point at other entries with random kinds.
+        let ids: Vec<ContextItemId> = (0..entry_count).map(|_| ContextItemId::new()).collect();
+        let mut entries: Vec<(usize, ExternalizedContext)> = Vec::new();
+        for index in 0..entry_count {
+            let mut item = test_item(ids[index], &format!("graph item {index}"));
+            item.semantic = if rng.below(4) == 0 {
+                SemanticState::Live
+            } else {
+                SemanticState::Tombstoned
+            };
+            item.retention = if rng.below(10) == 0 {
+                ContextRetention::Pinned
+            } else {
+                ContextRetention::Working
+            };
+            for _ in 0..rng.below(4) {
+                let target = ids[rng.below(entry_count)];
+                let strong = rng.below(2) == 0;
+                item.dependencies.push(DependencyEdge {
+                    target,
+                    kind: if strong {
+                        agent_contracts::DependencyKind::DerivedFrom
+                    } else {
+                        agent_contracts::DependencyKind::SharesEntities
+                    },
+                });
+            }
+            let reference = externalize(dir.path(), &item).unwrap();
+            let entry = to_external_entry(&item, reference, 1, 1, None);
+            entries.push((index, entry));
+        }
+
+        // Resident/warm roots: a handful of items citing random entries
+        // with random edge kinds.
+        let mut state = State::default();
+        for _ in 0..6 {
+            let mut item = test_item(ContextItemId::new(), "resident root");
+            for _ in 0..2 {
+                let target = ids[rng.below(entry_count)];
+                let strong = rng.below(2) == 0;
+                item.dependencies.push(DependencyEdge {
+                    target,
+                    kind: if strong {
+                        agent_contracts::DependencyKind::EvidenceFor
+                    } else {
+                        agent_contracts::DependencyKind::SharesEntities
+                    },
+                });
+            }
+            state.items.push(item);
+        }
+        for (_, entry) in entries {
+            state.external.push(entry);
+        }
+
+        // Manual closure, mirroring `plan_storage_gc` exactly.
+        let non_deletable = |entry: &ExternalizedContext| {
+            !entry.semantic.is_dead()
+                || matches!(
+                    entry.retention,
+                    ContextRetention::Pinned | ContextRetention::Durable
+                )
+        };
+        let mut protected: HashSet<ContextItemId> = state
+            .items
+            .iter()
+            .chain(state.eviction_buffer.iter())
+            .flat_map(|item| {
+                item.dependencies
+                    .iter()
+                    .filter(|edge| edge.kind.is_strong())
+                    .map(|edge| edge.target)
+            })
+            .collect();
+        loop {
+            let mut grew = false;
+            for entry in &state.external {
+                let contributes = protected.contains(&entry.item_id) || non_deletable(entry);
+                if !contributes {
+                    continue;
+                }
+                for edge in &entry.dependencies {
+                    if edge.kind.is_strong() && protected.insert(edge.target) {
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+
+        let now_tick = 100;
+        let plan = plan_storage_gc(&state, &config, now_tick);
+        let planned: HashSet<ContextItemId> = plan.candidates.iter().map(|(id, _)| *id).collect();
+
+        // The manual closure's complement: dead, retention-eligible, old and
+        // unreachable entries — exactly what the plan must select.
+        let expected: HashSet<ContextItemId> = state
+            .external
+            .iter()
+            .filter(|entry| {
+                entry.semantic.is_dead()
+                    && !matches!(
+                        entry.retention,
+                        ContextRetention::Pinned | ContextRetention::Durable
+                    )
+                    && !protected.contains(&entry.item_id)
+                    && now_tick.saturating_sub(entry.externalized_at_tick)
+                        >= config.storage_ttl_ticks
+            })
+            .map(|entry| entry.item_id)
+            .collect();
+
+        assert_eq!(
+            planned, expected,
+            "the plan must match the manual strong-edge closure exactly"
+        );
+
+        // Liveness: run the full delete pass; survivors are exactly the
+        // non-candidates.
+        let report = run_storage_gc(&mut state, &config, now_tick);
+        assert_eq!(report.deleted, planned.len(), "{report:?}");
+        for entry in state.external.iter() {
+            assert!(
+                !planned.contains(&entry.item_id),
+                "a planned deletion must not survive"
+            );
+            assert!(
+                non_deletable(entry) || protected.contains(&entry.item_id),
+                "a strong-edge-reachable or non-deletable record must survive"
+            );
+        }
     }
 }

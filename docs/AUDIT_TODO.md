@@ -339,6 +339,37 @@ Storage GC must root every non-deletable record and traverse strong edges
 before selecting a terminal, retention-eligible, expired target. Add random
 graph safety and liveness tests across all body locations.
 
+**Closed 2026-08-10.**
+
+Implemented:
+
+- `DependencyKind` grows the strong-edge taxonomy — `EvidenceFor`,
+  `VerifiedBy`, `ArtifactOf`, `Continuation` alongside `DerivedFrom` —
+  and `DependencyKind::is_strong()` draws the line: `SharesEntities`
+  (auto-minted entity overlap at ingest) is weak affinity and is never a
+  permanent-delete guard; the other kinds are deliberate citations.
+- `plan_storage_gc` is now a strong-edge closure. Roots are the
+  strong-edge targets of resident/warm items **and every non-deletable
+  stored record itself** (Live semantic, or Pinned/Durable retention) —
+  so a Live stored decision citing a terminal evidence file keeps that
+  file alive even when nothing resident references the decision. From any
+  referenced record the closure traverses strong edges only, so
+  external -> external chains survive exactly when each hop is a strong
+  citation; a stored record's entity overlap with a terminal neighbor
+  never pins it.
+
+Acceptance (new tests): `storage_gc_roots_live_stored_records_through_
+strong_edges` (the reported defect: a Live record's strong edge protects
+its terminal evidence; its weak edge does not),
+`weak_shares_edges_never_protect_from_permanent_deletion` (resident weak
+edge and stored weak edge both fail to pin),
+`storage_gc_reaches_through_external_dependency_chains` updated to strong
+edges at every hop, and the seeded random-graph property test
+`storage_gc_strong_edge_closure_matches_manual_reachability` (60 entries
+with random semantics/retention/edge kinds + resident roots): the plan
+must equal a manually computed strong-edge closure, and the delete pass
+must leave exactly the closure survivors alive.
+
 ### CTX-10 — TaskAnchor and completion output have no authoritative contract
 
 The runtime can recycle completed-task process detail, but it cannot identify
@@ -396,6 +427,9 @@ Confirmed chain:
 - a process mutates inside the child and returns only `ToolOutput`; the
   adapter wraps it as `CapabilityOutcome::Value`, bypassing actor generation,
   cancel and effect rollback;
+- an in-process capability granted `workspace:write` can call
+  `WorkspaceHandle::write`, which applies the mutation immediately during
+  `invoke`; only the sibling `prepare_write` path reaches a staged Effect;
 - a side-effecting process tool can self-declare `ReadOnly`, which approval
   auto-allows;
 - cwd + env filtering + Unix rlimits are not filesystem/network isolation;
@@ -411,7 +445,8 @@ Required order:
 
 1. conservative manifest-id grammar and private unpredictable directories;
 2. derive minimum risk/permissions from transport and requested authority;
-3. replace child-performed mutation with brokered `EffectRequest`;
+3. remove/refuse direct capability `WorkspaceHandle::write` and replace
+   child/in-process mutation with brokered `EffectRequest`;
 4. broker FS/network/process access and deny undeclared access;
 5. process group / Windows Job Object cancellation, including descendants;
 6. bounded stdout/stderr + artifact spill and disk/CPU/memory/process quotas;
