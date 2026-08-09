@@ -144,8 +144,7 @@ pub async fn run_engine(
                 // Replay preserves the task identity: re-focusing a task
                 // with the same id resumes its scopes exactly like the live
                 // runtime, instead of minting a fresh task per event.
-                let mut focus = FocusState::new(goal.clone());
-                focus.task_id = *task_id;
+                let focus = FocusState::for_task(*task_id, goal.clone());
                 engine
                     .ingest(ContextIngress::FocusChanged { focus })
                     .await?;
@@ -397,7 +396,7 @@ mod tests {
     use super::*;
     use agent_contracts::{
         ContextMaintenanceReport, ContextMaintenanceTrigger, ContextScope, RunId, RuntimeEvent,
-        ToolOutput,
+        TaskId, ToolOutput,
     };
     use serde_json::json;
 
@@ -422,7 +421,6 @@ mod tests {
             summary: if ok { "ok" } else { "failed" }.into(),
             model_content: model_content.into(),
             artifact_ref: Some("artifact://run/test.log".into()),
-            context_action: None,
             metadata: json!({}),
         }
     }
@@ -432,17 +430,27 @@ mod tests {
         let run = RunId::new();
         let events = vec![
             envelope(run, 1, RuntimeEvent::RunStarted),
-            // Turn 1: user message + one model round.
+            // The runtime establishes focus (an implicit task) before the
+            // first message is ingested.
             envelope(
                 run,
                 2,
+                RuntimeEvent::FocusChanged {
+                    task_id: TaskId::new(),
+                    goal: "fix AuthService.rs".into(),
+                },
+            ),
+            // Turn 1: user message + one model round.
+            envelope(
+                run,
+                3,
                 RuntimeEvent::UserMessageAccepted {
                     content: "fix AuthService.rs".into(),
                 },
             ),
             envelope(
                 run,
-                3,
+                4,
                 RuntimeEvent::ContextMaintained {
                     trigger: ContextMaintenanceTrigger::UserInput,
                     report: dummy_report(),
@@ -450,7 +458,7 @@ mod tests {
             ),
             envelope(
                 run,
-                4,
+                5,
                 RuntimeEvent::ContextPrepared {
                     diagnostics: ContextDiagnostics::default(),
                     selected: Vec::new(),
@@ -458,7 +466,7 @@ mod tests {
             ),
             envelope(
                 run,
-                5,
+                6,
                 RuntimeEvent::ContextMaintained {
                     trigger: ContextMaintenanceTrigger::BeforeModel,
                     report: dummy_report(),
@@ -466,7 +474,7 @@ mod tests {
             ),
             envelope(
                 run,
-                6,
+                7,
                 RuntimeEvent::ContextMaintained {
                     trigger: ContextMaintenanceTrigger::AfterModel,
                     report: dummy_report(),
@@ -474,32 +482,32 @@ mod tests {
             ),
             envelope(
                 run,
-                7,
+                8,
                 RuntimeEvent::AssistantMessage {
                     content: "fixed AuthService".into(),
                 },
             ),
             envelope(
                 run,
-                8,
+                9,
                 RuntimeEvent::ContextMaintained {
                     trigger: ContextMaintenanceTrigger::AfterModel,
                     report: dummy_report(),
                 },
             ),
-            envelope(run, 9, RuntimeEvent::TurnCompleted),
+            envelope(run, 10, RuntimeEvent::TurnCompleted),
             // Turn 2: the assistant message from turn 1 becomes prior working
             // context and is consumed by this turn's model request.
             envelope(
                 run,
-                10,
+                11,
                 RuntimeEvent::UserMessageAccepted {
                     content: "continue".into(),
                 },
             ),
             envelope(
                 run,
-                11,
+                12,
                 RuntimeEvent::ContextMaintained {
                     trigger: ContextMaintenanceTrigger::UserInput,
                     report: dummy_report(),
@@ -507,7 +515,7 @@ mod tests {
             ),
             envelope(
                 run,
-                12,
+                13,
                 RuntimeEvent::ContextPrepared {
                     diagnostics: ContextDiagnostics::default(),
                     selected: Vec::new(),
@@ -515,7 +523,7 @@ mod tests {
             ),
             envelope(
                 run,
-                13,
+                14,
                 RuntimeEvent::ContextMaintained {
                     trigger: ContextMaintenanceTrigger::AfterModel,
                     report: dummy_report(),
@@ -523,12 +531,12 @@ mod tests {
             ),
             envelope(
                 run,
-                14,
+                15,
                 RuntimeEvent::AssistantMessage {
                     content: "done".into(),
                 },
             ),
-            envelope(run, 15, RuntimeEvent::TurnCompleted),
+            envelope(run, 16, RuntimeEvent::TurnCompleted),
         ];
 
         let outcome = replay_events(&events, &ReplayConfig::default())
@@ -581,13 +589,21 @@ mod tests {
             envelope(
                 run,
                 1,
+                RuntimeEvent::FocusChanged {
+                    task_id: TaskId::new(),
+                    goal: "task one".into(),
+                },
+            ),
+            envelope(
+                run,
+                2,
                 RuntimeEvent::UserMessageAccepted {
                     content: "task one".into(),
                 },
             ),
             envelope(
                 run,
-                2,
+                3,
                 RuntimeEvent::ContextMaintained {
                     trigger: ContextMaintenanceTrigger::UserInput,
                     report: dummy_report(),
@@ -595,14 +611,14 @@ mod tests {
             ),
             envelope(
                 run,
-                3,
+                4,
                 RuntimeEvent::Pinned {
                     content: "never edit generated files".into(),
                 },
             ),
             envelope(
                 run,
-                4,
+                5,
                 RuntimeEvent::ContextMaintained {
                     trigger: ContextMaintenanceTrigger::FocusChanged,
                     report: dummy_report(),
@@ -610,14 +626,14 @@ mod tests {
             ),
             envelope(
                 run,
-                5,
+                6,
                 RuntimeEvent::TaskCompleted {
                     summary: "task one done".into(),
                 },
             ),
             envelope(
                 run,
-                6,
+                7,
                 RuntimeEvent::ContextMaintained {
                     trigger: ContextMaintenanceTrigger::TaskCompleted,
                     report: dummy_report(),
@@ -625,14 +641,14 @@ mod tests {
             ),
             envelope(
                 run,
-                7,
+                8,
                 RuntimeEvent::UserMessageAccepted {
                     content: "task two".into(),
                 },
             ),
             envelope(
                 run,
-                8,
+                9,
                 RuntimeEvent::ContextMaintained {
                     trigger: ContextMaintenanceTrigger::UserInput,
                     report: dummy_report(),
@@ -640,7 +656,7 @@ mod tests {
             ),
             envelope(
                 run,
-                9,
+                10,
                 RuntimeEvent::ContextPrepared {
                     diagnostics: ContextDiagnostics::default(),
                     selected: Vec::new(),
@@ -648,7 +664,7 @@ mod tests {
             ),
             envelope(
                 run,
-                10,
+                11,
                 RuntimeEvent::ContextMaintained {
                     trigger: ContextMaintenanceTrigger::AfterModel,
                     report: dummy_report(),
@@ -656,12 +672,12 @@ mod tests {
             ),
             envelope(
                 run,
-                11,
+                12,
                 RuntimeEvent::AssistantMessage {
                     content: "ok".into(),
                 },
             ),
-            envelope(run, 12, RuntimeEvent::TurnCompleted),
+            envelope(run, 13, RuntimeEvent::TurnCompleted),
         ];
 
         let outcome = replay_events(&events, &ReplayConfig::default())

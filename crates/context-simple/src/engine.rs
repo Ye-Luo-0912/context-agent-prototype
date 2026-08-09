@@ -1,9 +1,9 @@
 use agent_contracts::{
-    AgentResult, ContextAction, ContextDiagnostics, ContextEngine, ContextGcReport, ContextIngress,
-    ContextItem, ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextQuery, ContextRetention, ContextScope,
-    ContextStateTransition, CoreLabel, FocusState, Label, MaterializedContext, Scope, ScopeId,
-    ScopeKind, ScopeState,
+    AgentError, AgentResult, ContextAction, ContextDiagnostics, ContextEngine, ContextGcReport,
+    ContextIngress, ContextItem, ContextItemId, ContextItemSummary, ContextKind,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention,
+    ContextScope, ContextStateTransition, CoreLabel, FocusState, Label, MaterializedContext, Scope,
+    ScopeId, ScopeKind, ScopeState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,6 +58,18 @@ pub struct SimpleContextConfig {
     /// Storage GC only deletes store entries whose semantic lifecycle ended
     /// at least this many ticks ago and that nothing references.
     pub storage_ttl_ticks: u64,
+    /// Cap on how many items may carry `keep_alive` at once. Model hints are
+    /// hints: a runaway `gc_hint keep=true` must not root the whole heap.
+    pub max_keep_alive_items: usize,
+    /// Cap on lease turns per directive. A lease is bounded, not permanent —
+    /// the model cannot lease an item "forever" with one call.
+    pub max_lease_turns: u32,
+    /// Cap on leased items per task (count). A task cannot lease its whole
+    /// history into roots.
+    pub max_leased_items_per_task: usize,
+    /// Cap on total content tokens leased per task. Count + tokens together
+    /// bound both the number and the weight of model-protected items.
+    pub max_leased_tokens_per_task: usize,
 }
 
 impl Default for SimpleContextConfig {
@@ -78,6 +90,10 @@ impl Default for SimpleContextConfig {
             context_store_dir: None,
             gc_external_ttl_passes: 4,
             storage_ttl_ticks: 40,
+            max_keep_alive_items: 16,
+            max_lease_turns: 32,
+            max_leased_items_per_task: 16,
+            max_leased_tokens_per_task: 4096,
         }
     }
 }
@@ -189,13 +205,16 @@ impl ContextEngine for SimpleContextEngine {
                     focus.current_query = content.clone();
                     focus.active_entities = entity::extract_entities(&content);
                     focus.generation += 1;
-                } else {
-                    let mut focus = FocusState::new(content.clone());
-                    focus.active_entities = entity::extract_entities(&content);
-                    state.focus = Some(focus);
                 }
+                // A user message with no focus is a session-level message:
+                // the engine never mints a `TaskId` (task identity is
+                // runtime-owned, established via `FocusChanged`), so no
+                // focus is invented here — the item lands in the session
+                // scope and stays selectable while focus is absent.
+                let has_focus = state.focus.is_some();
                 // The user message opens (or touches) the task and focus
-                // scopes of the current work.
+                // scopes of the current work; without a focus this falls
+                // back to the session scope.
                 scope::open_focus_scope(&mut state);
 
                 let mut item = item::make_item(
@@ -203,7 +222,11 @@ impl ContextEngine for SimpleContextEngine {
                     &self.config,
                     content.clone(),
                     ContextKind::UserMessage,
-                    ContextScope::Task,
+                    if has_focus {
+                        ContextScope::Task
+                    } else {
+                        ContextScope::Session
+                    },
                     ContextRetention::Working,
                     0.62,
                     Some("user".to_string()),
@@ -365,6 +388,15 @@ impl ContextEngine for SimpleContextEngine {
                     if state.focus.as_ref().map(|f| f.task_id) == Some(completed_task) {
                         state.focus = None;
                     }
+                    // Model hints are per-task: when the task completes its
+                    // keep_alive and lease protections expire, so a completed
+                    // task cannot keep rooting items forever.
+                    for item in &mut state.items {
+                        if item.task_id == Some(completed_task) {
+                            item.keep_alive = false;
+                            item.lease_until_turn = None;
+                        }
+                    }
                     scope::queue_task_scope_close(&mut state, completed_task);
                 }
                 let item = item::make_item(
@@ -380,7 +412,12 @@ impl ContextEngine for SimpleContextEngine {
                 dependency::push_linked(&mut state, &self.config, item);
             }
             ContextIngress::ContextDirective { action } => {
-                apply_directive(&mut state, action);
+                if let Some(reason) = apply_directive(&mut state, &self.config, action) {
+                    // A quota refused the directive: surface it so the model
+                    // (which believes the hint/lease was granted) learns it
+                    // was not.
+                    return Err(AgentError::InvalidRequest(reason));
+                }
             }
         }
 
@@ -500,18 +537,113 @@ impl ContextEngine for SimpleContextEngine {
 /// back on the next GC pass); a stale `item_id` (already externalized or
 /// superseded) is a silent no-op. GC reads the resulting fields, so every
 /// "kept because ..." is explainable in the eviction reasons.
-fn apply_directive(state: &mut State, action: ContextAction) {
+///
+/// Returns `Some(reason)` when the directive was refused by a quota:
+/// `keep_alive` and leases are bounded so the model cannot root the whole
+/// heap. A refused directive leaves the item unchanged — the caller
+/// surfaces the reason to the model.
+fn apply_directive(
+    state: &mut State,
+    config: &SimpleContextConfig,
+    action: ContextAction,
+) -> Option<String> {
+    let target_id = directive_item_id(&action);
+
+    // Quota checks run on read-only views first; the mutation happens after,
+    // so the checks never contend with the mutable borrow.
+    let refusal = match &action {
+        // `keep=false` always applies (releasing cannot exceed a cap);
+        // `keep=true` is bounded by the keep-alive quota.
+        ContextAction::GcHint {
+            keep_alive: true, ..
+        } => {
+            let kept = state.items.iter().filter(|item| item.keep_alive).count();
+            (kept >= config.max_keep_alive_items).then(|| {
+                format!(
+                    "gc_hint refused: {kept} items are already keep_alive (cap {})",
+                    config.max_keep_alive_items
+                )
+            })
+        }
+        ContextAction::Lease { .. } => {
+            let target = state
+                .items
+                .iter()
+                .find(|item| item.id == target_id)
+                .or_else(|| {
+                    state
+                        .eviction_buffer
+                        .iter()
+                        .find(|item| item.id == target_id)
+                });
+            match target {
+                // Stale target: silent no-op, same as the mutation path.
+                None => None,
+                Some(item) => {
+                    // A lease is bounded per directive and per task: the
+                    // model cannot lease an item forever, nor lease a task's
+                    // whole history into roots.
+                    let task = item.task_id;
+                    // Renewing an item that is already leased adds no new
+                    // leased item or tokens, so it never trips the quota.
+                    let already_leased = item
+                        .lease_until_turn
+                        .is_some_and(|until| until >= state.turn);
+                    let (leased, leased_tokens) = state
+                        .items
+                        .iter()
+                        .filter(|other| {
+                            other
+                                .lease_until_turn
+                                .is_some_and(|until| until >= state.turn)
+                                && other.task_id == task
+                        })
+                        .fold((0usize, 0usize), |(count, tokens), other| {
+                            (
+                                count + 1,
+                                tokens + crate::item::approx_tokens(&other.content),
+                            )
+                        });
+                    let added = usize::from(!already_leased);
+                    let added_tokens = if already_leased {
+                        0
+                    } else {
+                        crate::item::approx_tokens(&item.content)
+                    };
+                    if leased.saturating_add(added) > config.max_leased_items_per_task {
+                        Some(format!(
+                            "lease refused: task would lease {} items (cap {})",
+                            leased.saturating_add(added),
+                            config.max_leased_items_per_task
+                        ))
+                    } else if leased_tokens.saturating_add(added_tokens)
+                        > config.max_leased_tokens_per_task
+                    {
+                        Some(format!(
+                            "lease refused: task would lease {} tokens (cap {})",
+                            leased_tokens.saturating_add(added_tokens),
+                            config.max_leased_tokens_per_task
+                        ))
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+        _ => None,
+    };
+    if let Some(reason) = refusal {
+        return Some(reason);
+    }
+
     let mut target = state
         .items
         .iter_mut()
         .chain(state.eviction_buffer.iter_mut())
-        .find(|item| item.id == directive_item_id(&action));
+        .find(|item| item.id == target_id);
     if let Some(item) = target.as_mut() {
         match action {
-            ContextAction::GcHint {
-                item_id: _,
-                keep_alive,
-            } => {
+            ContextAction::GcHint { keep_alive, .. } => {
                 item.keep_alive = keep_alive;
             }
             ContextAction::Tag { tag, .. } => {
@@ -521,6 +653,7 @@ fn apply_directive(state: &mut State, action: ContextAction) {
                 }
             }
             ContextAction::Lease { turns, .. } => {
+                let turns = turns.min(config.max_lease_turns);
                 item.lease_until_turn = Some(state.turn.saturating_add(turns as u64));
             }
             // The runtime owns the GC pass; `context.collect` never arrives
@@ -528,6 +661,7 @@ fn apply_directive(state: &mut State, action: ContextAction) {
             ContextAction::Collect => {}
         }
     }
+    None
 }
 
 fn directive_item_id(action: &ContextAction) -> ContextItemId {

@@ -1,13 +1,15 @@
 use std::path::{Component, Path, PathBuf};
 
-use agent_contracts::{AgentError, AgentResult, Effect, RunId};
+use agent_contracts::{AgentError, AgentResult, Effect, EffectCommitError, RunId};
 use serde::Serialize;
 use tokio::fs;
 use uuid::Uuid;
 
 mod handles;
+mod replace;
 
 pub use handles::{ArtifactStoreHandle, ConfinedWorkspaceHandle};
+pub use replace::atomic_replace;
 
 /// One record in the workspace change journal (`.focus-agent/changes.jsonl`).
 ///
@@ -214,15 +216,23 @@ impl Workspace {
     ) -> AgentResult<MutationTransaction> {
         let target = self.resolve_mutation(relative).await?;
         let mut bytes_before = 0u64;
+        let mut before_hash = content_hash(&[]);
         let mut old_content = None;
         match fs::metadata(&target).await {
             Ok(meta) => {
                 bytes_before = meta.len();
-                if meta.is_file() && meta.len() as usize <= CHANGE_CAPTURE_LIMIT {
+                if meta.is_file() {
+                    // The hash must always reflect the real content — a
+                    // recovery pass relies on it to tell "prepared but
+                    // never committed" from "committed". Only the *backup*
+                    // is bounded: big files get a hash but no journal copy.
                     let bytes = fs::read(&target)
                         .await
                         .map_err(|e| AgentError::Io(format!("read {}: {e}", target.display())))?;
-                    old_content = String::from_utf8(bytes).ok();
+                    before_hash = content_hash(&bytes);
+                    if bytes.len() as u64 <= CHANGE_CAPTURE_LIMIT as u64 {
+                        old_content = String::from_utf8(bytes).ok();
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -237,6 +247,7 @@ impl Workspace {
             tool: tool.to_string(),
             action: action.to_string(),
             bytes_before,
+            before_hash,
             old_content,
             tx_id: Uuid::new_v4().to_string(),
         })
@@ -374,6 +385,10 @@ pub struct MutationTransaction {
     tool: String,
     action: String,
     bytes_before: u64,
+    /// Content hash of the real file at prepare time (computed even when the
+    /// backup copy is truncated — recovery integrity must not depend on the
+    /// capture limit).
+    before_hash: String,
     old_content: Option<String>,
     tx_id: String,
 }
@@ -413,12 +428,6 @@ impl MutationTransaction {
         }
         drop(file);
 
-        let before_hash = content_hash(
-            self.old_content
-                .as_deref()
-                .map(str::as_bytes)
-                .unwrap_or_default(),
-        );
         let record = ChangeRecord::MutationPrepared {
             tx_id: self.tx_id.clone(),
             timestamp_ms: now_ms(),
@@ -427,7 +436,7 @@ impl MutationTransaction {
             action: self.action.clone(),
             bytes_before: self.bytes_before,
             bytes_after: content.len() as u64,
-            before_hash,
+            before_hash: self.before_hash,
             after_hash: content_hash(content),
             old_content: self.old_content.take(),
         };
@@ -446,10 +455,19 @@ impl MutationTransaction {
     }
 
     /// Convenience: prepare then commit immediately (used where the caller
-    /// is itself the only judge of the operation's validity).
+    /// is itself the only judge of the operation's validity — the runtime's
+    /// generation fence is bypassed, so only trusted core paths may use it).
     pub async fn apply(self, content: &[u8]) -> AgentResult<()> {
         let prepared = self.prepare(content).await?;
-        prepared.commit().await
+        match prepared.commit().await {
+            Ok(()) => Ok(()),
+            // Apply collapses the structured failure: the caller only needs
+            // to know it failed and whether the world changed.
+            Err(EffectCommitError::NotApplied(error)) => Err(error),
+            Err(EffectCommitError::AppliedButDurabilityFailed(error)) => Err(AgentError::Internal(
+                format!("mutation applied but its journal record failed: {error}"),
+            )),
+        }
     }
 }
 
@@ -471,35 +489,46 @@ impl PreparedMutation {
 
     /// Atomically replace the target and record `MutationCommitted`. On
     /// failure the staged file is removed and `MutationRolledBack` is
-    /// recorded, so the journal reflects reality.
-    pub async fn commit(mut self) -> AgentResult<()> {
+    /// recorded, so the journal reflects reality. The failure is
+    /// structured: `NotApplied` when the replace never landed,
+    /// `AppliedButDurabilityFailed` when the replace landed but the
+    /// `MutationCommitted` record could not be appended — the caller must
+    /// treat that as a degraded state, never as "nothing happened".
+    pub async fn commit(mut self) -> Result<(), EffectCommitError> {
         let Some(temp) = self.temp.take() else {
             return Ok(());
         };
-        if let Err(e) = fs::rename(&temp, &self.target).await {
+        if let Err(e) = atomic_replace(&temp, &self.target).await {
             let _ = fs::remove_file(&temp).await;
             self.record_rolled_back(format!("commit failed: {e}")).await;
-            return Err(AgentError::Io(format!(
+            return Err(EffectCommitError::NotApplied(AgentError::Io(format!(
                 "commit {}: {e}",
                 self.target.display()
-            )));
+            ))));
         }
+        // The target changed; from here on any failure is a durability
+        // problem, not a "did not apply" one.
+        self.finished = true;
         let record = ChangeRecord::MutationCommitted {
             tx_id: self.tx_id.clone(),
             timestamp_ms: now_ms(),
         };
-        // The rename landed but the commit record could not be written:
-        // surface it — the target state and the journal now disagree.
-        self.workspace.record_change(record).await?;
-        self.finished = true;
+        if let Err(error) = self.workspace.record_change(record).await {
+            return Err(EffectCommitError::AppliedButDurabilityFailed(error));
+        }
         Ok(())
     }
 
     /// Remove the staged file and record `MutationRolledBack` (best effort).
     /// Called when the owning operation is stale and the mutation must not
-    /// land.
+    /// land. The staging file is deleted here, not left behind for the
+    /// `Drop` impl — a stale or cancelled mutation must never leak temp
+    /// files.
     pub async fn rollback(mut self, reason: &str) {
-        self.temp = None;
+        if let Some(temp) = self.temp.take() {
+            let _ = fs::remove_file(&temp).await;
+        }
+        self.finished = true;
         self.record_rolled_back(reason.to_string()).await;
     }
 
@@ -533,7 +562,7 @@ impl Effect for PreparedMutation {
         format!("workspace mutation {}", self.tx_id)
     }
 
-    async fn commit(self: Box<Self>) -> AgentResult<()> {
+    async fn commit(self: Box<Self>) -> Result<(), EffectCommitError> {
         (*self).commit().await
     }
 
@@ -789,5 +818,119 @@ mod tests {
         let rolled_back: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(rolled_back["kind"], "mutation_rolled_back");
         assert_eq!(rolled_back["tx_id"], prepared["tx_id"]);
+    }
+
+    #[tokio::test]
+    async fn rollback_deletes_the_staged_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let target = workspace.resolve_relative("notes.txt").await.unwrap();
+        fs::write(&target, "original").await.unwrap();
+
+        let tx = workspace
+            .begin_mutation("fs.write", "write", "notes.txt")
+            .await
+            .unwrap();
+        let prepared = tx.prepare(b"staged").await.unwrap();
+
+        let parent = target.parent().unwrap();
+        let temp_count = || async {
+            let mut count = 0usize;
+            let mut entries = fs::read_dir(parent).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                if entry.file_name().to_string_lossy().ends_with(".tmp") {
+                    count += 1;
+                }
+            }
+            count
+        };
+        assert_eq!(temp_count().await, 1, "staging must leave one temp file");
+
+        // A stale/cancelled mutation rolls back — and the staging file must
+        // be gone, not leaked for the Drop impl to clean up later.
+        prepared.rollback("stale operation").await;
+        assert_eq!(temp_count().await, 0, "rollback must delete the temp file");
+        assert_eq!(
+            fs::read_to_string(&target).await.unwrap(),
+            "original",
+            "the target is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_that_lands_but_cannot_journal_is_a_durability_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let target = workspace.resolve_relative("file.txt").await.unwrap();
+        fs::write(&target, "before").await.unwrap();
+
+        workspace
+            .begin_mutation("fs.write", "write", "file.txt")
+            .await
+            .unwrap()
+            .apply(b"after")
+            .await
+            .unwrap();
+
+        // Stage the second mutation while the journal is still healthy...
+        let tx = workspace
+            .begin_mutation("fs.write", "write", "file.txt")
+            .await
+            .unwrap();
+        let prepared = tx.prepare(b"second").await.unwrap();
+
+        // ...then break the journal *between* prepare and commit: the rename
+        // lands, but the MutationCommitted record cannot be appended.
+        let journal = workspace.state_dir().join("changes.jsonl");
+        fs::remove_file(&journal).await.unwrap();
+        fs::create_dir(&journal).await.unwrap();
+
+        let err = prepared.commit().await.unwrap_err();
+        match &err {
+            EffectCommitError::AppliedButDurabilityFailed(_) => {}
+            other => panic!("expected AppliedButDurabilityFailed, got {other:?}"),
+        }
+
+        // The world did change: the caller must treat this as a degraded
+        // state needing recovery, never as "nothing happened".
+        assert_eq!(
+            fs::read_to_string(&target).await.unwrap(),
+            "second",
+            "the mutation landed even though the journal record failed"
+        );
+
+        fs::remove_dir(&journal).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn before_hash_hashes_real_content_beyond_the_capture_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let target = workspace.resolve_relative("big.bin").await.unwrap();
+        let big = vec![b'z'; CHANGE_CAPTURE_LIMIT + 1000];
+        fs::write(&target, &big).await.unwrap();
+
+        let tx = workspace
+            .begin_mutation("fs.write", "write", "big.bin")
+            .await
+            .unwrap();
+        tx.prepare(b"small").await.unwrap();
+
+        let journal = fs::read_to_string(workspace.state_dir().join("changes.jsonl"))
+            .await
+            .unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+        assert_eq!(record["kind"], "mutation_prepared");
+        assert_eq!(record["bytes_before"], big.len() as u64);
+        assert_eq!(
+            record["before_hash"],
+            content_hash(&big),
+            "the hash must reflect the real 256KB+ content, not an empty fallback"
+        );
+        assert!(
+            record["old_content"].is_null(),
+            "the bounded backup copy must not capture a 256KB+ file"
+        );
     }
 }

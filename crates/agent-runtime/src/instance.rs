@@ -9,6 +9,7 @@ use agent_contracts::{AgentError, AgentResult};
 use agent_kernel::AgentKernel;
 use tokio::task::JoinHandle;
 
+use crate::checkpoint::RuntimeCheckpoint;
 use crate::command::RuntimeHandle;
 use crate::host::ModuleHost;
 
@@ -43,6 +44,27 @@ impl RuntimeInstance {
     /// Start the runtime (emits `RunStarted`). Subscribe first to see it.
     pub async fn start(&self) -> AgentResult<()> {
         self.handle.start().await
+    }
+
+    /// A complete runtime checkpoint: the actor's state (task table, current
+    /// task) plus the context engine's checkpoint, plus the dynamic
+    /// capability surface state the host owns. This — not the context
+    /// checkpoint alone — is the snapshot a restart can restore from.
+    pub async fn checkpoint(&self) -> AgentResult<RuntimeCheckpoint> {
+        let mut checkpoint = self.handle.checkpoint().await?;
+        checkpoint.capabilities = self.host.capability_registry().snapshot();
+        Ok(checkpoint)
+    }
+
+    /// Restore the whole runtime from a checkpoint: the host re-applies the
+    /// capability surface first, then the actor restores the task table,
+    /// the current task and the context engine. Idle is required, exactly
+    /// like every other runtime mutation.
+    pub async fn restore(&self, checkpoint: RuntimeCheckpoint) -> AgentResult<()> {
+        self.host
+            .capability_registry()
+            .restore(&checkpoint.capabilities);
+        self.handle.restore(checkpoint).await
     }
 
     /// Full ordered shutdown. Every step runs even when an earlier one

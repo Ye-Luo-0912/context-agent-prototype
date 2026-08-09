@@ -182,16 +182,22 @@ impl Tool for ContextDirectiveTool {
             ContextDirectiveKind::Collect => ContextAction::Collect,
         };
         let description = describe(&action);
-        Ok(ToolOutcome::Value(ToolOutput {
-            call_id: call_id.into(),
-            tool_name: self.name().into(),
-            ok: true,
-            summary: description.clone(),
-            model_content: description,
-            artifact_ref: None,
-            context_action: Some(action.clone()),
-            metadata: json!({"context_action": action}),
-        }))
+        // The meta-tools produce a `RuntimeDirective`, not a plain output:
+        // context control is a distinct `ToolOutcome` variant so only
+        // trusted tools (and capabilities granted `runtime:context-control`)
+        // can ask the runtime to change context state.
+        Ok(ToolOutcome::RuntimeDirective {
+            output: ToolOutput {
+                call_id: call_id.into(),
+                tool_name: self.name().into(),
+                ok: true,
+                summary: description.clone(),
+                model_content: description,
+                artifact_ref: None,
+                metadata: json!({"context_action": action}),
+            },
+            directive: agent_contracts::RuntimeDirective::Context(action),
+        })
     }
 }
 

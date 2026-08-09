@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use agent_contracts::{
     AgentError, AgentResult, Capability, CapabilityInvocationContext, CapabilityManifest,
-    CapabilityTransport, ToolCall, ToolOutput,
+    CapabilityOutcome, CapabilityTransport, ToolCall, ToolOutput,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -95,7 +95,7 @@ impl Capability for ProcessCapabilityAdapter {
         &self,
         call: ToolCall,
         ctx: CapabilityInvocationContext,
-    ) -> AgentResult<ToolOutput> {
+    ) -> AgentResult<CapabilityOutcome> {
         let slot = self.host.lock().await;
         let host = slot.as_ref().ok_or_else(|| {
             AgentError::Context(format!(
@@ -113,8 +113,13 @@ impl Capability for ProcessCapabilityAdapter {
                 "permissions": ctx.granted_permissions,
             }))
             .await?;
-        serde_json::from_value(value)
-            .map_err(|e| AgentError::Context(format!("decode capability output: {e}")))
+        let output: ToolOutput = serde_json::from_value(value)
+            .map_err(|e| AgentError::Context(format!("decode capability output: {e}")))?;
+        // An out-of-process capability applies its own side effects inside
+        // the subprocess; across the wire the runtime only ever sees a
+        // completed value. Staged effect / directive transport is a future
+        // protocol extension.
+        Ok(CapabilityOutcome::Value(output))
     }
 }
 

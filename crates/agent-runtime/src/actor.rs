@@ -10,19 +10,30 @@ use std::{collections::VecDeque, sync::Arc};
 use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, ContextHints, ContextIngress,
-    ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect, ModelRequest, OperationId,
-    OperationOutcome, OperationResult, RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall,
-    ToolOutcome, ToolOutput, ToolSurfaceSnapshot, TurnFrame, TurnFrameStep, TurnId,
+    ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect, EffectCommitError,
+    ModelRequest, OperationId, OperationOutcome, OperationResult, RuntimeDirective, RuntimeEvent,
+    ScopeId, ScopeKind, TaskId, ToolCall, ToolOutcome, ToolOutput, ToolSurfaceSnapshot, TurnFrame,
+    TurnFrameStep, TurnId,
 };
 use agent_kernel::AgentKernel;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::budget::{DEFAULT_OUTPUT_RESERVE, ModelBudget, approx_layer_tokens};
+use crate::checkpoint::{
+    RUNTIME_CHECKPOINT_VERSION, RunMetadata, RuntimeCheckpoint, TaskManagerSnapshot,
+};
 use crate::command::{Reply, RuntimeCommand, RuntimeHandle};
 use crate::prompt::PromptAssembler;
 use crate::sink::LiveSink;
 use crate::task::TaskManager;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
 
 /// Which operation a spawned task is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +79,10 @@ pub(crate) struct OperationCompletion {
     /// must roll it back so the effect never lands (tool computation is
     /// separate from side-effect commit).
     effect: Option<Box<dyn Effect>>,
+    /// A runtime directive (context control) the tool attached to its
+    /// output. Executed at commit time, right after the effect — so a
+    /// "manual collect now" is actually now, not at turn end.
+    directive: Option<RuntimeDirective>,
 }
 
 /// Mutable runtime state, owned exclusively by the actor loop. Callers never
@@ -169,12 +184,16 @@ impl RuntimeActor {
                 let result = match self.ensure_idle() {
                     Ok(()) => {
                         // A task is the long-lived entity; focus is the
-                        // attention inside it. `create_task` resumes a
+                        // attention inside it. `prepare_create` resumes a
                         // non-completed task with the same goal, so
-                        // re-focusing returns to the same task id.
-                        let task_id = self.state.tasks.create_task(goal.clone());
+                        // re-focusing returns to the same task id. The
+                        // TaskManager transition is committed only after
+                        // the engine's focus change succeeded, so the two
+                        // can never diverge.
+                        let (txn, task_id) = self.state.tasks.prepare_create(&goal);
                         match self.kernel.set_focus(task_id, goal).await {
                             Ok(()) => {
+                                self.state.tasks.commit(txn);
                                 self.state.task_id = Some(task_id);
                                 self.state.generation += 1;
                                 Ok(())
@@ -188,12 +207,11 @@ impl RuntimeActor {
             }
             RuntimeCommand::ActivateTask { task_id, reply } => {
                 let result = match self.ensure_idle() {
-                    Ok(()) => {
-                        if self.state.tasks.activate_task(task_id).is_none() {
-                            Err(AgentError::InvalidRequest(format!(
-                                "task {task_id} does not exist or is completed"
-                            )))
-                        } else {
+                    Ok(()) => match self.state.tasks.prepare_activate(task_id) {
+                        None => Err(AgentError::InvalidRequest(format!(
+                            "task {task_id} does not exist or is completed"
+                        ))),
+                        Some(txn) => {
                             let goal = self
                                 .state
                                 .tasks
@@ -202,6 +220,7 @@ impl RuntimeActor {
                                 .unwrap_or_default();
                             match self.kernel.set_focus(task_id, goal).await {
                                 Ok(()) => {
+                                    self.state.tasks.commit(txn);
                                     self.state.task_id = Some(task_id);
                                     self.state.generation += 1;
                                     Ok(())
@@ -209,24 +228,25 @@ impl RuntimeActor {
                                 Err(error) => Err(error),
                             }
                         }
-                    }
+                    },
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
             }
             RuntimeCommand::SuspendTask { reply } => {
                 let result = match self.ensure_idle() {
-                    Ok(()) => {
-                        self.state.tasks.suspend_active();
-                        match self.kernel.clear_focus().await {
+                    Ok(()) => match self.state.tasks.prepare_suspend() {
+                        None => Ok(()),
+                        Some(txn) => match self.kernel.clear_focus().await {
                             Ok(()) => {
+                                self.state.tasks.commit(txn);
                                 self.state.task_id = None;
                                 self.state.generation += 1;
                                 Ok(())
                             }
                             Err(error) => Err(error),
-                        }
-                    }
+                        },
+                    },
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
@@ -243,22 +263,69 @@ impl RuntimeActor {
             }
             RuntimeCommand::CompleteTask { summary, reply } => {
                 let result = match self.ensure_idle() {
-                    Ok(()) => {
-                        // The engine resolves the completed task from the
-                        // current focus; the TaskManager just closes its
-                        // record so the id is never resumed.
-                        if let Some(active) = self.state.tasks.active() {
-                            self.state.tasks.complete_task(active);
+                    Ok(()) => match self.state.tasks.prepare_complete() {
+                        None => Err(AgentError::InvalidRequest(
+                            "no active task to complete".into(),
+                        )),
+                        Some(txn) => {
+                            // The engine resolves the completed task from the
+                            // current focus; the TaskManager closes its record
+                            // only after the engine's close succeeded.
+                            match self.kernel.complete_current_task(summary).await {
+                                Ok(()) => {
+                                    self.state.tasks.commit(txn);
+                                    self.state.task_id = None;
+                                    self.state.generation += 1;
+                                    Ok(())
+                                }
+                                Err(error) => Err(error),
+                            }
                         }
-                        self.kernel.complete_current_task(summary).await
-                    }
+                    },
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
             }
             RuntimeCommand::Checkpoint { reply } => {
                 let result = match self.ensure_idle() {
-                    Ok(()) => self.kernel.checkpoint().await,
+                    Ok(()) => match self.kernel.checkpoint().await {
+                        Ok(context) => Ok(RuntimeCheckpoint {
+                            version: RUNTIME_CHECKPOINT_VERSION,
+                            run_metadata: RunMetadata {
+                                run_id: self.kernel.run_id(),
+                                created_at_ms: now_ms(),
+                            },
+                            tasks: TaskManagerSnapshot::from_manager(&self.state.tasks),
+                            current_task_id: self.state.task_id,
+                            context,
+                            // The actor does not own the host: the capability
+                            // surface is merged in by RuntimeInstance.
+                            capabilities: Vec::new(),
+                        }),
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            RuntimeCommand::Restore { checkpoint, reply } => {
+                let result = match self.ensure_idle() {
+                    Ok(()) => {
+                        if checkpoint.version != RUNTIME_CHECKPOINT_VERSION {
+                            Err(AgentError::InvalidRequest(format!(
+                                "checkpoint version {} is not supported (expected {})",
+                                checkpoint.version, RUNTIME_CHECKPOINT_VERSION
+                            )))
+                        } else {
+                            // The engine's scopes were restored from the
+                            // context payload; the task table and the
+                            // current task come back in sync with them.
+                            self.state.tasks.restore(checkpoint.tasks);
+                            self.state.task_id = checkpoint.current_task_id;
+                            self.state.generation += 1;
+                            self.kernel.restore(checkpoint.context).await
+                        }
+                    }
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
@@ -306,6 +373,21 @@ impl RuntimeActor {
         if content.trim().is_empty() {
             let _ = reply.send(Ok(()));
             return;
+        }
+
+        // The first message with no active task auto-creates one: a task is
+        // the long-lived entity and the engine must never mint a TaskId, so
+        // this is the single place an implicit task can be born. The focus
+        // change lands before the message is ingested, exactly like an
+        // explicit `/focus`.
+        if self.state.tasks.active().is_none() {
+            let (txn, task_id) = self.state.tasks.prepare_create(content.trim());
+            if let Err(error) = self.kernel.set_focus(task_id, content.clone()).await {
+                let _ = reply.send(Err(error));
+                return;
+            }
+            self.state.tasks.commit(txn);
+            self.state.task_id = Some(task_id);
         }
 
         self.state.generation += 1;
@@ -639,6 +721,7 @@ impl RuntimeActor {
                     },
                     kind: OpKind::Model,
                     effect: None,
+                    directive: None,
                 })
                 .await;
         });
@@ -699,7 +782,7 @@ impl RuntimeActor {
         let task_id = self.state.task_id;
         tokio::spawn(async move {
             let outcome = kernel.execute_tool(call, cancel, &surface).await;
-            let (operation, effect) = match outcome {
+            let (operation, effect, directive) = match outcome {
                 ToolOutcome::Value(output) => (
                     OperationResult {
                         run_id,
@@ -710,6 +793,7 @@ impl RuntimeActor {
                         generation,
                         outcome: OperationOutcome::ToolOutput(output),
                     },
+                    None,
                     None,
                 ),
                 ToolOutcome::PreparedEffect { output, effect } => (
@@ -723,6 +807,20 @@ impl RuntimeActor {
                         outcome: OperationOutcome::ToolOutput(output),
                     },
                     Some(effect),
+                    None,
+                ),
+                ToolOutcome::RuntimeDirective { output, directive } => (
+                    OperationResult {
+                        run_id,
+                        turn_id,
+                        task_id,
+                        scope_id: tool_scope,
+                        operation_id,
+                        generation,
+                        outcome: OperationOutcome::ToolOutput(output),
+                    },
+                    None,
+                    Some(directive),
                 ),
             };
             let _ = op_tx
@@ -730,6 +828,7 @@ impl RuntimeActor {
                     operation,
                     kind: OpKind::Tool,
                     effect,
+                    directive,
                 })
                 .await;
         });
@@ -804,7 +903,7 @@ impl RuntimeActor {
                 let output = match completion.effect {
                     Some(effect) => match effect.commit().await {
                         Ok(()) => output,
-                        Err(error) => ToolOutput {
+                        Err(EffectCommitError::NotApplied(error)) => ToolOutput {
                             ok: false,
                             summary: format!("effect commit failed: {error}"),
                             model_content: format!(
@@ -812,9 +911,39 @@ impl RuntimeActor {
                             ),
                             ..output
                         },
+                        Err(EffectCommitError::AppliedButDurabilityFailed(error)) => {
+                            // The side effect landed but its journal record
+                            // did not: the world and the journal disagree.
+                            // The model must be told the truth — "applied but
+                            // not recorded" — and the runtime flags a
+                            // degraded/recovery state instead of pretending
+                            // nothing happened.
+                            let _ = self
+                                .kernel
+                                .emit_warning(format!(
+                                    "effect applied but its journal record failed: {error}"
+                                ))
+                                .await;
+                            ToolOutput {
+                                ok: false,
+                                summary: format!(
+                                    "effect applied but its journal record failed: {error}"
+                                ),
+                                model_content: format!(
+                                    "the change WAS applied to the file, but recording it in the change journal failed: {error}. The filesystem and the journal now disagree — recovery is required."
+                                ),
+                                ..output
+                            }
+                        }
                     },
                     None => output,
                 };
+                // Execute the tool's runtime directive now, as part of the
+                // operation commit — not at turn end — so a context control
+                // request takes effect before the next model round.
+                if let Some(directive) = completion.directive {
+                    self.execute_directive(directive).await;
+                }
                 if let Some(turn) = self.state.turn.as_mut() {
                     turn.turn_frame
                         .push_tool_result(output.clone(), op_scope_id);
@@ -861,40 +990,52 @@ impl RuntimeActor {
         })
     }
 
+    /// Execute a runtime directive a tool attached to its output. Runs at
+    /// operation-commit time — after any staged effect, before the result
+    /// enters the turn frame — so a "manual collect now" is actually now,
+    /// and a hint/lease/tag lands before the next model round, not at turn
+    /// end. Only trusted tools and `runtime:context-control` capabilities
+    /// can produce directives (the dispatcher enforces that); here they are
+    /// simply routed to the engine.
+    async fn execute_directive(&mut self, directive: RuntimeDirective) {
+        match directive {
+            RuntimeDirective::Context(agent_contracts::ContextAction::Collect) => {
+                if let Ok(report) = self.kernel.context_gc().await {
+                    let _ = self
+                        .kernel
+                        .emit_event(RuntimeEvent::ContextGc { report })
+                        .await;
+                }
+            }
+            RuntimeDirective::Context(other) => {
+                if let Err(error) = self
+                    .kernel
+                    .context_ingest(ContextIngress::ContextDirective { action: other })
+                    .await
+                {
+                    // A quota refused the directive (keep_alive / lease
+                    // caps): the model believes it was granted, so surface
+                    // the refusal.
+                    let _ = self
+                        .kernel
+                        .emit_warning(format!("context directive refused: {error}"))
+                        .await;
+                }
+            }
+        }
+    }
+
     /// When the model stops calling tools, the turn's tool observations
     /// become the long-term record, then the final assistant message. Each
-    /// observation is tagged with the tool scope that produced it.
+    /// observation is tagged with the tool scope that produced it. Context
+    /// directives were already executed at operation-commit time (see
+    /// `execute_directive`), so finalization only persists observations.
     async fn finalize_turn(&mut self, content: String) {
         let mut ingested = false;
         if let Some(turn) = self.state.turn.as_mut() {
             for step in &turn.turn_frame.steps {
-                if let TurnFrameStep::ToolResult { output, scope_id } = step {
-                    // Route the tool's context directive first: gc hints,
-                    // tags and leases target existing items, and the
-                    // observation ingest below must not race them.
-                    if let Some(action) = &output.context_action {
-                        match action {
-                            agent_contracts::ContextAction::Collect => {
-                                // Manual collect: the model asked for a
-                                // full GC pass now, mid-turn.
-                                if let Ok(report) = self.kernel.context_gc().await {
-                                    let _ = self
-                                        .kernel
-                                        .emit_event(RuntimeEvent::ContextGc { report })
-                                        .await;
-                                }
-                            }
-                            other => {
-                                let _ = self
-                                    .kernel
-                                    .context_ingest(ContextIngress::ContextDirective {
-                                        action: other.clone(),
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                    if self
+                if let TurnFrameStep::ToolResult { output, scope_id } = step
+                    && self
                         .kernel
                         .context_ingest(ContextIngress::ToolObservation {
                             output: output.clone(),
@@ -902,9 +1043,8 @@ impl RuntimeActor {
                         })
                         .await
                         .is_ok()
-                    {
-                        ingested = true;
-                    }
+                {
+                    ingested = true;
                 }
             }
         }

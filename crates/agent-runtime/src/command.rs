@@ -5,6 +5,7 @@ use agent_contracts::{
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::checkpoint::RuntimeCheckpoint;
 use crate::task::TaskInfo;
 
 /// Reply channel back to the caller of a command.
@@ -48,7 +49,13 @@ pub enum RuntimeCommand {
         reply: Reply<AgentResult<()>>,
     },
     Checkpoint {
-        reply: Reply<AgentResult<serde_json::Value>>,
+        reply: Reply<AgentResult<RuntimeCheckpoint>>,
+    },
+    /// Restore the runtime (task table, current task, context engine) from
+    /// a checkpoint. The host re-applies the capability surface separately.
+    Restore {
+        checkpoint: RuntimeCheckpoint,
+        reply: Reply<AgentResult<()>>,
     },
     EmitDiagnostics {
         reply: Reply<AgentResult<()>>,
@@ -142,8 +149,19 @@ impl RuntimeHandle {
             .await
     }
 
-    pub async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+    /// Snapshot of the whole runtime: the actor's state (task table, current
+    /// task) plus the context engine's checkpoint. Capability surface state
+    /// is merged in by `RuntimeInstance`, which owns the host.
+    pub async fn checkpoint(&self) -> AgentResult<RuntimeCheckpoint> {
         self.call(|reply| RuntimeCommand::Checkpoint { reply })
+            .await
+    }
+
+    /// Restore the actor-side state (task table, current task, context
+    /// engine) from a checkpoint. Call `RuntimeInstance::restore` instead to
+    /// also restore the capability surface.
+    pub async fn restore(&self, checkpoint: RuntimeCheckpoint) -> AgentResult<()> {
+        self.call(|reply| RuntimeCommand::Restore { checkpoint, reply })
             .await
     }
 

@@ -233,7 +233,6 @@ fn tool(name: &str, ok: bool, content: &str) -> ToolOutput {
         summary: format!("{name}: {} chars", content.chars().count()),
         model_content: content.into(),
         artifact_ref: Some(format!("artifact://run/{name}.log")),
-        context_action: None,
         metadata: json!({}),
     }
 }

@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use agent_contracts::{
     AgentResult, CancellationToken, Capability, CapabilityInvocationContext, CapabilityKind,
-    CapabilityLifecycle, CapabilityManifest, CapabilityStatus, CapabilityTransport, ToolCall,
-    ToolRisk, ToolSpec,
+    CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
+    CapabilityTransport, ToolCall, ToolRisk, ToolSpec,
 };
 use context_contextcore::{ProcessCapabilityAdapter, ProcessHostConfig};
 use serde_json::json;
@@ -77,6 +77,10 @@ async fn process_capability_round_trips_an_invoke_over_the_host() {
         )
         .await
         .unwrap();
+    let output = match output {
+        CapabilityOutcome::Value(output) => output,
+        other => panic!("the wire only carries plain values, got: {other:?}"),
+    };
     assert!(output.ok);
     assert_eq!(output.call_id, "c1");
     assert!(

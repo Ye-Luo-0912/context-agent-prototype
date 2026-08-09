@@ -144,7 +144,6 @@ impl Tool for EditReplaceTool {
                 summary: "no-op: replacement text equals original".into(),
                 model_content: format!("no change: {}", display_relative(&self.workspace, &path)),
                 artifact_ref: None,
-                context_action: None,
                 metadata: json!({"changed": false, "occurrences": count}),
             }));
         }
@@ -178,7 +177,6 @@ impl Tool for EditReplaceTool {
                     updated.len()
                 ),
                 artifact_ref: None,
-                context_action: None,
                 metadata: json!({"changed": true, "occurrences": count, "bytes_before": metadata.len(), "bytes_after": updated.len()}),
             },
             effect,

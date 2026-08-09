@@ -209,10 +209,14 @@ pub struct FocusState {
 }
 
 impl FocusState {
-    pub fn new(goal: impl Into<String>) -> Self {
+    /// Build a focus for an *existing* task. The task id comes from the
+    /// runtime's `TaskManager` — the context engine must never mint a
+    /// `TaskId` (task identity is runtime-owned), which is why this is the
+    /// only constructor.
+    pub fn for_task(task_id: TaskId, goal: impl Into<String>) -> Self {
         let goal = goal.into();
         Self {
-            task_id: TaskId::new(),
+            task_id,
             current_query: goal.clone(),
             goal,
             phase: "working".to_string(),
@@ -299,12 +303,12 @@ pub enum ContextIngress {
     },
 }
 
-/// A structured context directive a tool may attach to its output
-/// (`ToolOutput::context_action`). The runtime routes it to the context
-/// engine; the engine applies it or silently ignores it when the target
-/// item is gone. Every directive must be explainable in the lifecycle
-/// ledger: "item kept alive because ...", "item leased until turn N ...",
-/// "item tagged because ...".
+/// A structured context directive a tool may attach to its output as a
+/// `RuntimeDirective` (context control). The runtime routes it to the
+/// context engine; the engine applies it or silently ignores it when the
+/// target item is gone. Every directive must be explainable in the
+/// lifecycle ledger: "item kept alive because ...", "item leased until
+/// turn N ...", "item tagged because ...".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContextAction {

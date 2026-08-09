@@ -188,14 +188,34 @@ capabilities under one catalog:
 Since V1-M9 the model can also steer the *context* surface through
 read-only meta-tools (`context.gc_hint` / `context.tag` / `context.lease` /
 `context.collect`, always loaded with the core set). They do no work
-themselves: each attaches a typed `ContextAction` to
-`ToolOutput.context_action` that the runtime routes to the context engine
-(`Collect` runs the GC pass; the rest become a `ContextDirective` ingest) —
-tools still never touch the engine or memory stores (invariant 3), and the
-kernel stays the only authority over how a directive is applied. The model
-addresses items by the ids exposed in the materialized context frame
-(`id=<...>` per item), and the engine silently ignores directives whose
-target item is gone.
+themselves: each returns a `ToolOutcome::RuntimeDirective` carrying a typed
+`ContextAction` (`Collect` runs the GC pass via `ContextEngine::gc`; the
+rest become a `ContextDirective` ingest) — tools still never touch the
+engine or memory stores (invariant 3), and the kernel stays the only
+authority over how a directive is applied. The model addresses items by the
+ids exposed in the materialized context frame (`id=<...>` per item), and
+the engine silently ignores directives whose target item is gone.
+
+Two guards keep these directives from becoming a backdoor:
+
+- **commit-time execution**: the directive is executed by the actor when
+  the tool result commits (inside the operation's generation fence), not
+  at turn finalize — `context.collect` really collects *now*, and a hint
+  lands before the next model round observes it. Finalize only persists
+  observations;
+- **permission gate**: producing a `RuntimeDirective` requires the
+  `runtime:context-control` permission in the capability manifest. A
+  random `weather.lookup` tool cannot return a `GcHint`/`Lease`; the
+  dispatcher rewrites such attempts into a denied `Value`.
+
+Hints and leases are bounded, never permanent roots: `keep_alive` is
+capped per engine (`max_keep_alive_items`), leases are capped per task in
+both count (`max_leased_items_per_task`) and weight
+(`max_leased_tokens_per_task`) plus a per-directive turn cap
+(`max_lease_turns`). A quota refusal surfaces as an `InvalidRequest` error
+from the directive ingest, so the model learns its hint was not granted,
+and both protections auto-expire when the owning task completes.
+
 
 `ToolExecutionRequest` carries a `CancellationToken` (`cancel`), so long-running
 work (searches, shell processes) can be aborted cooperatively by the caller.
@@ -256,6 +276,18 @@ so a later recovery pass can distinguish "prepared but never committed"
 `after_hash`). The single-record variant that claimed a mutation without
 proof is gone: a rename failure now rolls the transaction back instead of
 leaving the journal describing a mutation that never landed.
+
+Commit failures are structured, because "the file did not change" and
+"the file changed but I could not record it" need different recovery:
+`EffectCommitError::NotApplied` (rename never landed — target intact) vs
+`EffectCommitError::AppliedButDurabilityFailed` (the swap landed but the
+`MutationCommitted` record could not be appended — the runtime must treat
+this as a degraded state needing recovery, never report "no change" to
+the model). The swap itself goes through `agent-workspace`'s
+`atomic_replace(src, dst)` primitive — a true atomic-overwrite on both
+platforms (Unix `rename`, Windows `MoveFileExW` with replace + write
+through), never a remove-then-rename that breaks atomicity.
+
 
 ### Tool lifecycle (V1-P6)
 
@@ -545,6 +577,16 @@ state (items, focus, counters) to `.focus-agent/checkpoints/*.json`, separate
 from the event journal. `restore` reloads it. Traces are for learning/replay;
 checkpoints are for durable runtime state.
 
+Since the actor owns the task table, a checkpoint that only covered the
+context engine is no longer a complete snapshot: the runtime's checkpoint is
+a `RuntimeCheckpoint` (versioned) wrapping the task manager (task rows +
+current task id), the context checkpoint, capability activation state and
+store generation/refs, and `RuntimeInstance::restore` puts the whole runtime
+— task table included — back together. The `TaskManager` applies its
+transitions transactionally: it validates and *prepares* a transition, the
+external side (kernel focus/context) commits first, and only then does the
+manager commit — a failed `set_focus` never leaves the task table changed.
+
 ## 8c. Runtime actor and module host (V1-M3, hardened V1-P0-1/V1-P0-4)
 
 Since V1-M3 the runtime is an actor (`agent-runtime`), not `Mutex`
@@ -590,12 +632,13 @@ RuntimeHandle ── mpsc<RuntimeCommand> ──▶ RuntimeActor (owns mutable s
 - `AgentKernel` is now a stateless executor/helper: context/model/tool
   primitives plus event plumbing (journal, sequence, broadcast). Its
   turn loop, turn locks and `TurnFrame` ownership are gone;
-- since V1-M9, a tool result can carry a context directive: at turn
-  finalize the actor routes `ToolOutput.context_action` *before* the
-  observation ingest — `Collect` runs `ContextEngine::gc()` mid-turn and
-  emits `RuntimeEvent::ContextGc`, everything else becomes a
-  `ContextDirective` ingest, so a hint/lease/tag lands before the
-  observation it targets (see the meta-tools under §4 ToolDispatcher);
+- since V1-M9, a tool result can carry a context directive: the actor
+  executes the `RuntimeDirective` at operation-commit time, inside the
+  same generation fence that guards effect commit — `Collect` runs
+  `ContextEngine::gc()` immediately and emits `RuntimeEvent::ContextGc`,
+  everything else becomes a `ContextDirective` ingest, so a hint/lease/tag
+  lands before the observation it targets (see the meta-tools under §4
+  ToolDispatcher);
 - the actor selects on both the command channel and the operation
   completion channel, so `/cancel` is processed mid-operation and a new
   turn can start right after; cancellation is committed by the actor
@@ -665,6 +708,16 @@ ModuleHost
                            │
                      kernel tool_provider -> model tool schemas -> invoke
 ```
+
+Since V1-M9 capability invocation returns a `CapabilityOutcome`, not a raw
+`ToolOutput`: `Value(ToolOutput)`, `EffectRequest { output, effect }`
+(a staged, rollback-able mutation the core commits under the generation
+fence — external capabilities submit *requests*, they do not perform side
+effects themselves), or `RuntimeDirective { output, directive }` (the
+context-control path, gated on the `runtime:context-control` manifest
+permission). The dispatcher maps these onto the kernel's `ToolOutcome`,
+so the effect fence is the same for builtin prepared mutations and for
+dynamic capabilities — there is no second, unfenced side-effect lane.
 
 Since V1-P0-8 the composition root composes into one `RuntimeInstance`
 that owns the `ModuleHost`, the `RuntimeHandle` and the actor `JoinHandle`.

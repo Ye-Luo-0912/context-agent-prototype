@@ -15,7 +15,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentResult, CancellationToken, ToolCall, ToolOutput, ToolSpec};
+use crate::{
+    AgentResult, CancellationToken, Effect, RuntimeDirective, ToolCall, ToolOutput, ToolSpec,
+};
 
 /// When a capability's service is started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +187,13 @@ pub trait WorkspaceHandle: Send + Sync {
     /// Write a file through the runtime's journaled, atomic mutation
     /// transaction, confined like `resolve`.
     async fn write(&self, relative: &str, content: &[u8]) -> AgentResult<()>;
+
+    /// Stage a journaled write without applying it: the returned `Effect`
+    /// is committed by the runtime after the generation fence, exactly like
+    /// a builtin tool's `PreparedEffect`. Capabilities that want their
+    /// side effects behind the effect fence use this instead of `write` —
+    /// the capability stages, the core executes.
+    async fn prepare_write(&self, relative: &str, content: &[u8]) -> AgentResult<Box<dyn Effect>>;
 }
 
 /// A confined view of the artifact store: large outputs land under the
@@ -219,6 +228,48 @@ pub struct CapabilityInvocationContext {
     pub cancel: CancellationToken,
 }
 
+/// What a capability invocation produced. The core owns *all* side-effect
+/// execution: a capability either returns a plain bounded output, stages an
+/// `EffectRequest` for the runtime to commit (behind the generation fence,
+/// like a builtin tool), or attaches a `RuntimeDirective` — which the
+/// dispatcher only forwards when the manifest declares
+/// `RUNTIME_CONTEXT_CONTROL`. A capability never applies a side effect
+/// directly; it submits it.
+pub enum CapabilityOutcome {
+    /// The invocation produced only an output; nothing to commit.
+    Value(ToolOutput),
+    /// The invocation stages a side effect for the core to commit after
+    /// the generation fence (the capability computes, the core executes).
+    EffectRequest {
+        output: ToolOutput,
+        effect: Box<dyn Effect>,
+    },
+    /// The invocation asks the runtime to change runtime-owned state.
+    /// Dispatchers enforce `RUNTIME_CONTEXT_CONTROL` before forwarding.
+    RuntimeDirective {
+        output: ToolOutput,
+        directive: RuntimeDirective,
+    },
+}
+
+impl std::fmt::Debug for CapabilityOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Value(output) => f.debug_tuple("Value").field(output).finish(),
+            Self::EffectRequest { output, .. } => f
+                .debug_struct("EffectRequest")
+                .field("output", output)
+                .field("effect", &"<staged effect>")
+                .finish(),
+            Self::RuntimeDirective { output, directive } => f
+                .debug_struct("RuntimeDirective")
+                .field("output", output)
+                .field("directive", directive)
+                .finish(),
+        }
+    }
+}
+
 /// The runtime object behind a capability: a manifest, the tool schemas it
 /// exposes to the model, and the invocation handler. The chain is
 /// `Service -> Capability -> Tool Schema -> LLM`: a registered capability's
@@ -242,7 +293,7 @@ pub trait Capability: Send + Sync {
         &self,
         call: ToolCall,
         ctx: CapabilityInvocationContext,
-    ) -> AgentResult<ToolOutput>;
+    ) -> AgentResult<CapabilityOutcome>;
 
     async fn start(&self) -> AgentResult<()> {
         Ok(())

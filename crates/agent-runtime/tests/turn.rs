@@ -259,7 +259,6 @@ impl ToolDispatcher for OkToolDispatcher {
             summary: "ok".into(),
             model_content: "ok from fs.read".into(),
             artifact_ref: None,
-            context_action: None,
             metadata: json!({}),
         }))
     }
@@ -376,11 +375,12 @@ async fn turn_frame_is_execution_stack_not_long_term_memory() {
     .await;
     handle.user_message("go".into()).await.unwrap();
 
-    // Wait for the turn to persist its observations (user + tool + assistant).
+    // Wait for the turn to persist its observations (focus + user + tool +
+    // assistant).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
         let count = context.ingests.lock().await.len();
-        if count >= 3 {
+        if count >= 4 {
             break;
         }
         assert!(
@@ -417,12 +417,18 @@ async fn turn_frame_is_execution_stack_not_long_term_memory() {
     drop(requests);
 
     // The observation reached the context engine only after the turn ended,
-    // in ingest order: user message, then the persisted tool observation,
+    // in ingest order: the implicit task's focus (established before the
+    // message), then the user message, then the persisted tool observation,
     // then the final assistant message.
     let ingests = context.ingests.lock().await;
     assert_eq!(
         ingests.as_slice(),
-        &["UserMessage", "ToolObservation", "AssistantMessage"]
+        &[
+            "FocusChanged",
+            "UserMessage",
+            "ToolObservation",
+            "AssistantMessage"
+        ]
     );
     drop(ingests);
 
@@ -565,10 +571,11 @@ async fn tool_scope_opens_at_tool_start_and_closes_when_consumed() {
 }
 
 // ---------------------------------------------------------------------------
-// Context directive routing: the actor reads `ToolOutput::context_action`
-// and turns it into a `ContextIngress::ContextDirective` ingest (gc hint /
-// tag / lease) or a full GC pass (`context.collect`). Tools never touch the
-// engine — the runtime routes.
+// Context directive routing: a tool's `RuntimeDirective` is executed at
+// operation-commit time — right after any staged effect, before the result
+// enters the turn frame — so a "manual collect now" is actually now and a
+// lease lands before the next model round, not at turn end. Tools never
+// touch the engine — the runtime routes.
 // ---------------------------------------------------------------------------
 
 /// Emits one tool call (`name`) with the given arguments, then plain text.
@@ -605,7 +612,7 @@ impl ModelTransport for DirectiveModel {
     }
 }
 
-/// Serves the context meta-tools: each returns a `ToolOutput` carrying the
+/// Serves the context meta-tools: each returns a `RuntimeDirective` with the
 /// matching `ContextAction`, exactly like the real `context.*` tools.
 #[derive(Debug)]
 struct DirectiveToolDispatcher;
@@ -629,28 +636,34 @@ impl ToolDispatcher for DirectiveToolDispatcher {
         ]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
-        let action = match request.call.name.as_str() {
-            "context.lease" => Some(agent_contracts::ContextAction::Lease {
-                item_id: agent_contracts::ContextItemId::new(),
-                turns: 3,
-            }),
-            "context.collect" => Some(agent_contracts::ContextAction::Collect),
+        let directive = match request.call.name.as_str() {
+            "context.lease" => {
+                agent_contracts::RuntimeDirective::Context(agent_contracts::ContextAction::Lease {
+                    item_id: agent_contracts::ContextItemId::new(),
+                    turns: 3,
+                })
+            }
+            "context.collect" => {
+                agent_contracts::RuntimeDirective::Context(agent_contracts::ContextAction::Collect)
+            }
             other => {
                 return Err(agent_contracts::AgentError::Tool(format!(
                     "unknown tool: {other}"
                 )));
             }
         };
-        Ok(ToolOutcome::Value(ToolOutput {
-            call_id: request.call.id,
-            tool_name: request.call.name,
-            ok: true,
-            summary: "directive queued".into(),
-            model_content: "directive queued".into(),
-            artifact_ref: None,
-            context_action: action,
-            metadata: json!({}),
-        }))
+        Ok(ToolOutcome::RuntimeDirective {
+            output: ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "directive queued".into(),
+                model_content: "directive queued".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            directive,
+        })
     }
 }
 
@@ -687,7 +700,17 @@ async fn actor_routes_lease_directive_into_the_context_engine() {
     let ingests = context.ingests.lock().await;
     assert!(
         ingests.iter().any(|label| label == "ContextDirective"),
-        "the tool's context_action must be routed as a ContextDirective ingest, got: {ingests:?}"
+        "the directive must be routed as a ContextDirective ingest, got: {ingests:?}"
+    );
+    // The directive executes at operation-commit time: it must land BEFORE
+    // the observation is persisted at turn end — "now", not "later".
+    let directive_index = ingests.iter().position(|label| label == "ContextDirective");
+    let observation_index = ingests.iter().position(|label| label == "ToolObservation");
+    assert!(
+        directive_index.is_some()
+            && observation_index.is_some()
+            && directive_index < observation_index,
+        "the directive must be executed before the observation is persisted, got: {ingests:?}"
     );
 }
 
@@ -831,7 +854,7 @@ impl agent_contracts::Effect for FlagEffect {
     fn describe(&self) -> String {
         "test effect".into()
     }
-    async fn commit(self: Box<Self>) -> AgentResult<()> {
+    async fn commit(self: Box<Self>) -> Result<(), agent_contracts::EffectCommitError> {
         self.committed.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -870,7 +893,6 @@ impl ToolDispatcher for EffectToolDispatcher {
                 summary: "staged".into(),
                 model_content: "staged".into(),
                 artifact_ref: None,
-                context_action: None,
                 metadata: json!({}),
             },
             effect: Box::new(FlagEffect {

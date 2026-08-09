@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agent_contracts::{AgentError, AgentResult, ArtifactHandle, RunId, WorkspaceHandle};
+use agent_contracts::{AgentError, AgentResult, ArtifactHandle, Effect, RunId, WorkspaceHandle};
 use async_trait::async_trait;
 
 use crate::Workspace;
@@ -57,6 +57,15 @@ impl WorkspaceHandle for ConfinedWorkspaceHandle {
             .begin_mutation(&self.tool, "write", relative)
             .await?;
         transaction.apply(content).await
+    }
+
+    async fn prepare_write(&self, relative: &str, content: &[u8]) -> AgentResult<Box<dyn Effect>> {
+        let transaction = self
+            .workspace
+            .begin_mutation(&self.tool, "write", relative)
+            .await?;
+        let prepared = transaction.prepare(content).await?;
+        Ok(Box::new(prepared))
     }
 }
 

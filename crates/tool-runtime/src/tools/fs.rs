@@ -128,7 +128,6 @@ impl Tool for FsListTool {
             ),
             model_content: format!("{}{}", visible.join("\n"), truncated_note),
             artifact_ref,
-            context_action: None,
             metadata: json!({"entry_count": entries.len()}),
         }))
     }
@@ -235,7 +234,6 @@ impl Tool for FsReadTool {
             ),
             model_content: selected,
             artifact_ref: None,
-            context_action: None,
             metadata: json!({"line_count": lines.len(), "bytes": metadata.len()}),
         }))
     }
@@ -301,7 +299,6 @@ impl Tool for FsWriteTool {
             summary: format!("wrote {} bytes to {}", args.content.len(), relative),
             model_content: format!("file updated: {relative}"),
             artifact_ref: None,
-            context_action: None,
             metadata: json!({"bytes": args.content.len()}),
         };
         Ok(ToolOutcome::PreparedEffect { output, effect })

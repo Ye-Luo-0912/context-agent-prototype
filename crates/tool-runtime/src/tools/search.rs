@@ -207,7 +207,6 @@ impl Tool for SearchGrepTool {
                 format!("{}{}", model_hits.join("\n"), truncated_note)
             },
             artifact_ref,
-            context_action: None,
             metadata: json!({"hits": hits.len(), "files_scanned": scanned_files}),
         }))
     }
@@ -230,7 +229,9 @@ mod tests {
     fn value(outcome: ToolOutcome) -> ToolOutput {
         match outcome {
             ToolOutcome::Value(output) => output,
-            ToolOutcome::PreparedEffect { .. } => panic!("search.grep must return a plain value"),
+            ToolOutcome::PreparedEffect { .. } | ToolOutcome::RuntimeDirective { .. } => {
+                panic!("search.grep must return a plain value")
+            }
         }
     }
 

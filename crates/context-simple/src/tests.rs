@@ -1,10 +1,25 @@
 use agent_contracts::{
-    AttentionState, ContextAction, ContextEngine, ContextHints, ContextIngress, ContextItem,
-    ContextItemId, ContextKind, ContextMaintenanceTrigger, ContextQuery, ContextRetention,
-    ContextScope, FocusState, LifecycleLabel, ScopeKind, ScopeState, SemanticState, ToolOutput,
+    AgentError, AttentionState, ContextAction, ContextEngine, ContextHints, ContextIngress,
+    ContextItem, ContextItemId, ContextKind, ContextMaintenanceTrigger, ContextQuery,
+    ContextRetention, ContextScope, FocusState, LifecycleLabel, ScopeKind, ScopeState,
+    SemanticState, TaskId, ToolOutput,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
+
+/// Open a runtime-owned focus (the engine must never mint a `TaskId`), so
+/// the message that follows lands in a real task scope instead of the
+/// session fallback.
+async fn open_focus(engine: &SimpleContextEngine, goal: &str) -> TaskId {
+    let task_id = TaskId::new();
+    engine
+        .ingest(ContextIngress::FocusChanged {
+            focus: FocusState::for_task(task_id, goal),
+        })
+        .await
+        .unwrap();
+    task_id
+}
 
 #[tokio::test]
 async fn successful_observation_is_ephemeral_but_failure_persists_until_verified() {
@@ -26,7 +41,6 @@ async fn successful_observation_is_ephemeral_but_failure_persists_until_verified
                 summary: "test failed".into(),
                 model_content: "error in AuthService.rs:42".into(),
                 artifact_ref: Some("artifact://run/test.log".into()),
-                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: None,
@@ -57,7 +71,6 @@ async fn successful_observation_is_ephemeral_but_failure_persists_until_verified
                 summary: "tests passed".into(),
                 model_content: "tests passed in AuthService.rs".into(),
                 artifact_ref: None,
-                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: None,
@@ -152,7 +165,6 @@ async fn maintenance_records_transitions_with_reasons() {
                 summary: "tests ok".into(),
                 model_content: "3 passed, 0 failed".into(),
                 artifact_ref: None,
-                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: None,
@@ -287,6 +299,7 @@ async fn inspect_is_bounded_and_oldest_first() {
 #[tokio::test]
 async fn completed_task_working_set_is_archived_and_stays_out() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "refactor auth module").await;
     engine
         .ingest(ContextIngress::UserMessage {
             content: "refactor auth module".into(),
@@ -427,7 +440,6 @@ async fn recurring_failure_supersedes_prior_error() {
                     summary: format!("round {round} failed"),
                     model_content: "error in Build.kt (module build failed)".into(),
                     artifact_ref: None,
-                    context_action: None,
                     metadata: serde_json::Value::Null,
                 },
                 scope_id: None,
@@ -504,7 +516,6 @@ async fn hot_entities_follow_user_then_tool_then_reset() {
                 summary: "read".into(),
                 model_content: "CacheStore.rs is hot now".into(),
                 artifact_ref: None,
-                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: None,
@@ -555,7 +566,6 @@ async fn ingest_links_items_sharing_entities() {
                 summary: "ok".into(),
                 model_content: "tests passed in AuthService.rs".into(),
                 artifact_ref: None,
-                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: None,
@@ -854,6 +864,7 @@ async fn archived_dependency_below_threshold_stays_out() {
 #[tokio::test]
 async fn scope_tree_opens_with_session_task_and_focus() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "refactor AuthService.rs").await;
     engine
         .ingest(ContextIngress::UserMessage {
             content: "refactor AuthService.rs".into(),
@@ -893,20 +904,17 @@ async fn scope_tree_opens_with_session_task_and_focus() {
 #[tokio::test]
 async fn task_scope_suspends_when_focus_switches_task() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let first_task = open_focus(&engine, "task one: fix login").await;
     engine
         .ingest(ContextIngress::UserMessage {
             content: "task one: fix login".into(),
         })
         .await
         .unwrap();
-    let first_task = {
-        let state = engine.state.lock().await;
-        state.focus.as_ref().unwrap().task_id
-    };
-
+    let second_task = TaskId::new();
     engine
         .ingest(ContextIngress::FocusChanged {
-            focus: FocusState::new("task two: add tests"),
+            focus: FocusState::for_task(second_task, "task two: add tests"),
         })
         .await
         .unwrap();
@@ -951,6 +959,7 @@ async fn tool_scope_lifecycle_is_runtime_driven() {
     // consumed the result. The observation persisted later carries the
     // scope id, so membership stays authoritative.
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "fix the build").await;
     engine
         .ingest(ContextIngress::UserMessage {
             content: "fix the build".into(),
@@ -1001,7 +1010,6 @@ async fn tool_scope_lifecycle_is_runtime_driven() {
                 summary: "tests pass".into(),
                 model_content: "3 passed in Build.kt".into(),
                 artifact_ref: None,
-                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: Some(tool_scope),
@@ -1049,6 +1057,7 @@ async fn tool_scope_lifecycle_is_runtime_driven() {
 #[tokio::test]
 async fn task_close_processes_members_by_scope_id() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "refactor auth module").await;
     engine
         .ingest(ContextIngress::UserMessage {
             content: "refactor auth module".into(),
@@ -1120,6 +1129,7 @@ async fn task_close_promotes_decisions_and_evicts_the_rest() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
     // A decision message (gets the durable "decision" tag) and a plain
     // working message of the same task.
+    open_focus(&engine, "use TOML for config").await;
     engine
         .ingest(ContextIngress::UserMessage {
             content: "use TOML for config".into(),
@@ -1183,6 +1193,7 @@ async fn task_close_promotes_decisions_and_evicts_the_rest() {
 #[tokio::test]
 async fn promoted_finding_reactivates_for_a_related_task() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "use TOML for config").await;
     engine
         .ingest(ContextIngress::UserMessage {
             content: "use TOML for config".into(),
@@ -1253,6 +1264,7 @@ async fn promoted_finding_reactivates_for_a_related_task() {
 #[tokio::test]
 async fn checkpoint_preserves_scope_tree() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "refactor AuthService.rs").await;
     engine
         .ingest(ContextIngress::UserMessage {
             content: "refactor AuthService.rs".into(),
@@ -1268,7 +1280,6 @@ async fn checkpoint_preserves_scope_tree() {
                 summary: "ok".into(),
                 model_content: "compiles".into(),
                 artifact_ref: None,
-                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: None,
@@ -1451,6 +1462,7 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
 #[tokio::test]
 async fn task_close_promotes_archived_durable_outcomes_and_resyncs_scope_id() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let task_id = open_focus(&engine, "use AuthService.rs as the auth layer").await;
     engine
         .ingest(ContextIngress::UserMessage {
             content: "use AuthService.rs as the auth layer".into(),
@@ -1467,7 +1479,6 @@ async fn task_close_promotes_archived_durable_outcomes_and_resyncs_scope_id() {
                 summary: "ok".into(),
                 model_content: "touched AuthService.rs".into(),
                 artifact_ref: None,
-                context_action: None,
                 metadata: serde_json::Value::Null,
             },
             scope_id: None,
@@ -1500,7 +1511,6 @@ async fn task_close_promotes_archived_durable_outcomes_and_resyncs_scope_id() {
         }
     }
 
-    let task_id = engine.state.lock().await.focus.as_ref().unwrap().task_id;
     engine
         .ingest(ContextIngress::TaskCompleted {
             task_id: Some(task_id),
@@ -1578,7 +1588,6 @@ fn observation_output(id: &str, ok: bool, content: &str) -> ToolOutput {
         summary: "ok".into(),
         model_content: content.into(),
         artifact_ref: None,
-        context_action: None,
         metadata: serde_json::json!({}),
     }
 }
@@ -1813,6 +1822,288 @@ async fn directive_with_unknown_item_id_is_a_silent_noop() {
     );
 }
 
+/// Open a focus and produce `n` tool observations inside its task scope.
+async fn observations_in_focus(engine: &SimpleContextEngine, n: usize) -> Vec<ContextItemId> {
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on the service layer".into(),
+        })
+        .await
+        .unwrap();
+    for i in 0..n {
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                output: observation_output(
+                    &format!("step-{i}"),
+                    true,
+                    &format!("step {i} completed"),
+                ),
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let items = engine.inspect(usize::MAX).await.unwrap();
+    items
+        .iter()
+        .filter(|item| item.kind == ContextKind::ToolObservation)
+        .map(|item| item.id)
+        .collect()
+}
+
+#[tokio::test]
+async fn keep_alive_quota_refuses_extra_hints_until_one_is_released() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        max_keep_alive_items: 1,
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    let ids = observations_in_focus(&engine, 2).await;
+
+    let hint = |item_id, keep_alive| ContextIngress::ContextDirective {
+        action: ContextAction::GcHint {
+            item_id,
+            keep_alive,
+        },
+    };
+
+    // The first hint fits the quota...
+    engine.ingest(hint(ids[0], true)).await.unwrap();
+    // ...the second is refused and the reason is surfaced to the model.
+    let err = engine.ingest(hint(ids[1], true)).await.unwrap_err();
+    match &err {
+        AgentError::InvalidRequest(reason) => {
+            assert!(
+                reason.contains("keep_alive"),
+                "the refusal must explain the quota: {reason}"
+            );
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+
+    // Releasing an item frees the slot: the same hint now applies.
+    engine.ingest(hint(ids[0], false)).await.unwrap();
+    engine.ingest(hint(ids[1], true)).await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        let kept = state
+            .items
+            .iter()
+            .filter(|item| item.keep_alive)
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        assert_eq!(kept, vec![ids[1]], "only the hinted item stays keep_alive");
+    }
+}
+
+#[tokio::test]
+async fn lease_turns_are_clamped_to_the_config_cap() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        max_lease_turns: 4,
+        ..SimpleContextConfig::default()
+    });
+    let task_id = open_focus(&engine, "service layer").await;
+    let ids = observations_in_focus(&engine, 1).await;
+
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Lease {
+                item_id: ids[0],
+                turns: 1000,
+            },
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        let item = state
+            .items
+            .iter()
+            .find(|item| item.id == ids[0])
+            .expect("the observation exists");
+        // One user message was ingested, so state.turn == 1 here; the lease
+        // is clamped to the cap instead of running "forever".
+        assert_eq!(
+            item.lease_until_turn,
+            Some(state.turn.saturating_add(4)),
+            "the lease must be clamped to max_lease_turns"
+        );
+        assert_eq!(item.task_id, Some(task_id));
+    }
+}
+
+#[tokio::test]
+async fn lease_count_quota_is_per_task_and_renewal_is_free() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        max_leased_items_per_task: 1,
+        ..SimpleContextConfig::default()
+    });
+    let task_a = open_focus(&engine, "task A").await;
+    let ids = observations_in_focus(&engine, 2).await;
+
+    let lease = |item_id| ContextIngress::ContextDirective {
+        action: ContextAction::Lease { item_id, turns: 2 },
+    };
+
+    // The first item in the task leases fine, and renewing it adds no new
+    // protected item, so the renewal stays allowed...
+    engine.ingest(lease(ids[0])).await.unwrap();
+    engine.ingest(lease(ids[0])).await.unwrap();
+    // ...a second distinct item in the same task is refused.
+    let err = engine.ingest(lease(ids[1])).await.unwrap_err();
+    match &err {
+        AgentError::InvalidRequest(reason) => {
+            assert!(
+                reason.contains("items (cap 1)"),
+                "the refusal must name the count quota: {reason}"
+            );
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+
+    // A different task owns its own budget: the cap does not leak across
+    // tasks, and task A keeps exactly its one lease.
+    open_focus(&engine, "task B").await;
+    let other = observations_in_focus(&engine, 1).await;
+    engine.ingest(lease(other[0])).await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        let leased_in_a = state
+            .items
+            .iter()
+            .filter(|item| item.task_id == Some(task_a) && item.lease_until_turn.is_some())
+            .count();
+        assert_eq!(leased_in_a, 1, "task A keeps exactly its one lease");
+    }
+}
+
+#[tokio::test]
+async fn lease_token_quota_bounds_the_weight_of_protected_items() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        max_leased_items_per_task: 8,
+        max_leased_tokens_per_task: 100,
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "big task").await;
+    let big = "x".repeat(300); // ~75 tokens
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on the service layer".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: observation_output("big-1", true, &big),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: observation_output("big-2", true, &big),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let items = engine.inspect(usize::MAX).await.unwrap();
+    let ids: Vec<_> = items
+        .iter()
+        .filter(|item| item.kind == ContextKind::ToolObservation)
+        .map(|item| item.id)
+        .collect();
+    assert_eq!(ids.len(), 2);
+
+    let lease = |item_id| ContextIngress::ContextDirective {
+        action: ContextAction::Lease { item_id, turns: 2 },
+    };
+    // One ~75-token item fits a 100-token budget; the second does not.
+    engine.ingest(lease(ids[0])).await.unwrap();
+    let err = engine.ingest(lease(ids[1])).await.unwrap_err();
+    match &err {
+        AgentError::InvalidRequest(reason) => {
+            assert!(
+                reason.contains("tokens (cap 100)"),
+                "the refusal must name the token quota: {reason}"
+            );
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn task_close_expires_keep_alive_and_leases() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let task_id = open_focus(&engine, "service layer").await;
+    let ids = observations_in_focus(&engine, 1).await;
+
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::GcHint {
+                item_id: ids[0],
+                keep_alive: true,
+            },
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Lease {
+                item_id: ids[0],
+                turns: 100,
+            },
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        let item = state
+            .items
+            .iter()
+            .find(|item| item.id == ids[0])
+            .expect("the observation exists");
+        assert!(
+            item.keep_alive && item.lease_until_turn.is_some(),
+            "the protections are active while the task runs"
+        );
+    }
+
+    // Completing the task clears the model protections: a finished task
+    // cannot keep rooting its working set forever.
+    engine
+        .ingest(ContextIngress::TaskCompleted {
+            task_id: Some(task_id),
+            summary: "service layer done".into(),
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        let item = state
+            .items
+            .iter()
+            .find(|item| item.id == ids[0])
+            .expect("the observation exists");
+        assert!(!item.keep_alive, "keep_alive expires with the task");
+        assert_eq!(item.lease_until_turn, None, "leases expire with the task");
+    }
+
+    // Freed from protection, the consumed observation is evictable again.
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.evicted >= 1,
+        "the completed task's working set is evictable: {report:?}"
+    );
+}
+
 #[tokio::test]
 async fn pinned_dependency_cannot_break_the_expansion_budget() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
@@ -1836,7 +2127,6 @@ async fn pinned_dependency_cannot_break_the_expansion_budget() {
                 summary: "ok".into(),
                 model_content: "AuthService.rs tests passed".into(),
                 artifact_ref: None,
-                context_action: None,
                 metadata: serde_json::json!({}),
             },
             scope_id: None,

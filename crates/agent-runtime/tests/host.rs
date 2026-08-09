@@ -5,12 +5,12 @@ use std::sync::{Arc, Mutex};
 
 use agent_contracts::{
     AgentResult, ApprovalGate, CancellationToken, Capability, CapabilityActivation,
-    CapabilityInvocationContext, CapabilityLifecycle, CapabilityManifest, CapabilityStatus,
-    CapabilityTransport, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
-    MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, RunId,
-    ScopeId, ScopeKind, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome,
-    ToolOutput, ToolRisk, ToolSpec,
+    CapabilityInvocationContext, CapabilityLifecycle, CapabilityManifest, CapabilityOutcome,
+    CapabilityStatus, CapabilityTransport, ContextDiagnostics, ContextEngine, ContextIngress,
+    ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
+    ContextStateTransition, MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest,
+    ModelTransport, RunId, ScopeId, ScopeKind, ToolCall, ToolDispatcher, ToolExecutionRequest,
+    ToolLifecycle, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_runtime::{
     APPROVAL_POLICY, CapabilityAwareDispatcher, CapabilityId, ContextModule, ModelModule, Module,
@@ -353,17 +353,16 @@ impl Capability for DemoCapability {
         &self,
         call: ToolCall,
         _ctx: CapabilityInvocationContext,
-    ) -> AgentResult<ToolOutput> {
-        Ok(ToolOutput {
+    ) -> AgentResult<CapabilityOutcome> {
+        Ok(CapabilityOutcome::Value(ToolOutput {
             call_id: call.id,
             tool_name: call.name.clone(),
             ok: true,
             summary: "demo ran".into(),
             model_content: format!("demo handled {}", call.name),
             artifact_ref: None,
-            context_action: None,
             metadata: json!({}),
-        })
+        }))
     }
 }
 
@@ -382,7 +381,9 @@ async fn execute(dispatcher: Arc<dyn ToolDispatcher>, tool: &str) -> ToolOutput 
         .unwrap();
     match outcome {
         ToolOutcome::Value(output) => output,
-        ToolOutcome::PreparedEffect { .. } => panic!("test dispatcher returns plain values"),
+        ToolOutcome::PreparedEffect { .. } | ToolOutcome::RuntimeDirective { .. } => {
+            panic!("test dispatcher returns plain values")
+        }
     }
 }
 
@@ -846,17 +847,16 @@ impl Capability for RecordingCapability {
         &self,
         call: ToolCall,
         _ctx: CapabilityInvocationContext,
-    ) -> AgentResult<ToolOutput> {
-        Ok(ToolOutput {
+    ) -> AgentResult<CapabilityOutcome> {
+        Ok(CapabilityOutcome::Value(ToolOutput {
             call_id: call.id,
             tool_name: call.name,
             ok: true,
             summary: "ok".into(),
             model_content: "ok".into(),
             artifact_ref: None,
-            context_action: None,
             metadata: json!({}),
-        })
+        }))
     }
     async fn stop(&self) -> AgentResult<()> {
         self.log.lock().unwrap().push("stop:capability".into());

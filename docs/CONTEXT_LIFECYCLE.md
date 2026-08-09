@@ -191,7 +191,16 @@ A FocusState contains:
 
 The prototype supports explicit `/focus <goal>` to force a new task focus.
 
-The first normal user message creates a focus. Later user messages update the current query while keeping the task goal. A future task-boundary detector can replace this explicit/simple behavior.
+Task identity is runtime-owned: only the `TaskManager` creates tasks, and
+focus is always established through `set_focus(task_id, goal)` → a
+`FocusChanged` ingest. The engine never mints a `TaskId` — when the first
+normal user message arrives with no active task, the runtime auto-creates
+an *implicit* task, sets focus to it, and only then ingests the message, so
+the message lands in a real task scope. A `UserMessage` that still arrives
+with no focus (engine used directly) is a session-level message: it falls
+back to the session scope and stays selectable, but no focus is invented.
+Later user messages update the current query while keeping the task goal. A
+future task-boundary detector can replace this explicit/simple behavior.
 
 ## 8. Completing a task
 
@@ -586,17 +595,30 @@ a full GC pass — without ever touching the engine (invariant 3: tools return
 
 Four read-only meta-tools (`context.gc_hint` / `context.tag` /
 `context.lease` / `context.collect`, always loaded with the core tool set)
-produce a `ContextAction` attached to `ToolOutput.context_action`. The
-runtime routes each result at turn finalize, before the observation ingest
-(a hint never races the very observation it targets):
+return a `ToolOutcome::RuntimeDirective` carrying a typed `ContextAction`
+(invariant 3 still holds — tools return `ToolOutput`-shaped results and
+never touch the engine; the kernel routes the directive). The actor
+executes the directive at **operation-commit time**, inside the same
+generation fence that guards effect commit, so a hint lands before the
+very observation it targets (and before the next model round sees it):
 
-- `Collect` — the actor calls `ContextEngine::gc()` mid-turn and emits
+- `Collect` — the actor calls `ContextEngine::gc()` immediately and emits
   `RuntimeEvent::ContextGc { report }`. The runtime owns the GC pass; a
   collect directive never enters the engine as ingest.
 - everything else — `ContextIngress::ContextDirective { action }`, applied
   by `apply_directive`: `gc_hint` sets/clears `keep_alive`, `tag` pushes a
   deduped `Label::extension(tag)`, `lease` stamps `lease_until_turn =
-  turn + turns`.
+  turn + min(turns, max_lease_turns)`.
+
+Producing a `RuntimeDirective` requires the `runtime:context-control`
+permission in the capability manifest; a tool without it gets its directive
+rewritten into a denied `Value`. Hints and leases are bounded, not
+permanent roots: `keep_alive` is capped (`max_keep_alive_items`), leases
+are capped per task in count (`max_leased_items_per_task`) and weight
+(`max_leased_tokens_per_task`), and a quota refusal surfaces as an
+`InvalidRequest` error from the directive ingest so the model learns its
+request was not granted. Both protections auto-expire when the owning task
+completes.
 
 The engine searches the heap *and* the eviction buffer for the target id,
 so a hint/lease on an already-evicted item reactivates it on the next GC

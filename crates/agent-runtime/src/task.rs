@@ -5,12 +5,19 @@
 //! task. `/focus A` then `/focus B` then `/focus A` resumes task A instead
 //! of minting a third task, because the task identity is stable and the
 //! context engine keys scope suspension on it.
+//!
+//! Task transitions are two-phase (`prepare_*` then `commit`): the caller
+//! applies the external transition first (the context engine's focus/scope
+//! change) and only commits the `TaskManager` mutation once that succeeded,
+//! so the runtime's task table can never diverge from the engine's task
+//! scopes. A prepared-but-uncommitted transition is simply discarded.
 
 use agent_contracts::TaskId;
 
 /// Lifecycle of a task. `Suspended` tasks keep their scopes in the engine
 /// and resume on activation; `Completed` tasks are closed for good.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Active,
     Suspended,
@@ -35,6 +42,32 @@ pub struct TaskInfo {
     pub status: TaskStatus,
 }
 
+/// A pending task-state transition produced by `TaskManager::prepare_*`.
+/// Nothing is mutated until `commit` runs, and `commit` must only run after
+/// the external transition (the engine's focus/scope change) succeeded.
+#[must_use]
+pub struct TaskTxn {
+    plan: TaskPlan,
+}
+
+enum TaskPlan {
+    /// A brand-new task becomes active (the previous active one suspends).
+    Create {
+        target: TaskId,
+        goal: String,
+        prev_active: Option<TaskId>,
+    },
+    /// An existing task becomes active (the previous active one suspends).
+    Activate {
+        target: TaskId,
+        prev_active: Option<TaskId>,
+    },
+    /// The active task suspends without completing.
+    Suspend { active: TaskId },
+    /// The active task completes (and leaves the active slot).
+    Complete { active: TaskId },
+}
+
 #[derive(Default)]
 pub struct TaskManager {
     tasks: Vec<TaskRecord>,
@@ -56,93 +89,127 @@ impl TaskManager {
         self.tasks.iter().find(|task| task.id == id)
     }
 
-    /// Create a task and activate it. When a non-completed task with the
-    /// same goal already exists, that task is resumed instead — the
-    /// `/focus A -> /focus B -> /focus A` sequence must come back to task
-    /// A, not spawn task C.
-    pub fn create_task(&mut self, goal: String) -> TaskId {
-        if let Some(task) = self
-            .tasks
-            .iter_mut()
-            .find(|task| task.goal == goal && task.status != TaskStatus::Completed)
-        {
-            task.status = TaskStatus::Active;
-            task.last_active_ms = now_ms();
-            self.active = Some(task.id);
-            return task.id;
-        }
-        // A new task suspends the previously active one, exactly like a
-        // task switch.
-        if let Some(previous) = self
-            .active
-            .and_then(|id| self.tasks.iter_mut().find(|task| task.id == id))
-            && previous.status != TaskStatus::Completed
-        {
-            previous.status = TaskStatus::Suspended;
-        }
-        let task = TaskRecord {
-            id: TaskId::new(),
-            goal,
-            status: TaskStatus::Active,
-            created_at_ms: now_ms(),
-            last_active_ms: now_ms(),
-        };
-        let id = task.id;
-        self.active = Some(id);
-        self.tasks.push(task);
-        id
-    }
-
-    /// Activate an existing task (suspending the currently active one).
-    /// Unknown ids are rejected so the caller can surface the error.
-    pub fn activate_task(&mut self, id: TaskId) -> Option<()> {
-        // Reject unknown and completed ids first (the borrow ends here).
-        if self
+    /// Plan to make `goal` the active task. A non-completed task with the
+    /// same goal is resumed instead — the `/focus A -> /focus B ->
+    /// /focus A` sequence must come back to task A, not spawn task C. A
+    /// fresh task id is minted here only when no match exists, and it is
+    /// discarded if the transition is never committed.
+    pub fn prepare_create(&self, goal: &str) -> (TaskTxn, TaskId) {
+        let existing = self
             .tasks
             .iter()
-            .find(|task| task.id == id)
-            .is_none_or(|task| task.status == TaskStatus::Completed)
-        {
-            return None;
+            .find(|task| task.goal == goal && task.status != TaskStatus::Completed)
+            .map(|task| task.id);
+        match existing {
+            Some(id) => (
+                TaskTxn {
+                    plan: TaskPlan::Activate {
+                        target: id,
+                        prev_active: self.active.filter(|active| *active != id),
+                    },
+                },
+                id,
+            ),
+            None => {
+                let id = TaskId::new();
+                (
+                    TaskTxn {
+                        plan: TaskPlan::Create {
+                            target: id,
+                            goal: goal.to_string(),
+                            prev_active: self.active,
+                        },
+                    },
+                    id,
+                )
+            }
         }
-        // Switching to another task suspends the one that was active.
-        if let Some(previous) = self
-            .active
-            .and_then(|active| self.tasks.iter_mut().find(|task| task.id == active))
-            && previous.id != id
-            && previous.status != TaskStatus::Completed
-        {
-            previous.status = TaskStatus::Suspended;
-        }
-        if let Some(target) = self.tasks.iter_mut().find(|task| task.id == id) {
-            target.status = TaskStatus::Active;
-            target.last_active_ms = now_ms();
-        }
-        self.active = Some(id);
-        Some(())
     }
 
-    /// Suspend the active task, if any. Returns the suspended task id.
-    pub fn suspend_active(&mut self) -> Option<TaskId> {
-        let id = self.active?;
-        if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id)
+    /// Plan to activate an existing task (suspending the currently active
+    /// one). `None` for unknown or completed ids so the caller can surface
+    /// the error before anything changes.
+    pub fn prepare_activate(&self, id: TaskId) -> Option<TaskTxn> {
+        let known = self
+            .tasks
+            .iter()
+            .any(|task| task.id == id && task.status != TaskStatus::Completed);
+        known.then(|| TaskTxn {
+            plan: TaskPlan::Activate {
+                target: id,
+                prev_active: self.active.filter(|active| *active != id),
+            },
+        })
+    }
+
+    /// Plan to suspend the active task. `None` when nothing is active.
+    pub fn prepare_suspend(&self) -> Option<TaskTxn> {
+        self.active.map(|active| TaskTxn {
+            plan: TaskPlan::Suspend { active },
+        })
+    }
+
+    /// Plan to complete the active task. `None` when nothing is active.
+    pub fn prepare_complete(&self) -> Option<TaskTxn> {
+        self.active.map(|active| TaskTxn {
+            plan: TaskPlan::Complete { active },
+        })
+    }
+
+    /// Apply a prepared transition. Call only after the external transition
+    /// (the engine's `set_focus` / `clear_focus` / task completion) has
+    /// succeeded, so the task table and the engine's scopes stay in sync.
+    pub fn commit(&mut self, txn: TaskTxn) {
+        match txn.plan {
+            TaskPlan::Create {
+                target,
+                goal,
+                prev_active,
+            } => {
+                self.suspend_previous(prev_active);
+                let now = now_ms();
+                self.tasks.push(TaskRecord {
+                    id: target,
+                    goal,
+                    status: TaskStatus::Active,
+                    created_at_ms: now,
+                    last_active_ms: now,
+                });
+                self.active = Some(target);
+            }
+            TaskPlan::Activate {
+                target,
+                prev_active,
+            } => {
+                self.suspend_previous(prev_active);
+                if let Some(task) = self.tasks.iter_mut().find(|task| task.id == target) {
+                    task.status = TaskStatus::Active;
+                    task.last_active_ms = now_ms();
+                }
+                self.active = Some(target);
+            }
+            TaskPlan::Suspend { active } => {
+                if let Some(task) = self.tasks.iter_mut().find(|task| task.id == active) {
+                    task.status = TaskStatus::Suspended;
+                }
+                self.active = None;
+            }
+            TaskPlan::Complete { active } => {
+                if let Some(task) = self.tasks.iter_mut().find(|task| task.id == active) {
+                    task.status = TaskStatus::Completed;
+                }
+                self.active = None;
+            }
+        }
+    }
+
+    fn suspend_previous(&mut self, previous: Option<TaskId>) {
+        if let Some(id) = previous
+            && let Some(task) = self.tasks.iter_mut().find(|task| task.id == id)
             && task.status != TaskStatus::Completed
         {
             task.status = TaskStatus::Suspended;
         }
-        self.active = None;
-        Some(id)
-    }
-
-    /// Mark a task completed (and clear it from the active slot when it was
-    /// current). Returns the completed id.
-    pub fn complete_task(&mut self, id: TaskId) -> Option<TaskId> {
-        let task = self.tasks.iter_mut().find(|task| task.id == id)?;
-        task.status = TaskStatus::Completed;
-        if self.active == Some(id) {
-            self.active = None;
-        }
-        Some(id)
     }
 
     /// The active task's goal, if any (used when re-focusing on activation).
@@ -150,6 +217,19 @@ impl TaskManager {
         self.active
             .and_then(|id| self.tasks.iter().find(|task| task.id == id))
             .map(|task| task.goal.as_str())
+    }
+
+    /// Every task record, in creation order (used by checkpoints).
+    pub fn list_records(&self) -> &[TaskRecord] {
+        &self.tasks
+    }
+
+    /// Replace the whole task table from a checkpoint snapshot. Used by
+    /// restore: the engine's task scopes were restored from its own
+    /// checkpoint, and this brings the runtime's view back in sync.
+    pub fn restore(&mut self, snapshot: crate::checkpoint::TaskManagerSnapshot) {
+        self.tasks = snapshot.tasks.into_iter().map(TaskRecord::from).collect();
+        self.active = snapshot.active;
     }
 
     /// Snapshot for the UI.
@@ -176,13 +256,20 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn create(tasks: &mut TaskManager, goal: &str) -> TaskId {
+        let (txn, id) = tasks.prepare_create(goal);
+        tasks.commit(txn);
+        id
+    }
+
     #[test]
     fn refocusing_the_same_goal_resumes_the_same_task() {
         let mut tasks = TaskManager::new();
-        let a = tasks.create_task("fix AuthService".into());
-        let b = tasks.create_task("write docs".into());
-        let again = tasks.create_task("fix AuthService".into());
+        let a = create(&mut tasks, "fix AuthService");
+        let b = create(&mut tasks, "write docs");
+        let (txn, again) = tasks.prepare_create("fix AuthService");
         assert_eq!(a, again, "same goal resumes the existing task");
+        tasks.commit(txn);
         assert_ne!(a, b);
         assert_eq!(tasks.active(), Some(a));
     }
@@ -190,37 +277,52 @@ mod tests {
     #[test]
     fn activate_suspends_and_complete_closes() {
         let mut tasks = TaskManager::new();
-        let a = tasks.create_task("task A".into());
-        let b = tasks.create_task("task B".into());
+        let a = create(&mut tasks, "task A");
+        let b = create(&mut tasks, "task B");
         assert_eq!(tasks.active(), Some(b));
         assert_eq!(tasks.get(a).map(|t| t.status), Some(TaskStatus::Suspended));
 
-        tasks.activate_task(a).unwrap();
+        let txn = tasks.prepare_activate(a).expect("a exists and is open");
+        tasks.commit(txn);
         assert_eq!(tasks.active(), Some(a));
         assert_eq!(tasks.get(b).map(|t| t.status), Some(TaskStatus::Suspended));
 
-        tasks.complete_task(a).unwrap();
+        let txn = tasks.prepare_complete().expect("a is active");
+        tasks.commit(txn);
         assert_eq!(tasks.get(a).map(|t| t.status), Some(TaskStatus::Completed));
         assert_eq!(tasks.active(), None, "completing the active task clears it");
 
         // A completed task cannot be re-activated.
-        assert!(tasks.activate_task(a).is_none());
+        assert!(tasks.prepare_activate(a).is_none());
     }
 
     #[test]
     fn suspend_active_clears_the_active_slot() {
         let mut tasks = TaskManager::new();
-        let a = tasks.create_task("task A".into());
-        assert_eq!(tasks.suspend_active(), Some(a));
+        let a = create(&mut tasks, "task A");
+        assert_eq!(tasks.active(), Some(a));
+        let txn = tasks.prepare_suspend().expect("a is active");
+        tasks.commit(txn);
         assert_eq!(tasks.active(), None);
         assert_eq!(tasks.get(a).map(|t| t.status), Some(TaskStatus::Suspended));
-        assert_eq!(tasks.suspend_active(), None);
+        assert!(tasks.prepare_suspend().is_none());
     }
 
     #[test]
     fn unknown_task_ids_are_rejected() {
+        let tasks = TaskManager::new();
+        assert!(tasks.prepare_activate(TaskId::new()).is_none());
+        assert!(tasks.prepare_complete().is_none());
+    }
+
+    #[test]
+    fn an_uncommitted_transition_changes_nothing() {
         let mut tasks = TaskManager::new();
-        assert!(tasks.activate_task(TaskId::new()).is_none());
-        assert!(tasks.complete_task(TaskId::new()).is_none());
+        let a = create(&mut tasks, "task A");
+        // Prepare a switch to a new task but never commit it: the table
+        // must stay exactly as it was (the external transition failed).
+        let (_txn, _b) = tasks.prepare_create("task B");
+        assert_eq!(tasks.active(), Some(a));
+        assert_eq!(tasks.list().len(), 1);
     }
 }

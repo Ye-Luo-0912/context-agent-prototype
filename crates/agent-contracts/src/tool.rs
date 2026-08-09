@@ -38,11 +38,6 @@ pub struct ToolOutput {
     /// Raw/large output should live here instead of in the prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_ref: Option<String>,
-    /// A structured context directive the tool attached to its output
-    /// (gc hint, tag, lease, collect). The runtime routes it to the context
-    /// engine — tools never touch the engine themselves.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_action: Option<ContextAction>,
     #[serde(default)]
     pub metadata: Value,
 }
@@ -71,16 +66,66 @@ pub trait Effect: Send + Sync {
     /// Human-readable description for events and logs.
     fn describe(&self) -> String;
     /// Apply the prepared effect (atomic rename, outbox send, ...). The
-    /// journal must reflect the outcome either way.
-    async fn commit(self: Box<Self>) -> AgentResult<()>;
+    /// journal must reflect the outcome either way. The failure kind is
+    /// structured: `NotApplied` leaves the world unchanged, while
+    /// `AppliedButDurabilityFailed` means the effect landed but its record
+    /// could not be persisted — the runtime must treat that as a
+    /// degraded/recovery state, never as "nothing happened".
+    async fn commit(self: Box<Self>) -> Result<(), EffectCommitError>;
     /// Undo the preparation: the effect must not land.
     async fn rollback(self: Box<Self>, reason: &str);
 }
 
+/// Why an effect commit failed. The distinction is load-bearing: after a
+/// `NotApplied` failure the world is unchanged (tell the model "nothing
+/// happened"); after `AppliedButDurabilityFailed` the side effect already
+/// landed but its journal record could not be persisted — the runtime must
+/// surface a degraded/recovery state instead of claiming the mutation never
+/// happened.
+#[derive(Debug)]
+pub enum EffectCommitError {
+    /// The effect did not land; there is nothing to recover.
+    NotApplied(AgentError),
+    /// The effect landed but its durability record (journal) failed. The
+    /// filesystem and the journal now disagree.
+    AppliedButDurabilityFailed(AgentError),
+}
+
+impl std::fmt::Display for EffectCommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotApplied(error) => write!(f, "effect not applied: {error}"),
+            Self::AppliedButDurabilityFailed(error) => {
+                write!(f, "effect applied but its journal record failed: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EffectCommitError {}
+
+/// A directive a tool attaches to its output asking the runtime to change
+/// runtime-owned state (a context `gc_hint` / `tag` / `lease` / `collect`).
+/// Unlike a plain `ToolOutput` field — which any tool, including a
+/// capability, could set — a `RuntimeDirective` is a distinct
+/// `ToolOutcome` variant. The dispatcher only lets trusted tools and
+/// capabilities holding `RUNTIME_CONTEXT_CONTROL` produce it, so an
+/// arbitrary capability cannot forge context-control requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimeDirective {
+    Context(ContextAction),
+}
+
+/// Permission a capability's manifest must declare to attach context
+/// directives to its outputs. The dispatcher checks it before a directive
+/// from a capability reaches the actor.
+pub const RUNTIME_CONTEXT_CONTROL: &str = "runtime:context-control";
+
 /// What a tool execution produced: either a plain bounded output (a value —
-/// reads, searches, already-applied behavior like a spawned process), or an
+/// reads, searches, already-applied behavior like a spawned process), an
 /// output plus a staged side effect the runtime must commit (or roll back)
-/// after validating the operation is still current.
+/// after validating the operation is still current, or an output plus a
+/// runtime directive (context control) the actor executes at commit time.
 pub enum ToolOutcome {
     /// The execution produced only an output; there is nothing to commit.
     Value(ToolOutput),
@@ -89,6 +134,13 @@ pub enum ToolOutcome {
     PreparedEffect {
         output: ToolOutput,
         effect: Box<dyn Effect>,
+    },
+    /// The computation finished and the tool asks the runtime to change
+    /// runtime-owned state. Executed at operation-commit time, right after
+    /// any staged effect, so "manual collect now" is actually now.
+    RuntimeDirective {
+        output: ToolOutput,
+        directive: RuntimeDirective,
     },
 }
 
@@ -100,6 +152,11 @@ impl std::fmt::Debug for ToolOutcome {
                 .debug_struct("PreparedEffect")
                 .field("output", output)
                 .field("effect", &"<staged effect>")
+                .finish(),
+            ToolOutcome::RuntimeDirective { output, directive } => f
+                .debug_struct("RuntimeDirective")
+                .field("output", output)
+                .field("directive", directive)
                 .finish(),
         }
     }

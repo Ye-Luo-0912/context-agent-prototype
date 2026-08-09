@@ -15,9 +15,10 @@ use std::{
 use agent_contracts::{
     AgentError, AgentResult, ArtifactHandle, CAPABILITY_INSPECT, CAPABILITY_LOAD,
     CAPABILITY_SEARCH, CAPABILITY_UNLOAD, Capability, CapabilityActivation,
-    CapabilityInvocationContext, CapabilityLifecycle, CapabilityStatus, CapabilityTransport,
-    ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput,
-    ToolSpec, ToolSurfaceSnapshot, WorkspaceHandle,
+    CapabilityInvocationContext, CapabilityLifecycle, CapabilityOutcome, CapabilityStatus,
+    CapabilityTransport, Effect, RUNTIME_CONTEXT_CONTROL, ToolCatalogEntry, ToolDispatcher,
+    ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolSpec, ToolSurfaceSnapshot,
+    WorkspaceHandle,
 };
 use agent_workspace::{ArtifactStoreHandle, ConfinedWorkspaceHandle, Workspace};
 use async_trait::async_trait;
@@ -404,6 +405,40 @@ impl CapabilityRegistry {
         }
     }
 
+    /// Snapshot of every registered capability's surface state (activation +
+    /// loaded), for checkpoints. Registration identity itself is not part of
+    /// the snapshot: capabilities are re-registered by the composition root
+    /// on a fresh run, then this re-applies their flags.
+    pub fn snapshot(&self) -> Vec<crate::checkpoint::CapabilitySnapshot> {
+        let inner = self.inner.read().expect("capability registry poisoned");
+        let mut entries: Vec<_> = inner
+            .iter()
+            .map(|(id, entry)| crate::checkpoint::CapabilitySnapshot {
+                id: id.clone(),
+                activation: entry.activation,
+                loaded: entry.loaded,
+            })
+            .collect();
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        entries
+    }
+
+    /// Re-apply a checkpoint's capability surface state: activation first,
+    /// then the loaded flag (a loaded flag without a usable activation is
+    /// dropped — activation is the gate in front of the model surface).
+    pub fn restore(&self, state: &[crate::checkpoint::CapabilitySnapshot]) {
+        for entry in state {
+            let mut inner = self.inner.write().expect("poisoned");
+            let Some(current) = inner.get_mut(&entry.id) else {
+                // The capability is not registered in this run; its flags
+                // have nothing to apply to.
+                continue;
+            };
+            current.activation = entry.activation;
+            current.loaded = entry.loaded && entry.activation.usable();
+        }
+    }
+
     /// Start every eager capability that has not started yet (host start).
     /// Disabled/quarantined capabilities are not started — they are not
     /// usable, so there is nothing to run.
@@ -712,12 +747,43 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
                     self.capabilities.ensure_started(&id).await?;
                     self.capabilities.mark_active(&name);
                     let ctx = self.invocation_context(&capability, &request);
-                    let output = capability.invoke(request.call, ctx).await;
+                    let outcome = capability.invoke(request.call, ctx).await;
                     self.capabilities.mark_idle(&name);
-                    // An out-of-process capability applies its own side
-                    // effects inside the subprocess; the runtime only ever
-                    // sees a completed value across the wire.
-                    return output.map(ToolOutcome::Value);
+                    // The core owns every side effect: a capability can only
+                    // stage an effect (the actor commits it behind the
+                    // generation fence) or attach a runtime directive —
+                    // which is refused unless the manifest declares
+                    // `runtime:context-control`. A plain value passes
+                    // through unchanged.
+                    return match outcome? {
+                        CapabilityOutcome::Value(output) => Ok(ToolOutcome::Value(output)),
+                        CapabilityOutcome::EffectRequest { output, effect } => {
+                            Ok(ToolOutcome::PreparedEffect { output, effect })
+                        }
+                        CapabilityOutcome::RuntimeDirective { output, directive } => {
+                            let manifest = capability.manifest();
+                            if manifest
+                                .permissions
+                                .iter()
+                                .any(|permission| permission == RUNTIME_CONTEXT_CONTROL)
+                            {
+                                Ok(ToolOutcome::RuntimeDirective { output, directive })
+                            } else {
+                                Ok(ToolOutcome::Value(ToolOutput {
+                                    ok: false,
+                                    summary: format!(
+                                        "capability '{}' attempted a runtime directive without '{}' permission",
+                                        manifest.id, RUNTIME_CONTEXT_CONTROL
+                                    ),
+                                    model_content: format!(
+                                        "runtime directive denied: capability '{}' does not hold '{}' permission",
+                                        manifest.id, RUNTIME_CONTEXT_CONTROL
+                                    ),
+                                    ..output
+                                }))
+                            }
+                        }
+                    };
                 }
                 self.base.execute(request).await
             }
@@ -742,6 +808,15 @@ impl WorkspaceHandle for ReadOnlyWorkspace {
         self.0.read(relative).await
     }
     async fn write(&self, _relative: &str, _content: &[u8]) -> AgentResult<()> {
+        Err(AgentError::InvalidRequest(
+            "workspace:write was not granted to this capability".into(),
+        ))
+    }
+    async fn prepare_write(
+        &self,
+        _relative: &str,
+        _content: &[u8],
+    ) -> AgentResult<Box<dyn Effect>> {
         Err(AgentError::InvalidRequest(
             "workspace:write was not granted to this capability".into(),
         ))
@@ -838,7 +913,6 @@ impl CapabilityAwareDispatcher {
             ),
             model_content: lines.join("\n"),
             artifact_ref: None,
-            context_action: None,
             metadata: json!({"total": entries.len(), "active": active}),
         })
     }
@@ -854,7 +928,6 @@ impl CapabilityAwareDispatcher {
                 summary: format!("unknown tool: {}", args.name),
                 model_content: format!("unknown tool: {}", args.name),
                 artifact_ref: None,
-                context_action: None,
                 metadata: json!({}),
             });
         };
@@ -897,7 +970,6 @@ impl CapabilityAwareDispatcher {
                 spec.name, owner, activation, state, spec.description, spec.input_schema
             ),
             artifact_ref: None,
-            context_action: None,
             metadata: json!({
                 "name": spec.name,
                 "owner": owner,
@@ -922,7 +994,6 @@ impl CapabilityAwareDispatcher {
                 args.name
             ),
             artifact_ref: None,
-            context_action: None,
             metadata: json!({"tool": args.name}),
         })
     }
@@ -938,7 +1009,6 @@ impl CapabilityAwareDispatcher {
             summary: format!("tool unloaded: {}", args.name),
             model_content: format!("tool unloaded: {}", args.name),
             artifact_ref: None,
-            context_action: None,
             metadata: json!({"tool": args.name}),
         })
     }

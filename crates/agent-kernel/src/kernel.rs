@@ -271,8 +271,7 @@ impl AgentKernel {
     /// its scopes in the context engine (suspension/resume is keyed on the
     /// task id), while a fresh task id opens a fresh task scope.
     pub async fn set_focus(&self, task_id: TaskId, goal: String) -> AgentResult<()> {
-        let mut focus = FocusState::new(goal.clone());
-        focus.task_id = task_id;
+        let focus = FocusState::for_task(task_id, goal.clone());
         self.context
             .ingest(ContextIngress::FocusChanged { focus })
             .await?;
@@ -368,6 +367,13 @@ impl AgentKernel {
         self.context.checkpoint().await
     }
 
+    /// Restore the context engine from a checkpoint's context payload.
+    /// The runtime actor restores its own state (task table, current task)
+    /// around this call, so a restored run has both planes back.
+    pub async fn restore(&self, data: serde_json::Value) -> AgentResult<()> {
+        self.context.restore(data).await
+    }
+
     async fn emit(&self, event: RuntimeEvent) -> AgentResult<()> {
         let envelope = RuntimeEventEnvelope {
             run_id: self.run_id,
@@ -392,7 +398,6 @@ fn tool_error_output(call: &ToolCall, message: String) -> ToolOutput {
         summary: message.clone(),
         model_content: format!("tool error: {message}"),
         artifact_ref: None,
-        context_action: None,
         metadata: serde_json::Value::Null,
     }
 }

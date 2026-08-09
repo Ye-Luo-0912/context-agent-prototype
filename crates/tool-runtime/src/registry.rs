@@ -376,7 +376,6 @@ impl BuiltinToolDispatcher {
             ),
             model_content: lines.join("\n"),
             artifact_ref: None,
-            context_action: None,
             metadata: json!({"total": entries.len(), "active": active}),
         })
     }
@@ -395,7 +394,6 @@ impl BuiltinToolDispatcher {
                 args.name
             ),
             artifact_ref: None,
-            context_action: None,
             metadata: json!({"tool": args.name}),
         })
     }
@@ -411,7 +409,6 @@ impl BuiltinToolDispatcher {
             summary: format!("tool unloaded: {}", args.name),
             model_content: format!("tool unloaded: {}", args.name),
             artifact_ref: None,
-            context_action: None,
             metadata: json!({"tool": args.name}),
         })
     }
@@ -423,11 +420,14 @@ mod tests {
     use agent_contracts::{CancellationToken, ContextAction, ToolCall, ToolExecutionRequest};
     use serde_json::Value;
 
-    /// Unwrap a plain tool value (control tools never stage an effect).
+    /// Unwrap a plain tool value (control tools never stage an effect or a
+    /// directive).
     fn value(outcome: ToolOutcome) -> ToolOutput {
         match outcome {
             ToolOutcome::Value(output) => output,
-            ToolOutcome::PreparedEffect { .. } => panic!("control tools return plain values"),
+            ToolOutcome::PreparedEffect { .. } | ToolOutcome::RuntimeDirective { .. } => {
+                panic!("control tools return plain values")
+            }
         }
     }
 
@@ -497,6 +497,13 @@ mod tests {
 
         let item_id = "00000000-0000-0000-0000-000000000000";
 
+        // The context meta-tools return a `RuntimeDirective` (a distinct
+        // `ToolOutcome` variant), not a field on the output.
+        let directive = |outcome: ToolOutcome| match outcome {
+            ToolOutcome::RuntimeDirective { directive, .. } => directive,
+            other => panic!("context tools must return a directive, got {other:?}"),
+        };
+
         let output = dispatcher
             .execute(request(
                 "context.gc_hint",
@@ -504,10 +511,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        let output = value(output);
         assert!(matches!(
-            output.context_action,
-            Some(ContextAction::GcHint {
+            directive(output),
+            agent_contracts::RuntimeDirective::Context(ContextAction::GcHint {
                 keep_alive: true,
                 ..
             })
@@ -520,10 +526,10 @@ mod tests {
             ))
             .await
             .unwrap();
-        let output = value(output);
         assert!(matches!(
-            output.context_action,
-            Some(ContextAction::Tag { ref tag, .. }) if tag == "urgent"
+            directive(output),
+            agent_contracts::RuntimeDirective::Context(ContextAction::Tag { ref tag, .. })
+                if tag == "urgent"
         ));
 
         let output = dispatcher
@@ -533,20 +539,18 @@ mod tests {
             ))
             .await
             .unwrap();
-        let output = value(output);
         assert!(matches!(
-            output.context_action,
-            Some(ContextAction::Lease { turns: 3, .. })
+            directive(output),
+            agent_contracts::RuntimeDirective::Context(ContextAction::Lease { turns: 3, .. })
         ));
 
         let output = dispatcher
             .execute(request("context.collect", json!({})))
             .await
             .unwrap();
-        let output = value(output);
         assert!(matches!(
-            output.context_action,
-            Some(ContextAction::Collect)
+            directive(output),
+            agent_contracts::RuntimeDirective::Context(ContextAction::Collect)
         ));
 
         // Bad arguments are rejected like any other tool.

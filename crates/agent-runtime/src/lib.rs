@@ -5,6 +5,7 @@
 mod actor;
 pub mod budget;
 mod capability;
+pub mod checkpoint;
 mod command;
 pub mod host;
 mod instance;
@@ -16,6 +17,10 @@ pub mod task;
 pub use actor::{RuntimeActor, spawn_runtime};
 pub use budget::{DEFAULT_OUTPUT_RESERVE, ModelBudget, approx_layer_tokens};
 pub use capability::{CapabilityAwareDispatcher, CapabilityCatalogEntry, CapabilityRegistry};
+pub use checkpoint::{
+    CapabilitySnapshot, RUNTIME_CHECKPOINT_VERSION, RunMetadata, RuntimeCheckpoint,
+    TaskManagerSnapshot, TaskRecordSnapshot,
+};
 pub use command::{Reply, RuntimeCommand, RuntimeHandle};
 pub use host::{
     APPROVAL_POLICY, ARTIFACT_STORE, CONTEXT_SERVICE, CapabilityId, EVENT_STORE, MODEL_PROVIDER,

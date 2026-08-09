@@ -144,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
     let result = run_ui(
         &mut terminal,
         runtime.handle().clone(),
+        &runtime,
         &mut runtime_events,
         interactive,
         &context_policy,
@@ -170,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run_ui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     handle: RuntimeHandle,
+    runtime: &RuntimeInstance,
     runtime_events: &mut tokio::sync::broadcast::Receiver<agent_contracts::RuntimeEventEnvelope>,
     interactive: Option<InteractiveHandle>,
     context_policy: &str,
@@ -338,9 +340,9 @@ async fn run_ui(
                     if trimmed == "/checkpoint" {
                         let path =
                             checkpoint_dir.join(format!("{}-{}.json", handle.run_id(), now_ms()));
-                        match handle.checkpoint().await {
-                            Ok(value) => {
-                                let bytes = match serde_json::to_vec_pretty(&value) {
+                        match runtime.checkpoint().await {
+                            Ok(checkpoint) => {
+                                let bytes = match serde_json::to_vec_pretty(&checkpoint) {
                                     Ok(bytes) => bytes,
                                     Err(error) => {
                                         app.push_system(format!(
@@ -356,7 +358,8 @@ async fn run_ui(
                                 }
                                 match tokio::fs::write(&path, bytes).await {
                                     Ok(()) => app.push_system(format!(
-                                        "checkpoint saved: {}",
+                                        "checkpoint saved ({} tasks): {}",
+                                        checkpoint.tasks.tasks.len(),
                                         path.display()
                                     )),
                                     Err(error) => {
@@ -365,6 +368,33 @@ async fn run_ui(
                                 }
                             }
                             Err(error) => app.push_system(format!("checkpoint failed: {error}")),
+                        }
+                        continue;
+                    }
+                    if let Some(restore_path) = trimmed.strip_prefix("/restore ") {
+                        let path = std::path::PathBuf::from(restore_path.trim());
+                        let result = async {
+                            let bytes = tokio::fs::read(&path).await.map_err(|error| {
+                                anyhow::anyhow!("read {}: {error}", path.display())
+                            })?;
+                            let checkpoint: agent_runtime::RuntimeCheckpoint =
+                                serde_json::from_slice(&bytes).map_err(|error| {
+                                    anyhow::anyhow!(
+                                        "parse {}: {error} (is this a runtime checkpoint?)",
+                                        path.display()
+                                    )
+                                })?;
+                            runtime
+                                .restore(checkpoint)
+                                .await
+                                .map_err(anyhow::Error::from)
+                        }
+                        .await;
+                        match result {
+                            Ok(()) => {
+                                app.push_system(format!("runtime restored from {}", path.display()))
+                            }
+                            Err(error) => app.push_system(format!("restore failed: {error}")),
                         }
                         continue;
                     }

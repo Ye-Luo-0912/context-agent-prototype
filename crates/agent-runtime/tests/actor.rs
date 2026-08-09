@@ -130,9 +130,16 @@ impl ModelTransport for StreamingModel {
 }
 
 fn kernel(model: Arc<dyn ModelTransport>) -> Arc<AgentKernel> {
+    kernel_with(model, Arc::new(TestContextEngine))
+}
+
+fn kernel_with(
+    model: Arc<dyn ModelTransport>,
+    context: Arc<dyn ContextEngine>,
+) -> Arc<AgentKernel> {
     Arc::new(AgentKernel::new(
         AgentKernelConfig::default(),
-        Arc::new(TestContextEngine),
+        context,
         model,
         Arc::new(TestToolDispatcher),
         Arc::new(PolicyApprovalGate::read_only()),
@@ -424,5 +431,100 @@ async fn dropping_all_handles_still_shuts_down_cleanly() {
     assert!(
         run_completed,
         "dropping all handles must still run the full shutdown"
+    );
+}
+
+/// The engine rejects the focus change: `FocusChanged` ingest fails, so any
+/// task transition that depends on it must fail too — and the runtime's
+/// task table must not move.
+#[derive(Debug)]
+struct FailingFocusContextEngine;
+
+#[async_trait::async_trait]
+impl ContextEngine for FailingFocusContextEngine {
+    async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+        if matches!(ingress, ContextIngress::FocusChanged { .. }) {
+            return Err(agent_contracts::AgentError::Internal(
+                "focus rejected".into(),
+            ));
+        }
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            focus: None,
+            items: Vec::new(),
+            external: Vec::new(),
+            selected: Vec::new(),
+            approx_tokens: 0,
+            diagnostics: ContextDiagnostics::default(),
+        })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+}
+
+/// Finishes a model round immediately with an empty reply.
+#[derive(Debug)]
+struct SilentModel;
+
+#[async_trait::async_trait]
+impl ModelTransport for SilentModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        Ok(ModelOutput {
+            content: String::new(),
+            tool_calls: Vec::new(),
+            usage: Default::default(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn failed_focus_never_mutates_the_task_table() {
+    let kernel = kernel_with(Arc::new(SilentModel), Arc::new(FailingFocusContextEngine));
+    let (handle, _task) = spawn_runtime(kernel);
+    handle.start().await.unwrap();
+
+    // An explicit /focus whose engine transition fails must leave the
+    // runtime without a task: TaskManager state changes only on commit.
+    let result = handle.set_focus("goal A".into()).await;
+    assert!(result.is_err(), "focus must fail");
+    assert!(
+        handle.list_tasks().await.unwrap().is_empty(),
+        "no task may be registered when the focus transition failed"
+    );
+
+    // The first user message auto-creates an implicit task; when the focus
+    // transition fails there too, the implicit task must not be registered.
+    let result = handle.user_message("hello".into()).await;
+    assert!(result.is_err(), "the turn must fail with the focus error");
+    assert!(
+        handle.list_tasks().await.unwrap().is_empty(),
+        "an implicit task exists only after its focus committed"
     );
 }

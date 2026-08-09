@@ -82,7 +82,6 @@ async fn run_git(
             summary: format!("git {args:?} failed (exit={:?})", output.status.code()),
             model_content: "(empty output; is this a git repository?)".into(),
             artifact_ref: None,
-            context_action: None,
             metadata: json!({"exit_code": output.status.code()}),
         });
     }
@@ -126,7 +125,6 @@ async fn run_git(
             bounded
         },
         artifact_ref,
-        context_action: None,
         metadata: json!({"exit_code": output.status.code(), "bytes": combined.len()}),
     })
 }

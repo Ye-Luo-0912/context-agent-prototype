@@ -15,6 +15,25 @@ use agent_contracts::{
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
 use agent_runtime::{CapabilityId, Module, ModuleHost, RuntimeInstance, ServiceRegistry};
 
+/// Build an instance over the real reference engine, so the checkpoint test
+/// exercises items, scopes and focus — not a stub that trivially roundtrips.
+async fn simple_instance() -> (RuntimeInstance, Arc<context_simple::SimpleContextEngine>) {
+    let context = Arc::new(context_simple::SimpleContextEngine::new(
+        context_simple::SimpleContextConfig::default(),
+    ));
+    let kernel = Arc::new(AgentKernel::new(
+        AgentKernelConfig::default(),
+        context.clone(),
+        Arc::new(QuietModel),
+        Arc::new(EmptyTools),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), kernel);
+    instance.start().await.unwrap();
+    (instance, context)
+}
+
 #[derive(Debug, Default)]
 struct TestContextEngine;
 
@@ -229,4 +248,81 @@ async fn shutdown_with_no_turn_is_a_clean_noop_path() {
         .await
         .expect("shutdown must not hang");
     assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn runtime_checkpoint_roundtrips_tasks_context_and_capabilities() {
+    let (instance, _context) = simple_instance().await;
+    let mut events = instance.handle().subscribe();
+
+    // Two tasks, one with a real turn, so the task table and the context
+    // engine both carry state worth restoring.
+    instance
+        .handle()
+        .set_focus("task A: refactor auth".into())
+        .await
+        .unwrap();
+    instance
+        .handle()
+        .user_message("task A: refactor auth".into())
+        .await
+        .unwrap();
+    // Wait for the turn to finish (checkpoint requires an idle runtime).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let completed = events
+            .try_recv()
+            .is_ok_and(|envelope| matches!(envelope.event, RuntimeEvent::TurnCompleted));
+        if completed || tokio::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    instance
+        .handle()
+        .set_focus("task B: write docs".into())
+        .await
+        .unwrap();
+
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert_eq!(
+        checkpoint.tasks.tasks.len(),
+        2,
+        "the checkpoint must carry the task table, not just the context engine"
+    );
+    assert!(checkpoint.current_task_id.is_some());
+    assert!(
+        checkpoint.context != serde_json::Value::Null,
+        "the context payload must be present"
+    );
+
+    // The file roundtrip: serialize to JSON, parse it back.
+    let bytes = serde_json::to_vec(&checkpoint).unwrap();
+    let decoded: agent_runtime::RuntimeCheckpoint = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(decoded.tasks.tasks.len(), 2);
+    assert_eq!(decoded.version, agent_runtime::RUNTIME_CHECKPOINT_VERSION);
+
+    // Restore into a fresh runtime: tasks come back, and the engine carries
+    // the restored items and scopes.
+    let (fresh, _fresh_context) = simple_instance().await;
+    fresh.restore(decoded).await.unwrap();
+    let tasks = fresh.handle().list_tasks().await.unwrap();
+    assert_eq!(tasks.len(), 2, "restore must bring the task table back");
+    let active = tasks
+        .iter()
+        .find(|task| task.id == checkpoint.current_task_id.unwrap());
+    assert_eq!(
+        active.map(|task| task.status),
+        Some(agent_runtime::TaskStatus::Active),
+        "the restored active task must stay active"
+    );
+    let items = fresh.handle().inspect_context(usize::MAX).await.unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|item| item.kind == agent_contracts::ContextKind::UserMessage),
+        "the restored engine must carry the user message items"
+    );
+    fresh.shutdown().await.unwrap();
+    instance.shutdown().await.unwrap();
 }
