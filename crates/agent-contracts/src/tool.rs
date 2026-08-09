@@ -45,6 +45,30 @@ pub struct ToolOutput {
     pub metadata: Value,
 }
 
+/// What happens to a tool result after the turn: whether it becomes a new
+/// long-term observation or stays transient.
+///
+/// Context retrieval (`context.search` / `context.inspect` / `context.fetch`)
+/// is a transient store read: it must make evidence visible to the current
+/// turn without duplicating it under a new observation id (CTX-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ToolResultDisposition {
+    /// Persist the result as a new `ToolObservation` (default).
+    #[default]
+    PersistObservation,
+    /// The result is visible to the current turn only; it is not persisted
+    /// as a new observation. Access stamps (last_access, GC epoch) are still
+    /// recorded by the engine where the read happened.
+    TransientNoPersist,
+    /// The result is visible to the current turn only and is not persisted
+    /// as a new observation — but the referenced item itself receives a
+    /// lifecycle/access event (`context.admit`: the item re-enters the
+    /// working set under its original id, one transition). Persisting the
+    /// directive result would duplicate the admitted item under a new id,
+    /// so the event *is* the record.
+    AccessEventOnly,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolExecutionRequest {
     pub run_id: RunId,

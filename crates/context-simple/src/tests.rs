@@ -1,8 +1,8 @@
 use agent_contracts::{
     AgentError, AttentionState, ContextAction, ContextEngine, ContextHints, ContextIngress,
     ContextItem, ContextItemId, ContextKind, ContextMaintenanceTrigger, ContextQuery,
-    ContextRetention, ContextScope, ContextSearchQuery, CoreLabel, FocusState, Label,
-    LifecycleLabel, ScopeKind, ScopeState, SemanticState, TaskId, ToolOutput,
+    ContextRetention, ContextScope, ContextSearchQuery, CoreLabel, DependencyKind, FocusState,
+    Label, LifecycleLabel, ScopeKind, ScopeState, SemanticState, TaskId, ToolOutput,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -3416,5 +3416,461 @@ async fn keep_alive_quota_counts_warm_items() {
     assert!(
         refused.to_string().contains("keep_alive"),
         "the warm item must consume the quota, got {refused}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CTX-03: fetch/search/inspect are transient reads; admit re-enters an item
+// under its ORIGINAL id with exactly one lifecycle transition; derive
+// persists a fact as a NEW item with a DerivedFrom edge to the source ref.
+// ---------------------------------------------------------------------------
+
+/// The retrieval surface is a fidelity boundary: `context.admit` must bring
+/// an externalized item back into the working set under the same id (never a
+/// copy), with exactly one observable lifecycle transition. The result is
+/// the same item — `fetch` only reads it, `admit` makes it current again.
+#[tokio::test]
+async fn admit_externalized_item_preserves_identity_and_produces_one_transition() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        gc_reactivate_per_pass: 8,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    let contents = [
+        format!("step 0: fix AuthService.rs {}", "x".repeat(160)),
+        format!("step 1: fix AuthService.rs {}", "y".repeat(160)),
+    ];
+    for (i, content) in contents.iter().enumerate() {
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                output: observation_output(&format!("step-{i}"), true, content),
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let gc_report = engine.gc().await.unwrap();
+    assert!(
+        gc_report.externalized >= 1,
+        "buffer overflow must externalize: {gc_report:?}"
+    );
+
+    // Pick one externalized ref; drain any transitions already pending from
+    // the seeding so the admit transition is the only one to count.
+    let refs = engine
+        .search_external(agent_contracts::ContextSearchQuery {
+            query: "AuthService".into(),
+            kind: None,
+            scope: None,
+            task_id: None,
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert!(!refs.is_empty(), "the retrieval surface must list refs");
+    let target = refs[0].item_id;
+    let expected_content = engine
+        .fetch_external(target)
+        .await
+        .unwrap()
+        .expect("the ref resolves")
+        .content;
+
+    // Admit: same id, one transition, content back in the working set. No
+    // maintenance runs between the seed and the admit, so the admitted
+    // item's age stays inside the ephemeral TTL and the materializer can
+    // still select it.
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Admit {
+                item_id: target,
+                reason: "the model needs this step again".into(),
+            },
+        })
+        .await
+        .unwrap();
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::Checkpoint)
+        .await
+        .unwrap();
+    let admits: Vec<_> = report
+        .transitions
+        .iter()
+        .filter(|t| t.item_id == target && t.reason.contains("admitted"))
+        .collect();
+    assert_eq!(
+        admits.len(),
+        1,
+        "admit must produce exactly one lifecycle transition, got {:?}",
+        report.transitions
+    );
+    assert_eq!(admits[0].to, AttentionState::Active);
+    assert_ne!(admits[0].from, AttentionState::Active);
+
+    // The item is back in the working set under its ORIGINAL id — the
+    // materializer can select it, and the store no longer owns it.
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "continue AuthService.rs".into(),
+            budget_tokens: 4096,
+            hints: Default::default(),
+        })
+        .await
+        .unwrap();
+    let back = materialized
+        .items
+        .iter()
+        .find(|item| item.item_id == target)
+        .expect("the admitted item is materializable again");
+    assert_eq!(
+        back.content, expected_content,
+        "admit must recover the exact content, not a copy"
+    );
+    assert_eq!(
+        back.attention,
+        AttentionState::Active,
+        "the admitted item re-enters as an active working-set member"
+    );
+    assert!(
+        engine.fetch_external(target).await.unwrap().is_none(),
+        "the admitted item must leave the external map (no duplicate owner)"
+    );
+}
+
+/// Admit also pulls a warm-buffer item back with its original id, and the
+/// transition is observable exactly once.
+#[tokio::test]
+async fn admit_warm_buffer_item_preserves_identity_and_one_transition() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 64,
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    tool_observation(&engine, "1", "step 0: fix AuthService.rs").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    let warm_id = {
+        let state = engine.state.lock().await;
+        assert!(
+            !state.eviction_buffer.is_empty(),
+            "the GC must move items to the warm buffer: {report:?}"
+        );
+        state.eviction_buffer[0].id
+    };
+    engine
+        .maintain(ContextMaintenanceTrigger::Checkpoint)
+        .await
+        .unwrap();
+
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Admit {
+                item_id: warm_id,
+                reason: "the model needs this back".into(),
+            },
+        })
+        .await
+        .unwrap();
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::Checkpoint)
+        .await
+        .unwrap();
+    let admits: Vec<_> = report
+        .transitions
+        .iter()
+        .filter(|t| t.item_id == warm_id && t.reason.contains("admitted"))
+        .collect();
+    assert_eq!(
+        admits.len(),
+        1,
+        "admit must produce exactly one lifecycle transition, got {:?}",
+        report.transitions
+    );
+    let state = engine.state.lock().await;
+    assert!(
+        !state.eviction_buffer.iter().any(|item| item.id == warm_id),
+        "the admitted item must leave the warm buffer"
+    );
+    let resident = state
+        .items
+        .iter()
+        .find(|item| item.id == warm_id)
+        .expect("the admitted item is resident under its original id");
+    assert_eq!(resident.attention, AttentionState::Active);
+}
+
+/// Terminal semantic states never resurrect: admitting a tombstoned entry
+/// is refused with an explainable reason, and the item stays dead.
+#[tokio::test]
+async fn admit_refused_for_terminal_semantic_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        gc_reactivate_per_pass: 8,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    // Two long observations overflow the buffer of 1, forcing the store to
+    // externalize (a single evicted item would stay warm instead).
+    tool_observation(
+        &engine,
+        "1",
+        &format!("step 0: fix AuthService.rs {}", "z".repeat(200)),
+    )
+    .await;
+    tool_observation(
+        &engine,
+        "2",
+        &format!("step 1: fix CacheStore.rs {}", "z".repeat(200)),
+    )
+    .await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    engine.gc().await.unwrap();
+    let refs = engine
+        .search_external(agent_contracts::ContextSearchQuery {
+            query: "AuthService".into(),
+            kind: None,
+            scope: None,
+            task_id: None,
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert!(!refs.is_empty(), "the entry must be externalized");
+    let target = refs[0].item_id;
+    // The entry's semantic lifecycle ends while it sits in the store
+    // (e.g. Storage GC eligibility): it must stop being retrievable.
+    {
+        let mut state = engine.state.lock().await;
+        state
+            .external
+            .get_mut(target)
+            .expect("the external entry exists")
+            .semantic = SemanticState::Tombstoned;
+    }
+    let refused = engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Admit {
+                item_id: target,
+                reason: "should not resurrect".into(),
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("terminal"),
+        "the refusal must be explainable, got {refused}"
+    );
+    assert!(
+        engine.fetch_external(target).await.unwrap().is_none(),
+        "a terminal entry must not be retrievable"
+    );
+}
+
+/// Per-turn quotas bound admit and derive: the model cannot pull the whole
+/// external history into the working set in one turn.
+#[tokio::test]
+async fn admit_and_derive_respect_per_turn_quotas() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 64,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        max_admits_per_turn: 1,
+        max_derived_items_per_turn: 1,
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    tool_observation(&engine, "1", "step 0: fix AuthService.rs").await;
+    tool_observation(&engine, "2", "step 1: fix CacheStore.rs").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    engine.gc().await.unwrap();
+    let warm_ids: Vec<ContextItemId> = {
+        let state = engine.state.lock().await;
+        assert!(
+            state.eviction_buffer.len() >= 2,
+            "the test needs two warm items, got {}",
+            state.eviction_buffer.len()
+        );
+        state.eviction_buffer.iter().map(|item| item.id).collect()
+    };
+
+    // First admit is granted; the second is refused by the per-turn cap.
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Admit {
+                item_id: warm_ids[0],
+                reason: "first admit".into(),
+            },
+        })
+        .await
+        .unwrap();
+    let refused = engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Admit {
+                item_id: warm_ids[1],
+                reason: "second admit".into(),
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("admit refused"),
+        "the per-turn admit cap must refuse, got {refused}"
+    );
+
+    // The derive cap is separate and also refuses after one call.
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Derive {
+                item_id: warm_ids[1],
+                fact: "lesson one".into(),
+                reason: "first derive".into(),
+            },
+        })
+        .await
+        .unwrap();
+    let refused = engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Derive {
+                item_id: warm_ids[1],
+                fact: "lesson two".into(),
+                reason: "second derive".into(),
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("derive refused"),
+        "the per-turn derive cap must refuse, got {refused}"
+    );
+}
+
+/// Derive persists a fact as a NEW item with a new id and an explicit
+/// `DerivedFrom` edge to the source ref — traceable, but never a copy of
+/// the source's identity.
+#[tokio::test]
+async fn derive_creates_a_new_item_with_a_derived_from_edge() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    tool_observation(&engine, "1", "step 0: fix AuthService.rs").await;
+    let source = {
+        let state = engine.state.lock().await;
+        state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::ToolObservation)
+            .expect("the source observation")
+            .id
+    };
+    let before = engine.diagnostics().await.unwrap().total_items;
+
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Derive {
+                item_id: source,
+                fact: "the auth fix landed in AuthService.rs".into(),
+                reason: "lesson for the next task".into(),
+            },
+        })
+        .await
+        .unwrap();
+
+    {
+        let state = engine.state.lock().await;
+        let after = state.items.len();
+        assert_eq!(
+            after,
+            before + 1,
+            "derive must persist exactly one new item"
+        );
+        let derived = state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::Note)
+            .expect("the derived item is a Note");
+        assert_ne!(
+            derived.id, source,
+            "the derived item must mint a NEW id, never reuse the source id"
+        );
+        assert_eq!(
+            derived.content, "the auth fix landed in AuthService.rs",
+            "the derived item carries the persisted fact"
+        );
+        assert!(
+            derived
+                .dependencies
+                .iter()
+                .any(|edge| edge.kind == DependencyKind::DerivedFrom && edge.target == source),
+            "the derived item must carry an explicit DerivedFrom edge, got {:?}",
+            derived.dependencies
+        );
+        assert_eq!(derived.scope, ContextScope::Task);
+        assert_eq!(derived.attention, AttentionState::Active);
+    }
+
+    // A stale derive target is a silent no-op, like every other directive:
+    // the model referenced a ref that left; nothing is minted.
+    let before_stale = engine.diagnostics().await.unwrap().total_items;
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Derive {
+                item_id: ContextItemId::new(),
+                fact: "ghost".into(),
+                reason: "stale".into(),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.diagnostics().await.unwrap().total_items,
+        before_stale,
+        "a stale derive must not mint anything"
     );
 }

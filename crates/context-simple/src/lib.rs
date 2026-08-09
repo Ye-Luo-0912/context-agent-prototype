@@ -1,5 +1,6 @@
 mod checkpoint;
 mod diagnostics;
+mod directive;
 mod engine;
 mod gc;
 mod heap;

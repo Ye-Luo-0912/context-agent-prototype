@@ -16,9 +16,9 @@ use std::time::Duration;
 
 use agent_contracts::{
     AgentError, AgentResult, CONTEXT_MANAGE, ContextEngine, ContextIngress, ContextItemId,
-    ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery, EngineQuery, FocusState,
-    ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, RuntimeEvent, TaskId, ToolCall,
-    ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    ContextKind, ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery, EngineQuery,
+    FocusState, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, RuntimeEvent, TaskId,
+    ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
 use agent_runtime::spawn_runtime;
@@ -105,9 +105,10 @@ fn observation_output(id: &str, ok: bool, content: &str) -> ToolOutput {
     }
 }
 
-/// The minimal retrieval surface: `context.manage` fetch emits the typed
-/// `EngineQuery` the runtime resolves — the tool still never touches the
-/// engine (invariant 3), it only names what it wants.
+/// The minimal retrieval surface: `context.manage` emits the typed
+/// `EngineQuery` the runtime resolves for fetch/search/inspect and the
+/// typed `ContextAction` it routes for admit/derive — the tool still never
+/// touches the engine (invariant 3), it only names what it wants.
 #[derive(Debug)]
 struct EngineQueryTools;
 
@@ -121,8 +122,10 @@ impl ToolDispatcher for EngineQueryTools {
                 "type": "object",
                 "required": ["op"],
                 "properties": {
-                    "op": {"type": "string", "enum": ["fetch"]},
-                    "item_id": {"type": "string"}
+                    "op": {"type": "string", "enum": ["fetch", "search", "inspect", "admit", "derive"]},
+                    "item_id": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "fact": {"type": "string"}
                 }
             }),
             risk: ToolRisk::ReadOnly,
@@ -141,11 +144,15 @@ impl ToolDispatcher for EngineQueryTools {
             .arguments
             .get("item_id")
             .and_then(Value::as_str);
+        let parse_id = || -> AgentResult<ContextItemId> {
+            let id =
+                item_id.ok_or_else(|| AgentError::InvalidRequest("missing item_id".to_string()))?;
+            id.parse()
+                .map_err(|error| AgentError::InvalidRequest(format!("bad item id: {error}")))
+        };
         match (op, item_id) {
-            ("fetch", Some(id)) => {
-                let item_id: ContextItemId = id
-                    .parse()
-                    .map_err(|error| AgentError::InvalidRequest(format!("bad item id: {error}")))?;
+            ("fetch", Some(_)) => {
+                let item_id = parse_id()?;
                 Ok(ToolOutcome::EngineQuery {
                     output: ToolOutput {
                         call_id: request.call.id.clone(),
@@ -157,6 +164,96 @@ impl ToolDispatcher for EngineQueryTools {
                         metadata: json!({"engine_query": true}),
                     },
                     query: EngineQuery::FetchExternal { item_id },
+                })
+            }
+            ("search", _) => Ok(ToolOutcome::EngineQuery {
+                output: ToolOutput {
+                    call_id: request.call.id.clone(),
+                    tool_name: CONTEXT_MANAGE.into(),
+                    ok: true,
+                    summary: "querying the context engine".into(),
+                    model_content: "resolving...".into(),
+                    artifact_ref: None,
+                    metadata: json!({"engine_query": true}),
+                },
+                query: EngineQuery::SearchExternal {
+                    query: "step".into(),
+                    kind: None,
+                    scope: None,
+                    task_id: None,
+                    limit: 16,
+                },
+            }),
+            ("inspect", Some(_)) => {
+                let item_id = parse_id()?;
+                Ok(ToolOutcome::EngineQuery {
+                    output: ToolOutput {
+                        call_id: request.call.id.clone(),
+                        tool_name: CONTEXT_MANAGE.into(),
+                        ok: true,
+                        summary: "querying the context engine".into(),
+                        model_content: "resolving...".into(),
+                        artifact_ref: None,
+                        metadata: json!({"engine_query": true}),
+                    },
+                    query: EngineQuery::InspectExternal { item_id },
+                })
+            }
+            ("admit", Some(_)) => {
+                let item_id = parse_id()?;
+                let reason = request
+                    .call
+                    .arguments
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("needed again")
+                    .to_string();
+                let action = agent_contracts::ContextAction::Admit { item_id, reason };
+                Ok(ToolOutcome::RuntimeDirective {
+                    output: ToolOutput {
+                        call_id: request.call.id.clone(),
+                        tool_name: CONTEXT_MANAGE.into(),
+                        ok: true,
+                        summary: "admitting ref".into(),
+                        model_content: "admitting ref".into(),
+                        artifact_ref: None,
+                        metadata: json!({"context_action": "admit"}),
+                    },
+                    directive: agent_contracts::RuntimeDirective::Context(action),
+                })
+            }
+            ("derive", Some(_)) => {
+                let item_id = parse_id()?;
+                let fact = request
+                    .call
+                    .arguments
+                    .get("fact")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the fix landed in AuthService.rs")
+                    .to_string();
+                let reason = request
+                    .call
+                    .arguments
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("lesson")
+                    .to_string();
+                let action = agent_contracts::ContextAction::Derive {
+                    item_id,
+                    fact,
+                    reason,
+                };
+                Ok(ToolOutcome::RuntimeDirective {
+                    output: ToolOutput {
+                        call_id: request.call.id.clone(),
+                        tool_name: CONTEXT_MANAGE.into(),
+                        ok: true,
+                        summary: "deriving fact".into(),
+                        model_content: "deriving fact".into(),
+                        artifact_ref: None,
+                        metadata: json!({"context_action": "derive"}),
+                    },
+                    directive: agent_contracts::RuntimeDirective::Context(action),
                 })
             }
             other => Err(AgentError::Tool(format!("unsupported op: {other:?}"))),
@@ -209,11 +306,25 @@ impl ModelTransport for RecallModel {
             }
             return Ok(ModelOutput {
                 content: "pulling the externalized observation back".into(),
-                tool_calls: vec![ToolCall {
-                    id: "recall-1".into(),
-                    name: CONTEXT_MANAGE.into(),
-                    arguments: json!({"op": "fetch", "item_id": self.target_id.to_string()}),
-                }],
+                tool_calls: vec![
+                    ToolCall {
+                        id: "recall-1".into(),
+                        name: CONTEXT_MANAGE.into(),
+                        arguments: json!({"op": "fetch", "item_id": self.target_id.to_string()}),
+                    },
+                    // Search and inspect are transient reads too: they must
+                    // not duplicate the ref under a new observation id.
+                    ToolCall {
+                        id: "recall-2".into(),
+                        name: CONTEXT_MANAGE.into(),
+                        arguments: json!({"op": "search", "query": "step"}),
+                    },
+                    ToolCall {
+                        id: "recall-3".into(),
+                        name: CONTEXT_MANAGE.into(),
+                        arguments: json!({"op": "inspect", "item_id": self.target_id.to_string()}),
+                    },
+                ],
                 usage: Default::default(),
             });
         }
@@ -237,9 +348,16 @@ async fn recall_turn_pulls_external_content_back_without_polluting_the_prompt() 
         gc_buffer_capacity: 1,
         gc_reactivate_per_pass: 8,
         context_store_dir: Some(dir.path().to_path_buf()),
+        // The seed's user message sits in a suspended task scope after the
+        // runtime auto-creates its own task; a long TTL + generation cap
+        // keep it resident so the count assertions measure the turn's
+        // disposition behavior, not the generational GC's staleness.
+        turn_ttl_ticks: 1000,
+        gc_max_generation: 100,
         ..SimpleContextConfig::default()
     }));
     let (target_id, expected_content) = seed_externalized(&engine).await;
+    let catalog_before = engine.diagnostics().await.unwrap().total_items;
 
     // The prompt never carried the full content: materialize right after
     // the seed and confirm the frame exposes the externalized item as a
@@ -312,13 +430,15 @@ async fn recall_turn_pulls_external_content_back_without_polluting_the_prompt() 
 
     // The model saw the ref in the prompt, fetched it, and got the exact
     // content back — through the tool result, not the prompt.
-    let round_1 = model.round_1.lock().unwrap();
-    assert!(
-        round_1
-            .iter()
-            .any(|line| line.contains(&target_id.to_string())),
-        "round 1 must expose the externalized ref, saw: {round_1:?}"
-    );
+    {
+        let round_1 = model.round_1.lock().unwrap();
+        assert!(
+            round_1
+                .iter()
+                .any(|line| line.contains(&target_id.to_string())),
+            "round 1 must expose the externalized ref, saw: {round_1:?}"
+        );
+    }
     assert!(
         !model.round_1_saw_content.load(Ordering::SeqCst),
         "the prompt must not carry the full externalized content before the fetch"
@@ -326,5 +446,174 @@ async fn recall_turn_pulls_external_content_back_without_polluting_the_prompt() 
     assert!(
         model.round_2_saw_content.load(Ordering::SeqCst),
         "the model must receive the exact content through the tool result"
+    );
+
+    // CTX-03: fetch/search/inspect results are transient. They reached the
+    // model through the turn frame, but finalization must not persist them
+    // as new observations. The turn's own user + assistant messages are
+    // expected to persist; a retrieval result would show up as an extra
+    // ToolObservation.
+    let after = engine.diagnostics().await.unwrap();
+    let summaries = engine.inspect(100).await.unwrap();
+    assert_eq!(
+        after.total_items,
+        catalog_before + 2,
+        "only the turn's user + assistant messages may be added, got {} -> {}",
+        catalog_before,
+        after.total_items
+    );
+    assert!(
+        summaries
+            .iter()
+            .all(|s| s.kind != ContextKind::ToolObservation),
+        "context fetch/search/inspect must not persist ToolObservations: {:?}",
+        summaries.iter().map(|s| s.kind).collect::<Vec<_>>()
+    );
+    assert!(
+        engine.inspect_external(target_id).await.unwrap().is_some(),
+        "the fetched entry keeps its original id and stays retrievable"
+    );
+}
+
+/// CTX-03 end to end for the directive half: `admit` re-enters the item
+/// under its ORIGINAL id (identity preserved, one lifecycle transition) and
+/// `derive` mints a new Note — and neither directive's tool result is
+/// duplicated as a ToolObservation, because the admission event and the
+/// derived item are the records.
+#[tokio::test]
+async fn admit_and_derive_through_the_runtime_never_duplicate_observations() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        gc_reactivate_per_pass: 8,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        // Same long-TTL/generation choice as the fetch test: the count
+        // assertions must measure dispositions, not GC staleness.
+        turn_ttl_ticks: 1000,
+        gc_max_generation: 100,
+        ..SimpleContextConfig::default()
+    }));
+    let (target_id, _) = seed_externalized(&engine).await;
+    let catalog_before = engine.diagnostics().await.unwrap().total_items;
+
+    // One turn: round 1 calls admit (same id) + derive (new id) on the ref;
+    // round 2 replies plain so the turn finalizes.
+    struct AdmitDeriveModel {
+        target_id: ContextItemId,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ModelTransport for AdmitDeriveModel {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::default()
+        }
+        async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+            let round = self.calls.fetch_add(1, Ordering::SeqCst);
+            if round == 0 {
+                return Ok(ModelOutput {
+                    content: "admitting and deriving from the ref".into(),
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "admit-1".into(),
+                            name: CONTEXT_MANAGE.into(),
+                            arguments: json!({
+                                "op": "admit",
+                                "item_id": self.target_id.to_string(),
+                                "reason": "the model needs this step again"
+                            }),
+                        },
+                        ToolCall {
+                            id: "derive-1".into(),
+                            name: CONTEXT_MANAGE.into(),
+                            arguments: json!({
+                                "op": "derive",
+                                "item_id": self.target_id.to_string(),
+                                "fact": "the auth fix landed in AuthService.rs",
+                                "reason": "lesson"
+                            }),
+                        },
+                    ],
+                    usage: Default::default(),
+                });
+            }
+            Ok(ModelOutput {
+                content: "done".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            })
+        }
+    }
+
+    let model = Arc::new(AdmitDeriveModel {
+        target_id,
+        calls: AtomicUsize::new(0),
+    });
+    let kernel = Arc::new(AgentKernel::new(
+        AgentKernelConfig::default(),
+        engine.clone(),
+        model.clone(),
+        Arc::new(EngineQueryTools),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _runtime_task) = spawn_runtime(kernel);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .user_message("admit and derive from the recalled ref".into())
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut completed = false;
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if matches!(envelope.event, RuntimeEvent::TurnCompleted) {
+                completed = true;
+            }
+        }
+        if completed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(completed, "the admit/derive turn must complete");
+    handle.stop().await.unwrap();
+
+    // The admitted item is back under its original id (identity preserved,
+    // no copy) and the derived Note was minted — and neither directive
+    // result became a ToolObservation, so the total grew by exactly:
+    // user + assistant messages + admitted + derived = 4.
+    let after = engine.diagnostics().await.unwrap();
+    let summaries = engine.inspect(100).await.unwrap();
+    assert_eq!(
+        after.total_items,
+        catalog_before + 4,
+        "expected user+assistant+admitted+derived, got {} -> {}",
+        catalog_before,
+        after.total_items
+    );
+    let admitted = summaries.iter().filter(|s| s.id == target_id).count();
+    assert_eq!(
+        admitted, 1,
+        "the admitted item must exist exactly once under its original id, got {summaries:?}"
+    );
+    assert!(
+        summaries.iter().any(|s| s.kind == ContextKind::Note),
+        "the derived fact must be persisted as a new Note"
+    );
+    assert!(
+        engine.inspect_external(target_id).await.unwrap().is_none(),
+        "the admitted item must leave the external map (no duplicate owner)"
+    );
+    // The only ToolObservation-capable evidence is the admitted item
+    // itself; the directives' own results were not persisted.
+    let tool_observations = summaries
+        .iter()
+        .filter(|s| s.kind == ContextKind::ToolObservation)
+        .count();
+    assert_eq!(
+        tool_observations, 1,
+        "only the admitted item may be a ToolObservation, got {summaries:?}"
     );
 }

@@ -72,6 +72,13 @@ the closed-scope GC rule, same-template messages kept a focus-match floor
 above `active_threshold`, were rated Active every maintain pass, and were
 never evictable.
 
+Residual correctness follow-up (does not invalidate the bounded-residency
+acceptance): episode rotation closes the Focus scope but does not reset the
+shared `FocusState.generation`. Once the 500-turn guard first fires, every
+later user message can satisfy the same guard and rotate again. Reset or
+replace the episode-local counter and add a cadence regression proving one
+overlong episode does not permanently exhaust every later episode's budget.
+
 Confirmed behavior (as audited):
 
 - `context-simple/src/scope.rs::open_focus_scope` reused one Focus scope for
@@ -167,6 +174,13 @@ GC moves `body_location`; it does not move or duplicate authority metadata.
 Property tests must run supersession, recurrence, verification, completion
 and quota sequences with the target initially in every residency.
 
+Residual correctness follow-up: terminal semantic mutations now span body
+locations, but minor TTL/tombstone aging still iterates Resident items and
+Stored metadata cannot represent every keep/lease directive field. A live
+item that moves to Warm/Cold/External can therefore escape the same lifecycle
+clock. Make aging/protection semantics catalog-owned before closing the
+structural target.
+
 ### CTX-03 — Fetch/Search/Inspect persist as new observations
 
 The contract says fetch is a transient store read, but runtime tool results
@@ -185,6 +199,49 @@ id) and `derive(ref, fact, reason)` (new id + `DerivedFrom`).
 
 Acceptance: fetch/search/inspect leave catalog ids/count unchanged; admit
 preserves identity and produces one lifecycle transition.
+
+**Closed 2026-08-10.**
+
+Implemented:
+
+- `ToolResultDisposition` is now three-valued — `PersistObservation`
+  (default) | `TransientNoPersist` | `AccessEventOnly` — and rides on
+  `TurnFrameStep::ToolResult`. The actor marks `EngineQuery` results
+  (search/inspect/fetch) `TransientNoPersist`, `context.admit` results
+  `AccessEventOnly` (the admission event is the record — the same item id
+  must not be duplicated), and `context.derive` results
+  `TransientNoPersist` (the derived item is the record). `finalize_turn`
+  skips every non-`PersistObservation` step, so a transient read never
+  becomes a `ToolObservation` with a new id.
+- `context.manage` gains `admit` and `derive` ops alongside
+  search/inspect/fetch. `admit(ref, reason)` routes a
+  `ContextAction::Admit` that re-enters the item into the working set under
+  its ORIGINAL id — heap resident is a no-op, warm buffer moves to the
+  heap, and an externalized item is read back from the store (plan -> io ->
+  commit, the lock is never held across disk IO) — with exactly one
+  `ContextStateTransition` ("admitted by model directive: <reason>") and a
+  refreshed lifecycle clock (the explicitly admitted item is a fresh
+  working-set member, so the ephemeral TTL does not tombstone it the moment
+  it re-enters). Terminal semantic states refuse admit ("terminal states
+  never resurrect"); stale ids are silent no-ops.
+- `derive(ref, fact, reason)` routes a `ContextAction::Derive` that mints a
+  NEW item (`ContextKind::Note`) with an explicit `DependencyKind::DerivedFrom`
+  edge to the source ref — traceable, never a copy of the source id.
+- both directives are quota-bounded per turn (`max_admits_per_turn`,
+  `max_derived_items_per_turn`, default 8 each); content is bounded by
+  `max_item_chars`.
+
+Acceptance (new tests): engine-level
+`admit_externalized_item_preserves_identity_and_produces_one_transition`,
+`admit_warm_buffer_item_preserves_identity_and_one_transition`,
+`admit_refused_for_terminal_semantic_item`,
+`admit_and_derive_respect_per_turn_quotas`,
+`derive_creates_a_new_item_with_a_derived_from_edge`; runtime-level
+`recall_turn_pulls_external_content_back_without_polluting_the_prompt`
+(fetch + search + inspect in one turn leave catalog count unchanged) and
+`admit_and_derive_through_the_runtime_never_duplicate_observations`
+(catalog delta is exactly the turn's messages + the admitted item + the
+derived Note; no directive result is duplicated).
 
 ### CTX-04 — Context-store blob ownership and crash recovery are incomplete
 
@@ -227,6 +284,54 @@ EvidenceFor | DerivedFrom | VerifiedBy | ArtifactOf | Continuation
 Storage GC must root every non-deletable record and traverse strong edges
 before selecting a terminal, retention-eligible, expired target. Add random
 graph safety and liveness tests across all body locations.
+
+### CTX-10 — TaskAnchor and completion output have no authoritative contract
+
+The runtime can recycle completed-task process detail, but it cannot identify
+or durably protect the actual task result:
+
+- `TaskRecord`/RuntimeCheckpoint only retain id, goal, status and timestamps;
+  suspended work has no authoritative criteria, plan, open loops or resume
+  point;
+- the model's actual final response is an ordinary Working
+  `AssistantMessage`, is truncated before entering ContextItem, and is
+  archived with the task's ordinary dialogue;
+- `/done <summary>` accepts unrelated free text and writes it as a Session
+  Durable Summary after focus was cleared, so it gets `task_id=None`, becomes
+  a global GC/materialization root, and is not linked to final output,
+  artifacts, acceptance criteria or verification;
+- `TaskCompleted` events omit task/result identity, and restore cannot verify
+  that a completed task owns exactly one committed outcome.
+
+Required contract:
+
+- actor-owned bounded/versioned `TaskAnchor` with goal, user-authority
+  constraints, acceptance criteria, plan progress, current episode, open
+  loops and typed root claims; updates are sourced CAS patches;
+- separate Prompt, Resident and Storage root semantics. The Anchor itself is
+  task authority, not a scored ContextItem;
+- immutable `CompletionRecord`/`TaskOutcome` with task id, anchor revision,
+  outcome status, exact final-output body ref + digest, acceptance results,
+  artifacts/effects, verification, unresolved state and episode outcomes;
+- atomic root transfer: `CompletionPrepared` first protects/finalizes output
+  and evidence, then commits the outcome, closes scopes, releases active
+  roots and finally commits TaskManager completion. Failure remains
+  Active/Completing/ClosePending and is idempotently recoverable;
+- a completed outcome is a Storage root and explicit task-catalog result, not
+  an automatic prompt/residency root for unrelated tasks.
+
+Acceptance:
+
+- `Completed` iff one committed CompletionRecord exists and task/focus scopes
+  are closed; restore rejects every other combination;
+- final output is byte-for-byte readable by digest after overflow, restart
+  and Storage GC;
+- completion fault injection never produces a half-closed task or releases
+  the only output/evidence roots;
+- 1,000 completed tasks keep Resident/candidate work bounded, while every
+  outcome remains searchable by task id;
+- Active -> Suspend -> unrelated GC -> Resume restores Anchor revision,
+  criteria/open loops and ResumePoint without replaying the old transcript.
 
 ### CORE-01 — Process capabilities bypass effect and approval boundaries
 
@@ -288,6 +393,9 @@ ordinary event.
 - restore migration validates Resident only, not duplicate ids, scope
   ancestry, body location or store files;
 - task close may leave deep descendants open;
+- scope-close promotion/transition logic primarily visits Resident bodies;
+- tool-scope close currently discards context-close errors and returned
+  transitions instead of publishing an auditable result;
 - a named task summary can inherit the wrong current focus identity/scope.
 
 First safe step: serialize GC/storage-GC/checkpoint/restore and validate all
@@ -327,6 +435,10 @@ interpret it as age. Separate `event_seq`, `user_turn`, `gc_epoch` and
 Use bounded GC event counters/samples plus an artifact-backed ledger with
 item/revision/axis/from/to/cause/trigger/turn/related-id. Diagnostics must
 cover all body locations; root/externalize/age/recall need item reasons.
+`ContextDiagnostics.total_items` and `inspect()` currently count Resident
+only, so replay `final_total` is not a logical-catalog total. Also propagate
+audit failures from `BeforeModel` maintenance and explicit collect; a state
+change must not silently outrun its journal event.
 
 ### CORE-03 — Checkpoint capture is not an atomic cross-plane snapshot
 
@@ -376,11 +488,50 @@ open/create can race a link swap. Trusted Core should use directory-handle-
 relative/openat-style operations (and Windows equivalent), reject reparse
 substitution at operation time, and test concurrent swaps.
 
+### CORE-08 — Per-call approval cannot support unattended long tasks
+
+The current policy has two extremes:
+
+- `PolicyApprovalGate` uses global booleans for all WorkspaceWrite and all
+  ProcessExecution calls;
+- `InteractiveApprovalGate` prompts on every non-read-only call, waits up to
+  five minutes, then denies on timeout.
+
+There is no task/session-scoped standing grant, target/path restriction,
+effect/reversibility classification, expiry/revocation, interruption budget,
+batched boundary request, or “deny this effect and continue independent work”
+contract. Coarse `ProcessExecution` also treats a bounded local test and a
+dangerous external command as the same interaction burden.
+
+Required direction (after/unified with M12 Effect Runtime and M14 Resource
+Policy):
+
+- trusted `TaskExecutionPolicy` with narrow effect + target + constraint +
+  expiry grants; the model can use but never widen it;
+- automatic operation inside the standing sandbox/task grant;
+- derive risk from the prepared effect, target scope and reversibility, not
+  only a tool's declaration;
+- no responder means deny/skip and continue safe independent work, never
+  implicit allow and never an indefinitely blocked run;
+- aggregate unavoidable goal/scope/irreversible boundary choices at a
+  checkpoint with an interruption cap;
+- finish `Partial`/`Blocked` with one consolidated boundary report when an
+  ungranted effect is truly essential.
+
+Acceptance: a long coding task can edit its granted workspace and run bounded
+local tests without per-call prompts; it cannot push/deploy/delete broadly or
+access secrets/network without the matching narrow grant; zero user responses
+produces no privilege expansion and no five-minute-per-call stall.
+
 ## P2 — policy quality and evaluation
 
 - terminal semantic checks should precede pinned retention;
 - replace weak `SharesEntities` pseudo-dependencies with typed edges;
 - add store corruption/reconcile and lifecycle growth-slope metrics;
+- make fact comparison replay each policy on a fresh engine; the current
+  observing run and coverage run reuse one engine, contaminating the latter;
+- replace the fixed-marker rolling baseline with real compaction and account
+  for actor, compactor, recall, store, tool-schema and wall-time cost;
 - audit process parity whenever `ContextEngine` gains a method;
 - compare dynamic, rolling and append-only engines on these scenarios:
 
@@ -409,15 +560,17 @@ savings.
 
 ## Suggested independent Agent work packages
 
-1. **Context properties:** residency × lifecycle tests for CTX-01/02/03
+1. **Task authority/completion:** CTX-10 contracts, checkpoint, root transfer
+   and fault tests; do not combine with scoring changes.
+2. **Context properties:** residency × lifecycle tests for CTX-01/02/03
    before policy changes.
-2. **Store integrity:** CTX-04/05 plus crash injection/reconcile; no scoring
+3. **Store integrity:** CTX-04/05 plus crash injection/reconcile; no scoring
    edits.
-3. **Context concurrency:** CTX-06 with operation gate/restore validation.
-4. **Materializer:** CTX-07/08 and budget/candidate metrics; no store edits.
-5. **Trusted effect + sandbox:** CORE-01/06/07 in M12 -> M13 order.
-6. **Durability:** CORE-02 plus recovery replay, isolated from policy.
-7. **Prompt/resource boundary:** CORE-04/05 with adversarial evals.
+4. **Context concurrency:** CTX-06 with operation gate/restore validation.
+5. **Materializer:** CTX-07/08 and budget/candidate metrics; no store edits.
+6. **Trusted effect + sandbox:** CORE-01/06/07/08 in M12 -> M14 order.
+7. **Durability:** CORE-02 plus recovery replay, isolated from policy.
+8. **Prompt/resource boundary:** CORE-04/05 with adversarial evals.
 
 Do not run packages editing the same crate concurrently unless file ownership
 is explicitly partitioned.

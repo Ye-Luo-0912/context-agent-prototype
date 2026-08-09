@@ -46,6 +46,12 @@ enum ManageOp {
     Inspect,
     /// Pull the full content of one externalized item back from the store.
     Fetch,
+    /// Re-enter an externalized ref into the working set under its original
+    /// id (one lifecycle transition; identity preserved).
+    Admit,
+    /// Persist a fact derived from a ref as a new item with a `DerivedFrom`
+    /// link to the source.
+    Derive,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +77,11 @@ struct ManageArgs {
     scope: Option<ContextScope>,
     #[serde(default)]
     task_id: Option<TaskId>,
+    // Admit / derive
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    fact: Option<String>,
 }
 
 pub(crate) struct ContextManageTool;
@@ -95,9 +106,12 @@ impl Tool for ContextManageTool {
             description: concat!(
                 "One entry point for runtime context control and the externalized-ref retrieval loop. ",
                 "Directive ops (gc_hint/tag/lease/collect) ask the runtime to change context state; ",
-                "query ops (search/inspect/fetch) read externalized refs — search lists refs matching ",
-                "an entity/kind/scope/task query, inspect shows one ref's metadata, fetch pulls its ",
-                "full content back on demand. Item ids come from the materialized context frame."
+                "admit re-enters an externalized ref into the working set under its original id ",
+                "(one lifecycle transition, identity preserved); derive persists a fact as a new ",
+                "item with a DerivedFrom link to the ref. Query ops (search/inspect/fetch) read ",
+                "externalized refs — search lists refs matching an entity/kind/scope/task query, ",
+                "inspect shows one ref's metadata, fetch pulls its full content back on demand. ",
+                "Item ids come from the materialized context frame."
             )
             .to_string(),
             input_schema: json!({
@@ -106,12 +120,14 @@ impl Tool for ContextManageTool {
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["gc_hint", "tag", "lease", "collect", "search", "inspect", "fetch"]
+                        "enum": ["gc_hint", "tag", "lease", "collect", "search", "inspect", "fetch", "admit", "derive"]
                     },
-                    "item_id": {"type": "string", "description": "Target item (gc_hint/tag/lease/inspect/fetch)"},
+                    "item_id": {"type": "string", "description": "Target item (gc_hint/tag/lease/inspect/fetch/admit/derive)"},
                     "keep": {"type": "boolean", "description": "gc_hint: true protects, false releases"},
                     "tag": {"type": "string", "description": "tag: tag text (stored under the ext: namespace)"},
                     "turns": {"type": "integer", "minimum": 1, "description": "lease: how many turns the item stays protected"},
+                    "reason": {"type": "string", "description": "admit: why this ref is being pulled back into the working set"},
+                    "fact": {"type": "string", "description": "derive: the fact to persist as a new derived item"},
                     "query": {"type": "string", "description": "search: free text matched against entity signatures and summaries"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 64, "description": "search: max refs to return (default 16)"},
                     "kind": {"type": "string", "description": "search: optional ContextKind filter"},
@@ -259,6 +275,48 @@ impl Tool for ContextManageTool {
                     query: EngineQuery::FetchExternal { item_id },
                 })
             }
+            // ---- Admit / derive: typed ContextActions the runtime routes ----
+            ManageOp::Admit => {
+                let item_id = require(args.item_id, "admit", "item_id")?;
+                let reason = require(args.reason, "admit", "reason")?;
+                let action = ContextAction::Admit { item_id, reason };
+                let description = describe(&action);
+                Ok(ToolOutcome::RuntimeDirective {
+                    output: ToolOutput {
+                        call_id: call_id.into(),
+                        tool_name: CONTEXT_MANAGE.into(),
+                        ok: true,
+                        summary: description.clone(),
+                        model_content: description,
+                        artifact_ref: None,
+                        metadata: json!({"context_action": action}),
+                    },
+                    directive: agent_contracts::RuntimeDirective::Context(action),
+                })
+            }
+            ManageOp::Derive => {
+                let item_id = require(args.item_id, "derive", "item_id")?;
+                let fact = require(args.fact, "derive", "fact")?;
+                let reason = require(args.reason, "derive", "reason")?;
+                let action = ContextAction::Derive {
+                    item_id,
+                    fact,
+                    reason,
+                };
+                let description = describe(&action);
+                Ok(ToolOutcome::RuntimeDirective {
+                    output: ToolOutput {
+                        call_id: call_id.into(),
+                        tool_name: CONTEXT_MANAGE.into(),
+                        ok: true,
+                        summary: description.clone(),
+                        model_content: description,
+                        artifact_ref: None,
+                        metadata: json!({"context_action": action}),
+                    },
+                    directive: agent_contracts::RuntimeDirective::Context(action),
+                })
+            }
         }
     }
 }
@@ -275,5 +333,15 @@ fn describe(action: &ContextAction) -> String {
             format!("lease: item {item_id} protected for {turns} turns")
         }
         ContextAction::Collect => "collect: full GC pass requested".to_string(),
+        ContextAction::Admit { item_id, reason } => {
+            format!("admit: item {item_id} re-enters the working set — {reason}")
+        }
+        ContextAction::Derive {
+            item_id,
+            fact,
+            reason,
+        } => {
+            format!("derive: '{fact}' persisted as a new item derived from {item_id} — {reason}")
+        }
     }
 }

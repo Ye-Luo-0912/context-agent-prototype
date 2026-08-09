@@ -135,6 +135,11 @@ pub enum DependencyKind {
     #[default]
     #[serde(rename = "shares_entities")]
     SharesEntities,
+    /// The item is a fact the model derived from the target ref
+    /// (`context.derive`): a new item with its own id, explicitly linked
+    /// back to the ref it came from, so traceability survives storage GC.
+    #[serde(rename = "derived_from")]
+    DerivedFrom,
 }
 
 /// One explicit dependency edge: the item depends on `target` for the
@@ -384,6 +389,26 @@ pub enum ContextAction {
     /// Run a full GC pass now (`context.collect`). Handled by the runtime
     /// — it owns the GC pass — not by `ContextIngress::ContextDirective`.
     Collect,
+    /// Bring an item back into the working set under its *original* item
+    /// id (`context.admit`). Unlike `fetch` (transient read only), admit
+    /// produces one lifecycle transition: the item re-enters the heap with
+    /// the same id, re-stamped into the current task's scope, so it can be
+    /// materialized without a later re-fetch. Terminal items (superseded,
+    /// verified-fixed, tombstoned) are refused — semantic death never
+    /// resurrects.
+    Admit {
+        item_id: ContextItemId,
+        reason: String,
+    },
+    /// Persist a fact derived from a ref (`context.derive`): a *new* item
+    /// with a new id and an explicit `DerivedFrom` edge to the source ref,
+    /// so the derived knowledge is traceable but never confuses the source
+    /// ref's identity with a copy.
+    Derive {
+        item_id: ContextItemId,
+        fact: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

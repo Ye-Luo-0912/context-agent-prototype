@@ -419,6 +419,42 @@ The structural target remains a single `ContextCatalog` record per
 `item_id` carrying identity + lifecycle metadata + `body_location`; see
 `docs/AUDIT_TODO.md` CTX-02.
 
+### Retrieval results are transient; admit and derive move items deliberately (CTX-03)
+
+The model-facing retrieval loop (`context.manage` op=search/inspect/fetch)
+is a **store read, not an observation**: the result is visible to the
+current turn through the tool result, but finalization must not persist it
+under a new `ToolObservation` id. Every `TurnFrameStep::ToolResult` carries
+a `ToolResultDisposition`:
+
+- `PersistObservation` (default) — the result becomes a long-term
+  observation at turn end.
+- `TransientNoPersist` — search/inspect/fetch results, and the result text
+  of a `derive` directive: visible to the turn, never persisted. The engine
+  already stamps `last_access` on the read itself, so recency stays honest
+  without duplicating evidence.
+- `AccessEventOnly` — the result of an `admit` directive: not persisted as
+  an observation, because the admission event *is* the record (the same
+  item id must not be duplicated under a new id).
+
+`fetch(ref)` is a pure read. `admit(ref, reason)` and `derive(ref, fact,
+reason)` are explicit lifecycle moves:
+
+- **admit** re-enters the item into the working set under its ORIGINAL id:
+  heap-resident is a no-op; a warm-buffer item moves to the heap; an
+  externalized item is read back from the store (plan -> io -> commit, the
+  state lock is never held across disk IO) and re-stamped into the current
+  working scope, producing exactly one `ContextStateTransition`
+  ("admitted by model directive: <reason>"). The lifecycle clock is
+  refreshed on admit — the item's presence in the heap is a fresh,
+  deliberate act — so the ephemeral TTL does not tombstone it the moment it
+  re-enters. Terminal semantic states refuse admit; stale ids are silent
+  no-ops; the per-turn cap (`max_admits_per_turn`) bounds the model.
+- **derive** mints a NEW item (`ContextKind::Note`) with an explicit
+  `DependencyKind::DerivedFrom` edge to the source ref: the derivation is
+  traceable but never confuses the source's identity with a copy. Bounded
+  per turn (`max_derived_items_per_turn`) and per item (`max_item_chars`).
+
 ## 9c. P4: entity affinity and the explicit dependency graph
 
 Two more explicit, non-learned signals make the working set follow what the
@@ -738,11 +774,14 @@ external section carries only the bounded ref preview (content truncated
 at externalization), never the full externalized content.
 
 The engine-level fetch is still a read and does not reactivate the stored
-record. The current runtime does, however, persist fetch/search/inspect tool
-results as fresh ToolObservations at finalization. That duplicates content
-under new ids, so end-to-end retrieval is not yet working-set-neutral.
-`docs/AUDIT_TODO.md` CTX-03 tracks a transient result disposition and the
-explicit fetch/admit/derive split.
+record. Since CTX-03, the runtime also no longer persists retrieval results
+as fresh observations: every `TurnFrameStep::ToolResult` carries a
+`ToolResultDisposition` (`PersistObservation` | `TransientNoPersist` |
+`AccessEventOnly`), and search/inspect/fetch results are transient — visible
+to the turn, never duplicated under a new id. The explicit
+fetch/admit/derive split (see §9b, "Retrieval results are transient...")
+completes the retrieval surface: fetch is a pure read, admit re-enters an
+item under its original id, derive mints a new derived item.
 
 Default operational retrieval is Live-only at every entry point: materialized
 external refs, search, inspect and fetch all hide Superseded, VerifiedFixed

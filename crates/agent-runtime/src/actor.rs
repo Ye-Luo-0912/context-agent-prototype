@@ -13,7 +13,7 @@ use agent_contracts::{
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect,
     EffectCommitError, ModelInput, ModelRequest, OperationId, OperationOutcome, OperationResult,
     RuntimeDirective, RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall, ToolOutcome, ToolOutput,
-    ToolSurfaceSnapshot, TurnFrame, TurnFrameStep, TurnId,
+    ToolResultDisposition, ToolSurfaceSnapshot, TurnFrame, TurnFrameStep, TurnId,
 };
 use agent_kernel::AgentKernel;
 use tokio::sync::mpsc;
@@ -138,6 +138,10 @@ pub(crate) struct OperationCompletion {
     /// output. Executed at commit time, right after the effect — so a
     /// "manual collect now" is actually now, not at turn end.
     directive: Option<RuntimeDirective>,
+    /// Whether the result persists as a long-term observation at turn end.
+    /// Engine-query results (context search/inspect/fetch) are transient:
+    /// they must not duplicate fetched evidence under a new id (CTX-03).
+    disposition: ToolResultDisposition,
 }
 
 /// Mutable runtime state, owned exclusively by the actor loop. Callers never
@@ -962,6 +966,7 @@ impl RuntimeActor {
                     kind: OpKind::Model,
                     effect: None,
                     directive: None,
+                    disposition: ToolResultDisposition::PersistObservation,
                 })
                 .await;
         });
@@ -1022,7 +1027,7 @@ impl RuntimeActor {
         let task_id = self.state.task_id;
         tokio::spawn(async move {
             let outcome = kernel.execute_tool(call, cancel, &surface).await;
-            let (operation, effect, directive) = match outcome {
+            let (operation, effect, directive, disposition) = match outcome {
                 ToolOutcome::Value(output) => (
                     OperationResult {
                         run_id,
@@ -1035,6 +1040,7 @@ impl RuntimeActor {
                     },
                     None,
                     None,
+                    ToolResultDisposition::PersistObservation,
                 ),
                 ToolOutcome::PreparedEffect { output, effect } => (
                     OperationResult {
@@ -1048,24 +1054,45 @@ impl RuntimeActor {
                     },
                     Some(effect),
                     None,
+                    ToolResultDisposition::PersistObservation,
                 ),
-                ToolOutcome::RuntimeDirective { output, directive } => (
-                    OperationResult {
-                        run_id,
-                        turn_id,
-                        task_id,
-                        scope_id: tool_scope,
-                        operation_id,
-                        generation,
-                        outcome: OperationOutcome::ToolOutput(output),
-                    },
-                    None,
-                    Some(directive),
-                ),
+                ToolOutcome::RuntimeDirective { output, directive } => {
+                    // Most directives are decision records and persist as
+                    // observations. `admit` re-enters the *same* item id, so
+                    // persisting the result would duplicate it under a new
+                    // id — the admission event is the record (CTX-03).
+                    // `derive` already persists a new derived item via the
+                    // directive; the result text stays transient (CTX-03).
+                    let disposition = match &directive {
+                        RuntimeDirective::Context(agent_contracts::ContextAction::Admit {
+                            ..
+                        }) => ToolResultDisposition::AccessEventOnly,
+                        RuntimeDirective::Context(agent_contracts::ContextAction::Derive {
+                            ..
+                        }) => ToolResultDisposition::TransientNoPersist,
+                        _ => ToolResultDisposition::PersistObservation,
+                    };
+                    (
+                        OperationResult {
+                            run_id,
+                            turn_id,
+                            task_id,
+                            scope_id: tool_scope,
+                            operation_id,
+                            generation,
+                            outcome: OperationOutcome::ToolOutput(output),
+                        },
+                        None,
+                        Some(directive),
+                        disposition,
+                    )
+                }
                 // The tool asked the runtime to resolve a read-only engine
                 // query: the kernel (the ContextEngine owner) answers and
                 // the placeholder output becomes the final one. No effect,
-                // no directive — search/inspect/fetch are pure reads.
+                // no directive — search/inspect/fetch are pure reads. The
+                // result is transient (CTX-03): reading evidence must not
+                // duplicate it as a new observation.
                 ToolOutcome::EngineQuery { output, query } => {
                     let resolved = kernel.resolve_engine_query(output, query).await;
                     (
@@ -1080,6 +1107,7 @@ impl RuntimeActor {
                         },
                         None,
                         None,
+                        ToolResultDisposition::TransientNoPersist,
                     )
                 }
             };
@@ -1089,6 +1117,7 @@ impl RuntimeActor {
                     kind: OpKind::Tool,
                     effect,
                     directive,
+                    disposition,
                 })
                 .await;
         });
@@ -1222,8 +1251,11 @@ impl RuntimeActor {
                     self.execute_directive(directive).await;
                 }
                 if let Some(turn) = self.state.turn.as_mut() {
-                    turn.turn_frame
-                        .push_tool_result(output.clone(), op_scope_id);
+                    turn.turn_frame.push_tool_result_with(
+                        output.clone(),
+                        op_scope_id,
+                        completion.disposition,
+                    );
                 }
                 let _ = self
                     .kernel
@@ -1322,9 +1354,21 @@ impl RuntimeActor {
         let mut ingested = false;
         if let Some(turn) = self.state.turn.as_mut() {
             for step in &turn.turn_frame.steps {
-                let TurnFrameStep::ToolResult { output, scope_id } = step else {
+                let TurnFrameStep::ToolResult {
+                    output,
+                    scope_id,
+                    disposition,
+                } = step
+                else {
                     continue;
                 };
+                // Transient results (context search/inspect/fetch) stay out
+                // of the long-term context: reading evidence must not
+                // duplicate it under a new observation id (CTX-03). The
+                // engine already stamped access on the read itself.
+                if *disposition != ToolResultDisposition::PersistObservation {
+                    continue;
+                }
                 if let Err(error) = self
                     .kernel
                     .context_ingest(ContextIngress::ToolObservation {

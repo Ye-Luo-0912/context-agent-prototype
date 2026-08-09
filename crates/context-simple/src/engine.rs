@@ -74,6 +74,13 @@ pub struct SimpleContextConfig {
     /// Cap on total content tokens leased per task. Count + tokens together
     /// bound both the number and the weight of model-protected items.
     pub max_leased_tokens_per_task: usize,
+    /// Cap on `context.admit` calls per turn: admit re-enters items into
+    /// the working set, so a runaway admit loop must not grow the heap
+    /// without bound between GC passes.
+    pub max_admits_per_turn: usize,
+    /// Cap on `context.derive` calls per turn: each derive persists a new
+    /// observation, so the model cannot mint derived items without bound.
+    pub max_derived_items_per_turn: usize,
     /// Minimum token overlap between a new user instruction and the current
     /// episode's query for the instruction to count as a continuation of the
     /// same episode. Below this, and when the message carries real
@@ -109,6 +116,8 @@ impl Default for SimpleContextConfig {
             max_lease_turns: 32,
             max_leased_items_per_task: 16,
             max_leased_tokens_per_task: 4096,
+            max_admits_per_turn: 8,
+            max_derived_items_per_turn: 8,
             episode_rotate_threshold: 0.15,
             episode_max_user_turns: 500,
         }
@@ -202,6 +211,15 @@ pub(crate) struct State {
     pub(crate) gc_externalized_total: u64,
     #[serde(default)]
     pub(crate) gc_storage_deleted_total: u64,
+    /// Directives counted against the per-turn admit cap. Reset by the
+    /// next user message (turn boundary); a turn whose admits are refused
+    /// keeps the count so the model learns the cap from refusals.
+    #[serde(default)]
+    pub(crate) admits_this_turn: usize,
+    /// Directives counted against the per-turn derive cap (same lifecycle
+    /// as `admits_this_turn`).
+    #[serde(default)]
+    pub(crate) derives_this_turn: usize,
 }
 
 pub struct SimpleContextEngine {
@@ -231,6 +249,10 @@ impl ContextEngine for SimpleContextEngine {
                 // instruction.
                 state.turn += 1;
                 state.tool_round = 0;
+                // Per-turn directive quotas reset at the turn boundary: the
+                // admit/derive caps are per user turn, not per process run.
+                state.admits_this_turn = 0;
+                state.derives_this_turn = 0;
                 // Episode rotation: the working set is bounded by the current
                 // episode plus unresolved semantic state, not by task turns.
                 // A new instruction that is semantically distant from the
@@ -466,7 +488,33 @@ impl ContextEngine for SimpleContextEngine {
                 dependency::push_linked(&mut state, &self.config, item);
             }
             ContextIngress::ContextDirective { action } => {
-                if let Some(reason) = apply_directive(&mut state, &self.config, action) {
+                // Admit of an externalized item reads its content back from
+                // the context store. Plan under the lock, read outside it,
+                // re-apply under a fresh lock — the state lock is never held
+                // across disk IO (same phases as the GC's store step).
+                let read_plan = match &action {
+                    ContextAction::Admit { item_id, .. } => {
+                        match crate::directive::plan_admit(&state, *item_id) {
+                            crate::directive::AdmitPlan::Refused(reason) => {
+                                return Err(AgentError::InvalidRequest(reason));
+                            }
+                            crate::directive::AdmitPlan::ReadExternal(id) => Some(id),
+                            crate::directive::AdmitPlan::InMemory
+                            | crate::directive::AdmitPlan::Missing => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let external_read = match read_plan {
+                    Some(item_id) => {
+                        let dir = crate::store::store_dir(&self.config);
+                        Some((item_id, crate::store::read_item_async(&dir, item_id).await))
+                    }
+                    None => None,
+                };
+                if let Some(reason) =
+                    apply_directive(&mut state, &self.config, action, external_read)
+                {
                     // A quota refused the directive: surface it so the model
                     // (which believes the hint/lease was granted) learns it
                     // was not.
@@ -710,8 +758,22 @@ fn apply_directive(
     state: &mut State,
     config: &SimpleContextConfig,
     action: ContextAction,
+    external_read: Option<(ContextItemId, Option<ContextItem>)>,
 ) -> Option<String> {
     let target_id = directive_item_id(&action);
+
+    // Admit and Derive have their own quota checks and mutation logic (the
+    // admit path may need the store read planned by `ingest`); dispatch
+    // them before the in-memory directive machinery.
+    match &action {
+        ContextAction::Admit { item_id, reason } => {
+            return crate::directive::apply_admit(state, config, *item_id, reason, external_read);
+        }
+        ContextAction::Derive { item_id, fact, .. } => {
+            return crate::directive::apply_derive(state, config, *item_id, fact.clone());
+        }
+        _ => {}
+    }
 
     // Quota checks run on read-only views first; the mutation happens after,
     // so the checks never contend with the mutable borrow.
@@ -834,6 +896,9 @@ fn apply_directive(
             // The runtime owns the GC pass; `context.collect` never arrives
             // as an ingest directive (the actor calls `ContextEngine::gc`).
             ContextAction::Collect => {}
+            // Admit/Derive are dispatched above and never reach the
+            // in-memory directive loop.
+            ContextAction::Admit { .. } | ContextAction::Derive { .. } => unreachable!(),
         }
     }
     None
@@ -843,7 +908,9 @@ fn directive_item_id(action: &ContextAction) -> ContextItemId {
     match action {
         ContextAction::GcHint { item_id, .. }
         | ContextAction::Tag { item_id, .. }
-        | ContextAction::Lease { item_id, .. } => *item_id,
+        | ContextAction::Lease { item_id, .. }
+        | ContextAction::Admit { item_id, .. }
+        | ContextAction::Derive { item_id, .. } => *item_id,
         ContextAction::Collect => ContextItemId::new(),
     }
 }

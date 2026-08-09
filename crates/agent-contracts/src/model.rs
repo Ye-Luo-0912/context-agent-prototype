@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{AgentResult, CancellationToken, ScopeId, ToolCall, ToolOutput, ToolSpec};
+use crate::{
+    AgentResult, CancellationToken, ScopeId, ToolCall, ToolOutput, ToolResultDisposition, ToolSpec,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelRole {
@@ -108,6 +110,11 @@ pub enum TurnFrameStep {
         /// tool start; the persisted observation is tagged with it.
         #[serde(default)]
         scope_id: Option<ScopeId>,
+        /// Whether this result becomes a long-term observation at turn end.
+        /// Context retrieval results are transient (CTX-03): they must not
+        /// duplicate fetched evidence under a new item id.
+        #[serde(default)]
+        disposition: ToolResultDisposition,
     },
 }
 
@@ -139,8 +146,22 @@ impl TurnFrame {
     }
 
     pub fn push_tool_result(&mut self, output: ToolOutput, scope_id: Option<ScopeId>) {
-        self.steps
-            .push(TurnFrameStep::ToolResult { output, scope_id });
+        self.push_tool_result_with(output, scope_id, ToolResultDisposition::PersistObservation);
+    }
+
+    /// Push a tool result with an explicit persist disposition (CTX-03):
+    /// context retrieval results are `TransientNoPersist`.
+    pub fn push_tool_result_with(
+        &mut self,
+        output: ToolOutput,
+        scope_id: Option<ScopeId>,
+        disposition: ToolResultDisposition,
+    ) {
+        self.steps.push(TurnFrameStep::ToolResult {
+            output,
+            scope_id,
+            disposition,
+        });
     }
 
     pub fn has_tool_steps(&self) -> bool {
