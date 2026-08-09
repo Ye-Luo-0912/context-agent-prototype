@@ -26,15 +26,7 @@ fn main() {
         eprintln!("mock host requires MOCK_MARKER=1 (env injection test)");
         std::process::exit(1);
     }
-    // A single-threaded runtime: the mock is one ping-pong server, and the
-    // strict sandbox can set a hard RLIMIT_NPROC on the child — a
-    // multi-thread runtime would try to spawn one worker per core and fail
-    // the limit on a busy machine (the rlimit counts the whole user's
-    // threads, and even the stdio blocking pool needs one).
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("mock runtime");
+    let runtime = tokio::runtime::Runtime::new().expect("mock runtime");
     runtime.block_on(server_loop());
 }
 
@@ -50,15 +42,15 @@ fn main() {
 async fn server_loop() {
     if let Ok(path) = std::env::var("MOCK_HEARTBEAT") {
         let path = std::path::PathBuf::from(path);
-        tokio::spawn(async move {
+        // A dedicated thread, decoupled from the tokio runtime: the
+        // heartbeat must tick regardless of how the async server loop is
+        // scheduled, on any runtime configuration.
+        std::thread::spawn(move || {
             let mut n: u64 = 0;
             loop {
-                // Synchronous write: a tokio fs call would borrow a
-                // blocking-pool thread, which the NPROC-limited sandbox may
-                // not be able to create on a busy machine.
                 let _ = std::fs::write(&path, n.to_string());
                 n += 1;
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                std::thread::sleep(Duration::from_millis(50));
             }
         });
     }
