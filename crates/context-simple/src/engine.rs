@@ -161,9 +161,11 @@ pub(crate) struct State {
     pub(crate) eviction_buffer: Vec<ContextItem>,
     /// The external context map: lightweight entries for items whose content
     /// lives in the context store. `Cold` entries can still be recalled by
-    /// hot-entity matches; `External` entries only exist as references.
+    /// hot-entity matches; `External` entries only exist as references. The
+    /// map owns its id/entity indexes: structural mutations (push, retain,
+    /// replace) go through `ExternalMap` methods so the indexes cannot drift.
     #[serde(default)]
-    pub(crate) external: Vec<agent_contracts::ExternalizedContext>,
+    pub(crate) external: crate::index::external::ExternalMap,
     /// Counts full GC passes only. External-entry aging (Cold -> External)
     /// and TTLs compare this epoch, never the tick counter — the tick also
     /// advances on ingest/maintain/materialize, so a pass-based TTL must
@@ -516,11 +518,7 @@ impl ContextEngine for SimpleContextEngine {
         item_id: ContextItemId,
     ) -> AgentResult<Option<agent_contracts::ExternalizedContext>> {
         let state = self.state.lock().await;
-        Ok(state
-            .external
-            .iter()
-            .find(|e| e.item_id == item_id)
-            .cloned())
+        Ok(state.external.get(item_id).cloned())
     }
 
     async fn fetch_external(&self, item_id: ContextItemId) -> AgentResult<Option<ContextItem>> {
@@ -530,7 +528,9 @@ impl ContextEngine for SimpleContextEngine {
         let dir = crate::store::store_dir(&self.config);
         let (present, now_tick, gc_epoch) = {
             let state = self.state.lock().await;
-            let present = state.external.iter().any(|e| e.item_id == item_id);
+            // O(1) id-index membership instead of a linear scan: the
+            // model's retrieval loop calls this per item.
+            let present = state.external.contains_id(item_id);
             (present, state.tick, state.gc_epoch)
         };
         if !present {
@@ -542,7 +542,7 @@ impl ContextEngine for SimpleContextEngine {
             // entry, so ranking and Cold -> External aging stay honest — the
             // item was used, it is not an untouched stale reference.
             let mut state = self.state.lock().await;
-            if let Some(entry) = state.external.iter_mut().find(|e| e.item_id == item_id) {
+            if let Some(entry) = state.external.get_mut(item_id) {
                 entry.last_access_tick = now_tick;
                 entry.last_access_gc_epoch = Some(gc_epoch);
             }

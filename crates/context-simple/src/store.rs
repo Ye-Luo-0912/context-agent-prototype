@@ -340,7 +340,7 @@ pub(crate) fn commit_storage_gc(
 
     let mut report = StorageGcReport::default();
     let mut kept: Vec<ExternalizedContext> = Vec::with_capacity(state.external.len());
-    for entry in state.external.drain(..) {
+    for entry in state.external.take_all() {
         match outcomes.get(&entry.item_id) {
             Some(Ok(DeleteOutcome::Deleted | DeleteOutcome::NotFound)) => {
                 report.deleted += 1;
@@ -371,7 +371,8 @@ pub(crate) fn commit_storage_gc(
             None => kept.push(entry),
         }
     }
-    state.external = kept;
+    // The map re-indexes the survivors in one step (take/replace pair).
+    state.external.replace_all(kept);
     report.scanned = state.external.len() + report.deleted;
     report
 }

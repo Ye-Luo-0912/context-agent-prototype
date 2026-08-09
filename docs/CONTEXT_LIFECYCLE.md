@@ -739,6 +739,29 @@ entities_still_reach_them` pins both halves: the observation is absent
 from the frame while nothing references it, and returns the moment its
 entity is hot again.
 
+### 9j. V1-M9: the external map owns its indexes (ExternalMap)
+
+The heap is not the only index owner anymore. `State.external` was a bare
+`Vec<ExternalizedContext>` mutated directly by every external path; now
+that retrieval and recall read id/entity indexes, the map binds storage
+and indexes together like `ContextHeap`: `push` (externalize commit),
+`retain` (recall removes), `take_all` / `replace_all` (storage-GC commit,
+restore) go through methods that rebuild the id + exact-entity indexes in
+the same step, while non-indexed fields (residency aging, access stamps)
+stay reachable via `&mut` iteration. `inspect_external` and the
+`fetch_external` membership/stamp path are O(1) id lookups instead of
+linear scans; the GC recall pass reads exact hot-entity matches from the
+entity buckets and keeps a residual scan for substring-tolerant overlaps
+(hot `AuthService.rs` vs an entry entity `src/auth/AuthService.rs`) so
+recall coverage is unchanged. Checkpoints serialize only the entries;
+indexes rebuild on restore.
+
+The materialized `external` field is the bounded `ContextMapView` named in
+§9g, and since P1 the cap is enforced by the *type*, not just the
+selection code: the constructor asserts `<= 32` and the wire
+deserializer rejects over-cap payloads, so the bound holds on both sides
+of the context-service boundary.
+
 ## 10. What should become durable later
 
 A later policy can promote only structured outcomes such as:

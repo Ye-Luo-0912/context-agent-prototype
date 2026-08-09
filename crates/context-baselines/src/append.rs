@@ -101,7 +101,7 @@ impl ContextEngine for AppendOnlyEngine {
         Ok(MaterializedContext {
             focus: None,
             items,
-            external: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
             selected,
             approx_tokens: approx_tokens_total,
             diagnostics: active_diagnostics(&state.records, None, 0),

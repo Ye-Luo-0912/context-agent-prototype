@@ -36,7 +36,7 @@ impl ContextEngine for TestContextEngine {
         Ok(MaterializedContext {
             focus: None,
             items: Vec::new(),
-            external: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),
@@ -291,7 +291,7 @@ impl ContextEngine for RecordingContextEngine {
         Ok(MaterializedContext {
             focus: None,
             items: Vec::new(),
-            external: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),
@@ -462,7 +462,7 @@ impl ContextEngine for FailingFocusContextEngine {
         Ok(MaterializedContext {
             focus: None,
             items: Vec::new(),
-            external: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),
@@ -557,7 +557,7 @@ impl ContextEngine for FailingClearFocusContextEngine {
         Ok(MaterializedContext {
             focus: None,
             items: Vec::new(),
-            external: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),
@@ -686,7 +686,7 @@ impl ContextEngine for BigContextEngine {
         Ok(MaterializedContext {
             focus: None,
             items,
-            external: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 9_000,
             diagnostics: ContextDiagnostics::default(),

@@ -179,6 +179,17 @@ pub struct CapabilityRegistry {
     /// unified dispatcher snapshot's `generation` reflects dynamic
     /// capability changes — not just the builtin catalog's.
     generation: AtomicU64,
+    /// Derived catalog metadata (`catalog_rows`) is cached and invalidated
+    /// by this counter: bumped on *every* mutation that can change what the
+    /// discovery rows report (register, activation, load/unload, active
+    /// marks, restore). Distinct from `generation`, which is the audit
+    /// surface generation — a tool executing mid-round must not churn the
+    /// snapshot's audit identity.
+    catalog_version: AtomicU64,
+    /// Cached unified discovery rows, keyed on `catalog_version`: an
+    /// unchanged catalog answers `capability.search` without rebuilding
+    /// every row from the registry lock.
+    rows_cache: RwLock<Option<(u64, Arc<Vec<ToolCatalogEntry>>)>>,
 }
 
 impl CapabilityRegistry {
@@ -292,6 +303,7 @@ impl CapabilityRegistry {
         // A new capability changes the catalog; surface-related flags are
         // covered by their own bumps below.
         self.generation.fetch_add(1, Ordering::Relaxed);
+        self.catalog_version.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -331,6 +343,8 @@ impl CapabilityRegistry {
         }
         // Activation flips the usable surface: bump the generation.
         self.generation.fetch_add(1, Ordering::Relaxed);
+        // ... and the derived discovery rows.
+        self.catalog_version.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -428,6 +442,7 @@ impl CapabilityRegistry {
         entry.loaded = true;
         // A load puts tools on the surface: bump the generation.
         self.generation.fetch_add(1, Ordering::Relaxed);
+        self.catalog_version.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -443,6 +458,7 @@ impl CapabilityRegistry {
         }
         // An unload takes tools off the surface: bump the generation.
         self.generation.fetch_add(1, Ordering::Relaxed);
+        self.catalog_version.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -482,31 +498,48 @@ impl CapabilityRegistry {
     }
 
     /// Unified discovery rows: every capability tool with its owner id and
-    /// lifecycle state.
-    pub fn catalog_rows(&self) -> Vec<ToolCatalogEntry> {
-        let inner = self.inner.read().expect("capability registry poisoned");
-        let mut rows = Vec::new();
-        for (id, entry) in inner.iter() {
-            let owner = id.clone();
-            let active = entry.active;
-            let usable = entry.loaded && entry.activation.usable();
-            for spec in &entry.tool_specs {
-                let state = if active {
-                    ToolLifecycle::Active
-                } else if usable {
-                    ToolLifecycle::Loaded
-                } else {
-                    ToolLifecycle::Available
-                };
-                rows.push(ToolCatalogEntry {
-                    name: spec.name.clone(),
-                    state,
-                    owner: owner.clone(),
-                    description: spec.description.clone(),
-                });
-            }
+    /// lifecycle state. The rows are derived metadata, cached across calls
+    /// and rebuilt only when `catalog_version` changes — an unchanged
+    /// catalog answers `capability.search` with an `Arc` clone instead of
+    /// re-reading the registry and re-cloning every tool description.
+    pub fn catalog_rows(&self) -> Arc<Vec<ToolCatalogEntry>> {
+        let version = self.catalog_version.load(Ordering::Relaxed);
+        if let Some((cached_version, rows)) = self.rows_cache.read().expect("poisoned").as_ref()
+            && *cached_version == version
+        {
+            return rows.clone();
         }
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        let rows = {
+            let inner = self.inner.read().expect("capability registry poisoned");
+            let mut rows = Vec::new();
+            for (id, entry) in inner.iter() {
+                let owner = id.clone();
+                let active = entry.active;
+                let usable = entry.loaded && entry.activation.usable();
+                for spec in &entry.tool_specs {
+                    let state = if active {
+                        ToolLifecycle::Active
+                    } else if usable {
+                        ToolLifecycle::Loaded
+                    } else {
+                        ToolLifecycle::Available
+                    };
+                    rows.push(ToolCatalogEntry {
+                        name: spec.name.clone(),
+                        state,
+                        owner: owner.clone(),
+                        description: spec.description.clone(),
+                    });
+                }
+            }
+            rows.sort_by(|a, b| a.name.cmp(&b.name));
+            rows
+        };
+        let rows = Arc::new(rows);
+        *self
+            .rows_cache
+            .write()
+            .expect("capability registry poisoned") = Some((version, rows.clone()));
         rows
     }
 
@@ -522,6 +555,8 @@ impl CapabilityRegistry {
         {
             entry.active = true;
         }
+        // The discovery rows carry the Active state: invalidate the cache.
+        self.catalog_version.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Clear the executing marker after a call finished.
@@ -536,6 +571,8 @@ impl CapabilityRegistry {
         {
             entry.active = false;
         }
+        // The discovery rows carry the Active state: invalidate the cache.
+        self.catalog_version.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Snapshot of every registered capability's surface state (activation +
@@ -570,6 +607,8 @@ impl CapabilityRegistry {
             current.activation = entry.activation;
             current.loaded = entry.loaded && entry.activation.usable();
         }
+        // Restore re-applies surface flags the discovery rows report.
+        self.catalog_version.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Start every eager capability that has not started yet (host start).
@@ -769,6 +808,10 @@ pub struct CapabilityAwareDispatcher {
     /// gets a `CapabilityInvocationContext` whose confined handles are
     /// built from it.
     workspace: Option<Arc<Workspace>>,
+    /// The base catalog's always-loaded core tools, captured once at
+    /// construction (a fresh base dispatcher reports exactly its core set
+    /// as `Loaded`). The round-surface bound never trims these.
+    core_tools: HashSet<String>,
 }
 
 impl CapabilityAwareDispatcher {
@@ -791,10 +834,20 @@ impl CapabilityAwareDispatcher {
             base.catalog().into_iter().map(|entry| entry.name).collect();
         reserved.push(CAPABILITY_MANAGE.to_string());
         capabilities.reserve_names(reserved);
+        // The always-loaded core set, captured while the base catalog is
+        // still in its pristine construction state (only `always_loaded`
+        // tools report `Loaded`).
+        let core_tools: HashSet<String> = base
+            .catalog()
+            .into_iter()
+            .filter(|entry| entry.state == ToolLifecycle::Loaded)
+            .map(|entry| entry.name)
+            .collect();
         Self {
             base,
             capabilities,
             workspace,
+            core_tools,
         }
     }
 
@@ -823,7 +876,7 @@ impl CapabilityAwareDispatcher {
     /// The unified catalog: builtin rows plus capability rows, sorted by name.
     fn unified_catalog(&self) -> Vec<ToolCatalogEntry> {
         let mut rows = self.base.catalog();
-        rows.extend(self.capabilities.catalog_rows());
+        rows.extend(self.capabilities.catalog_rows().iter().cloned());
         rows.sort_by(|a, b| a.name.cmp(&b.name));
         rows
     }
@@ -847,8 +900,14 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
     }
 
     fn snapshot(&self) -> ToolSurfaceSnapshot {
+        // The round surface is bounded by a deterministic schema budget:
+        // control + core tools always, optional tools smallest-first up to
+        // `MAX_TOOL_SURFACE_TOKENS`. Budget, prompt and tool-call
+        // validation all read this one snapshot, so the model sees — and
+        // the runtime prices and validates — exactly the bounded surface.
+        let specs = crate::budget::bounded_tool_surface(self.specs(), &self.core_tools);
         ToolSurfaceSnapshot {
-            specs: self.specs(),
+            specs,
             // The unified surface generation: the base catalog's generation
             // (its own load/unload/gc transitions) combined with the
             // capability registry's (register/activation/load/unload), so a

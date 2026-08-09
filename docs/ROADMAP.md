@@ -1065,12 +1065,22 @@ failure reporting, directive-before-next-round, child termination on
 cancel, store confinement, exact fetch recovery, full-contract parity,
 window-vs-reserve budget) are in place; see `docs/ARCHITECTURE.md` §9e/§9f.
 
+Performance P1 landed ahead of the milestones below: the external map
+owns its id/entity indexes (`ExternalMap`, O(1) inspect/fetch lookups,
+index-accelerated recall), `MaterializedContext.external` is a
+type-enforced `ContextMapView` (cap 32, wire-validated), the per-round
+tool surface is bounded by a deterministic schema budget
+(`MAX_TOOL_SURFACE_TOKENS`), and capability catalog rows are cached per
+`catalog_version`; see `docs/ARCHITECTURE.md` §9g and
+`docs/CONTEXT_LIFECYCLE.md` §9j.
+
 ## Next: V1-M10 → V2 (ordered)
 
 1. **V1-M10 Runtime Consistency** — task authority, transactional task
    transitions, RuntimeCheckpoint, Turn commit. Acceptance: the runtime and
    the context never drift into a task/state split-brain.
-2. **V1-M11 Context Recall** — store injection, ContextMapView,
+2. **V1-M11 Context Recall** — store injection, `ContextMapView` (the
+   type-level bounded view landed in Performance P1),
    `context.search`/`fetch`, `gc_epoch`, async store. Acceptance: external
    information can be pulled back on demand without polluting the prompt.
 3. **V1-M12 Effect Runtime** — every capability routes side effects through
@@ -1079,7 +1089,8 @@ window-vs-reserve budget) are in place; see `docs/ARCHITECTURE.md` §9e/§9f.
 4. **V1-M13 Extension Sandbox** — process sandbox, env scrub, brokered
    FS/network, cancel. Acceptance: experimental code cannot exceed the
    permissions granted to it.
-5. **V1-M14 Resource Policy** — tool schema budget, context hint quota,
+5. **V1-M14 Resource Policy** — tool schema budget (the per-round surface
+   bound landed in Performance P1), context hint quota,
    RiskClass, PermissionSet. Acceptance: the LLM cannot exhaust runtime
    resources through meta-tools.
 6. **V1-M15 Real Evaluation** — coding workload A/B/C + lifecycle metrics.

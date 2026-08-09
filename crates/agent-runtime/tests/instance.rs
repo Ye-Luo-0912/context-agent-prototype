@@ -52,7 +52,7 @@ impl ContextEngine for TestContextEngine {
         Ok(MaterializedContext {
             focus: None,
             items: Vec::new(),
-            external: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),

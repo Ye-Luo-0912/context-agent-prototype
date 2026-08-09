@@ -2,9 +2,9 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use agent_contracts::{
-    AttentionState, ContextItem, ContextItemId, ContextMap, ContextQuery, ContextRetention,
-    ContextSelection, MaterializedContext, MaterializedItem, ScopeId, ScopeKind, ScopeState,
-    ScoreBreakdown,
+    AttentionState, CONTEXT_MAP_VIEW_CAP, ContextItem, ContextItemId, ContextMapView, ContextQuery,
+    ContextRetention, ContextSelection, MaterializedContext, MaterializedItem, ScopeId, ScopeKind,
+    ScopeState, ScoreBreakdown,
 };
 
 use crate::diagnostics;
@@ -43,6 +43,10 @@ pub(crate) fn materialize(
     // edges, not task membership (the same rule the GC mark phase enforces
     // by never crossing a closed scope).
     state.items.ensure_consistent();
+    // The external map's length guard: a direct mutation outside the
+    // structured methods (restored checkpoints, tests) triggers a rebuild
+    // before any indexed query reads it.
+    state.external.ensure_consistent();
     let active_task_id = focus.as_ref().map(|f| f.task_id);
     let mut active_scopes: HashSet<ScopeId> = HashSet::new();
     for scope in &state.scopes {
@@ -298,18 +302,21 @@ pub(crate) fn materialize(
     }
 }
 
-/// Cap on external refs surfaced in one materialized context.
-const MAX_EXTERNAL_REFS: usize = 32;
+/// Cap on external refs surfaced in one materialized context. The bound is
+/// enforced by the [`ContextMapView`] type; this is the selection side that
+/// keeps the producer within it.
+const MAX_EXTERNAL_REFS: usize = CONTEXT_MAP_VIEW_CAP;
 
 /// Build a small, deterministic slice of the external map: hot-entity
 /// matches and open loops first, then most-recently-accessed entries, up
-/// to `MAX_EXTERNAL_REFS`. Quickselect keeps this O(n) without cloning the
-/// whole map.
-fn external_view(state: &State, hot_entities: &[String]) -> ContextMap {
+/// to `CONTEXT_MAP_VIEW_CAP`. Quickselect keeps this O(n) without cloning
+/// the whole map; the bounded `ContextMapView` enforces the cap at the
+/// type level.
+fn external_view(state: &State, hot_entities: &[String]) -> ContextMapView {
     let mut ranked: Vec<&agent_contracts::ExternalizedContext> = state.external.iter().collect();
     let k = ranked.len().min(MAX_EXTERNAL_REFS);
     if k == 0 {
-        return Vec::new();
+        return ContextMapView::default();
     }
     ranked.select_nth_unstable_by(k - 1, |a, b| {
         external_view_key(b, hot_entities).cmp(&external_view_key(a, hot_entities))
@@ -321,7 +328,7 @@ fn external_view(state: &State, hot_entities: &[String]) -> ContextMap {
             .cmp(&external_view_key(a, hot_entities))
             .then_with(|| a.item_id.0.cmp(&b.item_id.0))
     });
-    ranked.into_iter().cloned().collect()
+    ContextMapView::new(ranked.into_iter().cloned().collect())
 }
 
 /// (hot-entity match, open loop, recency) — higher sorts first. Open loops

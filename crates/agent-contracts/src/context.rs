@@ -482,9 +482,10 @@ pub struct MaterializedContext {
     pub focus: Option<FocusState>,
     pub items: Vec<MaterializedItem>,
     /// The lightweight context map: externalized items the model can only
-    /// see as references (`context://...`), never as full content.
+    /// see as references (`context://...`), never as full content. The
+    /// view is bounded by [`CONTEXT_MAP_VIEW_CAP`].
     #[serde(default)]
-    pub external: ContextMap,
+    pub external: ContextMapView,
     pub selected: Vec<ContextSelection>,
     pub approx_tokens: usize,
     pub diagnostics: ContextDiagnostics,
@@ -626,9 +627,92 @@ pub struct ExternalizedContext {
     pub last_access_gc_epoch: Option<u64>,
 }
 
-/// The lightweight context map the model sees for externalized items:
-/// references, never content.
-pub type ContextMap = Vec<ExternalizedContext>;
+/// Cap on the external refs surfaced in one materialized context. The
+/// prompt renders refs only, so the bound is about prompt cost: the model
+/// should see a handful of pullable refs, not the whole external history.
+pub const CONTEXT_MAP_VIEW_CAP: usize = 32;
+
+/// The bounded, model-facing view of the external context map. The engine
+/// selects at most [`CONTEXT_MAP_VIEW_CAP`] refs per materialization; the
+/// type enforces that bound, so a producer that forgets the cap fails
+/// loudly at the type boundary instead of silently growing the prompt.
+/// Newtype-serializes transparently as the inner refs, so the wire shape
+/// is unchanged from the raw `Vec`.
+#[derive(Debug, Clone, Default)]
+pub struct ContextMapView(Vec<ExternalizedContext>);
+
+impl ContextMapView {
+    /// Build a view from a bounded selection. Panics when `entries`
+    /// exceeds [`CONTEXT_MAP_VIEW_CAP`]: the engine's selection policy is
+    /// the only local producer and is itself bounded, so an over-cap input
+    /// is an internal invariant violation, not a runtime condition.
+    pub fn new(entries: Vec<ExternalizedContext>) -> Self {
+        assert!(
+            entries.len() <= CONTEXT_MAP_VIEW_CAP,
+            "external context map view of {} refs exceeds the cap of {CONTEXT_MAP_VIEW_CAP}",
+            entries.len()
+        );
+        Self(entries)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, ExternalizedContext> {
+        self.0.iter()
+    }
+
+    pub fn as_slice(&self) -> &[ExternalizedContext] {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for ContextMapView {
+    type Target = [ExternalizedContext];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a ContextMapView {
+    type Item = &'a ExternalizedContext;
+    type IntoIter = std::slice::Iter<'a, ExternalizedContext>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl Serialize for ContextMapView {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextMapView {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let entries = Vec::<ExternalizedContext>::deserialize(deserializer)?;
+        if entries.len() > CONTEXT_MAP_VIEW_CAP {
+            return Err(serde::de::Error::custom(format!(
+                "external context map view of {} refs exceeds the cap of {CONTEXT_MAP_VIEW_CAP}",
+                entries.len()
+            )));
+        }
+        Ok(Self(entries))
+    }
+}
 
 /// Deterministic search over the external context map — no vectors. The
 /// indexed dimensions of the map (entity signature, kind, scope, task,
@@ -800,4 +884,67 @@ pub trait ContextEngine: Send + Sync {
 
     /// Replace runtime state from a previously exported checkpoint.
     async fn restore(&self, data: serde_json::Value) -> AgentResult<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ref_entry() -> ExternalizedContext {
+        ExternalizedContext {
+            item_id: ContextItemId::new(),
+            task_id: None,
+            kind: ContextKind::Note,
+            scope: ContextScope::Task,
+            retention: ContextRetention::Working,
+            attention: AttentionState::Archived,
+            semantic: SemanticState::Live,
+            context_ref: ContextRef {
+                uri: "context://run/x".into(),
+                item_id: ContextItemId::new(),
+                kind: ContextKind::Note,
+                scope: ContextScope::Task,
+                summary: "x".into(),
+                created_tick: 0,
+            },
+            externalized_at_tick: 0,
+            last_access_tick: 0,
+            residency: ContextResidency::Cold,
+            entities: Vec::new(),
+            tags: Vec::new(),
+            dependencies: Vec::new(),
+            last_access_gc_epoch: Some(0),
+        }
+    }
+
+    #[test]
+    fn context_map_view_caps_at_the_contract_bound() {
+        let entries: Vec<ExternalizedContext> =
+            (0..CONTEXT_MAP_VIEW_CAP).map(|_| ref_entry()).collect();
+        let view = ContextMapView::new(entries);
+        assert_eq!(view.len(), CONTEXT_MAP_VIEW_CAP);
+        assert_eq!(view.iter().count(), CONTEXT_MAP_VIEW_CAP);
+        assert_eq!(view.as_slice().len(), CONTEXT_MAP_VIEW_CAP);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the cap")]
+    fn context_map_view_rejects_an_over_cap_build() {
+        let entries: Vec<ExternalizedContext> =
+            (0..CONTEXT_MAP_VIEW_CAP + 1).map(|_| ref_entry()).collect();
+        let _ = ContextMapView::new(entries);
+    }
+
+    #[test]
+    fn context_map_view_serializes_transparently_and_validates_wire_data() {
+        let mut entries: Vec<ExternalizedContext> =
+            (0..CONTEXT_MAP_VIEW_CAP).map(|_| ref_entry()).collect();
+        entries.push(ref_entry());
+        // Over-cap wire data is rejected by deserialization (the bound is
+        // enforced on both sides of the service boundary), while the local
+        // constructor's invariant keeps the in-process shape honest.
+        let bytes = serde_json::to_vec(&entries).unwrap();
+        let err = serde_json::from_slice::<ContextMapView>(&bytes).unwrap_err();
+        assert!(err.to_string().contains("exceeds the cap"));
+    }
 }

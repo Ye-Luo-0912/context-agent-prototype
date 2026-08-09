@@ -560,17 +560,53 @@ fn reactivate(state: &mut State, config: &SimpleContextConfig, now_tick: u64, pl
     // matches earn a recall (no content, so no score-based fallback). The
     // entity filter runs on the in-memory entry signature first, so with
     // thousands of Cold entries only the matching ids are read in the IO
-    // phase. Skip the whole pass when no store directory exists yet.
+    // phase. Exact matches come from the map's entity index (O(bucket) per
+    // hot entity instead of a full scan); substring-tolerant overlaps —
+    // hot `AuthService.rs` vs an entry entity `src/auth/AuthService.rs` —
+    // cannot be indexed with exact keys, so a residual scan covers the
+    // entries the index did not already propose. Coverage is preserved;
+    // the common exact-match case is fast. Skip the whole pass when no
+    // store directory exists yet.
     if remaining > 0 && !hot_entities.is_empty() && store::store_ready(config) {
-        for entry in &state.external {
+        let mut covered: HashSet<ContextItemId> = HashSet::new();
+        for hot in &hot_entities {
             if remaining == 0 {
                 break;
             }
-            let recallable = entry.semantic.is_live() && store::recallable(entry);
-            let entities_match = entities_match(&entry.entities, &hot_entities);
-            if recallable && entities_match {
-                plan.recall_candidates.push(entry.item_id);
-                remaining -= 1;
+            for id in state.external.ids_for_entity(hot) {
+                if remaining == 0 {
+                    break;
+                }
+                if !covered.insert(*id) {
+                    continue;
+                }
+                let Some(entry) = state.external.get(*id) else {
+                    continue;
+                };
+                if entry.semantic.is_live()
+                    && store::recallable(entry)
+                    && entities_match(&entry.entities, &hot_entities)
+                {
+                    plan.recall_candidates.push(*id);
+                    remaining -= 1;
+                }
+            }
+        }
+        if remaining > 0 {
+            for entry in state.external.iter() {
+                if remaining == 0 {
+                    break;
+                }
+                if covered.contains(&entry.item_id) {
+                    continue;
+                }
+                if entry.semantic.is_live()
+                    && store::recallable(entry)
+                    && entities_match(&entry.entities, &hot_entities)
+                {
+                    plan.recall_candidates.push(entry.item_id);
+                    remaining -= 1;
+                }
             }
         }
     }

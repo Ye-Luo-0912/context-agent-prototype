@@ -378,9 +378,20 @@ impl AgentKernel {
             .find(|spec| spec.name == call.name)
             .cloned();
         let Some(spec) = spec else {
+            // The round surface is bounded by the schema budget; a loaded
+            // tool trimmed off this round is not "unknown" — tell the model
+            // it exists but is not on the current surface.
+            let trimmed = self.tools.specs().iter().any(|s| s.name == call.name);
             return ToolOutcome::Value(tool_error_output(
                 &call,
-                format!("unknown tool: {}", call.name),
+                if trimmed {
+                    format!(
+                        "tool '{}' is loaded but not on this round's model surface (schema budget); swap it in with capability.manage load",
+                        call.name
+                    )
+                } else {
+                    format!("unknown tool: {}", call.name)
+                },
             ));
         };
 

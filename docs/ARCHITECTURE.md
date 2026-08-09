@@ -989,6 +989,45 @@ extra scoring coefficient:
   method (see 9d), and the assembled input + output reserve stays within
   the provider context window.
 
+## 9g. Performance P1: indexed external map, bounded tool surface, cached catalog
+
+- **The external map owns its indexes (`ExternalMap`).** `State.external`
+  is no longer a bare `Vec`; it binds the entries with an id index and
+  exact-entity buckets — the mirror of `ContextHeap`, and the same
+  structural-mutation discipline (push / retain / take_all / replace_all
+  rebuild the indexes in the same step; checkpoints serialize only the
+  entries). `inspect_external` and the `fetch_external` membership +
+  access-stamp path are O(1) id-index lookups instead of linear scans, so
+  the model's retrieval loop (`context.manage` inspect/fetch) no longer
+  costs O(map) per item. The GC's hot-entity recall answers exact matches
+  from the entity buckets (O(bucket) per hot entity); substring-tolerant
+  overlaps (hot `AuthService.rs` vs an entry entity `src/auth/AuthService
+  .rs`) are not indexable with exact keys, so a residual scan over the
+  entries the index did not propose keeps recall coverage identical.
+- **The materialized external view is bounded at the type level.**
+  `MaterializedContext.external` is now `ContextMapView`
+  (`CONTEXT_MAP_VIEW_CAP = 32`): the constructor asserts the cap and the
+  `Deserialize` impl rejects over-cap wire data, so the bound holds on
+  both sides of the context-service boundary. It serializes transparently
+  (same wire shape as the raw refs), and the selection side keeps the
+  quickselect ranking inside the engine.
+- **The tool surface has a deterministic schema budget.** Each round's
+  surface is bounded at capture (`MAX_TOOL_SURFACE_TOKENS = 4096`):
+  control tools and the base catalog's core tools are never trimmed;
+  optional tools (loaded builtin + capability tools) are kept
+  smallest-schema-first (name tie-break) until the cap. Budget, prompt
+  and tool-call validation all read the same bounded snapshot, so pricing
+  is honest; a loaded tool trimmed off a round gets an explicit "not on
+  this round's model surface" error instead of "unknown tool". The final
+  budget guard stays as the backstop for tiny provider windows.
+- **Capability catalog metadata is cached.** `catalog_rows()` returns an
+  `Arc` of the derived discovery rows, rebuilt only when
+  `catalog_version` changes (register / activation / load / unload /
+  active-marks / restore) — distinct from the audit `generation`, so a
+  tool executing mid-round cannot churn the snapshot's audit identity. An
+  unchanged catalog answers `capability.search` without re-reading the
+  registry and re-cloning every tool description.
+
 ## 10. Explicit non-goals for v0.1
 
 - vector embeddings;

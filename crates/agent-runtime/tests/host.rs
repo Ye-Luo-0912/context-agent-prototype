@@ -39,7 +39,7 @@ impl ContextEngine for StubContextEngine {
         Ok(MaterializedContext {
             focus: None,
             items: Vec::new(),
-            external: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
             diagnostics: ContextDiagnostics::default(),
@@ -1277,5 +1277,69 @@ async fn failed_start_is_observable_and_a_later_start_retries() {
             .find(|entry| entry.id == "flaky")
             .map(|entry| entry.run_state),
         Some(CapabilityRunState::Started)
+    );
+}
+
+#[tokio::test]
+async fn catalog_rows_are_cached_and_invalidate_on_surface_changes() {
+    let host = ModuleHost::new();
+    let registry = host.capability_registry();
+    registry
+        .register(Arc::new(DemoCapability::new(
+            "cache-demo",
+            CapabilityLifecycle::Lazy,
+            Arc::new(Mutex::new(false)),
+        )))
+        .unwrap();
+
+    // An unchanged catalog serves the cached rows: repeated discovery
+    // reads must not rebuild the derived metadata per call.
+    let first = registry.catalog_rows();
+    let second = registry.catalog_rows();
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "unchanged catalog must serve the cached rows"
+    );
+
+    // A surface change (load) invalidates the cache and the fresh rows
+    // reflect the new lifecycle state.
+    registry.load_tool("cache-demo.demo").unwrap();
+    let third = registry.catalog_rows();
+    assert!(
+        !Arc::ptr_eq(&first, &third),
+        "a load must invalidate the cache"
+    );
+    assert!(
+        third
+            .iter()
+            .any(|row| row.name == "cache-demo.demo" && row.state == ToolLifecycle::Loaded),
+        "a loaded tool must report Loaded in the fresh rows"
+    );
+
+    // An executing tool flips its row to Active; the cache must not serve
+    // a stale Loaded state across a call boundary.
+    registry.mark_active("cache-demo.demo");
+    let fourth = registry.catalog_rows();
+    assert!(
+        !Arc::ptr_eq(&third, &fourth),
+        "an active mark must invalidate the cache"
+    );
+    assert!(
+        fourth
+            .iter()
+            .any(|row| row.name == "cache-demo.demo" && row.state == ToolLifecycle::Active),
+        "an executing tool must report Active in the fresh rows"
+    );
+    registry.mark_idle("cache-demo.demo");
+    let fifth = registry.catalog_rows();
+    assert!(
+        !Arc::ptr_eq(&fourth, &fifth),
+        "an idle mark must invalidate the cache"
+    );
+    assert!(
+        fifth
+            .iter()
+            .any(|row| row.name == "cache-demo.demo" && row.state == ToolLifecycle::Loaded),
+        "an idle tool returns to Loaded in the fresh rows"
     );
 }
