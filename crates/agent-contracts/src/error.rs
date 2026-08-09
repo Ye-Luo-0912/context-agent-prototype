@@ -31,6 +31,12 @@ pub enum AgentError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// A mutation may have partially landed and automatic rollback also
+    /// failed. Callers must stop ordinary mutation and recover from a
+    /// known-good checkpoint instead of treating this as a retryable error.
+    #[error("recovery required: {0}")]
+    RecoveryRequired(String),
 }
 
 pub type AgentResult<T> = Result<T, AgentError>;

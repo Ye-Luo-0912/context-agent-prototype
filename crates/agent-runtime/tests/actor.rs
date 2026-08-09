@@ -538,6 +538,7 @@ async fn failed_focus_never_mutates_the_task_table() {
 #[derive(Debug, Default)]
 struct MutatingThenFailingFocusEngine {
     focus: Mutex<Option<FocusState>>,
+    rollback_fails: bool,
 }
 
 #[async_trait::async_trait]
@@ -593,6 +594,11 @@ impl ContextEngine for MutatingThenFailingFocusEngine {
             .map_err(|error| agent_contracts::AgentError::Context(error.to_string()))
     }
     async fn restore(&self, data: serde_json::Value) -> AgentResult<()> {
+        if self.rollback_fails {
+            return Err(agent_contracts::AgentError::Context(
+                "simulated rollback failure".into(),
+            ));
+        }
         let focus = serde_json::from_value(data)
             .map_err(|error| agent_contracts::AgentError::Context(error.to_string()))?;
         *self.focus.lock().unwrap() = focus;
@@ -622,6 +628,26 @@ async fn maintenance_failure_rolls_back_context_before_rejecting_focus() {
         materialized.focus.is_none(),
         "the focus mutation must be rolled back with the rejected task transition"
     );
+}
+
+#[tokio::test]
+async fn rollback_failure_poison_fences_further_runtime_mutation() {
+    let context = Arc::new(MutatingThenFailingFocusEngine {
+        focus: Mutex::new(None),
+        rollback_fails: true,
+    });
+    let kernel = kernel_with(Arc::new(SilentModel), context);
+    let (handle, _task) = spawn_runtime(kernel);
+    handle.start().await.unwrap();
+
+    let first = handle.set_focus("goal A".into()).await.unwrap_err();
+    assert!(first.to_string().contains("rollback failed"));
+    let second = handle.set_focus("goal B".into()).await.unwrap_err();
+    assert!(
+        second.to_string().contains("runtime recovery is required"),
+        "once alignment cannot be proven, later mutations must be fenced: {second}"
+    );
+    assert!(handle.list_tasks().await.unwrap().is_empty());
 }
 
 #[derive(Debug)]
@@ -673,6 +699,11 @@ async fn journal_failure_after_focus_never_splits_task_and_context() {
         focus.map(|focus| focus.task_id),
         Some(tasks[0].id),
         "journal failure may create an audit gap, but not split task authority from context"
+    );
+    let next = handle.set_focus("goal B".into()).await.unwrap_err();
+    assert!(
+        matches!(next, agent_contracts::AgentError::RecoveryRequired(_)),
+        "an applied transition with a missing audit record must fence later mutation"
     );
 }
 

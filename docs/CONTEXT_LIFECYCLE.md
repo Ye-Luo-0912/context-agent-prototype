@@ -202,6 +202,14 @@ back to the session scope and stays selectable, but no focus is invented.
 Later user messages update the current query while keeping the task goal. A
 future task-boundary detector can replace this explicit/simple behavior.
 
+Audit caveat (2026-08-10): the reference engine currently reuses one Focus
+scope for the lifetime of a task. Every live member of that active scope is a
+GC root, while same-task User/Assistant score floors stay above the archive
+threshold. A sufficiently long task therefore trends back toward a resident,
+selectable transcript even though final token packing is bounded. The next
+policy step is an explicit Task → Episode/Focus model, not another threshold
+tweak; see `docs/AUDIT_TODO.md` CTX-01 and its 10K-turn property test.
+
 ## 8. Completing a task
 
 `/done <summary>` performs the intended lifecycle transition. Since V1-M2
@@ -647,7 +655,10 @@ Externalized is not deleted, and since V1-M9 it is also *findable again*:
 `ContextEngine` gains a deterministic retrieval surface —
 `search_external(ContextSearchQuery { query, kind, scope, task_id, limit })`,
 `inspect_external(item_id)` and `fetch_external(item_id)` (default no-ops,
-so baselines and the wire adapter are untouched). Three always-loaded
+so engines without a store remain compatible). The process service/wire
+forwards all three operations, and parity tests force real externalization so
+a missing override cannot pass by returning the trait default. Three
+always-loaded
 read-only meta-tools (`context.search` / `context.inspect` /
 `context.fetch`) produce an `EngineQuery` the kernel resolves against the
 engine (invariant 3 — tools still never touch the engine). The prompt's
@@ -663,11 +674,28 @@ and the exact content returns in the tool result — while the prompt's
 external section carries only the bounded ref preview (content truncated
 at externalization), never the full externalized content.
 
+The engine-level fetch is still a read and does not reactivate the stored
+record. The current runtime does, however, persist fetch/search/inspect tool
+results as fresh ToolObservations at finalization. That duplicates content
+under new ids, so end-to-end retrieval is not yet working-set-neutral.
+`docs/AUDIT_TODO.md` CTX-03 tracks a transient result disposition and the
+explicit fetch/admit/derive split.
+
+Default operational retrieval is Live-only at every entry point: materialized
+external refs, search, inspect and fetch all hide Superseded, VerifiedFixed
+and Tombstoned metadata. Fetch rechecks the canonical metadata after store IO
+so a concurrent terminal transition cannot leak a body read that began while
+the entry was Live. Terminal files remain available only to audit/Storage-GC
+machinery, not as current model facts.
+
 The materialized `external` field is a bounded `ContextMapView`, not a
 clone of the whole map: at most 32 refs, quickselect-ranked in O(n)
 without cloning it (hot-entity match first, then open-loop tags, then
-recency, with a deterministic id tie-break). A run with 10 K / 100 K
-external refs costs the same per materialize as a run with 32.
+recency, with a deterministic id tie-break). The output and cloned entry
+count are bounded, but the current ranking still collects/scans O(total
+external refs) temporary references; 100 K refs therefore do **not** cost the
+same as 32. Indexed/streaming top-K work is tracked in `docs/AUDIT_TODO.md`
+CTX-07.
 
 Cold recall pre-filters in memory instead of reading the disk:
 `ExternalizedContext` keeps the item's entity signature (`entities`),

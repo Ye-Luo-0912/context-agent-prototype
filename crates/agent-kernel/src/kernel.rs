@@ -520,8 +520,8 @@ impl AgentKernel {
             Ok(value) => Ok(value),
             Err(error) => match self.context.restore(checkpoint).await {
                 Ok(()) => Err(error),
-                Err(rollback_error) => Err(AgentError::Context(format!(
-                    "{operation} failed ({error}); rollback failed ({rollback_error}); recovery required"
+                Err(rollback_error) => Err(AgentError::RecoveryRequired(format!(
+                    "{operation} failed ({error}); rollback failed ({rollback_error})"
                 ))),
             },
         }

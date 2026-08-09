@@ -604,6 +604,20 @@ transitions transactionally: it validates and *prepares* a transition, the
 external side (kernel focus/context) commits first, and only then does the
 manager commit — a failed `set_focus` never leaves the task table changed.
 
+Focus/clear/complete are multi-step context transactions: the kernel takes a
+portable engine checkpoint before ingest + maintenance and restores it on
+either failure; the actor commits task authority only after that succeeds,
+then publishes audit/UI events. Restore validates the redundant active-task
+fields and restored engine focus before exposing the task table, and applies
+capability flags last. If context rollback itself fails, the actor fences
+further mutation and emits `RecoveryRequired` until a known-good full restore
+succeeds. An audit-event failure after aligned state commits is handled the
+same way: state stays aligned, but the missing record is an explicit recovery
+gap rather than a retryable "nothing happened" result. Cross-plane *capture*
+is not frozen yet (actor state and the shared
+capability registry are sampled separately); `docs/AUDIT_TODO.md` CORE-03
+tracks that remaining gap.
+
 ## 8c. Runtime actor and module host (V1-M3, hardened V1-P0-1/V1-P0-4)
 
 Since V1-M3 the runtime is an actor (`agent-runtime`), not `Mutex`
@@ -656,6 +670,10 @@ RuntimeHandle ── mpsc<RuntimeCommand> ──▶ RuntimeActor (owns mutable s
   everything else becomes a `ContextDirective` ingest, so a hint/lease/tag
   lands before the observation it targets (see the meta-tools under §4
   ToolDispatcher);
+- every completed tool result passes a runtime-owned 16,000-character
+  model-content guard before it can enter TurnFrame, context or events.
+  Normal producers still spill the full result to an artifact; the guard is
+  defense against a capability/adapter violating that contract;
 - the actor selects on both the command channel and the operation
   completion channel, so `/cancel` is processed mid-operation and a new
   turn can start right after; cancellation is committed by the actor
@@ -975,7 +993,8 @@ not trait/vtable dispatch or small-object clones. The P0 items:
   bounded view (`MAX_EXTERNAL_REFS = 32`, hot-entity/open-loop/recency
   ranking via quickselect); `search_external` truncates to the query limit
   before cloning; `inspect_external` clones one entry. The full map stays
-  in the engine.
+  in the engine. This bounds copied/model-facing data, not CPU: ranking still
+  scans and collects O(total refs) borrowed entries pending CTX-07.
 
 ## 9f. Consistency invariant test suite
 

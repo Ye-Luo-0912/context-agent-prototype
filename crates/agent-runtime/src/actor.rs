@@ -151,6 +151,11 @@ struct ActorState {
     task_id: Option<TaskId>,
     /// Long-lived task records; focus is attention inside the current task.
     tasks: TaskManager,
+    /// A context transaction failed and its checkpoint rollback also failed.
+    /// The two authority planes can no longer be proven aligned, so no
+    /// further mutation is accepted until the process is recovered from a
+    /// known-good RuntimeCheckpoint.
+    recovery_required: bool,
     /// The runtime's view of the current scope (filled once the context
     /// engine exposes its scope tree through the contract).
     scope_id: Option<ScopeId>,
@@ -262,7 +267,7 @@ impl RuntimeActor {
                                 )
                                 .await
                             }
-                            Err(error) => Err(error),
+                            Err(error) => Err(self.context_transition_failed(error)),
                         }
                     }
                     Err(error) => Err(error),
@@ -298,7 +303,7 @@ impl RuntimeActor {
                                     )
                                     .await
                                 }
-                                Err(error) => Err(error),
+                                Err(error) => Err(self.context_transition_failed(error)),
                             }
                         }
                     },
@@ -322,7 +327,7 @@ impl RuntimeActor {
                                 )
                                 .await
                             }
-                            Err(error) => Err(error),
+                            Err(error) => Err(self.context_transition_failed(error)),
                         },
                     },
                     Err(error) => Err(error),
@@ -347,7 +352,7 @@ impl RuntimeActor {
                                 )
                                 .await
                             }
-                            Err(error) => Err(error),
+                            Err(error) => Err(self.context_transition_failed(error)),
                         }
                     }
                     Err(error) => Err(error),
@@ -381,7 +386,7 @@ impl RuntimeActor {
                                     )
                                     .await
                                 }
-                                Err(error) => Err(error),
+                                Err(error) => Err(self.context_transition_failed(error)),
                             }
                         }
                     },
@@ -412,7 +417,9 @@ impl RuntimeActor {
                 let _ = reply.send(result);
             }
             RuntimeCommand::Restore { checkpoint, reply } => {
-                let result = match self.ensure_idle() {
+                // Restore is the one mutation allowed while poisoned: it is
+                // how a known-good full checkpoint re-establishes authority.
+                let result = match self.ensure_no_active_turn() {
                     Ok(()) => {
                         match checkpoint.validate() {
                             Err(error) => Err(error),
@@ -424,7 +431,7 @@ impl RuntimeActor {
                                     ..
                                 } = checkpoint;
                                 match self.kernel.restore(context, current_task_id).await {
-                                    Err(error) => Err(error),
+                                    Err(error) => Err(self.context_transition_failed(error)),
                                     Ok(()) => {
                                         // No fallible operation follows this
                                         // point: context and task authority
@@ -432,6 +439,7 @@ impl RuntimeActor {
                                         self.state.tasks.restore(tasks);
                                         self.state.task_id = current_task_id;
                                         self.state.generation += 1;
+                                        self.state.recovery_required = false;
                                         Ok(())
                                     }
                                 }
@@ -461,6 +469,16 @@ impl RuntimeActor {
     /// mutation removes the structural race where focus/pin/task commands
     /// interleaved with an in-flight turn.
     fn ensure_idle(&self) -> AgentResult<()> {
+        if self.state.recovery_required {
+            Err(AgentError::RecoveryRequired(
+                "runtime recovery is required after a context transaction rollback failed".into(),
+            ))
+        } else {
+            self.ensure_no_active_turn()
+        }
+    }
+
+    fn ensure_no_active_turn(&self) -> AgentResult<()> {
         if self.state.turn.is_some() {
             Err(AgentError::InvalidRequest(
                 "agent is busy: a turn is already running".into(),
@@ -470,19 +488,45 @@ impl RuntimeActor {
         }
     }
 
+    fn context_transition_failed(&mut self, error: AgentError) -> AgentError {
+        if matches!(&error, AgentError::RecoveryRequired(_)) {
+            self.state.recovery_required = true;
+            let kernel = self.kernel.clone();
+            tokio::spawn(async move {
+                let _ = kernel.emit_event(RuntimeEvent::RecoveryRequired).await;
+            });
+        }
+        error
+    }
+
     /// Publish the audit/UI events for an already committed context/task
     /// transition. Event persistence may still fail, but it can no longer
     /// leave the context plane ahead of the task authority plane.
     async fn publish_context_transition(
-        &self,
+        &mut self,
         event: RuntimeEvent,
         trigger: ContextMaintenanceTrigger,
         report: ContextMaintenanceReport,
     ) -> AgentResult<()> {
-        self.kernel.emit_event(event).await?;
-        self.kernel
+        if let Err(error) = self.kernel.emit_event(event).await {
+            return Err(self.audit_gap_after_commit(error).await);
+        }
+        if let Err(error) = self
+            .kernel
             .emit_event(RuntimeEvent::ContextMaintained { trigger, report })
             .await
+        {
+            return Err(self.audit_gap_after_commit(error).await);
+        }
+        Ok(())
+    }
+
+    async fn audit_gap_after_commit(&mut self, error: AgentError) -> AgentError {
+        self.state.recovery_required = true;
+        let _ = self.kernel.emit_event(RuntimeEvent::RecoveryRequired).await;
+        AgentError::RecoveryRequired(format!(
+            "context/task transition committed, but its audit event failed ({error})"
+        ))
     }
 
     /// Commit the turn start: user message into the long-term context, then
@@ -511,6 +555,7 @@ impl RuntimeActor {
             let (txn, task_id) = self.state.tasks.prepare_create(content.trim());
             match self.kernel.set_focus(task_id, content.clone()).await {
                 Err(error) => {
+                    let error = self.context_transition_failed(error);
                     let _ = reply.send(Err(error));
                     return;
                 }

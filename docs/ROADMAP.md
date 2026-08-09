@@ -1096,6 +1096,15 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 
 ## Next: V1-M10 → V2 (ordered)
 
+> **2026-08-10 audit correction.** Checkmarks below record that a named
+> feature path exists; they do not prove the trusted acceptance criteria.
+> Adversarial review reopened process effects/sandboxing (M12/M13), journal
+> durability, cross-plane checkpoint capture and the long-task working-set
+> goal. V2 Self-Iteration remains blocked on P0 items in
+> [`docs/AUDIT_TODO.md`](AUDIT_TODO.md). In particular, cwd/env/rlimits are
+> not filesystem/network isolation, and a process capability that mutates in
+> the child does not pass through the actor's Effect fence.
+
 1. **V1-M10 Runtime Consistency** — task authority, transactional task
    transitions, RuntimeCheckpoint, Turn commit. Acceptance: the runtime and
    the context never drift into a task/state split-brain. ✅ (implemented —
