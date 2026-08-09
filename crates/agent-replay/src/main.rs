@@ -11,14 +11,21 @@ fn usage() -> ! {
          what entered, why, which turns consumed it, when/why it left, and its\n\
          final state.\n\
          \n\
-         A/B/C comparison mode:\n\
+         A/B/C comparison modes:\n\
          \n\
          usage: agent-replay --compare [scenario]\n\
          \n\
          Runs the named scenario (or all seven) through the three context\n\
          policies — A append-only, B rolling summary, C dynamic working set —\n\
          and prints a metrics table: total/max input tokens, over-budget\n\
-         snapshots, lifecycle churn and final working-set size.\n"
+         snapshots, lifecycle churn and final working-set size.\n\
+         \n\
+         usage: agent-replay --facts [scenario]\n\
+         \n\
+         Same comparison plus key-fact coverage: which required facts stayed\n\
+         in the model-visible working set when they mattered, and which\n\
+         forbidden (stale) facts leaked. The completion-quality proxy that\n\
+         needs no model.\n"
     );
     std::process::exit(2);
 }
@@ -48,6 +55,31 @@ async fn main() -> anyhow::Result<()> {
         for scenario in &selected {
             let results = agent_replay::compare_scenario(scenario, &config).await?;
             print!("{}", render_comparison(scenario, &results));
+        }
+        return Ok(());
+    }
+
+    if first == "--facts" {
+        let filter = args.next();
+        let scenarios = agent_replay::all_scenarios();
+        let selected: Vec<_> = match &filter {
+            Some(name) => scenarios
+                .into_iter()
+                .filter(|scenario| scenario.name == *name)
+                .collect(),
+            None => scenarios,
+        };
+        if selected.is_empty() {
+            eprintln!("unknown scenario: {}", filter.unwrap_or_default());
+            usage();
+        }
+        let config = compare_config();
+        for scenario in &selected {
+            let results = agent_replay::compare_facts(scenario, &config).await?;
+            print!(
+                "{}",
+                agent_replay::render_fact_comparison(scenario, &results)
+            );
         }
         return Ok(());
     }

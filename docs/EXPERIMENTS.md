@@ -25,6 +25,9 @@ cargo run -p agent-replay -- --compare
 
 # One scenario
 cargo run -p agent-replay -- --compare long_refactor
+
+# Completion-quality proxy: same comparison plus key-fact coverage
+cargo run -p agent-replay -- --facts
 ```
 
 The same engines are available live in the TUI (the kernel, tools and UI are
@@ -47,6 +50,19 @@ Measured per scenario per engine:
 | `over_budget` | Model inputs exceeding the configured budget (12 K tokens in the comparison). |
 | `churn` | Total lifecycle transitions emitted by maintenance (C: archive/cool/drop; B: collapses). |
 | `final_total` / `final_active` | Items retained vs. active at the end of the scenario. |
+
+The `--facts` mode adds the completion-quality proxy (`crates/agent-replay/src/facts.rs`):
+each scenario declares key facts — content needles that must be in the
+model-visible working set during a turn window (required: previous failure,
+final decision, current file) or must not (forbidden: superseded decision,
+completed task's detail). Every miss is explainable as "fact X was not in
+view on turn N".
+
+| Fact metric | Meaning |
+| --- | --- |
+| `req_met` / `req_viol` | Window turns in which required facts were in view / out of view. |
+| `forb_viol` | Forbidden facts that leaked into view at least once (stale-instruction leakage). |
+| `coverage` | `req_met / req_viol + req_met` — required-fact coverage ratio. |
 
 Scenario scripts mirror the kernel event pattern (user message → maintain →
 model rounds with tool results → assistant reply → maintain), so replay
@@ -140,7 +156,62 @@ scenario: pinned_constraint - one pin across three tasks
   of the model budget, capped at +8 items per snapshot) is the entire cost of
   traceability.
 
-## 7. Reproducibility
+## 7. Key-fact coverage (completion-quality proxy, 2026-08-10, `--facts`, budget 12 K)
+
+```
+scenario: task_switch_and_return - task A -> B -> A
+  engine              in_tok_total    req_met   req_viol forb_viol coverage
+  A append-only              22476        0/0          0         1  100.0%
+  B rolling-summary          22476        0/0          0         1  100.0%
+  C dynamic                   6708        0/0          0         0  100.0%
+  fact [forbidden] task B's middleware detail must not contaminate task A's finish:
+      A append-only: VIOLATED (first: turn 23);  B rolling-summary: VIOLATED;  C dynamic: ok
+
+scenario: superseded_decisions - superseding design decisions
+  A append-only               7054        9/9          0         1  100.0%
+  B rolling-summary           7054        9/9          0         1  100.0%
+  C dynamic                   4469        9/9          0         0  100.0%
+  fact [must-see] the final decision stays in view through implementation: all ok
+  fact [forbidden] the superseded first decision must not contaminate implementation:
+      A append-only: VIOLATED;  B rolling-summary: VIOLATED;  C dynamic: ok
+
+scenario: completed_then_unrelated - completed task then unrelated task
+  A append-only             140365        9/9          0         1  100.0%
+  B rolling-summary         140365        9/9          0         1  100.0%
+  C dynamic                  16949        9/9          0         0  100.0%
+  fact [must-see] the CSV task's file stays in view: all ok
+  fact [forbidden] the completed pagination detail must not contaminate the CSV task:
+      A append-only: VIOLATED;  B rolling-summary: VIOLATED;  C dynamic: ok
+
+scenario: test_fix_loop - 16 test/fix rounds
+  A append-only             403352      15/15          0         0  100.0%
+  B rolling-summary         305245      15/15          0         0  100.0%
+  C dynamic                  56430      15/15          0         0  100.0%
+  fact [must-see] every fix round sees the previous failure: all ok
+
+scenario: pinned_constraint - one pin across three tasks
+  all engines 15/15 required turns, coverage 100%
+```
+
+Reading:
+
+- **Stale-instruction leakage is measured, and C is clean.** On all three
+  contamination scenarios the forbidden fact (task B's detail in task A's
+  finish, the superseded first decision, the completed task's pagination
+  code) leaks into A's and B's model-visible working set and never leaks in
+  C — while C pays 3–9× less than A for the same required-fact coverage.
+- **Required facts hold in C.** The previous failure is visible in every
+  fix round (15/15), the final decision through implementation (9/9), the
+  active task's file (9/9) and the pinned constraint in every turn.
+- **Honest negative: `long_refactor`.** C loses the previous step's file
+  content on 2 of 4 window turns (the final fix still sees the previous
+  failure — the core success premise holds). A/B keep it. In a long
+  refactor that cycles files, the most recent content of the non-current
+  file leaves C's working set too early — a real incorrect-eviction signal
+  and the documented input for the next non-vector policy iteration, not a
+  hidden pass.
+
+## 8. Reproducibility
 
 Replay is deterministic: the same scenario events through the same engine
 version produce the same metrics. Metrics are token estimates (`ascii/4 +

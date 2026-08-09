@@ -281,8 +281,12 @@ long-task focus without a material regression in task success.
 
 Token-cost and task-switch focus advantages are demonstrated (see
 `docs/EXPERIMENTS.md`). Completion-quality and repeated-mistake metrics
-require a real model provider and are tracked as the next step; the harness
-already produces the per-turn inputs a live measurement would need.
+now have a replay-level proxy — key-fact coverage, `agent-replay
+--facts` (see the V1-M15 section): required facts stay in view and
+forbidden (stale) facts never leak in the dynamic engine, measured per
+turn in CI without a model. A live measurement against a real model
+provider remains the follow-up; the harness already produces the
+per-turn inputs it would need.
 
 ---
 
@@ -1248,6 +1252,46 @@ success rate — the token numbers above and the
 agent-replay tests green, A/B/C replay baseline unchanged). Live
 completion-quality measurement against a real model remains a follow-up;
 the harness already emits the per-turn inputs such a measurement needs.
+
+### Completion-quality proxy: key-fact coverage (`agent-replay --facts`)
+
+The success-rate half now has a replay-level proxy that needs no model
+(`crates/agent-replay/src/facts.rs`, so it runs in CI). Each scenario
+declares `KeyFact`s — a content needle that must be in the model-visible
+working set during a turn window (a *required* fact: the previous
+failure, the final decision, the current file) or must *not* be (a
+*forbidden* fact: a superseded decision, a completed task's detail).
+The evaluator replays the scenario and checks every materialized
+snapshot against the needles, so every miss is explainable as "fact X
+was not in view on turn N".
+
+Measured on the seven scenarios (budget 12 K):
+
+- **Forbidden facts never leak in C, always leak in A (and B).** On
+  `task_switch_and_return` (task B's middleware in task A's finish), on
+  `superseded_decisions` (the superseded first decision during
+  implementation) and on `completed_then_unrelated` (the finished
+  pagination detail in the CSV task), A and B keep the stale detail in
+  view (forbidden violations = 1 each), C archives it (0) — the
+  stale-instruction-leakage metric, measured, not asserted. C pays 3–9×
+  less for the privilege.
+- **Required facts stay in view in C.** The previous failure in every
+  fix round (`test_fix_loop` 15/15), the final decision through
+  implementation (`superseded_decisions` 9/9), the active task's file
+  (`completed_then_unrelated` 9/9) and the pinned constraint in every
+  turn of every engine (15/15).
+- **Honest negative.** On `long_refactor`, C loses the last step's file
+  content out of view on 2 of 4 window turns (the final fix still sees
+  the previous failure — that required fact holds), while A/B keep it.
+  This is a real incorrect-eviction signal — in a long refactor that
+  cycles files, the most recent content of a non-current file leaves
+  the working set too early. It is the documented input for the next
+  non-vector policy iteration, not a hidden pass.
+
+The proxy makes the roadmap's completion-quality metrics (completion
+quality, repeated-mistake rate, stale instruction leakage, incorrect
+eviction rate) replay-level and CI-runnable; the real-model live
+measurement stays the follow-up that needs a provider configuration.
 
 ## V2 Self-Iteration 🚧 (partially implemented)
 

@@ -16,17 +16,21 @@
 //! the append-only, rolling-summary and dynamic-working-set engines to
 //! measure input-token cost, over-budget turns and context churn.
 
+mod facts;
 mod scenarios;
 
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use agent_contracts::{
     AttentionState, ContextDiagnostics, ContextEngine, ContextHints, ContextIngress, ContextItemId,
-    ContextItemSummary, ContextKind, ContextQuery, FocusState, RuntimeEvent, RuntimeEventEnvelope,
-    tokens,
+    ContextItemSummary, ContextKind, ContextQuery, FocusState, MaterializedItem, RuntimeEvent,
+    RuntimeEventEnvelope, tokens,
 };
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 
+pub use facts::{
+    FactCoverage, FactOutcome, KeyFact, compare_facts, render_fact_comparison, scenario_key_facts,
+};
 pub use scenarios::{
     Scenario, all_scenarios, compare_config, compare_scenario, engine_variants, render_comparison,
 };
@@ -113,6 +117,19 @@ pub async fn run_engine(
     engine: Arc<dyn ContextEngine>,
     events: &[RuntimeEventEnvelope],
     config: &ReplayConfig,
+) -> anyhow::Result<ReplayOutcome> {
+    run_engine_observing(engine, events, config, |_, _| {}).await
+}
+
+/// Like [`run_engine`], but hands every materialized snapshot to an
+/// observer alongside the turn that produced it. The observer sees exactly
+/// the working-set items the model would have received (`MaterializedItem`
+/// carries content), which is what the fact-coverage evaluation keys on.
+pub(crate) async fn run_engine_observing(
+    engine: Arc<dyn ContextEngine>,
+    events: &[RuntimeEventEnvelope],
+    config: &ReplayConfig,
+    mut observe: impl FnMut(u64, &[MaterializedItem]),
 ) -> anyhow::Result<ReplayOutcome> {
     let mut current_input = String::new();
     let mut current_turn = 0u64;
@@ -217,6 +234,9 @@ pub async fn run_engine(
                 if input_tokens > config.budget_tokens {
                     over_budget_snapshots += 1;
                 }
+                // The fact-coverage evaluation keys on exactly what the model
+                // would have seen, so the observer gets the working-set items.
+                observe(current_turn, &materialized.items);
                 for selection in materialized.selected {
                     consumed
                         .entry(selection.item_id)
