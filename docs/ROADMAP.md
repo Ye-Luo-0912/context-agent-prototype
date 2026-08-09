@@ -1118,7 +1118,10 @@ operation; see `docs/ARCHITECTURE.md` §9h and
    success rate. ✅ (implemented — see the section below)
 7. **V2 Self-Iteration** — generate → sandbox → test → replay → evaluate →
    canary → stable. The LLM grows capabilities, but cannot modify the
-   evaluation or permission Core.
+   evaluation or permission Core. 🚧 (partially implemented — the
+   evaluation/permission Core is protected by test and the test step
+   runs sandboxed; autonomous generate→canary→stable promotion is
+   deferred, see the section below)
 
 M12/M13 strictly precede Self-Iteration: a capability that can already
 stage effects and a sandbox that can contain it are prerequisites for
@@ -1245,6 +1248,48 @@ success rate — the token numbers above and the
 agent-replay tests green, A/B/C replay baseline unchanged). Live
 completion-quality measurement against a real model remains a follow-up;
 the harness already emits the per-turn inputs such a measurement needs.
+
+## V2 Self-Iteration 🚧 (partially implemented)
+
+The full vision — the LLM generates a capability, the runtime sandboxes
+it, tests it, replays it, evaluates it, canaries it, and promotes it to
+Stable — is the roadmap's autonomy goal. The reachable slice at this
+head protects the two things the vision says the LLM must never touch,
+and wires the loop's test step to the sandbox:
+
+- **The evaluation Core is read-only for capabilities.** The maturity
+  ladder (V1-P7) pins every out-of-process registration to
+  `Experimental` regardless of its declared status — a generated
+  capability cannot promote itself. Activation gating, quarantine
+  rollback and reserved-name protection are covered end to end in
+  `agent-runtime/tests/host.rs`.
+- **The permission Core grants nothing undeclared.** The runtime builds
+  the invocation context from `CapabilityManifest.permissions` alone
+  (V1-M14 PermissionSet): a capability that did not declare a permission
+  receives no handle for it — including the workspace mutation path and
+  the effect-commit channel — and unknown permission strings grant
+  nothing. Covered by the
+  `undeclared_permissions_receive_no_handle` test in
+  `agent-runtime/tests/host.rs`: a capability declaring only
+  `runtime:context-control` receives no workspace handle at all, a
+  `workspace:read`-only capability's write and staged-write paths are
+  refused with an error naming the missing grant while its reads work,
+  the `workspace:write` grant opens the same journaled write path, and
+  an unknown permission string grants no handle.
+- **The test step runs inside the sandbox.** A capability's self-check
+  is a contained verification: the mock's `self_check` op writes its
+  artifact into its own working directory and reports the result, and
+  `sandboxed_self_check_artifacts_stay_contained` asserts the artifact
+  lands in the sandboxed cwd and never escapes to the parent — the
+  "test" leg of the loop executes generated code in the same strict
+  boundary (`agent-process` sandbox: env whitelist, dedicated cwd,
+  resource limits, cancel-kills-tree) the runtime will later rely on.
+
+Deferred (honest remainder): the autonomous generate→compile→register
+loop, canary promotion, and auto-advance to Stable. Those need an
+LLM-authored-code-to-sandbox-test pipeline that is a product decision,
+not a single code change; the evaluation/permission boundary they must
+respect is already tested.
 
 ## V1-M12 Effect Runtime ✅ (implemented)
 

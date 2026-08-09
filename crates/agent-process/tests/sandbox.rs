@@ -170,3 +170,56 @@ async fn sandbox_cwd_is_created_and_isolates_the_child() {
     );
     host.shutdown().await;
 }
+
+/// The V2 evaluation-loop link: a generated capability's self-check runs
+/// inside the strict sandbox, and the check's own artifacts cannot escape
+/// it. The mock's `self_check` op writes a verification artifact into its
+/// working directory and reports the result; the parent must see the pass
+/// but no trace of the artifact outside the sandboxed cwd.
+#[tokio::test]
+async fn sandboxed_self_check_artifacts_stay_contained() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("child-workdir");
+    let host = connect_with(ProcessSandbox {
+        env_whitelist: Some(vec!["PATH".into()]),
+        cwd: Some(cwd.clone()),
+        ..ProcessSandbox::default()
+    })
+    .await;
+
+    // The check passes and reports where its artifact landed.
+    let result: Value = host
+        .call(serde_json::json!({ "op": "self_check" }))
+        .await
+        .expect("self_check op answers");
+    assert_eq!(result["passed"], true, "the self-check must pass");
+
+    // The artifact is real, and it sits inside the sandboxed cwd — the
+    // only place the sandboxed child can write.
+    let probe = result["probe"].as_str().unwrap_or_default().to_string();
+    assert!(
+        probe.starts_with(&cwd.to_string_lossy().into_owned()),
+        "the self-check artifact must stay inside the sandboxed cwd: {probe}"
+    );
+    assert!(
+        std::path::PathBuf::from(&probe).exists(),
+        "the self-check must really write its artifact"
+    );
+
+    // The parent workspace saw nothing: no trace of the verification
+    // outside the sandbox cwd.
+    let parent_entries: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name() != "child-workdir")
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        parent_entries
+            .iter()
+            .all(|name| !name.contains("self-check-result")),
+        "the self-check artifact must not escape the sandbox: {parent_entries:?}"
+    );
+
+    host.shutdown().await;
+}

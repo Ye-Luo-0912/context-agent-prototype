@@ -75,6 +75,24 @@ async fn server_loop() {
                     .unwrap_or_default();
                 reply(&mut writer, id, json!(cwd)).await;
             }
+            "self_check" => {
+                // The evaluation loop's test step: a generated capability
+                // runs its own verification round inside the sandbox. The
+                // check writes its artifact into the working directory and
+                // reports the result — the sandbox test asserts the
+                // artifact stays inside the sandboxed cwd, so the
+                // verification itself is contained, not just env and cwd.
+                let probe = std::env::current_dir()
+                    .map(|cwd| cwd.join("self-check-result.json"))
+                    .unwrap_or_default();
+                let _ = std::fs::write(&probe, "{\"passed\":true}\n");
+                reply(
+                    &mut writer,
+                    id,
+                    json!({ "passed": true, "probe": probe.to_string_lossy() }),
+                )
+                .await;
+            }
             "env" => {
                 // Echo a variable (sandbox test: unlisted parent secrets
                 // must not reach the child; explicit grants must).

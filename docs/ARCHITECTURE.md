@@ -838,6 +838,20 @@ sandbox); until then **V2 autonomous capability generation stays gated** —
 a generated capability only runs after explicit `enable`, and only inside
 the sandbox above.
 
+The same "declarations are not enforcement" rule holds on the in-process
+side (V1-M14 PermissionSet): `CapabilityAwareDispatcher::invocation_context`
+builds handles only from the declared `manifest.permissions` — a
+capability that never declared a workspace permission receives no
+workspace handle at all, a `workspace:read`-only capability gets a
+`ReadOnlyWorkspace` whose write/staged-write paths are refused with an
+error naming the missing grant, and unknown permission strings grant
+nothing. Both enforcement points are under test:
+`undeclared_permissions_receive_no_handle` (agent-runtime) proves the
+grant-by-construction behavior end to end, and
+`sandboxed_self_check_artifacts_stay_contained` (agent-process) proves
+the V2 loop's test step — a generated capability's self-check — runs
+inside the sandbox and its artifacts cannot escape the dedicated cwd.
+
 ## 9c. The tool surface: merged meta-tools, a bounded catalog, one generation (V1-M9)
 
 The always-visible tool schemas are themselves context. Since V1-M9 the

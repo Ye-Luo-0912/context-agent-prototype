@@ -374,6 +374,70 @@ impl Capability for DemoCapability {
     }
 }
 
+/// A capability that captures the invocation context it received, so the
+/// permission tests can assert exactly which handles were granted — and
+/// prove that a handle the manifest never declared is absent by
+/// construction, not by trust.
+struct ContextCapturingCapability {
+    manifest: CapabilityManifest,
+    captured: Arc<Mutex<Option<CapabilityInvocationContext>>>,
+}
+
+impl ContextCapturingCapability {
+    fn with_permissions(id: &str, permissions: &[&str]) -> Self {
+        Self {
+            manifest: CapabilityManifest {
+                id: id.into(),
+                version: "1.0.0".into(),
+                name: id.into(),
+                summary: "records its invocation context".into(),
+                status: CapabilityStatus::Experimental,
+                provides: vec![agent_contracts::CapabilityKind::Tool],
+                permissions: permissions.iter().map(|p| p.to_string()).collect(),
+                requires: Vec::new(),
+                tools: Vec::new(),
+                lifecycle: CapabilityLifecycle::Lazy,
+                transport: CapabilityTransport::Builtin,
+            },
+            captured: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Capability for ContextCapturingCapability {
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+    fn tool_specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: format!("{}.run", self.manifest.id),
+            description: "recording tool".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+        }]
+    }
+    async fn start(&self) -> AgentResult<()> {
+        Ok(())
+    }
+    async fn invoke(
+        &self,
+        call: ToolCall,
+        ctx: CapabilityInvocationContext,
+    ) -> AgentResult<CapabilityOutcome> {
+        *self.captured.lock().unwrap() = Some(ctx);
+        Ok(CapabilityOutcome::Value(ToolOutput {
+            call_id: call.id,
+            tool_name: call.name.clone(),
+            ok: true,
+            summary: "recorded".into(),
+            model_content: format!("recorded {}", call.name),
+            artifact_ref: None,
+            metadata: json!({}),
+        }))
+    }
+}
+
 async fn execute(dispatcher: Arc<dyn ToolDispatcher>, tool: &str) -> ToolOutput {
     let outcome = dispatcher
         .execute(ToolExecutionRequest {
@@ -1342,4 +1406,122 @@ async fn catalog_rows_are_cached_and_invalidate_on_surface_changes() {
             .any(|row| row.name == "cache-demo.demo" && row.state == ToolLifecycle::Loaded),
         "an idle tool returns to Loaded in the fresh rows"
     );
+}
+
+/// The permission Core grants nothing undeclared: the runtime builds the
+/// invocation context from the manifest's declared permissions alone, so a
+/// capability that never declared a workspace permission receives no
+/// workspace handle at all, and one that declared only reads cannot write —
+/// blocked by construction, not by trust.
+#[tokio::test]
+async fn undeclared_permissions_receive_no_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    let mut host = ModuleHost::new();
+    let registry = host.capability_registry();
+
+    // Four capabilities with different declared grants, plus one declaring
+    // an unknown permission string (which must grant nothing).
+    let no_ws = Arc::new(ContextCapturingCapability::with_permissions(
+        "no-ws",
+        &[agent_contracts::RUNTIME_CONTEXT_CONTROL],
+    ));
+    let no_ws_captured = no_ws.captured.clone();
+    let read_only = Arc::new(ContextCapturingCapability::with_permissions(
+        "read-only",
+        &["workspace:read"],
+    ));
+    let read_only_captured = read_only.captured.clone();
+    let write_ws = Arc::new(ContextCapturingCapability::with_permissions(
+        "write-ws",
+        &["workspace:write"],
+    ));
+    let write_ws_captured = write_ws.captured.clone();
+    let unknown = Arc::new(ContextCapturingCapability::with_permissions(
+        "unknown-perm",
+        &["totally-made-up:perm"],
+    ));
+    let unknown_captured = unknown.captured.clone();
+    for capability in [no_ws, read_only, write_ws, unknown] {
+        host.register_capability(capability).unwrap();
+    }
+
+    let dispatcher = Arc::new(CapabilityAwareDispatcher::with_workspace(
+        Arc::new(StubTools),
+        registry.clone(),
+        Some(workspace.clone()),
+    ));
+    host.add_module(Arc::new(ToolModule::new(dispatcher.clone())))
+        .unwrap();
+    host.start().await.unwrap();
+
+    // Builtin capabilities are Enabled on registration, so the full model
+    // path works: load each tool, call it, inspect what it received.
+    let tools = host.registry().tool_provider().unwrap();
+    for id in ["no-ws", "read-only", "write-ws", "unknown-perm"] {
+        registry.load_tool(&format!("{id}.run")).unwrap();
+        let output = execute(tools.clone(), &format!("{id}.run")).await;
+        assert!(output.ok, "{id}: the recording call must succeed");
+    }
+
+    // 1. No workspace permission declared -> no workspace handle at all.
+    let ctx = no_ws_captured.lock().unwrap().take().unwrap();
+    assert_eq!(
+        ctx.granted_permissions,
+        [agent_contracts::RUNTIME_CONTEXT_CONTROL]
+    );
+    assert!(
+        ctx.workspace.is_none(),
+        "a capability that declared no workspace permission must receive no workspace handle"
+    );
+    assert!(ctx.artifacts.is_none(), "no artifact permission declared");
+
+    // 2. Read-only declared -> a read-only handle whose write path is
+    //    blocked with an error naming the missing grant.
+    let ctx = read_only_captured.lock().unwrap().take().unwrap();
+    assert_eq!(ctx.granted_permissions, ["workspace:read"]);
+    let handle = ctx.workspace.expect("workspace:read must receive a handle");
+    let error = handle.write("x.txt", b"x").await.unwrap_err().to_string();
+    assert!(
+        error.contains("workspace:write was not granted"),
+        "the write refusal must name the grant: {error}"
+    );
+    let error = match handle.prepare_write("x.txt", b"x").await {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("prepare_write must be refused without the grant"),
+    };
+    assert!(
+        error.contains("workspace:write was not granted"),
+        "the staged-write refusal must name the grant: {error}"
+    );
+
+    // 3. Write declared -> the same write path succeeds: the grant, not a
+    //    blanket block, is what opens it.
+    let ctx = write_ws_captured.lock().unwrap().take().unwrap();
+    assert_eq!(ctx.granted_permissions, ["workspace:write"]);
+    let handle = ctx
+        .workspace
+        .expect("workspace:write must receive a handle");
+    handle
+        .write("granted.txt", b"granted content")
+        .await
+        .unwrap();
+    assert_eq!(
+        handle.read("granted.txt").await.unwrap(),
+        b"granted content"
+    );
+
+    // 4. An unknown permission string grants nothing.
+    let ctx = unknown_captured.lock().unwrap().take().unwrap();
+    assert_eq!(ctx.granted_permissions, ["totally-made-up:perm"]);
+    assert!(
+        ctx.workspace.is_none(),
+        "an unknown permission must grant no handle"
+    );
+    assert!(
+        ctx.artifacts.is_none(),
+        "an unknown permission grants nothing"
+    );
+
+    host.stop().await.unwrap();
 }
