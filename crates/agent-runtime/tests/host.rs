@@ -1476,27 +1476,9 @@ async fn undeclared_permissions_receive_no_handle() {
     );
     assert!(ctx.artifacts.is_none(), "no artifact permission declared");
 
-    // 2. Read-only declared -> a read-only handle whose write path is
-    //    blocked with an error naming the missing grant.
-    let ctx = read_only_captured.lock().unwrap().take().unwrap();
-    assert_eq!(ctx.granted_permissions, ["workspace:read"]);
-    let handle = ctx.workspace.expect("workspace:read must receive a handle");
-    let error = handle.write("x.txt", b"x").await.unwrap_err().to_string();
-    assert!(
-        error.contains("workspace:write was not granted"),
-        "the write refusal must name the grant: {error}"
-    );
-    let error = match handle.prepare_write("x.txt", b"x").await {
-        Err(error) => error.to_string(),
-        Ok(_) => panic!("prepare_write must be refused without the grant"),
-    };
-    assert!(
-        error.contains("workspace:write was not granted"),
-        "the staged-write refusal must name the grant: {error}"
-    );
-
-    // 3. Write declared -> the same write path succeeds: the grant, not a
-    //    blanket block, is what opens it.
+    // 2. Write declared -> the same write path succeeds: the grant, not a
+    //    blanket block, is what opens it. This lands the file the
+    //    read-only capability will read back below.
     let ctx = write_ws_captured.lock().unwrap().take().unwrap();
     assert_eq!(ctx.granted_permissions, ["workspace:write"]);
     let handle = ctx
@@ -1509,6 +1491,30 @@ async fn undeclared_permissions_receive_no_handle() {
     assert_eq!(
         handle.read("granted.txt").await.unwrap(),
         b"granted content"
+    );
+
+    // 3. Read-only declared -> a read-only handle: reads work, both write
+    //    paths are blocked with an error naming the missing grant.
+    let ctx = read_only_captured.lock().unwrap().take().unwrap();
+    assert_eq!(ctx.granted_permissions, ["workspace:read"]);
+    let handle = ctx.workspace.expect("workspace:read must receive a handle");
+    assert_eq!(
+        handle.read("granted.txt").await.unwrap(),
+        b"granted content",
+        "the read-only handle must still read the workspace"
+    );
+    let error = handle.write("x.txt", b"x").await.unwrap_err().to_string();
+    assert!(
+        error.contains("workspace:write was not granted"),
+        "the write refusal must name the grant: {error}"
+    );
+    let error = match handle.prepare_write("x.txt", b"x").await {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("prepare_write must be refused without the grant"),
+    };
+    assert!(
+        error.contains("workspace:write was not granted"),
+        "the staged-write refusal must name the grant: {error}"
     );
 
     // 4. An unknown permission string grants nothing.
