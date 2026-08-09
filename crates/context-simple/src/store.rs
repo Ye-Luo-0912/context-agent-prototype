@@ -69,6 +69,63 @@ pub(crate) fn read_item(dir: &Path, item_id: ContextItemId) -> Option<ContextIte
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Deterministic search over externalized refs — no vectors, no store
+/// reads. Filters on the indexed dimensions of the map (entity signature,
+/// kind, scope, task), ranks entity matches above recency, and caps the
+/// answer. The full content stays in the store; the model decides what to
+/// fetch after seeing the refs.
+pub(crate) fn search_entries(
+    entries: &[ExternalizedContext],
+    query: &agent_contracts::ContextSearchQuery,
+) -> Vec<ExternalizedContext> {
+    let needle = query.query.to_lowercase();
+    let mut hits: Vec<&ExternalizedContext> = entries
+        .iter()
+        .filter(|entry| {
+            if let Some(kind) = query.kind
+                && entry.kind != kind
+            {
+                return false;
+            }
+            if let Some(scope) = query.scope
+                && entry.scope != scope
+            {
+                return false;
+            }
+            if let Some(task) = query.task_id
+                && entry.task_id != Some(task)
+            {
+                return false;
+            }
+            if needle.is_empty() {
+                return true;
+            }
+            entry.entities.iter().any(|entity| {
+                entity.to_lowercase().contains(&needle)
+            }) || entry.context_ref.summary.to_lowercase().contains(&needle)
+                || entry.context_ref.uri.to_lowercase().contains(&needle)
+        })
+        .collect();
+    hits.sort_by(|a, b| {
+        let a_entity = a
+            .entities
+            .iter()
+            .any(|entity| entity.to_lowercase().contains(&needle));
+        let b_entity = b
+            .entities
+            .iter()
+            .any(|entity| entity.to_lowercase().contains(&needle));
+        b_entity
+            .cmp(&a_entity)
+            .then_with(|| b.last_access_tick.cmp(&a.last_access_tick))
+            .then_with(|| b.externalized_at_tick.cmp(&a.externalized_at_tick))
+            .then_with(|| a.item_id.0.cmp(&b.item_id.0))
+    });
+    let limit = if query.limit == 0 { 16 } else { query.limit };
+    hits.truncate(limit);
+    hits.into_iter().cloned().collect()
+}
+
 /// Build the lightweight external-map entry for an item just written to the
 /// store. The entry keeps the item's entity signature and dependency edges
 /// so recall and Storage GC can decide *without* reading the file: recall
@@ -83,6 +140,7 @@ pub(crate) fn to_external_entry(
 ) -> ExternalizedContext {
     ExternalizedContext {
         item_id: item.id,
+        task_id: item.task_id,
         kind: item.kind,
         scope: item.scope,
         retention: item.retention,

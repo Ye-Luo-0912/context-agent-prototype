@@ -63,6 +63,23 @@ impl PromptAssembler {
             }
             context_frame.push(ModelMessage::system(working));
         }
+        if !materialized.external.is_empty() {
+            // Externalized items: the model sees refs, not content. The
+            // retrieval loop (context.search / context.inspect /
+            // context.fetch) is how a ref comes back on demand — this is
+            // the on-demand half of the lifecycle: externalized is not
+            // deleted, and the agent knows how to pull it back.
+            let mut external = String::from(
+                "EXTERNAL CONTEXT (refs only)\nThese items were archived to the context store. Use context.inspect for metadata or context.fetch to pull the full content back on demand.",
+            );
+            for entry in &materialized.external {
+                external.push_str(&format!(
+                    "\n{} | kind={:?} scope={:?} | {}",
+                    entry.context_ref.uri, entry.kind, entry.scope, entry.context_ref.summary
+                ));
+            }
+            context_frame.push(ModelMessage::system(external));
+        }
 
         ModelInput {
             system_policy: vec![ModelMessage::system(self.system_prompt.clone())],

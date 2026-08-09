@@ -490,6 +490,46 @@ impl ContextEngine for SimpleContextEngine {
         Ok(summaries)
     }
 
+    async fn search_external(
+        &self,
+        query: agent_contracts::ContextSearchQuery,
+    ) -> AgentResult<Vec<agent_contracts::ExternalizedContext>> {
+        let state = self.state.lock().await;
+        Ok(crate::store::search_entries(&state.external, &query))
+    }
+
+    async fn inspect_external(
+        &self,
+        item_id: ContextItemId,
+    ) -> AgentResult<Option<agent_contracts::ExternalizedContext>> {
+        let state = self.state.lock().await;
+        Ok(state.external.iter().find(|e| e.item_id == item_id).cloned())
+    }
+
+    async fn fetch_external(
+        &self,
+        item_id: ContextItemId,
+    ) -> AgentResult<Option<ContextItem>> {
+        let mut state = self.state.lock().await;
+        if !state.external.iter().any(|e| e.item_id == item_id) {
+            return Ok(None);
+        }
+        let dir = crate::store::store_dir(&self.config);
+        let item = crate::store::read_item(&dir, item_id);
+        if item.is_some() {
+            // A deliberate pull stamps recency and the GC generation on the
+            // entry, so ranking and Cold -> External aging stay honest — the
+            // item was used, it is not an untouched stale reference.
+            let now_tick = state.tick;
+            let gc_epoch = state.gc_epoch;
+            if let Some(entry) = state.external.iter_mut().find(|e| e.item_id == item_id) {
+                entry.last_access_tick = now_tick;
+                entry.last_access_gc_epoch = Some(gc_epoch);
+            }
+        }
+        Ok(item)
+    }
+
     async fn checkpoint(&self) -> AgentResult<Value> {
         let state = self.state.lock().await;
         checkpoint::serialize(&state)

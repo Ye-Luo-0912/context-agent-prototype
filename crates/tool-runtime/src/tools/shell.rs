@@ -298,9 +298,9 @@ mod tests {
     fn value(outcome: ToolOutcome) -> ToolOutput {
         match outcome {
             ToolOutcome::Value(output) => output,
-            ToolOutcome::PreparedEffect { .. } | ToolOutcome::RuntimeDirective { .. } => {
-                panic!("shell.exec must return a plain value")
-            }
+            ToolOutcome::PreparedEffect { .. }
+            | ToolOutcome::RuntimeDirective { .. }
+            | ToolOutcome::EngineQuery { .. } => panic!("shell.exec must return a plain value"),
         }
     }
 

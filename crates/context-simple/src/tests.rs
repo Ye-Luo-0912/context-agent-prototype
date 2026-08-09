@@ -1,8 +1,8 @@
 use agent_contracts::{
     AgentError, AttentionState, ContextAction, ContextEngine, ContextHints, ContextIngress,
     ContextItem, ContextItemId, ContextKind, ContextMaintenanceTrigger, ContextQuery,
-    ContextRetention, ContextScope, FocusState, LifecycleLabel, ScopeKind, ScopeState,
-    SemanticState, TaskId, ToolOutput,
+    ContextRetention, ContextScope, ContextSearchQuery, CoreLabel, FocusState, Label, LifecycleLabel,
+    ScopeKind, ScopeState, SemanticState, TaskId, ToolOutput,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -2101,6 +2101,126 @@ async fn task_close_expires_keep_alive_and_leases() {
     assert!(
         report.evicted >= 1,
         "the completed task's working set is evictable: {report:?}"
+    );
+}
+
+#[tokio::test]
+async fn external_retrieval_searches_inspects_and_fetches() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let task_a = TaskId::new();
+    let task_b = TaskId::new();
+    let (item_a_id, item_b_id) = {
+        let mut state = engine.state.lock().await;
+        let mut item_a = crate::item::make_item(
+            &state,
+            &engine.config,
+            "AuthService.rs decision: replace the auth flow".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.5,
+            None,
+        );
+        item_a.id = ContextItemId::new();
+        item_a.task_id = Some(task_a);
+        item_a.entities = crate::index::entity::extract_entities(&item_a.content);
+        item_a.tags.push(Label::core(CoreLabel::Decision));
+        let mut item_b = crate::item::make_item(
+            &state,
+            &engine.config,
+            "CacheStore.rs note: LRU eviction order".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.4,
+            None,
+        );
+        item_b.id = ContextItemId::new();
+        item_b.task_id = Some(task_b);
+        item_b.entities = crate::index::entity::extract_entities(&item_b.content);
+        for (item, tick) in [(&item_a, 1u64), (&item_b, 2u64)] {
+            let reference = crate::store::externalize(dir.path(), item).unwrap();
+            state
+                .external
+                .push(crate::store::to_external_entry(item, reference, tick, 1));
+        }
+        (item_a.id, item_b.id)
+    };
+
+    // Search by entity signature: only the decision matches.
+    let hits = engine
+        .search_external(ContextSearchQuery::new("AuthService", 10))
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "entity search must hit exactly one ref");
+    assert_eq!(hits[0].item_id, item_a_id);
+    assert_eq!(hits[0].task_id, Some(task_a));
+
+    // Kind filter without a query.
+    let hits = engine
+        .search_external(ContextSearchQuery {
+            query: String::new(),
+            kind: Some(ContextKind::Note),
+            scope: None,
+            task_id: None,
+            limit: 0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].item_id, item_b_id);
+
+    // Task filter: task A owns exactly its own ref.
+    let hits = engine
+        .search_external(ContextSearchQuery {
+            query: String::new(),
+            kind: None,
+            scope: None,
+            task_id: Some(task_a),
+            limit: 0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].item_id, item_a_id);
+
+    // Inspect: metadata without a store read.
+    let inspected = engine
+        .inspect_external(item_a_id)
+        .await
+        .unwrap()
+        .expect("entry exists");
+    assert_eq!(inspected.kind, ContextKind::Decision);
+    assert!(inspected.tags.iter().any(|t| t.is_core(CoreLabel::Decision)));
+
+    // Fetch: full content back, and the access is stamped on the entry so
+    // recency ranking and Cold -> External aging stay honest.
+    let fetched = engine
+        .fetch_external(item_a_id)
+        .await
+        .unwrap()
+        .expect("item readable back");
+    assert!(fetched.content.contains("replace the auth flow"));
+    {
+        let state = engine.state.lock().await;
+        let entry = state
+            .external
+            .iter()
+            .find(|e| e.item_id == item_a_id)
+            .expect("entry survives the fetch");
+        assert_eq!(entry.last_access_tick, state.tick);
+        assert_eq!(entry.last_access_gc_epoch, Some(state.gc_epoch));
+    }
+
+    // The item stays externalized: fetch is a read, not a reactivation.
+    let items = engine.inspect(usize::MAX).await.unwrap();
+    assert!(
+        items.iter().all(|item| item.id != item_a_id),
+        "fetch must not re-enter the working set"
     );
 }
 

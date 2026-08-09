@@ -822,6 +822,26 @@ impl RuntimeActor {
                     None,
                     Some(directive),
                 ),
+                // The tool asked the runtime to resolve a read-only engine
+                // query: the kernel (the ContextEngine owner) answers and
+                // the placeholder output becomes the final one. No effect,
+                // no directive — search/inspect/fetch are pure reads.
+                ToolOutcome::EngineQuery { output, query } => {
+                    let resolved = kernel.resolve_engine_query(output, query).await;
+                    (
+                        OperationResult {
+                            run_id,
+                            turn_id,
+                            task_id,
+                            scope_id: tool_scope,
+                            operation_id,
+                            generation,
+                            outcome: OperationOutcome::ToolOutput(resolved),
+                        },
+                        None,
+                        None,
+                    )
+                }
             };
             let _ = op_tx
                 .send(OperationCompletion {

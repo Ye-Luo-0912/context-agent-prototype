@@ -23,8 +23,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::tools::{
-    ContextDirectiveTool, EditReplaceTool, FsListTool, FsReadTool, FsWriteTool, GitDiffTool,
-    GitStatusTool, SearchGrepTool, ShellExecTool, Tool,
+    ContextDirectiveTool, ContextQueryTool, EditReplaceTool, FsListTool, FsReadTool, FsWriteTool,
+    GitDiffTool, GitStatusTool, SearchGrepTool, ShellExecTool, Tool,
 };
 
 /// Control tools are now defined by the unified catalog contract.
@@ -49,12 +49,16 @@ impl Default for ToolLifecycleConfig {
                 "fs.read".into(),
                 "search.grep".into(),
                 // The context meta-tools are the model's handle on the
-                // context engine (gc hints, tags, leases, manual collect);
+                // context engine (gc hints, tags, leases, manual collect,
+                // and the on-demand retrieval loop over externalized refs);
                 // they are cheap and always relevant.
                 "context.gc_hint".into(),
                 "context.tag".into(),
                 "context.lease".into(),
                 "context.collect".into(),
+                "context.search".into(),
+                "context.inspect".into(),
+                "context.fetch".into(),
             ],
             idle_to_warm_ticks: 8,
             warm_to_unload_ticks: 24,
@@ -96,6 +100,9 @@ impl BuiltinToolDispatcher {
             Arc::new(ContextDirectiveTool::tag()),
             Arc::new(ContextDirectiveTool::lease()),
             Arc::new(ContextDirectiveTool::collect()),
+            Arc::new(ContextQueryTool::search()),
+            Arc::new(ContextQueryTool::inspect()),
+            Arc::new(ContextQueryTool::fetch()),
         ];
         let catalog = tools
             .into_iter()
@@ -425,9 +432,9 @@ mod tests {
     fn value(outcome: ToolOutcome) -> ToolOutput {
         match outcome {
             ToolOutcome::Value(output) => output,
-            ToolOutcome::PreparedEffect { .. } | ToolOutcome::RuntimeDirective { .. } => {
-                panic!("control tools return plain values")
-            }
+            ToolOutcome::PreparedEffect { .. }
+            | ToolOutcome::RuntimeDirective { .. }
+            | ToolOutcome::EngineQuery { .. } => panic!("control tools return plain values"),
         }
     }
 
@@ -556,6 +563,72 @@ mod tests {
         // Bad arguments are rejected like any other tool.
         let error = dispatcher
             .execute(request("context.gc_hint", json!({})))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("args"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn context_query_tools_emit_engine_queries() {
+        let dispatcher = dispatcher().await;
+
+        // The retrieval loop is read-only and engine-serviced: the tools
+        // name what they want (`EngineQuery`), the kernel resolves it.
+        let query = |outcome: ToolOutcome| match outcome {
+            ToolOutcome::EngineQuery { query, .. } => query,
+            other => panic!("context query tools must emit an engine query, got {other:?}"),
+        };
+
+        let outcome = dispatcher
+            .execute(request(
+                "context.search",
+                json!({"query": "AuthService", "limit": 8}),
+            ))
+            .await
+            .unwrap();
+        match query(outcome) {
+            agent_contracts::EngineQuery::SearchExternal {
+                query,
+                limit,
+                kind,
+                scope,
+                task_id,
+            } => {
+                assert_eq!(query, "AuthService");
+                assert_eq!(limit, 8);
+                assert!(kind.is_none() && scope.is_none() && task_id.is_none());
+            }
+            other => panic!("expected SearchExternal, got {other:?}"),
+        }
+
+        let item_id = "00000000-0000-0000-0000-000000000000";
+        let outcome = dispatcher
+            .execute(request(
+                "context.inspect",
+                json!({"item_id": item_id}),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            query(outcome),
+            agent_contracts::EngineQuery::InspectExternal { .. }
+        ));
+
+        let outcome = dispatcher
+            .execute(request(
+                "context.fetch",
+                json!({"item_id": item_id}),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            query(outcome),
+            agent_contracts::EngineQuery::FetchExternal { .. }
+        ));
+
+        // Bad arguments are rejected like any other tool.
+        let error = dispatcher
+            .execute(request("context.search", json!({})))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("args"), "{error}");

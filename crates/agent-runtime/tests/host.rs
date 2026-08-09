@@ -381,9 +381,9 @@ async fn execute(dispatcher: Arc<dyn ToolDispatcher>, tool: &str) -> ToolOutput 
         .unwrap();
     match outcome {
         ToolOutcome::Value(output) => output,
-        ToolOutcome::PreparedEffect { .. } | ToolOutcome::RuntimeDirective { .. } => {
-            panic!("test dispatcher returns plain values")
-        }
+        ToolOutcome::PreparedEffect { .. }
+        | ToolOutcome::RuntimeDirective { .. }
+        | ToolOutcome::EngineQuery { .. } => panic!("test dispatcher returns plain values"),
     }
 }
 

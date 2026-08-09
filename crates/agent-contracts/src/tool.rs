@@ -2,7 +2,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{AgentError, AgentResult, CancellationToken, ContextAction, RunId};
+use crate::{
+    AgentError, AgentResult, CancellationToken, ContextAction, ContextItemId, ContextKind,
+    ContextScope, RunId, TaskId,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolRisk {
@@ -124,8 +127,10 @@ pub const RUNTIME_CONTEXT_CONTROL: &str = "runtime:context-control";
 /// What a tool execution produced: either a plain bounded output (a value —
 /// reads, searches, already-applied behavior like a spawned process), an
 /// output plus a staged side effect the runtime must commit (or roll back)
-/// after validating the operation is still current, or an output plus a
-/// runtime directive (context control) the actor executes at commit time.
+/// after validating the operation is still current, an output plus a
+/// runtime directive (context control) the actor executes at commit time,
+/// or an output plus an engine query the runtime resolves against the
+/// context engine (tools never touch the engine — invariant 3).
 pub enum ToolOutcome {
     /// The execution produced only an output; there is nothing to commit.
     Value(ToolOutput),
@@ -142,6 +147,39 @@ pub enum ToolOutcome {
         output: ToolOutput,
         directive: RuntimeDirective,
     },
+    /// The computation finished and the tool asks the runtime to resolve a
+    /// read-only query against the context engine (search/inspect/fetch
+    /// over externalized refs). The placeholder `output` becomes the final
+    /// tool output once the engine answers.
+    EngineQuery {
+        output: ToolOutput,
+        query: EngineQuery,
+    },
+}
+
+/// A read-only query the runtime resolves against the context engine. Only
+/// builtin context tools produce these (a capability cannot emit an engine
+/// query through `CapabilityOutcome`), and they carry no side effects — the
+/// engine stamps access on fetch so recency ranking stays honest.
+#[derive(Debug, Clone)]
+pub enum EngineQuery {
+    /// Deterministic search over externalized refs (entity/kind/scope/task
+    /// filters + recency). `limit` caps the answer.
+    SearchExternal {
+        query: String,
+        kind: Option<ContextKind>,
+        scope: Option<ContextScope>,
+        task_id: Option<TaskId>,
+        limit: usize,
+    },
+    /// Metadata of one externalized entry by item id (no store read).
+    InspectExternal {
+        item_id: ContextItemId,
+    },
+    /// Full content of one externalized item, pulled back deliberately.
+    FetchExternal {
+        item_id: ContextItemId,
+    },
 }
 
 impl std::fmt::Debug for ToolOutcome {
@@ -157,6 +195,11 @@ impl std::fmt::Debug for ToolOutcome {
                 .debug_struct("RuntimeDirective")
                 .field("output", output)
                 .field("directive", directive)
+                .finish(),
+            ToolOutcome::EngineQuery { output, query } => f
+                .debug_struct("EngineQuery")
+                .field("output", output)
+                .field("query", query)
                 .finish(),
         }
     }

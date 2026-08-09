@@ -588,6 +588,10 @@ pub struct ContextRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalizedContext {
     pub item_id: ContextItemId,
+    /// Task the item belonged to when it was externalized, kept so
+    /// deterministic retrieval can filter by task without reading the file.
+    #[serde(default)]
+    pub task_id: Option<TaskId>,
     pub kind: ContextKind,
     pub scope: ContextScope,
     pub retention: ContextRetention,
@@ -625,6 +629,39 @@ pub struct ExternalizedContext {
 /// The lightweight context map the model sees for externalized items:
 /// references, never content.
 pub type ContextMap = Vec<ExternalizedContext>;
+
+/// Deterministic search over the external context map — no vectors. The
+/// indexed dimensions of the map (entity signature, kind, scope, task,
+/// label, recency) are enough to bring a ref back on demand.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextSearchQuery {
+    /// Free-text query matched (case-insensitively) against entity
+    /// signatures and the entry summary.
+    pub query: String,
+    /// Optional kind filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ContextKind>,
+    /// Optional scope filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ContextScope>,
+    /// Optional task filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    /// Cap on returned refs. `0` means the engine default (16).
+    pub limit: usize,
+}
+
+impl ContextSearchQuery {
+    pub fn new(query: impl Into<String>, limit: usize) -> Self {
+        Self {
+            query: query.into(),
+            kind: None,
+            scope: None,
+            task_id: None,
+            limit,
+        }
+    }
+}
 
 /// The result of one `ContextEngine::storage_gc` pass. Storage GC is the
 /// only place information is permanently deleted, and it is deliberately
@@ -724,6 +761,42 @@ pub trait ContextEngine: Send + Sync {
 
     /// Bounded projection of live items, oldest first, capped at `limit`.
     async fn inspect(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>>;
+
+    /// Deterministic search over externalized refs: matches the query
+    /// against entity signatures, kind/scope/task filters and recency,
+    /// capped at `query.limit`. The default implementation returns nothing,
+    /// so engines without an external store (baselines, adapters) keep
+    /// working unchanged.
+    async fn search_external(
+        &self,
+        query: ContextSearchQuery,
+    ) -> AgentResult<Vec<ExternalizedContext>> {
+        let _ = query;
+        Ok(Vec::new())
+    }
+
+    /// One externalized entry's metadata by item id. No store read — the
+    /// map entry already carries everything the model needs to decide
+    /// whether to fetch.
+    async fn inspect_external(
+        &self,
+        item_id: ContextItemId,
+    ) -> AgentResult<Option<ExternalizedContext>> {
+        let _ = item_id;
+        Ok(None)
+    }
+
+    /// Pull one externalized item's full content back from the store. The
+    /// item stays externalized — this is a deliberate, access-stamped read,
+    /// not a reactivation; the caller (the model) decides what to do with
+    /// the content and the working set is left untouched.
+    async fn fetch_external(
+        &self,
+        item_id: ContextItemId,
+    ) -> AgentResult<Option<ContextItem>> {
+        let _ = item_id;
+        Ok(None)
+    }
 
     /// Export the current runtime state (separate from the event journal).
     async fn checkpoint(&self) -> AgentResult<serde_json::Value>;

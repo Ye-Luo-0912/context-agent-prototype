@@ -229,9 +229,9 @@ mod tests {
     fn value(outcome: ToolOutcome) -> ToolOutput {
         match outcome {
             ToolOutcome::Value(output) => output,
-            ToolOutcome::PreparedEffect { .. } | ToolOutcome::RuntimeDirective { .. } => {
-                panic!("search.grep must return a plain value")
-            }
+            ToolOutcome::PreparedEffect { .. }
+            | ToolOutcome::RuntimeDirective { .. }
+            | ToolOutcome::EngineQuery { .. } => panic!("search.grep must return a plain value"),
         }
     }
 

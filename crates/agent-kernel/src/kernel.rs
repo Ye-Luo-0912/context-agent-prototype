@@ -9,11 +9,11 @@ use std::{
 use agent_contracts::{
     AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, ContextEngine, ContextGcReport,
     ContextIngress, ContextItemSummary, ContextKind, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextQuery, ContextStateTransition, EventJournal, FocusState,
-    MaterializedContext, ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest,
-    ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, TaskId,
-    ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput, ToolSpec,
-    ToolSurfaceSnapshot,
+    ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery, ContextStateTransition,
+    EngineQuery, EventJournal, FocusState, MaterializedContext, ModelCapabilities, ModelEventSink,
+    ModelOutput, ModelRequest, ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, ScopeId,
+    ScopeKind, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput,
+    ToolSpec, ToolSurfaceSnapshot,
 };
 use tokio::sync::broadcast;
 
@@ -199,6 +199,155 @@ impl AgentKernel {
         scope_id: ScopeId,
     ) -> AgentResult<Vec<ContextStateTransition>> {
         self.context.close_scope(scope_id).await
+    }
+
+    /// Resolve a tool's engine query (context.search/inspect/fetch) against
+    /// the context engine and turn the engine's answer into the final tool
+    /// output. Tools never touch the engine (invariant 3); the kernel —
+    /// which owns the `ContextEngine` — services the query. The placeholder
+    /// `output` (call id, tool name) is preserved; only the content is
+    /// replaced. Errors become a failed output so the model learns the
+    /// query did not land.
+    pub async fn resolve_engine_query(
+        &self,
+        output: ToolOutput,
+        query: EngineQuery,
+    ) -> ToolOutput {
+        let mut output = output;
+        match query {
+            EngineQuery::SearchExternal {
+                query,
+                kind,
+                scope,
+                task_id,
+                limit,
+            } => {
+                let search = ContextSearchQuery {
+                    query,
+                    kind,
+                    scope,
+                    task_id,
+                    limit,
+                };
+                match self.context.search_external(search).await {
+                    Ok(hits) if hits.is_empty() => {
+                        output.ok = true;
+                        output.summary = "no external refs match".into();
+                        output.model_content =
+                            "context.search: no externalized items match the query.".into();
+                    }
+                    Ok(hits) => {
+                        output.ok = true;
+                        output.summary = format!("{} external ref(s) match", hits.len());
+                        output.model_content = hits
+                            .iter()
+                            .map(|entry| {
+                                format!(
+                                    "{} | kind={:?} scope={:?} task={} | {}\n  tags: {}\n  entities: {}",
+                                    entry.context_ref.uri,
+                                    entry.kind,
+                                    entry.scope,
+                                    entry
+                                        .task_id
+                                        .map(|t| t.to_string())
+                                        .unwrap_or_else(|| "-".into()),
+                                    entry.context_ref.summary,
+                                    if entry.tags.is_empty() {
+                                        "-".to_string()
+                                    } else {
+                                        entry
+                                            .tags
+                                            .iter()
+                                            .map(|tag| tag.as_str().to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    },
+                                    entry.entities.join(", "),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                    }
+                    Err(error) => {
+                        output.ok = false;
+                        output.summary = "context.search failed".into();
+                        output.model_content = format!("context.search failed: {error}");
+                    }
+                }
+            }
+            EngineQuery::InspectExternal { item_id } => match self
+                .context
+                .inspect_external(item_id)
+                .await
+            {
+                Ok(Some(entry)) => {
+                    output.ok = true;
+                    output.summary = "external ref metadata".into();
+                    output.model_content = format!(
+                        "{} | kind={:?} scope={:?} task={} residency={:?} semantic={:?}\nsummary: {}\ntags: {}\nentities: {}",
+                        entry.context_ref.uri,
+                        entry.kind,
+                        entry.scope,
+                        entry
+                            .task_id
+                            .map(|t| t.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        entry.residency,
+                        entry.semantic,
+                        entry.context_ref.summary,
+                        if entry.tags.is_empty() {
+                            "-".to_string()
+                        } else {
+                            entry
+                                .tags
+                                .iter()
+                                .map(|tag| tag.as_str().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        },
+                        entry.entities.join(", "),
+                    );
+                }
+                Ok(None) => {
+                    output.ok = true;
+                    output.summary = "no such external ref".into();
+                    output.model_content =
+                        format!("context.inspect: no externalized item with id {item_id}.");
+                }
+                Err(error) => {
+                    output.ok = false;
+                    output.summary = "context.inspect failed".into();
+                    output.model_content = format!("context.inspect failed: {error}");
+                }
+            }
+            EngineQuery::FetchExternal { item_id } => match self
+                .context
+                .fetch_external(item_id)
+                .await
+            {
+                Ok(Some(item)) => {
+                    output.ok = true;
+                    output.summary = "external item fetched".into();
+                    output.model_content = format!(
+                        "[{:?} | {:?} | id={}]\n{}",
+                        item.kind, item.scope, item.id, item.content
+                    );
+                }
+                Ok(None) => {
+                    output.ok = true;
+                    output.summary = "no such external ref".into();
+                    output.model_content = format!(
+                        "context.fetch: no externalized item with id {item_id} (it may have been deleted by storage GC)."
+                    );
+                }
+                Err(error) => {
+                    output.ok = false;
+                    output.summary = "context.fetch failed".into();
+                    output.model_content = format!("context.fetch failed: {error}");
+                }
+            }
+        }
+        output
     }
 
     /// One model round: stream the request to the provider. The result is a
