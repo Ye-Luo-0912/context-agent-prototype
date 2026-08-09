@@ -10,7 +10,7 @@
 //! policy lives here once.
 
 use std::io::ErrorKind;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use agent_contracts::{AgentError, AgentResult};
@@ -23,6 +23,40 @@ use tokio::time::timeout;
 /// Client protocol version echoed by every request; a mismatched child is
 /// poisoned instead of misparsed.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The child's execution boundary. Defaults to the historical behavior
+/// (inherit the parent environment and cwd, no resource limits); the
+/// process-capability adapter overrides it with a strict sandbox so a
+/// generated capability cannot read the parent's secrets, roam the
+/// parent's cwd or run without limits.
+#[derive(Debug, Clone)]
+pub struct ProcessSandbox {
+    /// If `Some(names)`, the child inherits *only* these parent variables
+    /// (plus the explicit `ProcessHostConfig::env` grants) — everything
+    /// else, API keys, `HOME`, credentials, is dropped. `None` inherits
+    /// the whole parent environment (the context-service default).
+    pub env_whitelist: Option<Vec<String>>,
+    /// The child's working directory, created at connect when missing.
+    /// `None` keeps the parent's cwd.
+    pub cwd: Option<std::path::PathBuf>,
+    /// Hard CPU-time limit in seconds via `RLIMIT_CPU` (Unix only; ignored
+    /// elsewhere). `0` = unlimited.
+    pub cpu_time_limit_secs: u64,
+    /// Hard process-count limit via `RLIMIT_NPROC` (Unix only; ignored
+    /// elsewhere). `0` = unlimited.
+    pub process_limit: u64,
+}
+
+impl Default for ProcessSandbox {
+    fn default() -> Self {
+        Self {
+            env_whitelist: None,
+            cwd: None,
+            cpu_time_limit_secs: 0,
+            process_limit: 0,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ProcessHostConfig {
@@ -38,6 +72,8 @@ pub struct ProcessHostConfig {
     pub request_timeout: Duration,
     /// Hard cap on one response frame.
     pub max_frame_bytes: usize,
+    /// The child's execution boundary (env, cwd, resource limits).
+    pub sandbox: ProcessSandbox,
 }
 
 /// A live child process speaking JSON-lines on stdio. Strict ping-pong:
@@ -50,6 +86,10 @@ pub struct ProcessHost {
     config: ProcessHostConfig,
     io: Mutex<HostIo>,
     next_id: AtomicU64,
+    /// The child's pid, kept outside the child lock so a cancellation can
+    /// kill the process *tree* (process group / taskkill) without touching
+    /// the io lock.
+    pid: AtomicU32,
 }
 
 struct HostIo {
@@ -66,15 +106,77 @@ impl ProcessHost {
     /// deadline, so a missing or broken program fails at connect time, not
     /// on the first real call.
     pub async fn connect(config: ProcessHostConfig) -> AgentResult<Self> {
-        let mut child = Command::new(&config.program)
+        let mut command = Command::new(&config.program);
+        command
             .args(&config.args)
-            .envs(config.env.iter().cloned())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+
+        // Sandbox: an explicit env whitelist drops every unlisted parent
+        // variable (secrets never cross), then the explicit grants land.
+        if let Some(whitelist) = &config.sandbox.env_whitelist {
+            command.env_clear();
+            for name in whitelist {
+                if let Ok(value) = std::env::var(name) {
+                    command.env(name, value);
+                }
+            }
+        }
+        command.envs(config.env.iter().cloned());
+
+        // Sandbox: the child runs in its own directory, created on demand,
+        // never the parent's cwd.
+        if let Some(cwd) = &config.sandbox.cwd {
+            std::fs::create_dir_all(cwd).map_err(|e| {
+                AgentError::Context(format!("create sandbox cwd '{}': {e}", cwd.display()))
+            })?;
+            command.current_dir(cwd);
+        }
+
+        // Sandbox (Unix): hard CPU-time and process-count ceilings enforced
+        // by the kernel via rlimits, applied right after fork.
+        #[cfg(unix)]
+        {
+            let cpu = config.sandbox.cpu_time_limit_secs;
+            let nproc = config.sandbox.process_limit;
+            if cpu > 0 || nproc > 0 {
+                unsafe {
+                    command.pre_exec(move || {
+                        if cpu > 0 {
+                            let limit = libc::rlimit {
+                                rlim_cur: cpu as libc::rlim_t,
+                                rlim_max: cpu as libc::rlim_t,
+                            };
+                            if libc::setrlimit(libc::RLIMIT_CPU, &limit) != 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                        }
+                        if nproc > 0 {
+                            let limit = libc::rlimit {
+                                rlim_cur: nproc as libc::rlim_t,
+                                rlim_max: nproc as libc::rlim_t,
+                            };
+                            if libc::setrlimit(libc::RLIMIT_NPROC, &limit) != 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                        }
+                        Ok(())
+                    });
+                }
+            }
+        }
+
+        // Make the child a process-group leader on Unix so a cancellation
+        // can kill its whole tree (`kill(-pgid)`), not just the direct
+        // child — a runaway subprocess must not survive its caller.
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command
             .spawn()
             .map_err(|e| AgentError::Context(format!("spawn '{}': {e}", config.program)))?;
+        let pid = child.id().unwrap_or(0);
         let stdin = child
             .stdin
             .take()
@@ -93,6 +195,7 @@ impl ProcessHost {
                 poisoned: None,
             }),
             next_id: AtomicU64::new(1),
+            pid: AtomicU32::new(pid),
         };
         timeout(
             host.config.startup_timeout,
@@ -126,6 +229,39 @@ impl ProcessHost {
                     self.config.program, self.config.request_timeout
                 ))
             })?
+    }
+
+    /// One framed call that also aborts when `cancel` fires (a user
+    /// `/cancel` or a superseded operation must stop the subprocess
+    /// *now*, not at the request deadline). Cancellation poisons the
+    /// connection and kills the child's whole process tree — a cancelled
+    /// capability must not keep producing side effects in the background.
+    pub async fn call_with_cancel(
+        &self,
+        op: Value,
+        cancel: &agent_contracts::CancellationToken,
+    ) -> AgentResult<Value> {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                self.poison("cancelled by the runtime".into());
+                Err(AgentError::Cancelled)
+            }
+            result = timeout(self.config.request_timeout, self.call_unbounded(op)) => {
+                match result {
+                    Ok(inner) => inner,
+                    Err(_) => {
+                        self.poison(format!(
+                            "request timed out after {:?}",
+                            self.config.request_timeout
+                        ));
+                        Err(AgentError::Context(format!(
+                            "process '{}' request timed out after {:?}; connection poisoned",
+                            self.config.program, self.config.request_timeout
+                        )))
+                    }
+                }
+            }
+        }
     }
 
     async fn call_unbounded(&self, op: Value) -> AgentResult<Value> {
@@ -250,15 +386,51 @@ impl ProcessHost {
         }
     }
 
-    /// Mark the connection poisoned and kill the child. `try_lock` so this
-    /// can be called from a timeout path without deadlocking on a guard
-    /// that the cancelled future still holds.
+    /// Mark the connection poisoned and kill the child's process tree.
+    /// `try_lock` so this can be called from a timeout/cancel path without
+    /// deadlocking on a guard that the cancelled future still holds.
     fn poison(&self, reason: String) {
         if let Ok(mut io) = self.io.try_lock() {
             io.poisoned = Some(reason);
         }
-        if let Ok(mut child) = self.child.try_lock() {
-            let _ = child.start_kill();
+        self.kill_tree();
+    }
+
+    /// Kill the child and every descendant. A cancelled or timed-out call
+    /// must not leave a runaway subtree alive — the child's own side
+    /// effects (spawned subprocesses, writers) die with it.
+    fn kill_tree(&self) {
+        let pid = self.pid.load(Ordering::Relaxed);
+        if pid == 0 {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            // Negative pid = the process group. The child was spawned with
+            // `process_group(0)`, so its pgid == its pid and SIGKILL to
+            // -pid reaches the whole tree. On ESRCH (no such group) fall
+            // back to killing the direct child.
+            let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            if result != 0 {
+                if let Ok(mut child) = self.child.try_lock() {
+                    let _ = child.start_kill();
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            // `taskkill /T` walks the tree from the pid; `/F` force-kills.
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            if let Ok(mut child) = self.child.try_lock() {
+                let _ = child.start_kill();
+            }
         }
     }
 }

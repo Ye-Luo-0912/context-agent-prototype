@@ -51,6 +51,29 @@ impl ProcessCapabilityAdapter {
             startup_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
             max_frame_bytes: 16 * 1024 * 1024,
+            sandbox: crate::host::ProcessSandbox {
+                // No parent secrets: only the non-secret platform essentials
+                // are inherited; anything else must be granted explicitly
+                // via `env` overrides. OPENAI_API_KEY, HOME, credentials and
+                // friends never cross the boundary by default.
+                env_whitelist: Some(vec![
+                    "PATH".into(),
+                    "SystemRoot".into(),
+                    "SystemDrive".into(),
+                    "TEMP".into(),
+                    "TMP".into(),
+                ]),
+                // A dedicated working directory per capability, created at
+                // connect — never the parent's cwd, so a generated
+                // capability cannot roam the workspace by relative paths.
+                cwd: Some(
+                    std::env::temp_dir()
+                        .join(format!("context-agent-capability-{}", manifest.id)),
+                ),
+                // Hard ceilings enforced by the kernel on Unix.
+                cpu_time_limit_secs: 60,
+                process_limit: 16,
+            },
         };
         Ok(Self::with_config(manifest, config))
     }
@@ -105,13 +128,19 @@ impl Capability for ProcessCapabilityAdapter {
         })?;
         // The process receives the call plus the granted permissions so it
         // knows what it may do; the sandbox enforcing those grants is a
-        // later concern, like the context service's own boundary.
+        // later concern, like the context service's own boundary. The
+        // invocation context's cancellation token aborts a long-running
+        // call immediately: `/cancel` or a superseded operation kills the
+        // subprocess tree instead of waiting for the request deadline.
         let value = host
-            .call(json!({
-                "op": "invoke",
-                "call": call,
-                "permissions": ctx.granted_permissions,
-            }))
+            .call_with_cancel(
+                json!({
+                    "op": "invoke",
+                    "call": call,
+                    "permissions": ctx.granted_permissions,
+                }),
+                &ctx.cancel,
+            )
             .await?;
         let output: ToolOutput = serde_json::from_value(value)
             .map_err(|e| AgentError::Context(format!("decode capability output: {e}")))?;

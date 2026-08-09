@@ -316,6 +316,7 @@ dependencies = [
  "agent-runtime",
  "async-trait",
  "context-simple",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

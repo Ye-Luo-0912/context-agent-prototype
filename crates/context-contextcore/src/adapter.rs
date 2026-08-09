@@ -102,6 +102,10 @@ impl ContextServiceAdapter {
             startup_timeout: config.startup_timeout,
             request_timeout: config.request_timeout,
             max_frame_bytes: config.max_frame_bytes,
+            // The context service is the runtime's own trusted sidecar; it
+            // keeps the historical inherit-all behavior. The strict sandbox
+            // is applied to *capabilities* (see ProcessCapabilityAdapter).
+            sandbox: crate::host::ProcessSandbox::default(),
         })
         .await
         .map_err(|e| {

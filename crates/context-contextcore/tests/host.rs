@@ -11,7 +11,7 @@ mod common;
 
 use std::time::Duration;
 
-use context_contextcore::{ProcessHost, ProcessHostConfig};
+use context_contextcore::{ProcessHost, ProcessHostConfig, ProcessSandbox};
 use serde_json::json;
 
 /// Spawn the `mock_host` test target with `--serve` and the env marker.
@@ -30,6 +30,7 @@ async fn spawn_mock(tune: impl FnOnce(&mut ProcessHostConfig)) -> ProcessHost {
         startup_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(5),
         max_frame_bytes: 1024 * 1024,
+        sandbox: Default::default(),
     };
     tune(&mut config);
     ProcessHost::connect(config)
@@ -77,4 +78,53 @@ async fn silent_request_times_out_and_poisons_the_connection() {
         second.to_string().contains("poisoned"),
         "expected a poisoned-connection error, got: {second}"
     );
+}
+
+#[tokio::test]
+async fn sandbox_drops_unlisted_secrets_and_forces_the_dedicated_cwd() {
+    // A parent secret the whitelist does not name: it must never reach the
+    // child. Explicit grants (via `env`) still arrive.
+    unsafe { std::env::set_var("SANDBOX_SECRET", "parent-secret") };
+    let host = spawn_mock(|config| {
+        config.sandbox = ProcessSandbox {
+            env_whitelist: Some(vec!["PATH".into()]),
+            cwd: Some(
+                std::env::temp_dir().join(format!("sandbox-cwd-{}", std::process::id())),
+            ),
+            cpu_time_limit_secs: 0,
+            process_limit: 0,
+        };
+    })
+    .await;
+    let cwd = host.call(json!({ "op": "cwd" })).await.unwrap();
+    assert!(
+        cwd.as_str().unwrap_or_default().contains("sandbox-cwd"),
+        "the child must run in its dedicated cwd, got: {cwd}"
+    );
+    let secret = host.call(json!({ "op": "env" })).await.unwrap();
+    assert_eq!(
+        secret, json!(""),
+        "an unlisted parent secret must not be inherited"
+    );
+    host.shutdown().await;
+
+    // An explicit grant crosses the boundary even under a strict whitelist.
+    let host = spawn_mock(|config| {
+        config.sandbox = ProcessSandbox {
+            env_whitelist: Some(vec!["PATH".into()]),
+            cwd: None,
+            cpu_time_limit_secs: 0,
+            process_limit: 0,
+        };
+        config
+            .env
+            .push(("SANDBOX_SECRET".into(), "granted-value".into()));
+    })
+    .await;
+    let secret = host.call(json!({ "op": "env" })).await.unwrap();
+    assert_eq!(
+        secret, json!("granted-value"),
+        "explicitly granted variables must reach the child"
+    );
+    host.shutdown().await;
 }

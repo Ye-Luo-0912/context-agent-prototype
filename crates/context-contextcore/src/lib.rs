@@ -14,5 +14,8 @@ mod wire;
 
 pub use adapter::{ContextServiceAdapter, ContextServiceConfig, ServiceEngine, connect_engine};
 pub use capability_host::{ProcessCapabilityAdapter, load_process_capability};
-pub use host::{PROTOCOL_VERSION, ProcessHost, ProcessHostConfig, probe_siblings, resolve_program};
+pub use host::{
+    PROTOCOL_VERSION, ProcessHost, ProcessHostConfig, ProcessSandbox, probe_siblings,
+    resolve_program,
+};
 pub use wire::{ServiceOp, ServiceRequest, ServiceResponse};

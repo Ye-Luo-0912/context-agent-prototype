@@ -47,9 +47,36 @@ async fn server_loop() {
         let id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
         match request.get("op").and_then(Value::as_str).unwrap_or("") {
             "ping" => reply(&mut writer, id, json!("pong")).await,
+            "cwd" => {
+                // Echo the child's working directory (sandbox test: the
+                // child must run in the dedicated cwd, not the parent's).
+                let cwd = std::env::current_dir()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                reply(&mut writer, id, json!(cwd)).await;
+            }
+            "env" => {
+                // Echo a variable (sandbox test: unlisted parent secrets
+                // must not reach the child; explicit grants must).
+                let value = std::env::var("SANDBOX_SECRET").unwrap_or_default();
+                reply(&mut writer, id, json!(value)).await;
+            }
             "invoke" => {
                 // A canned `ToolOutput` so the process-capability adapter's
-                // round trip is testable against a real process.
+                // round trip is testable against a real process — unless the
+                // call asks for `silent`, in which case the mock never
+                // answers (cancellation test: the client must abort and kill
+                // the tree instead of waiting out the request deadline).
+                let silent = request
+                    .get("call")
+                    .and_then(|call| call.get("arguments"))
+                    .and_then(|args| args.get("silent"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if silent {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    continue;
+                }
                 let output = serde_json::to_value(ToolOutput {
                     call_id: "c1".into(),
                     tool_name: "process-demo.invoke".into(),
