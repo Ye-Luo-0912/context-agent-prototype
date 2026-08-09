@@ -1,3 +1,3 @@
 mod simple;
 
-pub(crate) use simple::score_item_with_breakdown;
+pub(crate) use simple::{lexical_overlap, score_item_with_breakdown};

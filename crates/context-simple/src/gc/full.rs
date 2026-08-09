@@ -138,8 +138,30 @@ pub(crate) fn plan_full_gc(
             continue;
         }
         let generation = item.gc_generation;
-        if eviction_candidate(&item, config, now_tick, generation) {
-            let reason = eviction_reason(&item, config, now_tick, generation);
+        // A member of a closed scope is outside the working set: the
+        // residency pass may still score it Active (a same-template message
+        // keeps a high focus match), but its scope ended, so no root can
+        // protect it and no candidate can select it. Evict regardless of
+        // attention — the working set tracks open scopes, not task turns.
+        let closed_member = item.scope_id.is_some_and(|sid| {
+            state
+                .scopes
+                .by_id(sid)
+                .is_none_or(|scope| scope.state == ScopeState::Closed)
+        });
+        if closed_member || eviction_candidate(&item, config, now_tick, generation) {
+            let reason = if closed_member {
+                format!(
+                    "member of a closed {} scope; evicted to reversible buffer (generation {generation})",
+                    state
+                        .scopes
+                        .by_id(item.scope_id.expect("closed_member implies a scope id"))
+                        .map(|scope| format!("{:?}", scope.kind))
+                        .unwrap_or_default()
+                )
+            } else {
+                eviction_reason(&item, config, now_tick, generation)
+            };
             plan.evictions.push(ContextEviction {
                 item_id: item.id,
                 kind: item.kind,
@@ -538,6 +560,16 @@ fn reactivate(state: &mut State, config: &SimpleContextConfig, now_tick: u64, pl
         if item.evicted_at_tick == Some(now_tick) {
             continue;
         }
+        // A member of a closed scope (a rotated episode, a closed tool
+        // frame) may come back only for a *new causal reason* — a hot
+        // entity or a model directive — never for the residency score
+        // floor, which is what kept it Active across turns.
+        let scope_closed = item.scope_id.is_some_and(|sid| {
+            state
+                .scopes
+                .by_id(sid)
+                .is_none_or(|scope| scope.state == ScopeState::Closed)
+        });
         if !item.semantic.is_live() {
             // Semantic death is terminal: a superseded decision, a
             // verified-fixed error or a tombstoned item stays evicted
@@ -551,6 +583,7 @@ fn reactivate(state: &mut State, config: &SimpleContextConfig, now_tick: u64, pl
             &hot_entities,
             now_tick,
             state.turn,
+            scope_closed,
         ) else {
             continue;
         };
@@ -634,7 +667,9 @@ fn reactivate(state: &mut State, config: &SimpleContextConfig, now_tick: u64, pl
 /// Why an evicted item earns a second chance. `None` keeps it in the buffer.
 /// Task membership alone is deliberately not enough: within an active task
 /// the semantic machine already keeps working items; an evicted item must
-/// show fresh relevance (hot entities or a high score) to come back.
+/// show fresh relevance (hot entities or a high score) to come back. A
+/// member of a closed scope may come back only for a fresh causal reason —
+/// a hot entity or a model directive — never for the residency score floor.
 fn reactivation_reason(
     item: &ContextItem,
     config: &SimpleContextConfig,
@@ -642,6 +677,7 @@ fn reactivation_reason(
     hot_entities: &[String],
     now_tick: u64,
     current_turn: u64,
+    scope_closed: bool,
 ) -> Option<String> {
     if item.retention == ContextRetention::Pinned || item.scope == ContextScope::Pinned {
         return Some("explicitly pinned again".to_string());
@@ -661,13 +697,16 @@ fn reactivation_reason(
     }
     // The score is the fallback: a genuinely high-value item (importance,
     // retention, affinity) may still be worth reactivating even without a
-    // root match — explainable, not learned.
-    let breakdown = score_item_with_breakdown(item, focus, hot_entities, now_tick);
-    if breakdown.total >= config.active_threshold {
-        return Some(format!(
-            "score {:.2} >= active threshold {:.2}",
-            breakdown.total, config.active_threshold
-        ));
+    // root match — explainable, not learned. Closed-scope members are
+    // excluded: their score floor is what kept them resident across turns.
+    if !scope_closed {
+        let breakdown = score_item_with_breakdown(item, focus, hot_entities, now_tick);
+        if breakdown.total >= config.active_threshold {
+            return Some(format!(
+                "score {:.2} >= active threshold {:.2}",
+                breakdown.total, config.active_threshold
+            ));
+        }
     }
     None
 }

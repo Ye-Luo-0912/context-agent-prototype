@@ -74,6 +74,17 @@ pub struct SimpleContextConfig {
     /// Cap on total content tokens leased per task. Count + tokens together
     /// bound both the number and the weight of model-protected items.
     pub max_leased_tokens_per_task: usize,
+    /// Minimum token overlap between a new user instruction and the current
+    /// episode's query for the instruction to count as a continuation of the
+    /// same episode. Below this, and when the message carries real
+    /// information (entities or length), the focus episode rotates: durable
+    /// outcomes promote to the task scope, ordinary dialogue is evicted.
+    pub episode_rotate_threshold: f32,
+    /// Hard cap on user turns per focus episode. Even when every message is
+    /// a semantic continuation, the episode rotates at this budget so a
+    /// pathological single-episode run cannot grow the working set without
+    /// bound.
+    pub episode_max_user_turns: usize,
 }
 
 impl Default for SimpleContextConfig {
@@ -98,6 +109,8 @@ impl Default for SimpleContextConfig {
             max_lease_turns: 32,
             max_leased_items_per_task: 16,
             max_leased_tokens_per_task: 4096,
+            episode_rotate_threshold: 0.15,
+            episode_max_user_turns: 500,
         }
     }
 }
@@ -138,6 +151,11 @@ pub(crate) struct State {
     /// (item_id, by_id, reason) queued by ingest for verified-fixed errors.
     #[serde(default)]
     pub(crate) pending_verifications: Vec<(ContextItemId, ContextItemId, String)>,
+    /// Lifecycle transitions already applied by ingest (focus episode
+    /// rotation). They are surfaced by the next maintenance report so the
+    /// rotation is observable as bounded runtime events.
+    #[serde(default)]
+    pub(crate) pending_ingest_transitions: Vec<ContextStateTransition>,
     /// Entities named by the last user message or touched by recent tool
     /// observations. Reset on user message / focus change, extended by tools.
     #[serde(default)]
@@ -213,6 +231,20 @@ impl ContextEngine for SimpleContextEngine {
                 // instruction.
                 state.turn += 1;
                 state.tool_round = 0;
+                // Episode rotation: the working set is bounded by the current
+                // episode plus unresolved semantic state, not by task turns.
+                // A new instruction that is semantically distant from the
+                // current episode (below the token-overlap threshold, and
+                // informative enough to be a phase change rather than a
+                // continuation token), or an episode that exhausted its turn
+                // budget, closes the focus episode: durable outcomes promote
+                // to the task scope, ordinary dialogue leaves the working
+                // set. The transitions are applied here and surfaced by the
+                // next maintenance report.
+                if needs_episode_rotation(&state, &self.config, &content) {
+                    let transitions = scope::close_focus_episode(&mut state);
+                    state.pending_ingest_transitions.extend(transitions);
+                }
                 state.hot_entities = entity::extract_entities(&content);
                 if let Some(focus) = state.focus.as_mut() {
                     focus.current_query = content.clone();
@@ -640,6 +672,31 @@ impl ContextEngine for SimpleContextEngine {
 /// `keep_alive` and leases are bounded so the model cannot root the whole
 /// heap. A refused directive leaves the item unchanged — the caller
 /// surfaces the reason to the model.
+/// Whether the next user message should rotate the focus episode. Two
+/// signals, both explainable:
+/// - a semantic boundary: the new instruction shares almost no tokens with
+///   the current episode's query AND carries real information (entities or
+///   enough length) — a bare continuation token ("continue", "ok", "next")
+///   does not rotate;
+/// - the turn budget: even perfectly related instructions rotate once the
+///   episode exceeded `episode_max_user_turns` user turns.
+fn needs_episode_rotation(state: &State, config: &SimpleContextConfig, content: &str) -> bool {
+    let Some(focus) = state.focus.as_ref() else {
+        return false;
+    };
+    if focus.generation >= config.episode_max_user_turns as u64 {
+        return true;
+    }
+    let overlap = crate::policy::lexical_overlap(content, &focus.current_query);
+    // Continuation tokens carry no entities and are short; only a message
+    // with real entities or a genuinely long body can signal a phase
+    // change. The overlap check already covers entity-sharing continuations
+    // ("keep fixing AuthService.rs" shares the entity, so overlap is high).
+    let informative =
+        !entity::extract_entities(content).is_empty() || content.chars().count() >= 12;
+    overlap < config.episode_rotate_threshold && informative
+}
+
 fn apply_directive(
     state: &mut State,
     config: &SimpleContextConfig,

@@ -24,6 +24,12 @@ pub(crate) fn run_minor(
         turn,
         ..ContextMaintenanceReport::default()
     };
+    // Lifecycle transitions already applied by ingest (focus episode
+    // rotation) are surfaced here so they are observable as part of the
+    // maintenance report, not silently dropped.
+    let ingest_transitions = std::mem::take(&mut state.pending_ingest_transitions);
+    report.archived += ingest_transitions.len();
+    report.transitions.extend(ingest_transitions);
     let focus = state.focus.clone();
     // The hot set is capped at 24 entries and only changes on ingest; clone
     // once so the loop can read it while items are mutated.

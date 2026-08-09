@@ -45,10 +45,36 @@ Rules for follow-up agents:
 ### CTX-01 — Long tasks collapse back into an append-only transcript
 
 Decision gate: discuss Task/Focus/Episode semantics before implementation.
+**Closed 2026-08-10** — see the CONTEXT_LIFECYCLE "Episode boundary" note.
 
-Confirmed behavior:
+Implemented:
 
-- `context-simple/src/scope.rs::open_focus_scope` reuses one Focus scope for
+- `SimpleContextConfig.episode_rotate_threshold` (default 0.15) and
+  `episode_max_user_turns` (default 500);
+- `scope.rs::close_focus_episode` rotates the focus scope on the semantic
+  boundary (token overlap below the threshold AND informative content) or
+  the turn budget; the close promotes durable outcomes to the task scope and
+  evicts ordinary dialogue (close_members now evicts for Focus too);
+- `gc/full.rs`: a member of a closed scope is an eviction candidate
+  regardless of attention (the residency score floor can no longer keep
+  same-template dialogue Active forever), and is recallable only for a fresh
+  causal reason (hot entity / pin / model hint/lease), never for the score
+  floor;
+- ingest-applied rotation transitions surface in the next maintenance report
+  (`pending_ingest_transitions`), so the rotation is observable.
+
+Acceptance: `long_task_10k_turns_keeps_the_working_set_episode_bounded`
+(10,000 turns, mixed semantic/related workloads): resident heap stays flat
+(~10 items, peak < 200, no growth between turn 2,000 and 10,000), the
+durable decision stays recallable via hot entities, and stale ordinary
+dialogue leaves Resident. Confirmed the failure mode the fix targets: before
+the closed-scope GC rule, same-template messages kept a focus-match floor
+above `active_threshold`, were rated Active every maintain pass, and were
+never evictable.
+
+Confirmed behavior (as audited):
+
+- `context-simple/src/scope.rs::open_focus_scope` reused one Focus scope for
   the entire task;
 - every User/Assistant message is `Working` inside that long-lived focus;
 - same-task score floors remain above the default archive threshold after
@@ -58,9 +84,9 @@ Confirmed behavior:
 - the materializer admits all `Cooling` candidates and runtime supplies no
   finite `max_selected_items`.
 
-Resident bytes and candidate work therefore grow approximately with `2 ×
-task turns`; token packing hides prompt overflow but not the growing heap or
-selection cost.
+Resident bytes and candidate work therefore grew approximately with `2 ×
+task turns`; token packing hid prompt overflow but not the growing heap or
+selection cost. That linear growth is now bounded by episode rotation.
 
 Recommended design:
 

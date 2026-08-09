@@ -100,7 +100,7 @@ pub(crate) fn score_item_with_breakdown(
     }
 }
 
-fn lexical_overlap(left: &str, right: &str) -> f32 {
+pub(crate) fn lexical_overlap(left: &str, right: &str) -> f32 {
     let left = tokens(left);
     let right = tokens(right);
     if left.is_empty() || right.is_empty() {

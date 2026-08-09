@@ -165,6 +165,32 @@ pub(crate) fn close_scope(state: &mut State, scope_id: ScopeId) -> Vec<ContextSt
     close_members(state, &scope, parent_id, state.turn)
 }
 
+/// Close the currently active focus scope of the focused task as an
+/// *episode boundary*: durable outcomes promote to the task scope and
+/// ordinary working-set dialogue is evicted, so the working set tracks the
+/// current episode plus unresolved semantic state instead of the whole task
+/// transcript. The task scope stays open — this is not task completion. The
+/// engine calls this before a new user message opens a fresh focus scope
+/// when the semantic-boundary or turn-budget signal fires.
+pub(crate) fn close_focus_episode(state: &mut State) -> Vec<ContextStateTransition> {
+    let Some(focus) = state.focus.as_ref() else {
+        return Vec::new();
+    };
+    let focus_id = state
+        .scopes
+        .iter()
+        .find(|scope| {
+            scope.kind == ScopeKind::Focus
+                && scope.task_id == Some(focus.task_id)
+                && scope.state != ScopeState::Closed
+        })
+        .map(|scope| scope.id);
+    let Some(focus_id) = focus_id else {
+        return Vec::new();
+    };
+    close_scope(state, focus_id)
+}
+
 /// Queue the completed task's scope, plus its focus child, for close. The
 /// close (promotion + eviction) is applied by maintenance so the resulting
 /// transitions are observable.
@@ -235,10 +261,12 @@ fn nearest_open_parent(state: &State, scope: &Scope) -> Option<ScopeId> {
 }
 
 /// Move the scope's surviving items: durable outcomes are promoted to the
-/// parent scope, the rest of a completed task's working set is evicted.
-/// Focus closes only promote — the working set returns to the task scope and
-/// the normal lifecycle cools it. Tool scopes promote their durable outcomes
-/// and leave the ephemeral/working results to residency and error
+/// parent scope, the rest of a completed task's or closed episode's
+/// working set is evicted. Task closes release the whole working set.
+/// Focus closes are episode boundaries: they promote durable outcomes and
+/// evict ordinary dialogue so the working set tracks the current episode
+/// instead of the whole task transcript. Tool scopes promote their durable
+/// outcomes and leave the ephemeral/working results to residency and error
 /// verification — a tool frame is a container boundary, not an eviction
 /// pass. Session scopes are never closed.
 fn close_members(
@@ -293,7 +321,7 @@ fn close_members(
             ) {
                 scope_updates.push(update);
             }
-        } else if scope.kind == ScopeKind::Task {
+        } else if matches!(scope.kind, ScopeKind::Task | ScopeKind::Focus) {
             transitions.push(ContextStateTransition {
                 item_id: item.id,
                 kind: item.kind,
@@ -301,7 +329,15 @@ fn close_members(
                 from: item.attention,
                 to: AttentionState::Archived,
                 turn,
-                reason: "task completed: scope closed, working set evicted".to_string(),
+                reason: format!(
+                    "{} closed: {}",
+                    kind_name(scope.kind),
+                    if scope.kind == ScopeKind::Task {
+                        "task completed, working set evicted".to_string()
+                    } else {
+                        "episode rotated, ordinary dialogue evicted".to_string()
+                    }
+                ),
             });
             item.attention = AttentionState::Archived;
             item.relevance = 0.0;
@@ -369,6 +405,13 @@ fn legacy_belongs_to(item: &ContextItem, scope: &Scope) -> bool {
 /// `scope_id` membership stamp are updated, so later closes of the parent
 /// scope still see the item. The caller applies the returned index move
 /// (`item_id`, old scope, new scope) after its heap loop.
+///
+/// An item is promoted again when a *higher* ancestor closes (episode
+/// rotation promotes focus outcomes to the task scope; task close then
+/// promotes them to the session) — the `Promoted` label records that the
+/// item moved, it does not freeze it at its first target. The no-op guard
+/// is "already a member of the promotion target", which is what prevents
+/// the same scope from processing an item twice.
 fn promote(
     item: &mut ContextItem,
     parent_scope: ContextScope,
@@ -377,10 +420,16 @@ fn promote(
     turn: u64,
     transitions: &mut Vec<ContextStateTransition>,
 ) -> Option<(ContextItemId, Option<ScopeId>, Option<ScopeId>)> {
-    if item
-        .tags
-        .iter()
-        .any(|tag| tag.is_lifecycle(LifecycleLabel::Promoted))
+    if item.scope_id.is_some_and(|sid| Some(sid) == parent_id) {
+        return None;
+    }
+    // Legacy items without a scope stamp cannot compare targets; the label
+    // is their only repeat guard.
+    if item.scope_id.is_none()
+        && item
+            .tags
+            .iter()
+            .any(|tag| tag.is_lifecycle(LifecycleLabel::Promoted))
     {
         return None;
     }

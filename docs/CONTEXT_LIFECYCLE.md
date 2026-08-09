@@ -210,6 +210,39 @@ selectable transcript even though final token packing is bounded. The next
 policy step is an explicit Task → Episode/Focus model, not another threshold
 tweak; see `docs/AUDIT_TODO.md` CTX-01 and its 10K-turn property test.
 
+Since CTX-01 (closed 2026-08-10) the engine rotates the focus scope as an
+**episode boundary**, so the working set tracks the current episode plus
+unresolved semantic state instead of the whole task transcript:
+
+```text
+Session
+  └─ Task (long-lived goal/authority)
+       ├─ closed Episode/Focus 1
+       ├─ closed Episode/Focus 2
+       └─ current Episode/Focus
+            └─ open Tool scopes
+```
+
+Two explainable signals rotate the episode, both configurable
+(`episode_rotate_threshold`, `episode_max_user_turns`):
+
+- a semantic boundary: a new user instruction that shares almost no tokens
+  with the current episode's query AND carries real information (entities or
+  length) — a bare continuation token does not rotate;
+- the turn budget: even perfectly related instructions rotate once the
+  episode exceeded `episode_max_user_turns` user turns.
+
+Closing an episode promotes only durable outcomes (goal/constraint/decision/
+finding/open-loop/artifact/evidence — the same `is_promotable` set as task
+close) to the task scope and evicts ordinary dialogue. The GC then treats a
+member of a closed scope as outside the working set: it is an eviction
+candidate regardless of attention (the residency score floor no longer keeps
+same-template dialogue Active forever), and it can be recalled only for a
+fresh causal reason — a hot entity, a pin, or a model hint/lease — never for
+the residency floor. The `long_task_10k_turns` property test keeps the
+resident heap flat (~10 items) over 10,000 task turns while a durable
+decision stays recallable and stale dialogue leaves Resident.
+
 ## 8. Completing a task
 
 `/done <summary>` performs the intended lifecycle transition. Since V1-M2
