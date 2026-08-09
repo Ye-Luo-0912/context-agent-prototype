@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use agent_contracts::{
     AttentionState, ContextEviction, ContextGcReport, ContextItem, ContextItemId,
     ContextReactivation, ContextRef, ContextResidency, ContextRetention, ContextScope, FocusState,
-    ScopeId, ScopeKind, ScopeState,
+    ScopeId, ScopeKind, ScopeState, TaskId,
 };
 
 use crate::diagnostics;
@@ -388,7 +388,13 @@ fn mark_roots(
             && item.attention == AttentionState::Active;
         let durable_session_memory =
             item.retention == ContextRetention::Durable && item.scope == ContextScope::Session;
-        let hot = !hot_entities.is_empty() && entities_match(&item.entities, hot_entities);
+        // A completed task's records are never roots through the hot set:
+        // automatic recall of finished work requires an explicit reason
+        // (CTX-02), and the task's own entities may linger in the hot set
+        // after completion.
+        let hot = !task_completed(state, item.task_id)
+            && !hot_entities.is_empty()
+            && entities_match(&item.entities, hot_entities);
         // Model/operator-directed protection (`context.gc_hint` /
         // `context.lease`): the model asked for this item to stay, so GC
         // treats it as a root until the hint is cleared or the lease runs
@@ -583,7 +589,10 @@ fn reactivate(state: &mut State, config: &SimpleContextConfig, now_tick: u64, pl
             &hot_entities,
             now_tick,
             state.turn,
-            scope_closed,
+            RecallGuard {
+                scope_closed,
+                completed_task: task_completed(state, item.task_id),
+            },
         ) else {
             continue;
         };
@@ -637,6 +646,7 @@ fn reactivate(state: &mut State, config: &SimpleContextConfig, now_tick: u64, pl
                 };
                 if entry.semantic.is_live()
                     && store::recallable(entry)
+                    && !task_completed(state, entry.task_id)
                     && entities_match(&entry.entities, &hot_entities)
                 {
                     plan.recall_candidates.push(*id);
@@ -654,6 +664,7 @@ fn reactivate(state: &mut State, config: &SimpleContextConfig, now_tick: u64, pl
                 }
                 if entry.semantic.is_live()
                     && store::recallable(entry)
+                    && !task_completed(state, entry.task_id)
                     && entities_match(&entry.entities, &hot_entities)
                 {
                     plan.recall_candidates.push(entry.item_id);
@@ -664,12 +675,35 @@ fn reactivate(state: &mut State, config: &SimpleContextConfig, now_tick: u64, pl
     }
 }
 
+/// Whether the item's task has completed: its Task scope is closed. A
+/// completed task's records may return to the working set only for an
+/// explicit reason (pin, model hint/lease), never for automatic hot-entity
+/// recall (CTX-02).
+fn task_completed(state: &State, task_id: Option<TaskId>) -> bool {
+    task_id.is_some_and(|tid| {
+        state.scopes.iter().any(|scope| {
+            scope.kind == ScopeKind::Task
+                && scope.task_id == Some(tid)
+                && scope.state == ScopeState::Closed
+        })
+    })
+}
+
+/// What a recall candidate may come back for. A member of a closed scope
+/// may return only for a fresh causal reason — a hot entity or a model
+/// directive — never for the residency score floor. A completed task's
+/// record needs an explicit reason (pin/hint/lease); automatic hot-entity
+/// recall is forbidden.
+#[derive(Clone, Copy)]
+struct RecallGuard {
+    scope_closed: bool,
+    completed_task: bool,
+}
+
 /// Why an evicted item earns a second chance. `None` keeps it in the buffer.
 /// Task membership alone is deliberately not enough: within an active task
 /// the semantic machine already keeps working items; an evicted item must
-/// show fresh relevance (hot entities or a high score) to come back. A
-/// member of a closed scope may come back only for a fresh causal reason —
-/// a hot entity or a model directive — never for the residency score floor.
+/// show fresh relevance (hot entities or a high score) to come back.
 fn reactivation_reason(
     item: &ContextItem,
     config: &SimpleContextConfig,
@@ -677,7 +711,7 @@ fn reactivation_reason(
     hot_entities: &[String],
     now_tick: u64,
     current_turn: u64,
-    scope_closed: bool,
+    guard: RecallGuard,
 ) -> Option<String> {
     if item.retention == ContextRetention::Pinned || item.scope == ContextScope::Pinned {
         return Some("explicitly pinned again".to_string());
@@ -693,13 +727,19 @@ fn reactivation_reason(
         return Some(format!("leased by the model until turn {until}"));
     }
     if !hot_entities.is_empty() && entities_match(&item.entities, hot_entities) {
+        if guard.completed_task {
+            // Automatic recall of a completed task's record is forbidden
+            // without a new explicit reason (CTX-02): the hot set alone is
+            // not enough to bring finished work back as current truth.
+            return None;
+        }
         return Some("entities are hot again in the working set".to_string());
     }
     // The score is the fallback: a genuinely high-value item (importance,
     // retention, affinity) may still be worth reactivating even without a
     // root match — explainable, not learned. Closed-scope members are
     // excluded: their score floor is what kept them resident across turns.
-    if !scope_closed {
+    if !guard.scope_closed {
         let breakdown = score_item_with_breakdown(item, focus, hot_entities, now_tick);
         if breakdown.total >= config.active_threshold {
             return Some(format!(

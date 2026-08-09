@@ -434,9 +434,18 @@ impl ContextEngine for SimpleContextEngine {
                         state.focus = None;
                     }
                     // Model hints are per-task: when the task completes its
-                    // keep_alive and lease protections expire, so a completed
-                    // task cannot keep rooting items forever.
+                    // keep_alive and lease protections expire in *every* body
+                    // location, so a completed task cannot keep rooting items
+                    // forever (CTX-02). A keep-alive item is normally a GC
+                    // root and stays in the heap, but a warm-buffer item from
+                    // an older checkpoint must not retain the protection.
                     for item in &mut state.items {
+                        if item.task_id == Some(completed_task) {
+                            item.keep_alive = false;
+                            item.lease_until_turn = None;
+                        }
+                    }
+                    for item in &mut state.eviction_buffer {
                         if item.task_id == Some(completed_task) {
                             item.keep_alive = false;
                             item.lease_until_turn = None;
@@ -712,7 +721,14 @@ fn apply_directive(
         ContextAction::GcHint {
             keep_alive: true, ..
         } => {
-            let kept = state.items.iter().filter(|item| item.keep_alive).count();
+            // Quotas are global across body locations (CTX-02): a keep_alive
+            // item in the warm buffer still consumes the cap.
+            let kept = state
+                .items
+                .iter()
+                .chain(&state.eviction_buffer)
+                .filter(|item| item.keep_alive)
+                .count();
             (kept >= config.max_keep_alive_items).then(|| {
                 format!(
                     "gc_hint refused: {kept} items are already keep_alive (cap {})",
@@ -744,9 +760,13 @@ fn apply_directive(
                     let already_leased = item
                         .lease_until_turn
                         .is_some_and(|until| until >= state.turn);
+                    // Leased-item accounting is global across body locations:
+                    // a leased item in the warm buffer still counts against
+                    // the task cap (CTX-02).
                     let (leased, leased_tokens) = state
                         .items
                         .iter()
+                        .chain(&state.eviction_buffer)
                         .filter(|other| {
                             other
                                 .lease_until_turn

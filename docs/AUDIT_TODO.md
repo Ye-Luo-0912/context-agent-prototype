@@ -120,14 +120,37 @@ supersession, verification and recurrence mostly operate only on Resident.
 Directives can mutate Warm while quotas count only Resident. Warm/Cold facts
 can retain completed-task leases or return as Live after a newer fact already
 superseded them.
+**Closed 2026-08-10 (short-term behavior fixes; the ContextCatalog
+restructure stays the structural target below).**
 
-Short-term work:
+Implemented:
 
-- make keep-alive/lease accounting global across all body locations;
-- clear protections for a completed task in every residency;
-- apply supersession/verification/recurrence to Warm and stored metadata;
-- forbid automatic completed-task recall without a new explicit reason;
-- make semantic transition monotonic (`Live -> terminal`, never reverse).
+- supersession, verification and recurrence now reach every body location:
+  `drain_supersessions` / `drain_verifications` apply terminal semantics to
+  the resident heap, the warm buffer, or the stored entry via
+  `apply_terminal_semantic`; `queue_decision_supersessions`,
+  `queue_error_verifications` and `queue_error_recurrence` scan all three
+  locations. A stored decision is superseded by a later decision on the
+  same entities; a warm error is verified by a later success and superseded
+  by a recurring failure.
+- keep-alive/lease accounting is global: `apply_directive` counts leased
+  items/tokens and keep-alive items across heap + warm buffer.
+- a completed task clears keep_alive/lease protections in every residency
+  (heap + warm buffer).
+- automatic recall of a completed task's records is forbidden: GC roots,
+  warm reactivation and cold-store recall all exclude completed-task items
+  from the hot-entity path. Only an explicit reason (pin / model hint /
+  lease) brings finished work back.
+- semantic transitions remain monotonic through every body location
+  (`apply_terminal_semantic` refuses to re-transition a dead target).
+
+Acceptance (new property tests): `supersession_reaches_warm_and_stored_
+decisions`, `verification_reaches_warm_errors`, `recurrence_supersedes_
+warm_errors`, `completed_task_clears_protections_in_every_residency`,
+`completed_task_blocks_automatic_hot_recall`, `keep_alive_quota_counts_
+warm_items`. The hot-root test exposed a real defect: completed-task
+entities lingering in the hot set kept the finished dialogue rooted; GC
+roots now exclude completed tasks from the hot path.
 
 Correct structural target:
 

@@ -2731,6 +2731,25 @@ async fn tool_observation(engine: &SimpleContextEngine, call_id: &str, content: 
         .unwrap();
 }
 
+/// Build a failing tool observation for a turn (persists as an Error).
+async fn failed_observation(engine: &SimpleContextEngine, call_id: &str, content: &str) {
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: call_id.into(),
+                tool_name: "shell.exec".into(),
+                ok: false,
+                summary: "failed".into(),
+                model_content: content.into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+}
+
 /// CTX-01 acceptance (`long_task_10k_turns`): over 10,000 task turns the
 /// resident working set is bounded by the current episode plus unresolved
 /// semantic state, not by turn count. Required decisions stay recallable;
@@ -2890,5 +2909,512 @@ async fn long_task_10k_turns_keeps_the_working_set_episode_bounded() {
             .iter()
             .map(|item| &item.content)
             .collect::<Vec<_>>()
+    );
+}
+
+/// CTX-02: a terminal semantic transition (supersession) must reach the
+/// target wherever its body currently sits. A decision externalized to the
+/// store (Cold) and one sitting in the warm buffer are still the same
+/// decisions: a later decision on the same entities supersedes them.
+#[tokio::test]
+async fn supersession_reaches_warm_and_stored_decisions() {
+    let store = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 4,
+        // First GC pass evicts any unmarked Cooling/Archived item, so the
+        // switched-away task's records leave Resident without a long TTL.
+        gc_max_generation: 0,
+        context_store_dir: Some(store.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "auth work").await;
+    // A1 (AuthService.rs) is the oldest decision: it overflows to Cold.
+    // A3 (CacheStore.rs) is newer: it stays Warm in the buffer.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs for login".into(),
+        })
+        .await
+        .unwrap();
+    tool_observation(&engine, "1", "touched AuthService.rs").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use CacheStore.rs for caching".into(),
+        })
+        .await
+        .unwrap();
+    tool_observation(&engine, "2", "edited CacheStore.rs").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let (a1_id, a3_id) = {
+        let state = engine.state.lock().await;
+        (
+            state
+                .items
+                .iter()
+                .find(|item| item.content.contains("use AuthService.rs"))
+                .expect("decision A1")
+                .id,
+            state
+                .items
+                .iter()
+                .find(|item| item.content.contains("use CacheStore.rs"))
+                .expect("decision A3")
+                .id,
+        )
+    };
+
+    // Switch to task B: A's scopes suspend, A1/A3 cool out of the working
+    // set. GC evicts both; the 4-item buffer overflows the oldest (A1) to
+    // the store while A3 stays Warm.
+    open_focus(&engine, "cache work").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "investigate the cache miss pattern".into(),
+        })
+        .await
+        .unwrap();
+    tool_observation(&engine, "3", "traced the cache").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let gc = engine.gc().await.unwrap();
+    assert!(gc.externalized >= 1, "A1 must reach the store: {gc:?}");
+    {
+        let state = engine.state.lock().await;
+        assert!(state.external.get(a1_id).is_some(), "A1 is a Cold entry");
+        assert!(
+            state.eviction_buffer.iter().any(|item| item.id == a3_id),
+            "A3 stays Warm in the buffer"
+        );
+    }
+
+    // A later decision on the same entities supersedes each, wherever it
+    // sits. The maintain pass applies the queued terminal transitions.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs for the cache layer".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use CacheStore.rs for the read path".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    let a1 = state.external.get(a1_id).expect("stored decision entry");
+    assert!(
+        a1.semantic.is_dead(),
+        "the stored decision must be superseded, got {:?}",
+        a1.semantic
+    );
+    let a3 = state
+        .eviction_buffer
+        .iter()
+        .find(|item| item.id == a3_id)
+        .expect("warm decision");
+    assert!(
+        a3.semantic.is_dead(),
+        "the warm decision must be superseded, got {:?}",
+        a3.semantic
+    );
+}
+
+/// CTX-02: error verification must reach an error that left Resident. A
+/// successful result on the same entities verifies a Warm error as readily
+/// as a resident one.
+#[tokio::test]
+async fn verification_reaches_warm_errors() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_max_generation: 0,
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "auth work").await;
+    // A failing tool result persists as a Working Error in task A.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "debug the auth failure".into(),
+        })
+        .await
+        .unwrap();
+    failed_observation(&engine, "1", "error in AuthService.rs:42").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let error_id = {
+        let state = engine.state.lock().await;
+        state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::Error)
+            .expect("error item")
+            .id
+    };
+
+    // Task B takes over; A's error cools and is evicted to the buffer.
+    open_focus(&engine, "cache work").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "look at the cache".into(),
+        })
+        .await
+        .unwrap();
+    tool_observation(&engine, "2", "examined the cache").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    engine.gc().await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            state.eviction_buffer.iter().any(|item| item.id == error_id),
+            "the error must be Warm for this test"
+        );
+    }
+
+    // A successful result on the same entities verifies the Warm error.
+    tool_observation(&engine, "3", "fixed AuthService.rs").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    let error = state
+        .eviction_buffer
+        .iter()
+        .find(|item| item.id == error_id)
+        .expect("warm error");
+    assert!(
+        error.semantic.is_dead(),
+        "the warm error must be verified fixed, got {:?}",
+        error.semantic
+    );
+}
+
+/// CTX-02: a recurring failure supersedes the earlier error wherever it
+/// sits — a Warm error is superseded by the next failure on the same site.
+#[tokio::test]
+async fn recurrence_supersedes_warm_errors() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_max_generation: 0,
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "auth work").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "debug the auth failure".into(),
+        })
+        .await
+        .unwrap();
+    failed_observation(&engine, "1", "error in AuthService.rs:42").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let error_id = {
+        let state = engine.state.lock().await;
+        state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::Error)
+            .expect("error item")
+            .id
+    };
+
+    open_focus(&engine, "cache work").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "look at the cache".into(),
+        })
+        .await
+        .unwrap();
+    tool_observation(&engine, "2", "examined the cache").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    engine.gc().await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            state.eviction_buffer.iter().any(|item| item.id == error_id),
+            "the error must be Warm for this test"
+        );
+    }
+
+    // Same failure site again, in task B: recurrence supersedes the Warm
+    // error from task A. Identical content keeps the entity signature
+    // (including the line number) identical, as a real recurring failure
+    // on the same site would.
+    failed_observation(&engine, "3", "error in AuthService.rs:42").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    let error = state
+        .eviction_buffer
+        .iter()
+        .find(|item| item.id == error_id)
+        .expect("warm error");
+    assert!(
+        error.semantic.is_dead(),
+        "the recurring failure must supersede the warm error, got {:?}",
+        error.semantic
+    );
+}
+
+/// CTX-02: completing a task clears model protections (keep_alive / lease)
+/// in every body location, so a completed task cannot keep rooting items
+/// through a warm-buffer record.
+#[tokio::test]
+async fn completed_task_clears_protections_in_every_residency() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let task_id = open_focus(&engine, "auth work").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs for login".into(),
+        })
+        .await
+        .unwrap();
+    tool_observation(&engine, "1", "touched AuthService.rs").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+
+    // Protect one resident item (keep_alive + lease), then move it into
+    // the warm buffer (an old-checkpoint path a normal GC would never
+    // produce, because protected items are roots).
+    let protected_id = {
+        let state = engine.state.lock().await;
+        state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::ToolObservation)
+            .expect("tool observation")
+            .id
+    };
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::GcHint {
+                item_id: protected_id,
+                keep_alive: true,
+            },
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Lease {
+                item_id: protected_id,
+                turns: 32,
+            },
+        })
+        .await
+        .unwrap();
+    let warm_id = {
+        let mut state = engine.state.lock().await;
+        let items = state.items.take_all();
+        let mut protected = None;
+        let mut rest = Vec::new();
+        for item in items {
+            if item.id == protected_id {
+                protected = Some(item);
+            } else {
+                rest.push(item);
+            }
+        }
+        state.items.replace_all(rest);
+        let protected = protected.expect("the protected item");
+        assert!(protected.keep_alive && protected.lease_until_turn.is_some());
+        let id = protected.id;
+        state.eviction_buffer.push(protected);
+        id
+    };
+
+    engine
+        .ingest(ContextIngress::TaskCompleted {
+            task_id: Some(task_id),
+            summary: "auth work done".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::TaskCompleted)
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    let warm = state
+        .eviction_buffer
+        .iter()
+        .find(|item| item.id == warm_id)
+        .expect("warm protected item");
+    assert!(
+        !warm.keep_alive && warm.lease_until_turn.is_none(),
+        "completed task must clear protections in the warm buffer, got keep_alive={} lease={:?}",
+        warm.keep_alive,
+        warm.lease_until_turn
+    );
+}
+
+/// CTX-02: automatic hot-entity recall of a completed task's records is
+/// forbidden without an explicit reason. The hot set alone must not bring
+/// finished work back as current truth.
+#[tokio::test]
+async fn completed_task_blocks_automatic_hot_recall() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_max_generation: 0,
+        ..SimpleContextConfig::default()
+    });
+    let task_a = open_focus(&engine, "auth work").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "fix AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    tool_observation(&engine, "1", "touched AuthService.rs").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let message_id = {
+        let state = engine.state.lock().await;
+        state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::UserMessage)
+            .expect("task A message")
+            .id
+    };
+
+    // Complete task A: its scopes close, the working set is evicted, GC
+    // moves the archived dialogue to the warm buffer.
+    engine
+        .ingest(ContextIngress::TaskCompleted {
+            task_id: Some(task_a),
+            summary: "auth fixed".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::TaskCompleted)
+        .await
+        .unwrap();
+    engine.gc().await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            state
+                .eviction_buffer
+                .iter()
+                .any(|item| item.id == message_id),
+            "the completed task's dialogue must be Warm for this test"
+        );
+    }
+
+    // Task B makes the same entity hot. GC must NOT auto-recall the
+    // completed task's record (no explicit reason); an active task's
+    // evicted record would be recalled here.
+    open_focus(&engine, "auth follow-up").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs again".into(),
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert_eq!(
+        report.reactivated, 0,
+        "a completed task's record must not auto-return on hot entities, got {report:?}"
+    );
+    let state = engine.state.lock().await;
+    assert!(
+        !state.items.iter().any(|item| item.id == message_id),
+        "completed-task dialogue must stay out of the resident heap"
+    );
+}
+
+/// CTX-02: keep-alive accounting is global across body locations — a warm
+/// buffer item with keep_alive still consumes the cap.
+#[tokio::test]
+async fn keep_alive_quota_counts_warm_items() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        max_keep_alive_items: 1,
+        ..SimpleContextConfig::default()
+    });
+    let _task_id = open_focus(&engine, "auth work").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs for login".into(),
+        })
+        .await
+        .unwrap();
+    tool_observation(&engine, "1", "touched AuthService.rs").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+
+    // A keep-alive item in the warm buffer (old-checkpoint path).
+    let _warm_id = {
+        let mut state = engine.state.lock().await;
+        let items = state.items.take_all();
+        let mut protected = None;
+        let mut rest = Vec::new();
+        for mut item in items {
+            if item.kind == ContextKind::ToolObservation {
+                item.keep_alive = true;
+                protected = Some(item);
+            } else {
+                rest.push(item);
+            }
+        }
+        state.items.replace_all(rest);
+        let protected = protected.expect("a tool observation");
+        let id = protected.id;
+        state.eviction_buffer.push(protected);
+        id
+    };
+
+    // The warm buffer item already consumes the single keep_alive slot, so
+    // a resident item's keep_alive must be refused by the global quota.
+    let target = {
+        let state = engine.state.lock().await;
+        state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::UserMessage)
+            .expect("user message")
+            .id
+    };
+    let refused = engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::GcHint {
+                item_id: target,
+                keep_alive: true,
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("keep_alive"),
+        "the warm item must consume the quota, got {refused}"
     );
 }

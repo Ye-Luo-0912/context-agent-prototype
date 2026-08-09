@@ -389,6 +389,36 @@ These rules are configurable and can be switched off for comparison:
 `SimpleContextConfig { supersession, error_verification }` (default on);
 `SimpleContextConfig::baseline_v0()` reproduces the P3-era policy.
 
+### Lifecycle metadata is authoritative across body locations (CTX-02)
+
+Since the 2026-08-10 audit pass, terminal semantic transitions, task-close
+protection cleanup and protection quotas no longer depend on where the
+body currently sits (Resident / Warm / Stored):
+
+- supersession, verification and recurrence scan the resident heap, the
+  warm reversible buffer and the external map. A decision that was evicted
+  and externalized is still the same decision: a later decision on the same
+  entities supersedes it wherever it lives. `drain_supersessions` /
+  `drain_verifications` apply the terminal state through
+  `apply_terminal_semantic`, which refuses to re-transition a dead target
+  (semantic transitions stay monotonic across every residency).
+- keep-alive and lease quotas count heap + warm buffer together, so a
+  warm-buffer protected item cannot bypass the cap.
+- completing a task clears keep_alive/lease protections in the heap *and*
+  the warm buffer, so a completed task cannot keep rooting items through an
+  older record.
+- automatic recall of a completed task's records is forbidden: the hot set
+  alone cannot bring finished work back as current truth. GC roots, warm
+  reactivation and cold-store recall all exclude completed-task items from
+  the hot-entity path; only an explicit reason (pin / model hint / lease)
+  re-admits them. (This also fixed a latent defect: after task completion
+  the task's entities lingered in the hot set and kept the finished
+  dialogue rooted forever.)
+
+The structural target remains a single `ContextCatalog` record per
+`item_id` carrying identity + lifecycle metadata + `body_location`; see
+`docs/AUDIT_TODO.md` CTX-02.
+
 ## 9c. P4: entity affinity and the explicit dependency graph
 
 Two more explicit, non-learned signals make the working set follow what the
