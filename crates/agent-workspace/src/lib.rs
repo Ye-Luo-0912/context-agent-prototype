@@ -102,15 +102,44 @@ impl Workspace {
                 .await
                 .map_err(|e| AgentError::Io(format!("canonicalize workspace: {e}")))?,
         );
-        let state_dir = root.join(".focus-agent");
-        fs::create_dir_all(state_dir.join("artifacts"))
-            .await
-            .map_err(|e| AgentError::Io(format!("create state dir: {e}")))?;
+        let requested_state_dir = root.join(".focus-agent");
+        match fs::create_dir(&requested_state_dir).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(AgentError::Io(format!(
+                    "create state dir {}: {e}",
+                    requested_state_dir.display()
+                )));
+            }
+        }
         let state_dir = normalize_canonical(
-            fs::canonicalize(&state_dir)
+            fs::canonicalize(&requested_state_dir)
                 .await
                 .map_err(|e| AgentError::Io(format!("canonicalize state dir: {e}")))?,
         );
+        // Validate the state directory before creating anything beneath it.
+        // `create_dir_all(requested_state_dir/artifacts)` would otherwise
+        // follow a pre-planted symlink/junction and write outside the
+        // workspace before we had a chance to inspect its canonical target.
+        if state_dir == root || !state_dir.starts_with(&root) {
+            return Err(AgentError::InvalidRequest(format!(
+                "runtime state directory resolves outside its dedicated workspace location: {}",
+                requested_state_dir.display()
+            )));
+        }
+        let state_metadata = fs::metadata(&state_dir)
+            .await
+            .map_err(|e| AgentError::Io(format!("inspect state dir: {e}")))?;
+        if !state_metadata.is_dir() {
+            return Err(AgentError::InvalidRequest(format!(
+                "runtime state path is not a directory: {}",
+                requested_state_dir.display()
+            )));
+        }
+        fs::create_dir_all(state_dir.join("artifacts"))
+            .await
+            .map_err(|e| AgentError::Io(format!("create state artifacts dir: {e}")))?;
         Ok(Self { root, state_dir })
     }
 
@@ -171,7 +200,15 @@ impl Workspace {
     async fn confine(&self, clean: PathBuf) -> AgentResult<PathBuf> {
         let mut base = self.root.clone();
         let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut missing_prefix = false;
         for part in clean.components() {
+            // Once a component is missing, every remaining component belongs
+            // to that lexical tail. Probing later names against the old base
+            // can alias `missing/file.txt` to an existing root `file.txt`.
+            if missing_prefix {
+                tail.push(part.as_os_str().to_owned());
+                continue;
+            }
             let candidate = base.join(part);
             match fs::symlink_metadata(&candidate).await {
                 Ok(_) => {
@@ -186,10 +223,10 @@ impl Workspace {
                         )));
                     }
                     base = canonical;
-                    tail.clear();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     tail.push(part.as_os_str().to_owned());
+                    missing_prefix = true;
                 }
                 Err(e) => {
                     return Err(AgentError::Io(format!(
@@ -646,6 +683,62 @@ mod tests {
         assert_eq!(resolved, canonical_root.join("src/lib.rs"));
         let root = workspace.resolve_relative(".").await.unwrap();
         assert_eq!(root, workspace.root());
+    }
+
+    #[tokio::test]
+    async fn missing_prefix_keeps_its_entire_lexical_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("file.txt"), "root file")
+            .await
+            .unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+
+        let resolved = workspace
+            .resolve_relative("missing/file.txt")
+            .await
+            .unwrap();
+        assert_eq!(resolved, workspace.root().join("missing/file.txt"));
+
+        workspace
+            .begin_mutation("fs.write", "write", "missing/file.txt")
+            .await
+            .unwrap()
+            .apply(b"nested file")
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("file.txt"))
+                .await
+                .unwrap(),
+            "root file",
+            "a missing prefix must never collapse onto an existing root file"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.root().join("missing/file.txt"))
+                .await
+                .unwrap(),
+            "nested file"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_rejects_state_dir_link_outside_workspace_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let state_link = dir.path().join(".focus-agent");
+        if !try_make_link(&state_link, outside.path()) {
+            return;
+        }
+
+        let result = Workspace::open(dir.path()).await;
+        assert!(
+            result.is_err(),
+            "a pre-planted state-dir link must not escape the workspace"
+        );
+        assert!(
+            !outside.path().join("artifacts").exists(),
+            "open must validate the state-dir target before creating children"
+        );
     }
 
     #[tokio::test]

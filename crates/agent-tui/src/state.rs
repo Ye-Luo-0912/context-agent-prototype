@@ -42,6 +42,10 @@ pub struct AppState {
     pub busy: bool,
     pub scroll: u16,
     pub pending_approval: Option<PendingApproval>,
+    /// Cumulative provider-reported token usage for the live run (fed by
+    /// `RuntimeEvent::ModelUsed`).
+    pub input_tokens: u64,
+    pub output_tokens: u64,
     /// The model operation whose streamed deltas are currently being
     /// rendered. A delta that does not match this identity belongs to a
     /// superseded turn and is dropped — the fence against a cancelled
@@ -68,6 +72,8 @@ impl AppState {
             busy: false,
             scroll: 0,
             pending_approval: None,
+            input_tokens: 0,
+            output_tokens: 0,
             current_op: None,
         }
     }
@@ -298,6 +304,19 @@ impl AppState {
             RuntimeEvent::RecoveryRequired => {
                 self.busy = false;
                 self.status = "recovery_required".into();
+            }
+            RuntimeEvent::ModelUsed {
+                input_tokens,
+                output_tokens,
+            } => {
+                // A token meter for the live run: the provider-reported
+                // cost of the last model round, surfaced in the status line.
+                self.input_tokens += input_tokens;
+                self.output_tokens += output_tokens;
+                self.push_system(format!(
+                    "model used: {input_tokens} in + {output_tokens} out (run: {} in + {} out)",
+                    self.input_tokens, self.output_tokens
+                ));
             }
             RuntimeEvent::RunCompleted => {
                 self.busy = false;

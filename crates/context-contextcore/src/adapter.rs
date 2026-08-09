@@ -15,8 +15,9 @@ use std::time::Duration;
 
 use agent_contracts::{
     AgentError, AgentResult, ContextDiagnostics, ContextEngine, ContextGcReport, ContextIngress,
-    ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
-    ContextStateTransition, MaterializedContext, ScopeId, ScopeKind,
+    ContextItem, ContextItemId, ContextItemSummary, ContextMaintenanceReport,
+    ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery, ContextStateTransition,
+    ExternalizedContext, MaterializedContext, ScopeId, ScopeKind,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -197,6 +198,30 @@ impl ContextEngine for ContextServiceAdapter {
         let value = self.call(ServiceOp::Inspect { limit }).await?;
         serde_json::from_value(value)
             .map_err(|e| AgentError::Context(format!("decode inspect: {e}")))
+    }
+
+    async fn search_external(
+        &self,
+        query: ContextSearchQuery,
+    ) -> AgentResult<Vec<ExternalizedContext>> {
+        let value = self.call(ServiceOp::SearchExternal { query }).await?;
+        serde_json::from_value(value)
+            .map_err(|e| AgentError::Context(format!("decode external context search: {e}")))
+    }
+
+    async fn inspect_external(
+        &self,
+        item_id: ContextItemId,
+    ) -> AgentResult<Option<ExternalizedContext>> {
+        let value = self.call(ServiceOp::InspectExternal { item_id }).await?;
+        serde_json::from_value(value)
+            .map_err(|e| AgentError::Context(format!("decode external context metadata: {e}")))
+    }
+
+    async fn fetch_external(&self, item_id: ContextItemId) -> AgentResult<Option<ContextItem>> {
+        let value = self.call(ServiceOp::FetchExternal { item_id }).await?;
+        serde_json::from_value(value)
+            .map_err(|e| AgentError::Context(format!("decode external context item: {e}")))
     }
 
     async fn checkpoint(&self) -> AgentResult<Value> {

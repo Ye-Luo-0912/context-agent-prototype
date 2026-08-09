@@ -53,17 +53,24 @@ async fn run_git(
     run_id: RunId,
     call_id: &str,
     tool_name: &str,
+    cancel: CancellationToken,
 ) -> AgentResult<ToolOutput> {
-    let output = timeout(
-        Duration::from_millis(GIT_TIMEOUT_MS),
-        Command::new("git")
-            .args(args)
-            .current_dir(workspace.root())
-            .output(),
-    )
-    .await
-    .map_err(|_| AgentError::Tool(format!("git {args:?} timed out")))?
-    .map_err(|e| AgentError::Tool(format!("run git {args:?}: {e}")))?;
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(workspace.root())
+        // Dropping `Command::output` on timeout/cancellation must not leave
+        // the direct git child running in the background.
+        .kill_on_drop(true);
+    let output = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(AgentError::Cancelled),
+        result = timeout(Duration::from_millis(GIT_TIMEOUT_MS), command.output()) => {
+            result
+                .map_err(|_| AgentError::Tool(format!("git {args:?} timed out")))?
+                .map_err(|e| AgentError::Tool(format!("run git {args:?}: {e}")))?
+        }
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -158,7 +165,7 @@ impl Tool for GitStatusTool {
         run_id: RunId,
         call_id: &str,
         _arguments: Value,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let output = run_git(
             &self.workspace,
@@ -166,6 +173,7 @@ impl Tool for GitStatusTool {
             run_id,
             call_id,
             "git.status",
+            cancel,
         )
         .await?;
         Ok(ToolOutcome::Value(output))
@@ -196,7 +204,7 @@ impl Tool for GitDiffTool {
         run_id: RunId,
         call_id: &str,
         arguments: Value,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let args: DiffArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("git.diff args: {e}")))?;
@@ -207,10 +215,99 @@ impl Tool for GitDiffTool {
         if let Some(path) = args.path
             && !path.is_empty()
         {
+            // Reject absolute/parent escapes and links that leave the
+            // workspace. The explicit `--` then makes even an option-looking
+            // filename a pathspec rather than a git option.
+            self.workspace.resolve_relative(&path).await?;
+            git_args.push("--".into());
             git_args.push(path);
         }
         let refs: Vec<&str> = git_args.iter().map(String::as_str).collect();
-        let output = run_git(&self.workspace, &refs, run_id, call_id, "git.diff").await?;
+        let output = run_git(&self.workspace, &refs, run_id, call_id, "git.diff", cancel).await?;
         Ok(ToolOutcome::Value(output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn git_command(root: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git executable is required for git tool tests")
+    }
+
+    #[tokio::test]
+    async fn diff_treats_option_looking_path_as_a_path_without_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = git_command(dir.path(), &["init", "--quiet"]);
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        tokio::fs::write(dir.path().join("tracked.txt"), "before\n")
+            .await
+            .unwrap();
+        let add = git_command(dir.path(), &["add", "--", "tracked.txt"]);
+        assert!(
+            add.status.success(),
+            "git add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        tokio::fs::write(dir.path().join("tracked.txt"), "after\n")
+            .await
+            .unwrap();
+
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = GitDiffTool::new(workspace);
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "diff-call",
+                json!({"path": "--output=leak.patch"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::Value(output) if output.ok));
+        assert!(
+            !dir.path().join("leak.patch").exists(),
+            "an option-looking path must not activate git's --output option"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_rejects_paths_outside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = GitDiffTool::new(workspace);
+        let result = tool
+            .execute(
+                RunId::new(),
+                "diff-call",
+                json!({"path": "../outside.txt"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(AgentError::InvalidRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn status_honors_preexisting_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = GitStatusTool::new(workspace);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = tool
+            .execute(RunId::new(), "status-call", json!({}), cancel)
+            .await;
+        assert!(matches!(result, Err(AgentError::Cancelled)));
     }
 }

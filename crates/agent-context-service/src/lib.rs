@@ -81,6 +81,18 @@ pub async fn handle(op: ServiceOp, engine: &dyn ContextEngine) -> Result<Value, 
             let items = engine.inspect(limit).await?;
             serde_json::to_value(items).map_err(|e| AgentError::Context(e.to_string()))
         }
+        ServiceOp::SearchExternal { query } => {
+            let entries = engine.search_external(query).await?;
+            serde_json::to_value(entries).map_err(|e| AgentError::Context(e.to_string()))
+        }
+        ServiceOp::InspectExternal { item_id } => {
+            let entry = engine.inspect_external(item_id).await?;
+            serde_json::to_value(entry).map_err(|e| AgentError::Context(e.to_string()))
+        }
+        ServiceOp::FetchExternal { item_id } => {
+            let item = engine.fetch_external(item_id).await?;
+            serde_json::to_value(item).map_err(|e| AgentError::Context(e.to_string()))
+        }
         ServiceOp::Checkpoint => engine.checkpoint().await,
         ServiceOp::Restore { data } => {
             engine.restore(data).await?;

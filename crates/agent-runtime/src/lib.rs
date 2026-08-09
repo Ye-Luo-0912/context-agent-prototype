@@ -10,6 +10,7 @@ mod command;
 pub mod host;
 mod instance;
 pub mod modules;
+mod output;
 mod prompt;
 mod sink;
 pub mod task;

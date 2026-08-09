@@ -13,6 +13,7 @@ members = [
     "crates/agent-kernel",
     "crates/agent-runtime",
     "crates/agent-replay",
+    "crates/agent-eval",
     "crates/provider-openai",
     "crates/agent-tui",
 ]

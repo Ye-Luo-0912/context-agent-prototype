@@ -102,6 +102,15 @@ pub enum RuntimeEvent {
     /// crash-recovery machinery must intervene before normal operation
     /// resumes with full consistency guarantees.
     RecoveryRequired,
+    /// A model round completed and the provider reported usage. Emitted at
+    /// turn-commit time, so live consumers (the eval harness, a token meter)
+    /// can measure the true cost of a turn without parsing provider
+    /// internals. `input_tokens`/`output_tokens` are `0` when the provider
+    /// did not report them.
+    ModelUsed {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
     RunCompleted,
 }
 

@@ -21,7 +21,9 @@
 //! store files are durable on disk (only the in-memory `external` list is
 //! part of the engine checkpoint).
 
-use agent_contracts::{RunId, TaskId};
+use std::collections::HashSet;
+
+use agent_contracts::{AgentError, AgentResult, RunId, TaskId};
 use serde::{Deserialize, Serialize};
 
 use crate::task::{TaskManager, TaskRecord, TaskStatus};
@@ -74,6 +76,67 @@ pub struct CapabilitySnapshot {
     pub id: String,
     pub activation: agent_contracts::CapabilityActivation,
     pub loaded: bool,
+}
+
+impl RuntimeCheckpoint {
+    /// Validate the redundant task authority fields before any restore-side
+    /// mutation. A checkpoint is untrusted input: `tasks.active`, the
+    /// actor's `current_task_id`, and the record carrying `Active` must name
+    /// exactly the same task.
+    pub(crate) fn validate(&self) -> AgentResult<()> {
+        if self.version != RUNTIME_CHECKPOINT_VERSION {
+            return Err(AgentError::InvalidRequest(format!(
+                "checkpoint version {} is not supported (expected {})",
+                self.version, RUNTIME_CHECKPOINT_VERSION
+            )));
+        }
+
+        if self.tasks.active != self.current_task_id {
+            return Err(AgentError::InvalidRequest(
+                "checkpoint task authority is inconsistent: tasks.active and current_task_id differ"
+                    .into(),
+            ));
+        }
+
+        let mut task_ids = HashSet::new();
+        let mut active_records = Vec::new();
+        for task in &self.tasks.tasks {
+            if !task_ids.insert(task.id) {
+                return Err(AgentError::InvalidRequest(format!(
+                    "checkpoint contains duplicate task id {}",
+                    task.id
+                )));
+            }
+            if task.status == TaskStatus::Active {
+                active_records.push(task.id);
+            }
+        }
+
+        match self.current_task_id {
+            Some(current) if active_records.as_slice() != [current] => {
+                return Err(AgentError::InvalidRequest(format!(
+                    "checkpoint current task {current} must be the only active task record"
+                )));
+            }
+            None if !active_records.is_empty() => {
+                return Err(AgentError::InvalidRequest(
+                    "checkpoint has an active task record but no current task".into(),
+                ));
+            }
+            _ => {}
+        }
+
+        let mut capability_ids = HashSet::new();
+        for capability in &self.capabilities {
+            if !capability_ids.insert(capability.id.as_str()) {
+                return Err(AgentError::InvalidRequest(format!(
+                    "checkpoint contains duplicate capability id '{}'",
+                    capability.id
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl TaskManagerSnapshot {

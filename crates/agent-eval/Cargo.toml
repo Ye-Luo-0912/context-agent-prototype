@@ -1,0 +1,22 @@
+[package]
+name = "agent-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless live evaluation: run a real coding task through the A/B/C context engines with a real model and compare cost vs. task success"
+
+[dependencies]
+agent-contracts.workspace = true
+agent-kernel.workspace = true
+agent-runtime.workspace = true
+agent-storage.workspace = true
+agent-workspace.workspace = true
+context-baselines.workspace = true
+context-simple.workspace = true
+provider-openai.workspace = true
+tool-runtime.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tempfile = "3"

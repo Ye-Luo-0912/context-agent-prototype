@@ -2230,6 +2230,87 @@ async fn external_retrieval_searches_inspects_and_fetches() {
 }
 
 #[tokio::test]
+async fn terminal_external_entries_are_hidden_from_every_retrieval_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+
+    let (live_id, terminal_ids) = {
+        let mut state = engine.state.lock().await;
+        let semantics = [
+            SemanticState::Live,
+            SemanticState::Superseded { by: None },
+            SemanticState::VerifiedFixed { by: None },
+            SemanticState::Tombstoned,
+        ];
+        let mut ids = Vec::new();
+        for (offset, semantic) in semantics.into_iter().enumerate() {
+            let mut item = crate::item::make_item(
+                &state,
+                &engine.config,
+                format!("RecallSurface.rs entry {offset}"),
+                ContextKind::Note,
+                ContextScope::Task,
+                ContextRetention::Working,
+                0.5,
+                None,
+            );
+            item.semantic = semantic;
+            item.entities = crate::index::entity::extract_entities(&item.content);
+            let reference = crate::store::externalize(dir.path(), &item).unwrap();
+            let mut entry = crate::store::to_external_entry(&item, reference, offset as u64 + 1, 1);
+            if matches!(semantic, SemanticState::VerifiedFixed { .. }) {
+                entry.residency = agent_contracts::ContextResidency::External;
+            }
+            state.external.push(entry);
+            ids.push(item.id);
+        }
+        (ids[0], ids[1..].to_vec())
+    };
+
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "RecallSurface.rs".into(),
+            budget_tokens: 1_000,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        materialized
+            .external
+            .iter()
+            .map(|entry| entry.item_id)
+            .collect::<Vec<_>>(),
+        vec![live_id],
+        "the materialized external view must expose only live refs"
+    );
+
+    let hits = engine
+        .search_external(ContextSearchQuery::new("RecallSurface", 10))
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|entry| entry.item_id).collect::<Vec<_>>(),
+        vec![live_id],
+        "search must not return semantically terminal refs"
+    );
+
+    for item_id in terminal_ids {
+        assert!(
+            engine.inspect_external(item_id).await.unwrap().is_none(),
+            "inspect must hide terminal ref {item_id:?}"
+        );
+        assert!(
+            engine.fetch_external(item_id).await.unwrap().is_none(),
+            "fetch must refuse terminal ref {item_id:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn gc_externalizes_overflow_and_recalls_via_the_store() {
     let dir = tempfile::tempdir().unwrap();
     let engine = SimpleContextEngine::new(SimpleContextConfig {

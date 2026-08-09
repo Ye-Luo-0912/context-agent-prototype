@@ -6,11 +6,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_contracts::{
-    AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
+    AgentResult, Capability, CapabilityActivation, CapabilityInvocationContext,
+    CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
+    CapabilityTransport, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
     MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput, ModelRequest,
-    ModelTransport, RuntimeEvent, ScopeId, ScopeKind, ToolDispatcher, ToolExecutionRequest,
-    ToolOutcome, ToolSpec,
+    ModelTransport, RuntimeEvent, ScopeId, ScopeKind, ToolCall, ToolDispatcher,
+    ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
 use agent_runtime::{CapabilityId, Module, ModuleHost, RuntimeInstance, ServiceRegistry};
@@ -75,6 +77,62 @@ impl ContextEngine for TestContextEngine {
     }
     async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
         Ok(())
+    }
+}
+
+struct CheckpointCapability {
+    manifest: CapabilityManifest,
+}
+
+impl CheckpointCapability {
+    fn new() -> Self {
+        Self {
+            manifest: CapabilityManifest {
+                id: "checkpoint-capability".into(),
+                version: "1.0.0".into(),
+                name: "checkpoint capability".into(),
+                summary: "tests restore ordering".into(),
+                status: CapabilityStatus::Experimental,
+                provides: vec![agent_contracts::CapabilityKind::Tool],
+                permissions: Vec::new(),
+                requires: Vec::new(),
+                tools: Vec::new(),
+                lifecycle: CapabilityLifecycle::Lazy,
+                transport: CapabilityTransport::Builtin,
+            },
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Capability for CheckpointCapability {
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+
+    fn tool_specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "checkpoint.tool".into(),
+            description: "checkpoint test tool".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+        }]
+    }
+
+    async fn invoke(
+        &self,
+        call: ToolCall,
+        _ctx: CapabilityInvocationContext,
+    ) -> AgentResult<CapabilityOutcome> {
+        Ok(CapabilityOutcome::Value(ToolOutput {
+            call_id: call.id,
+            tool_name: call.name,
+            ok: true,
+            summary: "ok".into(),
+            model_content: "ok".into(),
+            artifact_ref: None,
+            metadata: serde_json::Value::Null,
+        }))
     }
 }
 
@@ -342,6 +400,135 @@ async fn runtime_checkpoint_roundtrips_tasks_context_and_capabilities() {
         "restore must align the context focus with the runtime's current task"
     );
     fresh.shutdown().await.unwrap();
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_restore_keeps_the_existing_task_and_context_authority() {
+    let (instance, context) = simple_instance().await;
+    instance
+        .handle()
+        .set_focus("original task".into())
+        .await
+        .unwrap();
+
+    let mut invalid = instance.checkpoint().await.unwrap();
+    invalid.tasks.tasks[0].goal = "replacement task".into();
+    // The task half is internally valid, but the opaque context payload is
+    // not. Previously the actor installed the replacement task table before
+    // discovering this restore error.
+    invalid.context = serde_json::Value::Null;
+
+    let result = instance.restore(invalid).await;
+    assert!(
+        result.is_err(),
+        "the invalid context payload must be rejected"
+    );
+    let tasks = instance.handle().list_tasks().await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].goal, "original task");
+
+    let focus = context
+        .materialize(ContextQuery {
+            current_input: String::new(),
+            budget_tokens: 0,
+            hints: Default::default(),
+        })
+        .await
+        .unwrap()
+        .focus
+        .expect("the original context focus must survive failed restore");
+    assert_eq!(focus.task_id, tasks[0].id);
+    assert_eq!(focus.goal, "original task");
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn restore_rejects_inconsistent_redundant_task_authority() {
+    let (instance, _context) = simple_instance().await;
+    instance
+        .handle()
+        .set_focus("original task".into())
+        .await
+        .unwrap();
+    let before = instance.handle().list_tasks().await.unwrap();
+    let mut invalid = instance.checkpoint().await.unwrap();
+    invalid.tasks.active = None;
+
+    let error = instance.restore(invalid).await.unwrap_err();
+    assert!(
+        error.to_string().contains("task authority is inconsistent"),
+        "the redundant authority mismatch must be diagnosed before mutation: {error}"
+    );
+    assert_eq!(instance.handle().list_tasks().await.unwrap(), before);
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn restore_rejects_context_focus_that_disagrees_with_task_authority() {
+    let (instance, context) = simple_instance().await;
+    instance
+        .handle()
+        .set_focus("original task".into())
+        .await
+        .unwrap();
+    let before = instance.handle().list_tasks().await.unwrap();
+    let mut invalid = instance.checkpoint().await.unwrap();
+
+    // Keep all actor-owned redundant fields internally consistent while
+    // making them disagree with the opaque context checkpoint's focus.
+    let replacement = agent_contracts::TaskId::new();
+    invalid.tasks.tasks[0].id = replacement;
+    invalid.tasks.active = Some(replacement);
+    invalid.current_task_id = Some(replacement);
+
+    let error = instance.restore(invalid).await.unwrap_err();
+    assert!(
+        error.to_string().contains("context focus"),
+        "context/task disagreement must be rejected explicitly: {error}"
+    );
+    assert_eq!(instance.handle().list_tasks().await.unwrap(), before);
+    let focus = context
+        .materialize(ContextQuery {
+            current_input: String::new(),
+            budget_tokens: 0,
+            hints: Default::default(),
+        })
+        .await
+        .unwrap()
+        .focus
+        .unwrap();
+    assert_eq!(focus.task_id, before[0].id);
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_actor_restore_does_not_change_capability_flags() {
+    let host = ModuleHost::new();
+    host.register_capability(Arc::new(CheckpointCapability::new()))
+        .unwrap();
+    let registry = host.capability_registry();
+    registry.enable("checkpoint-capability").unwrap();
+    registry.load_tool("checkpoint.tool").unwrap();
+
+    let instance = RuntimeInstance::spawn(host, kernel());
+    instance.start().await.unwrap();
+    let mut invalid = instance.checkpoint().await.unwrap();
+    invalid.version += 1;
+    invalid.capabilities[0].activation = CapabilityActivation::Disabled;
+    invalid.capabilities[0].loaded = false;
+
+    assert!(instance.restore(invalid).await.is_err());
+    assert_eq!(
+        registry.activation("checkpoint-capability"),
+        Some(CapabilityActivation::Enabled),
+        "a rejected actor restore must not partially apply capability activation"
+    );
+    assert_eq!(
+        registry.tool_state("checkpoint.tool"),
+        Some(ToolLifecycle::Loaded),
+        "a rejected actor restore must not unload the existing surface"
+    );
     instance.shutdown().await.unwrap();
 }
 

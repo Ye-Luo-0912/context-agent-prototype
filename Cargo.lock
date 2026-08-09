@@ -40,6 +40,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-eval"
+version = "0.1.0"
+dependencies = [
+ "agent-contracts",
+ "agent-kernel",
+ "agent-runtime",
+ "agent-storage",
+ "agent-workspace",
+ "anyhow",
+ "async-trait",
+ "context-baselines",
+ "context-simple",
+ "provider-openai",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tool-runtime",
+]
+
+[[package]]
 name = "agent-kernel"
 version = "0.1.0"
 dependencies = [

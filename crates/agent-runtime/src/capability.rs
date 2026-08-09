@@ -607,7 +607,10 @@ impl CapabilityRegistry {
             current.activation = entry.activation;
             current.loaded = entry.loaded && entry.activation.usable();
         }
-        // Restore re-applies surface flags the discovery rows report.
+        // Restore changes the model-visible surface just like explicit
+        // activation/load operations, so both the audit generation and the
+        // derived discovery rows must advance.
+        self.generation.fetch_add(1, Ordering::Relaxed);
         self.catalog_version.fetch_add(1, Ordering::Relaxed);
     }
 

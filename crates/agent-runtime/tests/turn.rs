@@ -334,6 +334,65 @@ async fn actor_streams_model_deltas_to_subscribers() {
     assert_eq!(final_content.as_deref(), Some("Hello world"));
 }
 
+/// Returns one plain text answer with a fixed provider usage report.
+#[derive(Debug)]
+struct UsageModel(u64, u64);
+
+#[async_trait::async_trait]
+impl ModelTransport for UsageModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        Ok(ModelOutput {
+            content: "done".into(),
+            tool_calls: Vec::new(),
+            usage: agent_contracts::ModelUsage {
+                input_tokens: Some(self.0),
+                output_tokens: Some(self.1),
+            },
+        })
+    }
+}
+
+#[tokio::test]
+async fn actor_reports_provider_usage_via_model_used() {
+    let handle = spawn_with(
+        Arc::new(UsageModel(321, 78)),
+        Arc::new(TestContextEngine),
+        Arc::new(TestToolDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("hello".into()).await.unwrap();
+
+    let mut used: Option<(u64, u64)> = None;
+    let mut turn_completed = false;
+    for _ in 0..500 {
+        if let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::ModelUsed {
+                    input_tokens,
+                    output_tokens,
+                } => used = Some((input_tokens, output_tokens)),
+                RuntimeEvent::TurnCompleted => turn_completed = true,
+                _ => {}
+            }
+        }
+        if turn_completed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(turn_completed, "the turn must complete");
+    assert_eq!(
+        used,
+        Some((321, 78)),
+        "the provider-reported usage must reach subscribers as ModelUsed"
+    );
+}
+
 #[tokio::test]
 async fn actor_cancels_hanging_model_cleanly() {
     let handle = spawn_with(

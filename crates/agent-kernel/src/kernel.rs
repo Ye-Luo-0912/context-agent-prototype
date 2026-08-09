@@ -7,8 +7,8 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, ContextEngine, ContextGcReport,
-    ContextIngress, ContextItemSummary, ContextKind, ContextMaintenanceReport,
+    AgentError, AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, ContextEngine,
+    ContextGcReport, ContextIngress, ContextItemSummary, ContextKind, ContextMaintenanceReport,
     ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery, ContextStateTransition,
     EngineQuery, EventJournal, FocusState, MaterializedContext, ModelCapabilities, ModelEventSink,
     ModelOutput, ModelRequest, ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, ScopeId,
@@ -429,79 +429,102 @@ impl AgentKernel {
     /// the runtime's `TaskManager` — re-focusing an existing task resumes
     /// its scopes in the context engine (suspension/resume is keyed on the
     /// task id), while a fresh task id opens a fresh task scope.
-    pub async fn set_focus(&self, task_id: TaskId, goal: String) -> AgentResult<()> {
+    pub async fn set_focus(
+        &self,
+        task_id: TaskId,
+        goal: String,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        let checkpoint = self.context.checkpoint().await?;
         let focus = FocusState::for_task(task_id, goal.clone());
-        self.context
-            .ingest(ContextIngress::FocusChanged { focus })
-            .await?;
-        self.emit(RuntimeEvent::FocusChanged { task_id, goal })
-            .await?;
-        let report = self
-            .context
-            .maintain(ContextMaintenanceTrigger::FocusChanged)
-            .await?;
-        self.emit(RuntimeEvent::ContextMaintained {
-            trigger: ContextMaintenanceTrigger::FocusChanged,
-            report,
-        })
-        .await?;
-        Ok(())
+        let transition = async {
+            self.context
+                .ingest(ContextIngress::FocusChanged { focus })
+                .await?;
+            self.context
+                .maintain(ContextMaintenanceTrigger::FocusChanged)
+                .await
+        }
+        .await;
+        self.finish_context_transaction("set focus", checkpoint, transition)
+            .await
     }
 
     /// Suspend the current focus without completing the task: the engine
     /// clears its focus and suspends the active task's scopes, so a later
     /// `set_focus` with the same task id resumes them.
-    pub async fn clear_focus(&self) -> AgentResult<()> {
-        self.context.ingest(ContextIngress::FocusCleared).await?;
-        self.emit(RuntimeEvent::FocusCleared).await?;
-        let report = self
-            .context
-            .maintain(ContextMaintenanceTrigger::FocusChanged)
-            .await?;
-        self.emit(RuntimeEvent::ContextMaintained {
-            trigger: ContextMaintenanceTrigger::FocusChanged,
-            report,
-        })
-        .await?;
-        Ok(())
+    pub async fn clear_focus(&self) -> AgentResult<ContextMaintenanceReport> {
+        let checkpoint = self.context.checkpoint().await?;
+        let transition = async {
+            self.context.ingest(ContextIngress::FocusCleared).await?;
+            self.context
+                .maintain(ContextMaintenanceTrigger::FocusChanged)
+                .await
+        }
+        .await;
+        self.finish_context_transaction("clear focus", checkpoint, transition)
+            .await
     }
 
-    pub async fn pin(&self, content: String) -> AgentResult<()> {
-        self.context
-            .ingest(ContextIngress::Pin {
-                content: content.clone(),
-                kind: ContextKind::Constraint,
-            })
-            .await?;
-        self.emit(RuntimeEvent::Pinned { content }).await?;
-        let report = self
-            .context
-            .maintain(ContextMaintenanceTrigger::FocusChanged)
-            .await?;
-        self.emit(RuntimeEvent::ContextMaintained {
-            trigger: ContextMaintenanceTrigger::FocusChanged,
-            report,
-        })
-        .await
+    pub async fn pin(&self, content: String) -> AgentResult<ContextMaintenanceReport> {
+        let checkpoint = self.context.checkpoint().await?;
+        let transition = async {
+            self.context
+                .ingest(ContextIngress::Pin {
+                    content,
+                    kind: ContextKind::Constraint,
+                })
+                .await?;
+            self.context
+                .maintain(ContextMaintenanceTrigger::FocusChanged)
+                .await
+        }
+        .await;
+        self.finish_context_transaction("pin context", checkpoint, transition)
+            .await
     }
 
-    pub async fn complete_current_task(&self, summary: String) -> AgentResult<()> {
-        self.context
-            .ingest(ContextIngress::TaskCompleted {
-                task_id: None,
-                summary: summary.clone(),
-            })
-            .await?;
-        self.emit(RuntimeEvent::TaskCompleted { summary }).await?;
-        let report = self
-            .context
-            .maintain(ContextMaintenanceTrigger::TaskCompleted)
-            .await?;
-        self.emit(RuntimeEvent::ContextMaintained {
-            trigger: ContextMaintenanceTrigger::TaskCompleted,
-            report,
-        })
-        .await
+    pub async fn complete_current_task(
+        &self,
+        task_id: TaskId,
+        summary: String,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        let checkpoint = self.context.checkpoint().await?;
+        let transition = async {
+            self.context
+                .ingest(ContextIngress::TaskCompleted {
+                    task_id: Some(task_id),
+                    summary,
+                })
+                .await?;
+            self.context
+                .maintain(ContextMaintenanceTrigger::TaskCompleted)
+                .await
+        }
+        .await;
+        self.finish_context_transaction("complete task", checkpoint, transition)
+            .await
+    }
+
+    /// Complete a context-only transaction. Context engines are replaceable
+    /// and their mutation methods are fallible, so the stateless core takes a
+    /// portable checkpoint before a multi-step transition and restores it if
+    /// either ingest or maintenance fails. Task state is committed by the
+    /// runtime actor only after this method returns `Ok`.
+    async fn finish_context_transaction<T>(
+        &self,
+        operation: &'static str,
+        checkpoint: serde_json::Value,
+        result: AgentResult<T>,
+    ) -> AgentResult<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => match self.context.restore(checkpoint).await {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(AgentError::Context(format!(
+                    "{operation} failed ({error}); rollback failed ({rollback_error}); recovery required"
+                ))),
+            },
+        }
     }
 
     pub async fn emit_diagnostics(&self) -> AgentResult<()> {
@@ -526,11 +549,47 @@ impl AgentKernel {
         self.context.checkpoint().await
     }
 
-    /// Restore the context engine from a checkpoint's context payload.
-    /// The runtime actor restores its own state (task table, current task)
-    /// around this call, so a restored run has both planes back.
-    pub async fn restore(&self, data: serde_json::Value) -> AgentResult<()> {
-        self.context.restore(data).await
+    /// Restore and verify the context half of a runtime checkpoint before
+    /// the actor exposes its task-table half. A fallible engine restore may
+    /// partially mutate, so this uses the same snapshot rollback as focus
+    /// transitions. The materialized focus is the contract-level authority
+    /// check; callers cannot assume opaque context JSON has a matching task.
+    pub async fn restore(
+        &self,
+        data: serde_json::Value,
+        expected_task_id: Option<TaskId>,
+    ) -> AgentResult<()> {
+        let checkpoint = self.context.checkpoint().await?;
+        let verification_restore = data.clone();
+        let restored = async {
+            self.context.restore(data).await?;
+            let actual_task_id = self
+                .context
+                .materialize(ContextQuery {
+                    current_input: String::new(),
+                    budget_tokens: 0,
+                    hints: agent_contracts::ContextHints {
+                        max_selected_items: Some(0),
+                    },
+                })
+                .await?
+                .focus
+                .map(|focus| focus.task_id);
+            if actual_task_id != expected_task_id {
+                return Err(AgentError::InvalidRequest(format!(
+                    "checkpoint context focus {actual_task_id:?} does not match current task {expected_task_id:?}"
+                )));
+            }
+            // `materialize` is the only implementation-agnostic way to read
+            // focus today and may stamp access/tick metadata. Re-applying
+            // the same replacement checkpoint removes that verification
+            // observation, so restore remains an exact state replacement.
+            self.context.restore(verification_restore).await?;
+            Ok(())
+        }
+        .await;
+        self.finish_context_transaction("restore context", checkpoint, restored)
+            .await
     }
 
     async fn emit(&self, event: RuntimeEvent) -> AgentResult<()> {

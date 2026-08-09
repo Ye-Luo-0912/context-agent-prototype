@@ -10,9 +10,9 @@ use std::{collections::VecDeque, sync::Arc};
 use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, ContextHints, ContextIngress,
-    ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect, EffectCommitError,
-    ModelInput, ModelRequest, OperationId, OperationOutcome, OperationResult, RuntimeDirective,
-    RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall, ToolOutcome, ToolOutput,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect,
+    EffectCommitError, ModelInput, ModelRequest, OperationId, OperationOutcome, OperationResult,
+    RuntimeDirective, RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall, ToolOutcome, ToolOutput,
     ToolSurfaceSnapshot, TurnFrame, TurnFrameStep, TurnId,
 };
 use agent_kernel::AgentKernel;
@@ -24,6 +24,7 @@ use crate::checkpoint::{
     RUNTIME_CHECKPOINT_VERSION, RunMetadata, RuntimeCheckpoint, TaskManagerSnapshot,
 };
 use crate::command::{Reply, RuntimeCommand, RuntimeHandle};
+use crate::output::bound_tool_output;
 use crate::prompt::PromptAssembler;
 use crate::sink::LiveSink;
 use crate::task::TaskManager;
@@ -245,12 +246,21 @@ impl RuntimeActor {
                         // the engine's focus change succeeded, so the two
                         // can never diverge.
                         let (txn, task_id) = self.state.tasks.prepare_create(&goal);
+                        let event_goal = goal.clone();
                         match self.kernel.set_focus(task_id, goal).await {
-                            Ok(()) => {
+                            Ok(report) => {
                                 self.state.tasks.commit(txn);
                                 self.state.task_id = Some(task_id);
                                 self.state.generation += 1;
-                                Ok(())
+                                self.publish_context_transition(
+                                    RuntimeEvent::FocusChanged {
+                                        task_id,
+                                        goal: event_goal,
+                                    },
+                                    ContextMaintenanceTrigger::FocusChanged,
+                                    report,
+                                )
+                                .await
                             }
                             Err(error) => Err(error),
                         }
@@ -272,12 +282,21 @@ impl RuntimeActor {
                                 .get(task_id)
                                 .map(|task| task.goal.clone())
                                 .unwrap_or_default();
+                            let event_goal = goal.clone();
                             match self.kernel.set_focus(task_id, goal).await {
-                                Ok(()) => {
+                                Ok(report) => {
                                     self.state.tasks.commit(txn);
                                     self.state.task_id = Some(task_id);
                                     self.state.generation += 1;
-                                    Ok(())
+                                    self.publish_context_transition(
+                                        RuntimeEvent::FocusChanged {
+                                            task_id,
+                                            goal: event_goal,
+                                        },
+                                        ContextMaintenanceTrigger::FocusChanged,
+                                        report,
+                                    )
+                                    .await
                                 }
                                 Err(error) => Err(error),
                             }
@@ -292,11 +311,16 @@ impl RuntimeActor {
                     Ok(()) => match self.state.tasks.prepare_suspend() {
                         None => Ok(()),
                         Some(txn) => match self.kernel.clear_focus().await {
-                            Ok(()) => {
+                            Ok(report) => {
                                 self.state.tasks.commit(txn);
                                 self.state.task_id = None;
                                 self.state.generation += 1;
-                                Ok(())
+                                self.publish_context_transition(
+                                    RuntimeEvent::FocusCleared,
+                                    ContextMaintenanceTrigger::FocusChanged,
+                                    report,
+                                )
+                                .await
                             }
                             Err(error) => Err(error),
                         },
@@ -310,7 +334,22 @@ impl RuntimeActor {
             }
             RuntimeCommand::Pin { content, reply } => {
                 let result = match self.ensure_idle() {
-                    Ok(()) => self.kernel.pin(content).await,
+                    Ok(()) => {
+                        let event_content = content.clone();
+                        match self.kernel.pin(content).await {
+                            Ok(report) => {
+                                self.publish_context_transition(
+                                    RuntimeEvent::Pinned {
+                                        content: event_content,
+                                    },
+                                    ContextMaintenanceTrigger::FocusChanged,
+                                    report,
+                                )
+                                .await
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
@@ -322,15 +361,25 @@ impl RuntimeActor {
                             "no active task to complete".into(),
                         )),
                         Some(txn) => {
-                            // The engine resolves the completed task from the
-                            // current focus; the TaskManager closes its record
-                            // only after the engine's close succeeded.
-                            match self.kernel.complete_current_task(summary).await {
-                                Ok(()) => {
+                            let task_id = self
+                                .state
+                                .tasks
+                                .active()
+                                .expect("a completion transaction has an active task");
+                            let event_summary = summary.clone();
+                            match self.kernel.complete_current_task(task_id, summary).await {
+                                Ok(report) => {
                                     self.state.tasks.commit(txn);
                                     self.state.task_id = None;
                                     self.state.generation += 1;
-                                    Ok(())
+                                    self.publish_context_transition(
+                                        RuntimeEvent::TaskCompleted {
+                                            summary: event_summary,
+                                        },
+                                        ContextMaintenanceTrigger::TaskCompleted,
+                                        report,
+                                    )
+                                    .await
                                 }
                                 Err(error) => Err(error),
                             }
@@ -365,19 +414,28 @@ impl RuntimeActor {
             RuntimeCommand::Restore { checkpoint, reply } => {
                 let result = match self.ensure_idle() {
                     Ok(()) => {
-                        if checkpoint.version != RUNTIME_CHECKPOINT_VERSION {
-                            Err(AgentError::InvalidRequest(format!(
-                                "checkpoint version {} is not supported (expected {})",
-                                checkpoint.version, RUNTIME_CHECKPOINT_VERSION
-                            )))
-                        } else {
-                            // The engine's scopes were restored from the
-                            // context payload; the task table and the
-                            // current task come back in sync with them.
-                            self.state.tasks.restore(checkpoint.tasks);
-                            self.state.task_id = checkpoint.current_task_id;
-                            self.state.generation += 1;
-                            self.kernel.restore(checkpoint.context).await
+                        match checkpoint.validate() {
+                            Err(error) => Err(error),
+                            Ok(()) => {
+                                let RuntimeCheckpoint {
+                                    tasks,
+                                    current_task_id,
+                                    context,
+                                    ..
+                                } = checkpoint;
+                                match self.kernel.restore(context, current_task_id).await {
+                                    Err(error) => Err(error),
+                                    Ok(()) => {
+                                        // No fallible operation follows this
+                                        // point: context and task authority
+                                        // become visible together.
+                                        self.state.tasks.restore(tasks);
+                                        self.state.task_id = current_task_id;
+                                        self.state.generation += 1;
+                                        Ok(())
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(error) => Err(error),
@@ -412,6 +470,21 @@ impl RuntimeActor {
         }
     }
 
+    /// Publish the audit/UI events for an already committed context/task
+    /// transition. Event persistence may still fail, but it can no longer
+    /// leave the context plane ahead of the task authority plane.
+    async fn publish_context_transition(
+        &self,
+        event: RuntimeEvent,
+        trigger: ContextMaintenanceTrigger,
+        report: ContextMaintenanceReport,
+    ) -> AgentResult<()> {
+        self.kernel.emit_event(event).await?;
+        self.kernel
+            .emit_event(RuntimeEvent::ContextMaintained { trigger, report })
+            .await
+    }
+
     /// Commit the turn start: user message into the long-term context, then
     /// spawn the first model operation.
     async fn start_turn(
@@ -436,12 +509,30 @@ impl RuntimeActor {
         // explicit `/focus`.
         if self.state.tasks.active().is_none() {
             let (txn, task_id) = self.state.tasks.prepare_create(content.trim());
-            if let Err(error) = self.kernel.set_focus(task_id, content.clone()).await {
-                let _ = reply.send(Err(error));
-                return;
+            match self.kernel.set_focus(task_id, content.clone()).await {
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+                Ok(report) => {
+                    self.state.tasks.commit(txn);
+                    self.state.task_id = Some(task_id);
+                    if let Err(error) = self
+                        .publish_context_transition(
+                            RuntimeEvent::FocusChanged {
+                                task_id,
+                                goal: content.clone(),
+                            },
+                            ContextMaintenanceTrigger::FocusChanged,
+                            report,
+                        )
+                        .await
+                    {
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                }
             }
-            self.state.tasks.commit(txn);
-            self.state.task_id = Some(task_id);
         }
 
         self.state.generation += 1;
@@ -805,6 +896,7 @@ impl RuntimeActor {
                 Ok(output) => OperationOutcome::ModelOutput {
                     content: output.content,
                     tool_calls: output.tool_calls,
+                    usage: output.usage,
                 },
                 Err(AgentError::Cancelled) => OperationOutcome::Cancelled,
                 Err(error) => OperationOutcome::Failed {
@@ -1007,7 +1099,18 @@ impl RuntimeActor {
             OperationOutcome::ModelOutput {
                 content,
                 tool_calls,
+                usage,
             } => {
+                // Report the round's true provider usage to live consumers
+                // (the eval harness, a token meter). Best-effort: a journal
+                // failure here must not abort the turn commit.
+                let _ = self
+                    .kernel
+                    .emit_event(RuntimeEvent::ModelUsed {
+                        input_tokens: usage.input_tokens.unwrap_or(0),
+                        output_tokens: usage.output_tokens.unwrap_or(0),
+                    })
+                    .await;
                 if tool_calls.is_empty() {
                     self.finalize_turn(content).await;
                 } else {
@@ -1061,6 +1164,12 @@ impl RuntimeActor {
                     },
                     None => output,
                 };
+                // Last-line invariant guard: untrusted capability/process
+                // outputs and context fetches must never enter the turn
+                // frame, context engine or event stream unbounded. Normal
+                // tools spill before this point; this guard makes a
+                // producer contract violation safe and visible.
+                let output = bound_tool_output(output);
                 // Execute the tool's runtime directive now, as part of the
                 // operation commit — not at turn end — so a context control
                 // request takes effect before the next model round.

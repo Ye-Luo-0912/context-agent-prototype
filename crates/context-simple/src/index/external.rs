@@ -101,12 +101,6 @@ impl ExternalMap {
             .and_then(move |slot| self.entries.get_mut(slot))
     }
 
-    /// Whether an entry id is present (the fetch_external membership check
-    /// that used to be a linear scan).
-    pub(crate) fn contains_id(&self, id: ContextItemId) -> bool {
-        self.id_index.contains_key(&id)
-    }
-
     /// Exact-match entity bucket: entries whose captured entity signature
     /// contains `entity`. Used by the GC recall fast path.
     pub(crate) fn ids_for_entity(&self, entity: &str) -> &[ContextItemId] {
@@ -238,8 +232,8 @@ mod tests {
 
         assert_eq!(map.get(a).unwrap().item_id, a);
         assert_eq!(map.get(b).unwrap().item_id, b);
-        assert!(map.contains_id(a));
-        assert!(!map.contains_id(ContextItemId::new()));
+        assert!(map.get(a).is_some());
+        assert!(map.get(ContextItemId::new()).is_none());
         assert_eq!(map.ids_for_entity("AuthService.rs"), &[a]);
         assert_eq!(map.ids_for_entity("CacheStore.rs"), &[b]);
     }

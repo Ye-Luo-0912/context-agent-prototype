@@ -6,7 +6,8 @@
 //! for a real ContextCore runtime.
 
 use agent_contracts::{
-    ContextIngress, ContextMaintenanceTrigger, ContextQuery, ScopeId, ScopeKind,
+    ContextIngress, ContextItemId, ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery,
+    ScopeId, ScopeKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -59,6 +60,20 @@ pub enum ServiceOp {
     Inspect {
         limit: usize,
     },
+    /// Bounded deterministic lookup over the external context map. The
+    /// query carries its result limit; full content stays in the store.
+    SearchExternal {
+        query: ContextSearchQuery,
+    },
+    /// Read one external map entry's metadata without touching the store.
+    InspectExternal {
+        item_id: ContextItemId,
+    },
+    /// Read one externalized item's full content from the store without
+    /// reactivating it into the working set.
+    FetchExternal {
+        item_id: ContextItemId,
+    },
     Checkpoint,
     Restore {
         data: Value,
@@ -109,7 +124,7 @@ impl ServiceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{ContextKind, ContextScope};
+    use agent_contracts::{ContextItemId, ContextKind, ContextScope, ContextSearchQuery};
 
     #[test]
     fn request_response_round_trip() {
@@ -176,5 +191,38 @@ mod tests {
         };
         let line = serde_json::to_string(&request).unwrap();
         assert!(line.contains("\"op\":\"materialize\""), "{line}");
+    }
+
+    #[test]
+    fn external_recall_ops_round_trip_with_typed_ids_and_bounds() {
+        let item_id = ContextItemId::new();
+        let ops = [
+            ServiceOp::SearchExternal {
+                query: ContextSearchQuery::new("AuthService", 7),
+            },
+            ServiceOp::InspectExternal { item_id },
+            ServiceOp::FetchExternal { item_id },
+        ];
+
+        for (index, op) in ops.into_iter().enumerate() {
+            let request = ServiceRequest {
+                id: index as u64,
+                version: PROTOCOL_VERSION,
+                op,
+            };
+            let encoded = serde_json::to_string(&request).unwrap();
+            let decoded: ServiceRequest = serde_json::from_str(&encoded).unwrap();
+            match decoded.op {
+                ServiceOp::SearchExternal { query } => {
+                    assert_eq!(query.query, "AuthService");
+                    assert_eq!(query.limit, 7);
+                }
+                ServiceOp::InspectExternal { item_id: decoded }
+                | ServiceOp::FetchExternal { item_id: decoded } => {
+                    assert_eq!(decoded, item_id);
+                }
+                other => panic!("unexpected recall op: {other:?}"),
+            }
+        }
     }
 }

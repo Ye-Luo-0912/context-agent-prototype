@@ -520,7 +520,11 @@ impl ContextEngine for SimpleContextEngine {
         item_id: ContextItemId,
     ) -> AgentResult<Option<agent_contracts::ExternalizedContext>> {
         let state = self.state.lock().await;
-        Ok(state.external.get(item_id).cloned())
+        Ok(state
+            .external
+            .get(item_id)
+            .filter(|entry| crate::store::externally_retrievable(entry))
+            .cloned())
     }
 
     async fn fetch_external(&self, item_id: ContextItemId) -> AgentResult<Option<ContextItem>> {
@@ -528,14 +532,17 @@ impl ContextEngine for SimpleContextEngine {
         // read happens *outside* it — sync store IO must never stall the
         // context hot path.
         let dir = crate::store::store_dir(&self.config);
-        let (present, now_tick, gc_epoch) = {
+        let (retrievable, now_tick, gc_epoch) = {
             let state = self.state.lock().await;
             // O(1) id-index membership instead of a linear scan: the
             // model's retrieval loop calls this per item.
-            let present = state.external.contains_id(item_id);
-            (present, state.tick, state.gc_epoch)
+            let retrievable = state
+                .external
+                .get(item_id)
+                .is_some_and(crate::store::externally_retrievable);
+            (retrievable, state.tick, state.gc_epoch)
         };
-        if !present {
+        if !retrievable {
             return Ok(None);
         }
         let item = crate::store::read_item_async(&dir, item_id).await;
@@ -545,8 +552,15 @@ impl ContextEngine for SimpleContextEngine {
             // item was used, it is not an untouched stale reference.
             let mut state = self.state.lock().await;
             if let Some(entry) = state.external.get_mut(item_id) {
+                // Re-check after IO: a concurrent lifecycle transition may
+                // have made the entry terminal while the file was read.
+                if !crate::store::externally_retrievable(entry) {
+                    return Ok(None);
+                }
                 entry.last_access_tick = now_tick;
                 entry.last_access_gc_epoch = Some(gc_epoch);
+            } else {
+                return Ok(None);
             }
         }
         Ok(item)

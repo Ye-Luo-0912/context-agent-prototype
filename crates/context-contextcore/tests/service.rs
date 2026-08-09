@@ -6,6 +6,7 @@
 //! the adapter into a real `AgentKernel` (the acceptance criterion: a
 //! composition-root change, nothing else).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +27,36 @@ async fn connect() -> Arc<dyn ContextEngine> {
     .await
     .expect("spawn + handshake with the context service");
     Arc::new(adapter)
+}
+
+/// A unique store outside the workspace. The contract-parity test forces
+/// real externalization, so it must not share the service's process-wide
+/// fallback directory with another test (or leave context artifacts in the
+/// repository when the test runner's CWD is the workspace).
+struct IsolatedStore {
+    path: PathBuf,
+}
+
+impl IsolatedStore {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "context-contextcore-{label}-{}-{}",
+            std::process::id(),
+            agent_contracts::ContextItemId::new()
+        ));
+        std::fs::create_dir_all(&path).expect("create isolated context store");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for IsolatedStore {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 #[tokio::test]
@@ -352,23 +383,26 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
         .open_scope(agent_contracts::ScopeKind::Tool, None)
         .await
         .unwrap();
-    // Fill the working set so the later gc() has something to evict and the
-    // store has entries to externalize — retrieval and storage GC need data.
-    for turn in 0..4 {
-        engine
-            .ingest(ContextIngress::UserMessage {
-                content: format!("turn {turn}: fix AuthService.rs"),
-            })
-            .await
-            .unwrap();
+    // Force the default-sized reversible buffer to overflow. This uses the
+    // same default capacity as the sidecar's dynamic engine, while keeping
+    // the service otherwise on production defaults. Successful tool
+    // observations become consumed ephemerals after AfterModel and are
+    // therefore evictable in the immediately following full GC pass.
+    let overflow_items = context_simple::SimpleContextConfig::default().gc_buffer_capacity + 1;
+    for item in 0..overflow_items {
+        let model_content = if item == 0 {
+            "external recall sentinel RecallSentinel.rs AuthService".to_string()
+        } else {
+            format!("historical File{item}.rs AuthService observation")
+        };
         engine
             .ingest(ContextIngress::ToolObservation {
                 output: ToolOutput {
-                    call_id: format!("c{turn}"),
+                    call_id: format!("overflow-{item}"),
                     tool_name: "shell.exec".into(),
-                    ok: turn % 2 == 0,
-                    summary: "ran".into(),
-                    model_content: format!("AuthService.rs line {turn}"),
+                    ok: true,
+                    summary: "historical result".into(),
+                    model_content,
                     artifact_ref: None,
                     metadata: json!({}),
                 },
@@ -376,17 +410,21 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
             })
             .await
             .unwrap();
-        engine
-            .maintain(ContextMaintenanceTrigger::AfterTool)
-            .await
-            .unwrap();
     }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
     let gc = engine.gc().await.unwrap();
+    assert!(
+        gc.externalized > 0,
+        "the parity script must cross the external-store boundary: {gc:?}"
+    );
     let transitions = engine.close_scope(scope_id).await.unwrap();
     let inspect = engine.inspect(100).await.unwrap();
     let search = engine
         .search_external(agent_contracts::ContextSearchQuery {
-            query: "AuthService".into(),
+            query: "RecallSentinel.rs".into(),
             kind: None,
             scope: None,
             task_id: None,
@@ -394,17 +432,28 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
         })
         .await
         .unwrap();
+    assert!(
+        !search.is_empty(),
+        "search_external must surface the externalized sentinel entry"
+    );
     // Pull one externalized entry by the id the search just returned, so
-    // inspect_external / fetch_external also cross the boundary.
-    let first_id = search.first().map(|entry| entry.item_id);
-    let inspect_external = match first_id {
-        Some(id) => engine.inspect_external(id).await.unwrap(),
-        None => None,
-    };
-    let fetch_external = match first_id {
-        Some(id) => engine.fetch_external(id).await.unwrap(),
-        None => None,
-    };
+    // inspect_external / fetch_external must cross the boundary. Requiring
+    // Some here prevents the trait's default no-op methods from producing a
+    // parity false positive.
+    let first_id = search[0].item_id;
+    let inspect_external = engine
+        .inspect_external(first_id)
+        .await
+        .unwrap()
+        .expect("inspect_external must return searched entry metadata");
+    assert_eq!(inspect_external.item_id, first_id);
+    let fetch_external = engine
+        .fetch_external(first_id)
+        .await
+        .unwrap()
+        .expect("fetch_external must return the searched entry content");
+    assert_eq!(fetch_external.id, first_id);
+    assert!(fetch_external.content.contains("RecallSentinel.rs"));
     let storage_gc = engine.storage_gc().await.unwrap();
     let diagnostics = engine.diagnostics().await.unwrap();
     // Checkpoint/restore round-trip as the last step: the restored engine
@@ -493,13 +542,23 @@ async fn full_contract_parity_across_the_process_boundary() {
     // for *every* contract method at once. A wire op dropped in the
     // service, or an adapter method left to its default no-op, diverges
     // here.
-    let service = connect().await;
-    let local: Arc<dyn ContextEngine> = Arc::new(context_simple::SimpleContextEngine::new(
-        context_simple::SimpleContextConfig::default(),
-    ));
+    let service_store = IsolatedStore::new("service-parity");
+    let service = ContextServiceAdapter::connect(&ContextServiceConfig {
+        engine: ServiceEngine::Dynamic,
+        store_dir: Some(service_store.path().to_path_buf()),
+        ..ContextServiceConfig::default()
+    })
+    .await
+    .expect("spawn isolated context service");
+    let local_store = IsolatedStore::new("local-parity");
+    let local = context_simple::SimpleContextEngine::new(context_simple::SimpleContextConfig {
+        context_store_dir: Some(local_store.path().to_path_buf()),
+        ..context_simple::SimpleContextConfig::default()
+    });
 
-    let service_snapshot = contract_snapshot(service.as_ref()).await;
-    let local_snapshot = contract_snapshot(local.as_ref()).await;
+    let service_snapshot = contract_snapshot(&service).await;
+    let local_snapshot = contract_snapshot(&local).await;
+    service.shutdown().await;
     assert_eq!(
         service_snapshot, local_snapshot,
         "every ContextEngine contract method must behave identically across the process boundary"

@@ -285,8 +285,9 @@ now have a replay-level proxy — key-fact coverage, `agent-replay
 --facts` (see the V1-M15 section): required facts stay in view and
 forbidden (stale) facts never leak in the dynamic engine, measured per
 turn in CI without a model. A live measurement against a real model
-provider remains the follow-up; the harness already produces the
-per-turn inputs it would need.
+provider (`agent-eval`, see the V1-M15 section) confirms the direction:
+on the first live workload the dynamic engine passes with 22% less
+input than append-only.
 
 ---
 
@@ -1249,9 +1250,34 @@ measurement.
 Acceptance: the dynamic runtime saves tokens without lowering task
 success rate — the token numbers above and the
 `dynamic_saves_tokens_without_losing_failure_facts` test (all
-agent-replay tests green, A/B/C replay baseline unchanged). Live
-completion-quality measurement against a real model remains a follow-up;
-the harness already emits the per-turn inputs such a measurement needs.
+agent-replay tests green, A/B/C replay baseline unchanged), plus the
+live measurement against a real model below.
+
+### Live measurement (real model, `agent-eval`)
+
+The follow-up is now runnable: `crates/agent-eval` is a headless
+composition of the real runtime (real OpenAI-compatible provider via
+`OPENAI_API_KEY`/`OPENAI_BASE_URL`/`OPENAI_MODEL`, real tools, one
+context engine) that drives a task end to end and measures **true
+provider usage** through the new `RuntimeEvent::ModelUsed` (emitted at
+turn commit with the round's reported input/output tokens).
+
+- The first live workload is a *constraint-retention* task — the live
+  endpoint used for the measurement (pinaic, model `gpt-5.6-luna`)
+  rejects requests that carry a `tools` array, so the task cannot use
+  tools; instead it is exactly the dynamic working set's acceptance
+  scenario: five constraints stated up front, eighteen turns of
+  unrelated noise, then a question only answerable from what the
+  context frame retained.
+- Measured (2026-08-10, 20 turns, real model): all three engines pass
+  (A/B/C each answer both facts correctly), and C costs **22% less
+  input tokens than A** (133,249 vs 170,240; B 169,778). The gap is
+  much smaller than the replay layer's 8–14× because the provider
+  reports a large per-round fixed cost, but the direction matches: the
+  dynamic working set keeps the required facts in view for less.
+
+`ModelUsed` is a contract addition (`RuntimeEvent`); the TUI shows a
+running token meter from it.
 
 ### Completion-quality proxy: key-fact coverage (`agent-replay --facts`)
 
@@ -1290,8 +1316,8 @@ Measured on the seven scenarios (budget 12 K):
 
 The proxy makes the roadmap's completion-quality metrics (completion
 quality, repeated-mistake rate, stale instruction leakage, incorrect
-eviction rate) replay-level and CI-runnable; the real-model live
-measurement stays the follow-up that needs a provider configuration.
+eviction rate) replay-level and CI-runnable, and the live measurement
+above confirms the direction against a real model.
 
 ## V2 Self-Iteration 🚧 (partially implemented)
 

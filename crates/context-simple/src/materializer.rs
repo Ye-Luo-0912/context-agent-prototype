@@ -386,7 +386,11 @@ const MAX_EXTERNAL_REFS: usize = CONTEXT_MAP_VIEW_CAP;
 /// the whole map; the bounded `ContextMapView` enforces the cap at the
 /// type level.
 fn external_view(state: &State, hot_entities: &[String]) -> ContextMapView {
-    let mut ranked: Vec<&agent_contracts::ExternalizedContext> = state.external.iter().collect();
+    let mut ranked: Vec<&agent_contracts::ExternalizedContext> = state
+        .external
+        .iter()
+        .filter(|entry| crate::store::externally_retrievable(entry))
+        .collect();
     let k = ranked.len().min(MAX_EXTERNAL_REFS);
     if k == 0 {
         return ContextMapView::default();

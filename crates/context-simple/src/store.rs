@@ -112,6 +112,9 @@ pub(crate) fn search_entries(
     let mut hits: Vec<&ExternalizedContext> = entries
         .iter()
         .filter(|entry| {
+            if !externally_retrievable(entry) {
+                return false;
+            }
             if let Some(kind) = query.kind
                 && entry.kind != kind
             {
@@ -156,6 +159,14 @@ pub(crate) fn search_entries(
     let limit = if query.limit == 0 { 16 } else { query.limit };
     hits.truncate(limit);
     hits.into_iter().cloned().collect()
+}
+
+/// Whether an external-map entry may be exposed through the model-facing
+/// retrieval surface. Semantic death is terminal regardless of physical
+/// residency: the store retains dead entries for audit/storage GC, but they
+/// must not be searchable, inspectable or fetchable back into model context.
+pub(crate) fn externally_retrievable(entry: &ExternalizedContext) -> bool {
+    entry.semantic.is_live()
 }
 
 /// Build the lightweight external-map entry for an item just written to the
@@ -435,7 +446,14 @@ pub(crate) fn age_external_entries(
         if entry.residency != ContextResidency::Cold {
             continue;
         }
-        let last = entry.last_access_gc_epoch.unwrap_or(gc_epoch);
+        let Some(last) = entry.last_access_gc_epoch else {
+            // A pre-epoch checkpoint has no generation anchor. Establish
+            // one on its first full GC so subsequent passes can age it
+            // normally; merely substituting `gc_epoch` here would leave
+            // the field `None` forever and make the entry immortal.
+            entry.last_access_gc_epoch = Some(gc_epoch);
+            continue;
+        };
         let idle = gc_epoch.saturating_sub(last);
         if idle >= config.gc_external_ttl_generations as u64 {
             entry.residency = ContextResidency::External;
@@ -654,6 +672,38 @@ mod tests {
             age_external_entries(&mut state, &config, 6),
             1,
             "4 generations passed: the entry ages to External"
+        );
+        assert_eq!(state.external[0].residency, ContextResidency::External);
+    }
+
+    #[test]
+    fn pre_epoch_cold_entry_gets_an_anchor_then_ages_normally() {
+        let config = store_config(tempfile::tempdir().unwrap().path());
+        let mut state = State::default();
+        let item = test_item(ContextItemId::new(), "pre-epoch aging candidate");
+        let reference = ContextRef {
+            uri: "context://run/pre-epoch".into(),
+            item_id: item.id,
+            kind: item.kind,
+            scope: item.scope,
+            summary: "pre-epoch aging".into(),
+            created_tick: 1,
+        };
+        let mut entry = to_external_entry(&item, reference, 100, 2);
+        entry.last_access_gc_epoch = None;
+        state.external.push(entry);
+
+        assert_eq!(age_external_entries(&mut state, &config, 5), 0);
+        assert_eq!(
+            state.external[0].last_access_gc_epoch,
+            Some(5),
+            "the first post-restore GC establishes the generation anchor"
+        );
+        assert_eq!(age_external_entries(&mut state, &config, 8), 0);
+        assert_eq!(
+            age_external_entries(&mut state, &config, 9),
+            1,
+            "the restored entry ages after four full generations"
         );
         assert_eq!(state.external[0].residency, ContextResidency::External);
     }

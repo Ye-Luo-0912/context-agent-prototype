@@ -4,8 +4,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentResult, ApprovalGate, ContextEngine, EventJournal, ModelTransport, OperationId, RunId,
-    ScopeId, TaskId, ToolCall, ToolDispatcher, ToolOutput, TurnId,
+    AgentResult, ApprovalGate, ContextEngine, EventJournal, ModelTransport, ModelUsage,
+    OperationId, RunId, ScopeId, TaskId, ToolCall, ToolDispatcher, ToolOutput, TurnId,
 };
 
 /// What a long-running operation produced. The actor compares the identity
@@ -17,6 +17,10 @@ pub enum OperationOutcome {
     ModelOutput {
         content: String,
         tool_calls: Vec<ToolCall>,
+        /// Provider-reported usage for this round, so the runtime can emit
+        /// `RuntimeEvent::ModelUsed` at commit time without re-parsing the
+        /// output.
+        usage: ModelUsage,
     },
     /// A tool execution produced its bounded output.
     ToolOutput(ToolOutput),

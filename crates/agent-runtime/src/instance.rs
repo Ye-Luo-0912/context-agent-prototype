@@ -56,15 +56,16 @@ impl RuntimeInstance {
         Ok(checkpoint)
     }
 
-    /// Restore the whole runtime from a checkpoint: the host re-applies the
-    /// capability surface first, then the actor restores the task table,
-    /// the current task and the context engine. Idle is required, exactly
-    /// like every other runtime mutation.
+    /// Restore the whole runtime from a checkpoint. The actor validates and
+    /// transactionally restores context + task authority first; only after
+    /// that succeeds are the infallible capability flags re-applied. A busy,
+    /// malformed or context-incompatible checkpoint therefore cannot
+    /// partially change the capability surface.
     pub async fn restore(&self, checkpoint: RuntimeCheckpoint) -> AgentResult<()> {
-        self.host
-            .capability_registry()
-            .restore(&checkpoint.capabilities);
-        self.handle.restore(checkpoint).await
+        let capabilities = checkpoint.capabilities.clone();
+        self.handle.restore(checkpoint).await?;
+        self.host.capability_registry().restore(&capabilities);
+        Ok(())
     }
 
     /// Full ordered shutdown. Every step runs even when an earlier one

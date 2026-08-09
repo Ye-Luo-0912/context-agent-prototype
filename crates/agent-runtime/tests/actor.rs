@@ -10,10 +10,11 @@ use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
     AgentResult, AttentionState, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemId,
     ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextQuery, ContextRetention, ContextScope, ContextStateTransition, MaterializedContext,
-    MaterializedItem, ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage, ModelOutput,
-    ModelRequest, ModelTransport, RuntimeEvent, ScopeId, ScopeKind, SemanticState, ToolDispatcher,
-    ToolExecutionRequest, ToolOutcome, ToolRisk, ToolSpec,
+    ContextQuery, ContextRetention, ContextScope, ContextStateTransition, EventJournal, FocusState,
+    MaterializedContext, MaterializedItem, ModelCapabilities, ModelChunk, ModelEventSink,
+    ModelMessage, ModelOutput, ModelRequest, ModelTransport, RuntimeEvent, RuntimeEventEnvelope,
+    ScopeId, ScopeKind, SemanticState, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolRisk,
+    ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
 use agent_runtime::{ModelBudget, RuntimeHandle, approx_layer_tokens, spawn_runtime};
@@ -528,6 +529,150 @@ async fn failed_focus_never_mutates_the_task_table() {
     assert!(
         handle.list_tasks().await.unwrap().is_empty(),
         "an implicit task exists only after its focus committed"
+    );
+}
+
+/// Simulates the important half-commit case: focus ingest mutates the
+/// engine, then the maintenance step fails. A transaction rollback must put
+/// the engine back before the runtime rejects the task transition.
+#[derive(Debug, Default)]
+struct MutatingThenFailingFocusEngine {
+    focus: Mutex<Option<FocusState>>,
+}
+
+#[async_trait::async_trait]
+impl ContextEngine for MutatingThenFailingFocusEngine {
+    async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+        match ingress {
+            ContextIngress::FocusChanged { focus } => {
+                *self.focus.lock().unwrap() = Some(focus);
+            }
+            ContextIngress::FocusCleared => *self.focus.lock().unwrap() = None,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn maintain(
+        &self,
+        trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        if trigger == ContextMaintenanceTrigger::FocusChanged {
+            return Err(agent_contracts::AgentError::Context(
+                "maintenance failed after focus mutation".into(),
+            ));
+        }
+        Ok(ContextMaintenanceReport::default())
+    }
+
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            focus: self.focus.lock().unwrap().clone(),
+            items: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
+            selected: Vec::new(),
+            approx_tokens: 0,
+            diagnostics: ContextDiagnostics::default(),
+        })
+    }
+
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        serde_json::to_value(self.focus.lock().unwrap().clone())
+            .map_err(|error| agent_contracts::AgentError::Context(error.to_string()))
+    }
+    async fn restore(&self, data: serde_json::Value) -> AgentResult<()> {
+        let focus = serde_json::from_value(data)
+            .map_err(|error| agent_contracts::AgentError::Context(error.to_string()))?;
+        *self.focus.lock().unwrap() = focus;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn maintenance_failure_rolls_back_context_before_rejecting_focus() {
+    let context = Arc::new(MutatingThenFailingFocusEngine::default());
+    let kernel = kernel_with(Arc::new(SilentModel), context.clone());
+    let (handle, _task) = spawn_runtime(kernel);
+    handle.start().await.unwrap();
+
+    let result = handle.set_focus("goal A".into()).await;
+    assert!(result.is_err());
+    assert!(handle.list_tasks().await.unwrap().is_empty());
+    let materialized = context
+        .materialize(ContextQuery {
+            current_input: String::new(),
+            budget_tokens: 0,
+            hints: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        materialized.focus.is_none(),
+        "the focus mutation must be rolled back with the rejected task transition"
+    );
+}
+
+#[derive(Debug)]
+struct FailFocusEventJournal;
+
+#[async_trait::async_trait]
+impl EventJournal for FailFocusEventJournal {
+    async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+        if matches!(envelope.event, RuntimeEvent::FocusChanged { .. }) {
+            return Err(agent_contracts::AgentError::Storage(
+                "simulated focus journal failure".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn journal_failure_after_focus_never_splits_task_and_context() {
+    let context = Arc::new(context_simple::SimpleContextEngine::new(
+        context_simple::SimpleContextConfig::default(),
+    ));
+    let kernel = Arc::new(AgentKernel::new(
+        AgentKernelConfig::default(),
+        context.clone(),
+        Arc::new(SilentModel),
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        Some(Arc::new(FailFocusEventJournal)),
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    handle.start().await.unwrap();
+
+    let result = handle.set_focus("goal A".into()).await;
+    assert!(result.is_err(), "the journal failure must stay observable");
+    let tasks = handle.list_tasks().await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].status, agent_runtime::TaskStatus::Active);
+    let focus = context
+        .materialize(ContextQuery {
+            current_input: String::new(),
+            budget_tokens: 0,
+            hints: Default::default(),
+        })
+        .await
+        .unwrap()
+        .focus;
+    assert_eq!(
+        focus.map(|focus| focus.task_id),
+        Some(tasks[0].id),
+        "journal failure may create an audit gap, but not split task authority from context"
     );
 }
 
