@@ -13,7 +13,7 @@ use std::{
 use agent_contracts::{
     AgentError, AgentResult, Capability, CapabilityInvocationContext, CapabilityLifecycle,
     CapabilityManifest, CapabilityOutcome, CapabilityStatus, CapabilityTransport,
-    ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
+    ContextDiagnostics, ContextEngine, ContextIngress, ContextItemId, ContextItemSummary,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
     Effect, EffectCommitError, MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink,
     ModelMessage, ModelOutput, ModelRequest, ModelRole, ModelTransport, OperationId, RuntimeEvent,
@@ -1486,4 +1486,155 @@ async fn failed_turn_commit_emits_turn_commit_failed_and_recovery_required() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Resource policy: the context meta-tools are bounded by quotas in the
+// engine, and a refused directive surfaces to the model as a warning — the
+// LLM cannot root the whole heap (or exhaust runtime resources) through
+// context.manage. Tools never touch the engine — the runtime routes the
+// directive and the engine's quota answers.
+// ---------------------------------------------------------------------------
+
+/// Emits `context.hint` on the first two rounds, then a plain reply.
+#[derive(Debug)]
+struct HintModel {
+    item_id: ContextItemId,
+    rounds: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for HintModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        if round < 2 {
+            Ok(ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: format!("hint-{round}"),
+                    name: "context.hint".into(),
+                    arguments: json!({"item_id": self.item_id.to_string(), "keep": true}),
+                }],
+                usage: Default::default(),
+            })
+        } else {
+            Ok(ModelOutput {
+                content: "done".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            })
+        }
+    }
+}
+
+/// Serves `context.hint`: emits a `GcHint` directive with the requested
+/// item id and keep flag, exactly like the real `context.manage gc_hint`.
+#[derive(Debug)]
+struct HintToolDispatcher;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for HintToolDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "context.hint".into(),
+            description: "keep an item alive across GC passes".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+        }]
+    }
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        let item_id: ContextItemId = request
+            .call
+            .arguments
+            .get("item_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .parse()
+            .map_err(|error| AgentError::InvalidRequest(format!("bad item id: {error}")))?;
+        let keep_alive = request
+            .call
+            .arguments
+            .get("keep")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        Ok(ToolOutcome::RuntimeDirective {
+            output: ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "hint queued".into(),
+                model_content: "hint queued".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            directive: agent_contracts::RuntimeDirective::Context(
+                agent_contracts::ContextAction::GcHint {
+                    item_id,
+                    keep_alive,
+                },
+            ),
+        })
+    }
+}
+
+#[tokio::test]
+async fn hint_quota_refuses_excess_meta_tool_requests() {
+    // A real reference engine with a keep-alive cap of one item: the model
+    // hints the same item twice, and the second hint must be refused by
+    // the quota — the meta-tool cannot root the whole heap.
+    let engine = Arc::new(context_simple::SimpleContextEngine::new(
+        context_simple::SimpleContextConfig {
+            max_keep_alive_items: 1,
+            ..context_simple::SimpleContextConfig::default()
+        },
+    ));
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "pin this".into(),
+        })
+        .await
+        .unwrap();
+    let summaries = engine.inspect(usize::MAX).await.unwrap();
+    let item_id = summaries[0].id;
+
+    let handle = spawn_with(
+        Arc::new(HintModel {
+            item_id,
+            rounds: AtomicUsize::new(0),
+        }),
+        engine.clone(),
+        Arc::new(HintToolDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("pin the item".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut refused = None;
+    let mut completed = false;
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::Warning { message } => {
+                    if message.contains("context directive refused") {
+                        refused = Some(message);
+                    }
+                }
+                RuntimeEvent::TurnCompleted => completed = true,
+                _ => {}
+            }
+        }
+        if completed && refused.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(completed, "the turn must complete");
+    let refused = refused.expect("the second hint must be refused by the quota");
+    assert!(
+        refused.contains("keep_alive") && refused.contains("cap 1"),
+        "the refusal must name the quota and its cap, got: {refused}"
+    );
+}
 // ---------------------------------------------------------------------------

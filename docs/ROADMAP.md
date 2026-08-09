@@ -1112,7 +1112,7 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 5. **V1-M14 Resource Policy** — tool schema budget (the per-round surface
    bound landed in Performance P1), context hint quota,
    RiskClass, PermissionSet. Acceptance: the LLM cannot exhaust runtime
-   resources through meta-tools.
+   resources through meta-tools. ✅ (implemented — see the section below)
 6. **V1-M15 Real Evaluation** — coding workload A/B/C + lifecycle metrics.
    Acceptance: the dynamic runtime saves tokens without lowering task
    success rate.
@@ -1164,6 +1164,41 @@ A process capability runs in a strict, static execution boundary
   limits), the same shape the context service uses. Dynamic per-grant
   FS/network brokering is deferred until measurement shows the static
   boundary is the bottleneck (see "Later, only after evidence").
+
+## V1-M14 Resource Policy ✅ (implemented)
+
+The model cannot exhaust runtime resources through meta-tools — every
+dimension the meta-tools can reach is bounded and the bounds are tested:
+
+- **Tool schema budget.** The per-round surface is capped by a
+  deterministic schema budget (`MAX_TOOL_SURFACE_TOKENS`): control and
+  core tools are never trimmed, optional tools are kept smallest-first
+  until the cap, and budget/prompt/tool-call validation all read the same
+  snapshot (landed with Performance P1, covered by `budget.rs` tests and
+  the actor's final budget guard test).
+- **Context hint quota.** `context.manage gc_hint` / `lease` are bounded
+  in the engine: a keep-alive item cap, a per-task leased-item cap and a
+  per-task leased-token cap. A refused directive leaves the item
+  unchanged and is surfaced to the model — the actor routes the
+  directive, the engine's quota answers (engine tests in
+  `context-simple`, plus the end-to-end
+  `hint_quota_refuses_excess_meta_tool_requests`: a real engine with a
+  cap of one keep-alive item refuses the model's second hint and the
+  refusal reaches the model as a warning naming the quota and the cap).
+- **RiskClass.** `ToolRisk` (ReadOnly / WorkspaceWrite / ProcessExecution)
+  is the risk classification every tool and capability declares; the
+  approval gate decides on it (read-only policy permits only `ReadOnly`).
+- **PermissionSet.** A capability's `manifest.permissions` is the granted
+  set; the runtime builds the invocation context so only declared
+  permissions receive a handle (a capability that did not declare
+  `workspace:*` gets no workspace handle at all), and the granted set is
+  delivered to out-of-process capabilities intact. Unknown permission
+  strings grant nothing — fail-safe by construction.
+- **Other bounds in the same policy family.** The model round count is
+  capped (`max_tool_rounds`), the materialized frame is budgeted per
+  request (engine prices the working set, the runtime's final guard
+  refuses an unshrinkable over-budget request), and the external view is
+  bounded by `ContextMapView` (cap 32).
 
 ## V1-M12 Effect Runtime ✅ (implemented)
 
