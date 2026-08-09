@@ -655,7 +655,13 @@ engine (invariant 3 — tools still never touch the engine). The prompt's
 explicitly points the model at the retrieval loop; `fetch` stamps recency
 and the GC generation on the entry so ranking and Cold -> External aging
 stay honest. A fetch is a deliberate read, not an automatic reactivation —
-the model decides what re-enters the working set.
+the model decides what re-enters the working set. The whole loop is
+covered end to end by `agent-runtime/tests/recall.rs`: the model calls
+`context.manage op=fetch` through a real runtime turn, the typed
+`EngineQuery` is resolved by the kernel against the real engine and store,
+and the exact content returns in the tool result — while the prompt's
+external section carries only the bounded ref preview (content truncated
+at externalization), never the full externalized content.
 
 The materialized `external` field is a bounded `ContextMapView`, not a
 clone of the whole map: at most 32 refs, quickselect-ranked in O(n)

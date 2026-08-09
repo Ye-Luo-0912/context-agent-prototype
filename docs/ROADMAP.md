@@ -1028,7 +1028,7 @@ stopped trusting declarations:
   membership alone (they come back via retention, affinity or dependency),
   matching the GC mark phase's closed-scope boundary.
 
-## V1-M10 start: durable turn commit, serialized capability lifecycle, process-boundary parity ✅ (implemented)
+## V1-M10 Runtime Consistency ✅ (implemented)
 
 Three consistency gaps closed before V2:
 
@@ -1064,6 +1064,11 @@ failure, checkpoint/restore alignment, stale-effect rollback, durability
 failure reporting, directive-before-next-round, child termination on
 cancel, store confinement, exact fetch recovery, full-contract parity,
 window-vs-reserve budget) are in place; see `docs/ARCHITECTURE.md` §9e/§9f.
+The milestone acceptance — the runtime and the context never drift into a
+task/state split-brain — is covered end to end by the runtime tests: the
+actor assigns the task id and the engine carries the same one
+(`runtime_task_id_matches_the_context_task_id`), and checkpoint/restore
+re-aligns both (`runtime_checkpoint_roundtrips_tasks_context_and_capabilities`).
 
 Performance P1 landed ahead of the milestones below: the external map
 owns its id/entity indexes (`ExternalMap`, O(1) inspect/fetch lookups,
@@ -1088,11 +1093,14 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 
 1. **V1-M10 Runtime Consistency** — task authority, transactional task
    transitions, RuntimeCheckpoint, Turn commit. Acceptance: the runtime and
-   the context never drift into a task/state split-brain.
+   the context never drift into a task/state split-brain. ✅ (implemented —
+   see the section above and the consistency invariant suite in
+   `agent-runtime/tests/instance.rs`)
 2. **V1-M11 Context Recall** — store injection, `ContextMapView` (the
    type-level bounded view landed in Performance P1),
    `context.search`/`fetch`, `gc_epoch`, async store. Acceptance: external
    information can be pulled back on demand without polluting the prompt.
+   ✅ (implemented — see the section below)
 3. **V1-M12 Effect Runtime** — every capability routes side effects through
    one unified EffectRequest/Effect commit. Acceptance: a cancelled
    operation produces no avoidable stale mutation.
@@ -1113,6 +1121,34 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 M12/M13 strictly precede Self-Iteration: a capability that can already
 stage effects and a sandbox that can contain it are prerequisites for
 letting the LLM grow capabilities autonomously.
+
+## V1-M11 Context Recall ✅ (implemented)
+
+Externalized information is pulled back on demand, and the prompt stays
+refs-only while it is external:
+
+- **Store injection is a composition-root choice.** `agent-tui` points the
+  reference engine at `workspace.state_dir()/context-store`; a run started
+  from a crate directory never scatters stores around the tree.
+- **`ContextMapView` bounds the materialized external view at the type
+  level** (cap 32, wire-validated; landed with Performance P1).
+- **One retrieval surface.** `context.manage op=search|inspect|fetch`
+  emits a typed `EngineQuery`; the actor routes it to the kernel, which
+  resolves it against the engine (invariant 3 — the tool never touches
+  the engine). `search` lists refs by entity/kind/scope/task, `inspect`
+  is metadata without a store read, `fetch` reads the exact item content
+  back from the store and stamps recency + GC generation on the entry —
+  a deliberate read, not an automatic reactivation.
+- **`gc_epoch`-based external TTLs** count real GC passes, and the store
+  IO phases are async and batched (Performance P0/P2), so retrieval and
+  eviction never stall the context hot path.
+- **End-to-end acceptance test** (`agent-runtime/tests/recall.rs`): the
+  full runtime loop through a real engine + real store — the model calls
+  `context.manage op=fetch` → `EngineQuery` → actor → kernel → engine store
+  read → the exact content returns in the tool result — while the
+  materialized prompt carries only the bounded ref preview, never the full
+  content. Acceptance: external information can be pulled back on demand
+  without polluting the prompt.
 
 ## P2: provider/tool secondary issues ✅ (implemented)
 
