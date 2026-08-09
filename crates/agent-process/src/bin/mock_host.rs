@@ -27,9 +27,10 @@ fn main() {
         std::process::exit(1);
     }
     // A single-threaded runtime: the mock is one ping-pong server, and the
-    // sandbox tests set a hard RLIMIT_NPROC on the child — a multi-thread
-    // runtime would try to spawn one worker per core and fail the limit on
-    // a busy CI machine (the rlimit counts the whole user's threads).
+    // strict sandbox can set a hard RLIMIT_NPROC on the child — a
+    // multi-thread runtime would try to spawn one worker per core and fail
+    // the limit on a busy machine (the rlimit counts the whole user's
+    // threads, and even the stdio blocking pool needs one).
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

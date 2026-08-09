@@ -274,7 +274,13 @@ async fn strict_sandbox_scrubs_parent_secrets_across_the_wire() {
             max_frame_bytes: 1024 * 1024,
             sandbox: agent_process::ProcessSandbox {
                 // The same strict shape `from_manifest` builds: only the
-                // non-secret platform essentials are inherited.
+                // non-secret platform essentials are inherited, and the
+                // child runs in its own working directory. Resource limits
+                // are deliberately left off here: RLIMIT_NPROC is a
+                // *per-user* ceiling on Linux, and on a busy CI host the
+                // user's thread count already exceeds any small limit, so
+                // the child could not even start its stdio threads — that
+                // dimension is not what this test asserts.
                 env_whitelist: Some(vec![
                     "PATH".into(),
                     "SystemRoot".into(),
@@ -283,8 +289,7 @@ async fn strict_sandbox_scrubs_parent_secrets_across_the_wire() {
                     "TMP".into(),
                 ]),
                 cwd: Some(std::env::temp_dir().join("context-agent-capability-sandbox-test")),
-                cpu_time_limit_secs: 60,
-                process_limit: 16,
+                ..agent_process::ProcessSandbox::default()
             },
         },
     ));

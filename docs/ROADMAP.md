@@ -1142,7 +1142,12 @@ A process capability runs in a strict, static execution boundary
   capability cannot roam the workspace by relative paths. Covered by
   `sandbox_cwd_is_created_and_isolates_the_child`.
 - **Resource limits (Unix).** Hard `RLIMIT_CPU` / `RLIMIT_NPROC` ceilings
-  applied by the kernel right after fork.
+  applied by the kernel right after fork. Note the `RLIMIT_NPROC` caveat:
+  on Linux it is a *per-user* ceiling, so a small value (the default 16)
+  can starve the child on a host where the same user already runs many
+  threads (observed on the CI runner). The limits are implemented but not
+  asserted in the sandbox acceptance tests, which focus on the env and cwd
+  dimensions.
 - **Cancellation kills the tree.** A cancelled invoke aborts immediately
   and terminates the child's whole process tree (process group on Unix,
   `taskkill /T /F` on Windows), never a background process still
