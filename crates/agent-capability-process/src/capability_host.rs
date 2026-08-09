@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use agent_contracts::{
     AgentError, AgentResult, Capability, CapabilityInvocationContext, CapabilityManifest,
-    CapabilityOutcome, CapabilityTransport, ToolCall, ToolOutput,
+    CapabilityOutcome, CapabilityTransport, ToolCall, ToolOutput, ToolRisk, WORKSPACE_WRITE,
+    validate_capability_id,
 };
 use agent_process::{ProcessHost, ProcessHostConfig, ProcessSandbox};
 use async_trait::async_trait;
@@ -35,6 +36,22 @@ pub struct ProcessCapabilityAdapter {
 impl ProcessCapabilityAdapter {
     /// Build the adapter from a manifest declaring `CapabilityTransport::Process`.
     pub fn from_manifest(manifest: CapabilityManifest) -> AgentResult<Self> {
+        validate_capability_id(&manifest.id).map_err(AgentError::InvalidRequest)?;
+        // Risk is derived from declared authority, never self-declared: a
+        // process that can write the workspace must not auto-allow through
+        // a ReadOnly tool at the approval gate (the registry enforces the
+        // same rule; the adapter must not trust a manifest the registry
+        // never saw, e.g. `with_config` in tests).
+        if manifest.permissions.iter().any(|p| p == WORKSPACE_WRITE) {
+            for spec in &manifest.tools {
+                if spec.risk == ToolRisk::ReadOnly {
+                    return Err(AgentError::InvalidRequest(format!(
+                        "capability '{}' declares '{WORKSPACE_WRITE}' but tool '{}' self-declares ReadOnly; risk is derived from declared authority, never self-declared",
+                        manifest.id, spec.name
+                    )));
+                }
+            }
+        }
         let program = match &manifest.transport {
             CapabilityTransport::Process { program } => program.clone(),
             other => {
@@ -62,15 +79,18 @@ impl ProcessCapabilityAdapter {
                     "TEMP".into(),
                     "TMP".into(),
                 ]),
-                // A dedicated working directory per capability, created at
-                // connect — never the parent's cwd, so a generated
-                // capability cannot roam the workspace by relative paths.
-                cwd: Some(
-                    std::env::temp_dir().join(format!("context-agent-capability-{}", manifest.id)),
-                ),
+                // A private working directory per capability — the id is
+                // validated to a conservative grammar *and* suffixed with
+                // an unpredictable nonce, so two runs (or two capabilities
+                // reusing an id) never share a predictable temp path and a
+                // hostile pre-created directory cannot be a symlink trap.
+                cwd: Some(private_capability_dir(&manifest.id)),
                 // Hard ceilings enforced by the kernel on Unix.
                 cpu_time_limit_secs: 60,
                 process_limit: 16,
+                // The child's stderr is piped and drained into a bounded
+                // tail, never inherited unbounded into the parent console.
+                stderr_capture_bytes: 64 * 1024,
             },
         };
         Ok(Self::with_config(manifest, config))
@@ -154,4 +174,36 @@ impl Capability for ProcessCapabilityAdapter {
 /// registry (which expects `Arc<dyn Capability>`).
 pub fn load_process_capability(manifest: CapabilityManifest) -> AgentResult<Arc<dyn Capability>> {
     Ok(Arc::new(ProcessCapabilityAdapter::from_manifest(manifest)?))
+}
+
+/// A private, unpredictable working directory for one capability: the
+/// validated id plus a random nonce, so no two runs share a path and a
+/// hostile pre-created directory cannot predict it. The parent is the OS
+/// temp dir (never the workspace, never the launch cwd).
+fn private_capability_dir(id: &str) -> std::path::PathBuf {
+    let nonce = agent_contracts::ContextItemId::new();
+    std::env::temp_dir().join(format!("context-agent-capability-{id}-{nonce}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_capability_dirs_are_unpredictable_and_path_safe() {
+        let a = private_capability_dir("process-demo");
+        let b = private_capability_dir("process-demo");
+        assert_ne!(a, b, "two builds must never share a predictable path");
+        assert_eq!(a.parent(), Some(std::env::temp_dir().as_path()));
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("context-agent-capability-process-demo-"),
+            "unexpected name: {name}"
+        );
+        // The id is validated before it ever reaches this function, but the
+        // nonce suffix alone keeps even a hostile pre-created directory
+        // from being predicted.
+        let without_id = name.trim_start_matches("context-agent-capability-");
+        assert!(without_id.len() > "process-demo-".len());
+    }
 }

@@ -10,7 +10,10 @@
 //! lives here once.
 
 use std::io::ErrorKind;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use agent_contracts::{AgentError, AgentResult};
@@ -45,6 +48,12 @@ pub struct ProcessSandbox {
     /// Hard process-count limit via `RLIMIT_NPROC` (Unix only; ignored
     /// elsewhere). `0` = unlimited.
     pub process_limit: u64,
+    /// How many bytes of the child's stderr to capture into a bounded tail
+    /// (surfaced on connection errors and diagnostics). `0` inherits the
+    /// parent's stderr instead — the context-service default. A sandboxed
+    /// capability pipes and drains stderr so a chatty child can never grow
+    /// the parent's memory or flood the console without bound.
+    pub stderr_capture_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +88,11 @@ pub struct ProcessHost {
     /// kill the process *tree* (process group / taskkill) without touching
     /// the io lock.
     pid: AtomicU32,
+    /// The bounded tail of the child's stderr, fed by a drainer task when
+    /// `ProcessSandbox::stderr_capture_bytes > 0`; `None` when stderr is
+    /// inherited. The tail is surfaced on errors so a failing child says
+    /// *why* without ever buffering unbounded stderr in the parent.
+    stderr_tail: Arc<Mutex<std::collections::VecDeque<u8>>>,
 }
 
 struct HostIo {
@@ -100,7 +114,11 @@ impl ProcessHost {
             .args(&config.args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
+            .stderr(if config.sandbox.stderr_capture_bytes > 0 {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::inherit()
+            })
             .kill_on_drop(true);
 
         // Sandbox: an explicit env whitelist drops every unlisted parent
@@ -175,6 +193,33 @@ impl ProcessHost {
             .take()
             .ok_or_else(|| AgentError::Context("child stdout unavailable".into()))?;
 
+        let stderr_tail = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        // Bounded stderr: when the sandbox asks for capture, a dedicated
+        // drainer task reads the pipe into a ring that keeps only the last
+        // `stderr_capture_bytes`. The child can stream forever without the
+        // parent buffering it all — the tail is the only memory it ever
+        // occupies, and it is surfaced on connection errors.
+        if let Some(stderr) = child.stderr.take() {
+            let cap = config.sandbox.stderr_capture_bytes;
+            let tail = Arc::clone(&stderr_tail);
+            tokio::spawn(async move {
+                let mut reader = stderr;
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let mut ring = tail.lock().await;
+                            ring.extend(&buf[..n]);
+                            while ring.len() > cap {
+                                ring.pop_front();
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         let host = Self {
             child: Mutex::new(child),
             config,
@@ -185,6 +230,7 @@ impl ProcessHost {
             }),
             next_id: AtomicU64::new(1),
             pid: AtomicU32::new(pid),
+            stderr_tail,
         };
         timeout(
             host.config.startup_timeout,
@@ -375,6 +421,15 @@ impl ProcessHost {
         }
     }
 
+    /// The bounded tail of the child's stderr (empty when stderr is
+    /// inherited or the child wrote nothing). Surfaced on connection
+    /// errors so a failing child says *why* without the parent ever
+    /// buffering unbounded stderr.
+    pub async fn stderr_tail(&self) -> String {
+        let mut ring = self.stderr_tail.lock().await;
+        String::from_utf8_lossy(ring.make_contiguous()).into_owned()
+    }
+
     /// Mark the connection poisoned and kill the child's process tree.
     /// `try_lock` so this can be called from a timeout/cancel path without
     /// deadlocking on a guard that the cancelled future still holds.
@@ -482,5 +537,58 @@ mod tests {
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
         std::fs::write(&exe, "test").unwrap();
         assert_eq!(probe_siblings(&exe, "agent-context-service"), None);
+    }
+
+    /// A chatty child must not grow the parent's memory or flood the
+    /// console: with `stderr_capture_bytes` set, the host pipes stderr and
+    /// drains it into a bounded tail that keeps the newest bytes only.
+    #[tokio::test]
+    async fn stderr_is_drained_into_a_bounded_tail() {
+        let program = resolve_program(Some("CARGO_BIN_EXE_mock_host"), "mock_host");
+        let host = ProcessHost::connect(ProcessHostConfig {
+            program: program.clone(),
+            args: vec!["--serve".into()],
+            env: vec![
+                ("MOCK_MARKER".into(), "1".into()),
+                // The mock writes 4 MiB of junk plus a tail marker to
+                // stderr at startup.
+                (
+                    "MOCK_STDERR_FLOOD_BYTES".into(),
+                    (4 * 1024 * 1024).to_string(),
+                ),
+            ],
+            startup_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+            max_frame_bytes: 1024 * 1024,
+            sandbox: ProcessSandbox {
+                env_whitelist: Some(vec![
+                    "PATH".into(),
+                    "SystemRoot".into(),
+                    "SystemDrive".into(),
+                    "TEMP".into(),
+                    "TMP".into(),
+                ]),
+                // The bounded tail: 8 KiB, far below the 4 MiB flood.
+                stderr_capture_bytes: 8 * 1024,
+                ..ProcessSandbox::default()
+            },
+        })
+        .await
+        .expect("spawn mock host");
+
+        // Give the drainer time to consume the flood.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let tail = host.stderr_tail().await;
+        assert!(
+            tail.len() <= 8 * 1024,
+            "the stderr tail must be bounded: {} bytes",
+            tail.len()
+        );
+        assert!(
+            tail.trim_end().ends_with("STDERR_TAIL_MARKER"),
+            "the tail keeps the newest bytes, got: {:?}",
+            tail.chars().rev().take(40).collect::<String>()
+        );
+        host.shutdown().await;
     }
 }

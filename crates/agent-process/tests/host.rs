@@ -91,6 +91,7 @@ async fn sandbox_drops_unlisted_secrets_and_forces_the_dedicated_cwd() {
             cwd: Some(std::env::temp_dir().join(format!("sandbox-cwd-{}", std::process::id()))),
             cpu_time_limit_secs: 0,
             process_limit: 0,
+            ..ProcessSandbox::default()
         };
     })
     .await;
@@ -114,6 +115,7 @@ async fn sandbox_drops_unlisted_secrets_and_forces_the_dedicated_cwd() {
             cwd: None,
             cpu_time_limit_secs: 0,
             process_limit: 0,
+            ..ProcessSandbox::default()
         };
         config
             .env

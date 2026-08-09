@@ -384,6 +384,44 @@ async fn from_manifest_rejects_non_process_transports() {
     );
 }
 
+#[test]
+fn from_manifest_rejects_ids_that_could_escape_a_path() {
+    // The id is embedded in the capability's private working directory and
+    // protocol routes; anything outside the conservative grammar is a
+    // path/route injection risk and must be refused at the adapter too
+    // (the registry enforces the same rule).
+    for bad in ["../escape", "a/b", "a\\b", "Uppercase", "a b", "-leading"] {
+        let mut manifest = manifest_with_program("irrelevant");
+        manifest.id = bad.into();
+        let error = match ProcessCapabilityAdapter::from_manifest(manifest) {
+            Ok(_) => panic!("id {bad:?} must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("capability id"),
+            "id {bad:?}: the refusal must name the id rule, got: {error}"
+        );
+    }
+}
+
+#[test]
+fn from_manifest_rejects_readonly_tools_on_write_capabilities() {
+    // A process that can write the workspace must not auto-allow through a
+    // ReadOnly tool at the approval gate — risk is derived from declared
+    // authority, never self-declared. The adapter refuses the combination
+    // even if the manifest never reached the registry.
+    let mut manifest = manifest_with_program("irrelevant");
+    manifest.permissions = vec![agent_contracts::WORKSPACE_WRITE.into()];
+    let error = match ProcessCapabilityAdapter::from_manifest(manifest) {
+        Ok(_) => panic!("a write-permissioned process must not self-declare ReadOnly"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("ReadOnly"),
+        "the refusal must name the self-declared risk: {error}"
+    );
+}
+
 #[tokio::test]
 async fn invoke_before_start_fails_with_a_clear_error() {
     let program = common::locate_mock_host().expect("mock_host built");

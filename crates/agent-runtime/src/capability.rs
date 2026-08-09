@@ -19,9 +19,10 @@ use agent_contracts::{
     AgentError, AgentResult, ArtifactHandle, CAPABILITY_MANAGE, CAPABILITY_SEARCH_DEFAULT_LIMIT,
     CAPABILITY_SEARCH_MAX_LIMIT, Capability, CapabilityActivation, CapabilityInvocationContext,
     CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
-    CapabilityTransport, Effect, RUNTIME_CONTEXT_CONTROL, ToolCatalogEntry, ToolDispatcher,
-    ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolSpec, ToolSurfaceSnapshot,
-    WorkspaceHandle,
+    CapabilityTransport, Effect, PROCESS_RUN, RUNTIME_CONTEXT_CONTROL, ToolCatalogEntry,
+    ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolRisk,
+    ToolSpec, ToolSurfaceSnapshot, WORKSPACE_READ, WORKSPACE_WRITE, WorkspaceHandle,
+    is_known_permission, validate_capability_id,
 };
 use agent_workspace::{ArtifactStoreHandle, ConfinedWorkspaceHandle, Workspace};
 use async_trait::async_trait;
@@ -152,6 +153,78 @@ fn validate_tool_specs(manifest_id: &str, specs: &[ToolSpec]) -> AgentResult<()>
     Ok(())
 }
 
+/// Validate the authority a manifest declares against what the runtime will
+/// actually enforce. The approval gate auto-allows `ReadOnly` tools, so the
+/// risk label must be *derived* from the declared authority, never
+/// self-declared by a side-effecting capability:
+///
+/// - every declared permission must be a known permission string (unknown
+///   access is denied by refusing the declaration);
+/// - a capability that declares any side-effecting permission may not mark
+///   any tool `ReadOnly` (a process that can write must not auto-allow);
+/// - a tool's risk may not exceed its grant (a `WorkspaceWrite` tool needs
+///   `workspace:write`, a `ProcessExecution` tool needs `process:run`);
+/// - a process-transport capability cannot stage in-process Rust effects,
+///   so `workspace:write` is refused until the effect broker exists — a
+///   process mutation would otherwise be an unbrokered side effect.
+fn validate_manifest_authority(
+    manifest: &CapabilityManifest,
+    tool_specs: &[ToolSpec],
+) -> AgentResult<()> {
+    for permission in &manifest.permissions {
+        if !is_known_permission(permission) {
+            return Err(AgentError::InvalidRequest(format!(
+                "capability '{}' declares unknown permission '{permission}'; allowed: workspace:read, workspace:write, process:run, runtime:context-control, artifact:*",
+                manifest.id
+            )));
+        }
+    }
+    let declares_approval_gated_mutation = manifest
+        .permissions
+        .iter()
+        .any(|p| p == WORKSPACE_WRITE || p == PROCESS_RUN);
+    if declares_approval_gated_mutation {
+        for spec in tool_specs {
+            if spec.risk == ToolRisk::ReadOnly {
+                return Err(AgentError::InvalidRequest(format!(
+                    "capability '{}' declares workspace-write/process-run authority but tool '{}' self-declares ReadOnly; risk is derived from declared authority, never self-declared (ReadOnly auto-allows at the approval gate)",
+                    manifest.id, spec.name
+                )));
+            }
+        }
+    }
+    for spec in tool_specs {
+        match spec.risk {
+            ToolRisk::WorkspaceWrite => {
+                if !manifest.permissions.iter().any(|p| p == WORKSPACE_WRITE) {
+                    return Err(AgentError::InvalidRequest(format!(
+                        "capability '{}' tool '{}' needs the '{WORKSPACE_WRITE}' permission, which is not declared",
+                        manifest.id, spec.name
+                    )));
+                }
+            }
+            ToolRisk::ProcessExecution => {
+                if !manifest.permissions.iter().any(|p| p == PROCESS_RUN) {
+                    return Err(AgentError::InvalidRequest(format!(
+                        "capability '{}' tool '{}' needs the '{PROCESS_RUN}' permission, which is not declared",
+                        manifest.id, spec.name
+                    )));
+                }
+            }
+            ToolRisk::ReadOnly => {}
+        }
+    }
+    if matches!(manifest.transport, CapabilityTransport::Process { .. })
+        && manifest.permissions.iter().any(|p| p == WORKSPACE_WRITE)
+    {
+        return Err(AgentError::InvalidRequest(format!(
+            "capability '{}' is a process capability and declares '{WORKSPACE_WRITE}': process mutations are not brokered yet — declare read-only access, or stage effects through the wire protocol when the effect broker lands",
+            manifest.id
+        )));
+    }
+    Ok(())
+}
+
 /// One row of the platform's capability catalog (the discovery surface).
 #[derive(Debug, Clone)]
 pub struct CapabilityCatalogEntry {
@@ -228,7 +301,11 @@ impl CapabilityRegistry {
         // time — never under the registry's lock.
         let manifest = capability.manifest().clone();
         let tool_specs = capability.tool_specs();
+        // The id is identity: it is validated before anything derived from
+        // it (tool names, routes, directories).
+        validate_capability_id(&manifest.id).map_err(AgentError::InvalidRequest)?;
         validate_tool_specs(&manifest.id, &tool_specs)?;
+        validate_manifest_authority(&manifest, &tool_specs)?;
         let tool_names: Vec<&str> = tool_specs.iter().map(|spec| spec.name.as_str()).collect();
 
         let mut inner = self.inner.write().expect("capability registry poisoned");
@@ -811,10 +888,6 @@ pub struct CapabilityAwareDispatcher {
     /// gets a `CapabilityInvocationContext` whose confined handles are
     /// built from it.
     workspace: Option<Arc<Workspace>>,
-    /// The base catalog's always-loaded core tools, captured once at
-    /// construction (a fresh base dispatcher reports exactly its core set
-    /// as `Loaded`). The round-surface bound never trims these.
-    core_tools: HashSet<String>,
 }
 
 impl CapabilityAwareDispatcher {
@@ -837,20 +910,10 @@ impl CapabilityAwareDispatcher {
             base.catalog().into_iter().map(|entry| entry.name).collect();
         reserved.push(CAPABILITY_MANAGE.to_string());
         capabilities.reserve_names(reserved);
-        // The always-loaded core set, captured while the base catalog is
-        // still in its pristine construction state (only `always_loaded`
-        // tools report `Loaded`).
-        let core_tools: HashSet<String> = base
-            .catalog()
-            .into_iter()
-            .filter(|entry| entry.state == ToolLifecycle::Loaded)
-            .map(|entry| entry.name)
-            .collect();
         Self {
             base,
             capabilities,
             workspace,
-            core_tools,
         }
     }
 
@@ -908,7 +971,18 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
         // `MAX_TOOL_SURFACE_TOKENS`. Budget, prompt and tool-call
         // validation all read this one snapshot, so the model sees — and
         // the runtime prices and validates — exactly the bounded surface.
-        let specs = crate::budget::bounded_tool_surface(self.specs(), &self.core_tools);
+        let specs = self.specs();
+        // Use the same pure classification as the actor's final guard. A
+        // dispatcher whose default is fail-closed therefore protects every
+        // schema it cannot classify, even when that mandatory set itself is
+        // above the cap; the actor can then fail explicitly instead of
+        // silently losing a required tool.
+        let protected: HashSet<String> = specs
+            .iter()
+            .filter(|spec| !self.may_omit_from_round(&spec.name))
+            .map(|spec| spec.name.clone())
+            .collect();
+        let specs = crate::budget::bounded_tool_surface(specs, &protected);
         ToolSurfaceSnapshot {
             specs,
             // The unified surface generation: the base catalog's generation
@@ -922,6 +996,20 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
                 .snapshot()
                 .generation
                 .wrapping_add(self.capabilities.generation()),
+        }
+    }
+
+    fn may_omit_from_round(&self, name: &str) -> bool {
+        // A capability tool is optional at this pre-TaskAnchor stage. Base
+        // tools delegate to their own catalog because only the concrete
+        // provider knows which entries are configured as core. Runtime
+        // controls remain fail-closed in either path.
+        if matches!(name, CAPABILITY_MANAGE | agent_contracts::CONTEXT_MANAGE) {
+            false
+        } else if self.capabilities.owner_of(name).is_some() {
+            true
+        } else {
+            self.base.may_omit_from_round(name)
         }
     }
 
@@ -1023,6 +1111,35 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
     }
 }
 
+/// A staged-only view over a confined workspace handle, handed to a
+/// capability that declared `workspace:write`. The direct `write` path is
+/// refused: a capability must stage a mutation as an `EffectRequest` via
+/// `prepare_write`, and the runtime commits it behind the generation fence —
+/// the capability computes, the core executes. A mutation applied during
+/// `invoke` would bypass actor generation, cancellation and effect rollback.
+struct StagedOnlyWorkspace(Arc<dyn WorkspaceHandle>);
+
+#[async_trait]
+impl WorkspaceHandle for StagedOnlyWorkspace {
+    fn root(&self) -> &Path {
+        self.0.root()
+    }
+    async fn resolve(&self, relative: &str) -> AgentResult<PathBuf> {
+        self.0.resolve(relative).await
+    }
+    async fn read(&self, relative: &str) -> AgentResult<Vec<u8>> {
+        self.0.read(relative).await
+    }
+    async fn write(&self, _relative: &str, _content: &[u8]) -> AgentResult<()> {
+        Err(AgentError::InvalidRequest(
+            "capability writes must be staged: call prepare_write and return a CapabilityOutcome::EffectRequest; direct write bypasses the effect fence".into(),
+        ))
+    }
+    async fn prepare_write(&self, relative: &str, content: &[u8]) -> AgentResult<Box<dyn Effect>> {
+        self.0.prepare_write(relative, content).await
+    }
+}
+
 /// A read-only view over a confined workspace handle, handed to a
 /// capability that declared `workspace:read` but not `workspace:write`.
 /// The write path is blocked by construction, not by trust.
@@ -1069,14 +1186,15 @@ impl CapabilityAwareDispatcher {
         let permissions = manifest.permissions.clone();
         let declares = |permission: &str| permissions.iter().any(|p| p == permission);
 
-        let workspace = if declares("workspace:read") || declares("workspace:write") {
+        let workspace = if declares(WORKSPACE_READ) || declares(WORKSPACE_WRITE) {
             self.workspace.as_ref().map(|workspace| {
                 let handle: Arc<dyn WorkspaceHandle> =
                     Arc::new(ConfinedWorkspaceHandle::new(workspace, &request.call.name));
-                if declares("workspace:write") {
-                    handle
+                if declares(WORKSPACE_WRITE) {
+                    // Writes are staged, never applied during invoke.
+                    Arc::new(StagedOnlyWorkspace(handle)) as Arc<dyn WorkspaceHandle>
                 } else {
-                    Arc::new(ReadOnlyWorkspace(handle))
+                    Arc::new(ReadOnlyWorkspace(handle)) as Arc<dyn WorkspaceHandle>
                 }
             })
         } else {

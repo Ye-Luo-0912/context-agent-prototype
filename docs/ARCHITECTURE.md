@@ -842,6 +842,11 @@ explicit `ProcessSandbox` (shared `ProcessHost`, since the crate split in
   group the child was spawned into (`process_group(0)`); Windows:
   `taskkill /PID <pid> /T /F`. A cancelled capability stops producing
   side effects *now*, not at the request deadline.
+- **Bounded stderr** — `stderr_capture_bytes`: when set (the capability
+  profile uses 64 KiB), the child's stderr is piped and drained by a task
+  into a bounded ring kept on the host; `ProcessHost::stderr_tail()`
+  surfaces the newest bytes for diagnostics. A chatty child can no longer
+  inherit unbounded output into the parent console.
 - **Brokered host APIs** — the child only ever speaks the bounded
   JSON-lines ops (`ping`/`invoke`); every host side effect goes through
   the same framed, deadline-bounded, poisoned-connection protocol as the
@@ -850,11 +855,17 @@ explicit `ProcessSandbox` (shared `ProcessHost`, since the crate split in
 `ProcessCapabilityAdapter::from_manifest` applies this strict profile to
 every process capability; `invoke` forwards the call and the granted
 permissions (informational), but the sandbox — not the manifest — is what
-enforces the boundary. Filesystem isolation beyond the dedicated cwd and
-an explicit network policy are still open (a future dedicated capability
-sandbox); until then **V2 autonomous capability generation stays gated** —
-a generated capability only runs after explicit `enable`, and only inside
-the sandbox above.
+enforces the boundary. Since the trust-boundary hardening, the manifest
+itself is no longer trusted either: the id must pass a conservative
+grammar (`validate_capability_id`, lowercase/digit start, `[a-z0-9._-]`,
+<= 64) before it is embedded in the working directory or any route, and
+the working directory is private and unpredictable
+(`context-agent-capability-<id>-<uuid>`) so no two runs share a path and
+a hostile pre-created directory cannot be predicted. Filesystem isolation
+beyond the dedicated cwd and an explicit network policy are still open (a
+future dedicated capability sandbox); until then **V2 autonomous
+capability generation stays gated** — a generated capability only runs
+after explicit `enable`, and only inside the sandbox above.
 
 The same "declarations are not enforcement" rule holds on the in-process
 side (V1-M14 PermissionSet): `CapabilityAwareDispatcher::invocation_context`
@@ -862,10 +873,21 @@ builds handles only from the declared `manifest.permissions` — a
 capability that never declared a workspace permission receives no
 workspace handle at all, a `workspace:read`-only capability gets a
 `ReadOnlyWorkspace` whose write/staged-write paths are refused with an
-error naming the missing grant, and unknown permission strings grant
-nothing. Both enforcement points are under test:
-`undeclared_permissions_receive_no_handle` (agent-runtime) proves the
-grant-by-construction behavior end to end, and
+error naming the missing grant, and unknown permission strings are now
+refused at registration (`is_known_permission`), so undeclared access is
+denied by construction before any handle could exist. A `workspace:write`
+capability gets a `StagedOnlyWorkspace`: the direct `write` path is
+refused ("must be staged") and only `prepare_write` works, returning an
+`Effect` the core commits behind the generation fence — a capability
+mutation can no longer land during `invoke` (the CORE-01 bypass). Risk is
+derived, never self-declared: a capability declaring workspace-write or
+process-run authority may not mark any tool `ReadOnly` (ReadOnly
+auto-allows at the approval gate), a tool's risk may not exceed its grant,
+and a process-transport capability declaring `workspace:write` is refused
+until the wire-level effect broker exists. Both enforcement points are
+under test: `undeclared_permissions_receive_no_handle` and
+`capability_authority_is_derived_and_validated_at_registration`
+(agent-runtime) prove the grant-by-construction behavior end to end, and
 `sandboxed_self_check_artifacts_stay_contained` (agent-process) proves
 the V2 loop's test step — a generated capability's self-check — runs
 inside the sandbox and its artifacts cannot escape the dedicated cwd.

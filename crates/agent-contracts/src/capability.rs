@@ -16,7 +16,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentResult, CancellationToken, Effect, RuntimeDirective, ToolCall, ToolOutput, ToolSpec,
+    AgentResult, CancellationToken, Effect, RUNTIME_CONTEXT_CONTROL, RuntimeDirective, ToolCall,
+    ToolOutput, ToolSpec,
 };
 
 /// When a capability's service is started.
@@ -126,6 +127,69 @@ pub enum CapabilityTransport {
     Process { program: String },
     // Future: Wasm — sandboxed in-process plugins. Deliberately not part of
     // the first version.
+}
+
+/// `workspace:read` — a confined read-only view of the workspace root.
+pub const WORKSPACE_READ: &str = "workspace:read";
+/// `workspace:write` — journaled writes inside the workspace root. The
+/// runtime hands a capability the *staged* write path only: the capability
+/// computes, the core commits behind the generation fence.
+pub const WORKSPACE_WRITE: &str = "workspace:write";
+/// `process:run` — the capability may spawn subprocesses (declared for
+/// process transport, where the child already is one).
+pub const PROCESS_RUN: &str = "process:run";
+/// `artifact:write` prefix — the capability may store outputs under the
+/// run's artifact directory.
+pub const ARTIFACT_WRITE: &str = "artifact:write";
+
+/// A permission a capability may declare. Unknown permission strings are
+/// rejected at registration — the runtime denies undeclared access by
+/// refusing the declaration in the first place.
+pub fn is_known_permission(permission: &str) -> bool {
+    permission == WORKSPACE_READ
+        || permission == WORKSPACE_WRITE
+        || permission == PROCESS_RUN
+        || permission == RUNTIME_CONTEXT_CONTROL
+        || permission.starts_with(ARTIFACT_WRITE)
+}
+
+/// Whether a permission implies side effects (something the approval gate
+/// must see and the effect fence must stage). `workspace:read` is the only
+/// read-only permission; everything else is a mutation or an execution.
+pub fn permission_is_side_effecting(permission: &str) -> bool {
+    permission != WORKSPACE_READ
+}
+
+/// Conservative grammar for a capability id: lowercase ASCII letters,
+/// digits, `.`, `_` or `-`, first character a lowercase letter or digit,
+/// at most 64 chars. The id is embedded in directory names and protocol
+/// routes, so anything outside this set is a path/route injection risk and
+/// is rejected — a capability id is identity, not free text.
+pub fn validate_capability_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("capability id is empty".into());
+    }
+    if id.len() > 64 {
+        return Err(format!(
+            "capability id '{}' is {} chars (allowed 1..=64)",
+            id,
+            id.len()
+        ));
+    }
+    let mut chars = id.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return Err(format!(
+            "capability id '{id}' must start with a lowercase letter or digit"
+        ));
+    }
+    if !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(format!(
+            "capability id '{id}' may only contain lowercase [a-z0-9._-]"
+        ));
+    }
+    Ok(())
 }
 
 /// The declarative part of a dynamic capability: stable identity, a human
@@ -301,5 +365,61 @@ pub trait Capability: Send + Sync {
 
     async fn stop(&self) -> AgentResult<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_id_grammar_is_conservative() {
+        // Acceptable: lowercase start, path-safe chars, bounded length.
+        for id in [
+            "a",
+            "process-demo",
+            "cap.1_x",
+            "a1",
+            "x".repeat(64).as_str(),
+        ] {
+            assert!(validate_capability_id(id).is_ok(), "should accept {id:?}");
+        }
+        // Rejected: anything that could escape a path or a route.
+        for id in [
+            "",
+            "Uppercase",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "a b",
+            "a:b",
+            "a;rm",
+            "a$b",
+            "-leading",
+            ".leading",
+            "x".repeat(65).as_str(),
+        ] {
+            assert!(
+                validate_capability_id(id).is_err(),
+                "should reject {id:?} — a capability id is identity, not free text"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_classification_matches_the_boundary() {
+        assert!(is_known_permission(WORKSPACE_READ));
+        assert!(is_known_permission(WORKSPACE_WRITE));
+        assert!(is_known_permission(PROCESS_RUN));
+        assert!(is_known_permission(RUNTIME_CONTEXT_CONTROL));
+        assert!(is_known_permission("artifact:write"));
+        assert!(!is_known_permission("fs:everything"));
+        assert!(!is_known_permission("network:anywhere"));
+
+        assert!(!permission_is_side_effecting(WORKSPACE_READ));
+        assert!(permission_is_side_effecting(WORKSPACE_WRITE));
+        assert!(permission_is_side_effecting(PROCESS_RUN));
+        assert!(permission_is_side_effecting(RUNTIME_CONTEXT_CONTROL));
+        assert!(permission_is_side_effecting("artifact:write"));
     }
 }

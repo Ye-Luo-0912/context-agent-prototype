@@ -40,6 +40,25 @@ fn main() {
 /// liveness signal from outside the process, so a cancellation test can
 /// prove the child tree was actually terminated (the counter stops).
 async fn server_loop() {
+    // Bounded-stderr test hook: when the parent injects
+    // `MOCK_STDERR_FLOOD_BYTES`, the mock writes that many bytes to stderr
+    // at startup (plus a tail marker) — the host must drain it into a
+    // bounded tail instead of buffering it all or inheriting it.
+    if let Ok(flood) = std::env::var("MOCK_STDERR_FLOOD_BYTES")
+        && let Ok(bytes) = flood.parse::<usize>()
+    {
+        use std::io::Write;
+        let mut sink = std::io::stderr().lock();
+        let chunk = "x".repeat(1024);
+        let mut written = 0usize;
+        while written < bytes {
+            let take = chunk.len().min(bytes - written);
+            let _ = sink.write_all(&chunk.as_bytes()[..take]);
+            written += take;
+        }
+        let _ = writeln!(sink, "STDERR_TAIL_MARKER");
+    }
+
     if let Ok(path) = std::env::var("MOCK_HEARTBEAT") {
         let path = std::path::PathBuf::from(path);
         // A dedicated thread, decoupled from the tokio runtime: the

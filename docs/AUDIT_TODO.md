@@ -453,6 +453,64 @@ Required order:
 7. adversarial tests proving a cancelled/ReadOnly process cannot mutate an
    absolute path, use undeclared network or outlive its operation.
 
+**Closed 2026-08-10 (runtime-owned boundary; OS-level FS/network brokering
+stays M13 — external process capabilities remain Disabled by default).**
+
+Implemented:
+
+1. **Manifest-id grammar + private directories** — `validate_capability_id`
+   (`agent-contracts`): lowercase/digit start, `[a-z0-9._-]`, <= 64 chars,
+   enforced at registration before anything derived from the id, and again
+   in the adapter's `from_manifest`. The capability working directory is
+   `temp_dir()/context-agent-capability-<id>-<uuid>` — unpredictable, so
+   two runs never share a path and a hostile pre-created directory cannot
+   be predicted or symlink-trapped.
+2. **Risk/permissions derived, never self-declared** —
+   `validate_manifest_authority` at registration (and mirrored in the
+   adapter): unknown permission strings are refused (`is_known_permission`:
+   `workspace:read | workspace:write | process:run | runtime:context-control
+   | artifact:*`); a capability declaring workspace-write/process-run may
+   not mark any tool `ReadOnly` (ReadOnly auto-allows at the approval
+   gate); a `WorkspaceWrite` tool needs `workspace:write`, a
+   `ProcessExecution` tool needs `process:run`; and a process-transport
+   capability declaring `workspace:write` is refused — process mutations
+   are not brokered yet.
+3. **No direct capability mutation** — the runtime hands a
+   `workspace:write` capability a `StagedOnlyWorkspace` handle whose
+   `write` is refused ("must be staged") and whose `prepare_write` returns
+   an `Effect` committed by the core behind the generation fence
+   (`CapabilityOutcome::EffectRequest`), exactly like a builtin tool. A
+   mutation can no longer land during `invoke`.
+4. **Undeclared access denied by construction** — the invocation context is
+   built from declared permissions alone (no declared workspace permission
+   -> no handle; `workspace:read` -> `ReadOnlyWorkspace` with both write
+   paths blocked), and now the registry refuses unknown permission strings
+   up front.
+5. **Process-tree cancellation** — already enforced (Unix process group +
+   SIGKILL, Windows `taskkill /T /F`) and verified by the existing
+   heartbeat test; cancellation kills the whole tree, not just the child.
+6. **Bounded stderr** — `ProcessSandbox::stderr_capture_bytes`: when set
+   (the capability sandbox uses 64 KiB), the child's stderr is piped and
+   drained by a task into a bounded ring; the tail is exposed via
+   `ProcessHost::stderr_tail()` for diagnostics. A chatty child can no
+   longer inherit unbounded output into the parent console.
+7. **Adversarial tests** — `capability_authority_is_derived_and_validated_
+   at_registration` (path-unsafe id, self-declared ReadOnly,
+   over-granted tool risk, process `workspace:write`, read-only process
+   allowed), `undeclared_permissions_receive_no_handle` updated (direct
+   write refused, staged write commits, unknown permission refused at
+   registration), `from_manifest_rejects_ids_that_could_escape_a_path`,
+   `from_manifest_rejects_readonly_tools_on_write_capabilities`,
+   `private_capability_dirs_are_unpredictable_and_path_safe`, and
+   `stderr_is_drained_into_a_bounded_tail` (a 4 MiB stderr flood leaves an
+   8 KiB tail ending in the newest bytes).
+
+Residual (M12/M13, not closed here): OS-level filesystem/network isolation
+for the child process (absolute paths and network remain available to a
+hostile child at the OS layer), Windows Job-Object quota enforcement, and
+the wire-level effect broker that lets a child stage mutations as
+structured `EffectRequest`s instead of mutating inside the process.
+
 ### CORE-02 — Event-journal enqueue is not a durable turn commit
 
 `FileEventJournal::append` acknowledges channel enqueue. Background open/
@@ -614,14 +672,25 @@ produces no privilege expansion and no five-minute-per-call stall.
 
 ### CORE-09 — Tool schema budget mutates lifecycle and can forget required capability
 
-The model-round snapshot is correctly bounded, but the final input guard in
-`RuntimeActor` responds to fixed-layer pressure by calling `tool_unload` on
-the largest schemas. That permanently changes catalog lifecycle state because
-one provider round had a small input budget. No TaskAnchor/Focus root or
-Required-vs-Preferred semantics prevents a task-critical editor/test tool
-from being unloaded. Dynamic capabilities also use one owner-level
-`loaded: bool`, so loading one tool exposes every sibling schema and they do
-not receive builtin idle cooling.
+Status: **[~] P0 lifecycle-mutation defect fixed; TaskAnchor-driven surface
+semantics remain open.**
+
+The final input guard now performs pure round-local schema omission against a
+caller-owned snapshot. It no longer calls `tool_unload`, budget omission does
+not bump catalog generation, the snapshot is published to turn state only
+after final packing succeeds, and a later larger-budget round can surface the
+same still-loaded tool without another load. Both the dispatcher's initial
+4096-token cap and the actor's provider-window guard use the same fail-closed
+`may_omit_from_round` classification; unknown/unclassified tools are
+mandatory. Regression tests cover non-mutation, budget recovery,
+deterministic largest-optional omission, and an oversized fail-closed schema.
+
+This is deliberately only the P0 stopgap. No TaskAnchor/Focus root or
+MustSurface-vs-PreferSurface policy yet prevents a task-critical editor/test
+tool from being omitted for one round. Dynamic capabilities also use one
+owner-level `loaded: bool`, so loading one tool exposes every sibling schema
+and they do not receive builtin idle cooling. Omission reasons and a unique
+round-surface revision are not yet emitted as bounded runtime diagnostics.
 
 Required direction:
 
@@ -638,6 +707,9 @@ Required direction:
   owner-level; loading one tool must not expose all siblings;
 - replace generation arithmetic with one monotonic surface revision covering
   catalog, Anchor, Focus, and execution-policy revisions;
+- publish a bounded round-surface event/ledger entry with selected/omitted
+  names, reasons, schema-token totals, provider input budget and source
+  revisions; emit `ModelStarted` only after final packing succeeds;
 - checkpoint authority/Anchor requirements and durable leases, not a derived
   per-round surface or `Active` state.
 

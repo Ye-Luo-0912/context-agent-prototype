@@ -105,6 +105,28 @@ impl ToolDispatcher for StubTools {
     }
 }
 
+/// A base dispatcher that deliberately relies on the ToolDispatcher
+/// fail-closed default: its large schema is mandatory because it does not
+/// opt into round-local omission.
+#[derive(Debug)]
+struct RequiredLargeTools;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for RequiredLargeTools {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "required.large".into(),
+            description: "x".repeat(20_000),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+        }]
+    }
+
+    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        Err(agent_contracts::AgentError::Tool("stub".into()))
+    }
+}
+
 #[derive(Debug)]
 struct StubApproval;
 
@@ -330,6 +352,15 @@ impl DemoCapability {
         capability.tool_names = tool_names.iter().map(|name| name.to_string()).collect();
         capability
     }
+
+    /// A capability with an explicit declared authority (permissions + tool
+    /// schemas), for the registration-validation tests.
+    fn with_authority(id: &str, permissions: &[&str], tools: Vec<ToolSpec>) -> Self {
+        let mut capability = Self::new(id, CapabilityLifecycle::Lazy, Arc::new(Mutex::new(false)));
+        capability.manifest.permissions = permissions.iter().map(|p| p.to_string()).collect();
+        capability.manifest.tools = tools;
+        capability
+    }
 }
 
 #[async_trait::async_trait]
@@ -410,11 +441,25 @@ impl Capability for ContextCapturingCapability {
         &self.manifest
     }
     fn tool_specs(&self) -> Vec<ToolSpec> {
+        // The risk is *derived* from the declared authority, exactly like
+        // the runtime's own validation: a capability that can write the
+        // workspace must never surface a ReadOnly tool (ReadOnly
+        // auto-allows at the approval gate).
+        let risk = if self
+            .manifest
+            .permissions
+            .iter()
+            .any(|p| p == "workspace:write" || p == "process:run")
+        {
+            ToolRisk::WorkspaceWrite
+        } else {
+            ToolRisk::ReadOnly
+        };
         vec![ToolSpec {
             name: format!("{}.run", self.manifest.id),
             description: "recording tool".into(),
             input_schema: json!({"type": "object"}),
-            risk: ToolRisk::ReadOnly,
+            risk,
         }]
     }
     async fn start(&self) -> AgentResult<()> {
@@ -582,6 +627,94 @@ async fn capability_dependencies_are_validated() {
         .register_capability(Arc::new(second))
         .expect_err("duplicate capability ids must be rejected");
     assert!(error.to_string().contains("already registered"), "{error}");
+}
+
+#[tokio::test]
+async fn capability_authority_is_derived_and_validated_at_registration() {
+    let host = ModuleHost::new();
+
+    // An id outside the conservative grammar is a path/route injection
+    // risk and is refused before anything else.
+    let bad_id = DemoCapability::with_authority("../escape", &["workspace:read"], Vec::new());
+    let error = host
+        .register_capability(Arc::new(bad_id))
+        .expect_err("a path-unsafe id must be rejected");
+    assert!(
+        error.to_string().contains("capability id"),
+        "the refusal must name the id rule: {error}"
+    );
+
+    // Self-declared ReadOnly on a workspace-write capability: ReadOnly
+    // auto-allows at the approval gate, so a mutating capability must
+    // never self-declare it — the risk is derived from the authority.
+    let write_tool = DemoCapability::with_authority("write-tool", &["workspace:write"], Vec::new());
+    let error = host
+        .register_capability(Arc::new(write_tool))
+        .expect_err("a write-permissioned capability must not self-declare ReadOnly");
+    assert!(
+        error.to_string().contains("ReadOnly"),
+        "the refusal must name the self-declared risk: {error}"
+    );
+
+    // A tool whose risk exceeds its grant is refused: WorkspaceWrite
+    // without the permission, ProcessExecution without the permission.
+    let over_granted = DemoCapability::with_authority(
+        "over-granted",
+        &["workspace:read"],
+        vec![ToolSpec {
+            name: "over-granted.run".into(),
+            description: "writes".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::WorkspaceWrite,
+        }],
+    );
+    let error = host
+        .register_capability(Arc::new(over_granted))
+        .expect_err("a tool risk may not exceed the declared grant");
+    assert!(
+        error.to_string().contains("workspace:write"),
+        "the refusal must name the missing grant: {error}"
+    );
+
+    // A process capability cannot stage in-process Rust effects, so
+    // workspace:write is refused until the effect broker exists.
+    let process_write = DemoCapability::with_authority(
+        "proc-write",
+        &["workspace:write"],
+        vec![ToolSpec {
+            name: "proc-write.run".into(),
+            description: "writes".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::WorkspaceWrite,
+        }],
+    );
+    let process_write = {
+        let mut capability = process_write;
+        capability.manifest.transport = CapabilityTransport::Process {
+            program: "x".into(),
+        };
+        capability
+    };
+    let error = host
+        .register_capability(Arc::new(process_write))
+        .expect_err("process mutation is not brokered yet");
+    assert!(
+        error.to_string().contains("not brokered"),
+        "the refusal must name the missing broker: {error}"
+    );
+
+    // A read-only process capability is fine: read authority, ReadOnly
+    // tool, no broker needed.
+    let process_read = DemoCapability::with_authority("proc-read", &["workspace:read"], Vec::new());
+    let process_read = {
+        let mut capability = process_read;
+        capability.manifest.transport = CapabilityTransport::Process {
+            program: "x".into(),
+        };
+        capability
+    };
+    host.register_capability(Arc::new(process_read))
+        .expect("a read-only process capability is allowed");
 }
 
 #[tokio::test]
@@ -1156,6 +1289,28 @@ async fn snapshot_generation_tracks_dynamic_capability_changes() {
     );
 }
 
+#[test]
+fn snapshot_never_silently_trims_a_fail_closed_required_schema() {
+    let dispatcher = CapabilityAwareDispatcher::new(
+        Arc::new(RequiredLargeTools),
+        Arc::new(agent_runtime::CapabilityRegistry::new()),
+    );
+
+    let snapshot = dispatcher.snapshot();
+    assert!(
+        snapshot
+            .specs
+            .iter()
+            .any(|spec| spec.name == "required.large"),
+        "the initial schema cap must preserve fail-closed schemas"
+    );
+    assert!(
+        agent_runtime::approx_layer_tokens(&snapshot.specs)
+            > agent_runtime::budget::MAX_TOOL_SURFACE_TOKENS,
+        "an oversized mandatory set remains visible so the actor can fail explicitly"
+    );
+}
+
 #[tokio::test]
 async fn unified_search_pages_and_spills_to_the_workspace() {
     let dir = tempfile::tempdir().unwrap();
@@ -1421,7 +1576,8 @@ async fn undeclared_permissions_receive_no_handle() {
     let registry = host.capability_registry();
 
     // Four capabilities with different declared grants, plus one declaring
-    // an unknown permission string (which must grant nothing).
+    // an unknown permission string — which the registry now refuses up
+    // front: unknown access is denied by refusing the declaration.
     let no_ws = Arc::new(ContextCapturingCapability::with_permissions(
         "no-ws",
         &[agent_contracts::RUNTIME_CONTEXT_CONTROL],
@@ -1437,12 +1593,21 @@ async fn undeclared_permissions_receive_no_handle() {
         &["workspace:write"],
     ));
     let write_ws_captured = write_ws.captured.clone();
-    let unknown = Arc::new(ContextCapturingCapability::with_permissions(
-        "unknown-perm",
-        &["totally-made-up:perm"],
-    ));
-    let unknown_captured = unknown.captured.clone();
-    for capability in [no_ws, read_only, write_ws, unknown] {
+    let unknown =
+        ContextCapturingCapability::with_permissions("unknown-perm", &["totally-made-up:perm"]);
+    let registration = host.register_capability(Arc::new(unknown));
+    assert!(
+        registration.is_err(),
+        "an unknown permission string must be refused at registration"
+    );
+    assert!(
+        registration
+            .unwrap_err()
+            .to_string()
+            .contains("unknown permission"),
+        "the refusal must name the unknown permission"
+    );
+    for capability in [no_ws, read_only, write_ws] {
         host.register_capability(capability).unwrap();
     }
 
@@ -1458,7 +1623,7 @@ async fn undeclared_permissions_receive_no_handle() {
     // Builtin capabilities are Enabled on registration, so the full model
     // path works: load each tool, call it, inspect what it received.
     let tools = host.registry().tool_provider().unwrap();
-    for id in ["no-ws", "read-only", "write-ws", "unknown-perm"] {
+    for id in ["no-ws", "read-only", "write-ws"] {
         registry.load_tool(&format!("{id}.run")).unwrap();
         let output = execute(tools.clone(), &format!("{id}.run")).await;
         assert!(output.ok, "{id}: the recording call must succeed");
@@ -1476,18 +1641,33 @@ async fn undeclared_permissions_receive_no_handle() {
     );
     assert!(ctx.artifacts.is_none(), "no artifact permission declared");
 
-    // 2. Write declared -> the same write path succeeds: the grant, not a
-    //    blanket block, is what opens it. This lands the file the
-    //    read-only capability will read back below.
+    // 2. Write declared -> a staged-only handle: the direct write path is
+    //    refused (a mutation applied during invoke would bypass the
+    //    generation fence, cancellation and effect rollback), and the
+    //    mutation must be prepared as an Effect and committed by the core.
+    //    This lands the file the read-only capability will read back below.
     let ctx = write_ws_captured.lock().unwrap().take().unwrap();
     assert_eq!(ctx.granted_permissions, ["workspace:write"]);
     let handle = ctx
         .workspace
         .expect("workspace:write must receive a handle");
-    handle
-        .write("granted.txt", b"granted content")
+    let error = handle
+        .write("granted.txt", b"x")
         .await
-        .unwrap();
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("must be staged"),
+        "the direct write must be refused and name the staged path: {error}"
+    );
+    let effect = handle
+        .prepare_write("granted.txt", b"granted content")
+        .await
+        .expect("prepare_write must stage the mutation");
+    effect
+        .commit()
+        .await
+        .expect("the staged effect commits like a builtin tool's");
     assert_eq!(
         handle.read("granted.txt").await.unwrap(),
         b"granted content"
@@ -1517,17 +1697,9 @@ async fn undeclared_permissions_receive_no_handle() {
         "the staged-write refusal must name the grant: {error}"
     );
 
-    // 4. An unknown permission string grants nothing.
-    let ctx = unknown_captured.lock().unwrap().take().unwrap();
-    assert_eq!(ctx.granted_permissions, ["totally-made-up:perm"]);
-    assert!(
-        ctx.workspace.is_none(),
-        "an unknown permission must grant no handle"
-    );
-    assert!(
-        ctx.artifacts.is_none(),
-        "an unknown permission grants nothing"
-    );
+    // 4. An unknown permission string is refused at registration (asserted
+    //    above) — unknown access is denied by refusing the declaration,
+    //    before any handle could ever be granted.
 
     host.stop().await.unwrap();
 }
