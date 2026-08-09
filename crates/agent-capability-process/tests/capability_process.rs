@@ -248,6 +248,124 @@ async fn cancellation_terminates_the_child_process() {
 }
 
 #[tokio::test]
+async fn strict_sandbox_scrubs_parent_secrets_across_the_wire() {
+    // The adapter's production sandbox (the `from_manifest` shape) drops
+    // every unlisted parent variable and runs the child in a dedicated
+    // cwd. A parent "secret" must be invisible inside the child, and an
+    // `echo_env` invoke must come back empty — the sandbox is enforced,
+    // not just declared.
+    //
+    // SAFETY: this test binary is its own process and mutates the
+    // environment exactly once, before the child spawns.
+    unsafe {
+        std::env::set_var("SANDBOX_SECRET", "parent-secret-value");
+    }
+    let program = common::locate_mock_host().expect("mock_host built");
+    let capability: Arc<dyn Capability> = Arc::new(ProcessCapabilityAdapter::with_config(
+        manifest_with_program(&program.to_string_lossy()),
+        ProcessHostConfig {
+            program: program.to_string_lossy().into_owned(),
+            args: vec!["--serve".into()],
+            // MOCK_MARKER is the explicit grant that lets the mock serve;
+            // SANDBOX_SECRET must NOT be granted here.
+            env: vec![("MOCK_MARKER".into(), "1".into())],
+            startup_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+            max_frame_bytes: 1024 * 1024,
+            sandbox: agent_process::ProcessSandbox {
+                // The same strict shape `from_manifest` builds: only the
+                // non-secret platform essentials are inherited.
+                env_whitelist: Some(vec![
+                    "PATH".into(),
+                    "SystemRoot".into(),
+                    "SystemDrive".into(),
+                    "TEMP".into(),
+                    "TMP".into(),
+                ]),
+                cwd: Some(std::env::temp_dir().join("context-agent-capability-sandbox-test")),
+                cpu_time_limit_secs: 60,
+                process_limit: 16,
+            },
+        },
+    ));
+    capability.start().await.unwrap();
+    let output = capability
+        .invoke(
+            ToolCall {
+                id: "c4".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({"echo_env": "SANDBOX_SECRET"}),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec!["workspace:read".into()],
+                workspace: None,
+                artifacts: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let output = match output {
+        CapabilityOutcome::Value(output) => output,
+        other => panic!("the wire only carries plain values, got: {other:?}"),
+    };
+    assert!(
+        output.model_content.is_empty(),
+        "the strict sandbox must scrub unlisted parent env, got: {:?}",
+        output.model_content
+    );
+    capability.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn granted_permissions_reach_the_child_intact() {
+    // The runtime hands the capability the manifest's granted permissions
+    // per invocation; they must arrive at the subprocess unchanged — the
+    // child can only know what it may do if the grant actually crossed.
+    let program = common::locate_mock_host().expect("mock_host built");
+    let capability: Arc<dyn Capability> = Arc::new(ProcessCapabilityAdapter::with_config(
+        manifest_with_program(&program.to_string_lossy()),
+        ProcessHostConfig {
+            program: program.to_string_lossy().into_owned(),
+            args: vec!["--serve".into()],
+            env: vec![("MOCK_MARKER".into(), "1".into())],
+            startup_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+            max_frame_bytes: 1024 * 1024,
+            sandbox: Default::default(),
+        },
+    ));
+    capability.start().await.unwrap();
+    let granted = vec!["workspace:read".to_string(), "process:run".to_string()];
+    let output = capability
+        .invoke(
+            ToolCall {
+                id: "c5".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({"echo_permissions": true}),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: granted.clone(),
+                workspace: None,
+                artifacts: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let output = match output {
+        CapabilityOutcome::Value(output) => output,
+        other => panic!("the wire only carries plain values, got: {other:?}"),
+    };
+    assert_eq!(
+        output.model_content,
+        serde_json::to_string(&granted).unwrap(),
+        "the granted permission set must cross the boundary intact"
+    );
+    capability.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn from_manifest_rejects_non_process_transports() {
     let mut manifest = manifest_with_program("irrelevant");
     manifest.transport = CapabilityTransport::Builtin;

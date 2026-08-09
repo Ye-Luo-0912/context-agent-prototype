@@ -94,12 +94,38 @@ async fn server_loop() {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     continue;
                 }
+                // `echo_env: "<name>"` replaces the canned content with that
+                // environment variable's value — the sandbox scrub test's
+                // window into the child's environment across the wire.
+                let echo_env = request
+                    .get("call")
+                    .and_then(|call| call.get("arguments"))
+                    .and_then(|args| args.get("echo_env"))
+                    .and_then(Value::as_str);
+                // `echo_permissions: true` surfaces the permissions the
+                // parent granted this invocation — the wire proof that the
+                // granted set reaches the experimental code intact.
+                let echo_permissions = request
+                    .get("call")
+                    .and_then(|call| call.get("arguments"))
+                    .and_then(|args| args.get("echo_permissions"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let permissions = request
+                    .get("permissions")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new()));
+                let model_content = match echo_env {
+                    Some(name) => std::env::var(name).unwrap_or_default(),
+                    None if echo_permissions => permissions.to_string(),
+                    None => "process capability handled the call".into(),
+                };
                 let output = serde_json::to_value(ToolOutput {
                     call_id: "c1".into(),
                     tool_name: "process-demo.invoke".into(),
                     ok: true,
                     summary: "process ran".into(),
-                    model_content: "process capability handled the call".into(),
+                    model_content,
                     artifact_ref: None,
                     metadata: json!({}),
                 })

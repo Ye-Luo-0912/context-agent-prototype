@@ -1107,7 +1107,8 @@ operation; see `docs/ARCHITECTURE.md` §9h and
    section below)
 4. **V1-M13 Extension Sandbox** — process sandbox, env scrub, brokered
    FS/network, cancel. Acceptance: experimental code cannot exceed the
-   permissions granted to it.
+   permissions granted to it. ✅ (implemented — env scrub, sandboxed cwd,
+   resource limits and cancellation; see the section below)
 5. **V1-M14 Resource Policy** — tool schema budget (the per-round surface
    bound landed in Performance P1), context hint quota,
    RiskClass, PermissionSet. Acceptance: the LLM cannot exhaust runtime
@@ -1122,6 +1123,42 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 M12/M13 strictly precede Self-Iteration: a capability that can already
 stage effects and a sandbox that can contain it are prerequisites for
 letting the LLM grow capabilities autonomously.
+
+## V1-M13 Extension Sandbox ✅ (implemented)
+
+A process capability runs in a strict, static execution boundary
+(`ProcessSandbox` in `agent-process`, built by
+`ProcessCapabilityAdapter::from_manifest`):
+
+- **Env scrub.** The child inherits *only* an explicit whitelist of
+  non-secret platform essentials (PATH/SystemRoot/SystemDrive/TEMP/TMP);
+  every other parent variable — API keys, HOME, credentials — is dropped.
+  Explicit `env` grants land after the whitelist. Covered end to end:
+  `agent-process/tests/sandbox.rs` (unlisted secret scrubbed, whitelisted
+  variable inherited, explicit grant delivered) and the capability-level
+  `strict_sandbox_scrubs_parent_secrets_across_the_wire`.
+- **Sandboxed cwd.** The child runs in its own dedicated working
+  directory, created at connect, never the parent's cwd — a generated
+  capability cannot roam the workspace by relative paths. Covered by
+  `sandbox_cwd_is_created_and_isolates_the_child`.
+- **Resource limits (Unix).** Hard `RLIMIT_CPU` / `RLIMIT_NPROC` ceilings
+  applied by the kernel right after fork.
+- **Cancellation kills the tree.** A cancelled invoke aborts immediately
+  and terminates the child's whole process tree (process group on Unix,
+  `taskkill /T /F` on Windows), never a background process still
+  producing side effects. Covered by the existing cancellation tests.
+- **Permissions cross the boundary.** The granted permission set is
+  delivered to the child with each invocation (`granted_permissions`
+  arrives intact — `granted_permissions_reach_the_child_intact`), so
+  experimental code only ever acts on what was granted; the static
+  sandbox is the enforcement layer for the environment and resource
+  dimensions.
+- **Scope boundary.** A per-invocation *brokered* FS/network proxy
+  (filtering the child's file/network access by the granted set) is not
+  part of this milestone — the sandbox is a static boundary (env, cwd,
+  limits), the same shape the context service uses. Dynamic per-grant
+  FS/network brokering is deferred until measurement shows the static
+  boundary is the bottleneck (see "Later, only after evidence").
 
 ## V1-M12 Effect Runtime ✅ (implemented)
 
