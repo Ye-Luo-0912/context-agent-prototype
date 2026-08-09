@@ -11,14 +11,17 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentResult, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
+    AgentError, AgentResult, Capability, CapabilityInvocationContext, CapabilityLifecycle,
+    CapabilityManifest, CapabilityOutcome, CapabilityStatus, CapabilityTransport,
+    ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
-    MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage, ModelOutput,
-    ModelRequest, ModelRole, ModelTransport, OperationId, RuntimeEvent, ScopeId, ScopeKind, TaskId,
-    ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput, ToolSpec,
+    Effect, EffectCommitError, MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink,
+    ModelMessage, ModelOutput, ModelRequest, ModelRole, ModelTransport, OperationId, RuntimeEvent,
+    ScopeId, ScopeKind, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome,
+    ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
-use agent_runtime::{RuntimeHandle, spawn_runtime};
+use agent_runtime::{CapabilityAwareDispatcher, CapabilityRegistry, RuntimeHandle, spawn_runtime};
 use serde_json::json;
 use tokio::sync::Mutex;
 
@@ -1002,6 +1005,363 @@ async fn stale_tool_rolls_back_its_prepared_effect() {
         committed.load(Ordering::SeqCst),
         0,
         "stale effect must never commit"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Capability effects: a capability stages side effects through the same
+// unified `EffectRequest` channel as a builtin tool's `PreparedEffect`, and
+// the actor commits or rolls them back behind the same generation fence —
+// the capability computes, the core executes.
+// ---------------------------------------------------------------------------
+
+/// A capability whose one tool stages a `FlagEffect` instead of returning a
+/// plain value. `release` lets a test hold the invocation open.
+struct StagingCapability {
+    manifest: CapabilityManifest,
+    committed: Arc<AtomicUsize>,
+    rolled_back: Arc<AtomicUsize>,
+    release: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl StagingCapability {
+    fn new(committed: Arc<AtomicUsize>, rolled_back: Arc<AtomicUsize>) -> Self {
+        Self {
+            manifest: CapabilityManifest {
+                id: "staging".into(),
+                version: "1.0.0".into(),
+                name: "staging capability".into(),
+                summary: "stages an effect".into(),
+                status: CapabilityStatus::Experimental,
+                provides: vec![agent_contracts::CapabilityKind::Tool],
+                permissions: Vec::new(),
+                requires: Vec::new(),
+                tools: vec![ToolSpec {
+                    name: "cap.stage".into(),
+                    description: "stages an effect".into(),
+                    input_schema: json!({"type": "object"}),
+                    risk: ToolRisk::ReadOnly,
+                }],
+                lifecycle: CapabilityLifecycle::Lazy,
+                transport: CapabilityTransport::Builtin,
+            },
+            committed,
+            rolled_back,
+            release: None,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Capability for StagingCapability {
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+
+    async fn invoke(
+        &self,
+        call: ToolCall,
+        _ctx: CapabilityInvocationContext,
+    ) -> AgentResult<CapabilityOutcome> {
+        if let Some(release) = &self.release {
+            release.notified().await;
+        }
+        Ok(CapabilityOutcome::EffectRequest {
+            output: ToolOutput {
+                call_id: call.id,
+                tool_name: call.name,
+                ok: true,
+                summary: "staged by capability".into(),
+                model_content: "staged by capability".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            effect: Box::new(FlagEffect {
+                committed: self.committed.clone(),
+                rolled_back: self.rolled_back.clone(),
+            }),
+        })
+    }
+}
+
+/// Calls the capability tool once, then replies plain.
+#[derive(Debug, Default)]
+struct CapabilityToolModel {
+    rounds: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for CapabilityToolModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        if round == 0 {
+            Ok(ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "cap-1".into(),
+                    name: "cap.stage".into(),
+                    arguments: json!({}),
+                }],
+                usage: Default::default(),
+            })
+        } else {
+            Ok(ModelOutput {
+                content: "done".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            })
+        }
+    }
+}
+
+/// Wire a `StagingCapability` into the actor through the capability-aware
+/// dispatcher — the composition a real host performs.
+async fn spawn_with_staging_capability(capability: StagingCapability) -> RuntimeHandle {
+    let registry = Arc::new(CapabilityRegistry::new());
+    registry
+        .register(Arc::new(capability))
+        .expect("capability registers");
+    // Loaded tools are the model surface; without a load the actor's
+    // round-surface validation would refuse the call before it executes.
+    registry
+        .load_tool("cap.stage")
+        .expect("capability tool loads");
+    let dispatcher = Arc::new(CapabilityAwareDispatcher::new(
+        Arc::new(TestToolDispatcher),
+        registry,
+    ));
+    spawn_with(
+        Arc::new(CapabilityToolModel::default()),
+        Arc::new(TestContextEngine),
+        dispatcher,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn capability_effect_requests_commit_behind_the_generation_fence() {
+    let committed = Arc::new(AtomicUsize::new(0));
+    let rolled_back = Arc::new(AtomicUsize::new(0));
+    let handle = spawn_with_staging_capability(StagingCapability::new(
+        committed.clone(),
+        rolled_back.clone(),
+    ))
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("go".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::TurnCompleted = envelope.event {
+                assert_eq!(
+                    committed.load(Ordering::SeqCst),
+                    1,
+                    "the capability's staged effect must commit once"
+                );
+                assert_eq!(
+                    rolled_back.load(Ordering::SeqCst),
+                    0,
+                    "a live capability effect must never roll back"
+                );
+                return;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the turn did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn stale_capability_effect_rolls_back() {
+    let committed = Arc::new(AtomicUsize::new(0));
+    let rolled_back = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut capability = StagingCapability::new(committed.clone(), rolled_back.clone());
+    capability.release = Some(release.clone());
+    let handle = spawn_with_staging_capability(capability).await;
+    handle.user_message("go".into()).await.unwrap();
+
+    // Give the capability invocation time to start and block inside invoke.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.cancel_turn().await;
+
+    // The capability finishes after the cancel: the generation fence has
+    // moved, so the actor must roll its staged effect back — a cancelled
+    // capability never mutates the world.
+    release.notify_one();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline && rolled_back.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        rolled_back.load(Ordering::SeqCst),
+        1,
+        "a stale capability effect must roll back"
+    );
+    assert_eq!(
+        committed.load(Ordering::SeqCst),
+        0,
+        "a stale capability effect must never commit"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Commit failure classification: `NotApplied` tells the model nothing
+// happened; `AppliedButDurabilityFailed` tells it the world DID change but
+// the record did not — a degraded/recovery state, never a silent swallow.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum CommitFailure {
+    NotApplied,
+    AppliedButDurabilityFailed,
+}
+
+/// An effect whose commit always fails with the given structured error.
+struct FailingEffect {
+    failure: CommitFailure,
+    rolled_back: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Effect for FailingEffect {
+    fn describe(&self) -> String {
+        "failing test effect".into()
+    }
+    async fn commit(self: Box<Self>) -> Result<(), EffectCommitError> {
+        match self.failure {
+            CommitFailure::NotApplied => Err(EffectCommitError::NotApplied(AgentError::Io(
+                "simulated disk failure".into(),
+            ))),
+            CommitFailure::AppliedButDurabilityFailed => {
+                Err(EffectCommitError::AppliedButDurabilityFailed(
+                    AgentError::Io("simulated journal failure".into()),
+                ))
+            }
+        }
+    }
+    async fn rollback(self: Box<Self>, _reason: &str) {
+        self.rolled_back.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A dispatcher whose (read-only) tool stages a `FailingEffect`.
+struct FailingEffectDispatcher {
+    failure: CommitFailure,
+    rolled_back: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ToolDispatcher for FailingEffectDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "fs.read".into(),
+            description: "stages a failing effect".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+        }]
+    }
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        Ok(ToolOutcome::PreparedEffect {
+            output: ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "staged".into(),
+                model_content: "staged".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            effect: Box::new(FailingEffect {
+                failure: self.failure,
+                rolled_back: self.rolled_back.clone(),
+            }),
+        })
+    }
+}
+
+/// Wait for the tool's finished output (the model-visible result) and the
+/// turn completion, returning the finished output.
+async fn run_failing_effect_turn(failure: CommitFailure) -> (ToolOutput, Vec<String>) {
+    let rolled_back = Arc::new(AtomicUsize::new(0));
+    let handle = spawn_with(
+        Arc::new(TwoRoundToolModel::default()),
+        Arc::new(TestContextEngine),
+        Arc::new(FailingEffectDispatcher {
+            failure,
+            rolled_back: rolled_back.clone(),
+        }),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("go".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut finished = None;
+    let mut warnings = Vec::new();
+    let mut completed = false;
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::ToolFinished { output } => finished = Some(output),
+                RuntimeEvent::Warning { message } => warnings.push(message),
+                RuntimeEvent::TurnCompleted => completed = true,
+                _ => {}
+            }
+        }
+        if completed && finished.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(completed, "the turn must complete");
+    assert_eq!(
+        rolled_back.load(Ordering::SeqCst),
+        0,
+        "a failed commit is not a stale operation; nothing to roll back"
+    );
+    (finished.expect("the tool must finish"), warnings)
+}
+
+#[tokio::test]
+async fn not_applied_commit_failure_reports_nothing_happened() {
+    let (finished, _) = run_failing_effect_turn(CommitFailure::NotApplied).await;
+    assert!(
+        !finished.ok,
+        "the failed effect must surface as a failed result"
+    );
+    assert!(
+        finished.model_content.contains("could not be committed"),
+        "the model must be told nothing happened, got: {}",
+        finished.model_content
+    );
+}
+
+#[tokio::test]
+async fn applied_but_durability_failure_surfaces_a_recovery_state() {
+    let (finished, warnings) =
+        run_failing_effect_turn(CommitFailure::AppliedButDurabilityFailed).await;
+    assert!(
+        !finished.ok,
+        "the durability failure must surface as a failed result"
+    );
+    assert!(
+        finished.model_content.contains("WAS applied"),
+        "the model must be told the change landed but the record failed, got: {}",
+        finished.model_content
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|message| message.contains("applied but its journal record failed")),
+        "the runtime must surface a degraded/recovery warning, got: {warnings:?}"
     );
 }
 

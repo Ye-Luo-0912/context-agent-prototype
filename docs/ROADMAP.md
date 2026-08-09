@@ -1103,7 +1103,8 @@ operation; see `docs/ARCHITECTURE.md` §9h and
    ✅ (implemented — see the section below)
 3. **V1-M12 Effect Runtime** — every capability routes side effects through
    one unified EffectRequest/Effect commit. Acceptance: a cancelled
-   operation produces no avoidable stale mutation.
+   operation produces no avoidable stale mutation. ✅ (implemented — see the
+   section below)
 4. **V1-M13 Extension Sandbox** — process sandbox, env scrub, brokered
    FS/network, cancel. Acceptance: experimental code cannot exceed the
    permissions granted to it.
@@ -1121,6 +1122,35 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 M12/M13 strictly precede Self-Iteration: a capability that can already
 stage effects and a sandbox that can contain it are prerequisites for
 letting the LLM grow capabilities autonomously.
+
+## V1-M12 Effect Runtime ✅ (implemented)
+
+Every side effect — builtin tool or capability — routes through one
+unified `EffectRequest` / `Effect` commit behind the runtime's generation
+fence:
+
+- **The contract is one channel.** `Effect` (commit/rollback, structured
+  `EffectCommitError`), `ToolOutcome::PreparedEffect` for builtin tools and
+  `CapabilityOutcome::EffectRequest` for capabilities; the capability-aware
+  dispatcher forwards a capability's `EffectRequest` as a
+  `PreparedEffect`, so the actor treats both identically. Capabilities
+  stage via `WorkspaceHandle::prepare_write` (journaled mutation
+  transaction) — the capability computes, the core executes.
+- **The fence is one place.** `on_operation_completed` validates the
+  operation against the generation fence: a stale completion (cancelled or
+  superseded) rolls the staged effect back, a live one commits it. A
+  cancelled tool or capability never mutates the workspace.
+- **Commit failures are classified, not swallowed.** `NotApplied` tells
+  the model nothing happened; `AppliedButDurabilityFailed` surfaces a
+  degraded/recovery warning and tells the model the change *did* land but
+  its record did not — the filesystem and the journal never silently
+  disagree.
+- **Coverage** (`agent-runtime/tests/turn.rs`): a live capability effect
+  commits behind the fence and a stale one rolls back (cancelled operation
+  → no avoidable stale mutation), plus the two commit-failure branches.
+  The workspace mutation transaction itself (atomic replace, rollback
+  deletes the staging file, durability-failure semantics) is covered by
+  `agent-workspace`'s own tests.
 
 ## V1-M11 Context Recall ✅ (implemented)
 
