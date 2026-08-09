@@ -140,7 +140,7 @@ pub(crate) struct OperationCompletion {
     directive: Option<RuntimeDirective>,
     /// Whether the result persists as a long-term observation at turn end.
     /// Engine-query results (context search/inspect/fetch) are transient:
-    /// they must not duplicate fetched evidence under a new id (CTX-03).
+    /// they must not duplicate fetched evidence under a new id.
     disposition: ToolResultDisposition,
 }
 
@@ -1060,9 +1060,9 @@ impl RuntimeActor {
                     // Most directives are decision records and persist as
                     // observations. `admit` re-enters the *same* item id, so
                     // persisting the result would duplicate it under a new
-                    // id — the admission event is the record (CTX-03).
+                    // id — the admission event is the record.
                     // `derive` already persists a new derived item via the
-                    // directive; the result text stays transient (CTX-03).
+                    // directive; the result text stays transient.
                     let disposition = match &directive {
                         RuntimeDirective::Context(agent_contracts::ContextAction::Admit {
                             ..
@@ -1091,8 +1091,8 @@ impl RuntimeActor {
                 // query: the kernel (the ContextEngine owner) answers and
                 // the placeholder output becomes the final one. No effect,
                 // no directive — search/inspect/fetch are pure reads. The
-                // result is transient (CTX-03): reading evidence must not
-                // duplicate it as a new observation.
+                // result is transient: reading evidence must not duplicate
+                // it as a new observation.
                 ToolOutcome::EngineQuery { output, query } => {
                     let resolved = kernel.resolve_engine_query(output, query).await;
                     (
@@ -1364,8 +1364,8 @@ impl RuntimeActor {
                 };
                 // Transient results (context search/inspect/fetch) stay out
                 // of the long-term context: reading evidence must not
-                // duplicate it under a new observation id (CTX-03). The
-                // engine already stamped access on the read itself.
+                // duplicate it under a new observation id. The engine
+                // already stamped access on the read itself.
                 if *disposition != ToolResultDisposition::PersistObservation {
                     continue;
                 }

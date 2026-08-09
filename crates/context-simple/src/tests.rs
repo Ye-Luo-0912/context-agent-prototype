@@ -2750,7 +2750,7 @@ async fn failed_observation(engine: &SimpleContextEngine, call_id: &str, content
         .unwrap();
 }
 
-/// CTX-01 acceptance (`long_task_10k_turns`): over 10,000 task turns the
+/// Long-task acceptance (`long_task_10k_turns`): over 10,000 task turns the
 /// resident working set is bounded by the current episode plus unresolved
 /// semantic state, not by turn count. Required decisions stay recallable;
 /// stale ordinary dialogue leaves Resident.
@@ -2912,10 +2912,10 @@ async fn long_task_10k_turns_keeps_the_working_set_episode_bounded() {
     );
 }
 
-/// CTX-02: a terminal semantic transition (supersession) must reach the
-/// target wherever its body currently sits. A decision externalized to the
-/// store (Cold) and one sitting in the warm buffer are still the same
-/// decisions: a later decision on the same entities supersedes them.
+/// A terminal semantic transition (supersession) must reach the target
+/// wherever its body currently sits. A decision externalized to the store
+/// (Cold) and one sitting in the warm buffer are still the same decisions:
+/// a later decision on the same entities supersedes them.
 #[tokio::test]
 async fn supersession_reaches_warm_and_stored_decisions() {
     let store = tempfile::tempdir().unwrap();
@@ -3030,7 +3030,7 @@ async fn supersession_reaches_warm_and_stored_decisions() {
     );
 }
 
-/// CTX-02: error verification must reach an error that left Resident. A
+/// Error verification must reach an error that left Resident. A
 /// successful result on the same entities verifies a Warm error as readily
 /// as a resident one.
 #[tokio::test]
@@ -3104,8 +3104,8 @@ async fn verification_reaches_warm_errors() {
     );
 }
 
-/// CTX-02: a recurring failure supersedes the earlier error wherever it
-/// sits — a Warm error is superseded by the next failure on the same site.
+/// A recurring failure supersedes the earlier error wherever it sits — a
+/// Warm error is superseded by the next failure on the same site.
 #[tokio::test]
 async fn recurrence_supersedes_warm_errors() {
     let engine = SimpleContextEngine::new(SimpleContextConfig {
@@ -3178,7 +3178,7 @@ async fn recurrence_supersedes_warm_errors() {
     );
 }
 
-/// CTX-02: completing a task clears model protections (keep_alive / lease)
+/// Completing a task clears model protections (keep_alive / lease)
 /// in every body location, so a completed task cannot keep rooting items
 /// through a warm-buffer record.
 #[tokio::test]
@@ -3273,9 +3273,9 @@ async fn completed_task_clears_protections_in_every_residency() {
     );
 }
 
-/// CTX-02: automatic hot-entity recall of a completed task's records is
-/// forbidden without an explicit reason. The hot set alone must not bring
-/// finished work back as current truth.
+/// Automatic hot-entity recall of a completed task's records is forbidden
+/// without an explicit reason. The hot set alone must not bring finished
+/// work back as current truth.
 #[tokio::test]
 async fn completed_task_blocks_automatic_hot_recall() {
     let engine = SimpleContextEngine::new(SimpleContextConfig {
@@ -3351,7 +3351,7 @@ async fn completed_task_blocks_automatic_hot_recall() {
     );
 }
 
-/// CTX-02: keep-alive accounting is global across body locations — a warm
+/// Keep-alive accounting is global across body locations — a warm
 /// buffer item with keep_alive still consumes the cap.
 #[tokio::test]
 async fn keep_alive_quota_counts_warm_items() {
@@ -3420,9 +3420,9 @@ async fn keep_alive_quota_counts_warm_items() {
 }
 
 // ---------------------------------------------------------------------------
-// CTX-03: fetch/search/inspect are transient reads; admit re-enters an item
-// under its ORIGINAL id with exactly one lifecycle transition; derive
-// persists a fact as a NEW item with a DerivedFrom edge to the source ref.
+// Fetch/search/inspect are transient reads; admit re-enters an item under
+// its ORIGINAL id with exactly one lifecycle transition; derive persists a
+// fact as a NEW item with a DerivedFrom edge to the source ref.
 // ---------------------------------------------------------------------------
 
 /// The retrieval surface is a fidelity boundary: `context.admit` must bring

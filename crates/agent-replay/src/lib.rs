@@ -325,7 +325,7 @@ fn build_replayed_items(
         .collect()
 }
 
-/// Human-readable lifecycle report answering the P0.5 acceptance questions.
+/// Human-readable lifecycle report answering the acceptance questions.
 pub fn render_report(outcome: &ReplayOutcome) -> String {
     let mut out = String::new();
     out.push_str(&format!(

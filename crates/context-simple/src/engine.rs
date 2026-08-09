@@ -458,7 +458,7 @@ impl ContextEngine for SimpleContextEngine {
                     // Model hints are per-task: when the task completes its
                     // keep_alive and lease protections expire in *every* body
                     // location, so a completed task cannot keep rooting items
-                    // forever (CTX-02). A keep-alive item is normally a GC
+                    // forever. A keep-alive item is normally a GC
                     // root and stays in the heap, but a warm-buffer item from
                     // an older checkpoint must not retain the protection.
                     for item in &mut state.items {
@@ -783,8 +783,8 @@ fn apply_directive(
         ContextAction::GcHint {
             keep_alive: true, ..
         } => {
-            // Quotas are global across body locations (CTX-02): a keep_alive
-            // item in the warm buffer still consumes the cap.
+            // Quotas are global across body locations: a keep_alive item in
+            // the warm buffer still consumes the cap.
             let kept = state
                 .items
                 .iter()
@@ -824,7 +824,7 @@ fn apply_directive(
                         .is_some_and(|until| until >= state.turn);
                     // Leased-item accounting is global across body locations:
                     // a leased item in the warm buffer still counts against
-                    // the task cap (CTX-02).
+                    // the task cap.
                     let (leased, leased_tokens) = state
                         .items
                         .iter()

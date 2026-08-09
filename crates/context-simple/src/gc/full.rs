@@ -389,8 +389,8 @@ fn mark_roots(
         let durable_session_memory =
             item.retention == ContextRetention::Durable && item.scope == ContextScope::Session;
         // A completed task's records are never roots through the hot set:
-        // automatic recall of finished work requires an explicit reason
-        // (CTX-02), and the task's own entities may linger in the hot set
+        // automatic recall of finished work requires an explicit reason,
+        // and the task's own entities may linger in the hot set
         // after completion.
         let hot = !task_completed(state, item.task_id)
             && !hot_entities.is_empty()
@@ -678,7 +678,7 @@ fn reactivate(state: &mut State, config: &SimpleContextConfig, now_tick: u64, pl
 /// Whether the item's task has completed: its Task scope is closed. A
 /// completed task's records may return to the working set only for an
 /// explicit reason (pin, model hint/lease), never for automatic hot-entity
-/// recall (CTX-02).
+/// recall.
 fn task_completed(state: &State, task_id: Option<TaskId>) -> bool {
     task_id.is_some_and(|tid| {
         state.scopes.iter().any(|scope| {
@@ -729,7 +729,7 @@ fn reactivation_reason(
     if !hot_entities.is_empty() && entities_match(&item.entities, hot_entities) {
         if guard.completed_task {
             // Automatic recall of a completed task's record is forbidden
-            // without a new explicit reason (CTX-02): the hot set alone is
+            // without a new explicit reason: the hot set alone is
             // not enough to bring finished work back as current truth.
             return None;
         }

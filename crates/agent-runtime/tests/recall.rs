@@ -448,9 +448,9 @@ async fn recall_turn_pulls_external_content_back_without_polluting_the_prompt() 
         "the model must receive the exact content through the tool result"
     );
 
-    // CTX-03: fetch/search/inspect results are transient. They reached the
-    // model through the turn frame, but finalization must not persist them
-    // as new observations. The turn's own user + assistant messages are
+    // Fetch/search/inspect results are transient. They reached the model
+    // through the turn frame, but finalization must not persist them as
+    // new observations. The turn's own user + assistant messages are
     // expected to persist; a retrieval result would show up as an extra
     // ToolObservation.
     let after = engine.diagnostics().await.unwrap();
@@ -475,11 +475,11 @@ async fn recall_turn_pulls_external_content_back_without_polluting_the_prompt() 
     );
 }
 
-/// CTX-03 end to end for the directive half: `admit` re-enters the item
-/// under its ORIGINAL id (identity preserved, one lifecycle transition) and
-/// `derive` mints a new Note — and neither directive's tool result is
-/// duplicated as a ToolObservation, because the admission event and the
-/// derived item are the records.
+/// End to end for the directive half: `admit` re-enters the item under its
+/// ORIGINAL id (identity preserved, one lifecycle transition) and `derive`
+/// mints a new Note — and neither directive's tool result is duplicated as
+/// a ToolObservation, because the admission event and the derived item are
+/// the records.
 #[tokio::test]
 async fn admit_and_derive_through_the_runtime_never_duplicate_observations() {
     let dir = tempfile::tempdir().unwrap();

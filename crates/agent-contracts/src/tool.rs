@@ -50,7 +50,7 @@ pub struct ToolOutput {
 ///
 /// Context retrieval (`context.search` / `context.inspect` / `context.fetch`)
 /// is a transient store read: it must make evidence visible to the current
-/// turn without duplicating it under a new observation id (CTX-03).
+/// turn without duplicating it under a new observation id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ToolResultDisposition {
     /// Persist the result as a new `ToolObservation` (default).

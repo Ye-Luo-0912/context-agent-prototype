@@ -44,7 +44,7 @@ pub(crate) fn is_excluded(item: &ContextItem) -> bool {
 /// excludes the new item itself and becomes the `by` of the Superseded
 /// semantic state. The scan covers the heap, the warm buffer and the
 /// external map, so an earlier decision is superseded wherever its body
-/// currently sits (CTX-02).
+/// currently sits.
 pub(crate) fn queue_decision_supersessions(
     state: &mut State,
     content: &str,
@@ -103,7 +103,7 @@ pub(crate) fn queue_decision_supersessions(
 /// entity with a successful observation. `by_id` is the successful
 /// observation that verified the error. Also covers the warm buffer and the
 /// external map: an error that left Resident is still the same error and
-/// still gets verified by a later success (CTX-02).
+/// still gets verified by a later success.
 pub(crate) fn queue_error_verifications(
     state: &mut State,
     content: &str,
@@ -151,7 +151,7 @@ pub(crate) fn queue_error_verifications(
 /// The scan covers every body location with a retained entity signature:
 /// the resident heap, the warm reversible buffer, and the external map.
 /// A recurring failure supersedes an earlier error wherever that error's
-/// body currently sits (CTX-02).
+/// body currently sits.
 pub(crate) fn queue_error_recurrence(
     state: &mut State,
     content: &str,
@@ -218,7 +218,7 @@ pub(crate) fn queue_error_recurrence(
 ///
 /// The target may live in any body location: the resident heap, the warm
 /// reversible buffer, or the external map. Lifecycle authority must not
-/// depend on where the body currently sits (CTX-02): a decision that was
+/// depend on where the body currently sits: a decision that was
 /// evicted and externalized is still the same decision and still gets
 /// superseded.
 pub(crate) fn drain_supersessions(state: &mut State, turn: u64) -> Vec<ContextStateTransition> {

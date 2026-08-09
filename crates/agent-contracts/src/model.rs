@@ -111,8 +111,8 @@ pub enum TurnFrameStep {
         #[serde(default)]
         scope_id: Option<ScopeId>,
         /// Whether this result becomes a long-term observation at turn end.
-        /// Context retrieval results are transient (CTX-03): they must not
-        /// duplicate fetched evidence under a new item id.
+        /// Context retrieval results are transient: they must not duplicate
+        /// fetched evidence under a new item id.
         #[serde(default)]
         disposition: ToolResultDisposition,
     },
@@ -149,8 +149,8 @@ impl TurnFrame {
         self.push_tool_result_with(output, scope_id, ToolResultDisposition::PersistObservation);
     }
 
-    /// Push a tool result with an explicit persist disposition (CTX-03):
-    /// context retrieval results are `TransientNoPersist`.
+    /// Push a tool result with an explicit persist disposition: context
+    /// retrieval results are `TransientNoPersist`.
     pub fn push_tool_result_with(
         &mut self,
         output: ToolOutput,
