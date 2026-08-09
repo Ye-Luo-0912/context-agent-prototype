@@ -1,5 +1,7 @@
 /target
-/.focus-agent
+# Runtime state dirs appear wherever a crate/test runs (workspace root or
+# a crate's own CWD); ignore every level, not just the repository root.
+**/.focus-agent/
 *.db
 *.db-shm
 *.db-wal

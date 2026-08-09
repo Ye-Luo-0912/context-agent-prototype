@@ -70,11 +70,16 @@ pub(crate) fn read_item(dir: &Path, item_id: ContextItemId) -> Option<ContextIte
 }
 
 /// Build the lightweight external-map entry for an item just written to the
-/// store.
+/// store. The entry keeps the item's entity signature and dependency edges
+/// so recall and Storage GC can decide *without* reading the file: recall
+/// pre-filters on `entities` in memory, and Storage GC runs a reachability
+/// closure over `dependencies` (resident heap, warm buffer and external
+/// entries alike).
 pub(crate) fn to_external_entry(
     item: &ContextItem,
     context_ref: ContextRef,
     now_tick: u64,
+    gc_epoch: u64,
 ) -> ExternalizedContext {
     ExternalizedContext {
         item_id: item.id,
@@ -87,17 +92,32 @@ pub(crate) fn to_external_entry(
         externalized_at_tick: now_tick,
         last_access_tick: now_tick,
         residency: ContextResidency::Cold,
+        entities: item.entities.clone(),
+        tags: item.tags.clone(),
+        dependencies: item.dependencies.clone(),
+        last_access_gc_epoch: Some(gc_epoch),
     }
 }
 
+/// The outcome of removing one store file. `Deleted` means the file is
+/// gone; `NotFound` means it was already gone. Any other IO condition is an
+/// *error* — the caller must keep the in-memory entry and surface it,
+/// because mistaking a permission/disk failure for "the file is gone" would
+/// drop the metadata while the content still exists.
+#[derive(Debug)]
+pub(crate) enum DeleteOutcome {
+    Deleted,
+    NotFound,
+}
+
 /// Delete one store file; the caller is responsible for removing the
-/// in-memory entry. Returns whether a file existed and was removed.
-fn delete_file(dir: &Path, item_id: ContextItemId) -> bool {
+/// in-memory entry only on `Deleted`/`NotFound`. Real IO errors propagate.
+fn delete_file(dir: &Path, item_id: ContextItemId) -> Result<DeleteOutcome, std::io::Error> {
     let path = file_path(dir, item_id);
     match std::fs::remove_file(&path) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => false,
+        Ok(()) => Ok(DeleteOutcome::Deleted),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DeleteOutcome::NotFound),
+        Err(e) => Err(e),
     }
 }
 
@@ -136,22 +156,49 @@ fn storage_candidate(
 
 /// Run the conservative Storage GC: delete store files whose entries are
 /// semantically dead, deletable by retention, older than the storage TTL
-/// and not referenced by any resident/warm item. This is the only place
+/// and unreachable from the reference graph. This is the only place
 /// information is permanently removed.
+///
+/// Reachability is a closure, not a single incoming-edge check: roots are
+/// the dependency edges of resident/warm items, and every external entry
+/// whose id becomes reachable contributes its own dependencies — so
+/// external -> external chains, semantic links that surface as dependencies,
+/// and any future audit/evidence/OpenLoop edges keep their targets alive
+/// transitively. A store file that fails to delete on a *real* IO error
+/// keeps its entry (degraded storage is surfaced, not silently treated as
+/// "already deleted").
 pub(crate) fn run_storage_gc(
     state: &mut State,
     config: &SimpleContextConfig,
     now_tick: u64,
 ) -> StorageGcReport {
     let dir = store_dir(config);
-    // Ids referenced by dependency edges from the resident heap or the warm
-    // buffer protect their store files from deletion.
-    let referenced: std::collections::HashSet<ContextItemId> = state
+
+    // Reachability closure over the reference graph: resident/warm items
+    // are roots; each reachable external entry contributes its own edges.
+    let mut referenced: std::collections::HashSet<ContextItemId> = state
         .items
         .iter()
         .chain(state.eviction_buffer.iter())
         .flat_map(|item| item.dependencies.iter().copied())
         .collect();
+    loop {
+        let mut grew = false;
+        for entry in &state.external {
+            if referenced.contains(&entry.item_id)
+                && entry
+                    .dependencies
+                    .iter()
+                    .any(|dep| !referenced.contains(dep))
+            {
+                referenced.extend(entry.dependencies.iter().copied());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
 
     let mut report = StorageGcReport::default();
     let mut kept: Vec<ExternalizedContext> = Vec::with_capacity(state.external.len());
@@ -163,19 +210,33 @@ pub(crate) fn run_storage_gc(
             kept.push(entry);
             continue;
         };
-        if delete_file(&dir, entry.item_id) {
-            report.deleted += 1;
-            state.gc_storage_deleted_total += 1;
-            report
-                .reasons
-                .push(format!("deleted {} ({})", entry.context_ref.uri, reason));
-        } else {
-            // No file behind the entry (already gone): drop the entry too.
-            report.deleted += 1;
-            state.gc_storage_deleted_total += 1;
-            report
-                .reasons
-                .push(format!("entry {} had no store file", entry.context_ref.uri));
+        match delete_file(&dir, entry.item_id) {
+            Ok(DeleteOutcome::Deleted) => {
+                report.deleted += 1;
+                state.gc_storage_deleted_total += 1;
+                report
+                    .reasons
+                    .push(format!("deleted {} ({reason})", entry.context_ref.uri));
+            }
+            Ok(DeleteOutcome::NotFound) => {
+                // No file behind the entry (already gone): drop the entry too.
+                report.deleted += 1;
+                state.gc_storage_deleted_total += 1;
+                report.reasons.push(format!(
+                    "entry {} had no store file",
+                    entry.context_ref.uri
+                ));
+            }
+            Err(e) => {
+                // Real IO failure: keep the entry and its metadata. The
+                // content still exists on disk; deleting the reference would
+                // orphan it silently.
+                report.io_errors += 1;
+                kept.push(entry);
+                report
+                    .reasons
+                    .push(format!("kept {}: storage IO error: {e}", reason));
+            }
         }
     }
     state.external = kept;
@@ -191,19 +252,25 @@ pub(crate) fn recallable(entry: &ExternalizedContext) -> bool {
 }
 
 /// Age `Cold` entries toward `External` after the configured number of full
-/// passes without access.
+/// GC *generations* without access. The unit is `gc_epoch`, which only a
+/// full GC pass increments — comparing against the tick counter would let
+/// unrelated runtime activity (ingest, maintain, materialize) age entries
+/// out without a single GC pass having run. Entries restored from
+/// pre-epoch checkpoints (`last_access_gc_epoch == None`) start fresh at
+/// the current epoch instead of aging out instantly.
 pub(crate) fn age_external_entries(
     state: &mut State,
     config: &SimpleContextConfig,
-    passes: u64,
+    gc_epoch: u64,
 ) -> usize {
     let mut aged = 0usize;
     for entry in &mut state.external {
         if entry.residency != ContextResidency::Cold {
             continue;
         }
-        let idle = passes.saturating_sub(entry.last_access_tick);
-        if idle >= config.gc_external_ttl_passes as u64 {
+        let last = entry.last_access_gc_epoch.unwrap_or(gc_epoch);
+        let idle = gc_epoch.saturating_sub(last);
+        if idle >= config.gc_external_ttl_generations as u64 {
             entry.residency = ContextResidency::External;
             aged += 1;
         }
@@ -280,7 +347,9 @@ mod tests {
 
         for item in [&dead, &live, &pinned, &orphan] {
             let reference = externalize(dir.path(), item).unwrap();
-            state.external.push(to_external_entry(item, reference, 1));
+            state
+                .external
+                .push(to_external_entry(item, reference, 1, 1));
         }
         // A resident item depends on the dead entry: it must survive.
         let mut holder = test_item(ContextItemId::new(), "holder");
@@ -314,5 +383,113 @@ mod tests {
             "the deletable orphan leaves the map"
         );
         assert_eq!(state.gc_storage_deleted_total, 1);
+    }
+
+    #[test]
+    fn external_entries_carry_the_entity_signature_and_dependencies() {
+        let mut item = test_item(ContextItemId::new(), "fix AuthService.rs");
+        item.dependencies.push(ContextItemId::new());
+        let reference = ContextRef {
+            uri: "context://run/x".into(),
+            item_id: item.id,
+            kind: item.kind,
+            scope: item.scope,
+            summary: "fix AuthService.rs".into(),
+            created_tick: 1,
+        };
+        let entry = to_external_entry(&item, reference, 7, 3);
+        assert!(
+            !entry.entities.is_empty(),
+            "the entry keeps the entity signature for in-memory recall"
+        );
+        assert_eq!(entry.dependencies, item.dependencies);
+        assert_eq!(entry.last_access_gc_epoch, Some(3));
+        assert!(entry.entities.iter().any(|e| e == "AuthService.rs"));
+    }
+
+    #[test]
+    fn storage_gc_reaches_through_external_dependency_chains() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = store_config(dir.path());
+        let mut state = State::default();
+        // target <- chain <- resident: the resident item only references
+        // the chain entry, and the chain entry references the target. The
+        // target must survive through the external -> external edge.
+        let target_id = ContextItemId::new();
+        let chain_id = ContextItemId::new();
+        let mut target = test_item(target_id, "deeply referenced dead content");
+        target.semantic = SemanticState::Tombstoned;
+        let mut chain = test_item(chain_id, "chain dead content");
+        chain.semantic = SemanticState::Tombstoned;
+        chain.dependencies.push(target_id);
+        let mut holder = test_item(ContextItemId::new(), "resident holder");
+        holder.dependencies.push(chain_id);
+        state.items.push(holder);
+        for item in [&target, &chain] {
+            let reference = externalize(dir.path(), item).unwrap();
+            state
+                .external
+                .push(to_external_entry(item, reference, 1, 1));
+        }
+
+        let report = run_storage_gc(&mut state, &config, 100);
+        assert_eq!(
+            report.deleted, 0,
+            "the whole reachable chain survives: {report:?}"
+        );
+        assert!(state.external.iter().any(|e| e.item_id == target_id));
+        assert!(state.external.iter().any(|e| e.item_id == chain_id));
+    }
+
+    #[test]
+    fn delete_file_distinguishes_not_found_from_other_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = ContextItemId::new();
+        match delete_file(dir.path(), missing) {
+            Ok(DeleteOutcome::NotFound) => {}
+            other => panic!("missing file must be NotFound, got {other:?}"),
+        }
+        // A real entry deletes cleanly.
+        let item = test_item(ContextItemId::new(), "to delete");
+        externalize(dir.path(), &item).unwrap();
+        match delete_file(dir.path(), item.id) {
+            Ok(DeleteOutcome::Deleted) => {}
+            other => panic!("existing file must delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cold_aging_counts_generations_not_ticks() {
+        let config = store_config(tempfile::tempdir().unwrap().path());
+        let mut state = State::default();
+        // Externalized at epoch 2; a tick-based TTL would age it out after
+        // 4 ticks of unrelated activity, a generation-based one only after
+        // 4 full GC passes.
+        let item = test_item(ContextItemId::new(), "aging candidate");
+        let reference = ContextRef {
+            uri: "context://run/a".into(),
+            item_id: item.id,
+            kind: item.kind,
+            scope: item.scope,
+            summary: "aging".into(),
+            created_tick: 1,
+        };
+        state
+            .external
+            .push(to_external_entry(&item, reference, 100, 2));
+        assert_eq!(
+            age_external_entries(&mut state, &config, 5),
+            0,
+            "only 3 generations passed, TTL is 4"
+        );
+        assert_eq!(
+            age_external_entries(&mut state, &config, 6),
+            1,
+            "4 generations passed: the entry ages to External"
+        );
+        assert_eq!(
+            state.external[0].residency,
+            ContextResidency::External
+        );
     }
 }

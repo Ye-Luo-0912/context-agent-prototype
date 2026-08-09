@@ -65,7 +65,14 @@ async fn main() -> anyhow::Result<()> {
     let context_engine: Arc<dyn ContextEngine> = match context_policy.as_str() {
         "append" => Arc::new(AppendOnlyEngine::new()),
         "rolling" => Arc::new(RollingSummaryEngine::with_config(RollingConfig::default())),
-        "dynamic" => Arc::new(SimpleContextEngine::new(SimpleContextConfig::default())),
+        "dynamic" => Arc::new(SimpleContextEngine::new(SimpleContextConfig {
+            // The external context store lives with the other runtime state,
+            // never guessed from the CWD: a run started from a crate
+            // directory must not scatter `.focus-agent/context-store`
+            // folders around the tree.
+            context_store_dir: Some(workspace.state_dir().join("context-store")),
+            ..SimpleContextConfig::default()
+        })),
         "service" => {
             connect_engine(&ContextServiceConfig {
                 engine: ServiceEngine::Dynamic,

@@ -49,12 +49,17 @@ pub struct SimpleContextConfig {
     pub gc_reactivate_per_pass: usize,
     /// Directory of the external context store: eviction-buffer overflow
     /// writes full items here and keeps only a lightweight `ContextRef`
-    /// entry. `None` defaults to `.focus-agent/context-store` under the
-    /// current working directory.
+    /// entry. The composition root injects `workspace.state_dir()/context-store`
+    /// so runtime state never scatters under a CWD; `None` is only a
+    /// standalone/test fallback (`.focus-agent/context-store` under the
+    /// current working directory).
     pub context_store_dir: Option<std::path::PathBuf>,
     /// Full GC passes an externalized (`Cold`) entry may sit in memory
-    /// before it ages to `External` (only the store retains it).
-    pub gc_external_ttl_passes: u32,
+    /// before it ages to `External` (only the store retains it). The unit
+    /// is *generations*: only a full GC increments `State::gc_epoch`, so
+    /// the TTL counts real passes, not the tick counter (which also grows
+    /// on ingest/maintain/materialize).
+    pub gc_external_ttl_generations: u32,
     /// Storage GC only deletes store entries whose semantic lifecycle ended
     /// at least this many ticks ago and that nothing references.
     pub storage_ttl_ticks: u64,
@@ -88,7 +93,7 @@ impl Default for SimpleContextConfig {
             gc_buffer_capacity: 256,
             gc_reactivate_per_pass: 8,
             context_store_dir: None,
-            gc_external_ttl_passes: 4,
+            gc_external_ttl_generations: 4,
             storage_ttl_ticks: 40,
             max_keep_alive_items: 16,
             max_lease_turns: 32,
@@ -157,6 +162,12 @@ pub(crate) struct State {
     /// hot-entity matches; `External` entries only exist as references.
     #[serde(default)]
     pub(crate) external: Vec<agent_contracts::ExternalizedContext>,
+    /// Counts full GC passes only. External-entry aging (Cold -> External)
+    /// and TTLs compare this epoch, never the tick counter — the tick also
+    /// advances on ingest/maintain/materialize, so a pass-based TTL must
+    /// not drift with unrelated runtime activity.
+    #[serde(default)]
+    pub(crate) gc_epoch: u64,
     /// Cumulative GC counters, so diagnostics explain a run's eviction and
     /// reactivation behavior without replaying every report.
     #[serde(default)]

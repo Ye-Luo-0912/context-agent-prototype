@@ -2,8 +2,8 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use agent_contracts::{
-    AttentionState, ContextItem, ContextItemId, ContextQuery, ContextRetention, ContextSelection,
-    MaterializedContext, MaterializedItem, ScopeId, ScopeKind, ScoreBreakdown,
+    AttentionState, ContextItem, ContextItemId, ContextMap, ContextQuery, ContextRetention,
+    ContextSelection, MaterializedContext, MaterializedItem, ScopeId, ScopeKind, ScoreBreakdown,
 };
 
 use crate::diagnostics;
@@ -264,14 +264,64 @@ pub(crate) fn materialize(
     MaterializedContext {
         focus,
         items,
-        // The lightweight context map: externalized items are visible only
-        // as references, never as content — the model sees `context://...`
-        // entries and can deliberately pull them with a future context tool.
-        external: state.external.clone(),
+        // The lightweight context map: a *bounded* slice of the external
+        // entries, never the whole map. The full `state.external` stays in
+        // the engine; cloning it per materialize would grow linearly with
+        // the run (10K/100K refs) and the prompt does not use it anyway.
+        // The view prefers hot-entity matches, open loops, then recency —
+        // the entries the model is most likely to deliberately pull.
+        external: external_view(state, &state.hot_entities),
         selected: selections,
         approx_tokens: approx_tokens_total,
         diagnostics: diagnostics::compute(state),
     }
+}
+
+/// Cap on external refs surfaced in one materialized context.
+const MAX_EXTERNAL_REFS: usize = 32;
+
+/// Build a small, deterministic slice of the external map: hot-entity
+/// matches and open loops first, then most-recently-accessed entries, up
+/// to `MAX_EXTERNAL_REFS`. Quickselect keeps this O(n) without cloning the
+/// whole map.
+fn external_view(state: &State, hot_entities: &[String]) -> ContextMap {
+    let mut ranked: Vec<&agent_contracts::ExternalizedContext> = state.external.iter().collect();
+    let k = ranked.len().min(MAX_EXTERNAL_REFS);
+    if k == 0 {
+        return Vec::new();
+    }
+    ranked.select_nth_unstable_by(k - 1, |a, b| {
+        external_view_key(b, hot_entities).cmp(&external_view_key(a, hot_entities))
+    });
+    ranked.truncate(k);
+    // Stable final order: rank, then item id as a deterministic tie-break.
+    ranked.sort_by(|a, b| {
+        external_view_key(b, hot_entities)
+            .cmp(&external_view_key(a, hot_entities))
+            .then_with(|| a.item_id.0.cmp(&b.item_id.0))
+    });
+    ranked.into_iter().cloned().collect()
+}
+
+/// (hot-entity match, open loop, recency) — higher sorts first. Open loops
+/// are tagged items whose decision is still pending; surfacing them keeps
+/// the model's unfinished business visible even after externalization.
+fn external_view_key(
+    entry: &agent_contracts::ExternalizedContext,
+    hot_entities: &[String],
+) -> (u8, u8, u64) {
+    let hot = u8::from(
+        hot_entities
+            .iter()
+            .any(|hot| entry.entities.iter().any(|e| e == hot)),
+    );
+    let open_loop = u8::from(
+        entry
+            .tags
+            .iter()
+            .any(|tag| tag.is_core(agent_contracts::CoreLabel::OpenLoop)),
+    );
+    (hot, open_loop, entry.last_access_tick)
 }
 
 fn selection_reason(item: &ContextItem, breakdown: &ScoreBreakdown) -> String {

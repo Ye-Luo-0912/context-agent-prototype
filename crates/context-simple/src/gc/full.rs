@@ -48,6 +48,12 @@ pub(crate) fn run_full_gc(
         return report;
     }
 
+    // One full GC generation. External aging and TTLs count generations —
+    // only this counter advances on a real pass, unlike `tick` which also
+    // grows on ingest/maintain/materialize.
+    state.gc_epoch += 1;
+    let gc_epoch = state.gc_epoch;
+
     // ----- Mark phase: the root set --------------------------------
     // Roots are the current attention: pins, members of the active focus
     // scope (including open tool frames under it), durable task
@@ -134,7 +140,7 @@ pub(crate) fn run_full_gc(
             Ok(context_ref) => {
                 state
                     .external
-                    .push(store::to_external_entry(&item, context_ref, now_tick));
+                    .push(store::to_external_entry(&item, context_ref, now_tick, gc_epoch));
                 report.externalized += 1;
                 state.gc_externalized_total += 1;
             }
@@ -149,8 +155,8 @@ pub(crate) fn run_full_gc(
     }
 
     // Cold -> External aging: entries untouched for the configured number
-    // of passes become references only.
-    report.aged_external = store::age_external_entries(state, config, now_tick);
+    // of full GC generations become references only.
+    report.aged_external = store::age_external_entries(state, config, gc_epoch);
 
     report.marked_roots = marked.len();
     report.resident = state.items.len();
@@ -440,9 +446,12 @@ fn reactivate(
                 continue;
             }
             let recallable = entry.semantic.is_live() && store::recallable(&entry);
-            let recalled_item = if recallable {
+            // Filter on the entity signature kept in the entry first: with
+            // thousands of Cold entries this avoids a disk read per entry —
+            // only entries whose entities are actually hot earn a read.
+            let entities_match = entities_match(&entry.entities, &hot_entities);
+            let recalled_item = if recallable && entities_match {
                 store::read_item(&dir, entry.item_id)
-                    .filter(|item| entities_match(&item.entities, &hot_entities))
             } else {
                 None
             };

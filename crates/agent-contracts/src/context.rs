@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentResult, ContextItemId, ScopeId, TaskId, ToolOutput};
+use crate::{AgentResult, ContextItemId, Label, ScopeId, TaskId, ToolOutput};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContextKind {
@@ -597,6 +597,29 @@ pub struct ExternalizedContext {
     pub externalized_at_tick: u64,
     pub last_access_tick: u64,
     pub residency: ContextResidency,
+    /// Entity signature captured at externalize time. Recall filters on this
+    /// in memory first, so a Cold-recall pass reads only the store files
+    /// whose entities actually match — not every externalized entry.
+    #[serde(default)]
+    pub entities: Vec<String>,
+    /// Tags captured at externalize time, so the materialized external view
+    /// and future context retrieval can rank by open-loop/decision labels
+    /// without reading the store file.
+    #[serde(default)]
+    pub tags: Vec<Label>,
+    /// Dependency edges captured at externalize time, so the Storage GC can
+    /// run a reachability closure over resident *and* external entries
+    /// instead of checking only single incoming edges from the heap.
+    #[serde(default)]
+    pub dependencies: Vec<ContextItemId>,
+    /// The `State::gc_epoch` at which this entry was last accessed. Aging
+    /// Cold -> External compares *generations* (only full GC increments the
+    /// epoch), never ticks — ingest/maintain/materialize also advance the
+    /// tick counter and would make a pass-based TTL meaningless. `None` for
+    /// entries restored from pre-epoch checkpoints: they are treated as
+    /// accessed at the current epoch instead of aging out instantly.
+    #[serde(default)]
+    pub last_access_gc_epoch: Option<u64>,
 }
 
 /// The lightweight context map the model sees for externalized items:
@@ -612,6 +635,11 @@ pub type ContextMap = Vec<ExternalizedContext>;
 pub struct StorageGcReport {
     pub scanned: usize,
     pub deleted: usize,
+    /// Store entries that could not be touched because the filesystem
+    /// returned a real error (permission, disk). Those entries are *kept* —
+    /// an IO failure must never be mistaken for "the file is already gone".
+    #[serde(default)]
+    pub io_errors: usize,
     #[serde(default)]
     pub reasons: Vec<String>,
 }
