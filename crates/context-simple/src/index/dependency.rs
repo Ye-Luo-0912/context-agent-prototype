@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use agent_contracts::{ContextItem, ContextItemId};
+use agent_contracts::{ContextItem, ContextItemId, DependencyEdge};
 
 use crate::engine::{SimpleContextConfig, State};
 use crate::index::entity::entities_match;
@@ -54,7 +54,7 @@ pub(crate) fn push_linked(
                     continue;
                 }
                 if entities_match(&entities, &prior.entities) {
-                    item.dependencies.push(prior.id);
+                    item.dependencies.push(DependencyEdge::shares(prior.id));
                     edges += 1;
                     if edges >= MAX_DEPENDENCY_EDGES {
                         break;

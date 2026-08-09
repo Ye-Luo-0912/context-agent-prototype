@@ -1028,6 +1028,40 @@ extra scoring coefficient:
   unchanged catalog answers `capability.search` without re-reading the
   registry and re-cloning every tool description.
 
+## 9h. Performance P2: scope tree index, top-K selection, typed edges, batched IO
+
+- **The scope tree owns its id index (`ScopeTree`).** `State.scopes` is no
+  longer a bare `Vec`; the tree binds the scopes with an id index. Scope
+  ids are immutable, so the only structural mutation is `push` (insert at
+  slot + index in one step); close/ancestor lookups (`close_scope`,
+  `nearest_open_parent`, `in_scope_chain`, `belongs_to`'s parent walk) go
+  through `by_id` / `index_of` in O(1) instead of re-scanning per hop.
+  Checkpoints serialize only the scopes; the index rebuilds on restore.
+- **The materializer selects by top-K, not full sorts.** Candidate
+  ordering is deterministic (score descending, slot as the tie-break —
+  the old unstable sort left equal-score order undefined), and when the
+  caller caps the working set (`max_selected_items`) the candidate
+  universe is quickselect-trimmed to that bound *before* sorting
+  (O(n + k log k) instead of O(n log n); the cap also bounds how many
+  items can be selected, so trimming cannot change the outcome).
+  Dependency expansion pops a bounded max-heap
+  (`ExpandedCandidate`, top-8 window) instead of sorting the whole
+  expanded set.
+- **Dependency edges are typed.** `ContextItem.dependencies` (and the
+  externalized entry's captured edges) are now `Vec<DependencyEdge>`
+  (`{ target, kind }`) instead of bare ids: the graph records *why* an
+  item is referenced, so GC reachability and future supersession/evidence
+  policies can distinguish edge semantics. The `Deserialize` impl accepts
+  the pre-typed bare-id form, so old checkpoints keep loading.
+  `ContextItemSummary` stays a projection (target ids only), so replay and
+  the UI are untouched.
+- **Store IO batches concurrently.** The GC's IO phase and the Storage GC
+  run their file writes/reads/removals on a `JoinSet` instead of one
+  await per file: the lock-free window shrinks to the slowest single
+  operation instead of the sum. Each overflow item gets its own write
+  attempt, so a transient failure no longer forfeits the rest of the
+  batch.
+
 ## 10. Explicit non-goals for v0.1
 
 - vector embeddings;

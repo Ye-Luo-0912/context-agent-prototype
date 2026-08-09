@@ -124,6 +124,62 @@ impl Generation {
     }
 }
 
+/// The semantics of one explicit dependency edge. The dependency graph is
+/// typed so GC reachability, supersession and future policies can
+/// distinguish *why* an item is referenced instead of treating every edge
+/// alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DependencyKind {
+    /// The item was created with an entity overlap with the target: the
+    /// default link edge recorded at ingest (new item -> prior item).
+    #[default]
+    #[serde(rename = "shares_entities")]
+    SharesEntities,
+}
+
+/// One explicit dependency edge: the item depends on `target` for the
+/// given reason. Deserializes from both the typed form
+/// (`{"target": "...", "kind": "shares_entities"}`) and the pre-typed
+/// form (`"<uuid>"`, meaning `SharesEntities`), so checkpoints written
+/// before the graph was typed keep loading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DependencyEdge {
+    pub target: ContextItemId,
+    #[serde(default)]
+    pub kind: DependencyKind,
+}
+
+impl DependencyEdge {
+    pub fn shares(target: ContextItemId) -> Self {
+        Self {
+            target,
+            kind: DependencyKind::SharesEntities,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DependencyEdge {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Typed {
+                target: ContextItemId,
+                #[serde(default)]
+                kind: DependencyKind,
+            },
+            Legacy(ContextItemId),
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Typed { target, kind } => Ok(DependencyEdge { target, kind }),
+            Repr::Legacy(target) => Ok(DependencyEdge::shares(target)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextItem {
     pub id: ContextItemId,
@@ -155,8 +211,10 @@ pub struct ContextItem {
     pub created_turn: u64,
     #[serde(default)]
     pub last_access_turn: u64,
+    /// Explicit dependency edges to prior items (typed: why the item
+    /// references the target).
     #[serde(default)]
-    pub dependencies: Vec<ContextItemId>,
+    pub dependencies: Vec<DependencyEdge>,
     /// Typed labels: core content labels, lifecycle markers and extension
     /// namespaces. Promotion and GC decide membership by these instead of
     /// raw string matching.
@@ -616,7 +674,7 @@ pub struct ExternalizedContext {
     /// run a reachability closure over resident *and* external entries
     /// instead of checking only single incoming edges from the heap.
     #[serde(default)]
-    pub dependencies: Vec<ContextItemId>,
+    pub dependencies: Vec<DependencyEdge>,
     /// The `State::gc_epoch` at which this entry was last accessed. Aging
     /// Cold -> External compares *generations* (only full GC increments the
     /// epoch), never ticks — ingest/maintain/materialize also advance the
@@ -946,5 +1004,29 @@ mod tests {
         let bytes = serde_json::to_vec(&entries).unwrap();
         let err = serde_json::from_slice::<ContextMapView>(&bytes).unwrap_err();
         assert!(err.to_string().contains("exceeds the cap"));
+    }
+
+    #[test]
+    fn dependency_edge_roundtrips_and_accepts_the_legacy_id_form() {
+        let target = ContextItemId::new();
+        let edge = DependencyEdge::shares(target);
+
+        // The typed wire form carries the edge kind...
+        let json = serde_json::to_string(&edge).unwrap();
+        assert!(json.contains("shares_entities"), "{json}");
+        let back: DependencyEdge = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, edge);
+
+        // ...and the pre-typed form (a bare id string, as written by old
+        // checkpoints) still deserializes as a SharesEntities edge.
+        let legacy: DependencyEdge = serde_json::from_str(&format!("\"{target}\"")).unwrap();
+        assert_eq!(legacy, DependencyEdge::shares(target));
+    }
+
+    #[test]
+    fn legacy_dependency_arrays_in_checkpoints_still_load() {
+        let target = ContextItemId::new();
+        let legacy: Vec<DependencyEdge> = serde_json::from_str(&format!("[\"{target}\"]")).unwrap();
+        assert_eq!(legacy, vec![DependencyEdge::shares(target)]);
     }
 }

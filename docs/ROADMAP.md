@@ -1074,6 +1074,16 @@ tool surface is bounded by a deterministic schema budget
 `catalog_version`; see `docs/ARCHITECTURE.md` §9g and
 `docs/CONTEXT_LIFECYCLE.md` §9j.
 
+Performance P2 closed out the q32 performance list: the scope tree owns
+its id index (`ScopeTree`, O(1) close/ancestor lookups), the materializer
+selects by top-K (quickselect trim under `max_selected_items` +
+deterministic ordering, bounded max-heap for dependency expansion),
+dependency edges are typed (`DependencyEdge` with a legacy bare-id wire
+form), and the GC/storage IO phases batch their file operations on a
+`JoinSet` so the lock-free window shrinks to the slowest single
+operation; see `docs/ARCHITECTURE.md` §9h and
+`docs/CONTEXT_LIFECYCLE.md` §9k.
+
 ## Next: V1-M10 → V2 (ordered)
 
 1. **V1-M10 Runtime Consistency** — task authority, transactional task

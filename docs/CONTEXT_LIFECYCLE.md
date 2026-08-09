@@ -762,6 +762,26 @@ selection code: the constructor asserts `<= 32` and the wire
 deserializer rejects over-cap payloads, so the bound holds on both sides
 of the context-service boundary.
 
+### 9k. V1-M9: typed dependency edges and the scope tree index
+
+The dependency graph is typed. `ContextItem.dependencies` (and the
+externalized entry's captured edges, which the Storage GC reachability
+closure reads) are now `Vec<DependencyEdge>` — `{ target, kind }` —
+instead of bare ids, so GC reachability and future supersession/evidence
+policies can distinguish *why* an item is referenced. Today every edge is
+`SharesEntities` (the entity-overlap link recorded at ingest,
+new -> prior); the wire deserializer accepts the pre-typed bare-id form,
+so checkpoints written before the graph was typed keep loading.
+`ContextItemSummary.dependencies` remains a projection of target ids
+only, so replay and the UI are untouched.
+
+The scope tree owns its id index too. `State.scopes` is a `ScopeTree`
+(bare `Vec` + id index): scope ids are immutable, so `push` is the only
+structural mutation and close/ancestor lookups (`close_scope`,
+`nearest_open_parent`, the `belongs_to` parent walk) are O(1) `by_id` /
+`index_of` instead of per-hop linear scans. Checkpoints serialize only
+the scopes; the index rebuilds on restore.
+
 ## 10. What should become durable later
 
 A later policy can promote only structured outcomes such as:

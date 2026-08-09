@@ -2,7 +2,7 @@ use agent_contracts::{
     AgentError, AgentResult, ContextAction, ContextDiagnostics, ContextEngine, ContextGcReport,
     ContextIngress, ContextItem, ContextItemId, ContextItemSummary, ContextKind,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention,
-    ContextScope, ContextStateTransition, CoreLabel, FocusState, Label, MaterializedContext, Scope,
+    ContextScope, ContextStateTransition, CoreLabel, FocusState, Label, MaterializedContext,
     ScopeId, ScopeKind, ScopeState,
 };
 use serde::{Deserialize, Serialize};
@@ -144,8 +144,10 @@ pub(crate) struct State {
     pub(crate) hot_entities: Vec<String>,
     /// Runtime scope tree: one session scope, one task scope per task, one
     /// focus scope per task while it runs, one tool scope per tool call.
+    /// The tree owns its id index: `push`/`by_id`/`index_of` keep lookups
+    /// O(1) and structural mutations cannot drift the index.
     #[serde(default)]
-    pub(crate) scopes: Vec<Scope>,
+    pub(crate) scopes: crate::scope_tree::ScopeTree,
     /// Deepest scope currently receiving attention (tool > focus > task).
     #[serde(default)]
     pub(crate) active_scope_id: Option<ScopeId>,
@@ -360,7 +362,7 @@ impl ContextEngine for SimpleContextEngine {
                 state.focus = None;
                 state.hot_entities.clear();
                 if let Some(task_id) = task_id {
-                    for scope in &mut state.scopes {
+                    for scope in state.scopes.iter_mut() {
                         if scope.task_id == Some(task_id) && scope.state == ScopeState::Active {
                             scope.state = ScopeState::Suspended;
                         }

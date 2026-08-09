@@ -201,25 +201,44 @@ pub(crate) async fn run_store_io(config: &SimpleContextConfig, plan: &mut GcPlan
         externalize_failed: Vec::new(),
         recalled: Vec::new(),
     };
-    // Write overflow items. On the first failure the failed item and every
-    // remaining candidate go back to the buffer (the store-unavailable
-    // fallback, applied by the commit).
+    // Write overflow items concurrently. The IO phase holds no state lock,
+    // so parallel file writes shrink the lock-free window to the slowest
+    // single write instead of the sum of every write. Failed writes go
+    // back to the buffer (the store-unavailable fallback, applied by the
+    // commit) — each item gets its own write attempt, so a transient
+    // failure on one file no longer forfeits the rest of the batch.
     let pending = std::mem::take(&mut plan.externalize);
-    let mut pending = pending.into_iter();
-    while let Some(item) = pending.next() {
-        match store::externalize_async(&dir, &item).await {
-            Ok(context_ref) => io.externalized.push((item, context_ref)),
-            Err(_) => {
-                io.externalize_failed.push(item);
-                io.externalize_failed.extend(pending);
-                break;
-            }
+    let mut writes = tokio::task::JoinSet::new();
+    for item in pending {
+        let dir = dir.clone();
+        writes.spawn(async move {
+            let outcome = store::externalize_async(&dir, &item).await;
+            (item, outcome)
+        });
+    }
+    while let Some(joined) = writes.join_next().await {
+        // `externalize_async` has no panic path (every fallible step
+        // returns a `Result`), so a `JoinError` here is unreachable in
+        // practice; if one ever fires, the item is lost with its task and
+        // the store fallback cannot restore it.
+        match joined {
+            Ok((item, Ok(context_ref))) => io.externalized.push((item, context_ref)),
+            Ok((item, Err(_))) => io.externalize_failed.push(item),
+            Err(_) => {}
         }
     }
     // Recall reads: only entries whose entities matched are read; failed
-    // reads leave the entry in the map for a later pass.
-    for item_id in plan.recall_candidates.drain(..) {
-        if let Some(item) = store::read_item_async(&dir, item_id).await {
+    // reads leave the entry in the map for a later pass. Same concurrency
+    // rationale — reads run in parallel so the lock-free window stays
+    // bounded by the slowest read, not the sum.
+    let recall: Vec<ContextItemId> = plan.recall_candidates.drain(..).collect();
+    let mut reads = tokio::task::JoinSet::new();
+    for item_id in recall {
+        let dir = dir.clone();
+        reads.spawn(async move { (item_id, store::read_item_async(&dir, item_id).await) });
+    }
+    while let Some(joined) = reads.join_next().await {
+        if let Ok((_item_id, Some(item))) = joined {
             io.recalled.push(item);
         }
     }
@@ -385,10 +404,10 @@ fn mark_roots(
             let Some(item) = state.items.iter().find(|item| item.id == id) else {
                 continue;
             };
-            for dependency in &item.dependencies {
-                if seen.insert(*dependency) {
-                    marked.push(*dependency);
-                    queue.push(*dependency);
+            for edge in &item.dependencies {
+                if seen.insert(edge.target) {
+                    marked.push(edge.target);
+                    queue.push(edge.target);
                     added += 1;
                 }
             }
@@ -406,7 +425,7 @@ fn in_scope_chain(state: &State, item: &ContextItem, target_id: ScopeId) -> bool
         if sid == target_id {
             return true;
         }
-        let Some(scope) = state.scopes.iter().find(|scope| scope.id == sid) else {
+        let Some(scope) = state.scopes.by_id(sid) else {
             return false;
         };
         if scope.state == ScopeState::Closed {
@@ -969,7 +988,7 @@ mod tests {
                 .find(|item| item.kind == ContextKind::ToolObservation)
                 .expect("finding item");
             assert!(
-                b.dependencies.contains(&a.id),
+                b.dependencies.iter().any(|edge| edge.target == a.id),
                 "the finding must depend on the decision it builds on"
             );
             (a.id, b.id)

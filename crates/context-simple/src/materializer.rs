@@ -10,6 +10,7 @@ use agent_contracts::{
 use crate::diagnostics;
 use crate::engine::{SimpleContextConfig, State};
 use crate::gc::reachability::is_excluded;
+use crate::index::dependency::MAX_DEPENDENCY_EDGES;
 use crate::item::{approx_tokens, short_id};
 use crate::policy::score_item_with_breakdown;
 
@@ -18,6 +19,41 @@ const MAX_EXPANSION_ITEMS: usize = 8;
 /// Token reserve carved out of the model budget so dependency expansion
 /// can follow selected items without blowing the budget.
 const EXPANSION_RESERVE_TOKENS: usize = 1024;
+
+/// One dependency-expansion candidate for the bounded top-K heap: ordered
+/// by (score descending, slot ascending) so equal scores pop
+/// deterministically. The heap never holds the whole expanded set sorted —
+/// it pops exactly the best candidates until the expansion window is full.
+struct ExpandedCandidate {
+    index: usize,
+    score: f32,
+    tokens: usize,
+    depends_on: ContextItemId,
+    breakdown: ScoreBreakdown,
+}
+
+impl Ord for ExpandedCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score
+            .partial_cmp(&other.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| other.index.cmp(&self.index))
+    }
+}
+
+impl PartialOrd for ExpandedCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ExpandedCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for ExpandedCandidate {}
 
 /// Materialize the working set for one model request: score the heap, pack
 /// the best candidates into the budget and expand along explicit dependency
@@ -47,6 +83,8 @@ pub(crate) fn materialize(
     // structured methods (restored checkpoints, tests) triggers a rebuild
     // before any indexed query reads it.
     state.external.ensure_consistent();
+    // The scope tree's length guard, for the same reason.
+    state.scopes.ensure_consistent();
     let active_task_id = focus.as_ref().map(|f| f.task_id);
     let mut active_scopes: HashSet<ScopeId> = HashSet::new();
     for scope in &state.scopes {
@@ -93,7 +131,25 @@ pub(crate) fn materialize(
         candidates.push((index, breakdown, tokens));
     }
 
-    candidates.sort_by(|a, b| b.1.total.partial_cmp(&a.1.total).unwrap_or(Ordering::Equal));
+    // Deterministic candidate order: score descending, slot index as the
+    // tie-break (the old unstable sort left equal-score order undefined).
+    // When the caller caps the working set, quickselect trims the candidate
+    // universe to that bound *before* sorting — the cap also bounds how
+    // many items can ever be selected, so trimming cannot change the
+    // outcome, and the sort cost drops from O(n log n) to O(n + k log k).
+    let by_score = |a: &(usize, ScoreBreakdown, usize), b: &(usize, ScoreBreakdown, usize)| {
+        b.1.total
+            .partial_cmp(&a.1.total)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    };
+    if let Some(max) = query.hints.max_selected_items
+        && max < candidates.len()
+    {
+        candidates.select_nth_unstable_by(max, by_score);
+        candidates.truncate(max);
+    }
+    candidates.sort_by(by_score);
 
     // The engine owns the focus frame and the selected items; the current
     // input rides in the runtime's turn frame and is charged there, so it is
@@ -179,11 +235,19 @@ pub(crate) fn materialize(
         .collect();
     if config.dependency_expansion {
         let mut expansion_budget = remaining + expansion_reserve;
-        let mut expanded: Vec<(usize, ScoreBreakdown, usize, ContextItemId)> = Vec::new();
+        // Bounded top-K: the expansion window is at most MAX_EXPANSION_ITEMS
+        // distinct items, so a max-heap pops exactly the best candidates
+        // (score descending, slot as the tie-break) instead of sorting the
+        // whole expanded set.
+        let mut expanded: std::collections::BinaryHeap<ExpandedCandidate> =
+            std::collections::BinaryHeap::with_capacity(
+                selected_indices.len().saturating_mul(MAX_DEPENDENCY_EDGES),
+            );
         for &index in &selected_indices {
             let item = &state.items[index];
             let dependencies = item.dependencies.clone();
-            for dep_id in dependencies {
+            for edge in dependencies {
+                let dep_id = edge.target;
                 if selected_ids.contains(&dep_id) {
                     continue;
                 }
@@ -202,13 +266,18 @@ pub(crate) fn materialize(
                     continue;
                 }
                 let tokens = approx_tokens(&dep.content);
-                expanded.push((dep_index, breakdown, tokens, item.id));
+                expanded.push(ExpandedCandidate {
+                    index: dep_index,
+                    score: breakdown.total,
+                    tokens,
+                    depends_on: item.id,
+                    breakdown,
+                });
             }
         }
-        expanded.sort_by(|a, b| b.1.total.partial_cmp(&a.1.total).unwrap_or(Ordering::Equal));
         let mut seen: Vec<usize> = Vec::new();
         let mut added = 0usize;
-        for (dep_index, breakdown, tokens, depends_on) in expanded {
+        while let Some(candidate) = expanded.pop() {
             if added >= MAX_EXPANSION_ITEMS {
                 break;
             }
@@ -219,6 +288,7 @@ pub(crate) fn materialize(
             {
                 break;
             }
+            let dep_index = candidate.index;
             if seen.contains(&dep_index) {
                 continue;
             }
@@ -227,18 +297,21 @@ pub(crate) fn materialize(
             // The expansion slice is a hard bound for every item — pinned
             // dependencies included. Priority is a selection-order concern,
             // not a budget exemption.
-            if tokens > expansion_budget {
+            if candidate.tokens > expansion_budget {
                 continue;
             }
-            expansion_budget = expansion_budget.saturating_sub(tokens);
+            expansion_budget = expansion_budget.saturating_sub(candidate.tokens);
             selected_ids.push(item.id);
             selected_indices.push(dep_index);
             selections.push(ContextSelection {
                 item_id: item.id,
-                score: breakdown.total,
-                approx_tokens: tokens,
-                reason: format!("included as dependency of item {}", short_id(&depends_on)),
-                breakdown,
+                score: candidate.score,
+                approx_tokens: candidate.tokens,
+                reason: format!(
+                    "included as dependency of item {}",
+                    short_id(&candidate.depends_on)
+                ),
+                breakdown: candidate.breakdown,
             });
             added += 1;
         }

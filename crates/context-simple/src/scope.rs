@@ -72,7 +72,7 @@ pub(crate) fn ensure_task_scope(state: &mut State, task_id: TaskId) -> ScopeId {
         state.scopes.push(scope);
         id
     };
-    for scope in &mut state.scopes {
+    for scope in state.scopes.iter_mut() {
         let is_other_task = scope.kind == ScopeKind::Task && scope.id != task_scope_id;
         let is_other_focus =
             scope.kind == ScopeKind::Focus && scope.parent.is_some_and(|p| p != task_scope_id);
@@ -146,15 +146,18 @@ pub(crate) fn open_scope(state: &mut State, kind: ScopeKind, parent: Option<Scop
 /// the transitions the close produced. Unknown or already-closed scopes are
 /// no-ops.
 pub(crate) fn close_scope(state: &mut State, scope_id: ScopeId) -> Vec<ContextStateTransition> {
-    let Some(index) = state.scopes.iter().position(|scope| scope.id == scope_id) else {
+    let Some(index) = state.scopes.index_of(scope_id) else {
         return Vec::new();
     };
     if state.scopes[index].state == ScopeState::Closed {
         return Vec::new();
     }
-    state.scopes[index].state = ScopeState::Closed;
-    state.scopes[index].closed_tick = Some(state.tick);
-    let scope = state.scopes[index].clone();
+    let scope = {
+        let scope = state.scopes.get_mut(index).expect("index_of slot exists");
+        scope.state = ScopeState::Closed;
+        scope.closed_tick = Some(state.tick);
+        scope.clone()
+    };
     let parent_id = nearest_open_parent(state, &scope);
     if state.active_scope_id == Some(scope.id) {
         state.active_scope_id = parent_id;
@@ -193,15 +196,18 @@ pub(crate) fn drain_closed_scopes(state: &mut State, turn: u64) -> Vec<ContextSt
     let mut transitions = Vec::new();
     let queued = std::mem::take(&mut state.pending_closed_scopes);
     for scope_id in queued {
-        let Some(index) = state.scopes.iter().position(|scope| scope.id == scope_id) else {
+        let Some(index) = state.scopes.index_of(scope_id) else {
             continue;
         };
         if state.scopes[index].state == ScopeState::Closed {
             continue;
         }
-        state.scopes[index].state = ScopeState::Closed;
-        state.scopes[index].closed_tick = Some(state.tick);
-        let scope = state.scopes[index].clone();
+        let scope = {
+            let scope = state.scopes.get_mut(index).expect("index_of slot exists");
+            scope.state = ScopeState::Closed;
+            scope.closed_tick = Some(state.tick);
+            scope.clone()
+        };
         let parent_id = nearest_open_parent(state, &scope);
         if state.active_scope_id == Some(scope.id) {
             state.active_scope_id = parent_id;
@@ -218,17 +224,12 @@ fn nearest_open_parent(state: &State, scope: &Scope) -> Option<ScopeId> {
     while let Some(id) = current {
         let closed = state
             .scopes
-            .iter()
-            .find(|scope| scope.id == id)
+            .by_id(id)
             .is_none_or(|scope| scope.state == ScopeState::Closed);
         if !closed {
             return Some(id);
         }
-        current = state
-            .scopes
-            .iter()
-            .find(|scope| scope.id == id)
-            .and_then(|scope| scope.parent);
+        current = state.scopes.by_id(id).and_then(|scope| scope.parent);
     }
     None
 }
@@ -250,13 +251,14 @@ fn close_members(
     if matches!(scope.kind, ScopeKind::Session) {
         return transitions;
     }
-    let parent_scope = parent_id
-        .and_then(|pid| state.scopes.iter().find(|scope| scope.id == pid))
-        .map_or(ContextScope::Session, |parent| match parent.kind {
-            ScopeKind::Session => ContextScope::Session,
-            ScopeKind::Task | ScopeKind::Focus => ContextScope::Task,
-            ScopeKind::Tool => ContextScope::Turn,
-        });
+    let parent_scope =
+        parent_id
+            .and_then(|pid| state.scopes.by_id(pid))
+            .map_or(ContextScope::Session, |parent| match parent.kind {
+                ScopeKind::Session => ContextScope::Session,
+                ScopeKind::Task | ScopeKind::Focus => ContextScope::Task,
+                ScopeKind::Tool => ContextScope::Turn,
+            });
     // A precomputed view of the tree so membership can be checked while
     // items are mutated.
     let scope_index: Vec<(ScopeId, ScopeKind, Option<ScopeId>)> = state

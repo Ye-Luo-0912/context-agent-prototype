@@ -265,7 +265,7 @@ pub(crate) fn plan_storage_gc(
         .items
         .iter()
         .chain(state.eviction_buffer.iter())
-        .flat_map(|item| item.dependencies.iter().copied())
+        .flat_map(|item| item.dependencies.iter().map(|edge| edge.target))
         .collect();
     loop {
         let mut grew = false;
@@ -274,9 +274,9 @@ pub(crate) fn plan_storage_gc(
                 && entry
                     .dependencies
                     .iter()
-                    .any(|dep| !referenced.contains(dep))
+                    .any(|edge| !referenced.contains(&edge.target))
             {
-                referenced.extend(entry.dependencies.iter().copied());
+                referenced.extend(entry.dependencies.iter().map(|edge| edge.target));
                 grew = true;
             }
         }
@@ -308,20 +308,35 @@ pub(crate) struct StorageGcPlan {
 
 /// Phase 2 (no lock held): remove the planned store files. Real IO errors
 /// keep their entries — degraded storage is surfaced, not silently treated
-/// as "already deleted".
+/// as "already deleted". Deletions run concurrently (the phase holds no
+/// lock, so parallel `remove_file` calls shrink the lock-free window to
+/// the slowest single deletion instead of the sum).
 pub(crate) async fn run_storage_io(
     dir: &Path,
     plan: &StorageGcPlan,
 ) -> Vec<(ContextItemId, Result<DeleteOutcome, std::io::Error>)> {
-    let mut results = Vec::with_capacity(plan.candidates.len());
+    let mut tasks = tokio::task::JoinSet::new();
     for (item_id, _) in &plan.candidates {
-        let path = file_path(dir, *item_id);
-        let outcome = match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(DeleteOutcome::Deleted),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DeleteOutcome::NotFound),
-            Err(e) => Err(e),
-        };
-        results.push((*item_id, outcome));
+        let item_id = *item_id;
+        let path = file_path(dir, item_id);
+        tasks.spawn(async move {
+            let outcome = match tokio::fs::remove_file(&path).await {
+                Ok(()) => Ok(DeleteOutcome::Deleted),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DeleteOutcome::NotFound),
+                Err(e) => Err(e),
+            };
+            (item_id, outcome)
+        });
+    }
+    let mut results = Vec::with_capacity(plan.candidates.len());
+    while let Some(joined) = tasks.join_next().await {
+        // `remove_file` returns a `Result`, so a `JoinError` here is
+        // unreachable in practice (no panic path); if one ever fires, that
+        // entry simply stays in the in-memory map, which is the same
+        // conservative outcome as an IO error.
+        if let Ok((item_id, outcome)) = joined {
+            results.push((item_id, outcome));
+        }
     }
     results
 }
@@ -440,7 +455,7 @@ mod tests {
     use super::*;
     use crate::engine::{SimpleContextConfig, State};
     use crate::item::make_item;
-    use agent_contracts::{ContextKind, ContextScope, SemanticState};
+    use agent_contracts::{ContextKind, ContextScope, DependencyEdge, SemanticState};
 
     fn store_config(dir: &Path) -> SimpleContextConfig {
         SimpleContextConfig {
@@ -505,7 +520,7 @@ mod tests {
         }
         // A resident item depends on the dead entry: it must survive.
         let mut holder = test_item(ContextItemId::new(), "holder");
-        holder.dependencies.push(dead_id);
+        holder.dependencies.push(DependencyEdge::shares(dead_id));
         state.items.push(holder);
 
         let report = run_storage_gc(&mut state, &config, 100);
@@ -540,7 +555,8 @@ mod tests {
     #[test]
     fn external_entries_carry_the_entity_signature_and_dependencies() {
         let mut item = test_item(ContextItemId::new(), "fix AuthService.rs");
-        item.dependencies.push(ContextItemId::new());
+        item.dependencies
+            .push(DependencyEdge::shares(ContextItemId::new()));
         let reference = ContextRef {
             uri: "context://run/x".into(),
             item_id: item.id,
@@ -573,9 +589,9 @@ mod tests {
         target.semantic = SemanticState::Tombstoned;
         let mut chain = test_item(chain_id, "chain dead content");
         chain.semantic = SemanticState::Tombstoned;
-        chain.dependencies.push(target_id);
+        chain.dependencies.push(DependencyEdge::shares(target_id));
         let mut holder = test_item(ContextItemId::new(), "resident holder");
-        holder.dependencies.push(chain_id);
+        holder.dependencies.push(DependencyEdge::shares(chain_id));
         state.items.push(holder);
         for item in [&target, &chain] {
             let reference = externalize(dir.path(), item).unwrap();
