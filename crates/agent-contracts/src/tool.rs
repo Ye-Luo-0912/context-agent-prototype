@@ -173,13 +173,9 @@ pub enum EngineQuery {
         limit: usize,
     },
     /// Metadata of one externalized entry by item id (no store read).
-    InspectExternal {
-        item_id: ContextItemId,
-    },
+    InspectExternal { item_id: ContextItemId },
     /// Full content of one externalized item, pulled back deliberately.
-    FetchExternal {
-        item_id: ContextItemId,
-    },
+    FetchExternal { item_id: ContextItemId },
 }
 
 impl std::fmt::Debug for ToolOutcome {

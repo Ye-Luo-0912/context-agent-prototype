@@ -70,7 +70,7 @@ Important consequences:
 
 ### ContextEngine
 
-The kernel needs five operations only:
+The kernel needs a small fixed surface:
 
 1. `ingest` — submit a meaningful runtime observation.
 2. `maintain` — trigger continuous lifecycle maintenance (the semantic
@@ -81,15 +81,22 @@ The kernel needs five operations only:
    implementation, so engines without a GC pass (baselines, the wire
    adapter) keep working unchanged.
 5. `diagnostics` — expose bounded observability.
+6. `search_external` / `inspect_external` / `fetch_external` — the
+   deterministic retrieval surface for externalized refs (default no-ops,
+   so engines without a store keep working). Search filters the indexed
+   dimensions of the external map (entity signature, kind, scope, task);
+   inspect returns one entry's metadata without a store read; fetch pulls
+   the full content back. See `docs/CONTEXT_LIFECYCLE.md` §9g.
 
 The API is asynchronous even though `context-simple` is in-process. This leaves room for a future ContextCore service adapter over local IPC/HTTP/gRPC without changing the kernel contract.
 
 Since V1-P0-2 the engine never renders prompt text. It answers a
 `ContextQuery { current_input, budget_tokens, hints }` with a
-`MaterializedContext { focus, items, selected, approx_tokens,
-diagnostics }`; `items` are structured `MaterializedItem`s and the
-runtime-owned `PromptAssembler` is the only place that turns them into
-`ModelMessage`s.
+`MaterializedContext { focus, items, external, selected, approx_tokens,
+diagnostics }`; `items` are structured `MaterializedItem`s, `external` is
+a bounded refs-only view of the store (max 32 entries, never the full
+map), and the runtime-owned `PromptAssembler` is the only place that turns
+them into `ModelMessage`s.
 
 Three implementations exist behind the same contract, plus the P5
 process-boundary adapter:
@@ -778,6 +785,48 @@ vocabulary leaks through the Agent API. A real ContextCore runtime replaces
 approvals, TUI and provider are untouched (`agent-tui --context=service`).
 
 Do not move Agent Kernel, tools, approvals, TUI, or provider code into ContextCore merely because ContextCore supplies context selection.
+
+## 9b. Process capability boundary: sandbox + cancellation (V1-M9)
+
+A process capability is not sandboxed by *telling* the child what it may
+do — the manifest's `permissions` array is informational, not
+enforcement. Since V1-M9 every out-of-process child runs inside an
+explicit `ProcessSandbox` (shared `ProcessHost`,
+`context-contextcore::host`):
+
+- **Environment whitelist** — `env_whitelist: Option<Vec<String>>`: when
+  set, the child inherits *only* the listed parent variables, plus the
+  explicit `ProcessHostConfig::env` grants. The process-capability
+  adapter's strict profile whitelists `PATH`/`SystemRoot`/`SystemDrive`/
+  `TEMP`/`TMP` only, so `OPENAI_API_KEY`, `HOME`, credentials and friends
+  never cross the boundary by default. `None` keeps the historical
+  inherit-everything behavior (the context-service default).
+- **Dedicated cwd** — `cwd: Option<PathBuf>`: the child runs in its own
+  directory, created at connect, never the parent's cwd — a generated
+  capability cannot roam the workspace by relative paths.
+- **Process/job limits and CPU quota** — Unix `pre_exec` rlimits
+  (`RLIMIT_CPU`, `RLIMIT_NPROC`) applied right after fork; the adapter
+  sets 60 s CPU and 16 processes.
+- **Kill tree on cancel** — `call_with_cancel(op, cancel)` selects the
+  framed request against the invocation's `CancellationToken`: on cancel
+  (user `/cancel`, superseded operation) it poisons the connection and
+  kills the whole process tree immediately — Unix: SIGKILL to the process
+  group the child was spawned into (`process_group(0)`); Windows:
+  `taskkill /PID <pid> /T /F`. A cancelled capability stops producing
+  side effects *now*, not at the request deadline.
+- **Brokered host APIs** — the child only ever speaks the bounded
+  JSON-lines ops (`ping`/`invoke`); every host side effect goes through
+  the same framed, deadline-bounded, poisoned-connection protocol as the
+  context service.
+
+`ProcessCapabilityAdapter::from_manifest` applies this strict profile to
+every process capability; `invoke` forwards the call and the granted
+permissions (informational), but the sandbox — not the manifest — is what
+enforces the boundary. Filesystem isolation beyond the dedicated cwd and
+an explicit network policy are still open (a future dedicated capability
+sandbox); until then **V2 autonomous capability generation stays gated** —
+a generated capability only runs after explicit `enable`, and only inside
+the sandbox above.
 
 ## 10. Explicit non-goals for v0.1
 

@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use agent_contracts::{
     AttentionState, ContextEviction, ContextGcReport, ContextItem, ContextItemId,
-    ContextReactivation, ContextResidency, ContextRetention, ContextScope, FocusState, ScopeId,
-    ScopeKind, ScopeState,
+    ContextReactivation, ContextRef, ContextResidency, ContextRetention, ContextScope, FocusState,
+    ScopeId, ScopeKind, ScopeState,
 };
 
 use crate::diagnostics;
@@ -16,10 +16,46 @@ use crate::store;
 /// set stays a bounded, cheap reachability view.
 const MAX_MARKED_DEPENDENCIES: usize = 8;
 
-/// One full GC pass: mark roots, sweep unmarked items into the bounded
-/// reversible eviction buffer, reactivate items that became relevant again,
-/// and — when the buffer overflows — externalize to the context store
-/// instead of purging.
+/// Everything one full GC pass decided under the state lock. The heap and
+/// the eviction buffer are already in their post-sweep state when the plan
+/// returns — the sweep, warm-buffer reactivation and Cold -> External aging
+/// are all in-memory. What remains is store IO (writing overflow items,
+/// reading back hot-entity recall candidates) which must not hold the
+/// lock, plus the commit that applies the IO results.
+pub(crate) struct GcPlan {
+    /// Buffer items whose store write is deferred to the IO phase (oldest
+    /// first; removed from the buffer by the plan).
+    pub(crate) externalize: Vec<ContextItem>,
+    /// Cold-store entry ids whose entities match the hot set; read back in
+    /// the IO phase. Entries stay in the map until a successful read.
+    pub(crate) recall_candidates: Vec<ContextItemId>,
+    /// Report data decided under lock.
+    pub(crate) evictions: Vec<ContextEviction>,
+    pub(crate) buffer_reactivations: Vec<ContextReactivation>,
+    pub(crate) marked_roots: usize,
+    pub(crate) evicted: usize,
+    pub(crate) reactivated: usize,
+    pub(crate) aged_external: usize,
+}
+
+/// The store IO outcomes, applied by the commit under a fresh lock.
+pub(crate) struct GcIoResult {
+    /// (item, reference) successfully written to the store.
+    pub(crate) externalized: Vec<(ContextItem, ContextRef)>,
+    /// Items whose store write failed, oldest first; the commit reinserts
+    /// them at the front of the buffer so the overflow retries next pass
+    /// (the store-unavailable fallback, decided outside the lock).
+    pub(crate) externalize_failed: Vec<ContextItem>,
+    /// Recalled items with full content read back from the store.
+    pub(crate) recalled: Vec<ContextItem>,
+}
+
+/// One full GC pass, phase 1 (planning, under the state lock): mark roots,
+/// sweep unmarked items into the bounded reversible eviction buffer,
+/// reactivate items that became relevant again, age Cold entries, and
+/// decide which overflow items to externalize and which store entries to
+/// recall — *without touching the disk*. `None` when there is nothing to
+/// do (GC disabled or an empty heap/buffer).
 ///
 /// The GC dimensions are separated:
 /// - `residency` (Resident / Warm / Cold / External) says where the item
@@ -33,19 +69,13 @@ const MAX_MARKED_DEPENDENCIES: usize = 8;
 ///
 /// Every eviction, reactivation and externalization carries an explicit
 /// reason, so the report can explain *why* an item moved where it did.
-pub(crate) fn run_full_gc(
+pub(crate) fn plan_full_gc(
     state: &mut State,
     config: &SimpleContextConfig,
     now_tick: u64,
-) -> ContextGcReport {
-    let mut report = ContextGcReport {
-        resident: state.items.len(),
-        ..ContextGcReport::default()
-    };
-
+) -> Option<GcPlan> {
     if !config.gc_enabled || state.items.is_empty() && state.eviction_buffer.is_empty() {
-        report.diagnostics = diagnostics::compute(state);
-        return report;
+        return None;
     }
 
     // One full GC generation. External aging and TTLs count generations —
@@ -53,6 +83,17 @@ pub(crate) fn run_full_gc(
     // grows on ingest/maintain/materialize.
     state.gc_epoch += 1;
     let gc_epoch = state.gc_epoch;
+
+    let mut plan = GcPlan {
+        externalize: Vec::new(),
+        recall_candidates: Vec::new(),
+        evictions: Vec::new(),
+        buffer_reactivations: Vec::new(),
+        marked_roots: 0,
+        evicted: 0,
+        reactivated: 0,
+        aged_external: 0,
+    };
 
     // ----- Mark phase: the root set --------------------------------
     // Roots are the current attention: pins, members of the active focus
@@ -72,7 +113,7 @@ pub(crate) fn run_full_gc(
     // buffer, then the store) instead of letting it linger in the heap and
     // checkpoints forever.
     let mut survivors: Vec<ContextItem> = Vec::with_capacity(state.items.len());
-    for item in state.items.drain(..) {
+    for item in state.items.take_all() {
         // A consumed ephemeral observation left attention (Archived) even
         // though it is still a member of the focus scope: root protection
         // is for the working set, not for spent turn observations — they
@@ -99,7 +140,7 @@ pub(crate) fn run_full_gc(
         let generation = item.gc_generation;
         if eviction_candidate(&item, config, now_tick, generation) {
             let reason = eviction_reason(&item, config, now_tick, generation);
-            report.evictions.push(ContextEviction {
+            plan.evictions.push(ContextEviction {
                 item_id: item.id,
                 kind: item.kind,
                 scope: item.scope,
@@ -107,7 +148,7 @@ pub(crate) fn run_full_gc(
                 evicted_at_tick: now_tick,
                 reason,
             });
-            report.evicted += 1;
+            plan.evicted += 1;
             state.gc_evicted_total += 1;
             let mut evicted = item;
             evicted.residency = ContextResidency::Warm;
@@ -121,46 +162,142 @@ pub(crate) fn run_full_gc(
             survivors.push(survivor);
         }
     }
-    state.items = survivors;
-    // The sweep rebuilt the heap wholesale; the indexes follow.
-    state.indexes.rebuild(&state.items);
+    // The sweep rebuilt the heap wholesale; the heap re-indexes itself.
+    state.items.replace_all(survivors);
 
     // ----- Reactivate phase: items that became relevant again ------
-    // Warm buffer items and Cold store entries both get a second chance:
-    // hot entities or a high score (buffer) / hot entities (store recall).
-    reactivate(state, config, now_tick, &mut report);
+    // Warm buffer items (content in memory) and Cold store entries (ids
+    // only — the content read happens in the IO phase) both get a second
+    // chance on hot entities / a high score.
+    reactivate(state, config, now_tick, &mut plan);
 
     // ----- Externalize phase: the buffer is bounded -----------------
     // Context GC never purges: overflow writes the item to the context
     // store and keeps only a lightweight entry (Cold), which later ages to
-    // External. Only Storage GC may delete store files.
+    // External. The *decision* is taken here; the writes happen in the IO
+    // phase so the lock is not held across disk IO. Only Storage GC may
+    // delete store files.
     while state.eviction_buffer.len() > config.gc_buffer_capacity {
         let item = state.eviction_buffer.remove(0);
-        match store::externalize(&store::store_dir(config), &item) {
-            Ok(context_ref) => {
-                state
-                    .external
-                    .push(store::to_external_entry(&item, context_ref, now_tick, gc_epoch));
-                report.externalized += 1;
-                state.gc_externalized_total += 1;
-            }
-            Err(_) => {
-                // Store unavailable: keep the item in the buffer and retry
-                // next pass (the default store directory is writable, so
-                // this is a degraded-mode fallback, not the norm).
-                state.eviction_buffer.insert(0, item);
-                break;
-            }
-        }
+        plan.externalize.push(item);
     }
 
     // Cold -> External aging: entries untouched for the configured number
     // of full GC generations become references only.
-    report.aged_external = store::age_external_entries(state, config, gc_epoch);
+    plan.aged_external = store::age_external_entries(state, config, gc_epoch);
 
-    report.marked_roots = marked.len();
-    report.resident = state.items.len();
-    report.diagnostics = diagnostics::compute(state);
+    plan.marked_roots = marked.len();
+    Some(plan)
+}
+
+/// One full GC pass, phase 2 (IO, *without* the state lock): write the
+/// overflow items to the store and read back the recall candidates. The
+/// heap/buffer stay in their post-plan state during this window, so
+/// concurrent ingests see a consistent post-sweep heap.
+pub(crate) async fn run_store_io(config: &SimpleContextConfig, plan: &mut GcPlan) -> GcIoResult {
+    let dir = store::store_dir(config);
+    let mut io = GcIoResult {
+        externalized: Vec::new(),
+        externalize_failed: Vec::new(),
+        recalled: Vec::new(),
+    };
+    // Write overflow items. On the first failure the failed item and every
+    // remaining candidate go back to the buffer (the store-unavailable
+    // fallback, applied by the commit).
+    let pending = std::mem::take(&mut plan.externalize);
+    let mut pending = pending.into_iter();
+    while let Some(item) = pending.next() {
+        match store::externalize_async(&dir, &item).await {
+            Ok(context_ref) => io.externalized.push((item, context_ref)),
+            Err(_) => {
+                io.externalize_failed.push(item);
+                io.externalize_failed.extend(pending);
+                break;
+            }
+        }
+    }
+    // Recall reads: only entries whose entities matched are read; failed
+    // reads leave the entry in the map for a later pass.
+    for item_id in plan.recall_candidates.drain(..) {
+        if let Some(item) = store::read_item_async(&dir, item_id).await {
+            io.recalled.push(item);
+        }
+    }
+    io
+}
+
+/// One full GC pass, phase 3 (commit, under a fresh state lock): apply the
+/// IO results — externalized entries join the map, recalled items re-enter
+/// the heap, failed writes return to the buffer — and assemble the report.
+pub(crate) fn commit_full_gc(
+    state: &mut State,
+    now_tick: u64,
+    plan: GcPlan,
+    io: GcIoResult,
+) -> ContextGcReport {
+    // The buffer: failed/undone writes come back at the front, so the
+    // overflow retries on the next pass (order preserved, oldest first).
+    let mut buffer = io.externalize_failed;
+    buffer.append(&mut state.eviction_buffer);
+    state.eviction_buffer = buffer;
+
+    // The store map: successful writes become Cold entries...
+    let externalized_count = io.externalized.len();
+    for (item, context_ref) in io.externalized {
+        state.gc_externalized_total += 1;
+        state.external.push(store::to_external_entry(
+            &item,
+            context_ref,
+            now_tick,
+            state.gc_epoch,
+        ));
+    }
+    // ...and successfully recalled entries leave the map: their content is
+    // resident again, so keeping the reference would duplicate it.
+    let recalled_ids: HashSet<ContextItemId> = io.recalled.iter().map(|item| item.id).collect();
+    if !recalled_ids.is_empty() {
+        state
+            .external
+            .retain(|entry| !recalled_ids.contains(&entry.item_id));
+    }
+
+    // Recalled items re-enter the heap as active residents, exactly like a
+    // warm-buffer reactivation.
+    let mut recalled_reactivations: Vec<ContextReactivation> = Vec::new();
+    for mut item in io.recalled {
+        let reason = "entities are hot again in the working set (recalled from the context store)"
+            .to_string();
+        recalled_reactivations.push(ContextReactivation {
+            item_id: item.id,
+            kind: item.kind,
+            scope: item.scope,
+            reactivated_at_tick: now_tick,
+            reason,
+        });
+        item.attention = AttentionState::Active;
+        item.relevance = item.relevance.max(0.5);
+        item.residency = ContextResidency::Resident;
+        item.gc_generation = 0;
+        item.evicted_at_tick = None;
+        item.last_access_tick = now_tick;
+        state.items.push(item);
+        state.gc_reactivated_total += 1;
+    }
+
+    let mut report = ContextGcReport {
+        resident: state.items.len(),
+        evicted: plan.evicted,
+        marked_roots: plan.marked_roots,
+        externalized: externalized_count,
+        reactivated: plan.reactivated + recalled_reactivations.len(),
+        aged_external: plan.aged_external,
+        diagnostics: diagnostics::compute(state),
+        ..ContextGcReport::default()
+    };
+    report.evictions = plan.evictions;
+    let mut reactivations = plan.buffer_reactivations;
+    reactivations.extend(recalled_reactivations);
+    report.reactivations = reactivations;
     report
 }
 
@@ -366,20 +503,15 @@ fn eviction_reason(
 /// items (superseded decisions, verified-fixed errors, tombstoned) never
 /// resurrect — their labels exclude them from the model, so an Active +
 /// Resident revival would be a state-space inconsistency. Cold store
-/// entries get the same second chance via hot-entity recall (content is
-/// read back from the store).
-fn reactivate(
-    state: &mut State,
-    config: &SimpleContextConfig,
-    now_tick: u64,
-    report: &mut ContextGcReport,
-) {
+/// entries get the same second chance via hot-entity recall — but only
+/// their ids are collected here; the content read happens in the IO phase
+/// without the state lock.
+fn reactivate(state: &mut State, config: &SimpleContextConfig, now_tick: u64, plan: &mut GcPlan) {
     let focus = state.focus.clone();
     let hot_entities = state.hot_entities.clone();
     let mut remaining = config.gc_reactivate_per_pass;
 
     // Warm buffer entries (content still in memory).
-    let mut reactivated: Vec<ContextItem> = Vec::new();
     let mut index = state.eviction_buffer.len();
     while index > 0 && remaining > 0 {
         index -= 1;
@@ -410,86 +542,36 @@ fn reactivate(
         item.gc_generation = 0;
         item.evicted_at_tick = None;
         item.last_access_tick = now_tick;
-        report.reactivations.push(ContextReactivation {
+        plan.buffer_reactivations.push(ContextReactivation {
             item_id: item.id,
             kind: item.kind,
             scope: item.scope,
             reactivated_at_tick: now_tick,
             reason,
         });
-        report.reactivated += 1;
+        plan.reactivated += 1;
         state.gc_reactivated_total += 1;
-        reactivated.push(item);
+        // The heap push indexes the item at its slot in the same step.
+        state.items.push(item);
         remaining -= 1;
-    }
-    let reactivated_count = reactivated.len();
-    state.items.extend(reactivated);
-    // The reactivation pass appended items to the heap; index them so the
-    // next materialize and ingest see them through the indexes. The sweep
-    // rebuilt the index from survivors only, so these slots are new — the
-    // insert overwrites any stale entry the rebuild cannot have left.
-    for slot in state.items.len().saturating_sub(reactivated_count)..state.items.len() {
-        state.indexes.insert(&state.items[slot], slot);
     }
 
     // Cold store entries: content lives in the store; only hot-entity
-    // matches earn a recall (no content, so no score-based fallback).
-    // Skip the whole pass when no store directory exists yet — every
-    // `read_item` would only fail a per-entry file stat.
+    // matches earn a recall (no content, so no score-based fallback). The
+    // entity filter runs on the in-memory entry signature first, so with
+    // thousands of Cold entries only the matching ids are read in the IO
+    // phase. Skip the whole pass when no store directory exists yet.
     if remaining > 0 && !hot_entities.is_empty() && store::store_ready(config) {
-        let dir = store::store_dir(config);
-        let mut recalled: Vec<ContextItem> = Vec::new();
-        let mut kept: Vec<agent_contracts::ExternalizedContext> = Vec::new();
-        for entry in state.external.drain(..) {
+        for entry in &state.external {
             if remaining == 0 {
-                kept.push(entry);
-                continue;
+                break;
             }
-            let recallable = entry.semantic.is_live() && store::recallable(&entry);
-            // Filter on the entity signature kept in the entry first: with
-            // thousands of Cold entries this avoids a disk read per entry —
-            // only entries whose entities are actually hot earn a read.
+            let recallable = entry.semantic.is_live() && store::recallable(entry);
             let entities_match = entities_match(&entry.entities, &hot_entities);
-            let recalled_item = if recallable && entities_match {
-                store::read_item(&dir, entry.item_id)
-            } else {
-                None
-            };
-            if let Some(item) = recalled_item {
-                let reason =
-                    "entities are hot again in the working set (recalled from the context store)"
-                        .to_string();
-                report.reactivations.push(ContextReactivation {
-                    item_id: item.id,
-                    kind: item.kind,
-                    scope: item.scope,
-                    reactivated_at_tick: now_tick,
-                    reason,
-                });
-                report.reactivated += 1;
-                state.gc_reactivated_total += 1;
-                recalled.push(item);
+            if recallable && entities_match {
+                plan.recall_candidates.push(entry.item_id);
                 remaining -= 1;
-                continue;
             }
-            kept.push(entry);
-        }
-        state.external = kept;
-        let mut recalled_count = 0usize;
-        for mut item in recalled {
-            item.attention = AttentionState::Active;
-            item.relevance = item.relevance.max(0.5);
-            item.residency = ContextResidency::Resident;
-            item.gc_generation = 0;
-            item.evicted_at_tick = None;
-            item.last_access_tick = now_tick;
-            state.items.push(item);
-            recalled_count += 1;
-        }
-        // Recalled store entries are heap members again; index them the
-        // same way as the buffer reactivations above.
-        for slot in state.items.len().saturating_sub(recalled_count)..state.items.len() {
-            state.indexes.insert(&state.items[slot], slot);
         }
     }
 }

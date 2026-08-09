@@ -67,8 +67,7 @@ impl ProcessCapabilityAdapter {
                 // connect — never the parent's cwd, so a generated
                 // capability cannot roam the workspace by relative paths.
                 cwd: Some(
-                    std::env::temp_dir()
-                        .join(format!("context-agent-capability-{}", manifest.id)),
+                    std::env::temp_dir().join(format!("context-agent-capability-{}", manifest.id)),
                 ),
                 // Hard ceilings enforced by the kernel on Unix.
                 cpu_time_limit_secs: 60,

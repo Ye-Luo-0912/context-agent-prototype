@@ -30,7 +30,7 @@ pub(crate) fn push_linked(
             let mut candidates: Vec<ContextItemId> = Vec::new();
             for entity in &entities {
                 let mut added = 0usize;
-                for id in state.indexes.ids_for_entity(entity) {
+                for id in state.items.indexes().ids_for_entity(entity) {
                     if seen.insert(*id) {
                         candidates.push(*id);
                         added += 1;
@@ -41,12 +41,12 @@ pub(crate) fn push_linked(
                 }
             }
             // Newest first: slot order is creation order.
-            candidates.sort_by_key(|id| state.indexes.get(*id).unwrap_or(0));
+            candidates.sort_by_key(|id| state.items.indexes().get(*id).unwrap_or(0));
             candidates.reverse();
 
             let mut edges = 0usize;
             for id in candidates {
-                let Some(index) = state.indexes.get(id) else {
+                let Some(index) = state.items.indexes().get(id) else {
                     continue;
                 };
                 let prior = &state.items[index];
@@ -64,9 +64,8 @@ pub(crate) fn push_linked(
         }
     }
     let id = item.id;
+    // The heap pushes and indexes the item in one step.
     state.items.push(item);
-    let slot = state.items.len() - 1;
-    state.indexes.insert(&state.items[slot], slot);
     id
 }
 

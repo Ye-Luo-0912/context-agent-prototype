@@ -43,29 +43,55 @@ fn context_uri(item_id: ContextItemId) -> String {
 }
 
 /// Write an item's full content to the store and return its reference.
-/// Callers (the GC pass) keep the lightweight entry; the file is the
-/// authoritative copy of the content.
+/// Test-only sync variant: the GC's IO phase uses the async
+/// [`externalize_async`] so the state lock is not held across disk writes.
+#[cfg(test)]
 pub(crate) fn externalize(dir: &Path, item: &ContextItem) -> std::io::Result<ContextRef> {
     std::fs::create_dir_all(dir)?;
     let path = file_path(dir, item.id);
     let bytes = serde_json::to_vec(item)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(&path, bytes)?;
+    Ok(make_context_ref(item))
+}
+
+/// Async variant of [`externalize`] for the GC's IO phase, which must not
+/// hold the state lock across disk writes.
+pub(crate) async fn externalize_async(
+    dir: &Path,
+    item: &ContextItem,
+) -> std::io::Result<ContextRef> {
+    tokio::fs::create_dir_all(dir).await?;
+    let path = file_path(dir, item.id);
+    let bytes = serde_json::to_vec(item)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    tokio::fs::write(&path, bytes).await?;
+    Ok(make_context_ref(item))
+}
+
+fn make_context_ref(item: &ContextItem) -> ContextRef {
     let summary: String = item.content.chars().take(SUMMARY_CHARS).collect();
-    Ok(ContextRef {
+    ContextRef {
         uri: context_uri(item.id),
         item_id: item.id,
         kind: item.kind,
         scope: item.scope,
         summary,
         created_tick: item.created_tick,
-    })
+    }
 }
 
 /// Read an externalized item's full content back from the store. `None`
 /// when the entry was already deleted by Storage GC.
 pub(crate) fn read_item(dir: &Path, item_id: ContextItemId) -> Option<ContextItem> {
     let bytes = std::fs::read(file_path(dir, item_id)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Async variant of [`read_item`] for the GC's IO phase (recall), which
+/// must not hold the state lock across disk reads.
+pub(crate) async fn read_item_async(dir: &Path, item_id: ContextItemId) -> Option<ContextItem> {
+    let bytes = tokio::fs::read(file_path(dir, item_id)).await.ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -100,9 +126,11 @@ pub(crate) fn search_entries(
             if needle.is_empty() {
                 return true;
             }
-            entry.entities.iter().any(|entity| {
-                entity.to_lowercase().contains(&needle)
-            }) || entry.context_ref.summary.to_lowercase().contains(&needle)
+            entry
+                .entities
+                .iter()
+                .any(|entity| entity.to_lowercase().contains(&needle))
+                || entry.context_ref.summary.to_lowercase().contains(&needle)
                 || entry.context_ref.uri.to_lowercase().contains(&needle)
         })
         .collect();
@@ -280,10 +308,9 @@ pub(crate) fn run_storage_gc(
                 // No file behind the entry (already gone): drop the entry too.
                 report.deleted += 1;
                 state.gc_storage_deleted_total += 1;
-                report.reasons.push(format!(
-                    "entry {} had no store file",
-                    entry.context_ref.uri
-                ));
+                report
+                    .reasons
+                    .push(format!("entry {} had no store file", entry.context_ref.uri));
             }
             Err(e) => {
                 // Real IO failure: keep the entry and its metadata. The
@@ -545,9 +572,6 @@ mod tests {
             1,
             "4 generations passed: the entry ages to External"
         );
-        assert_eq!(
-            state.external[0].residency,
-            ContextResidency::External
-        );
+        assert_eq!(state.external[0].residency, ContextResidency::External);
     }
 }

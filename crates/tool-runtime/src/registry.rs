@@ -603,10 +603,7 @@ mod tests {
 
         let item_id = "00000000-0000-0000-0000-000000000000";
         let outcome = dispatcher
-            .execute(request(
-                "context.inspect",
-                json!({"item_id": item_id}),
-            ))
+            .execute(request("context.inspect", json!({"item_id": item_id})))
             .await
             .unwrap();
         assert!(matches!(
@@ -615,10 +612,7 @@ mod tests {
         ));
 
         let outcome = dispatcher
-            .execute(request(
-                "context.fetch",
-                json!({"item_id": item_id}),
-            ))
+            .execute(request("context.fetch", json!({"item_id": item_id})))
             .await
             .unwrap();
         assert!(matches!(

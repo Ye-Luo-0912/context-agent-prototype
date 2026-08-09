@@ -29,7 +29,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// process-capability adapter overrides it with a strict sandbox so a
 /// generated capability cannot read the parent's secrets, roam the
 /// parent's cwd or run without limits.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProcessSandbox {
     /// If `Some(names)`, the child inherits *only* these parent variables
     /// (plus the explicit `ProcessHostConfig::env` grants) — everything
@@ -45,17 +45,6 @@ pub struct ProcessSandbox {
     /// Hard process-count limit via `RLIMIT_NPROC` (Unix only; ignored
     /// elsewhere). `0` = unlimited.
     pub process_limit: u64,
-}
-
-impl Default for ProcessSandbox {
-    fn default() -> Self {
-        Self {
-            env_whitelist: None,
-            cwd: None,
-            cpu_time_limit_secs: 0,
-            process_limit: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

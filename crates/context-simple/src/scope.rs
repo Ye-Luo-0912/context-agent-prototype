@@ -306,7 +306,11 @@ fn close_members(
         }
     }
     for (id, from, to) in scope_updates {
-        state.indexes.update_scope(id, from, to);
+        // The heap re-stamps the item and moves the scope bucket in one
+        // step, so the authoritative `scope_id` and the index never drift.
+        if let Some(index) = state.items.indexes().get(id) {
+            state.items.update_scope(index, from, to);
+        }
     }
     transitions
 }

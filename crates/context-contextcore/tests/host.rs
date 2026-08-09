@@ -88,9 +88,7 @@ async fn sandbox_drops_unlisted_secrets_and_forces_the_dedicated_cwd() {
     let host = spawn_mock(|config| {
         config.sandbox = ProcessSandbox {
             env_whitelist: Some(vec!["PATH".into()]),
-            cwd: Some(
-                std::env::temp_dir().join(format!("sandbox-cwd-{}", std::process::id())),
-            ),
+            cwd: Some(std::env::temp_dir().join(format!("sandbox-cwd-{}", std::process::id()))),
             cpu_time_limit_secs: 0,
             process_limit: 0,
         };
@@ -103,7 +101,8 @@ async fn sandbox_drops_unlisted_secrets_and_forces_the_dedicated_cwd() {
     );
     let secret = host.call(json!({ "op": "env" })).await.unwrap();
     assert_eq!(
-        secret, json!(""),
+        secret,
+        json!(""),
         "an unlisted parent secret must not be inherited"
     );
     host.shutdown().await;
@@ -123,7 +122,8 @@ async fn sandbox_drops_unlisted_secrets_and_forces_the_dedicated_cwd() {
     .await;
     let secret = host.call(json!({ "op": "env" })).await.unwrap();
     assert_eq!(
-        secret, json!("granted-value"),
+        secret,
+        json!("granted-value"),
         "explicitly granted variables must reach the child"
     );
     host.shutdown().await;

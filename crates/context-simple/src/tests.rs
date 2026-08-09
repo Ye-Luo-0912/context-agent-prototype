@@ -1,8 +1,8 @@
 use agent_contracts::{
     AgentError, AttentionState, ContextAction, ContextEngine, ContextHints, ContextIngress,
     ContextItem, ContextItemId, ContextKind, ContextMaintenanceTrigger, ContextQuery,
-    ContextRetention, ContextScope, ContextSearchQuery, CoreLabel, FocusState, Label, LifecycleLabel,
-    ScopeKind, ScopeState, SemanticState, TaskId, ToolOutput,
+    ContextRetention, ContextScope, ContextSearchQuery, CoreLabel, FocusState, Label,
+    LifecycleLabel, ScopeKind, ScopeState, SemanticState, TaskId, ToolOutput,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -2195,7 +2195,12 @@ async fn external_retrieval_searches_inspects_and_fetches() {
         .unwrap()
         .expect("entry exists");
     assert_eq!(inspected.kind, ContextKind::Decision);
-    assert!(inspected.tags.iter().any(|t| t.is_core(CoreLabel::Decision)));
+    assert!(
+        inspected
+            .tags
+            .iter()
+            .any(|t| t.is_core(CoreLabel::Decision))
+    );
 
     // Fetch: full content back, and the access is stamped on the entry so
     // recency ranking and Cold -> External aging stay honest.
@@ -2222,6 +2227,78 @@ async fn external_retrieval_searches_inspects_and_fetches() {
         items.iter().all(|item| item.id != item_a_id),
         "fetch must not re-enter the working set"
     );
+}
+
+#[tokio::test]
+async fn gc_externalizes_overflow_and_recalls_via_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        gc_reactivate_per_pass: 8,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    for i in 0..3 {
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                output: observation_output(
+                    &format!("step-{i}"),
+                    true,
+                    &format!("step {i}: fix AuthService.rs"),
+                ),
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+
+    // The buffer is capped at 1, so two of the three consumed observations
+    // overflow into the store — without the lock being held during the
+    // writes (the plan/commit split keeps disk IO outside the state lock).
+    let report = engine.gc().await.unwrap();
+    assert_eq!(
+        report.externalized, 2,
+        "buffer overflow must externalize to the store: {report:?}"
+    );
+    let stored = std::fs::read_dir(dir.path()).unwrap().count();
+    assert_eq!(stored, report.externalized, "the store files must exist");
+
+    // Hot entities belonging to an externalized item recall it: the store
+    // read happens in the IO phase and the item re-enters the heap.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "continue on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.reactivated >= 1,
+        "a hot externalized item must be recalled: {report:?}"
+    );
+    assert!(
+        report
+            .reactivations
+            .iter()
+            .any(|r| r.reason.contains("recalled from the context store")),
+        "the recall must be explainable: {:?}",
+        report.reactivations
+    );
+    // Recalled content is resident again, but the store files remain until
+    // Storage GC — recall is a read, never a deletion.
+    let stored = std::fs::read_dir(dir.path()).unwrap().count();
+    assert_eq!(stored, 2, "recall must not delete store files");
 }
 
 #[tokio::test]

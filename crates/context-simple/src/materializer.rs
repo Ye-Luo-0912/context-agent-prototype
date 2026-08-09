@@ -37,7 +37,7 @@ pub(crate) fn materialize(
     // unscoped items. The selection universe is explainable: an item is
     // scoreable when it is a member of the current task's scope lineage, is
     // pinned/durable in the session scope, or its entities are hot.
-    state.indexes.ensure_consistent(&state.items);
+    state.items.ensure_consistent();
     let active_task_id = focus.as_ref().map(|f| f.task_id);
     let mut active_scopes: HashSet<ScopeId> = HashSet::new();
     for scope in &state.scopes {
@@ -49,10 +49,11 @@ pub(crate) fn materialize(
 
     let mut candidates: Vec<(usize, ScoreBreakdown, usize)> = Vec::new();
     for id in state
-        .indexes
+        .items
+        .indexes()
         .candidate_ids(&active_scopes, &state.hot_entities)
     {
-        let Some(index) = state.indexes.get(id) else {
+        let Some(index) = state.items.indexes().get(id) else {
             continue;
         };
         let item = &state.items[index];
@@ -163,7 +164,7 @@ pub(crate) fn materialize(
                 if selected_ids.contains(&dep_id) {
                     continue;
                 }
-                let Some(dep_index) = state.indexes.get(dep_id) else {
+                let Some(dep_index) = state.items.indexes().get(dep_id) else {
                     continue;
                 };
                 let dep = &state.items[dep_index];
@@ -224,9 +225,10 @@ pub(crate) fn materialize(
     let turn = state.turn;
 
     // Access reinforcement happens on every materialization: an item that
-    // reached the working set earns a fresh access stamp.
+    // reached the working set earns a fresh access stamp. Access stamps are
+    // not indexed, so the raw mutable slice is safe here.
     for index in &selected_indices {
-        let item = &mut state.items[*index];
+        let item = &mut state.items.items_mut()[*index];
         item.last_access_tick = now_tick;
         item.last_access_turn = turn;
         item.access_count = item.access_count.saturating_add(1);

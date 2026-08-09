@@ -105,6 +105,29 @@ impl Indexes {
         }
     }
 
+    /// An item's entity signature was re-extracted (content edited): drop
+    /// the old signature from the entity buckets and index the new one.
+    pub(crate) fn update_entities(
+        &mut self,
+        id: ContextItemId,
+        old_entities: &[String],
+        new_entities: &[String],
+    ) {
+        for entity in old_entities {
+            if let Some(bucket) = self.entity_index.get_mut(entity)
+                && let Some(pos) = bucket.iter().position(|entry| *entry == id)
+            {
+                bucket.swap_remove(pos);
+            }
+        }
+        for entity in new_entities {
+            self.entity_index
+                .entry(entity.clone())
+                .or_default()
+                .push(id);
+        }
+    }
+
     pub(crate) fn get(&self, id: ContextItemId) -> Option<usize> {
         self.id_index.get(&id).copied()
     }

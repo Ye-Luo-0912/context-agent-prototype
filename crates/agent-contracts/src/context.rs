@@ -790,10 +790,7 @@ pub trait ContextEngine: Send + Sync {
     /// item stays externalized — this is a deliberate, access-stamped read,
     /// not a reactivation; the caller (the model) decides what to do with
     /// the content and the working set is left untouched.
-    async fn fetch_external(
-        &self,
-        item_id: ContextItemId,
-    ) -> AgentResult<Option<ContextItem>> {
+    async fn fetch_external(&self, item_id: ContextItemId) -> AgentResult<Option<ContextItem>> {
         let _ = item_id;
         Ok(None)
     }

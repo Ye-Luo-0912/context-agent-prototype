@@ -118,16 +118,19 @@ impl SimpleContextConfig {
     }
 }
 
-/// Mutable runtime state of the engine, kept behind a lock. The heap, the
-/// focus, the hot-entity set and the pending lifecycle intents all live here;
-/// modules read and mutate it through `pub(crate)` access.
+/// Mutable runtime state of the engine, kept behind a lock. The heap (with
+/// its secondary indexes bound to it), the focus, the hot-entity set and
+/// the pending lifecycle intents all live here; modules read and mutate it
+/// through `pub(crate)` access.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct State {
     pub(crate) tick: u64,
     pub(crate) turn: u64,
     pub(crate) tool_round: u64,
     pub(crate) focus: Option<FocusState>,
-    pub(crate) items: Vec<ContextItem>,
+    /// The heap owns its slot/entity/scope indexes: structural mutations
+    /// go through `ContextHeap` methods so the indexes cannot drift.
+    pub(crate) items: crate::index::heap::ContextHeap,
     /// (item_id, by_id, reason) queued by ingest for superseded decisions,
     /// drained by maintenance so the resulting semantic state change is
     /// recorded as a lifecycle transition.
@@ -178,10 +181,6 @@ pub(crate) struct State {
     pub(crate) gc_externalized_total: u64,
     #[serde(default)]
     pub(crate) gc_storage_deleted_total: u64,
-    /// Slot/entity/scope indexes over `items`, kept consistent by every
-    /// structural mutation. Never serialized: restored state rebuilds it.
-    #[serde(skip)]
-    pub(crate) indexes: crate::index::indexes::Indexes,
 }
 
 pub struct SimpleContextEngine {
@@ -453,10 +452,25 @@ impl ContextEngine for SimpleContextEngine {
     }
 
     async fn gc(&self) -> AgentResult<ContextGcReport> {
+        // Three phases so the state lock is not held across disk IO:
+        // 1. plan under the lock (mark/sweep/reactivate/age — in memory);
+        // 2. store writes and recall reads without the lock;
+        // 3. commit under a fresh lock (external entries, recalled items,
+        //    failed-write buffer returns, diagnostics).
         let mut state = self.state.lock().await;
         state.tick += 1;
         let now_tick = state.tick;
-        Ok(full::run_full_gc(&mut state, &self.config, now_tick))
+        let Some(mut plan) = full::plan_full_gc(&mut state, &self.config, now_tick) else {
+            return Ok(ContextGcReport {
+                resident: state.items.len(),
+                diagnostics: diagnostics::compute(&state),
+                ..ContextGcReport::default()
+            });
+        };
+        drop(state);
+        let io = full::run_store_io(&self.config, &mut plan).await;
+        let mut state = self.state.lock().await;
+        Ok(full::commit_full_gc(&mut state, now_tick, plan, io))
     }
 
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
@@ -503,13 +517,14 @@ impl ContextEngine for SimpleContextEngine {
         item_id: ContextItemId,
     ) -> AgentResult<Option<agent_contracts::ExternalizedContext>> {
         let state = self.state.lock().await;
-        Ok(state.external.iter().find(|e| e.item_id == item_id).cloned())
+        Ok(state
+            .external
+            .iter()
+            .find(|e| e.item_id == item_id)
+            .cloned())
     }
 
-    async fn fetch_external(
-        &self,
-        item_id: ContextItemId,
-    ) -> AgentResult<Option<ContextItem>> {
+    async fn fetch_external(&self, item_id: ContextItemId) -> AgentResult<Option<ContextItem>> {
         let mut state = self.state.lock().await;
         if !state.external.iter().any(|e| e.item_id == item_id) {
             return Ok(None);
@@ -539,14 +554,25 @@ impl ContextEngine for SimpleContextEngine {
         let mut state = self.state.lock().await;
         *state = checkpoint::deserialize(data)?;
         // Old checkpoints predate the entity signature cache; backfill it
-        // once so restored items keep scoring and dependency behavior.
-        for item in &mut state.items {
-            if item.entities.is_empty() {
-                item.entities = entity::extract_entities(&item.content);
-            }
-            // Pre-split checkpoints expressed semantic death as lifecycle
-            // labels; migrate them to the SemanticState dimension so GC and
-            // the materializer treat restored items like live ones.
+        // once so restored items keep scoring and dependency behavior. The
+        // heap method re-indexes each backfilled signature, so the entity
+        // index stays consistent without a wholesale rebuild.
+        let backfills: Vec<(usize, Vec<String>)> = state
+            .items
+            .items_mut()
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, item)| item.entities.is_empty())
+            .map(|(index, item)| (index, entity::extract_entities(&item.content)))
+            .collect();
+        for (index, entities) in backfills {
+            state.items.update_entities(index, entities);
+        }
+        // Pre-split checkpoints expressed semantic death as lifecycle
+        // labels; migrate them to the SemanticState dimension so GC and
+        // the materializer treat restored items like live ones. Semantic
+        // state is not indexed, so the raw mutable slice is safe here.
+        for item in state.items.items_mut() {
             if item.semantic.is_live() {
                 if item
                     .tags
@@ -563,14 +589,6 @@ impl ContextEngine for SimpleContextEngine {
                 }
             }
         }
-        // Restored state never carries the in-memory indexes (they are not
-        // serialized); rebuild them so materialize and dependency ingest
-        // see the restored heap through the indexes. The guard's deref does
-        // not split field borrows, so the heap is taken out, rebuilt
-        // against, and put back (O(1) for the Vec).
-        let items = std::mem::take(&mut state.items);
-        state.indexes.rebuild(&items);
-        state.items = items;
         Ok(())
     }
 

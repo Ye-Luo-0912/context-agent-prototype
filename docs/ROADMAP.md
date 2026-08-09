@@ -960,6 +960,38 @@ observation ingest;
 tool-runtime tests cover the four schemas and executions. Full workspace
 build/test/clippy/fmt green; A/B/C replay baseline unchanged.
 
+## V1-M9: process sandbox + external store retrieval loop ✅ (implemented)
+
+Two review blockers cleared before V2 autonomous capability generation:
+
+- **The process boundary is a sandbox, not a permission note.**
+  `ProcessHost` runs every child inside `ProcessSandbox`: env whitelist
+  (the process-capability adapter's profile is PATH/SystemRoot/
+  SystemDrive/TEMP/TMP only — no inherited secrets, `OPENAI_API_KEY` and
+  `HOME` never cross), a dedicated per-capability cwd, Unix rlimits
+  (RLIMIT_CPU / RLIMIT_NPROC; 60 s / 16 processes), and
+  `call_with_cancel` — a cancel (user `/cancel`, superseded operation)
+  poisons the connection and kills the whole process tree immediately
+  instead of waiting for the request deadline. V2 autonomous capability
+  generation stays gated until filesystem isolation beyond the cwd and a
+  network policy land.
+- **The context store is a retrieval loop, not a black hole.** The store
+  path is injected at the composition root
+  (`workspace.state_dir()/context-store`); the leaked CWD-guessed copy was
+  removed and `.gitignore` covers `**/.focus-agent/`.
+  `context.search` / `context.inspect` / `context.fetch` (read-only,
+  always loaded) resolve through `ContextEngine`'s new
+  `search_external` / `inspect_external` / `fetch_external` —
+  deterministic, no vectors. `MaterializedContext.external` is a bounded
+  view (max 32 refs, quickselect-ranked by hot entity / open loop /
+  recency), never a clone of the map; `ExternalizedContext` keeps the
+  entity signature so Cold recall filters in memory before touching disk;
+  external TTLs count GC generations (`gc_epoch`), not ticks; the full GC
+  pass splits into plan (lock) -> store IO (no lock) -> commit (fresh
+  lock); Storage GC is a reachability closure with `Result<DeleteOutcome>`
+  so real IO errors keep entries; `ContextHeap` makes index consistency
+  structural (a stale index is a type error, not a length guard).
+
 ## P2: provider/tool secondary issues ✅ (implemented)
 
 - **Stream retry can no longer duplicate output.** `RetryingTransport`

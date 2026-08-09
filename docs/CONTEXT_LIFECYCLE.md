@@ -634,6 +634,88 @@ explainable in the ledger (`kept because the model leased it until turn N /
 set keep_alive`), and the effect is visible to the model because the context
 frame exposes each item's id (`id=<...>`), so the next request can target it.
 
+### 9g. V1-M9: the external store becomes a retrieval surface
+
+The store path is no longer guessed from the CWD. The composition root
+injects `workspace.state_dir()/context-store` into
+`SimpleContextConfig::context_store_dir` (`agent-tui`), so a run started
+from a crate directory can no longer scatter `.focus-agent/context-store`
+folders around the tree. The leaked tracked copy was deleted and
+`.gitignore` covers `**/.focus-agent/` (not just the repository root).
+
+Externalized is not deleted, and since V1-M9 it is also *findable again*:
+`ContextEngine` gains a deterministic retrieval surface —
+`search_external(ContextSearchQuery { query, kind, scope, task_id, limit })`,
+`inspect_external(item_id)` and `fetch_external(item_id)` (default no-ops,
+so baselines and the wire adapter are untouched). Three always-loaded
+read-only meta-tools (`context.search` / `context.inspect` /
+`context.fetch`) produce an `EngineQuery` the kernel resolves against the
+engine (invariant 3 — tools still never touch the engine). The prompt's
+`EXTERNAL CONTEXT` section shows refs only (uri + kind/scope + summary) and
+explicitly points the model at the retrieval loop; `fetch` stamps recency
+and the GC generation on the entry so ranking and Cold -> External aging
+stay honest. A fetch is a deliberate read, not an automatic reactivation —
+the model decides what re-enters the working set.
+
+The materialized `external` field is a bounded `ContextMapView`, not a
+clone of the whole map: at most 32 refs, quickselect-ranked in O(n)
+without cloning it (hot-entity match first, then open-loop tags, then
+recency, with a deterministic id tie-break). A run with 10 K / 100 K
+external refs costs the same per materialize as a run with 32.
+
+Cold recall pre-filters in memory instead of reading the disk:
+`ExternalizedContext` keeps the item's entity signature (`entities`),
+`tags`, `dependencies` and `task_id`, so with thousands of Cold entries
+only the entity-matching ids are read in the IO phase (10 K refs -> a few
+reads), never the reverse.
+
+External TTLs count *generations*, not ticks. `State::gc_epoch`
+increments only on a full GC pass; `ExternalizedContext::last_access_gc_epoch`
+records the pass it was last touched; `gc_external_ttl_generations`
+replaces the pass/tick-confused `gc_external_ttl_passes`. "4 generations"
+means 4 real GC passes, not 4 unrelated runtime operations (ingest /
+maintain / materialize also grow `tick`). Entries restored from pre-epoch
+checkpoints (`last_access_gc_epoch == None`) start fresh at the current
+epoch instead of aging out instantly.
+
+GC no longer holds the async state lock across synchronous disk IO. One
+full pass is three phases: `plan_full_gc` (under the lock — mark / sweep /
+reactivate, decide the externalize list and the recall candidates, bump
+`gc_epoch`), then `run_store_io` (lock released — `externalize_async` /
+`read_item_async`), then `commit_full_gc` (fresh lock — entries join the
+map, recalled items re-enter the heap, failed writes return to the front
+of the buffer so overflow retries next pass). The tail latency of a
+growing store stops being synchronous with the state lock.
+
+Storage GC is the only place information is permanently deleted, and it is
+now a *reachability closure* rather than a single incoming-edge check:
+roots are the dependency edges of resident/warm items, and every reachable
+external entry contributes its own `dependencies`, so external -> external
+chains, semantic links and future audit/evidence/OpenLoop edges keep their
+targets alive transitively. `delete_file` returns
+`Result<DeleteOutcome>` (`Deleted` / `NotFound`): a real IO error
+(permission, disk) keeps the in-memory entry and surfaces in
+`StorageGcReport.io_errors`, instead of being mistaken for "the file is
+gone" and dropping the metadata while the content still exists.
+
+### 9h. V1-M9: index consistency is structural (ContextHeap)
+
+`State.items` was a bare `Vec<ContextItem>` any module could mutate while
+the slot/entity/scope indexes silently drifted — the consistency guard
+could only catch length changes, never a same-length `entities` or
+`scope_id` edit. The heap now owns its indexes: `ContextHeap` exposes only
+structured mutations — `push` (index at its slot in one step),
+`replace_all` (GC sweep / restore), `take_all`, `update_scope(index, from,
+to)` (field write + bucket move atomic), `update_entities(index, entities)`
+(old buckets removed, new added) — plus read-only iteration, so a stale
+index is a type error instead of a runtime heuristic. Non-indexed fields
+(semantic state, tags, keep_alive, lease, access stamps) stay reachable
+through `iter_mut`, which cannot affect any index bucket.
+`ensure_consistent` survives only as a len-guard safety net for test-only
+direct pushes; the production mutation surface no longer needs it.
+Checkpoints serialize only the items; the indexes are derived state and
+rebuild on restore.
+
 ## 10. What should become durable later
 
 A later policy can promote only structured outcomes such as:

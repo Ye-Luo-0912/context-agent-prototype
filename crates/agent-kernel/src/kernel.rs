@@ -208,11 +208,7 @@ impl AgentKernel {
     /// `output` (call id, tool name) is preserved; only the content is
     /// replaced. Errors become a failed output so the model learns the
     /// query did not land.
-    pub async fn resolve_engine_query(
-        &self,
-        output: ToolOutput,
-        query: EngineQuery,
-    ) -> ToolOutput {
+    pub async fn resolve_engine_query(&self, output: ToolOutput, query: EngineQuery) -> ToolOutput {
         let mut output = output;
         match query {
             EngineQuery::SearchExternal {
@@ -275,75 +271,71 @@ impl AgentKernel {
                     }
                 }
             }
-            EngineQuery::InspectExternal { item_id } => match self
-                .context
-                .inspect_external(item_id)
-                .await
-            {
-                Ok(Some(entry)) => {
-                    output.ok = true;
-                    output.summary = "external ref metadata".into();
-                    output.model_content = format!(
-                        "{} | kind={:?} scope={:?} task={} residency={:?} semantic={:?}\nsummary: {}\ntags: {}\nentities: {}",
-                        entry.context_ref.uri,
-                        entry.kind,
-                        entry.scope,
-                        entry
-                            .task_id
-                            .map(|t| t.to_string())
-                            .unwrap_or_else(|| "-".into()),
-                        entry.residency,
-                        entry.semantic,
-                        entry.context_ref.summary,
-                        if entry.tags.is_empty() {
-                            "-".to_string()
-                        } else {
+            EngineQuery::InspectExternal { item_id } => {
+                match self.context.inspect_external(item_id).await {
+                    Ok(Some(entry)) => {
+                        output.ok = true;
+                        output.summary = "external ref metadata".into();
+                        output.model_content = format!(
+                            "{} | kind={:?} scope={:?} task={} residency={:?} semantic={:?}\nsummary: {}\ntags: {}\nentities: {}",
+                            entry.context_ref.uri,
+                            entry.kind,
+                            entry.scope,
                             entry
-                                .tags
-                                .iter()
-                                .map(|tag| tag.as_str().to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        },
-                        entry.entities.join(", "),
-                    );
-                }
-                Ok(None) => {
-                    output.ok = true;
-                    output.summary = "no such external ref".into();
-                    output.model_content =
-                        format!("context.inspect: no externalized item with id {item_id}.");
-                }
-                Err(error) => {
-                    output.ok = false;
-                    output.summary = "context.inspect failed".into();
-                    output.model_content = format!("context.inspect failed: {error}");
+                                .task_id
+                                .map(|t| t.to_string())
+                                .unwrap_or_else(|| "-".into()),
+                            entry.residency,
+                            entry.semantic,
+                            entry.context_ref.summary,
+                            if entry.tags.is_empty() {
+                                "-".to_string()
+                            } else {
+                                entry
+                                    .tags
+                                    .iter()
+                                    .map(|tag| tag.as_str().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            },
+                            entry.entities.join(", "),
+                        );
+                    }
+                    Ok(None) => {
+                        output.ok = true;
+                        output.summary = "no such external ref".into();
+                        output.model_content =
+                            format!("context.inspect: no externalized item with id {item_id}.");
+                    }
+                    Err(error) => {
+                        output.ok = false;
+                        output.summary = "context.inspect failed".into();
+                        output.model_content = format!("context.inspect failed: {error}");
+                    }
                 }
             }
-            EngineQuery::FetchExternal { item_id } => match self
-                .context
-                .fetch_external(item_id)
-                .await
-            {
-                Ok(Some(item)) => {
-                    output.ok = true;
-                    output.summary = "external item fetched".into();
-                    output.model_content = format!(
-                        "[{:?} | {:?} | id={}]\n{}",
-                        item.kind, item.scope, item.id, item.content
-                    );
-                }
-                Ok(None) => {
-                    output.ok = true;
-                    output.summary = "no such external ref".into();
-                    output.model_content = format!(
-                        "context.fetch: no externalized item with id {item_id} (it may have been deleted by storage GC)."
-                    );
-                }
-                Err(error) => {
-                    output.ok = false;
-                    output.summary = "context.fetch failed".into();
-                    output.model_content = format!("context.fetch failed: {error}");
+            EngineQuery::FetchExternal { item_id } => {
+                match self.context.fetch_external(item_id).await {
+                    Ok(Some(item)) => {
+                        output.ok = true;
+                        output.summary = "external item fetched".into();
+                        output.model_content = format!(
+                            "[{:?} | {:?} | id={}]\n{}",
+                            item.kind, item.scope, item.id, item.content
+                        );
+                    }
+                    Ok(None) => {
+                        output.ok = true;
+                        output.summary = "no such external ref".into();
+                        output.model_content = format!(
+                            "context.fetch: no externalized item with id {item_id} (it may have been deleted by storage GC)."
+                        );
+                    }
+                    Err(error) => {
+                        output.ok = false;
+                        output.summary = "context.fetch failed".into();
+                        output.model_content = format!("context.fetch failed: {error}");
+                    }
                 }
             }
         }
