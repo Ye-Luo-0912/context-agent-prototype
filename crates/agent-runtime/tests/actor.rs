@@ -531,6 +531,88 @@ async fn failed_focus_never_mutates_the_task_table() {
     );
 }
 
+/// The engine rejects the clear-focus transition (`FocusCleared` ingest
+/// fails), so a suspend that depends on it must fail too — and the task
+/// table must not move.
+#[derive(Debug)]
+struct FailingClearFocusContextEngine;
+
+#[async_trait::async_trait]
+impl ContextEngine for FailingClearFocusContextEngine {
+    async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+        if matches!(ingress, ContextIngress::FocusCleared) {
+            return Err(agent_contracts::AgentError::Internal(
+                "clear focus rejected".into(),
+            ));
+        }
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            focus: None,
+            items: Vec::new(),
+            external: Vec::new(),
+            selected: Vec::new(),
+            approx_tokens: 0,
+            diagnostics: ContextDiagnostics::default(),
+        })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn failed_clear_focus_never_mutates_the_task_table() {
+    let kernel = kernel_with(
+        Arc::new(SilentModel),
+        Arc::new(FailingClearFocusContextEngine),
+    );
+    let (handle, _task) = spawn_runtime(kernel);
+    handle.start().await.unwrap();
+
+    handle.set_focus("goal A".into()).await.unwrap();
+    assert_eq!(handle.list_tasks().await.unwrap().len(), 1);
+
+    // The engine rejects clear_focus: the suspend must fail and the task
+    // must stay registered and active — TaskManager commits only after the
+    // engine transition succeeds.
+    let result = handle.suspend_task().await;
+    assert!(result.is_err(), "suspend must fail with the engine error");
+    let tasks = handle.list_tasks().await.unwrap();
+    assert_eq!(
+        tasks.len(),
+        1,
+        "a failed clear_focus must not mutate the task table"
+    );
+    assert_eq!(
+        tasks[0].status,
+        agent_runtime::TaskStatus::Active,
+        "the task must stay active after a failed suspend"
+    );
+}
+
 /// Records every request it receives and finishes immediately, so the test
 /// can assert on exactly what the final budget guard let through.
 #[derive(Debug, Default)]

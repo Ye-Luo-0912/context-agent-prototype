@@ -76,6 +76,9 @@ async fn main() -> anyhow::Result<()> {
         "service" => {
             connect_engine(&ContextServiceConfig {
                 engine: ServiceEngine::Dynamic,
+                // The service's context store must live under the workspace
+                // state dir too — the child never guesses a CWD-relative path.
+                store_dir: Some(workspace.state_dir().join("context-store")),
                 ..ContextServiceConfig::default()
             })
             .await?

@@ -304,7 +304,7 @@ async fn runtime_checkpoint_roundtrips_tasks_context_and_capabilities() {
 
     // Restore into a fresh runtime: tasks come back, and the engine carries
     // the restored items and scopes.
-    let (fresh, _fresh_context) = simple_instance().await;
+    let (fresh, fresh_context) = simple_instance().await;
     fresh.restore(decoded).await.unwrap();
     let tasks = fresh.handle().list_tasks().await.unwrap();
     assert_eq!(tasks.len(), 2, "restore must bring the task table back");
@@ -323,6 +323,67 @@ async fn runtime_checkpoint_roundtrips_tasks_context_and_capabilities() {
             .any(|item| item.kind == agent_contracts::ContextKind::UserMessage),
         "the restored engine must carry the user message items"
     );
+    // Task id alignment survives the round-trip: the restored engine's
+    // focus must point at the same task the runtime restored as current,
+    // so runtime and context cannot drift into a split-brain after
+    // recovery.
+    let restored_focus = fresh_context
+        .materialize(ContextQuery {
+            current_input: "resume".into(),
+            budget_tokens: 4096,
+            hints: Default::default(),
+        })
+        .await
+        .unwrap()
+        .focus;
+    assert_eq!(
+        restored_focus.map(|focus| focus.task_id),
+        checkpoint.current_task_id,
+        "restore must align the context focus with the runtime's current task"
+    );
     fresh.shutdown().await.unwrap();
+    instance.shutdown().await.unwrap();
+}
+
+/// The runtime assigns a task id on focus; the context engine must be
+/// focused on the *same* task — runtime and context share one task
+/// identity, never a parallel one.
+#[tokio::test]
+async fn runtime_task_id_matches_the_context_task_id() {
+    let (instance, context) = simple_instance().await;
+    let mut events = instance.handle().subscribe();
+
+    instance
+        .handle()
+        .set_focus("task A: refactor auth".into())
+        .await
+        .unwrap();
+    let mut runtime_task_id = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline && runtime_task_id.is_none() {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::FocusChanged { task_id, .. } = envelope.event {
+                runtime_task_id = Some(task_id);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let runtime_task_id = runtime_task_id.expect("FocusChanged must carry the task id");
+
+    // The engine's materialized focus must carry the same task id the
+    // runtime assigned — the single source of task identity, not a copy.
+    let snapshot = context
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 4096,
+            hints: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.focus.map(|focus| focus.task_id),
+        Some(runtime_task_id),
+        "the context engine must be focused on the runtime's task id, not a parallel one"
+    );
     instance.shutdown().await.unwrap();
 }

@@ -8,6 +8,7 @@
 //! cargo to rebuild the binary whenever the wire protocol changes, so the
 //! process-boundary parity tests always exercise the current protocol.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_contracts::{AgentError, ContextEngine};
@@ -18,10 +19,16 @@ use serde_json::Value;
 
 /// The engine behind the service, chosen with `--engine`. `dynamic` is the
 /// real context engine; the two baselines are kept so the wire protocol can
-/// be exercised against engines without a GC/store at all.
-pub fn build_engine(engine: &str) -> Arc<dyn ContextEngine> {
+/// be exercised against engines without a GC/store at all. `store_dir`
+/// (from `--store-dir`) pins the context store under the caller-provided
+/// state dir; `None` falls back to the engine's temp-dir default — never a
+/// CWD-relative path.
+pub fn build_engine(engine: &str, store_dir: Option<PathBuf>) -> Arc<dyn ContextEngine> {
     match engine {
-        "dynamic" => Arc::new(SimpleContextEngine::new(SimpleContextConfig::default())),
+        "dynamic" => Arc::new(SimpleContextEngine::new(SimpleContextConfig {
+            context_store_dir: store_dir,
+            ..SimpleContextConfig::default()
+        })),
         "append" => Arc::new(AppendOnlyEngine::new()),
         "rolling" => Arc::new(RollingSummaryEngine::with_config(
             context_baselines::RollingConfig::default(),

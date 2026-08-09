@@ -51,6 +51,11 @@ pub struct ContextServiceConfig {
     /// else a sibling of the current executable, else PATH lookup.
     pub program: Option<String>,
     pub engine: ServiceEngine,
+    /// Where the service's context store lives. The composition root
+    /// injects `workspace.state_dir()/context-store`; without it the
+    /// service falls back to an OS temp dir — the store never lands in a
+    /// CWD-relative path.
+    pub store_dir: Option<std::path::PathBuf>,
     pub startup_timeout: Duration,
     /// Deadline for every request after the handshake, so a wedged service
     /// cannot hang a turn.
@@ -65,6 +70,7 @@ impl Default for ContextServiceConfig {
         Self {
             program: None,
             engine: ServiceEngine::Dynamic,
+            store_dir: None,
             startup_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
             max_frame_bytes: 16 * 1024 * 1024,
@@ -95,9 +101,16 @@ impl ContextServiceAdapter {
     /// Spawn the service, handshake, and return a ready adapter.
     pub async fn connect(config: &ContextServiceConfig) -> AgentResult<Self> {
         let program = config.resolve_program();
+        let mut args = vec!["--engine".into(), config.engine.as_arg().into()];
+        // The store must live under the workspace state dir, never a
+        // CWD-relative path the child happens to run in.
+        if let Some(dir) = &config.store_dir {
+            args.push("--store-dir".into());
+            args.push(dir.to_string_lossy().into_owned());
+        }
         let host = ProcessHost::connect(ProcessHostConfig {
             program: program.clone(),
-            args: vec!["--engine".into(), config.engine.as_arg().into()],
+            args,
             env: Vec::new(),
             startup_timeout: config.startup_timeout,
             request_timeout: config.request_timeout,

@@ -1057,6 +1057,14 @@ Three consistency gaps closed before V2:
   dev-dependency of the adapter crate so it is rebuilt whenever the
   protocol changes.
 
+Performance P0 (store out of the CWD, sync disk IO out of the context
+lock, bounded external view) and the consistency invariant test suite
+(task id alignment, transactional task transitions on set/clear-focus
+failure, checkpoint/restore alignment, stale-effect rollback, durability
+failure reporting, directive-before-next-round, child termination on
+cancel, store confinement, exact fetch recovery, full-contract parity,
+window-vs-reserve budget) are in place; see `docs/ARCHITECTURE.md` §9e/§9f.
+
 ## Next: V1-M10 → V2 (ordered)
 
 1. **V1-M10 Runtime Consistency** — task authority, transactional task

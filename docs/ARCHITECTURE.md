@@ -938,6 +938,57 @@ authority, sandbox authority, runtime integrity — are the seed of an
 task manager, scope scheduling, prompt assembly, materialization, adaptive
 policy) stays in `agent-runtime`. Runtime evolves, Core stays trusted.
 
+## 9e. Performance P0: store confinement, lock-free IO, bounded external view
+
+The next hot paths are store I/O, external recall and the tool surface —
+not trait/vtable dispatch or small-object clones. The P0 items:
+
+- **Context store out of the CWD.** The store's default fallback is no
+  longer `.focus-agent/context-store` relative to the CWD; it is an OS
+  temp dir scoped to the process. The composition root (TUI) and the
+  context service both pin the store under `workspace.state_dir()/
+  context-store` (the service receives it via `--store-dir`, threaded from
+  `ContextServiceConfig.store_dir`), so externalized content can never
+  scatter into a launch directory.
+- **Sync disk IO out of the context lock.** `fetch_external` checks
+  membership and captures the access-stamp inputs under the lock, reads
+  the file outside it (async), then re-locks to stamp recency. Storage GC
+  is a plan/IO/commit split like the full GC: the reachability closure and
+  candidate decision run under the lock, `tokio::fs::remove_file` runs
+  without it, and a fresh lock applies the outcomes. The state lock is
+  never held across a disk read or write on the hot path.
+- **External ContextMap is never fully cloned.** `materialize` surfaces a
+  bounded view (`MAX_EXTERNAL_REFS = 32`, hot-entity/open-loop/recency
+  ranking via quickselect); `search_external` truncates to the query limit
+  before cloning; `inspect_external` clones one entry. The full map stays
+  in the engine.
+
+## 9f. Consistency invariant test suite
+
+Tests that guard the runtime's consistency claims, worth more than any
+extra scoring coefficient:
+
+- runtime task id == context task id (`runtime_task_id_matches_the_
+  context_task_id`); `kernel.set_focus` failure and `clear_focus` failure
+  both leave the TaskManager untouched (`failed_focus_never_mutates_the_
+  task_table`, `failed_clear_focus_never_mutates_the_task_table`);
+  checkpoint → restore reproduces task ids, scopes and the current task
+  with the engine focus aligned to the restored task;
+- stale `PreparedEffect` → target unchanged, staged temp deleted,
+  `MutationRolledBack` journaled; a landed rename whose journal record
+  fails is reported `AppliedButDurabilityFailed`, never "nothing
+  happened";
+- a `ContextAction` directive takes effect before the next model round
+  (asserted on a shared activity timeline), not just at turn end;
+- process-capability cancellation terminates the child (a heartbeat file
+  the child rewrites stops advancing after cancel);
+- `fetch(ref)` recovers the exact externalized content; the context store
+  never writes outside its configured directory and the default fallback
+  is never CWD-relative;
+- dynamic vs service engines are parity-checked for every `ContextEngine`
+  method (see 9d), and the assembled input + output reserve stays within
+  the provider context window.
+
 ## 10. Explicit non-goals for v0.1
 
 - vector embeddings;

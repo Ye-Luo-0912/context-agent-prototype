@@ -50,9 +50,8 @@ pub struct SimpleContextConfig {
     /// Directory of the external context store: eviction-buffer overflow
     /// writes full items here and keeps only a lightweight `ContextRef`
     /// entry. The composition root injects `workspace.state_dir()/context-store`
-    /// so runtime state never scatters under a CWD; `None` is only a
-    /// standalone/test fallback (`.focus-agent/context-store` under the
-    /// current working directory).
+    /// so runtime state never scatters under a CWD; `None` falls back to an
+    /// OS temp dir scoped to this process (never a CWD-relative path).
     pub context_store_dir: Option<std::path::PathBuf>,
     /// Full GC passes an externalized (`Cold`) entry may sit in memory
     /// before it ages to `External` (only the store retains it). The unit
@@ -525,18 +524,24 @@ impl ContextEngine for SimpleContextEngine {
     }
 
     async fn fetch_external(&self, item_id: ContextItemId) -> AgentResult<Option<ContextItem>> {
-        let mut state = self.state.lock().await;
-        if !state.external.iter().any(|e| e.item_id == item_id) {
+        // Membership and the access-stamp inputs under the lock; the disk
+        // read happens *outside* it — sync store IO must never stall the
+        // context hot path.
+        let dir = crate::store::store_dir(&self.config);
+        let (present, now_tick, gc_epoch) = {
+            let state = self.state.lock().await;
+            let present = state.external.iter().any(|e| e.item_id == item_id);
+            (present, state.tick, state.gc_epoch)
+        };
+        if !present {
             return Ok(None);
         }
-        let dir = crate::store::store_dir(&self.config);
-        let item = crate::store::read_item(&dir, item_id);
+        let item = crate::store::read_item_async(&dir, item_id).await;
         if item.is_some() {
             // A deliberate pull stamps recency and the GC generation on the
             // entry, so ranking and Cold -> External aging stay honest — the
             // item was used, it is not an untouched stale reference.
-            let now_tick = state.tick;
-            let gc_epoch = state.gc_epoch;
+            let mut state = self.state.lock().await;
             if let Some(entry) = state.external.iter_mut().find(|e| e.item_id == item_id) {
                 entry.last_access_tick = now_tick;
                 entry.last_access_gc_epoch = Some(gc_epoch);
@@ -593,10 +598,18 @@ impl ContextEngine for SimpleContextEngine {
     }
 
     async fn storage_gc(&self) -> AgentResult<agent_contracts::StorageGcReport> {
+        // Plan under the lock, delete outside it, commit under a fresh
+        // lock — the state lock is never held across disk IO.
+        let plan = {
+            let mut state = self.state.lock().await;
+            state.tick += 1;
+            let now_tick = state.tick;
+            store::plan_storage_gc(&state, &self.config, now_tick)
+        };
+        let dir = store::store_dir(&self.config);
+        let io = store::run_storage_io(&dir, &plan).await;
         let mut state = self.state.lock().await;
-        state.tick += 1;
-        let now_tick = state.tick;
-        Ok(store::run_storage_gc(&mut state, &self.config, now_tick))
+        Ok(store::commit_storage_gc(&mut state, plan, io))
     }
 }
 

@@ -34,7 +34,24 @@ fn main() {
 /// (`{id, version, ok, value}`) plus two deliberate failure modes:
 /// - `big` streams an oversized line without a newline (bounded-read test);
 /// - `silent` never answers (request-deadline test).
+///
+/// When `MOCK_HEARTBEAT=<path>` is injected, a background task rewrites the
+/// file with an incrementing counter every 50 ms — the *only* observable
+/// liveness signal from outside the process, so a cancellation test can
+/// prove the child tree was actually terminated (the counter stops).
 async fn server_loop() {
+    if let Ok(path) = std::env::var("MOCK_HEARTBEAT") {
+        let path = std::path::PathBuf::from(path);
+        tokio::spawn(async move {
+            let mut n: u64 = 0;
+            loop {
+                let _ = tokio::fs::write(&path, n.to_string()).await;
+                n += 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+    }
+
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let stdout = tokio::io::stdout();
     let mut writer = BufWriter::new(stdout);

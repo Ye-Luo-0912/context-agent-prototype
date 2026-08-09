@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: agent-context-service --engine <dynamic|append|rolling>\n\
+        "usage: agent-context-service --engine <dynamic|append|rolling> [--store-dir <path>]\n\
          \n\
          Speaks the context-contextcore wire protocol on stdin/stdout.\n"
     );
@@ -25,6 +25,7 @@ fn usage() -> ! {
 #[tokio::main]
 async fn main() {
     let mut engine = None;
+    let mut store_dir = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -32,7 +33,13 @@ async fn main() {
                 let Some(value) = args.next() else {
                     usage();
                 };
-                engine = Some(build_engine(&value));
+                engine = Some(value);
+            }
+            "--store-dir" => {
+                let Some(value) = args.next() else {
+                    usage();
+                };
+                store_dir = Some(std::path::PathBuf::from(value));
             }
             other => {
                 eprintln!("unknown argument: {other}");
@@ -40,7 +47,8 @@ async fn main() {
             }
         }
     }
-    let engine = engine.expect("--engine is required");
+    let engine_name = engine.expect("--engine is required");
+    let engine = build_engine(&engine_name, store_dir);
     let engine: &dyn ContextEngine = engine.as_ref();
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();

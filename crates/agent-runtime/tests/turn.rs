@@ -137,12 +137,15 @@ impl ModelTransport for HangingModel {
 
 /// Records every ingest and maintain call the runtime makes, so the test can
 /// assert *when* observations reached the long-term context. Also counts
-/// full GC passes, so `context.collect` routing is observable.
+/// full GC passes, so `context.collect` routing is observable. `activity`
+/// is a strictly ordered log of ingests and materializations, so tests can
+/// assert that a runtime directive took effect before the next model round.
 #[derive(Debug, Default)]
 struct RecordingContextEngine {
     ingests: Arc<Mutex<Vec<String>>>,
     maintains: Arc<Mutex<Vec<ContextMaintenanceTrigger>>>,
     gcs: Arc<Mutex<usize>>,
+    activity: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -159,6 +162,7 @@ impl ContextEngine for RecordingContextEngine {
             ContextIngress::ContextDirective { .. } => "ContextDirective",
         };
         self.ingests.lock().await.push(label.to_string());
+        self.activity.lock().await.push(label.to_string());
         Ok(())
     }
     async fn gc(&self) -> AgentResult<agent_contracts::ContextGcReport> {
@@ -173,6 +177,7 @@ impl ContextEngine for RecordingContextEngine {
         Ok(ContextMaintenanceReport::default())
     }
     async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        self.activity.lock().await.push("Materialize".into());
         Ok(MaterializedContext {
             focus: None,
             items: Vec::new(),
@@ -711,6 +716,29 @@ async fn actor_routes_lease_directive_into_the_context_engine() {
             && observation_index.is_some()
             && directive_index < observation_index,
         "the directive must be executed before the observation is persisted, got: {ingests:?}"
+    );
+    drop(ingests);
+
+    // Stronger timing invariant: the directive must take effect before the
+    // NEXT model round materializes, not just before turn-end persistence.
+    // The model calls the tool on round 0 and finishes on round 1, so the
+    // second materialization happens after the directive — prove it by
+    // ordering on the shared activity log.
+    let activity = context.activity.lock().await;
+    let directive_index = activity
+        .iter()
+        .position(|entry| entry == "ContextDirective");
+    let second_materialize = activity
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.as_str() == "Materialize")
+        .nth(1)
+        .map(|(index, _)| index);
+    assert!(
+        directive_index.is_some()
+            && second_materialize.is_some()
+            && directive_index < second_materialize,
+        "a ContextAction must be effective before the next model round, got: {activity:?}"
     );
 }
 

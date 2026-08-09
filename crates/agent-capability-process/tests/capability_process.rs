@@ -171,6 +171,83 @@ async fn cancellation_aborts_a_long_running_invoke_and_kills_the_child() {
 }
 
 #[tokio::test]
+async fn cancellation_terminates_the_child_process() {
+    // A heartbeat file the child rewrites every 50 ms is the observable
+    // liveness signal: after the cancel, the counter must stop advancing —
+    // the whole process tree is dead, not just the pending request.
+    let dir = tempfile::tempdir().unwrap();
+    let heartbeat = dir.path().join("heartbeat.txt");
+    let program = common::locate_mock_host().expect("mock_host built");
+    let capability: Arc<dyn Capability> = Arc::new(ProcessCapabilityAdapter::with_config(
+        manifest_with_program(&program.to_string_lossy()),
+        ProcessHostConfig {
+            program: program.to_string_lossy().into_owned(),
+            args: vec!["--serve".into()],
+            env: vec![
+                ("MOCK_MARKER".into(), "1".into()),
+                (
+                    "MOCK_HEARTBEAT".into(),
+                    heartbeat.to_string_lossy().into_owned(),
+                ),
+            ],
+            startup_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(30),
+            max_frame_bytes: 1024 * 1024,
+            sandbox: Default::default(),
+        },
+    ));
+    capability.start().await.unwrap();
+
+    // Give the heartbeat a moment to start ticking, then confirm it moves.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let ticking = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert_ne!(
+        std::fs::read_to_string(&heartbeat).unwrap_or_default(),
+        ticking,
+        "the heartbeat must advance while the child is alive"
+    );
+
+    // Cancel a silent invoke: the adapter must kill the child tree.
+    let cancel = CancellationToken::new();
+    let cancel_for_kill = cancel.clone();
+    let kill = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cancel_for_kill.cancel();
+    });
+    let result = capability
+        .invoke(
+            ToolCall {
+                id: "c2".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({"silent": true}),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec!["workspace:read".into()],
+                workspace: None,
+                artifacts: None,
+                cancel: cancel.clone(),
+            },
+        )
+        .await;
+    kill.await.unwrap();
+    assert!(
+        matches!(result, Err(agent_contracts::AgentError::Cancelled)),
+        "expected Cancelled, got {result:?}"
+    );
+
+    // The heartbeat must freeze: a cancelled capability is a terminated
+    // child, not a background process still producing side effects.
+    let frozen = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        std::fs::read_to_string(&heartbeat).unwrap_or_default(),
+        frozen,
+        "the child must be terminated after cancellation — the heartbeat stopped"
+    );
+}
+
+#[tokio::test]
 async fn from_manifest_rejects_non_process_transports() {
     let mut manifest = manifest_with_program("irrelevant");
     manifest.transport = CapabilityTransport::Builtin;

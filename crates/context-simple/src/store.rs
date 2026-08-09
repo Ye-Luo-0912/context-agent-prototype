@@ -25,13 +25,16 @@ use crate::engine::{SimpleContextConfig, State};
 /// How much of an item's content survives in the external map entry.
 const SUMMARY_CHARS: usize = 120;
 
-/// The store directory, defaulting to `.focus-agent/context-store` under
-/// the current working directory.
+/// The store directory. The composition root injects the workspace state
+/// dir (`workspace.state_dir()/context-store`), so runtime state never
+/// scatters under a CWD; the standalone/test fallback is an OS temp dir
+/// scoped to this process — never a CWD-relative path, so a misconfigured
+/// runtime cannot drop externalized context content into the launch
+/// directory.
 pub(crate) fn store_dir(config: &SimpleContextConfig) -> PathBuf {
-    config
-        .context_store_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(".focus-agent").join("context-store"))
+    config.context_store_dir.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("context-agent-store-{}", std::process::id()))
+    })
 }
 
 fn file_path(dir: &Path, item_id: ContextItemId) -> PathBuf {
@@ -83,6 +86,7 @@ fn make_context_ref(item: &ContextItem) -> ContextRef {
 
 /// Read an externalized item's full content back from the store. `None`
 /// when the entry was already deleted by Storage GC.
+#[cfg(test)]
 pub(crate) fn read_item(dir: &Path, item_id: ContextItemId) -> Option<ContextItem> {
     let bytes = std::fs::read(file_path(dir, item_id)).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -198,6 +202,7 @@ pub(crate) enum DeleteOutcome {
 
 /// Delete one store file; the caller is responsible for removing the
 /// in-memory entry only on `Deleted`/`NotFound`. Real IO errors propagate.
+#[cfg(test)]
 fn delete_file(dir: &Path, item_id: ContextItemId) -> Result<DeleteOutcome, std::io::Error> {
     let path = file_path(dir, item_id);
     match std::fs::remove_file(&path) {
@@ -240,28 +245,22 @@ fn storage_candidate(
     ))
 }
 
-/// Run the conservative Storage GC: delete store files whose entries are
-/// semantically dead, deletable by retention, older than the storage TTL
-/// and unreachable from the reference graph. This is the only place
-/// information is permanently removed.
+/// Phase 1 of the conservative Storage GC (under the state lock): decide
+/// which store entries are deletable and why. Pure in-memory — reachability
+/// closure over the reference graph, then retention/semantic/TTL checks —
+/// so the plan itself never touches the disk.
 ///
 /// Reachability is a closure, not a single incoming-edge check: roots are
 /// the dependency edges of resident/warm items, and every external entry
 /// whose id becomes reachable contributes its own dependencies — so
-/// external -> external chains, semantic links that surface as dependencies,
-/// and any future audit/evidence/OpenLoop edges keep their targets alive
-/// transitively. A store file that fails to delete on a *real* IO error
-/// keeps its entry (degraded storage is surfaced, not silently treated as
-/// "already deleted").
-pub(crate) fn run_storage_gc(
-    state: &mut State,
+/// external -> external chains, semantic links that surface as
+/// dependencies, and any future audit/evidence/OpenLoop edges keep their
+/// targets alive transitively.
+pub(crate) fn plan_storage_gc(
+    state: &State,
     config: &SimpleContextConfig,
     now_tick: u64,
-) -> StorageGcReport {
-    let dir = store_dir(config);
-
-    // Reachability closure over the reference graph: resident/warm items
-    // are roots; each reachable external entry contributes its own edges.
+) -> StorageGcPlan {
     let mut referenced: std::collections::HashSet<ContextItemId> = state
         .items
         .iter()
@@ -286,47 +285,114 @@ pub(crate) fn run_storage_gc(
         }
     }
 
+    let candidates = state
+        .external
+        .iter()
+        .filter_map(|entry| {
+            storage_candidate(
+                entry,
+                now_tick,
+                config.storage_ttl_ticks,
+                referenced.contains(&entry.item_id),
+            )
+            .map(|reason| (entry.item_id, reason))
+        })
+        .collect();
+    StorageGcPlan { candidates }
+}
+
+/// The Storage GC plan: which entries to delete and why (for the report).
+pub(crate) struct StorageGcPlan {
+    pub(crate) candidates: Vec<(ContextItemId, String)>,
+}
+
+/// Phase 2 (no lock held): remove the planned store files. Real IO errors
+/// keep their entries — degraded storage is surfaced, not silently treated
+/// as "already deleted".
+pub(crate) async fn run_storage_io(
+    dir: &Path,
+    plan: &StorageGcPlan,
+) -> Vec<(ContextItemId, Result<DeleteOutcome, std::io::Error>)> {
+    let mut results = Vec::with_capacity(plan.candidates.len());
+    for (item_id, _) in &plan.candidates {
+        let path = file_path(dir, *item_id);
+        let outcome = match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(DeleteOutcome::Deleted),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DeleteOutcome::NotFound),
+            Err(e) => Err(e),
+        };
+        results.push((*item_id, outcome));
+    }
+    results
+}
+
+/// Phase 3 (under a fresh lock): apply the IO results to the external map
+/// and build the report. Deleted/NotFound drop their entries; IO errors
+/// keep them; non-candidates are untouched.
+pub(crate) fn commit_storage_gc(
+    state: &mut State,
+    plan: StorageGcPlan,
+    io: Vec<(ContextItemId, Result<DeleteOutcome, std::io::Error>)>,
+) -> StorageGcReport {
+    let reasons: std::collections::HashMap<ContextItemId, String> =
+        plan.candidates.into_iter().collect();
+    let outcomes: std::collections::HashMap<_, _> = io.into_iter().collect();
+
     let mut report = StorageGcReport::default();
     let mut kept: Vec<ExternalizedContext> = Vec::with_capacity(state.external.len());
     for entry in state.external.drain(..) {
-        let referenced_now = referenced.contains(&entry.item_id);
-        let Some(reason) =
-            storage_candidate(&entry, now_tick, config.storage_ttl_ticks, referenced_now)
-        else {
-            kept.push(entry);
-            continue;
-        };
-        match delete_file(&dir, entry.item_id) {
-            Ok(DeleteOutcome::Deleted) => {
+        match outcomes.get(&entry.item_id) {
+            Some(Ok(DeleteOutcome::Deleted | DeleteOutcome::NotFound)) => {
                 report.deleted += 1;
                 state.gc_storage_deleted_total += 1;
+                let reason = reasons
+                    .get(&entry.item_id)
+                    .map(String::as_str)
+                    .unwrap_or("deleted by storage GC");
                 report
                     .reasons
                     .push(format!("deleted {} ({reason})", entry.context_ref.uri));
             }
-            Ok(DeleteOutcome::NotFound) => {
-                // No file behind the entry (already gone): drop the entry too.
-                report.deleted += 1;
-                state.gc_storage_deleted_total += 1;
-                report
-                    .reasons
-                    .push(format!("entry {} had no store file", entry.context_ref.uri));
-            }
-            Err(e) => {
+            Some(Err(e)) => {
                 // Real IO failure: keep the entry and its metadata. The
                 // content still exists on disk; deleting the reference would
                 // orphan it silently.
                 report.io_errors += 1;
+                let uri = entry.context_ref.uri.clone();
+                let reason = reasons
+                    .get(&entry.item_id)
+                    .map(String::as_str)
+                    .unwrap_or("storage GC");
                 kept.push(entry);
                 report
                     .reasons
-                    .push(format!("kept {}: storage IO error: {e}", reason));
+                    .push(format!("kept {uri}: storage IO error: {e} ({reason})"));
             }
+            None => kept.push(entry),
         }
     }
     state.external = kept;
     report.scanned = state.external.len() + report.deleted;
     report
+}
+
+/// Sync composition of the Storage GC, used by tests (which hold `&mut
+/// State` directly). The engine uses the async plan/io/commit split so the
+/// state lock is never held across disk IO.
+#[cfg(test)]
+pub(crate) fn run_storage_gc(
+    state: &mut State,
+    config: &SimpleContextConfig,
+    now_tick: u64,
+) -> StorageGcReport {
+    let plan = plan_storage_gc(state, config, now_tick);
+    let dir = store_dir(config);
+    let io = plan
+        .candidates
+        .iter()
+        .map(|(item_id, _)| (*item_id, delete_file(&dir, *item_id)))
+        .collect();
+    commit_storage_gc(state, plan, io)
 }
 
 /// Whether a semantically dead item may still be recalled. Only `Cold`

@@ -2474,3 +2474,159 @@ async fn closed_tool_scopes_are_not_candidates_but_hot_entities_still_reach_them
         "hot entities must recall the closed frame's observation"
     );
 }
+
+/// The external store is a fidelity boundary: `fetch(ref)` must recover the
+/// exact content that was externalized, not a summary or a truncated copy.
+#[tokio::test]
+async fn fetch_external_recovers_the_exact_original_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        gc_reactivate_per_pass: 8,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    let contents = ["step 0: fix AuthService.rs", "step 1: fix AuthService.rs"];
+    for (i, content) in contents.iter().enumerate() {
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                output: observation_output(&format!("step-{i}"), true, content),
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.externalized >= 1,
+        "buffer overflow must externalize: {report:?}"
+    );
+
+    // Find one externalized ref through the retrieval surface, then pull
+    // its full content back across the store boundary.
+    let refs = engine
+        .search_external(agent_contracts::ContextSearchQuery {
+            query: "AuthService".into(),
+            kind: None,
+            scope: None,
+            task_id: None,
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !refs.is_empty(),
+        "the search must surface the externalized refs"
+    );
+    let fetched = engine
+        .fetch_external(refs[0].item_id)
+        .await
+        .unwrap()
+        .expect("fetch must return the externalized item");
+    assert_eq!(
+        fetched.id, refs[0].item_id,
+        "fetch must return the item the ref points at"
+    );
+    assert_eq!(
+        fetched.kind,
+        ContextKind::ToolObservation,
+        "the recovered item keeps its kind"
+    );
+    assert!(
+        contents.contains(&fetched.content.as_str()),
+        "fetch must recover the exact original content, got: {:?}",
+        fetched.content
+    );
+}
+
+/// The context store is confined: with an explicit store dir every write
+/// lands under it, and the default fallback is an OS temp dir — never a
+/// CWD-relative path, so a misconfigured runtime cannot scatter externalized
+/// content into the launch directory.
+#[tokio::test]
+async fn context_store_never_writes_outside_the_state_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("context-store");
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        gc_reactivate_per_pass: 8,
+        context_store_dir: Some(store.clone()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    for i in 0..3 {
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                output: observation_output(
+                    &format!("step-{i}"),
+                    true,
+                    &format!("step {i}: fix AuthService.rs"),
+                ),
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(report.externalized >= 1, "overflow must externalize");
+
+    // Every store file is inside the configured directory and nothing else
+    // was created nearby.
+    let files: Vec<_> = std::fs::read_dir(&store).unwrap().collect();
+    assert_eq!(
+        files.len(),
+        report.externalized,
+        "all store files land in the configured dir"
+    );
+    for file in files {
+        let path = file.unwrap().path();
+        assert!(path.starts_with(&store), "store file escaped: {path:?}");
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("json"),
+            "store files are the item payloads"
+        );
+    }
+    // The old CWD-relative fallback must never appear.
+    let legacy = std::env::current_dir()
+        .unwrap()
+        .join(".focus-agent")
+        .join("context-store");
+    assert!(
+        !legacy.exists(),
+        "no store may be created under the CWD: {}",
+        legacy.display()
+    );
+
+    // The default fallback is an OS temp dir, never CWD-derived.
+    let default_dir = crate::store::store_dir(&SimpleContextConfig::default());
+    assert!(
+        default_dir.starts_with(std::env::temp_dir()),
+        "the default store must live under the OS temp dir, got: {default_dir:?}"
+    );
+    assert!(
+        !default_dir.starts_with(std::env::current_dir().unwrap()),
+        "the default store must never be CWD-relative: {default_dir:?}"
+    );
+}

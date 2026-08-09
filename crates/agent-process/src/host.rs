@@ -400,10 +400,10 @@ impl ProcessHost {
             // -pid reaches the whole tree. On ESRCH (no such group) fall
             // back to killing the direct child.
             let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-            if result != 0 {
-                if let Ok(mut child) = self.child.try_lock() {
-                    let _ = child.start_kill();
-                }
+            if result != 0
+                && let Ok(mut child) = self.child.try_lock()
+            {
+                let _ = child.start_kill();
             }
         }
         #[cfg(windows)]
