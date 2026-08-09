@@ -13,17 +13,38 @@
 //! older than the storage TTL, and not referenced by any resident/warm
 //! item's dependency edges. Pinned and durable items are never touched.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use agent_contracts::{
     ContextItem, ContextItemId, ContextRef, ContextResidency, ContextRetention,
-    ExternalizedContext, StorageGcReport,
+    ExternalizedContext, StorageGcReport, StoreReconcileReport,
 };
 
 use crate::engine::{SimpleContextConfig, State};
 
 /// How much of an item's content survives in the external map entry.
 const SUMMARY_CHARS: usize = 120;
+
+/// Cap on concurrent store IO (writes, reads, deletes, reconcile): the IO
+/// phase runs without the state lock, so parallel operations shrink the
+/// lock-free window to the slowest single op — but unbounded parallelism
+/// would trade one problem for another (fd/thread pressure on a store with
+/// tens of thousands of blobs).
+pub(crate) const MAX_STORE_IO_CONCURRENCY: usize = 8;
+
+/// FNV-1a 64-bit checksum of a blob, hex-encoded. Not cryptographic: it is
+/// a corruption/bit-rot detector for reconcile, which compares the blob
+/// against the checksum the owning entry captured at write time. The hot
+/// read path skips it so per-item retrieval stays IO-cheap.
+fn checksum_hex(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
 
 /// The store directory. The composition root injects the workspace state
 /// dir (`workspace.state_dir()/context-store`), so runtime state never
@@ -59,20 +80,35 @@ pub(crate) fn externalize(dir: &Path, item: &ContextItem) -> std::io::Result<Con
 }
 
 /// Async variant of [`externalize`] for the GC's IO phase, which must not
-/// hold the state lock across disk writes.
+/// hold the state lock across disk writes. The bytes are pre-serialized
+/// under the lock by the caller (the IO phase never re-reads state), so a
+/// join failure cannot lose the source item; the returned checksum is
+/// captured on the owning entry so the reconcile can detect corruption.
+///
+/// The write is atomic: temp file -> flush + sync -> rename. A crash
+/// between the temp write and the rename leaves only a `.tmp` file (cleaned
+/// by the startup reconcile), never a half-written blob under the formal
+/// name.
 pub(crate) async fn externalize_async(
     dir: &Path,
-    item: &ContextItem,
-) -> std::io::Result<ContextRef> {
+    item_id: ContextItemId,
+    bytes: &[u8],
+) -> std::io::Result<String> {
     tokio::fs::create_dir_all(dir).await?;
-    let path = file_path(dir, item.id);
-    let bytes = serde_json::to_vec(item)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    tokio::fs::write(&path, bytes).await?;
-    Ok(make_context_ref(item))
+    let path = file_path(dir, item_id);
+    let tmp = dir.join(format!("{item_id}.tmp"));
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+    }
+    tokio::fs::rename(&tmp, &path).await?;
+    Ok(checksum_hex(bytes))
 }
 
-fn make_context_ref(item: &ContextItem) -> ContextRef {
+pub(crate) fn make_context_ref(item: &ContextItem) -> ContextRef {
     let summary: String = item.content.chars().take(SUMMARY_CHARS).collect();
     ContextRef {
         uri: context_uri(item.id),
@@ -174,12 +210,14 @@ pub(crate) fn externally_retrievable(entry: &ExternalizedContext) -> bool {
 /// so recall and Storage GC can decide *without* reading the file: recall
 /// pre-filters on `entities` in memory, and Storage GC runs a reachability
 /// closure over `dependencies` (resident heap, warm buffer and external
-/// entries alike).
+/// entries alike). `blob_checksum` is the hash captured at write time so
+/// the startup reconcile can detect corruption.
 pub(crate) fn to_external_entry(
     item: &ContextItem,
     context_ref: ContextRef,
     now_tick: u64,
     gc_epoch: u64,
+    blob_checksum: Option<String>,
 ) -> ExternalizedContext {
     ExternalizedContext {
         item_id: item.id,
@@ -197,6 +235,7 @@ pub(crate) fn to_external_entry(
         tags: item.tags.clone(),
         dependencies: item.dependencies.clone(),
         last_access_gc_epoch: Some(gc_epoch),
+        blob_checksum,
     }
 }
 
@@ -468,12 +507,274 @@ pub(crate) fn store_ready(config: &SimpleContextConfig) -> bool {
     store_dir(config).exists()
 }
 
+/// Delete the store blobs for the given ids. Used *after* a successful
+/// recall commit: only once the recalled content is resident again (and the
+/// entry left the map) is the blob removed, so a crash between commit and
+/// delete leaves an orphan the startup reconcile re-owns instead of losing
+/// content. Deletions run with bounded concurrency; real IO errors are
+/// surfaced per id (the reconcile pass converges on them later).
+pub(crate) async fn delete_blobs_async(
+    dir: &Path,
+    ids: &[ContextItemId],
+) -> Vec<(ContextItemId, Result<DeleteOutcome, std::io::Error>)> {
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_STORE_IO_CONCURRENCY));
+    let mut tasks = tokio::task::JoinSet::new();
+    for &item_id in ids {
+        let dir = dir.to_path_buf();
+        let semaphore = std::sync::Arc::clone(&semaphore);
+        let permit = semaphore.acquire_owned().await.expect("semaphore");
+        tasks.spawn(async move {
+            let _permit = permit;
+            let path = file_path(&dir, item_id);
+            let outcome = match tokio::fs::remove_file(&path).await {
+                Ok(()) => Ok(DeleteOutcome::Deleted),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DeleteOutcome::NotFound),
+                Err(e) => Err(e),
+            };
+            (item_id, outcome)
+        });
+    }
+    let mut results = Vec::with_capacity(ids.len());
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok(result) = joined {
+            results.push(result);
+        }
+    }
+    results
+}
+
+// ---------------------------------------------------------------------------
+// Startup reconcile: bring the on-disk blob directory back in line with the
+// external map after a crash or an interrupted IO phase. Every formal blob
+// gets exactly one owner; uncertain state is quarantined, never ignored.
+// ---------------------------------------------------------------------------
+
+/// What one blob became, decided without the state lock. The plan/io/commit
+/// split mirrors the GC: the lock is never held across disk IO.
+#[derive(Default)]
+pub(crate) struct ReconcileIo {
+    /// Valid, ownerless blobs whose content should re-enter the map
+    /// (item + the checksum captured from the file).
+    pub(crate) rebuilt_candidates: Vec<(ContextItem, String)>,
+    pub(crate) scanned: usize,
+    pub(crate) deleted_stale: usize,
+    pub(crate) quarantined: usize,
+    pub(crate) temp_cleaned: usize,
+    pub(crate) io_errors: usize,
+    pub(crate) reasons: Vec<String>,
+}
+
+/// Phase 2 of the reconcile (no lock held): scan the store directory, read
+/// every formal blob, and classify it. `map_checksums` is the id -> owned
+/// checksum snapshot taken under the lock; `resident_ids` is the heap +
+/// warm-buffer id snapshot. Blobs the map owns are kept when their checksum
+/// matches; corrupt / id-mismatched blobs are moved to `quarantine/`;
+/// abandoned `.tmp` files are removed.
+pub(crate) async fn run_reconcile_io(
+    dir: &Path,
+    map_checksums: &HashMap<ContextItemId, Option<String>>,
+    resident_ids: &HashSet<ContextItemId>,
+) -> ReconcileIo {
+    let mut io = ReconcileIo::default();
+    let quarantine_dir = dir.join("quarantine");
+
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return io,
+        Err(e) => {
+            io.io_errors += 1;
+            io.reasons.push(format!("store dir unreadable: {e}"));
+            return io;
+        }
+    };
+
+    while let Some(entry) = entries.next_entry().await.unwrap_or_else(|e| {
+        io.io_errors += 1;
+        io.reasons.push(format!("store dir read error: {e}"));
+        None
+    }) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        // Abandoned temp file: the atomic write never reached its rename.
+        if name.ends_with(".tmp") {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {
+                    io.temp_cleaned += 1;
+                    io.reasons
+                        .push(format!("removed abandoned temp file {name}"));
+                }
+                Err(e) => {
+                    io.io_errors += 1;
+                    io.reasons.push(format!("could not remove {name}: {e}"));
+                }
+            }
+            continue;
+        }
+        if !name.ends_with(".json") {
+            continue;
+        }
+        io.scanned += 1;
+
+        // The file name must parse as the id it claims to hold.
+        let Ok(item_id) = name.trim_end_matches(".json").parse::<ContextItemId>() else {
+            quarantine(
+                &quarantine_dir,
+                &path,
+                &name,
+                &mut io,
+                "file name is not an item id",
+            )
+            .await;
+            continue;
+        };
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                io.io_errors += 1;
+                io.reasons.push(format!("unreadable blob {name}: {e}"));
+                continue;
+            }
+        };
+        let checksum = checksum_hex(&bytes);
+        let item: ContextItem = match serde_json::from_slice(&bytes) {
+            Ok(item) => item,
+            Err(e) => {
+                quarantine(
+                    &quarantine_dir,
+                    &path,
+                    &name,
+                    &mut io,
+                    &format!("unparseable blob: {e}"),
+                )
+                .await;
+                continue;
+            }
+        };
+        if item.id != item_id {
+            quarantine(
+                &quarantine_dir,
+                &path,
+                &name,
+                &mut io,
+                &format!("blob content id {} != file name id {item_id}", item.id),
+            )
+            .await;
+            continue;
+        }
+
+        match map_checksums.get(&item_id) {
+            // The map owns this blob: a checksum mismatch means the file
+            // was corrupted or tampered with after the write.
+            Some(Some(expected)) if *expected != checksum => {
+                quarantine(
+                    &quarantine_dir,
+                    &path,
+                    &name,
+                    &mut io,
+                    "checksum mismatch: blob changed since the owning entry captured it",
+                )
+                .await;
+            }
+            // Consistent owner (or a pre-checksum entry: parse + id match
+            // is the best available signal).
+            Some(_) => {}
+            // No owner: if the same id is live in the heap or warm buffer
+            // (a crash between an externalize write and its commit, or a
+            // stale duplicate after recall), the file is a stale copy of
+            // resident content and is deleted; otherwise the blob is
+            // re-owned as an external entry — the conservative choice.
+            None => {
+                if resident_ids.contains(&item_id) {
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => {
+                            io.deleted_stale += 1;
+                            io.reasons
+                                .push(format!("deleted stale blob {name}: id already resident"));
+                        }
+                        Err(e) => {
+                            io.io_errors += 1;
+                            io.reasons
+                                .push(format!("could not remove stale blob {name}: {e}"));
+                        }
+                    }
+                } else {
+                    io.rebuilt_candidates.push((item, checksum));
+                }
+            }
+        }
+    }
+    io
+}
+
+/// Move one unreadable/inconsistent blob to the quarantine subdirectory.
+/// The file is preserved (evidence), just no longer treated as a formal
+/// blob.
+async fn quarantine(
+    quarantine_dir: &Path,
+    path: &Path,
+    name: &str,
+    io: &mut ReconcileIo,
+    reason: &str,
+) {
+    let _ = tokio::fs::create_dir_all(quarantine_dir).await;
+    match tokio::fs::rename(path, quarantine_dir.join(name)).await {
+        Ok(()) => {
+            io.quarantined += 1;
+            io.reasons.push(format!("quarantined {name}: {reason}"));
+        }
+        Err(e) => {
+            io.io_errors += 1;
+            io.reasons.push(format!("could not quarantine {name}: {e}"));
+        }
+    }
+}
+
+/// Phase 3 of the reconcile (under a fresh lock): apply the IO results —
+/// rebuilt blobs re-enter the map as external entries (re-checking that
+/// nothing claimed the id while the lock was down), and the report is
+/// assembled.
+pub(crate) fn commit_reconcile(
+    state: &mut State,
+    io: ReconcileIo,
+    now_tick: u64,
+    gc_epoch: u64,
+) -> StoreReconcileReport {
+    let mut rebuilt = 0usize;
+    for (item, checksum) in io.rebuilt_candidates {
+        if state.external.get(item.id).is_some() {
+            continue; // claimed concurrently; the blob keeps its owner
+        }
+        let context_ref = make_context_ref(&item);
+        state.external.push(to_external_entry(
+            &item,
+            context_ref,
+            now_tick,
+            gc_epoch,
+            Some(checksum),
+        ));
+        state.gc_externalized_total += 1;
+        rebuilt += 1;
+    }
+    StoreReconcileReport {
+        scanned: io.scanned,
+        rebuilt,
+        deleted_stale: io.deleted_stale,
+        quarantined: io.quarantined,
+        temp_cleaned: io.temp_cleaned,
+        io_errors: io.io_errors,
+        reasons: io.reasons,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::{SimpleContextConfig, State};
     use crate::item::make_item;
     use agent_contracts::{ContextKind, ContextScope, DependencyEdge, SemanticState};
+    use std::collections::{HashMap, HashSet};
 
     fn store_config(dir: &Path) -> SimpleContextConfig {
         SimpleContextConfig {
@@ -534,7 +835,7 @@ mod tests {
             let reference = externalize(dir.path(), item).unwrap();
             state
                 .external
-                .push(to_external_entry(item, reference, 1, 1));
+                .push(to_external_entry(item, reference, 1, 1, None));
         }
         // A resident item depends on the dead entry: it must survive.
         let mut holder = test_item(ContextItemId::new(), "holder");
@@ -583,7 +884,7 @@ mod tests {
             summary: "fix AuthService.rs".into(),
             created_tick: 1,
         };
-        let entry = to_external_entry(&item, reference, 7, 3);
+        let entry = to_external_entry(&item, reference, 7, 3, None);
         assert!(
             !entry.entities.is_empty(),
             "the entry keeps the entity signature for in-memory recall"
@@ -615,7 +916,7 @@ mod tests {
             let reference = externalize(dir.path(), item).unwrap();
             state
                 .external
-                .push(to_external_entry(item, reference, 1, 1));
+                .push(to_external_entry(item, reference, 1, 1, None));
         }
 
         let report = run_storage_gc(&mut state, &config, 100);
@@ -662,7 +963,7 @@ mod tests {
         };
         state
             .external
-            .push(to_external_entry(&item, reference, 100, 2));
+            .push(to_external_entry(&item, reference, 100, 2, None));
         assert_eq!(
             age_external_entries(&mut state, &config, 5),
             0,
@@ -689,7 +990,7 @@ mod tests {
             summary: "pre-epoch aging".into(),
             created_tick: 1,
         };
-        let mut entry = to_external_entry(&item, reference, 100, 2);
+        let mut entry = to_external_entry(&item, reference, 100, 2, None);
         entry.last_access_gc_epoch = None;
         state.external.push(entry);
 
@@ -706,5 +1007,295 @@ mod tests {
             "the restored entry ages after four full generations"
         );
         assert_eq!(state.external[0].residency, ContextResidency::External);
+    }
+
+    /// Simulate the four crash windows around one externalize/recall cycle
+    /// and assert the reconcile converges in every one: a leftover temp
+    /// file is removed, an uncommitted blob is rebuilt into an entry, a
+    /// healthy store needs no intervention, and a blob whose content came
+    /// back resident is reclaimed. No window may lose the content or leave
+    /// an unowned file.
+    #[tokio::test]
+    async fn reconcile_heals_each_crash_window_without_losing_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::default();
+        let id = ContextItemId::new();
+        let item = test_item(id, "crash window content");
+        let bytes = serde_json::to_vec(&item).unwrap();
+        let checksum = checksum_hex(&bytes);
+
+        // Window 1: crash after the temp write, before the rename. Only a
+        // `.tmp` file exists; no formal blob, no owner needed.
+        let tmp = dir.path().join(format!("{id}.tmp"));
+        std::fs::write(&tmp, &bytes).unwrap();
+        let io = run_reconcile_io(dir.path(), &HashMap::new(), &HashSet::new()).await;
+        let report = commit_reconcile(&mut state, io, 1, 1);
+        assert_eq!(report.temp_cleaned, 1, "temp cleaned: {report:?}");
+        assert_eq!(report.rebuilt, 0);
+        assert!(state.external.get(id).is_none());
+        assert!(!tmp.exists());
+
+        // Window 2: crash after the rename, before the map commit. The
+        // blob is valid and unowned → rebuilt into an entry that captures
+        // its checksum, so the content stays reachable.
+        externalize_async(dir.path(), id, &bytes).await.unwrap();
+        let io = run_reconcile_io(dir.path(), &HashMap::new(), &HashSet::new()).await;
+        let report = commit_reconcile(&mut state, io, 1, 1);
+        assert_eq!(report.rebuilt, 1, "orphan rebuilt: {report:?}");
+        let entry = state.external.get(id).expect("rebuilt entry owns the blob");
+        assert_eq!(entry.blob_checksum.as_deref(), Some(checksum.as_str()));
+
+        // Window 3: healthy — the map owns the blob and the checksum
+        // matches. One owner, zero interventions.
+        let owned: HashMap<_, _> = [(id, Some(checksum.clone()))].into_iter().collect();
+        let io = run_reconcile_io(dir.path(), &owned, &HashSet::new()).await;
+        let report = commit_reconcile(&mut state, io, 1, 1);
+        assert_eq!(report.scanned, 1);
+        assert_eq!(
+            report.rebuilt + report.deleted_stale + report.quarantined,
+            0
+        );
+
+        // Window 4: crash after a recall commit, before the blob delete.
+        // The content is resident again; the leftover blob is a stale
+        // duplicate and is reclaimed, content stays in the heap.
+        state.external.retain(|e| e.item_id != id);
+        state.items.push(item.clone());
+        let resident: HashSet<_> = [id].into_iter().collect();
+        let io = run_reconcile_io(dir.path(), &HashMap::new(), &resident).await;
+        let report = commit_reconcile(&mut state, io, 1, 1);
+        assert_eq!(report.deleted_stale, 1, "stale blob reclaimed: {report:?}");
+        assert!(
+            !dir.path().join(format!("{id}.json")).exists(),
+            "the reclaimed blob is gone"
+        );
+        assert!(
+            state.items.iter().any(|i| i.id == id),
+            "the recalled content stayed resident"
+        );
+    }
+
+    /// One reconcile pass over a store holding every damaged state at once:
+    /// an owned blob, an orphan, a stale duplicate, an unparseable file, a
+    /// tampered blob and an abandoned temp file. Each lands in exactly the
+    /// right bucket, and the damaged evidence is quarantined, not deleted.
+    #[tokio::test]
+    async fn reconcile_classifies_every_blob_state_in_one_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::default();
+
+        let owned_id = ContextItemId::new();
+        let owned = test_item(owned_id, "owned content");
+        let owned_bytes = serde_json::to_vec(&owned).unwrap();
+        let owned_checksum = externalize_async(dir.path(), owned_id, &owned_bytes)
+            .await
+            .unwrap();
+
+        let orphan_id = ContextItemId::new();
+        let orphan = test_item(orphan_id, "orphan content");
+        externalize_async(dir.path(), orphan_id, &serde_json::to_vec(&orphan).unwrap())
+            .await
+            .unwrap();
+
+        let stale_id = ContextItemId::new();
+        let stale = test_item(stale_id, "stale content");
+        externalize_async(dir.path(), stale_id, &serde_json::to_vec(&stale).unwrap())
+            .await
+            .unwrap();
+        state.items.push(stale);
+
+        let damaged_id = ContextItemId::new();
+        std::fs::write(
+            dir.path().join(format!("{damaged_id}.json")),
+            b"not a context item{{{",
+        )
+        .unwrap();
+
+        let tampered_id = ContextItemId::new();
+        let tampered = test_item(tampered_id, "tampered content");
+        let tampered_checksum = externalize_async(
+            dir.path(),
+            tampered_id,
+            &serde_json::to_vec(&tampered).unwrap(),
+        )
+        .await
+        .unwrap();
+        // Tamper after the entry captured its checksum: different bytes
+        // under the same name.
+        std::fs::write(
+            dir.path().join(format!("{tampered_id}.json")),
+            serde_json::to_vec(&test_item(tampered_id, "changed content")).unwrap(),
+        )
+        .unwrap();
+
+        let abandoned_id = ContextItemId::new();
+        std::fs::write(dir.path().join(format!("{abandoned_id}.tmp")), b"partial").unwrap();
+
+        let map_checksums: HashMap<_, _> = [
+            (owned_id, Some(owned_checksum)),
+            (tampered_id, Some(tampered_checksum)),
+        ]
+        .into_iter()
+        .collect();
+        let resident: HashSet<_> = [stale_id].into_iter().collect();
+        let io = run_reconcile_io(dir.path(), &map_checksums, &resident).await;
+        let report = commit_reconcile(&mut state, io, 2, 1);
+
+        assert_eq!(report.scanned, 5, "five formal blobs scanned: {report:?}");
+        assert_eq!(report.rebuilt, 1, "orphan rebuilt: {report:?}");
+        assert_eq!(
+            report.deleted_stale, 1,
+            "stale duplicate removed: {report:?}"
+        );
+        assert_eq!(
+            report.quarantined, 2,
+            "damaged + tampered quarantined: {report:?}"
+        );
+        assert_eq!(report.temp_cleaned, 1, "abandoned temp removed: {report:?}");
+        assert_eq!(report.io_errors, 0);
+        assert!(
+            dir.path()
+                .join("quarantine")
+                .join(format!("{damaged_id}.json"))
+                .exists(),
+            "damaged evidence is preserved"
+        );
+        assert!(
+            dir.path()
+                .join("quarantine")
+                .join(format!("{tampered_id}.json"))
+                .exists(),
+            "tampered evidence is preserved"
+        );
+        assert!(
+            state.external.get(orphan_id).is_some(),
+            "the rebuilt orphan owns its blob"
+        );
+        assert!(
+            state.external.iter().all(|e| e.item_id != stale_id),
+            "the reclaimed id has no entry anymore"
+        );
+    }
+
+    /// The ownership invariant after a full externalize → recall → reconcile
+    /// cycle: every map entry has one readable blob whose bytes match the
+    /// entry's captured checksum, and every formal blob has exactly one
+    /// owner — no orphans, no dangling records.
+    #[tokio::test]
+    async fn reconcile_leaves_exactly_one_owner_per_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::default();
+
+        let mut ids = Vec::new();
+        for index in 0..5 {
+            let id = ContextItemId::new();
+            let item = test_item(id, &format!("invariant item {index}"));
+            let bytes = serde_json::to_vec(&item).unwrap();
+            let checksum = externalize_async(dir.path(), id, &bytes).await.unwrap();
+            state.external.push(to_external_entry(
+                &item,
+                make_context_ref(&item),
+                1,
+                1,
+                Some(checksum),
+            ));
+            ids.push(id);
+        }
+
+        // Simulate a recall whose post-commit delete never ran: the content
+        // is resident again but the blob is still on disk.
+        let recalled = ids[0];
+        state
+            .items
+            .push(test_item(recalled, "recalled invariant item"));
+        state.external.retain(|e| e.item_id != recalled);
+
+        let map_checksums: HashMap<_, _> = state
+            .external
+            .iter()
+            .map(|e| (e.item_id, e.blob_checksum.clone()))
+            .collect();
+        let resident: HashSet<_> = state.items.iter().map(|i| i.id).collect();
+        let io = run_reconcile_io(dir.path(), &map_checksums, &resident).await;
+        let report = commit_reconcile(&mut state, io, 2, 1);
+        assert_eq!(
+            report.deleted_stale, 1,
+            "recalled blob reclaimed: {report:?}"
+        );
+
+        // Every entry owns one readable blob matching its checksum.
+        for entry in state.external.iter() {
+            let bytes = std::fs::read(dir.path().join(format!("{}.json", entry.item_id)))
+                .expect("every entry has a readable blob");
+            let expected = entry
+                .blob_checksum
+                .clone()
+                .expect("every entry captures a checksum");
+            assert_eq!(
+                checksum_hex(&bytes),
+                expected,
+                "blob matches its entry checksum"
+            );
+        }
+        // Every formal blob is owned by exactly one entry.
+        let formal: HashSet<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .map(|e| {
+                e.file_name()
+                    .to_str()
+                    .unwrap()
+                    .trim_end_matches(".json")
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            formal.len(),
+            state.external.len(),
+            "no orphan or dangling blobs after reconcile"
+        );
+        assert!(formal.iter().all(|name| {
+            state
+                .external
+                .iter()
+                .any(|e| e.item_id.to_string() == *name)
+        }));
+    }
+
+    #[tokio::test]
+    async fn reconcile_quarantines_a_tampered_blob_against_its_entry_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::default();
+        let id = ContextItemId::new();
+        let item = test_item(id, "original content");
+        let checksum = externalize_async(dir.path(), id, &serde_json::to_vec(&item).unwrap())
+            .await
+            .unwrap();
+        // Bit rot / tampering after the write: same id, different bytes.
+        std::fs::write(
+            dir.path().join(format!("{id}.json")),
+            serde_json::to_vec(&test_item(id, "changed content")).unwrap(),
+        )
+        .unwrap();
+
+        let map_checksums: HashMap<_, _> = [(id, Some(checksum))].into_iter().collect();
+        let io = run_reconcile_io(dir.path(), &map_checksums, &HashSet::new()).await;
+        let report = commit_reconcile(&mut state, io, 1, 1);
+        assert_eq!(
+            report.quarantined, 1,
+            "tampered blob quarantined: {report:?}"
+        );
+        assert!(
+            dir.path()
+                .join("quarantine")
+                .join(format!("{id}.json"))
+                .exists(),
+            "the corrupted evidence is preserved for inspection"
+        );
+        assert!(
+            !dir.path().join(format!("{id}.json")).exists(),
+            "the corrupted blob no longer masquerades as a formal blob"
+        );
     }
 }

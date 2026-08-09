@@ -646,6 +646,12 @@ pub struct ContextGcReport {
     pub evictions: Vec<ContextEviction>,
     #[serde(default)]
     pub reactivations: Vec<ContextReactivation>,
+    /// Store blob deletions that failed after a successful recall commit
+    /// (real filesystem errors). The recalled content is resident, so this
+    /// never loses information — the leftover blob is re-owned or deleted
+    /// by the next startup reconcile.
+    #[serde(default)]
+    pub store_blob_delete_errors: usize,
     pub diagnostics: ContextDiagnostics,
 }
 
@@ -708,6 +714,13 @@ pub struct ExternalizedContext {
     /// accessed at the current epoch instead of aging out instantly.
     #[serde(default)]
     pub last_access_gc_epoch: Option<u64>,
+    /// Checksum of the stored blob this entry owns, captured at write time.
+    /// The startup reconcile validates blobs against it; the hot read path
+    /// (fetch) skips the hash so per-item retrieval stays IO-cheap. `None`
+    /// for entries written before checksums existed (restore reconciles
+    /// them by parsing + id match).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_checksum: Option<String>,
 }
 
 /// Cap on the external refs surfaced in one materialized context. The
@@ -848,6 +861,41 @@ pub struct StorageGcReport {
     pub reasons: Vec<String>,
 }
 
+/// The outcome of a store reconcile pass: the on-disk blob directory is
+/// brought back in line with the external map, so every formal blob has
+/// exactly one owner and every stored record has one readable blob.
+/// Uncertain state is quarantined (moved aside, evidence preserved), never
+/// silently ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StoreReconcileReport {
+    /// Formal blobs (`<id>.json`) inspected.
+    pub scanned: usize,
+    /// Orphan blobs rebuilt into external-map entries (the file was valid
+    /// and nothing else owned the id) — the conservative choice: context
+    /// GC never purges, so a reachable file becomes a reference again.
+    #[serde(default)]
+    pub rebuilt: usize,
+    /// Orphan blobs deleted because the same id was already live in the
+    /// heap or warm buffer (the file was a stale duplicate of resident
+    /// content).
+    #[serde(default)]
+    pub deleted_stale: usize,
+    /// Unreadable / id-mismatched / checksum-mismatched blobs moved to the
+    /// `quarantine/` subdirectory instead of being treated as deleted.
+    #[serde(default)]
+    pub quarantined: usize,
+    /// Abandoned temp files (`*.tmp` from an interrupted atomic write)
+    /// removed.
+    #[serde(default)]
+    pub temp_cleaned: usize,
+    /// Real filesystem errors (permission, disk): the blob was left in
+    /// place and surfaced, not guessed at.
+    #[serde(default)]
+    pub io_errors: usize,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
 /// A bounded, UI/replay-friendly projection of one context item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextItemSummary {
@@ -926,6 +974,17 @@ pub trait ContextEngine: Send + Sync {
         Ok(StorageGcReport::default())
     }
 
+    /// Bring the store back in line with the external map after a crash or
+    /// an interrupted IO phase: every formal blob gets exactly one owner
+    /// (rebuilt entry or deleted as a stale duplicate of resident content),
+    /// corrupt/id-mismatched blobs are quarantined, and abandoned temp
+    /// files are removed. The composition root calls this at startup after
+    /// restoring the checkpoint. Default implementation does nothing, so
+    /// engines without a store keep working unchanged.
+    async fn reconcile_store(&self) -> AgentResult<StoreReconcileReport> {
+        Ok(StoreReconcileReport::default())
+    }
+
     /// Bounded projection of live items, oldest first, capped at `limit`.
     async fn inspect(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>>;
 
@@ -997,6 +1056,7 @@ mod tests {
             tags: Vec::new(),
             dependencies: Vec::new(),
             last_access_gc_epoch: Some(0),
+            blob_checksum: None,
         }
     }
 

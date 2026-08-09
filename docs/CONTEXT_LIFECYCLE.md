@@ -918,6 +918,44 @@ structural mutation and close/ancestor lookups (`close_scope`,
 `index_of` instead of per-hop linear scans. Checkpoints serialize only
 the scopes; the index rebuilds on restore.
 
+### 9l. Store blob ownership and crash recovery
+
+Every formal blob (`<id>.json` under the store dir) has exactly one owner:
+the external-map entry whose `ExternalizedContext.blob_checksum` is the
+FNV-1a content hash captured at write time (corruption/bit-rot detection
+for the reconcile; the hot read path skips it so per-item retrieval stays
+IO-cheap). Ownership holds across every state transition:
+
+- **Externalize** pre-serializes the bytes under the lock and keeps the
+  source item with the caller (`GcPlan::externalize` carries `(item,
+  bytes)`, id-keyed); the spawned IO task only writes. A `JoinError`
+  (panic/cancellation) therefore returns every unconsumed item to the
+  buffer — the source item is never lost with its task. Writes are
+  atomic: temp file -> flush + sync -> rename, so a crash mid-write
+  leaves only a `.tmp` file, never a half-written blob under the formal
+  name. Store IO (writes, recall reads, post-commit deletes) is bounded
+  by `MAX_STORE_IO_CONCURRENCY = 8` via a shared semaphore.
+- **Recall** re-enters the content as a resident item and removes the map
+  entry at commit; the blob is deleted only *after* the commit (phase 4 of
+  `gc()`, outside the lock, with per-id IO errors surfaced in
+  `ContextGcReport.store_blob_delete_errors`). A crash between commit and
+  delete leaves a stale blob whose id is resident — the reconcile
+  reclaims it; content is never lost.
+- **Startup reconcile** (`ContextEngine::reconcile_store()`, default
+  empty report; `context-simple` implements it) converges the directory
+  with the map under the same plan/io/commit split as GC, so the state
+  lock is never held across disk IO. Each blob is classified: a valid
+  ownerless blob is rebuilt into an entry (context GC never purges — a
+  reachable file becomes a reference again); a blob whose id is resident
+  is reclaimed as a stale duplicate; an unreadable / id-mismatched /
+  checksum-mismatched blob is moved to `quarantine/` (evidence preserved,
+  never guessed away); an abandoned `.tmp` file is removed; a real IO
+  error leaves the blob in place and is surfaced. `StoreReconcileReport`
+  counts every bucket and explains each action. The service boundary
+  forwards it (`ServiceOp::ReconcileStore`), with parity tests proving the
+  wire op, the adapter override and the sidecar handling agree with the
+  in-process engine.
+
 ## 10. What should become durable later
 
 A later policy can promote only structured outcomes such as:

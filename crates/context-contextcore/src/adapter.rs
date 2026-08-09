@@ -170,6 +170,12 @@ impl ContextEngine for ContextServiceAdapter {
             .map_err(|e| AgentError::Context(format!("decode storage gc report: {e}")))
     }
 
+    async fn reconcile_store(&self) -> AgentResult<agent_contracts::StoreReconcileReport> {
+        let value = self.call(ServiceOp::ReconcileStore).await?;
+        serde_json::from_value(value)
+            .map_err(|e| AgentError::Context(format!("decode store reconcile report: {e}")))
+    }
+
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
         let value = self.call(ServiceOp::Materialize { query }).await?;
         serde_json::from_value(value)

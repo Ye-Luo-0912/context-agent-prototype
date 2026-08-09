@@ -219,6 +219,7 @@ mod tests {
             tags: Vec::new(),
             dependencies: Vec::new(),
             last_access_gc_epoch: Some(0),
+            blob_checksum: None,
         }
     }
 

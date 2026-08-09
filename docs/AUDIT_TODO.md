@@ -268,6 +268,60 @@ Inject crashes after temp write, rename, map commit, map removal and delete.
 After restart every formal blob has one owner and every Stored record has one
 readable blob; orphan/dangling counts are zero.
 
+**Closed 2026-08-10.**
+
+Implemented:
+
+- Every formal blob has exactly one owner. The external-map entry now
+  carries the checksum captured at write time
+  (`ExternalizedContext.blob_checksum`), so the startup reconcile can prove
+  a blob belongs to its record. A recalled item's blob is deleted only
+  AFTER the recall commit lands (`gc()` phase 4, outside the lock): a crash
+  between commit and delete leaves an orphan the reconcile re-owns, never
+  lost content.
+- Externalization no longer detaches the source item into the IO task:
+  `GcPlan::externalize` keeps `(item, pre-serialized bytes)` with the
+  caller, so a `JoinError` (panic/cancellation) returns every unconsumed
+  item to the buffer instead of losing it with its task. Writes are
+  atomic: temp file -> flush + sync -> rename, so a crash mid-write leaves
+  only a `.tmp` file, never a half-written blob.
+- Store IO is bounded: `MAX_STORE_IO_CONCURRENCY = 8` via a shared
+  `Arc<Semaphore>` across externalize writes, recall reads and post-commit
+  blob deletes.
+- `ContextEngine::reconcile_store()` is a new contract method (default
+  returns an empty report; `context-simple` implements it) that converges
+  the on-disk directory with the external map under the same plan/io/commit
+  split as GC: the lock is never held across disk IO. Valid ownerless
+  blobs are rebuilt into entries (context GC never purges — a reachable
+  file becomes a reference again); blobs whose id is resident are reclaimed
+  as stale duplicates; unreadable / id-mismatched / checksum-mismatched
+  blobs are moved to `quarantine/` (evidence preserved, never guessed
+  away); abandoned `.tmp` files are removed; real IO errors are surfaced
+  per blob and left in place. The full report (`StoreReconcileReport`)
+  counts every bucket and explains each action.
+- The service boundary is closed: `ServiceOp::ReconcileStore` crosses the
+  wire with a snake_case tag, the adapter overrides `reconcile_store`, and
+  the sidecar dispatches it — verified by
+  `reconcile_store_parity_between_in_process_and_service_boundary`.
+
+Acceptance (new tests): store-level
+`reconcile_heals_each_crash_window_without_losing_ownership` (temp write /
+rename / healthy / recall-delete windows),
+`reconcile_classifies_every_blob_state_in_one_pass`,
+`reconcile_leaves_exactly_one_owner_per_blob` (orphan/dangling counts
+zero, every entry has a readable blob matching its checksum),
+`reconcile_quarantines_a_tampered_blob_against_its_entry_checksum`;
+engine-level `reconcile_store_converges_a_crash_injected_directory`;
+service-boundary parity `reconcile_store_parity_between_in_process_and_
+service_boundary`. The pre-existing
+`gc_externalizes_overflow_and_recalls_via_the_store` assertion flipped to
+the new ownership rule: recalled blobs are removed once their content is
+resident.
+
+Residual follow-up: quarantine preserves the map entry whose blob was moved
+aside (the report explains it, an operator can restore it), and the storage
+GC strong-edge traversal is the next store-safety item (CTX-05).
+
 ### CTX-05 — Storage GC may delete evidence referenced by live stored facts
 
 Roots start from Resident/Warm outgoing targets. A Live/Pinned/Durable stored
@@ -522,6 +576,42 @@ Acceptance: a long coding task can edit its granted workspace and run bounded
 local tests without per-call prompts; it cannot push/deploy/delete broadly or
 access secrets/network without the matching narrow grant; zero user responses
 produces no privilege expansion and no five-minute-per-call stall.
+
+### CORE-09 — Tool schema budget mutates lifecycle and can forget required capability
+
+The model-round snapshot is correctly bounded, but the final input guard in
+`RuntimeActor` responds to fixed-layer pressure by calling `tool_unload` on
+the largest schemas. That permanently changes catalog lifecycle state because
+one provider round had a small input budget. No TaskAnchor/Focus root or
+Required-vs-Preferred semantics prevents a task-critical editor/test tool
+from being unloaded. Dynamic capabilities also use one owner-level
+`loaded: bool`, so loading one tool exposes every sibling schema and they do
+not receive builtin idle cooling.
+
+Required direction:
+
+- separate catalog/authority, operational lifecycle, and one-round surface;
+- token/schema budget performs pure round-local packing and never unloads a
+  tool or changes its lifecycle;
+- actor supplies typed TaskAnchor/Focus/Active-call roots at the existing
+  BeforeModel safe point;
+- `MustSurface` tools are selected or produce explicit
+  `ToolSurfaceUnsatisfiable`; `PreferSurface` omissions are observable but do
+  not mutate lifecycle; `KeepReady` tools stay cheap to reactivate without
+  entering every prompt;
+- make external capability lifecycle per tool while process start/stop remains
+  owner-level; loading one tool must not expose all siblings;
+- replace generation arithmetic with one monotonic surface revision covering
+  catalog, Anchor, Focus, and execution-policy revisions;
+- checkpoint authority/Anchor requirements and durable leases, not a derived
+  per-round surface or `Active` state.
+
+Acceptance: shrinking then restoring a provider budget produces identical
+catalog lifecycle; every rooted required tool appears or the round fails with
+an explicit reason; optional omission never bumps catalog generation; one
+capability tool does not surface siblings; quarantine after snapshot still
+revokes execution; suspend/resume reconstructs the surface from TaskAnchor
+without transcript replay.
 
 ## P2 — policy quality and evaluation
 

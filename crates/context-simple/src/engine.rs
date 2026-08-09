@@ -3,7 +3,7 @@ use agent_contracts::{
     ContextIngress, ContextItem, ContextItemId, ContextItemSummary, ContextKind,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention,
     ContextScope, ContextStateTransition, CoreLabel, FocusState, Label, MaterializedContext,
-    ScopeId, ScopeKind, ScopeState,
+    ScopeId, ScopeKind, ScopeState, StoreReconcileReport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -544,11 +544,13 @@ impl ContextEngine for SimpleContextEngine {
     }
 
     async fn gc(&self) -> AgentResult<ContextGcReport> {
-        // Three phases so the state lock is not held across disk IO:
+        // Four phases so the state lock is not held across disk IO:
         // 1. plan under the lock (mark/sweep/reactivate/age — in memory);
         // 2. store writes and recall reads without the lock;
         // 3. commit under a fresh lock (external entries, recalled items,
-        //    failed-write buffer returns, diagnostics).
+        //    failed-write buffer returns, diagnostics);
+        // 4. delete recalled blobs after the commit, without the lock — a
+        //    blob is removed only once its content is resident again.
         let mut state = self.state.lock().await;
         state.tick += 1;
         let now_tick = state.tick;
@@ -562,7 +564,48 @@ impl ContextEngine for SimpleContextEngine {
         drop(state);
         let io = full::run_store_io(&self.config, &mut plan).await;
         let mut state = self.state.lock().await;
-        Ok(full::commit_full_gc(&mut state, now_tick, plan, io))
+        let (mut report, blobs_to_delete) = full::commit_full_gc(&mut state, now_tick, plan, io);
+        drop(state);
+        if !blobs_to_delete.is_empty() {
+            let dir = crate::store::store_dir(&self.config);
+            let outcomes = crate::store::delete_blobs_async(&dir, &blobs_to_delete).await;
+            report.store_blob_delete_errors = outcomes
+                .iter()
+                .filter(|(_, outcome)| outcome.is_err())
+                .count();
+        }
+        Ok(report)
+    }
+
+    async fn reconcile_store(&self) -> AgentResult<StoreReconcileReport> {
+        // Same plan/io/commit split as the GC: snapshot the map's owned
+        // checksums and the resident ids under the lock, scan + classify
+        // the directory without it, then re-own rebuilt blobs under a
+        // fresh lock (re-checking that nothing claimed the id meanwhile).
+        let (map_checksums, resident_ids) = {
+            let mut state = self.state.lock().await;
+            state.tick += 1;
+            let map_checksums: std::collections::HashMap<_, _> = state
+                .external
+                .iter()
+                .map(|entry| (entry.item_id, entry.blob_checksum.clone()))
+                .collect();
+            let resident_ids: std::collections::HashSet<_> = state
+                .items
+                .iter()
+                .chain(state.eviction_buffer.iter())
+                .map(|item| item.id)
+                .collect();
+            (map_checksums, resident_ids)
+        };
+        let dir = crate::store::store_dir(&self.config);
+        let io = crate::store::run_reconcile_io(&dir, &map_checksums, &resident_ids).await;
+        let mut state = self.state.lock().await;
+        let now_tick = state.tick;
+        let gc_epoch = state.gc_epoch;
+        Ok(crate::store::commit_reconcile(
+            &mut state, io, now_tick, gc_epoch,
+        ))
     }
 
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {

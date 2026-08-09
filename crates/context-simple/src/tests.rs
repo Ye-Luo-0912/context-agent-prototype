@@ -2144,9 +2144,9 @@ async fn external_retrieval_searches_inspects_and_fetches() {
         item_b.entities = crate::index::entity::extract_entities(&item_b.content);
         for (item, tick) in [(&item_a, 1u64), (&item_b, 2u64)] {
             let reference = crate::store::externalize(dir.path(), item).unwrap();
-            state
-                .external
-                .push(crate::store::to_external_entry(item, reference, tick, 1));
+            state.external.push(crate::store::to_external_entry(
+                item, reference, tick, 1, None,
+            ));
         }
         (item_a.id, item_b.id)
     };
@@ -2260,7 +2260,8 @@ async fn terminal_external_entries_are_hidden_from_every_retrieval_surface() {
             item.semantic = semantic;
             item.entities = crate::index::entity::extract_entities(&item.content);
             let reference = crate::store::externalize(dir.path(), &item).unwrap();
-            let mut entry = crate::store::to_external_entry(&item, reference, offset as u64 + 1, 1);
+            let mut entry =
+                crate::store::to_external_entry(&item, reference, offset as u64 + 1, 1, None);
             if matches!(semantic, SemanticState::VerifiedFixed { .. }) {
                 entry.residency = agent_contracts::ContextResidency::External;
             }
@@ -2376,10 +2377,15 @@ async fn gc_externalizes_overflow_and_recalls_via_the_store() {
         "the recall must be explainable: {:?}",
         report.reactivations
     );
-    // Recalled content is resident again, but the store files remain until
-    // Storage GC — recall is a read, never a deletion.
+    // Recalled content is resident again, so its blobs are deleted only
+    // *after* the commit landed — every formal blob has exactly one owner,
+    // and a crash between commit and delete leaves an orphan the startup
+    // reconcile re-owns. One owner, one file.
     let stored = std::fs::read_dir(dir.path()).unwrap().count();
-    assert_eq!(stored, 2, "recall must not delete store files");
+    assert_eq!(
+        stored, 0,
+        "recalled blobs must be removed once their content is resident"
+    );
 }
 
 #[tokio::test]
@@ -3872,5 +3878,123 @@ async fn derive_creates_a_new_item_with_a_derived_from_edge() {
         engine.diagnostics().await.unwrap().total_items,
         before_stale,
         "a stale derive must not mint anything"
+    );
+}
+
+/// The startup reconcile, driven through the public engine API, converges a
+/// crash-injected store: an uncommitted orphan blob is rebuilt into an
+/// entry, a stale duplicate of resident content is reclaimed, a damaged
+/// blob is quarantined (evidence preserved), and an abandoned temp file is
+/// removed — with every action surfaced in the `StoreReconcileReport`.
+#[tokio::test]
+async fn reconcile_store_converges_a_crash_injected_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 64,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::Pin {
+            content: "AuthService reconcile sentinel".into(),
+            kind: ContextKind::Constraint,
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    for i in 0..70 {
+        tool_observation(
+            &engine,
+            &i.to_string(),
+            &format!("step {i}: fix AuthService.rs"),
+        )
+        .await;
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let gc = engine.gc().await.unwrap();
+    assert!(
+        gc.externalized > 0,
+        "buffer overflow must externalize: {gc:?}"
+    );
+
+    // Crash-inject four states. Orphan: a valid blob under a fresh id, as
+    // if the rename landed but the map commit never ran. Stale: the same
+    // trick under a *resident* id (the pin), as if a recall commit landed
+    // but the post-commit blob delete never ran. Damaged: garbage under a
+    // formal name. Temp: an abandoned atomic write.
+    let blobs: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .collect();
+    assert!(!blobs.is_empty(), "the engine wrote real blobs");
+    let source = std::fs::read(blobs[0].path()).unwrap();
+    let orphan_id = ContextItemId::new();
+    let mut orphan_value: serde_json::Value = serde_json::from_slice(&source).unwrap();
+    orphan_value["id"] = serde_json::to_value(orphan_id).unwrap();
+    std::fs::write(
+        dir.path().join(format!("{orphan_id}.json")),
+        serde_json::to_vec(&orphan_value).unwrap(),
+    )
+    .unwrap();
+
+    let residents = engine.inspect(100).await.unwrap();
+    assert!(
+        !residents.is_empty(),
+        "the pinned constraint stays resident"
+    );
+    let resident_id = residents[0].id;
+    let mut stale_value: serde_json::Value = serde_json::from_slice(&source).unwrap();
+    stale_value["id"] = serde_json::to_value(resident_id).unwrap();
+    std::fs::write(
+        dir.path().join(format!("{resident_id}.json")),
+        serde_json::to_vec(&stale_value).unwrap(),
+    )
+    .unwrap();
+
+    let damaged_id = ContextItemId::new();
+    std::fs::write(dir.path().join(format!("{damaged_id}.json")), b"garbage{{{").unwrap();
+    let temp_id = ContextItemId::new();
+    std::fs::write(dir.path().join(format!("{temp_id}.tmp")), b"partial").unwrap();
+
+    let report = engine.reconcile_store().await.unwrap();
+    assert_eq!(report.rebuilt, 1, "orphan rebuilt: {report:?}");
+    assert_eq!(report.deleted_stale, 1, "stale reclaimed: {report:?}");
+    assert_eq!(report.quarantined, 1, "damaged quarantined: {report:?}");
+    assert_eq!(report.temp_cleaned, 1, "temp cleaned: {report:?}");
+    assert_eq!(report.io_errors, 0);
+
+    // The rebuilt orphan is retrievable content again; the reclaimed id has
+    // neither a blob nor a duplicate entry.
+    assert!(
+        engine.fetch_external(orphan_id).await.unwrap().is_some(),
+        "the rebuilt orphan is retrievable"
+    );
+    assert!(
+        !dir.path().join(format!("{resident_id}.json")).exists(),
+        "the reclaimed stale blob is gone"
+    );
+    let search = engine
+        .search_external(ContextSearchQuery {
+            query: "AuthService".into(),
+            kind: None,
+            scope: None,
+            task_id: None,
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert!(
+        search.iter().all(|e| e.item_id != resident_id),
+        "the reclaimed id is not duplicated in the map"
     );
 }

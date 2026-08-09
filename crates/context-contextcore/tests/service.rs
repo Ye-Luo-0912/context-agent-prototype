@@ -487,8 +487,27 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
 /// two engine instances (which mint random item/scope ids) can be compared
 /// on everything that is actually deterministic. Works for plain ids and
 /// for uris embedding one (`context://run/<uuid>`).
+///
+/// `blob_checksum` values are normalized too: the checksum is a content
+/// hash of the serialized blob, and the blob embeds random ids, so the
+/// exact hash can never match across engines — what must match is that
+/// both engines captured one.
 fn strip_random_uuids(value: &mut serde_json::Value) {
     match value {
+        serde_json::Value::Object(map) => {
+            for (key, nested) in map.iter_mut() {
+                if key == "blob_checksum" && nested.is_string() {
+                    *nested = serde_json::Value::String("<checksum>".into());
+                    continue;
+                }
+                strip_random_uuids(nested);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for nested in items {
+                strip_random_uuids(nested);
+            }
+        }
         serde_json::Value::String(text) => {
             let bytes = text.as_bytes();
             let mut out = String::with_capacity(text.len());
@@ -504,16 +523,6 @@ fn strip_random_uuids(value: &mut serde_json::Value) {
                 }
             }
             *text = out;
-        }
-        serde_json::Value::Object(map) => {
-            for nested in map.values_mut() {
-                strip_random_uuids(nested);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for nested in items {
-                strip_random_uuids(nested);
-            }
         }
         _ => {}
     }
@@ -533,6 +542,60 @@ fn is_uuid_window(bytes: &[u8]) -> bool {
                 b.is_ascii_hexdigit()
             }
         })
+}
+
+/// First divergent JSON path between two snapshots, for readable parity
+/// failures (e.g. `gc.externalized: 1 != 2`).
+fn first_divergence(left: &serde_json::Value, right: &serde_json::Value) -> Option<String> {
+    fn walk(
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+        path: &mut Vec<String>,
+    ) -> Option<String> {
+        match (left, right) {
+            (serde_json::Value::Object(l), serde_json::Value::Object(r)) => {
+                for (key, lv) in l {
+                    match r.get(key) {
+                        Some(rv) => {
+                            path.push(key.clone());
+                            if let Some(diff) = walk(lv, rv, path) {
+                                return Some(diff);
+                            }
+                            path.pop();
+                        }
+                        None => return Some(format!("{}.{}: left only", path.join("."), key)),
+                    }
+                }
+                for key in r.keys() {
+                    if !l.contains_key(key) {
+                        return Some(format!("{}.{}: right only", path.join("."), key));
+                    }
+                }
+                None
+            }
+            (serde_json::Value::Array(l), serde_json::Value::Array(r)) => {
+                if l.len() != r.len() {
+                    return Some(format!(
+                        "{}: array len {} != {}",
+                        path.join("."),
+                        l.len(),
+                        r.len()
+                    ));
+                }
+                for (index, (lv, rv)) in l.iter().zip(r.iter()).enumerate() {
+                    path.push(index.to_string());
+                    if let Some(diff) = walk(lv, rv, path) {
+                        return Some(diff);
+                    }
+                    path.pop();
+                }
+                None
+            }
+            (l, r) if l == r => None,
+            (l, r) => Some(format!("{}: {} != {}", path.join("."), l, r)),
+        }
+    }
+    walk(left, right, &mut Vec::new())
 }
 
 #[tokio::test]
@@ -560,8 +623,10 @@ async fn full_contract_parity_across_the_process_boundary() {
     let local_snapshot = contract_snapshot(&local).await;
     service.shutdown().await;
     assert_eq!(
-        service_snapshot, local_snapshot,
-        "every ContextEngine contract method must behave identically across the process boundary"
+        service_snapshot,
+        local_snapshot,
+        "every ContextEngine contract method must behave identically across the process boundary; first divergence: {}",
+        first_divergence(&service_snapshot, &local_snapshot).unwrap_or_else(|| "<none>".into())
     );
 }
 
@@ -615,5 +680,176 @@ async fn storage_gc_parity_between_in_process_and_service_boundary() {
     assert_eq!(
         reports[0], reports[1],
         "Storage GC must behave identically across the process boundary"
+    );
+}
+
+/// Overflow the reversible buffer on `engine` (same script as the contract
+/// snapshot) so the full GC pass externalizes real blobs into `store_dir`.
+/// Returns the number of blobs the gc report claims it externalized.
+async fn externalize_some(engine: &dyn ContextEngine, store_dir: &Path) -> usize {
+    engine
+        .ingest(ContextIngress::Pin {
+            content: "reconcile sentinel AuthService".into(),
+            kind: agent_contracts::ContextKind::Constraint,
+        })
+        .await
+        .unwrap();
+    let overflow = context_simple::SimpleContextConfig::default().gc_buffer_capacity + 1;
+    for item in 0..overflow {
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                output: ToolOutput {
+                    call_id: format!("reconcile-{item}"),
+                    tool_name: "shell.exec".into(),
+                    ok: true,
+                    summary: "historical result".into(),
+                    model_content: format!("AuthService File{item}.rs observation"),
+                    artifact_ref: None,
+                    metadata: json!({}),
+                },
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let gc = engine.gc().await.unwrap();
+    assert!(
+        gc.externalized > 0,
+        "the reconcile parity script must externalize blobs: {gc:?}"
+    );
+    let _ = store_dir;
+    gc.externalized
+}
+
+/// The first non-quarantine blob in the store, with its `id` patched to
+/// `fresh_id` and written under `<fresh_id>.json`. Reusing an existing
+/// blob guarantees the file parses as a valid `ContextItem`, which is the
+/// only thing the reconcile can rely on.
+async fn clone_blob_with_id(
+    store_dir: &Path,
+    source_id: agent_contracts::ContextItemId,
+    fresh_id: agent_contracts::ContextItemId,
+) {
+    let source = std::fs::read(store_dir.join(format!("{source_id}.json"))).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&source).unwrap();
+    value["id"] = serde_json::to_value(fresh_id).unwrap();
+    std::fs::write(
+        store_dir.join(format!("{fresh_id}.json")),
+        serde_json::to_vec(&value).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn reconcile_store_parity_between_in_process_and_service_boundary() {
+    // The startup reconcile is the crash-recovery authority over store
+    // blobs; a service that drops `reconcile_store()` silently (or an
+    // adapter that leaves the trait's default no-op in place) must diverge
+    // here. Both engines get the identical crash-injected store, so the
+    // reports — rebuilt / deleted-stale / quarantined / temp-cleaned —
+    // must match exactly.
+    let service_store = IsolatedStore::new("reconcile-service");
+    let service = ContextServiceAdapter::connect(&ContextServiceConfig {
+        engine: ServiceEngine::Dynamic,
+        store_dir: Some(service_store.path().to_path_buf()),
+        ..ContextServiceConfig::default()
+    })
+    .await
+    .expect("spawn isolated context service");
+    let local_store = IsolatedStore::new("reconcile-local");
+    let local: Arc<dyn ContextEngine> = Arc::new(context_simple::SimpleContextEngine::new(
+        context_simple::SimpleContextConfig {
+            context_store_dir: Some(local_store.path().to_path_buf()),
+            ..context_simple::SimpleContextConfig::default()
+        },
+    ));
+
+    let mut reports = Vec::new();
+    for (engine, store_dir) in [
+        (&service as &dyn ContextEngine, service_store.path()),
+        (local.as_ref(), local_store.path()),
+    ] {
+        let externalized = externalize_some(engine, store_dir).await;
+
+        // Phase 1: a healthy store reconciles to zero interventions — every
+        // blob is owned by the map and matches its checksum.
+        let report = engine.reconcile_store().await.unwrap();
+        assert_eq!(report.scanned, externalized, "all blobs scanned");
+        assert_eq!(report.rebuilt, 0);
+        assert_eq!(report.deleted_stale, 0);
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(report.temp_cleaned, 0);
+        assert_eq!(report.io_errors, 0);
+
+        // Phase 2: crash-inject four states into the store and reconcile
+        // again. 1) an orphan blob (valid content, no owner) must be
+        // rebuilt into an entry; 2) a blob whose id is resident again must
+        // be deleted as stale; 3) an unparseable blob must be quarantined,
+        // not guessed away; 4) an abandoned temp file must be removed.
+        let blobs: Vec<_> = std::fs::read_dir(store_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
+            .map(|entry| entry.path())
+            .collect();
+        assert!(blobs.len() >= externalized);
+        let source_name = blobs[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_end_matches(".json")
+            .to_owned();
+        let source_id: agent_contracts::ContextItemId = source_name.parse().unwrap();
+
+        let orphan_id = agent_contracts::ContextItemId::new();
+        clone_blob_with_id(store_dir, source_id, orphan_id).await;
+
+        let residents = engine.inspect(100).await.unwrap();
+        let resident_id = residents[0].id;
+        clone_blob_with_id(store_dir, source_id, resident_id).await;
+
+        let garbage_id = agent_contracts::ContextItemId::new();
+        std::fs::write(
+            store_dir.join(format!("{garbage_id}.json")),
+            b"this is not a context item{{{",
+        )
+        .unwrap();
+
+        let temp_id = agent_contracts::ContextItemId::new();
+        std::fs::write(store_dir.join(format!("{temp_id}.tmp")), b"partial").unwrap();
+
+        let report = engine.reconcile_store().await.unwrap();
+        assert_eq!(report.rebuilt, 1, "orphan rebuilt: {report:?}");
+        assert_eq!(
+            report.deleted_stale, 1,
+            "stale duplicate removed: {report:?}"
+        );
+        assert_eq!(
+            report.quarantined, 1,
+            "damaged blob quarantined: {report:?}"
+        );
+        assert_eq!(report.temp_cleaned, 1, "abandoned temp removed: {report:?}");
+        assert_eq!(report.io_errors, 0);
+        assert_eq!(report.scanned, externalized + 3);
+
+        let mut report = serde_json::to_value(report).unwrap();
+        // `reasons` are gathered while walking the directory, whose entry
+        // order is filesystem-defined, not engine-defined — sort before
+        // comparing so the parity check measures behavior, not read_dir.
+        if let Some(reasons) = report.get_mut("reasons").and_then(|v| v.as_array_mut()) {
+            reasons.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+        }
+        strip_random_uuids(&mut report);
+        reports.push(report);
+    }
+    service.shutdown().await;
+    assert_eq!(
+        reports[0], reports[1],
+        "Store reconcile must behave identically across the process boundary"
     );
 }

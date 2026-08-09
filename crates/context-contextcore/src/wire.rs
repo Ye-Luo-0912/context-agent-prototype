@@ -46,6 +46,11 @@ pub enum ServiceOp {
     /// semantic lifecycle ended and nothing references anymore (the only
     /// place information is deleted; the in-memory GC only externalizes).
     StorageGc,
+    /// Startup reconcile: converge the on-disk blob directory with the
+    /// external map after a crash or interrupted IO, so every formal blob
+    /// has exactly one owner. Conservative — orphans are rebuilt into
+    /// entries, damaged blobs are quarantined, never guessed away.
+    ReconcileStore,
     Materialize {
         query: ContextQuery,
     },

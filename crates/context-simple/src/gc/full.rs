@@ -24,8 +24,10 @@ const MAX_MARKED_DEPENDENCIES: usize = 8;
 /// lock, plus the commit that applies the IO results.
 pub(crate) struct GcPlan {
     /// Buffer items whose store write is deferred to the IO phase (oldest
-    /// first; removed from the buffer by the plan).
-    pub(crate) externalize: Vec<ContextItem>,
+    /// first; removed from the buffer by the plan). Each carries the bytes
+    /// serialized under the lock, so the IO phase never needs the state
+    /// lock to re-read the item.
+    pub(crate) externalize: Vec<(ContextItem, Vec<u8>)>,
     /// Cold-store entry ids whose entities match the hot set; read back in
     /// the IO phase. Entries stay in the map until a successful read.
     pub(crate) recall_candidates: Vec<ContextItemId>,
@@ -40,8 +42,8 @@ pub(crate) struct GcPlan {
 
 /// The store IO outcomes, applied by the commit under a fresh lock.
 pub(crate) struct GcIoResult {
-    /// (item, reference) successfully written to the store.
-    pub(crate) externalized: Vec<(ContextItem, ContextRef)>,
+    /// (item, reference, checksum) successfully written to the store.
+    pub(crate) externalized: Vec<(ContextItem, ContextRef, String)>,
     /// Items whose store write failed, oldest first; the commit reinserts
     /// them at the front of the buffer so the overflow retries next pass
     /// (the store-unavailable fallback, decided outside the lock).
@@ -196,12 +198,14 @@ pub(crate) fn plan_full_gc(
     // ----- Externalize phase: the buffer is bounded -----------------
     // Context GC never purges: overflow writes the item to the context
     // store and keeps only a lightweight entry (Cold), which later ages to
-    // External. The *decision* is taken here; the writes happen in the IO
-    // phase so the lock is not held across disk IO. Only Storage GC may
-    // delete store files.
+    // External. The *decision* is taken here; the bytes are serialized
+    // under the lock so the IO phase can write without re-reading state;
+    // the writes happen in the IO phase so the lock is not held across
+    // disk IO. Only Storage GC may delete store files.
     while state.eviction_buffer.len() > config.gc_buffer_capacity {
         let item = state.eviction_buffer.remove(0);
-        plan.externalize.push(item);
+        let bytes = serde_json::to_vec(&item).expect("context items serialize");
+        plan.externalize.push((item, bytes));
     }
 
     // Cold -> External aging: entries untouched for the configured number
@@ -216,48 +220,89 @@ pub(crate) fn plan_full_gc(
 /// overflow items to the store and read back the recall candidates. The
 /// heap/buffer stay in their post-plan state during this window, so
 /// concurrent ingests see a consistent post-sweep heap.
+///
+/// IO concurrency is bounded (`store::MAX_STORE_IO_CONCURRENCY`): the
+/// phase holds no state lock, so parallelism shrinks the lock-free window
+/// to the slowest single op — but unbounded parallelism would pile up file
+/// descriptors on a store with many blobs. A `JoinError` (task panic) is
+/// unreachable in practice because every fallible step returns a `Result`,
+/// yet the source item is still recovered: items never move *into* the
+/// spawned tasks (only pre-serialized bytes do), so on any join failure the
+/// remaining pending items return to the buffer instead of being lost with
+/// their task.
 pub(crate) async fn run_store_io(config: &SimpleContextConfig, plan: &mut GcPlan) -> GcIoResult {
     let dir = store::store_dir(config);
+    let semaphore =
+        std::sync::Arc::new(tokio::sync::Semaphore::new(store::MAX_STORE_IO_CONCURRENCY));
     let mut io = GcIoResult {
         externalized: Vec::new(),
         externalize_failed: Vec::new(),
         recalled: Vec::new(),
     };
-    // Write overflow items concurrently. The IO phase holds no state lock,
-    // so parallel file writes shrink the lock-free window to the slowest
-    // single write instead of the sum of every write. Failed writes go
-    // back to the buffer (the store-unavailable fallback, applied by the
-    // commit) — each item gets its own write attempt, so a transient
-    // failure on one file no longer forfeits the rest of the batch.
+
+    // Write overflow items concurrently. The item itself stays with the
+    // caller (id-keyed) so a join failure cannot lose it; the task receives
+    // only the pre-serialized bytes and writes them atomically.
     let pending = std::mem::take(&mut plan.externalize);
+    let mut pending_items: std::collections::HashMap<ContextItemId, (ContextItem, Vec<u8>)> =
+        pending
+            .into_iter()
+            .map(|(item, bytes)| (item.id, (item, bytes)))
+            .collect();
     let mut writes = tokio::task::JoinSet::new();
-    for item in pending {
+    for (id, (_, bytes)) in pending_items.clone() {
         let dir = dir.clone();
+        let semaphore = std::sync::Arc::clone(&semaphore);
+        let permit = semaphore.acquire_owned().await.expect("semaphore");
         writes.spawn(async move {
-            let outcome = store::externalize_async(&dir, &item).await;
-            (item, outcome)
+            let _permit = permit;
+            let outcome = store::externalize_async(&dir, id, &bytes).await;
+            (id, outcome)
         });
     }
     while let Some(joined) = writes.join_next().await {
-        // `externalize_async` has no panic path (every fallible step
-        // returns a `Result`), so a `JoinError` here is unreachable in
-        // practice; if one ever fires, the item is lost with its task and
-        // the store fallback cannot restore it.
         match joined {
-            Ok((item, Ok(context_ref))) => io.externalized.push((item, context_ref)),
-            Ok((item, Err(_))) => io.externalize_failed.push(item),
-            Err(_) => {}
+            Ok((id, Ok(checksum))) => {
+                if let Some((item, _)) = pending_items.remove(&id) {
+                    let context_ref = store::make_context_ref(&item);
+                    io.externalized.push((item, context_ref, checksum));
+                }
+            }
+            Ok((id, Err(_))) => {
+                if let Some((item, _)) = pending_items.remove(&id) {
+                    io.externalize_failed.push(item);
+                }
+            }
+            // A task panicked: its id is unknowable, so the conservative
+            // recovery returns *every* item that has not been consumed yet
+            // to the buffer (a partially written blob is re-owned or
+            // deleted by the startup reconcile). No item is lost with its
+            // task.
+            Err(_) => {
+                io.externalize_failed
+                    .extend(pending_items.drain().map(|(_, (item, _))| item));
+                break;
+            }
         }
     }
+    // Any items whose tasks never completed (loop exited early) go back to
+    // the buffer too.
+    io.externalize_failed
+        .extend(pending_items.into_iter().map(|(_, (item, _))| item));
+
     // Recall reads: only entries whose entities matched are read; failed
-    // reads leave the entry in the map for a later pass. Same concurrency
-    // rationale — reads run in parallel so the lock-free window stays
-    // bounded by the slowest read, not the sum.
+    // reads leave the entry in the map for a later pass. Same bounded
+    // concurrency rationale as the writes.
     let recall: Vec<ContextItemId> = plan.recall_candidates.drain(..).collect();
     let mut reads = tokio::task::JoinSet::new();
     for item_id in recall {
         let dir = dir.clone();
-        reads.spawn(async move { (item_id, store::read_item_async(&dir, item_id).await) });
+        let semaphore = std::sync::Arc::clone(&semaphore);
+        let permit = semaphore.acquire_owned().await.expect("semaphore");
+        reads.spawn(async move {
+            let _permit = permit;
+            (item_id, store::read_item_async(&dir, item_id).await)
+        });
     }
     while let Some(joined) = reads.join_next().await {
         if let Ok((_item_id, Some(item))) = joined {
@@ -270,27 +315,34 @@ pub(crate) async fn run_store_io(config: &SimpleContextConfig, plan: &mut GcPlan
 /// One full GC pass, phase 3 (commit, under a fresh state lock): apply the
 /// IO results — externalized entries join the map, recalled items re-enter
 /// the heap, failed writes return to the buffer — and assemble the report.
+///
+/// Returns the report plus the ids of store blobs that must be deleted
+/// *after* the commit: successfully recalled content is resident again, so
+/// its blob is only removed once the commit landed (a crash between commit
+/// and delete leaves an orphan the startup reconcile re-owns).
 pub(crate) fn commit_full_gc(
     state: &mut State,
     now_tick: u64,
     plan: GcPlan,
     io: GcIoResult,
-) -> ContextGcReport {
+) -> (ContextGcReport, Vec<ContextItemId>) {
     // The buffer: failed/undone writes come back at the front, so the
     // overflow retries on the next pass (order preserved, oldest first).
     let mut buffer = io.externalize_failed;
     buffer.append(&mut state.eviction_buffer);
     state.eviction_buffer = buffer;
 
-    // The store map: successful writes become Cold entries...
+    // The store map: successful writes become Cold entries (carrying the
+    // checksum captured at write time for the reconcile)...
     let externalized_count = io.externalized.len();
-    for (item, context_ref) in io.externalized {
+    for (item, context_ref, checksum) in io.externalized {
         state.gc_externalized_total += 1;
         state.external.push(store::to_external_entry(
             &item,
             context_ref,
             now_tick,
             state.gc_epoch,
+            Some(checksum),
         ));
     }
     // ...and successfully recalled entries leave the map: their content is
@@ -339,7 +391,7 @@ pub(crate) fn commit_full_gc(
     let mut reactivations = plan.buffer_reactivations;
     reactivations.extend(recalled_reactivations);
     report.reactivations = reactivations;
-    report
+    (report, recalled_ids.into_iter().collect())
 }
 
 /// Mark the root set: pins, members of the active focus scope tree, durable
