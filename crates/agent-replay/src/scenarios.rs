@@ -730,4 +730,64 @@ mod tests {
             );
         }
     }
+
+    /// The other half of the evaluation acceptance: saving tokens must not
+    /// lower task success rate. In these scripted workloads a fix can only
+    /// succeed if the failure facts stay visible — the dynamic engine must
+    /// still select every Error item by the model rounds that need it, even
+    /// as it trims the working set to a fraction of append-only's size.
+    #[tokio::test]
+    async fn dynamic_saves_tokens_without_losing_failure_facts() {
+        let config = compare_config();
+        for name in ["long_refactor", "test_fix_loop"] {
+            let scenario = all_scenarios()
+                .into_iter()
+                .find(|s| s.name == name)
+                .expect(name);
+            let results = compare_scenario(&scenario, &config).await.unwrap();
+            let append = results
+                .iter()
+                .find(|(l, _)| *l == "A append-only")
+                .map(|(_, o)| o)
+                .expect("append-only");
+            let dynamic = results
+                .iter()
+                .find(|(l, _)| *l == "C dynamic")
+                .map(|(_, o)| o)
+                .expect("dynamic");
+
+            // Token saving holds on this workload too.
+            assert!(
+                dynamic.input_tokens_total * 2 < append.input_tokens_total,
+                "{name}: dynamic input {} must be below half of append-only {}",
+                dynamic.input_tokens_total,
+                append.input_tokens_total
+            );
+            assert_eq!(
+                dynamic.over_budget_snapshots, 0,
+                "{name}: the dynamic working set must stay within the budget"
+            );
+
+            // Success rate: every failure fact was selected by at least one
+            // model round after it appeared — the fix always had the
+            // failure in view while it mattered.
+            let errors: Vec<_> = dynamic
+                .items
+                .iter()
+                .filter(|item| item.kind == agent_contracts::ContextKind::Error)
+                .collect();
+            assert!(
+                !errors.is_empty(),
+                "{name}: the workload must contain failure facts"
+            );
+            for error in errors {
+                assert!(
+                    !error.consumed_turns.is_empty(),
+                    "{name}: failure fact {} must be selected by a model round, got {:?}",
+                    error.id,
+                    error.consumed_turns
+                );
+            }
+        }
+    }
 }

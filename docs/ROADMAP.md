@@ -1115,7 +1115,7 @@ operation; see `docs/ARCHITECTURE.md` §9h and
    resources through meta-tools. ✅ (implemented — see the section below)
 6. **V1-M15 Real Evaluation** — coding workload A/B/C + lifecycle metrics.
    Acceptance: the dynamic runtime saves tokens without lowering task
-   success rate.
+   success rate. ✅ (implemented — see the section below)
 7. **V2 Self-Iteration** — generate → sandbox → test → replay → evaluate →
    canary → stable. The LLM grows capabilities, but cannot modify the
    evaluation or permission Core.
@@ -1199,6 +1199,52 @@ dimension the meta-tools can reach is bounded and the bounds are tested:
   request (engine prices the working set, the runtime's final guard
   refuses an unshrinkable over-budget request), and the external view is
   bounded by `ContextMapView` (cap 32).
+
+## V1-M15 Real Evaluation ✅ (implemented)
+
+Coding-workload A/B/C comparison with lifecycle metrics. The evaluation
+harness itself landed with P3 (`agent-replay`: seven deterministic
+scenarios, generic `run_engine` over any `ContextEngine`, token-cost /
+over-budget / churn / working-set metrics, `--compare` CLI); this
+milestone closes the acceptance's second half — saving tokens must not
+lower task success rate — with an explicit test, and records the
+measurement.
+
+- **Harness.** `agent-replay` replays each scripted workload through the
+  three engines (A append-only / B rolling-summary / C dynamic) under a
+  shared 12 K-token budget and reports input-token totals/peaks,
+  over-budget snapshots, lifecycle churn and final working-set size.
+  The engines and the token estimator are the same code the runtime
+  uses, so the comparison measures the policy, not an approximation.
+- **Token saving is measured, not asserted.** On the heavy scenarios the
+  dynamic engine costs a small fraction of append-only (budget 12 K):
+  `long_refactor` 622,560 → 64,014 input tokens total (peak 17,425 →
+  1,085), `test_fix_loop` 403,352 → 56,430, `high_volume_irrelevant_output`
+  469,568 → 33,328; B bounds the peak but still pays ~9× C's cost.
+  C never exceeds the budget (A blows past it 13–22 times). The
+  superseded-decisions scenario, where P3 measured a C penalty, now
+  costs C 4,469 vs 7,054 — the P4 supersession rules closed that gap.
+- **Success-rate half, covered by test.** The new
+  `dynamic_saves_tokens_without_losing_failure_facts` test asserts, on
+  `long_refactor` and `test_fix_loop`, that C's input-token total stays
+  below half of A's, C stays in budget, and every failure fact
+  (`ContextKind::Error`) in C's trace was selected by at least one model
+  round — the fix always had the failing observation in view while it
+  mattered. A scripted workload can only succeed if the failure facts
+  stay visible, so "selected when needed" is the replay-level proxy for
+  task success.
+- **Working-set focus.** C archives completed/old-task detail
+  (`final_active` 6–24 vs A/B 31–97); the task-switch and
+  post-completion contamination scenarios are C's sharpest advantage
+  (`task_switch_and_return` 22,476 → 6,708; `completed_then_unrelated`
+  140,365 → 16,949).
+
+Acceptance: the dynamic runtime saves tokens without lowering task
+success rate — the token numbers above and the
+`dynamic_saves_tokens_without_losing_failure_facts` test (all
+agent-replay tests green, A/B/C replay baseline unchanged). Live
+completion-quality measurement against a real model remains a follow-up;
+the harness already emits the per-turn inputs such a measurement needs.
 
 ## V1-M12 Effect Runtime ✅ (implemented)
 
