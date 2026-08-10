@@ -468,9 +468,11 @@ Required order:
 7. adversarial tests proving a cancelled/ReadOnly process cannot mutate an
    absolute path, use undeclared network or outlive its operation.
 
-**Partially repaired 2026-08-10.** The in-process/runtime-owned mutation path
-is fenced and external process capabilities remain Disabled by default. The
-process wire and OS isolation defects below keep CORE-01/M12/M13 open.
+**Partially repaired 2026-08-10; wire broker landed 2026-08-11.** The
+in-process/runtime-owned mutation path is fenced, process mutations now
+cross a brokered wire effect path, and external process capabilities remain
+Disabled by default. The OS isolation defects below keep CORE-01/M12/M13
+open.
 
 Implemented:
 
@@ -488,9 +490,9 @@ Implemented:
    | artifact:*`); a capability declaring workspace-write/process-run may
    not mark any tool `ReadOnly` (ReadOnly auto-allows at the approval
    gate); a `WorkspaceWrite` tool needs `workspace:write`, a
-   `ProcessExecution` tool needs `process:run`; and a process-transport
-   capability declaring `workspace:write` is refused — process mutations
-   are not brokered yet.
+   `ProcessExecution` tool needs `process:run`; a process-transport
+   capability may declare `workspace:write` because the wire effect broker
+   (item 8 below) stages its mutations.
 3. **No direct capability mutation** — the runtime hands a
    `workspace:write` capability a `StagedOnlyWorkspace` handle whose
    `write` is refused ("must be staged") and whose `prepare_write` returns
@@ -512,20 +514,42 @@ Implemented:
    longer inherit unbounded output into the parent console.
 7. **Adversarial tests** — `capability_authority_is_derived_and_validated_
    at_registration` (path-unsafe id, self-declared ReadOnly,
-   over-granted tool risk, process `workspace:write`, read-only process
-   allowed), `undeclared_permissions_receive_no_handle` updated (direct
-   write refused, staged write commits, unknown permission refused at
-   registration), `from_manifest_rejects_ids_that_could_escape_a_path`,
+   over-granted tool risk, process `workspace:write` now registers through
+   the wire broker, read-only process allowed), `undeclared_permissions_
+   receive_no_handle` updated (direct write refused, staged write commits,
+   unknown permission refused at registration),
+   `from_manifest_rejects_ids_that_could_escape_a_path`,
    `from_manifest_rejects_readonly_tools_on_write_capabilities`,
    `private_capability_dirs_are_unpredictable_and_path_safe`, and
    `stderr_is_drained_into_a_bounded_tail` (a 4 MiB stderr flood leaves an
    8 KiB tail ending in the newest bytes).
+8. **Wire-level effect broker** — `WireEffect` (`agent-contracts`): a
+   process capability declares structured mutation intent over the invoke
+   wire (`workspace_write` with a base64 payload, so arbitrary bytes cross
+   JSON safely) instead of mutating inside the child. The adapter's
+   `stage_wire_effects` (`agent-capability-process`) validates every effect
+   against the invocation's granted permissions and stages it through the
+   confined workspace handle (`prepare_write`), then returns
+   `CapabilityOutcome::EffectRequest` — the core commits the composite
+   effect behind the generation fence exactly like a builtin tool's
+   `PreparedEffect`. A plain `ToolOutput` response still decodes as a
+   no-effect `Value` (backward compatible); `Vec<Box<dyn Effect>>` commits
+   sub-effects in order and stops at the first failure. The
+   registration-time refusal of process `workspace:write` is lifted. Wire
+   tests: `wire_effect_round_trips_binary_content_over_json`,
+   `composite_effect_commits_every_sub_effect_in_order` /
+   `composite_effect_stops_at_the_first_failure` /
+   `composite_effect_rolls_back_every_sub_effect`,
+   `staged_wire_write_returns_an_effect_request` (nothing lands until the
+   runtime commits), `wire_write_without_the_grant_is_refused` and
+   `wire_write_without_a_workspace_handle_is_refused`.
 
 Residual (M12/M13; CORE-01 remains open): OS-level filesystem/network isolation
 for the child process (absolute paths and network remain available to a
-hostile child at the OS layer), Windows Job-Object quota enforcement, and
-the wire-level effect broker that lets a child stage mutations as
-structured `EffectRequest`s instead of mutating inside the process.
+hostile child at the OS layer) and Windows Job-Object quota enforcement.
+The wire-level effect broker is implemented: a child stages structured
+mutations as `EffectRequest`s and the core commits them behind the
+generation fence.
 
 ### CORE-02 — Event-journal enqueue is not a durable turn commit
 

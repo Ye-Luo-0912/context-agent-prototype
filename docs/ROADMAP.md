@@ -984,8 +984,10 @@ acceptance:
   `call_with_cancel` — a cancel (user `/cancel`, superseded operation)
   poisons the connection and kills the whole process tree immediately
   instead of waiting for the request deadline. Absolute filesystem/network
-  access, cross-platform quotas and process-wire effects remain M12/M13
-  blockers; the type name is not milestone acceptance.
+  access and cross-platform quotas remain M12/M13 blockers; process-wire
+  effects landed with the `CORE-01` wire broker (a child stages structured
+  `WireEffect`s the adapter validates and the core commits behind the
+  generation fence); the type name is not milestone acceptance.
 - **The context store is a retrieval loop, not a black hole.** The store
   path is injected at the composition root
   (`workspace.state_dir()/context-store`); the leaked CWD-guessed copy was
@@ -1116,7 +1118,7 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 | --- | --- | --- |
 | M10 Runtime Consistency | 🟡 transaction baseline | Cross-plane checkpoint capture and live-restore audit/recovery are closed (`CORE-03`), the GC/storage/checkpoint/restore operation protocol is closed (`CTX-06`), and the task authority/completion contract is closed (`CTX-10`: TaskAnchor, CompletionRecord, atomic root transfer, storage-root outcomes). M10's named acceptance (runtime and context never drift into a task/state split-brain) is exercised by the invariant suite; the remaining gap is a single standing recovery-replay path (`CORE-02` residual) rather than a missing transaction primitive. |
 | M11 Context Recall | ✅ narrow retrieval baseline | Search/inspect/fetch, transient results, bounded external view and service parity work. Canonical catalog ownership and complete cross-residency semantics remain context-runtime work rather than reasons to call recall itself absent. TaskAnchor/Completion roots are now implemented (`CTX-10`). |
-| M12 Effect Runtime | ⛔ trust blocker | In-process prepared effects use the generation fence, but `shell.exec` mutates directly and the process-capability wire returns only `Value`; child-side effects cannot be rolled back. |
+| M12 Effect Runtime | 🟡 partial | In-process prepared effects use the generation fence and process capabilities now stage structured wire effects (`WireEffect`) that the adapter validates against the grant and the core commits behind the fence (`CORE-01` wire broker); `shell.exec` still mutates directly, so the direct-shell escape path (`CORE-06`) keeps M12 open. |
 | M13 Extension Sandbox | ⛔ trust blocker | Env scrub, private cwd, bounded stderr and process-tree cancellation are useful host hardening. A cwd is not a filesystem boundary; absolute filesystem/network access and cross-platform resource isolation are not brokered. |
 | M14 Resource Policy | 🟡 partial | Schema/context quotas, risk/permission validation and final output guards exist. A unified output broker, standing task execution policy and effect-derived approval/resource enforcement remain open. |
 | M15 Real Evaluation | 🧪 instrumentation/smoke only | Replay is a policy proxy and the live run is a no-tool constraint-retention task. There is no paired real coding workload, hidden outcome verification, all-module cost accounting or non-inferiority result. |
@@ -1150,8 +1152,10 @@ the required gate order; the numbered list and table above are authoritative.
    stays in the context queue.
 3. **V1-M12 Effect Runtime** — every capability routes side effects through
    one unified EffectRequest/Effect commit. Acceptance: a cancelled
-   operation produces no avoidable stale mutation. ⛔ Close the process-wire
-   and direct-shell escape paths in `CORE-01`/`CORE-06`.
+   operation produces no avoidable stale mutation. 🟡 The process-wire path
+   is closed (`CORE-01` wire broker: structured `WireEffect` staged through
+   the confined handle, committed behind the generation fence); the
+   direct-shell escape path in `CORE-06` keeps the gate open.
 4. **V1-M13 Extension Sandbox** — process sandbox, env scrub, brokered
    FS/network, cancel. Acceptance: experimental code cannot exceed the
    permissions granted to it. ⛔ Host hardening exists, but brokered OS
