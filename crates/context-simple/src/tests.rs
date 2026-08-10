@@ -4430,3 +4430,60 @@ async fn demoted_dependency_is_recalled_because_a_live_root_depends_on_it() {
         );
     }
 }
+
+/// An external-only state (nothing resident) still runs a full GC pass so
+/// Cold entries age toward External — the pass-skip check must not treat
+/// an empty heap and buffer as "nothing to do" while the external map
+/// still holds entries that need aging and recall.
+#[tokio::test]
+async fn external_only_state_still_ages_cold_entries_on_full_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        gc_external_ttl_generations: 1,
+        ..SimpleContextConfig::default()
+    });
+    {
+        let mut state = engine.state.lock().await;
+        let item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "stored decision body".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.5,
+            None,
+        );
+        let entry = crate::store::to_external_entry(
+            &item,
+            agent_contracts::ContextRef {
+                uri: format!("context://run/{}", item.id),
+                item_id: item.id,
+                kind: ContextKind::Decision,
+                scope: ContextScope::Task,
+                summary: "stored decision".into(),
+                created_tick: 0,
+            },
+            0,
+            0,
+            None,
+        );
+        state.external.push(entry);
+    }
+
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.aged_external >= 1,
+        "a Cold entry must age to External when the state is external-only: {report:?}"
+    );
+    {
+        let state = engine.state.lock().await;
+        let entry = state.external.iter().next().unwrap();
+        assert_eq!(
+            entry.residency,
+            ContextResidency::External,
+            "the Cold entry must have aged to External"
+        );
+    }
+}

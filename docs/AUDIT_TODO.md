@@ -649,9 +649,19 @@ dependency was marked but never brought back. Regression:
 score, non-hot warm-buffer evidence item is recalled because a pinned live
 decision cites it) plus `dependency_edges_resolve_across_heap_buffer_and_store`.
 
-Remaining CTX-06 work: external-only GC skipping, scope-close promotion for
-non-resident bodies, task-close descendant handling, tool-scope close error
-publishing, and task-summary focus identity.
+**External-only state no longer skips the GC pass closed 2026-08-10.** The
+pass-skip check treated an empty heap and eviction buffer as "nothing to
+do", so a state whose items were all externalized never ran a full GC pass
+again: Cold entries never aged to External (aging only happens when a pass
+increments `gc_epoch`) and recall never got the chance to run. The check now
+requires the external map to be empty too; an external-only state runs the
+pass so Cold aging and recall keep working. Regression:
+`external_only_state_still_ages_cold_entries_on_full_gc` (a Cold entry
+ages to External in one pass when nothing is resident).
+
+Remaining CTX-06 work: scope-close promotion for non-resident bodies,
+task-close descendant handling, tool-scope close error publishing, and
+task-summary focus identity.
 
 ### CTX-07 — Materializer budget and hot-path correctness
 

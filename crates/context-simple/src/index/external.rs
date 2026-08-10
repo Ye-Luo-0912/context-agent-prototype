@@ -107,6 +107,12 @@ impl ExternalMap {
         self.entries.iter()
     }
 
+    /// Whether the map holds no entries (the GC pass-skip check and
+    /// restore validation use this).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Exact-match entity bucket: entries whose captured entity signature
     /// contains `entity`. Used by the GC recall fast path.
     pub(crate) fn ids_for_entity(&self, entity: &str) -> &[ContextItemId] {

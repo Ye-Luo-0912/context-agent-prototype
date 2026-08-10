@@ -76,7 +76,14 @@ pub(crate) fn plan_full_gc(
     config: &SimpleContextConfig,
     now_tick: u64,
 ) -> Option<GcPlan> {
-    if !config.gc_enabled || state.items.is_empty() && state.eviction_buffer.is_empty() {
+    if !config.gc_enabled
+        || (state.items.is_empty() && state.eviction_buffer.is_empty() && state.external.is_empty())
+    {
+        // A pass only makes sense when something can change: resident
+        // items to sweep, buffer entries to recall, or external entries to
+        // age (Cold -> External) and recall. An external-only state must
+        // still run the pass — the heap and buffer being empty is exactly
+        // when aging and recall would otherwise stop forever.
         return None;
     }
 
