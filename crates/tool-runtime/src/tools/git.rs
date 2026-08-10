@@ -6,10 +6,13 @@
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
+use agent_process::kill_process_tree;
 use agent_workspace::Workspace;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::process::Stdio;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
@@ -59,37 +62,80 @@ async fn run_git(
     command
         .args(args)
         .current_dir(workspace.root())
-        // Dropping `Command::output` on timeout/cancellation must not leave
-        // the direct git child running in the background.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Dropping on timeout/cancellation must not leave the direct git
+        // child running in the background.
         .kill_on_drop(true);
-    let output = tokio::select! {
+
+    // Same process-tree guarantee as `shell.exec`: a cancelled or
+    // timed-out git must not leave descendants (hooks, aliases spawning
+    // subprocesses) alive — every process path kills the same way.
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| AgentError::Tool(format!("run git {args:?}: {e}")))?;
+    let pid = child.id().unwrap_or(0);
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AgentError::Tool("git stdout unavailable".into()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AgentError::Tool("git stderr unavailable".into()))?;
+
+    let status = tokio::select! {
         biased;
-        _ = cancel.cancelled() => return Err(AgentError::Cancelled),
-        result = timeout(Duration::from_millis(GIT_TIMEOUT_MS), command.output()) => {
-            result
-                .map_err(|_| AgentError::Tool(format!("git {args:?} timed out")))?
-                .map_err(|e| AgentError::Tool(format!("run git {args:?}: {e}")))?
+        _ = cancel.cancelled() => {
+            kill_process_tree(pid);
+            let _ = child.kill().await;
+            return Err(AgentError::Cancelled);
+        }
+        result = timeout(Duration::from_millis(GIT_TIMEOUT_MS), child.wait()) => {
+            match result {
+                Ok(Ok(status)) => status,
+                Ok(Err(e)) => return Err(AgentError::Tool(format!("run git {args:?}: {e}"))),
+                Err(_) => {
+                    kill_process_tree(pid);
+                    let _ = child.kill().await;
+                    return Err(AgentError::Tool(format!("git {args:?} timed out")));
+                }
+            }
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    stdout
+        .read_to_end(&mut stdout_bytes)
+        .await
+        .map_err(|e| AgentError::Tool(format!("read git stdout: {e}")))?;
+    stderr
+        .read_to_end(&mut stderr_bytes)
+        .await
+        .map_err(|e| AgentError::Tool(format!("read git stderr: {e}")))?;
+
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
     let combined = if stderr.trim().is_empty() {
         stdout.to_string()
     } else {
         format!("{stdout}\n[stderr]\n{stderr}")
     };
 
-    let ok = output.status.success();
+    let ok = status.success();
     if !ok && combined.trim().is_empty() {
         return Ok(ToolOutput {
             call_id: call_id.into(),
             tool_name: tool_name.into(),
             ok: false,
-            summary: format!("git {args:?} failed (exit={:?})", output.status.code()),
+            summary: format!("git {args:?} failed (exit={:?})", status.code()),
             model_content: "(empty output; is this a git repository?)".into(),
             artifact_ref: None,
-            metadata: json!({"exit_code": output.status.code()}),
+            metadata: json!({"exit_code": status.code()}),
         });
     }
 
@@ -116,8 +162,7 @@ async fn run_git(
         ok,
         summary: format!(
             "git {args:?} (exit={}, {} bytes)",
-            output
-                .status
+            status
                 .code()
                 .map_or_else(|| "signal".to_string(), |v| v.to_string()),
             combined.len()
@@ -132,7 +177,7 @@ async fn run_git(
             bounded
         },
         artifact_ref,
-        metadata: json!({"exit_code": output.status.code(), "bytes": combined.len()}),
+        metadata: json!({"exit_code": status.code(), "bytes": combined.len()}),
     })
 }
 
