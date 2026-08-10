@@ -350,6 +350,36 @@ fn close_members(
             state.items.update_scope(index, from, to);
         }
     }
+
+    // Warm buffer members of the closing scope get the same promotion: a
+    // durable outcome does not lose its scope promotion just because it
+    // was evicted before the scope closed. A promoted item re-enters the
+    // heap — promotion means resident, not just re-stamped. Terminal
+    // semantics and excluded items stay out, exactly like the heap pass.
+    let mut index = state.eviction_buffer.len();
+    while index > 0 {
+        index -= 1;
+        let promote_this = {
+            let item = &state.eviction_buffer[index];
+            belongs_to(&scope_index, item, scope)
+                && item.semantic.is_live()
+                && !is_excluded(item)
+                && should_promote(item)
+        };
+        if promote_this {
+            let mut item = state.eviction_buffer.remove(index);
+            promote(
+                &mut item,
+                parent_scope,
+                parent_id,
+                scope.kind,
+                turn,
+                &mut transitions,
+            );
+            // The heap push indexes the item at its slot in the same step.
+            state.items.push(item);
+        }
+    }
     transitions
 }
 

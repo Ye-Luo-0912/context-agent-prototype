@@ -4487,3 +4487,80 @@ async fn external_only_state_still_ages_cold_entries_on_full_gc() {
         );
     }
 }
+
+/// A durable outcome of a closing scope is promoted even when it was
+/// already evicted to the warm buffer — promotion follows the item, not
+/// just the resident heap, and a promoted item becomes resident again.
+#[tokio::test]
+async fn warm_buffer_durable_outcome_is_promoted_on_scope_close() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let (task_scope_id, focus_scope_id, item_id) = {
+        let mut state = engine.state.lock().await;
+        let session_id = crate::scope::ensure_session(&mut state);
+        let task_id = TaskId::new();
+        let task_scope_id = state.scopes.push(agent_contracts::Scope {
+            id: ScopeId::new(),
+            parent: Some(session_id),
+            kind: ScopeKind::Task,
+            state: ScopeState::Active,
+            task_id: Some(task_id),
+            goal: None,
+            opened_tick: 1,
+            last_active_tick: 1,
+            closed_tick: None,
+        });
+        let focus_scope_id = state.scopes.push(agent_contracts::Scope {
+            id: ScopeId::new(),
+            parent: Some(task_scope_id),
+            kind: ScopeKind::Focus,
+            state: ScopeState::Active,
+            task_id: Some(task_id),
+            goal: None,
+            opened_tick: 2,
+            last_active_tick: 2,
+            closed_tick: None,
+        });
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "durable task decision".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.9,
+            None,
+        );
+        item.scope_id = Some(focus_scope_id);
+        item.attention = AttentionState::Archived;
+        item.residency = ContextResidency::Warm;
+        item.evicted_at_tick = Some(1);
+        let item_id = item.id;
+        state.eviction_buffer.push(item);
+        (task_scope_id, focus_scope_id, item_id)
+    };
+
+    engine.close_scope(focus_scope_id).await.unwrap();
+    let state = engine.state.lock().await;
+    assert!(
+        state.items.iter().any(|item| item.id == item_id),
+        "a promoted buffer outcome must be resident again"
+    );
+    assert!(
+        state.eviction_buffer.iter().all(|item| item.id != item_id),
+        "a promoted buffer outcome must leave the eviction buffer"
+    );
+    let promoted = state.items.iter().find(|item| item.id == item_id).unwrap();
+    assert_eq!(
+        promoted.scope_id,
+        Some(task_scope_id),
+        "the durable outcome must promote to the task scope"
+    );
+    assert_eq!(promoted.scope, ContextScope::Task);
+    assert!(
+        promoted
+            .tags
+            .iter()
+            .any(|tag| tag.is_lifecycle(LifecycleLabel::Promoted)),
+        "the promotion must be labeled"
+    );
+}

@@ -659,7 +659,21 @@ pass so Cold aging and recall keep working. Regression:
 `external_only_state_still_ages_cold_entries_on_full_gc` (a Cold entry
 ages to External in one pass when nothing is resident).
 
-Remaining CTX-06 work: scope-close promotion for non-resident bodies,
+**Scope-close promotion for warm bodies closed 2026-08-10.** The
+scope-close promotion pass only visited the resident heap, so a durable
+outcome that happened to be evicted to the warm buffer before the scope
+closed lost its promotion — it kept pointing at the closed scope. The close
+pass now promotes warm-buffer members of the closing scope exactly like
+heap members (terminal semantics and excluded items stay out), and a
+promoted item re-enters the heap: promotion means resident, not just
+re-stamped. Regression:
+`warm_buffer_durable_outcome_is_promoted_on_scope_close` (a Durable
+decision in the buffer is promoted to the task scope, labeled, and becomes
+resident again when the focus episode closes). External entries (Cold/
+External) still cannot be promoted — they carry `task_id` but no `scope_id`,
+so scope membership there needs a new signal; that is a separate slice.
+
+Remaining CTX-06 work: Cold/External scope-close promotion signal,
 task-close descendant handling, tool-scope close error publishing, and
 task-summary focus identity.
 
