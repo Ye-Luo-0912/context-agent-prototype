@@ -195,7 +195,7 @@ pub(crate) async fn run_engine_observing(
                     })
                     .await?;
             }
-            RuntimeEvent::TaskCompleted { summary } => {
+            RuntimeEvent::TaskCompleted { summary, .. } => {
                 engine
                     .ingest(ContextIngress::TaskCompleted {
                         task_id: None,
@@ -941,6 +941,8 @@ mod tests {
                 run,
                 6,
                 RuntimeEvent::TaskCompleted {
+                    task_id: TaskId::new(),
+                    anchor_revision: 0,
                     summary: "task one done".into(),
                 },
             ),

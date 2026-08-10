@@ -493,36 +493,37 @@ impl RuntimeActor {
             }
             RuntimeCommand::CompleteTask { summary, reply } => {
                 let result = match self.ensure_idle().and_then(|_| self.next_focus_revision()) {
-                    Ok(next_focus_revision) => match self.state.tasks.prepare_complete() {
-                        None => Err(AgentError::InvalidRequest(
-                            "no active task to complete".into(),
-                        )),
-                        Some(txn) => {
-                            let task_id = self
-                                .state
-                                .tasks
-                                .active()
-                                .expect("a completion transaction has an active task");
-                            let event_summary = summary.clone();
-                            match self.kernel.complete_current_task(task_id, summary).await {
-                                Ok(report) => {
-                                    self.state.tasks.commit(txn);
-                                    self.state.task_id = None;
-                                    self.state.focus_revision = next_focus_revision;
-                                    self.state.generation += 1;
-                                    self.publish_context_transition(
-                                        RuntimeEvent::TaskCompleted {
-                                            summary: event_summary,
-                                        },
-                                        ContextMaintenanceTrigger::TaskCompleted,
-                                        report,
-                                    )
-                                    .await
+                    Ok(next_focus_revision) => {
+                        match self.state.tasks.prepare_complete(summary.clone()) {
+                            None => Err(AgentError::InvalidRequest(
+                                "no active task to complete".into(),
+                            )),
+                            Some((txn, record)) => {
+                                let task_id = record.task_id;
+                                let anchor_revision = record.anchor_revision;
+                                let event_summary = record.summary.clone();
+                                match self.kernel.complete_current_task(task_id, summary).await {
+                                    Ok(report) => {
+                                        self.state.tasks.commit(txn);
+                                        self.state.task_id = None;
+                                        self.state.focus_revision = next_focus_revision;
+                                        self.state.generation += 1;
+                                        self.publish_context_transition(
+                                            RuntimeEvent::TaskCompleted {
+                                                task_id,
+                                                anchor_revision,
+                                                summary: event_summary,
+                                            },
+                                            ContextMaintenanceTrigger::TaskCompleted,
+                                            report,
+                                        )
+                                        .await
+                                    }
+                                    Err(error) => Err(self.context_transition_failed(error)),
                                 }
-                                Err(error) => Err(self.context_transition_failed(error)),
                             }
                         }
-                    },
+                    }
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);

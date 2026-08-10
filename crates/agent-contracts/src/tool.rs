@@ -241,6 +241,10 @@ pub const MAX_TASK_ANCHOR_LIST_ITEMS: usize = 32;
 pub const MAX_TASK_ANCHOR_ITEM_CHARS: usize = 200;
 pub const MAX_TASK_ANCHOR_CLAIMS: usize = 32;
 pub const MAX_TASK_ANCHOR_CHANGED_FIELDS: usize = 8;
+/// Defensive bounds for one typed CompletionRecord.
+pub const MAX_COMPLETION_SUMMARY_CHARS: usize = 2_000;
+pub const MAX_COMPLETION_REF_CHARS: usize = 256;
+pub const MAX_COMPLETION_ARTIFACTS: usize = 32;
 pub const MAX_TOOL_SURFACE_REPORT_SELECTED: usize = 32;
 pub const MAX_TOOL_SURFACE_REPORT_OMITTED: usize = 32;
 pub const MAX_TOOL_SURFACE_REPORT_BLOCKED: usize = 32;

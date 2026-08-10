@@ -24,12 +24,15 @@
 
 use std::collections::HashSet;
 
-use agent_contracts::{AgentError, AgentResult, RunId, TaskId};
+use agent_contracts::{
+    AgentError, AgentResult, MAX_COMPLETION_ARTIFACTS, MAX_COMPLETION_REF_CHARS,
+    MAX_COMPLETION_SUMMARY_CHARS, RunId, TaskId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::task::{
-    TaskAnchor, TaskManager, TaskRecord, TaskStatus, TaskToolRequirementSet, validate_anchor,
-    validate_tool_requirement_set,
+    CompletionRecord, TaskAnchor, TaskManager, TaskRecord, TaskStatus, TaskToolRequirementSet,
+    validate_anchor, validate_tool_requirement_set,
 };
 
 /// Bump when the checkpoint shape changes; restore rejects mismatches.
@@ -70,6 +73,10 @@ pub struct RunMetadata {
 pub struct TaskManagerSnapshot {
     pub tasks: Vec<TaskRecordSnapshot>,
     pub active: Option<TaskId>,
+    /// One immutable outcome per completed task, in completion order.
+    /// Defaults only to permit explicit rejection of legacy v2 payloads.
+    #[serde(default)]
+    pub completed: Vec<CompletionRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +166,56 @@ impl RuntimeCheckpoint {
             _ => {}
         }
 
+        // A completed task must own exactly one committed completion record,
+        // and every record must name a completed task with a matching anchor
+        // revision — the outcome is measured against exactly that authority.
+        let mut completed_without_record = Vec::new();
+        let mut records_by_task = std::collections::HashMap::new();
+        for task in &self.tasks.tasks {
+            if task.status == TaskStatus::Completed {
+                completed_without_record.push(task.id);
+            }
+        }
+        for record in &self.tasks.completed {
+            validate_completion_record(record).map_err(|error| {
+                AgentError::InvalidRequest(format!(
+                    "checkpoint has an invalid completion record: {error}"
+                ))
+            })?;
+            if let Some(position) = completed_without_record
+                .iter()
+                .position(|id| *id == record.task_id)
+            {
+                completed_without_record.swap_remove(position);
+                if records_by_task.insert(record.task_id, record).is_some() {
+                    return Err(AgentError::InvalidRequest(format!(
+                        "checkpoint task {} has more than one committed completion record",
+                        record.task_id
+                    )));
+                }
+            } else {
+                return Err(AgentError::InvalidRequest(format!(
+                    "checkpoint completion record names task {} which is not completed",
+                    record.task_id
+                )));
+            }
+        }
+        if let Some(task_id) = completed_without_record.first() {
+            return Err(AgentError::InvalidRequest(format!(
+                "checkpoint completed task {task_id} has no committed completion record"
+            )));
+        }
+        for task in &self.tasks.tasks {
+            if let Some(record) = records_by_task.get(&task.id)
+                && record.anchor_revision != task.anchor.revision
+            {
+                return Err(AgentError::InvalidRequest(format!(
+                    "checkpoint completion record for task {} names anchor revision {}, but the task anchor is at {}",
+                    task.id, record.anchor_revision, task.anchor.revision
+                )));
+            }
+        }
+
         let mut capability_ids = HashSet::new();
         for capability in &self.capabilities {
             if !capability_ids.insert(capability.id.as_str()) {
@@ -170,6 +227,44 @@ impl RuntimeCheckpoint {
         }
         Ok(())
     }
+}
+
+/// Bound and validate one completion record from a checkpoint. A record is
+/// immutable authority: every field is capped and refs are short strings.
+pub(crate) fn validate_completion_record(record: &CompletionRecord) -> AgentResult<()> {
+    if record.summary.chars().count() > MAX_COMPLETION_SUMMARY_CHARS {
+        return Err(AgentError::InvalidRequest(format!(
+            "completion summary has {} chars, above the {MAX_COMPLETION_SUMMARY_CHARS} cap",
+            record.summary.chars().count()
+        )));
+    }
+    if record.artifacts.len() > MAX_COMPLETION_ARTIFACTS {
+        return Err(AgentError::InvalidRequest(format!(
+            "completion record carries {} artifacts, above the {MAX_COMPLETION_ARTIFACTS} cap",
+            record.artifacts.len()
+        )));
+    }
+    for reference in record
+        .final_output_ref
+        .iter()
+        .chain(record.final_output_digest.iter())
+    {
+        if reference.chars().count() > MAX_COMPLETION_REF_CHARS {
+            return Err(AgentError::InvalidRequest(format!(
+                "completion ref has {} chars, above the {MAX_COMPLETION_REF_CHARS} cap",
+                reference.chars().count()
+            )));
+        }
+    }
+    for artifact in &record.artifacts {
+        if artifact.chars().count() > MAX_COMPLETION_REF_CHARS {
+            return Err(AgentError::InvalidRequest(format!(
+                "completion artifact ref has {} chars, above the {MAX_COMPLETION_REF_CHARS} cap",
+                artifact.chars().count()
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl TaskManagerSnapshot {
@@ -189,6 +284,7 @@ impl TaskManagerSnapshot {
                 })
                 .collect(),
             active: tasks.active(),
+            completed: tasks.completed_records().to_vec(),
         }
     }
 }

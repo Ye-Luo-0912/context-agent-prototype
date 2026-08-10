@@ -207,6 +207,8 @@ impl Script {
 
     fn done(&mut self, summary: &str) {
         self.push(RuntimeEvent::TaskCompleted {
+            task_id: TaskId::new(),
+            anchor_revision: 0,
             summary: summary.into(),
         });
         self.push(RuntimeEvent::ContextMaintained {

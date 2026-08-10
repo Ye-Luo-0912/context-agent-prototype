@@ -132,7 +132,13 @@ pub enum RuntimeEvent {
     Error {
         message: String,
     },
+    /// One task completed: the runtime committed a typed CompletionRecord
+    /// for it. Carries the task/result identity (task id and the anchor
+    /// revision the outcome was measured against) plus the bounded summary;
+    /// the full record lives in the runtime's task catalog, not the event.
     TaskCompleted {
+        task_id: TaskId,
+        anchor_revision: u64,
         summary: String,
     },
     /// A task's anchor was replaced through whole-set CAS. The event is the

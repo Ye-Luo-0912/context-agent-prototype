@@ -460,8 +460,14 @@ impl AppState {
                 self.status = "error".into();
                 self.push_system(format!("error: {message}"));
             }
-            RuntimeEvent::TaskCompleted { summary } => {
-                self.push_system(format!("task completed: {summary}"));
+            RuntimeEvent::TaskCompleted {
+                task_id,
+                anchor_revision,
+                summary,
+            } => {
+                self.push_system(format!(
+                    "task {task_id} completed (anchor r{anchor_revision}): {summary}"
+                ));
             }
             RuntimeEvent::TurnCompleted => {
                 // The turn is over: any delta still in flight belongs to a

@@ -838,6 +838,112 @@ async fn task_anchor_survives_checkpoint_restore() {
     instance.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn completion_commits_a_typed_record_and_publishes_task_identity() {
+    let (instance, _context) = simple_instance().await;
+    let mut events = instance.handle().subscribe();
+    instance
+        .handle()
+        .set_focus("refactor auth".into())
+        .await
+        .unwrap();
+    let task_id = instance.handle().list_tasks().await.unwrap()[0].id;
+
+    // Advance the anchor so the completion record names a non-trivial
+    // revision: the outcome is measured against exactly that authority.
+    instance
+        .handle()
+        .update_task_anchor(
+            task_id,
+            0,
+            TaskAnchor {
+                original_goal: "refactor auth".into(),
+                acceptance_criteria: vec!["tests pass".into()],
+                ..TaskAnchor::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    instance
+        .handle()
+        .complete_current_task("auth refactor shipped".into())
+        .await
+        .unwrap();
+
+    // The typed event carries the task/result identity, not free text only.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw = None;
+    while tokio::time::Instant::now() < deadline && saw.is_none() {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::TaskCompleted {
+                task_id: event_task,
+                anchor_revision,
+                summary,
+            } = envelope.event
+            {
+                saw = Some((event_task, anchor_revision, summary));
+                break;
+            }
+        }
+        if saw.is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    let (event_task, anchor_revision, summary) =
+        saw.expect("completion must publish its typed event");
+    assert_eq!(event_task, task_id);
+    assert_eq!(anchor_revision, 1);
+    assert_eq!(summary, "auth refactor shipped");
+
+    // The checkpoint carries the immutable record; restore brings it back.
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert_eq!(checkpoint.tasks.completed.len(), 1);
+    assert_eq!(checkpoint.tasks.completed[0].task_id, task_id);
+    assert_eq!(checkpoint.tasks.completed[0].anchor_revision, 1);
+    assert_eq!(
+        checkpoint.tasks.completed[0].summary,
+        "auth refactor shipped"
+    );
+    assert_eq!(
+        checkpoint.tasks.tasks[0].status,
+        agent_runtime::TaskStatus::Completed
+    );
+
+    instance.restore(checkpoint).await.unwrap();
+    assert_eq!(
+        instance.handle().list_tasks().await.unwrap()[0].status,
+        agent_runtime::TaskStatus::Completed,
+        "the completed task stays completed after restore"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn restore_rejects_completed_task_without_a_completion_record() {
+    let (instance, _context) = simple_instance().await;
+    instance
+        .handle()
+        .set_focus("refactor auth".into())
+        .await
+        .unwrap();
+    instance
+        .handle()
+        .complete_current_task("shipped".into())
+        .await
+        .unwrap();
+
+    let mut invalid = instance.checkpoint().await.unwrap();
+    invalid.tasks.completed.clear();
+
+    let error = instance.restore(invalid).await.unwrap_err();
+    assert!(
+        error.to_string().contains("no committed completion record"),
+        "a completed task must own exactly one outcome: {error}"
+    );
+    instance.shutdown().await.unwrap();
+}
+
 /// The runtime assigns a task id on focus; the context engine must be
 /// focused on the *same* task — runtime and context share one task
 /// identity, never a parallel one.

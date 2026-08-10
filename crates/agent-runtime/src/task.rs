@@ -137,6 +137,33 @@ pub enum RootClaimStrength {
     Recallable,
 }
 
+/// One immutable, typed task completion outcome.
+///
+/// A completed task owns exactly one committed `CompletionRecord`: it is the
+/// authoritative result (task identity, the anchor revision the outcome was
+/// measured against, the bounded summary, and optional refs to the exact
+/// final output body and its digest). The record lives with the
+/// `TaskManager` and is persisted in `RuntimeCheckpoint`; `TaskCompleted`
+/// events carry only the bounded summary. Every field is capped.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CompletionRecord {
+    pub task_id: TaskId,
+    /// The anchor revision at completion time: the outcome is measured
+    /// against exactly that authority state.
+    pub anchor_revision: u64,
+    /// Bounded completion summary (the `/done` text or a derived one).
+    pub summary: String,
+    pub completed_at_ms: u64,
+    /// Ref to the exact final output body (artifact path/uri), if retained.
+    pub final_output_ref: Option<String>,
+    /// Hex digest of the final output body, for byte-for-byte verification
+    /// after overflow, restart or Storage GC.
+    pub final_output_digest: Option<String>,
+    /// Bounded artifact/effect refs the completion produced.
+    pub artifacts: Vec<String>,
+}
+
 /// A serializable snapshot for the UI (`/tasks`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskInfo {
@@ -174,8 +201,13 @@ enum TaskPlan {
     },
     /// The active task suspends without completing.
     Suspend { active: TaskId },
-    /// The active task completes (and leaves the active slot).
-    Complete { active: TaskId },
+    /// The active task completes (and leaves the active slot). The typed
+    /// outcome is committed atomically with the status flip: a completed
+    /// task owns exactly one `CompletionRecord`.
+    Complete {
+        active: TaskId,
+        completion: CompletionRecord,
+    },
     /// Atomically replace one task's complete, normalized tool-demand set.
     ReplaceToolRequirements {
         target: TaskId,
@@ -192,6 +224,9 @@ enum TaskPlan {
 pub struct TaskManager {
     tasks: Vec<TaskRecord>,
     active: Option<TaskId>,
+    /// One immutable outcome per completed task, in completion order. This
+    /// is the authoritative task-catalog result, persisted in checkpoints.
+    completed: Vec<CompletionRecord>,
 }
 
 impl TaskManager {
@@ -269,11 +304,48 @@ impl TaskManager {
         })
     }
 
-    /// Plan to complete the active task. `None` when nothing is active.
-    pub fn prepare_complete(&self) -> Option<TaskTxn> {
-        self.active.map(|active| TaskTxn {
-            plan: TaskPlan::Complete { active },
-        })
+    /// Plan to complete the active task, committing its typed outcome with
+    /// the status flip. `None` when nothing is active. The record captures
+    /// the task identity and the anchor revision the outcome is measured
+    /// against; the bounded summary comes from the caller (`/done` text).
+    pub fn prepare_complete(&self, summary: String) -> Option<(TaskTxn, CompletionRecord)> {
+        let active = self.active?;
+        let anchor_revision = self
+            .tasks
+            .iter()
+            .find(|task| task.id == active)
+            .map(|task| task.anchor.revision)
+            .unwrap_or_default();
+        let record = CompletionRecord {
+            task_id: active,
+            anchor_revision,
+            summary,
+            completed_at_ms: now_ms(),
+            final_output_ref: None,
+            final_output_digest: None,
+            artifacts: Vec::new(),
+        };
+        Some((
+            TaskTxn {
+                plan: TaskPlan::Complete {
+                    active,
+                    completion: record.clone(),
+                },
+            },
+            record,
+        ))
+    }
+
+    /// Every committed completion outcome, in completion order.
+    pub fn completed_records(&self) -> &[CompletionRecord] {
+        &self.completed
+    }
+
+    /// The committed outcome of one task, if it completed.
+    pub fn completion_of(&self, task_id: TaskId) -> Option<&CompletionRecord> {
+        self.completed
+            .iter()
+            .find(|record| record.task_id == task_id)
     }
 
     /// Plan a bounded whole-set CAS replacement of a task's tool demand.
@@ -418,10 +490,11 @@ impl TaskManager {
                 }
                 self.active = None;
             }
-            TaskPlan::Complete { active } => {
+            TaskPlan::Complete { active, completion } => {
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == active) {
                     task.status = TaskStatus::Completed;
                 }
+                self.completed.push(completion);
                 self.active = None;
             }
             TaskPlan::ReplaceToolRequirements {
@@ -470,6 +543,7 @@ impl TaskManager {
     pub fn restore(&mut self, snapshot: crate::checkpoint::TaskManagerSnapshot) {
         self.tasks = snapshot.tasks.into_iter().map(TaskRecord::from).collect();
         self.active = snapshot.active;
+        self.completed = snapshot.completed;
     }
 
     /// Snapshot for the UI.
@@ -739,7 +813,7 @@ mod tests {
         assert_eq!(tasks.active(), Some(a));
         assert_eq!(tasks.get(b).map(|t| t.status), Some(TaskStatus::Suspended));
 
-        let txn = tasks.prepare_complete().expect("a is active");
+        let (txn, _record) = tasks.prepare_complete("done".into()).expect("a is active");
         tasks.commit(txn);
         assert_eq!(tasks.get(a).map(|t| t.status), Some(TaskStatus::Completed));
         assert_eq!(tasks.active(), None, "completing the active task clears it");
@@ -764,7 +838,7 @@ mod tests {
     fn unknown_task_ids_are_rejected() {
         let tasks = TaskManager::new();
         assert!(tasks.prepare_activate(TaskId::new()).is_none());
-        assert!(tasks.prepare_complete().is_none());
+        assert!(tasks.prepare_complete("done".into()).is_none());
     }
 
     #[test]
@@ -871,7 +945,9 @@ mod tests {
     fn completed_task_rejects_tool_requirement_replacement() {
         let mut tasks = TaskManager::new();
         let task_id = create(&mut tasks, "task A");
-        let txn = tasks.prepare_complete().expect("task is active");
+        let (txn, _record) = tasks
+            .prepare_complete("done".into())
+            .expect("task is active");
         tasks.commit(txn);
 
         assert!(matches!(
@@ -1023,7 +1099,9 @@ mod tests {
     fn completed_task_rejects_anchor_replacement() {
         let mut tasks = TaskManager::new();
         let task_id = create(&mut tasks, "task A");
-        let txn = tasks.prepare_complete().expect("task is active");
+        let (txn, _record) = tasks
+            .prepare_complete("done".into())
+            .expect("task is active");
         tasks.commit(txn);
 
         assert!(matches!(
@@ -1050,5 +1128,43 @@ mod tests {
         assert_eq!(restored.revision, 1);
         assert_eq!(restored.acceptance_criteria.len(), 2);
         assert_eq!(tasks.get(task_b).unwrap().status, TaskStatus::Suspended);
+    }
+
+    #[test]
+    fn completion_records_are_typed_one_per_completed_task() {
+        let mut tasks = TaskManager::new();
+        let task_id = create(&mut tasks, "task A");
+        let (replace, _, _) = tasks
+            .prepare_replace_anchor(task_id, 0, evolved_anchor())
+            .unwrap();
+        tasks.commit(replace);
+
+        let (txn, record) = tasks
+            .prepare_complete("auth refactor shipped".into())
+            .unwrap();
+        assert_eq!(record.task_id, task_id);
+        assert_eq!(
+            record.anchor_revision, 1,
+            "the record names the anchor it was measured against"
+        );
+        assert_eq!(record.summary, "auth refactor shipped");
+        assert!(
+            record.final_output_ref.is_none(),
+            "output retention is a later stage"
+        );
+        assert_eq!(
+            tasks.completed_records().len(),
+            0,
+            "prepare is not visible before commit"
+        );
+        tasks.commit(txn);
+
+        assert_eq!(tasks.completed_records().len(), 1);
+        let stored = tasks
+            .completion_of(task_id)
+            .expect("the task owns its outcome");
+        assert_eq!(stored.anchor_revision, 1);
+        assert_eq!(stored.summary, "auth refactor shipped");
+        assert_eq!(tasks.active(), None);
     }
 }
