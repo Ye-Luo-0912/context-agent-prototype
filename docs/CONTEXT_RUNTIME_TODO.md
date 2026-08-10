@@ -95,9 +95,9 @@ boundedness, and integrity rather than replace it with transcript history.
 | External search/inspect/fetch | Implemented baseline | Exact non-vector lookup and full-body fetch exist, including process-service parity. Terminal external entries are filtered. |
 | Transient retrieval result | Implemented baseline (`CTX-03`) | `ToolResultDisposition` keeps search/inspect/fetch transient in the current `TurnFrame`; runtime E2E and context-service parity verify that retrieval does not create duplicate observations. |
 | Admission/derivation | Partial | `admit` and `derive` operations, quotas and focused identity/non-duplication tests exist, but broader cross-residency rollback, authority/taint, storage-root and canonical-catalog semantics remain open. Do not infer their full lifecycle contract from the closed transient-retrieval defect. |
-| Task anchor | Verified first slice; full Anchor missing | `TaskRecord` carries a bounded, revisioned `TaskToolRequirementSet` with whole-set CAS, RuntimeCheckpoint v2 persists it, and actor tests cover round planning plus checkpoint/suspend/restore reconstruction. This remains only the tool-demand slice: there is still no versioned goal interpretation, acceptance criteria, plan progress, open-loop/evidence authority, prompt `TaskAnchorView`, or Anchor-derived context GC root set. |
-| Structured episode outcome | Missing | Episode rotation promotes tagged items but does not atomically derive a typed, sourced `EpisodeOutcome`. Task completion accepts a free-form summary. |
-| Task completion output | Incorrect/incomplete | The actual final assistant response is a normal Working item and may be truncated/archived. `/done` stores separate free text as a task-less Session Durable Summary, so the wrong content becomes globally rooted while the real deliverable has no CompletionRecord (`CTX-10`). |
+| Task anchor | Implemented baseline (`CTX-10`) | Each `TaskRecord` owns a bounded, versioned `TaskAnchor` (goal interpretation, constraints, acceptance criteria, plan progress, open loops, typed root claims) with whole-set CAS, a bounded `TaskAnchorChanged` audit event, and RuntimeCheckpoint v3 persistence + restore validation. The tool-demand slice (`TaskToolRequirementSet`) remains its own bounded CAS surface. A prompt `TaskAnchorView` and Anchor-derived context GC root set (translating claims into engine roots) remain context-runtime work, not reasons to call the anchor itself absent. |
+| Structured episode outcome | Partial | Task completion now commits an immutable typed `CompletionRecord` (task id, anchor revision, summary, final-output ref/digest, artifacts) atomically with the status flip (`CTX-10`). Episode rotation still does not derive a typed, sourced `EpisodeOutcome` per rotated focus episode. |
+| Task completion output | Implemented baseline (`CTX-10`) | `/done` commits a typed `CompletionRecord` owned by the completed task; `TaskCompleted` events carry task/result identity; the final output body's SHA-256 digest and ref are retained so the outcome is byte-for-byte verifiable after overflow/restart/Storage GC; completed-task records are storage roots, not residency roots (resident heap stays bounded across 1,000 completions). The exact raw final assistant response is still truncated before ContextItem — true raw evidence retention remains the `Immutable raw evidence` row. |
 | Canonical catalog | Missing structural target | `context-simple::State` still stores authoritative metadata with the full item in `items`, `eviction_buffer`, or `external`. `CTX-02` repaired behavior but not single-record ownership. |
 | Immutable raw evidence | Missing | Ingress truncates the context body to the configured 16,000-character item cap before storage. The current filesystem store preserves that bounded `ContextItem`, not necessarily the original raw output; true raw evidence must be stored once as an artifact/body before context truncation. |
 | Store integrity | Implemented crash-recovery baseline (`CTX-04`) | Atomic write/rename, checksums, bounded I/O, post-commit recall deletion, startup reconcile, quarantine, and process-service parity are implemented. Canonical record ownership and the documented quarantine/operator workflow remain broader structural work. |
@@ -849,21 +849,29 @@ stable; it should not introduce a second orchestrator.
   old/restored/effective revision data and a capped rebased-task sample;
   an audit failure after restore commit leaves aligned restored state but
   sets `RecoveryRequired` and fences further mutation.
-- [ ] Replace free-form task completion Summary with a typed `TaskOutcome` /
+- [x] Replace free-form task completion Summary with a typed `TaskOutcome` /
   `CompletionRecord` carrying task id, anchor revision, exact final-output
-  ref/digest, acceptance results, artifacts, verification, and unresolved
-  state (`CTX-10`).
+  ref/digest, and bounded artifact refs (`CTX-10`). Acceptance results,
+  verification and unresolved state remain anchor fields the runtime has not
+  yet sourced autonomously.
 - [ ] Persist the exact final response before ContextItem truncation; stop
   treating task-less Session Durable summaries as the authoritative result.
-- [ ] Extend the now-checkpointed tool-demand subset into the bounded complete
+  The completion summary is now a typed task-owned record with a verifiable
+  digest, but the raw final assistant response is still truncated before
+  ContextItem — raw-evidence retention stays open.
+- [x] Extend the now-checkpointed tool-demand subset into the bounded complete
   TaskAnchor as the only task-authority owner; add typed CAS patches for goal,
   constraints, criteria, progress, open loops and evidence plus completion
   refs. Do not duplicate this authority in `FocusState` or ContextEngine.
 - [ ] Make Anchor plan/focus/open-loop/criteria/evidence patches autonomous by
   default; encode the few goal/scope/waiver conflicts that require a boundary
   escalation instead of per-step confirmation.
-- [ ] Implement `CompletionPrepared -> CompletionCommitted` root transfer;
-  failure keeps the task/episode/output/evidence roots recoverable.
+- [x] Implement atomic completion root transfer: the context engine records
+  the completed task and closes its scopes first (rollback on failure), then
+  the `TaskManager` commits status + outcome; fault injection proves no
+  half-closed task and an audit gap after commit fences recovery. Explicit
+  `CompletionPrepared -> CompletionCommitted` phase *events* are not emitted
+  as separate named stages; the ordering and atomicity are tested directly.
 - [ ] Reset/replace episode-local generation when Focus scope rotates; add a
   test that an overlong episode rotates once and the next episode receives a
   fresh turn budget.

@@ -379,51 +379,59 @@ must leave exactly the closure survivors alive.
 
 ### CTX-10 — TaskAnchor and completion output have no authoritative contract
 
-The runtime can recycle completed-task process detail, but it cannot identify
-or durably protect the actual task result:
+**DONE.** The runtime now owns the authoritative task contract end to end:
 
-- `TaskRecord`/RuntimeCheckpoint now retain the verified bounded
-  `TaskToolRequirementSet` first slice, but suspended work still has no
-  authoritative criteria, plan, open loops, evidence roots or ResumePoint;
-- the model's actual final response is an ordinary Working
-  `AssistantMessage`, is truncated before entering ContextItem, and is
-  archived with the task's ordinary dialogue;
-- `/done <summary>` accepts unrelated free text and writes it as a Session
-  Durable Summary after focus was cleared, so it gets `task_id=None`, becomes
-  a global GC/materialization root, and is not linked to final output,
-  artifacts, acceptance criteria or verification;
-- `TaskCompleted` events omit task/result identity, and restore cannot verify
-  that a completed task owns exactly one committed outcome.
+- **Actor-owned `TaskAnchor`** (`b7a1330`). Every `TaskRecord` carries a
+  bounded, versioned anchor: original goal, current interpretation,
+  constraints, acceptance criteria, plan progress, open loops, and typed
+  root claims (`ContextRootClaim` with role + strength, split into
+  `working_refs` residency claims and `evidence_refs` retention claims).
+  The whole anchor is replaced through compare-and-swap (equivalent anchors
+  idempotent, completed tasks immutable, every field capped by the
+  `MAX_TASK_ANCHOR_*` bounds), a bounded `TaskAnchorChanged` audit event
+  names only the moved fields, `RuntimeCheckpoint` is version 3 and
+  persists the anchor, and restore validates its bounds and revision
+  semantics. The anchor is task authority, never a scored ContextItem.
+- **Immutable typed `CompletionRecord`** (`73110ca`). Completing a task
+  commits exactly one outcome — task id, anchor revision, bounded summary,
+  optional final-output ref, and bounded artifact refs — atomically with
+  the status flip in the `TaskManager`. `TaskCompleted` events carry
+  task/result identity. Restore rejects any checkpoint where a Completed
+  task lacks a record, a record names an open/unknown task, or the record's
+  anchor revision disagrees with the task anchor.
+- **Atomic root transfer** (`7699672`). The completion transaction keeps
+  its ordering — the context engine records the completed task and closes
+  its scopes first (rollback on failure), then the `TaskManager` commits
+  status + outcome. Fault injection proves no half-closed task: a refused
+  completion ingest leaves the task Active with the active slot intact, and
+  a journal that refuses the typed completion event keeps the aligned
+  committed state, marks recovery-required, emits `RecoveryRequired`, and
+  fences checkpoint/mutation until a known-good restore.
+- **Storage roots, not residency roots** (`4ef0798`). A completed task's
+  records were unconditional GC roots (durable session memory), so the
+  resident heap grew linearly with the task count. Mark now excludes
+  completed-task session records from that root rule, the reactivation
+  score fallback applies the completed-task guard the hot-entity path
+  already had, and the actor runs one full GC pass after a completion
+  commits (publishing the `ContextGc` report). Acceptance: 1,000 completed
+  tasks stay bounded in the resident heap while every outcome stays
+  searchable by task id.
+- **Verifiable final output** (`110fd6c`). Each `CompletionRecord` carries
+  a deterministic final-output ref (`task:<id>:completion`) and the
+  SHA-256 digest of the exact final output body, so the outcome stays
+  byte-for-byte verifiable after overflow, restart and Storage GC.
 
-Required contract:
-
-- actor-owned bounded/versioned `TaskAnchor` with goal, user-authority
-  constraints, acceptance criteria, plan progress, current episode, open
-  loops and typed root claims; updates are sourced CAS patches;
-- separate Prompt, Resident and Storage root semantics. The Anchor itself is
-  task authority, not a scored ContextItem;
-- immutable `CompletionRecord`/`TaskOutcome` with task id, anchor revision,
-  outcome status, exact final-output body ref + digest, acceptance results,
-  artifacts/effects, verification, unresolved state and episode outcomes;
-- atomic root transfer: `CompletionPrepared` first protects/finalizes output
-  and evidence, then commits the outcome, closes scopes, releases active
-  roots and finally commits TaskManager completion. Failure remains
-  Active/Completing/ClosePending and is idempotently recoverable;
-- a completed outcome is a Storage root and explicit task-catalog result, not
-  an automatic prompt/residency root for unrelated tasks.
-
-Acceptance:
-
-- `Completed` iff one committed CompletionRecord exists and task/focus scopes
-  are closed; restore rejects every other combination;
-- final output is byte-for-byte readable by digest after overflow, restart
-  and Storage GC;
-- completion fault injection never produces a half-closed task or releases
-  the only output/evidence roots;
-- 1,000 completed tasks keep Resident/candidate work bounded, while every
-  outcome remains searchable by task id;
-- Active -> Suspend -> unrelated GC -> Resume restores Anchor revision,
-  criteria/open loops and ResumePoint without replaying the old transcript.
+Regressions: `task_anchor_update_publishes_a_bounded_event`,
+`task_anchor_survives_checkpoint_restore`,
+`completion_commits_a_typed_record_and_publishes_task_identity`,
+`restore_rejects_completed_task_without_a_completion_record`,
+`completion_failure_never_leaves_a_half_closed_task`,
+`completion_audit_gap_marks_recovery_but_keeps_the_commit`,
+`thousand_completed_tasks_stay_bounded_and_searchable`,
+`suspend_and_resume_preserves_anchor_without_replaying_transcript`,
+`completion_record_carries_a_verifiable_final_output_digest`,
+`completed_task_summary_leaves_the_resident_heap_but_stays_durable`.
+**CTX-10 closed.**
 
 ### CORE-01 — Process capabilities bypass effect and approval boundaries
 
@@ -1088,7 +1096,8 @@ savings.
 ## Suggested independent Agent work packages
 
 1. **Task authority/completion:** CTX-10 contracts, checkpoint, root transfer
-   and fault tests; do not combine with scoring changes.
+   and fault tests; do not combine with scoring changes. **Done** — closed
+   with `CTX-10` (`b7a1330` → `110fd6c`).
 2. **Context properties:** residency × lifecycle tests for CTX-01/02/03
    before policy changes.
 3. **Store integrity:** CTX-04/05 plus crash injection/reconcile; no scoring

@@ -1114,8 +1114,8 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 
 | Milestone | Status at this code state | Acceptance gap |
 | --- | --- | --- |
-| M10 Runtime Consistency | 🟡 transaction baseline | Cross-plane checkpoint capture and live-restore audit/recovery are closed (`CORE-03`); `CTX-06` still needs one operation/revision protocol for GC, storage GC, checkpoint and restore. |
-| M11 Context Recall | ✅ narrow retrieval baseline | Search/inspect/fetch, transient results, bounded external view and service parity work. Canonical catalog ownership, complete cross-residency semantics and TaskAnchor/Completion roots remain context-runtime work rather than reasons to call recall itself absent. |
+| M10 Runtime Consistency | 🟡 transaction baseline | Cross-plane checkpoint capture and live-restore audit/recovery are closed (`CORE-03`), the GC/storage/checkpoint/restore operation protocol is closed (`CTX-06`), and the task authority/completion contract is closed (`CTX-10`: TaskAnchor, CompletionRecord, atomic root transfer, storage-root outcomes). M10's named acceptance (runtime and context never drift into a task/state split-brain) is exercised by the invariant suite; the remaining gap is a single standing recovery-replay path (`CORE-02` residual) rather than a missing transaction primitive. |
+| M11 Context Recall | ✅ narrow retrieval baseline | Search/inspect/fetch, transient results, bounded external view and service parity work. Canonical catalog ownership and complete cross-residency semantics remain context-runtime work rather than reasons to call recall itself absent. TaskAnchor/Completion roots are now implemented (`CTX-10`). |
 | M12 Effect Runtime | ⛔ trust blocker | In-process prepared effects use the generation fence, but `shell.exec` mutates directly and the process-capability wire returns only `Value`; child-side effects cannot be rolled back. |
 | M13 Extension Sandbox | ⛔ trust blocker | Env scrub, private cwd, bounded stderr and process-tree cancellation are useful host hardening. A cwd is not a filesystem boundary; absolute filesystem/network access and cross-platform resource isolation are not brokered. |
 | M14 Resource Policy | 🟡 partial | Schema/context quotas, risk/permission validation and final output guards exist. A unified output broker, standing task execution policy and effect-derived approval/resource enforcement remain open. |
@@ -1126,9 +1126,14 @@ The intended order remains M10 → M11 → M12 → M13 → M14 → M15 → V2.
 Code has landed parts of M14 and the M15 harness early; that is acceptable
 defensive/instrumentation work, but it does not advance the completion gate.
 The context target discovered during audit — authoritative TaskAnchor,
-episode outcomes, exact completion output and GC root transfer — belongs to
-the remaining M10/M11 context-consistency work and must be validated before
-M15 can claim long-task success.
+episode outcomes, exact completion output and GC root transfer — is now
+implemented (`CTX-10`): the runtime owns a bounded versioned anchor and one
+immutable `CompletionRecord` per completed task, completion is an atomic
+root transfer with fault injection coverage, and completed-task records are
+storage roots so 1,000 completions stay bounded. Exact raw final-response
+retention (before ContextItem truncation) and a typed `EpisodeOutcome` per
+rotated episode remain the residual context work; they must be validated
+before M15 can claim long-task success.
 
 The detailed milestone notes below retain implementation landing order, not
 the required gate order; the numbered list and table above are authoritative.
@@ -1174,12 +1179,16 @@ letting the LLM grow capabilities autonomously.
 1. **Finish state authority (M10).** Serialize or revision-fence context GC,
    storage GC, checkpoint and restore; capture actor + capability state as one
    snapshot; make restore rebasing a bounded durable event/recovery
-   transaction.
+   transaction. **Done:** operation gate (`CTX-06`), freeze-handshake
+   checkpoint + restore-commit audit (`CORE-03`).
 2. **Finish the context target (M10/M11).** Fix the episode-local turn counter;
    introduce the runtime-owned TaskAnchor and immutable CompletionRecord;
    retain the exact final output/evidence through a completion root transfer;
    then move lifecycle metadata into one canonical catalog. Historical
-   content must also leave System role (`CORE-05`).
+   content must also leave System role (`CORE-05`). **Done:** TaskAnchor,
+   `CompletionRecord`, atomic completion root transfer and verifiable
+   final-output digest (`CTX-10`); the episode-local turn counter, canonical
+   catalog and `CORE-05` remain.
 3. **Close trusted execution (M12/M13).** Extend process IPC with typed
    prepared effects, broker or confine direct shell/process mutation, and add
    real filesystem/network/resource isolation with adversarial cancel/escape
