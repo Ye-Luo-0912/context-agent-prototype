@@ -494,7 +494,22 @@ impl RuntimeActor {
             RuntimeCommand::CompleteTask { summary, reply } => {
                 let result = match self.ensure_idle().and_then(|_| self.next_focus_revision()) {
                     Ok(next_focus_revision) => {
-                        match self.state.tasks.prepare_complete(summary.clone()) {
+                        // The exact final-output body is the completion
+                        // summary itself in this prototype: retain its
+                        // digest so the outcome stays byte-for-byte
+                        // verifiable, with a deterministic ref naming the
+                        // task's completion record.
+                        let final_output_digest = Some(crate::task::sha256_hex(summary.as_bytes()));
+                        let final_output_ref = self
+                            .state
+                            .tasks
+                            .active()
+                            .map(|task_id| format!("task:{task_id}:completion"));
+                        match self.state.tasks.prepare_complete(
+                            summary.clone(),
+                            final_output_ref,
+                            final_output_digest,
+                        ) {
                             None => Err(AgentError::InvalidRequest(
                                 "no active task to complete".into(),
                             )),

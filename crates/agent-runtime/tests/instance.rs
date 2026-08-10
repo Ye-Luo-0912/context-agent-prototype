@@ -1183,6 +1183,59 @@ async fn thousand_completed_tasks_stay_bounded_and_searchable() {
 }
 
 #[tokio::test]
+async fn completion_record_carries_a_verifiable_final_output_digest() {
+    use sha2::{Digest, Sha256};
+
+    let (instance, _context) = simple_instance().await;
+    instance
+        .handle()
+        .set_focus("refactor auth".into())
+        .await
+        .unwrap();
+    let task_id = instance.handle().list_tasks().await.unwrap()[0].id;
+    let summary = "auth refactor shipped";
+    instance
+        .handle()
+        .complete_current_task(summary.into())
+        .await
+        .unwrap();
+
+    // The completion record names the exact final-output body and its
+    // digest, so the outcome is byte-for-byte verifiable.
+    let checkpoint = instance.checkpoint().await.unwrap();
+    let record = &checkpoint.tasks.completed[0];
+    let mut hasher = Sha256::new();
+    hasher.update(summary.as_bytes());
+    let expected = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        record.final_output_digest.as_deref(),
+        Some(expected.as_str()),
+        "the record carries the digest of the exact final output"
+    );
+    assert_eq!(
+        record.final_output_ref.as_deref(),
+        Some(format!("task:{task_id}:completion").as_str()),
+        "the record carries a deterministic ref to its own final output"
+    );
+
+    // Restart (restore) keeps the outcome and its digest intact.
+    instance.restore(checkpoint).await.unwrap();
+    let restored = instance.checkpoint().await.unwrap();
+    let restored_record = &restored.tasks.completed[0];
+    assert_eq!(restored_record.summary, summary);
+    assert_eq!(
+        restored_record.final_output_digest.as_deref(),
+        Some(expected.as_str()),
+        "the digest survives a restore unchanged"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn suspend_and_resume_preserves_anchor_without_replaying_transcript() {
     let (instance, context) = simple_instance().await;
     instance

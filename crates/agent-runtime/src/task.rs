@@ -308,7 +308,14 @@ impl TaskManager {
     /// the status flip. `None` when nothing is active. The record captures
     /// the task identity and the anchor revision the outcome is measured
     /// against; the bounded summary comes from the caller (`/done` text).
-    pub fn prepare_complete(&self, summary: String) -> Option<(TaskTxn, CompletionRecord)> {
+    /// `final_output_ref`/`final_output_digest` name the exact final output
+    /// body (if retained) so the outcome stays byte-for-byte verifiable.
+    pub fn prepare_complete(
+        &self,
+        summary: String,
+        final_output_ref: Option<String>,
+        final_output_digest: Option<String>,
+    ) -> Option<(TaskTxn, CompletionRecord)> {
         let active = self.active?;
         let anchor_revision = self
             .tasks
@@ -321,8 +328,8 @@ impl TaskManager {
             anchor_revision,
             summary,
             completed_at_ms: now_ms(),
-            final_output_ref: None,
-            final_output_digest: None,
+            final_output_ref,
+            final_output_digest,
             artifacts: Vec::new(),
         };
         Some((
@@ -769,6 +776,19 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// Hex SHA-256 digest of a final-output body, so a completion outcome stays
+/// byte-for-byte verifiable after overflow, restart or Storage GC.
+pub(crate) fn sha256_hex(content: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(content);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,7 +833,9 @@ mod tests {
         assert_eq!(tasks.active(), Some(a));
         assert_eq!(tasks.get(b).map(|t| t.status), Some(TaskStatus::Suspended));
 
-        let (txn, _record) = tasks.prepare_complete("done".into()).expect("a is active");
+        let (txn, _record) = tasks
+            .prepare_complete("done".into(), None, None)
+            .expect("a is active");
         tasks.commit(txn);
         assert_eq!(tasks.get(a).map(|t| t.status), Some(TaskStatus::Completed));
         assert_eq!(tasks.active(), None, "completing the active task clears it");
@@ -838,7 +860,7 @@ mod tests {
     fn unknown_task_ids_are_rejected() {
         let tasks = TaskManager::new();
         assert!(tasks.prepare_activate(TaskId::new()).is_none());
-        assert!(tasks.prepare_complete("done".into()).is_none());
+        assert!(tasks.prepare_complete("done".into(), None, None).is_none());
     }
 
     #[test]
@@ -946,7 +968,7 @@ mod tests {
         let mut tasks = TaskManager::new();
         let task_id = create(&mut tasks, "task A");
         let (txn, _record) = tasks
-            .prepare_complete("done".into())
+            .prepare_complete("done".into(), None, None)
             .expect("task is active");
         tasks.commit(txn);
 
@@ -1100,7 +1122,7 @@ mod tests {
         let mut tasks = TaskManager::new();
         let task_id = create(&mut tasks, "task A");
         let (txn, _record) = tasks
-            .prepare_complete("done".into())
+            .prepare_complete("done".into(), None, None)
             .expect("task is active");
         tasks.commit(txn);
 
@@ -1140,7 +1162,7 @@ mod tests {
         tasks.commit(replace);
 
         let (txn, record) = tasks
-            .prepare_complete("auth refactor shipped".into())
+            .prepare_complete("auth refactor shipped".into(), None, None)
             .unwrap();
         assert_eq!(record.task_id, task_id);
         assert_eq!(
