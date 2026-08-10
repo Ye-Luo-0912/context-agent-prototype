@@ -15,8 +15,8 @@ use agent_contracts::{
     AgentError, AgentResult, CONTEXT_CONSUMPTION_ACK_ITEM_CAP, CancellationToken,
     ContextConsumptionAck, ContextHints, ContextIngress, ContextMaintenanceReport,
     ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect, EffectCommitError,
-    ModelInput, ModelRequest, OperationId, OperationOutcome, OperationResult, RuntimeDirective,
-    RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall, ToolOutcome, ToolOutput,
+    ModelInput, ModelRequest, OperationId, OperationOutcome, OperationResult, RestoreRevision,
+    RuntimeDirective, RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall, ToolOutcome, ToolOutput,
     ToolResultDisposition, ToolSurfaceBlock, ToolSurfaceBlockReason, ToolSurfaceDemand,
     ToolSurfaceSnapshot, TurnFrame, TurnFrameStep, TurnId,
 };
@@ -538,8 +538,12 @@ impl RuntimeActor {
                                 let RuntimeCheckpoint {
                                     mut tasks,
                                     current_task_id,
+                                    focus_revision,
                                     last_surface_revision,
                                     context,
+                                    capabilities,
+                                    run_metadata,
+                                    version,
                                     ..
                                 } = checkpoint;
                                 let mut restored_requirement_high_water =
@@ -553,6 +557,12 @@ impl RuntimeActor {
                                         })
                                         .or_insert(task.tool_requirements.revision);
                                 }
+                                // Rebase bookkeeping for the restore-commit
+                                // audit record: which tasks had their
+                                // tool-requirement revision bumped past the
+                                // live high-water mark (capped sample).
+                                let mut rebased_tasks = 0usize;
+                                let mut rebased_task_sample: Vec<TaskId> = Vec::new();
                                 for task in &mut tasks.tasks {
                                     if let Some(live_revision) =
                                         restored_requirement_high_water.get(&task.id).copied()
@@ -572,10 +582,16 @@ impl RuntimeActor {
                                                 return;
                                             }
                                         };
+                                        rebased_tasks += 1;
+                                        if rebased_task_sample.len() < 16 {
+                                            rebased_task_sample.push(task.id);
+                                        }
                                     }
                                     restored_requirement_high_water
                                         .insert(task.id, task.tool_requirements.revision);
                                 }
+                                let old_focus_revision = self.state.focus_revision;
+                                let old_surface_revision = self.state.last_surface_revision;
                                 match self.kernel.restore(context, current_task_id).await {
                                     Err(error) => Err(self.context_transition_failed(error)),
                                     Ok(()) => {
@@ -593,7 +609,44 @@ impl RuntimeActor {
                                             .max(last_surface_revision);
                                         self.state.generation += 1;
                                         self.state.recovery_required = false;
-                                        Ok(())
+                                        // Mandatory audit record of the
+                                        // restore commit. A restore must not
+                                        // outrun its own journal event: if
+                                        // the barrier fails, the restored
+                                        // state stays (it is the aligned
+                                        // truth) but the runtime demands
+                                        // recovery and rejects normal
+                                        // mutation until a known-good
+                                        // restore.
+                                        let restored_event = RuntimeEvent::RuntimeRestored {
+                                            checkpoint_version: version,
+                                            restored_run_id: run_metadata.run_id,
+                                            current_run_id: self.kernel.run_id(),
+                                            focus_revision: RestoreRevision {
+                                                old: old_focus_revision,
+                                                restored: focus_revision,
+                                                effective: restored_focus_revision,
+                                            },
+                                            surface_revision: RestoreRevision {
+                                                old: old_surface_revision,
+                                                restored: last_surface_revision,
+                                                effective: self.state.last_surface_revision,
+                                            },
+                                            rebased_tasks,
+                                            rebased_task_sample,
+                                            capabilities_applied: !capabilities.is_empty(),
+                                        };
+                                        match self.kernel.emit_event_durable(restored_event).await {
+                                            Ok(()) => Ok(()),
+                                            Err(error) => {
+                                                self.state.recovery_required = true;
+                                                let _ = self
+                                                    .kernel
+                                                    .emit_event(RuntimeEvent::RecoveryRequired)
+                                                    .await;
+                                                Err(error)
+                                            }
+                                        }
                                     }
                                 }
                             }

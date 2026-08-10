@@ -844,10 +844,11 @@ stable; it should not introduce a second orchestrator.
   RuntimeCheckpoint v2 restore/resume. Full workspace tests and strict Clippy
   pass. This item is a tool-demand subset and
   must not be used as evidence that the complete TaskAnchor exists.
-- [ ] Make live-restore rebasing a durable, bounded audit transaction
-  (`CORE-03`): emit typed old/restored/effective revision data and a capped
-  rebased-task sample; an audit failure after restore commit leaves aligned
-  restored state but sets `RecoveryRequired` and fences further mutation.
+- [x] Make live-restore rebasing a durable, bounded audit transaction
+  (`CORE-03`): `RuntimeEvent::RuntimeRestored` carries typed
+  old/restored/effective revision data and a capped rebased-task sample;
+  an audit failure after restore commit leaves aligned restored state but
+  sets `RecoveryRequired` and fences further mutation.
 - [ ] Replace free-form task completion Summary with a typed `TaskOutcome` /
   `CompletionRecord` carrying task id, anchor revision, exact final-output
   ref/digest, acceptance results, artifacts, verification, and unresolved

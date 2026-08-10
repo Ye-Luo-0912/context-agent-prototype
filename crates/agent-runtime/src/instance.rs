@@ -50,10 +50,28 @@ impl RuntimeInstance {
     /// task) plus the context engine's checkpoint, plus the dynamic
     /// capability surface state the host owns. This — not the context
     /// checkpoint alone — is the snapshot a restart can restore from.
+    ///
+    /// Capture is a freeze handshake: the capability surface generation is
+    /// read before the actor snapshot and re-checked after the capability
+    /// snapshot. A concurrent surface mutation between the two planes would
+    /// otherwise produce a mixed snapshot (actor state from one moment,
+    /// capability flags from another); the mismatch is detected and the
+    /// capture retried, bounded, instead of silently shipping a torn view.
     pub async fn checkpoint(&self) -> AgentResult<RuntimeCheckpoint> {
-        let mut checkpoint = self.handle.checkpoint().await?;
-        checkpoint.capabilities = self.host.capability_registry().snapshot();
-        Ok(checkpoint)
+        let registry = self.host.capability_registry();
+        for _ in 0..3 {
+            let generation_before = registry.generation();
+            let mut checkpoint = self.handle.checkpoint().await?;
+            checkpoint.capabilities = registry.snapshot();
+            if registry.generation() == generation_before {
+                return Ok(checkpoint);
+            }
+            // A capability surface mutation landed between the two planes;
+            // retry the whole capture against one stable generation.
+        }
+        Err(AgentError::Internal(
+            "capability surface kept changing during checkpoint capture".into(),
+        ))
     }
 
     /// Restore the whole runtime from a checkpoint. The actor validates and

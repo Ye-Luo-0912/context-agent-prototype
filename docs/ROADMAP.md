@@ -1114,7 +1114,7 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 
 | Milestone | Status at this code state | Acceptance gap |
 | --- | --- | --- |
-| M10 Runtime Consistency | 🟡 transaction baseline | Cross-plane checkpoint capture and live-restore audit/recovery remain `CORE-03`; `CTX-06` still needs one operation/revision protocol for GC, storage GC, checkpoint and restore. |
+| M10 Runtime Consistency | 🟡 transaction baseline | Cross-plane checkpoint capture and live-restore audit/recovery are closed (`CORE-03`); `CTX-06` still needs one operation/revision protocol for GC, storage GC, checkpoint and restore. |
 | M11 Context Recall | ✅ narrow retrieval baseline | Search/inspect/fetch, transient results, bounded external view and service parity work. Canonical catalog ownership, complete cross-residency semantics and TaskAnchor/Completion roots remain context-runtime work rather than reasons to call recall itself absent. |
 | M12 Effect Runtime | ⛔ trust blocker | In-process prepared effects use the generation fence, but `shell.exec` mutates directly and the process-capability wire returns only `Value`; child-side effects cannot be rolled back. |
 | M13 Extension Sandbox | ⛔ trust blocker | Env scrub, private cwd, bounded stderr and process-tree cancellation are useful host hardening. A cwd is not a filesystem boundary; absolute filesystem/network access and cross-platform resource isolation are not brokered. |

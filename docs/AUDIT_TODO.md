@@ -875,31 +875,27 @@ fault already fences the commit into `RecoveryRequired`. Regressions:
 
 ### CORE-03 — Checkpoint capture is not an atomic cross-plane snapshot
 
-Restore ordering/rollback is fixed, but capture awaits actor state then reads
-the shared capability registry without a freeze. Concurrent surface mutation
-can produce a mixed snapshot. Public `RuntimeHandle::checkpoint/restore`
-also omits host capability state.
+**DONE.** Capture is now an atomic cross-plane snapshot via a
+freeze/generation handshake: `RuntimeInstance::checkpoint` reads the
+capability registry generation, captures the actor state, snapshots the
+registry, and retries (bounded) whenever the generation moved — a still-
+moving surface returns `AgentError::Internal` instead of a mixed snapshot.
+The public `RuntimeInstance::checkpoint/restore` also carries host capability
+state; a rejected actor restore leaves activation/load flags untouched.
 
-Move capability surface under one actor-owned snapshot protocol or add a
-shared freeze/generation handshake. Make partial APIs crate-private or name
-them explicitly actor-only.
-
-Live restore has a separate audit-transaction residual. The runtime now rebases
-focus, surface and task-requirement revisions against live high-water marks so
-an old checkpoint cannot create CAS ABA, but that semantic rewrite has no
-bounded typed `RuntimeRestored` / `TaskRequirementsRebased` event. A journal
-failure after context + task authority become visible therefore cannot be
-reported with the same explicit recovery-required transaction semantics as a
-failed focus/task-transition audit record.
-
-Required: publish one bounded restore-commit event carrying checkpoint/run
-identity, old/restored/effective revisions, rebased task count plus a capped
-sample (artifact spill for full detail), and whether capability state was
-applied. If this mandatory audit record/barrier fails after restore commits,
-keep the restored aligned state but set `recovery_required`, emit the standard
-recovery signal when possible, and reject normal mutation until a known-good
-restore. Fault tests must cover event append/flush failure after rebase without
-retrying the restore as if nothing changed.
+Live restore now publishes one bounded restore-commit audit event,
+`RuntimeEvent::RuntimeRestored`, carrying checkpoint version, restored and
+current run ids, old/restored/effective focus and surface revisions
+(`RestoreRevision`), the rebased task-requirement count plus a capped 16-id
+sample (artifact spill reserved for full detail), and whether capability
+state was applied. If appending this mandatory barrier fails after the
+context + task authority commit, the restored aligned state is kept but
+`recovery_required` is set, the standard `RecoveryRequired` signal is emitted
+when possible, and normal mutation is rejected until a known-good restore —
+the restore is never retried as if nothing changed. Regressions:
+`restore_emits_the_bounded_restore_commit_event`,
+`restore_audit_failure_demands_recovery_and_fences_mutation`.
+**CORE-03 closed.**
 
 ### CORE-04 — Output broker/resource policy is incomplete
 

@@ -16,6 +16,21 @@ pub struct RuntimeEventEnvelope {
     pub event: RuntimeEvent,
 }
 
+/// Old / restored / effective values of one runtime revision across a
+/// restore. `effective` is what the live runtime uses after rebase — it
+/// never moves backwards, so an old checkpoint cannot alias a surface
+/// prepared before the restore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreRevision {
+    /// Value the live runtime had before the restore.
+    pub old: u64,
+    /// Value recorded in the checkpoint.
+    pub restored: u64,
+    /// Value in effect after the rebase (max of the two, plus the restore
+    /// epoch bump where the runtime owns the revision).
+    pub effective: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEvent {
@@ -136,6 +151,31 @@ pub enum RuntimeEvent {
     /// crash-recovery machinery must intervene before normal operation
     /// resumes with full consistency guarantees.
     RecoveryRequired,
+    /// A restore committed: context + task authority were transactionally
+    /// restored, and the host re-applied the checkpoint's capability flags.
+    /// This is the bounded audit record of that commit. If it cannot be
+    /// journaled, the runtime keeps the restored state but demands
+    /// recovery — a restore must not outrun its own audit event.
+    RuntimeRestored {
+        checkpoint_version: u32,
+        /// Run that produced the checkpoint (the restored run identity).
+        restored_run_id: RunId,
+        /// Run that restored it (the live run; equal to `restored_run_id`
+        /// for an in-process round-trip).
+        current_run_id: RunId,
+        focus_revision: RestoreRevision,
+        surface_revision: RestoreRevision,
+        /// How many task tool-requirement revisions were rebased past the
+        /// live high-water mark so they cannot move backwards.
+        rebased_tasks: usize,
+        /// Capped sample of the rebased task ids (artifact spill carries
+        /// the full detail).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rebased_task_sample: Vec<TaskId>,
+        /// Whether the checkpoint carried capability surface state that
+        /// the host re-applied.
+        capabilities_applied: bool,
+    },
     /// A model round completed and the provider reported usage. Emitted at
     /// turn-commit time, so live consumers (the eval harness, a token meter)
     /// can measure the true cost of a turn without parsing provider

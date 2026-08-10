@@ -10,9 +10,10 @@ use agent_contracts::{
     CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
     CapabilityTransport, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
-    MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput, ModelRequest,
-    ModelTransport, RuntimeEvent, ScopeId, ScopeKind, ToolCall, ToolDispatcher,
-    ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    EventJournal, MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput,
+    ModelRequest, ModelTransport, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, ToolCall,
+    ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolRisk,
+    ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
 use agent_runtime::{CapabilityId, Module, ModuleHost, RuntimeInstance, ServiceRegistry};
@@ -531,6 +532,185 @@ async fn rejected_actor_restore_does_not_change_capability_flags() {
         "a rejected actor restore must not unload the existing surface"
     );
     instance.shutdown().await.unwrap();
+}
+
+#[derive(Debug)]
+struct FailRestoreEventJournal;
+
+#[async_trait::async_trait]
+impl EventJournal for FailRestoreEventJournal {
+    async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+        if matches!(envelope.event, RuntimeEvent::RuntimeRestored { .. }) {
+            return Err(agent_contracts::AgentError::Storage(
+                "simulated restore-commit journal failure".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn restore_emits_the_bounded_restore_commit_event() {
+    let (instance, _context) = simple_instance().await;
+    let mut events = instance.handle().subscribe();
+    instance
+        .handle()
+        .set_focus("task A: refactor auth".into())
+        .await
+        .unwrap();
+    instance
+        .handle()
+        .set_focus("task B: write docs".into())
+        .await
+        .unwrap();
+    let task_a = instance.handle().list_tasks().await.unwrap()[0].id;
+    let checkpoint = instance.checkpoint().await.unwrap();
+
+    // Push task A's tool-requirement revision past the checkpoint's value,
+    // so restoring the older checkpoint must rebase it (CAS-ABA fence).
+    instance
+        .handle()
+        .replace_task_tool_requirements(task_a, 0, Vec::new())
+        .await
+        .unwrap();
+
+    instance.restore(checkpoint.clone()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut restored = None;
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::RuntimeRestored { .. } = envelope.event {
+                restored = Some(envelope.event);
+                break;
+            }
+        }
+        if restored.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let RuntimeEvent::RuntimeRestored {
+        checkpoint_version,
+        restored_run_id,
+        current_run_id,
+        focus_revision,
+        surface_revision,
+        rebased_tasks,
+        rebased_task_sample,
+        capabilities_applied,
+    } = restored.expect("restore must publish its bounded restore-commit event")
+    else {
+        panic!("restore event is not the expected variant");
+    };
+
+    assert_eq!(
+        checkpoint_version,
+        agent_runtime::RUNTIME_CHECKPOINT_VERSION,
+        "the event names the restored checkpoint version"
+    );
+    assert_eq!(
+        restored_run_id, current_run_id,
+        "an in-process round-trip restores the same run"
+    );
+    assert_eq!(
+        restored_run_id, checkpoint.run_metadata.run_id,
+        "the event names the run that produced the checkpoint"
+    );
+    assert!(
+        focus_revision.effective > focus_revision.old,
+        "restore bumps the focus revision into a fresh epoch: {focus_revision:?}"
+    );
+    assert!(
+        surface_revision.effective >= surface_revision.restored
+            && surface_revision.effective >= surface_revision.old,
+        "the surface revision never moves backwards: {surface_revision:?}"
+    );
+    // Both tasks carry a tool-requirement revision at or below the live
+    // high-water mark (task A was advanced, task B ties), so both are
+    // rebased forward.
+    assert_eq!(
+        rebased_tasks, 2,
+        "the event counts every rebased task requirement revision"
+    );
+    assert_eq!(
+        rebased_task_sample.len(),
+        2,
+        "the capped sample carries the rebased task ids"
+    );
+    assert!(
+        !capabilities_applied,
+        "an empty capability surface records nothing applied"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn restore_audit_failure_demands_recovery_and_fences_mutation() {
+    let (source, _context) = simple_instance().await;
+    source
+        .handle()
+        .set_focus("original task".into())
+        .await
+        .unwrap();
+    let checkpoint = source.checkpoint().await.unwrap();
+
+    // The actor with a journal that refuses the restore-commit record.
+    let failing = RuntimeInstance::spawn(
+        ModuleHost::new(),
+        Arc::new(AgentKernel::new(
+            AgentKernelConfig::default(),
+            // The real reference engine: restore must pass the
+            // context/task focus agreement check and reach the journal
+            // barrier before the audit failure can surface.
+            Arc::new(context_simple::SimpleContextEngine::new(
+                context_simple::SimpleContextConfig::default(),
+            )),
+            Arc::new(QuietModel),
+            Arc::new(EmptyTools),
+            Arc::new(PolicyApprovalGate::read_only()),
+            Some(Arc::new(FailRestoreEventJournal)),
+        )),
+    );
+    failing.start().await.unwrap();
+    let mut events = failing.handle().subscribe();
+
+    let error = failing.restore(checkpoint).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("simulated restore-commit journal failure"),
+        "the audit failure must surface from restore: {error}"
+    );
+
+    // The standard recovery signal is emitted when possible.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_recovery = false;
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if matches!(envelope.event, RuntimeEvent::RecoveryRequired) {
+                saw_recovery = true;
+            }
+        }
+        if saw_recovery {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(saw_recovery, "the runtime must emit the recovery signal");
+
+    // Normal mutation is rejected until a known-good restore lands.
+    let fenced = failing
+        .handle()
+        .set_focus("another task".into())
+        .await
+        .unwrap_err();
+    assert!(
+        fenced.to_string().contains("recovery is required"),
+        "mutation must be fenced after a restore whose audit event failed: {fenced}"
+    );
+    failing.shutdown().await.unwrap();
+    source.shutdown().await.unwrap();
 }
 
 /// The runtime assigns a task id on focus; the context engine must be
