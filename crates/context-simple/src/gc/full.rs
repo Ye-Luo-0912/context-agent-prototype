@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use agent_contracts::{
     AttentionState, ContextEviction, ContextGcReport, ContextItem, ContextItemId,
-    ContextReactivation, ContextRef, ContextResidency, ContextRetention, ContextScope, FocusState,
-    ScopeId, ScopeKind, ScopeState, TaskId,
+    ContextReactivation, ContextRef, ContextResidency, ContextRetention, ContextScope,
+    DependencyEdge, FocusState, ScopeId, ScopeKind, ScopeState, TaskId,
 };
 
 use crate::diagnostics;
@@ -192,8 +192,10 @@ pub(crate) fn plan_full_gc(
     // ----- Reactivate phase: items that became relevant again ------
     // Warm buffer items (content in memory) and Cold store entries (ids
     // only — the content read happens in the IO phase) both get a second
-    // chance on hot entities / a high score.
-    reactivate(state, config, now_tick, &mut plan);
+    // chance on hot entities / a high score. A marked dependency is a
+    // stronger reason: the root that depends on it is live right now.
+    let marked_set: HashSet<ContextItemId> = marked.iter().copied().collect();
+    reactivate(state, config, now_tick, &mut plan, &marked_set);
 
     // ----- Externalize phase: the buffer is bounded -----------------
     // Context GC never purges: overflow writes the item to the context
@@ -473,6 +475,10 @@ fn mark_roots(
     // protected. The traversal follows `item.dependencies` (new -> old)
     // outward from the roots; dependents of a root are not protected — a
     // root's descendants carry no evidence the working set relies on.
+    // Dependencies are resolved across every residency: the heap, the warm
+    // buffer and the external map all carry edges, so a dependency that
+    // was demoted Warm/Cold is marked here and the reactivate phase below
+    // (which honors the same mark) recalls it.
     if config.dependency_expansion && !marked.is_empty() {
         let mut seen: HashSet<ContextItemId> = marked.iter().copied().collect();
         let mut queue: Vec<ContextItemId> = marked.clone();
@@ -481,10 +487,10 @@ fn mark_roots(
             if added >= MAX_MARKED_DEPENDENCIES {
                 break;
             }
-            let Some(item) = state.items.iter().find(|item| item.id == id) else {
+            let Some(edges) = dependency_edges(state, id) else {
                 continue;
             };
-            for edge in &item.dependencies {
+            for edge in edges {
                 if seen.insert(edge.target) {
                     marked.push(edge.target);
                     queue.push(edge.target);
@@ -494,6 +500,25 @@ fn mark_roots(
         }
     }
     marked
+}
+
+/// The dependency edges of an item wherever its record lives: the resident
+/// heap, the warm reversible buffer, or the external map (entries capture
+/// their edges at externalize time). The mark traversal must walk the same
+/// universe the sweep and the reactivate phase operate on — a dependency
+/// that was demoted out of the heap would otherwise be marked, but never
+/// found when reactivation looks for it.
+fn dependency_edges(state: &State, id: ContextItemId) -> Option<&[DependencyEdge]> {
+    if let Some(item) = state.items.iter().find(|item| item.id == id) {
+        return Some(&item.dependencies);
+    }
+    if let Some(item) = state.eviction_buffer.iter().find(|item| item.id == id) {
+        return Some(&item.dependencies);
+    }
+    state
+        .external
+        .get(id)
+        .map(|entry| entry.dependencies.as_slice())
 }
 
 /// Whether the item's authoritative scope membership chain (up to the root)
@@ -605,7 +630,13 @@ fn eviction_reason(
 /// entries get the same second chance via hot-entity recall — but only
 /// their ids are collected here; the content read happens in the IO phase
 /// without the state lock.
-fn reactivate(state: &mut State, config: &SimpleContextConfig, now_tick: u64, plan: &mut GcPlan) {
+fn reactivate(
+    state: &mut State,
+    config: &SimpleContextConfig,
+    now_tick: u64,
+    plan: &mut GcPlan,
+    marked: &HashSet<ContextItemId>,
+) {
     let focus = state.focus.clone();
     let hot_entities = state.hot_entities.clone();
     let mut remaining = config.gc_reactivate_per_pass;
@@ -634,16 +665,20 @@ fn reactivate(state: &mut State, config: &SimpleContextConfig, now_tick: u64, pl
             // however hot it looks.
             continue;
         }
+        let live_root_dep = marked.contains(&item.id);
         let Some(reason) = reactivation_reason(
             item,
-            config,
-            focus.as_ref(),
-            &hot_entities,
-            now_tick,
-            state.turn,
-            RecallGuard {
-                scope_closed,
-                completed_task: task_completed(state, item.task_id),
+            &ReactivationInput {
+                config,
+                focus: focus.as_ref(),
+                hot_entities: &hot_entities,
+                now_tick,
+                current_turn: state.turn,
+                guard: RecallGuard {
+                    scope_closed,
+                    completed_task: task_completed(state, item.task_id),
+                },
+                live_root_dep,
             },
         ) else {
             continue;
@@ -669,58 +704,79 @@ fn reactivate(state: &mut State, config: &SimpleContextConfig, now_tick: u64, pl
         remaining -= 1;
     }
 
-    // Cold store entries: content lives in the store; only hot-entity
-    // matches earn a recall (no content, so no score-based fallback). The
-    // entity filter runs on the in-memory entry signature first, so with
-    // thousands of Cold entries only the matching ids are read in the IO
-    // phase. Exact matches come from the map's entity index (O(bucket) per
-    // hot entity instead of a full scan); substring-tolerant overlaps —
-    // hot `AuthService.rs` vs an entry entity `src/auth/AuthService.rs` —
-    // cannot be indexed with exact keys, so a residual scan covers the
-    // entries the index did not already propose. Coverage is preserved;
-    // the common exact-match case is fast. Skip the whole pass when no
-    // store directory exists yet.
-    if remaining > 0 && !hot_entities.is_empty() && store::store_ready(config) {
+    // Cold store entries: content lives in the store; recall is earned by
+    // a marked dependency (required evidence — the root that depends on it
+    // is live) or a hot-entity match (no content in memory, so no
+    // score-based fallback). The entity filter runs on the in-memory entry
+    // signature first, so with thousands of Cold entries only the matching
+    // ids are read in the IO phase. Exact matches come from the map's
+    // entity index (O(bucket) per hot entity instead of a full scan);
+    // substring-tolerant overlaps — hot `AuthService.rs` vs an entry
+    // entity `src/auth/AuthService.rs` — cannot be indexed with exact
+    // keys, so a residual scan covers the entries the index did not
+    // already propose. Coverage is preserved; the common exact-match case
+    // is fast. Skip the whole pass when no store directory exists yet.
+    if remaining > 0
+        && store::store_ready(config)
+        && (!hot_entities.is_empty() || !marked.is_empty())
+    {
         let mut covered: HashSet<ContextItemId> = HashSet::new();
-        for hot in &hot_entities {
+        // Marked dependencies first: a Cold entry that a live root depends
+        // on is recalled even when no hot entity names it.
+        for entry in state.external.iter() {
             if remaining == 0 {
                 break;
             }
-            for id in state.external.ids_for_entity(hot) {
-                if remaining == 0 {
-                    break;
-                }
-                if !covered.insert(*id) {
-                    continue;
-                }
-                let Some(entry) = state.external.get(*id) else {
-                    continue;
-                };
-                if entry.semantic.is_live()
-                    && store::recallable(entry)
-                    && !task_completed(state, entry.task_id)
-                    && entities_match(&entry.entities, &hot_entities)
-                {
-                    plan.recall_candidates.push(*id);
-                    remaining -= 1;
-                }
+            if marked.contains(&entry.item_id)
+                && entry.semantic.is_live()
+                && store::recallable(entry)
+                && covered.insert(entry.item_id)
+            {
+                plan.recall_candidates.push(entry.item_id);
+                remaining -= 1;
             }
         }
-        if remaining > 0 {
-            for entry in state.external.iter() {
+        if remaining > 0 && !hot_entities.is_empty() {
+            for hot in &hot_entities {
                 if remaining == 0 {
                     break;
                 }
-                if covered.contains(&entry.item_id) {
-                    continue;
+                for id in state.external.ids_for_entity(hot) {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if !covered.insert(*id) {
+                        continue;
+                    }
+                    let Some(entry) = state.external.get(*id) else {
+                        continue;
+                    };
+                    if entry.semantic.is_live()
+                        && store::recallable(entry)
+                        && !task_completed(state, entry.task_id)
+                        && entities_match(&entry.entities, &hot_entities)
+                    {
+                        plan.recall_candidates.push(*id);
+                        remaining -= 1;
+                    }
                 }
-                if entry.semantic.is_live()
-                    && store::recallable(entry)
-                    && !task_completed(state, entry.task_id)
-                    && entities_match(&entry.entities, &hot_entities)
-                {
-                    plan.recall_candidates.push(entry.item_id);
-                    remaining -= 1;
+            }
+            if remaining > 0 {
+                for entry in state.external.iter() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if covered.contains(&entry.item_id) {
+                        continue;
+                    }
+                    if entry.semantic.is_live()
+                        && store::recallable(entry)
+                        && !task_completed(state, entry.task_id)
+                        && entities_match(&entry.entities, &hot_entities)
+                    {
+                        plan.recall_candidates.push(entry.item_id);
+                        remaining -= 1;
+                    }
                 }
             }
         }
@@ -752,19 +808,35 @@ struct RecallGuard {
     completed_task: bool,
 }
 
+/// Everything a recall decision needs beyond the candidate item itself,
+/// grouped so the reason function stays small and single-purpose.
+struct ReactivationInput<'a> {
+    config: &'a SimpleContextConfig,
+    focus: Option<&'a FocusState>,
+    hot_entities: &'a [String],
+    now_tick: u64,
+    current_turn: u64,
+    guard: RecallGuard,
+    /// The item was marked during the mark phase because a live root
+    /// depends on it.
+    live_root_dep: bool,
+}
+
 /// Why an evicted item earns a second chance. `None` keeps it in the buffer.
 /// Task membership alone is deliberately not enough: within an active task
 /// the semantic machine already keeps working items; an evicted item must
 /// show fresh relevance (hot entities or a high score) to come back.
-fn reactivation_reason(
-    item: &ContextItem,
-    config: &SimpleContextConfig,
-    focus: Option<&FocusState>,
-    hot_entities: &[String],
-    now_tick: u64,
-    current_turn: u64,
-    guard: RecallGuard,
-) -> Option<String> {
+fn reactivation_reason(item: &ContextItem, input: &ReactivationInput) -> Option<String> {
+    // A marked dependency is required evidence: the root that depends on
+    // it is live right now, so the item returns regardless of closed-scope
+    // or completed-task guards. This closes the mark/reactivate universe
+    // gap — the mark phase walks the buffer and the store, and this pass
+    // honors those marks.
+    if input.live_root_dep {
+        return Some(
+            "dependency of a marked root (reachable through dependency edges)".to_string(),
+        );
+    }
     if item.retention == ContextRetention::Pinned || item.scope == ContextScope::Pinned {
         return Some("explicitly pinned again".to_string());
     }
@@ -774,12 +846,12 @@ fn reactivation_reason(
         return Some("kept alive by a model gc_hint".to_string());
     }
     if let Some(until) = item.lease_until_turn
-        && current_turn <= until
+        && input.current_turn <= until
     {
         return Some(format!("leased by the model until turn {until}"));
     }
-    if !hot_entities.is_empty() && entities_match(&item.entities, hot_entities) {
-        if guard.completed_task {
+    if !input.hot_entities.is_empty() && entities_match(&item.entities, input.hot_entities) {
+        if input.guard.completed_task {
             // Automatic recall of a completed task's record is forbidden
             // without a new explicit reason: the hot set alone is
             // not enough to bring finished work back as current truth.
@@ -791,12 +863,13 @@ fn reactivation_reason(
     // retention, affinity) may still be worth reactivating even without a
     // root match — explainable, not learned. Closed-scope members are
     // excluded: their score floor is what kept them resident across turns.
-    if !guard.scope_closed {
-        let breakdown = score_item_with_breakdown(item, focus, hot_entities, now_tick);
-        if breakdown.total >= config.active_threshold {
+    if !input.guard.scope_closed {
+        let breakdown =
+            score_item_with_breakdown(item, input.focus, input.hot_entities, input.now_tick);
+        if breakdown.total >= input.config.active_threshold {
             return Some(format!(
                 "score {:.2} >= active threshold {:.2}",
-                breakdown.total, config.active_threshold
+                breakdown.total, input.config.active_threshold
             ));
         }
     }
@@ -1267,5 +1340,90 @@ mod tests {
             .items
             .iter()
             .any(|item| item.id == id)
+    }
+
+    #[test]
+    fn dependency_edges_resolve_across_heap_buffer_and_store() {
+        use crate::store::to_external_entry;
+        use agent_contracts::{ContextRef, ContextResidency, ContextScope, DependencyKind};
+
+        let mut state = State::default();
+        let heap_id = ContextItemId::new();
+        let buffer_id = ContextItemId::new();
+        let external_id = ContextItemId::new();
+        let edge = |target: ContextItemId| DependencyEdge {
+            target,
+            kind: DependencyKind::EvidenceFor,
+        };
+
+        let mut heap_item = crate::item::make_item(
+            &state,
+            &SimpleContextConfig::default(),
+            "heap body".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.8,
+            None,
+        );
+        heap_item.id = heap_id;
+        heap_item.dependencies.push(edge(buffer_id));
+        state.items.replace_all(vec![heap_item]);
+
+        let mut buffer_item = crate::item::make_item(
+            &state,
+            &SimpleContextConfig::default(),
+            "buffer body".into(),
+            ContextKind::ToolObservation,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.2,
+            None,
+        );
+        buffer_item.id = buffer_id;
+        buffer_item.dependencies.push(edge(external_id));
+        buffer_item.residency = ContextResidency::Warm;
+        state.eviction_buffer.push(buffer_item);
+
+        let mut external_item = crate::item::make_item(
+            &state,
+            &SimpleContextConfig::default(),
+            "store body".into(),
+            ContextKind::ToolObservation,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.2,
+            None,
+        );
+        external_item.id = external_id;
+        external_item.dependencies.push(edge(ContextItemId::new()));
+        let entry = to_external_entry(
+            &external_item,
+            ContextRef {
+                uri: format!("context://run/{external_id}"),
+                item_id: external_id,
+                kind: ContextKind::ToolObservation,
+                scope: ContextScope::Task,
+                summary: "store body".into(),
+                created_tick: 0,
+            },
+            0,
+            0,
+            None,
+        );
+        state.external.push(entry);
+
+        // The traversal must find edges in all three locations: the heap,
+        // the warm buffer and the external map.
+        assert!(dependency_edges(&state, heap_id).is_some_and(|e| e[0].target == buffer_id));
+        assert!(
+            dependency_edges(&state, buffer_id).is_some_and(|e| e[0].target == external_id),
+            "a demoted dependency's own edges must still be traversable"
+        );
+        assert!(
+            dependency_edges(&state, external_id).is_some(),
+            "an external entry's captured edges must be traversable"
+        );
+        assert!(dependency_edges(&state, ContextItemId::new()).is_none());
     }
 }

@@ -3,9 +3,9 @@ use std::sync::Arc;
 use agent_contracts::{
     AgentError, AttentionState, ContextAction, ContextConsumptionAck, ContextEngine, ContextHints,
     ContextIngress, ContextItem, ContextItemId, ContextKind, ContextMaintenanceTrigger,
-    ContextQuery, ContextRetention, ContextScope, ContextSearchQuery, CoreLabel, DependencyKind,
-    FocusState, Label, LifecycleLabel, MaterializedContext, OperationId, ScopeId, ScopeKind,
-    ScopeState, SemanticState, TaskId, ToolOutput, TurnId,
+    ContextQuery, ContextResidency, ContextRetention, ContextScope, ContextSearchQuery, CoreLabel,
+    DependencyEdge, DependencyKind, FocusState, Label, LifecycleLabel, MaterializedContext,
+    OperationId, ScopeId, ScopeKind, ScopeState, SemanticState, TaskId, ToolOutput, TurnId,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -4364,4 +4364,69 @@ async fn expect_restore_rejected(state: &crate::engine::State, needle: &str) {
         error.contains("checkpoint restore validation") && error.contains(needle),
         "expected a validation error mentioning '{needle}', got: {error}"
     );
+}
+
+/// A dependency demoted to the warm buffer is still recalled when a live
+/// root depends on it — the mark phase and the reactivate phase share one
+/// universe. Regression: the mark traversal only followed edges through
+/// the heap and reactivation only recalled hot-entity/score matches, so a
+/// demoted dependency was marked but never brought back.
+#[tokio::test]
+async fn demoted_dependency_is_recalled_because_a_live_root_depends_on_it() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let evidence_id = {
+        let mut state = engine.state.lock().await;
+        // The evidence lives in the warm buffer with no hot entities and a
+        // low score: nothing but the dependency edge marks it.
+        let mut evidence = crate::item::make_item(
+            &state,
+            &engine.config,
+            "cold evidence log".into(),
+            ContextKind::ToolObservation,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.1,
+            None,
+        );
+        let evidence_id = evidence.id;
+        evidence.attention = AttentionState::Archived;
+        evidence.residency = ContextResidency::Warm;
+        evidence.evicted_at_tick = Some(0);
+        state.eviction_buffer.push(evidence);
+
+        // A pinned live decision in the heap cites the evidence.
+        let mut root = crate::item::make_item(
+            &state,
+            &engine.config,
+            "live decision citing the evidence".into(),
+            ContextKind::Decision,
+            ContextScope::Pinned,
+            ContextRetention::Pinned,
+            0.9,
+            None,
+        );
+        root.dependencies.push(DependencyEdge {
+            target: evidence_id,
+            kind: DependencyKind::EvidenceFor,
+        });
+        state.items.replace_all(vec![root]);
+        evidence_id
+    };
+
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report
+            .reactivations
+            .iter()
+            .any(|r| r.item_id == evidence_id && r.reason.contains("dependency of a marked root")),
+        "the demoted dependency must be recalled because its root depends on it: {:?}",
+        report.reactivations
+    );
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            state.items.iter().any(|item| item.id == evidence_id),
+            "the recalled evidence must be back in the heap"
+        );
+    }
 }

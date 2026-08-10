@@ -635,10 +635,23 @@ round-trip is unchanged; corrupt/hostile checkpoints are rejected by
 existence is deliberately left to the startup reconcile (which owns blob
 recovery), not to restore.
 
-Remaining CTX-06 work: the mark/sweep/reactivation universe disagreement,
-external-only GC skipping, scope-close promotion for non-resident bodies,
-task-close descendant handling, tool-scope close error publishing, and
-task-summary focus identity.
+**Mark/reactivate universe agreement closed 2026-08-10.** The mark phase's
+dependency traversal now resolves edges across every residency — the heap,
+the warm buffer and the external map (entries capture their edges at
+externalize time) — and the reactivate phase honors those marks: a Warm
+buffer item or Cold store entry that a live root depends on is recalled as
+"dependency of a marked root", regardless of closed-scope/completed-task
+guards (the root is live right now) and even when no hot entity names it.
+Previously the traversal only followed edges through the heap and
+reactivation only recalled hot-entity/score matches, so a demoted
+dependency was marked but never brought back. Regression:
+`demoted_dependency_is_recalled_because_a_live_root_depends_on_it` (a low-
+score, non-hot warm-buffer evidence item is recalled because a pinned live
+decision cites it) plus `dependency_edges_resolve_across_heap_buffer_and_store`.
+
+Remaining CTX-06 work: external-only GC skipping, scope-close promotion for
+non-resident bodies, task-close descendant handling, tool-scope close error
+publishing, and task-summary focus identity.
 
 ### CTX-07 — Materializer budget and hot-path correctness
 
