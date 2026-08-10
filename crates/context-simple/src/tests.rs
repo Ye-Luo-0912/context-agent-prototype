@@ -4,8 +4,8 @@ use agent_contracts::{
     AgentError, AttentionState, ContextAction, ContextConsumptionAck, ContextEngine, ContextHints,
     ContextIngress, ContextItem, ContextItemId, ContextKind, ContextMaintenanceTrigger,
     ContextQuery, ContextRetention, ContextScope, ContextSearchQuery, CoreLabel, DependencyKind,
-    FocusState, Label, LifecycleLabel, MaterializedContext, OperationId, ScopeKind, ScopeState,
-    SemanticState, TaskId, ToolOutput, TurnId,
+    FocusState, Label, LifecycleLabel, MaterializedContext, OperationId, ScopeId, ScopeKind,
+    ScopeState, SemanticState, TaskId, ToolOutput, TurnId,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -4286,4 +4286,82 @@ async fn multi_phase_operations_are_serialized_by_the_operation_gate() {
     reconcile.await.unwrap().unwrap();
     checkpoint.await.unwrap().unwrap();
     restore.await.unwrap().unwrap();
+}
+
+/// A checkpoint that violates the structural invariants must be refused on
+/// restore with an explicit error — never silently adopted. The engine
+/// maintains these invariants at runtime, so a violating checkpoint is
+/// corrupt or hostile rather than a legacy format.
+#[tokio::test]
+async fn restore_rejects_checkpoints_that_violate_structural_invariants() {
+    let config = SimpleContextConfig::default();
+
+    let make_item = |state: &crate::engine::State, id: ContextItemId, content: &str| {
+        let mut item = crate::item::make_item(
+            state,
+            &config,
+            content.into(),
+            ContextKind::FileObservation,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.5,
+            None,
+        );
+        item.id = id;
+        item
+    };
+
+    // Duplicate id inside the heap: the id index hides it (last-wins), so
+    // only a raw-vector scan catches it.
+    let mut dup_heap = crate::engine::State::default();
+    let id = ContextItemId::new();
+    let item = make_item(&dup_heap, id, "first body");
+    dup_heap.items.replace_all(vec![item.clone(), item]);
+    expect_restore_rejected(&dup_heap, "more than once").await;
+
+    // An id owned by both the heap and the eviction buffer.
+    let mut cross = crate::engine::State::default();
+    let id = ContextItemId::new();
+    let item = make_item(&cross, id, "shared body");
+    cross.items.replace_all(vec![item.clone()]);
+    cross.eviction_buffer.push(item);
+    expect_restore_rejected(&cross, "owned by both").await;
+
+    // A scope whose parent is missing from the tree.
+    let mut broken_parent = crate::engine::State::default();
+    let missing = ScopeId::new();
+    broken_parent.scopes.push(agent_contracts::Scope {
+        id: ScopeId::new(),
+        parent: Some(missing),
+        kind: ScopeKind::Task,
+        state: ScopeState::Active,
+        task_id: None,
+        goal: None,
+        opened_tick: 1,
+        last_active_tick: 1,
+        closed_tick: None,
+    });
+    expect_restore_rejected(&broken_parent, "missing parent").await;
+
+    // An item referencing a scope that does not exist.
+    let mut missing_scope = crate::engine::State::default();
+    let mut item = make_item(&missing_scope, ContextItemId::new(), "orphan body");
+    item.scope_id = Some(ScopeId::new());
+    missing_scope.items.replace_all(vec![item]);
+    expect_restore_rejected(&missing_scope, "missing scope").await;
+
+    // The clean control: a default state still round-trips.
+    let value = crate::checkpoint::serialize(&crate::engine::State::default()).unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine.restore(value).await.unwrap();
+}
+
+async fn expect_restore_rejected(state: &crate::engine::State, needle: &str) {
+    let value = crate::checkpoint::serialize(state).unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let error = engine.restore(value).await.unwrap_err().to_string();
+    assert!(
+        error.contains("checkpoint restore validation") && error.contains(needle),
+        "expected a validation error mentioning '{needle}', got: {error}"
+    );
 }

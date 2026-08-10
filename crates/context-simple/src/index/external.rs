@@ -101,6 +101,12 @@ impl ExternalMap {
             .and_then(move |slot| self.entries.get_mut(slot))
     }
 
+    /// Immutable iteration over every entry in externalization order
+    /// (restore validation scans ownership against the live id index).
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, ExternalizedContext> {
+        self.entries.iter()
+    }
+
     /// Exact-match entity bucket: entries whose captured entity signature
     /// contains `entity`. Used by the GC recall fast path.
     pub(crate) fn ids_for_entity(&self, entity: &str) -> &[ContextItemId] {

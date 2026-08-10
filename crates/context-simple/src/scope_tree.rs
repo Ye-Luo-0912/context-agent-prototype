@@ -48,6 +48,12 @@ impl ScopeTree {
         self.id_index.get(&id).copied()
     }
 
+    /// Immutable iteration over every scope in push order (restore
+    /// validation scans ancestry against the live id index).
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, Scope> {
+        self.scopes.iter()
+    }
+
     /// Mutable iteration for *non-indexed* fields only (suspension on
     /// focus switch, active-scope restamping).
     pub(crate) fn iter_mut(&mut self) -> std::slice::IterMut<'_, Scope> {

@@ -872,6 +872,10 @@ impl ContextEngine for SimpleContextEngine {
         let _gate = self.op_gate.lock().await;
         let mut state = self.state.lock().await;
         *state = checkpoint::deserialize(data)?;
+        // Structural validation before the state becomes live: duplicate
+        // ids, cross-location ownership, scope ancestry and item scope
+        // references must all hold (see checkpoint::validate).
+        checkpoint::validate(&state)?;
         // Old checkpoints predate the entity signature cache; backfill it
         // once so restored items keep scoring and dependency behavior. The
         // heap method re-indexes each backfilled signature, so the entity

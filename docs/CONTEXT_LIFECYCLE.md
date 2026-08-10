@@ -1075,8 +1075,13 @@ are ground truth, and replay re-derives the same story from the events.
 `/checkpoint` (or `ContextEngine::checkpoint`) exports the engine's runtime
 state — items, focus, tick/turn counters — to a separate JSON file under
 `.focus-agent/checkpoints/`, independent of the event journal. `restore`
-replaces engine state from such a file. This keeps durable runtime state
-separate from the append-only trace used for learning/replay.
+replaces engine state from such a file, and before the restored state
+becomes live it runs a structural validation pass: duplicate ids inside one
+location, an id owned by more than one location, scope ancestry and item
+scope references must all hold, or the restore is refused with an explicit
+error. Store-file existence is not checked here — the startup reconcile owns
+blob recovery. This keeps durable runtime state separate from the
+append-only trace used for learning/replay.
 
 ## 12. Turn Frame vs Context Frame (V1)
 

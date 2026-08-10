@@ -622,11 +622,23 @@ serialization itself is a structural guarantee, proven by
 five operations blocks while the gate is held and completes after release —
 a regression that fails the moment any gated operation stops waiting).
 
-Remaining CTX-06 work: restore layer validation (duplicate ids, scope
-ancestry, body location, store files), the mark/sweep/reactivation universe
-disagreement, external-only GC skipping, scope-close promotion for non-
-resident bodies, task-close descendant handling, tool-scope close error
-publishing, and task-summary focus identity.
+**Restore layer validation closed 2026-08-10.** `restore` now runs a
+structural validation pass after deserialization and refuses a violating
+checkpoint with an explicit error instead of adopting it. The checks are the
+invariants the engine maintains at runtime, all in-memory and O(total
+ids/scopes): a duplicate id inside one location (the heap id index hides
+these with last-wins, so the raw vectors are scanned), an id owned by more
+than one of heap / eviction buffer / external map, a scope whose parent is
+missing from the tree, and an item whose scope reference is missing. A valid
+round-trip is unchanged; corrupt/hostile checkpoints are rejected by
+`restore_rejects_checkpoints_that_violate_structural_invariants`. Store-file
+existence is deliberately left to the startup reconcile (which owns blob
+recovery), not to restore.
+
+Remaining CTX-06 work: the mark/sweep/reactivation universe disagreement,
+external-only GC skipping, scope-close promotion for non-resident bodies,
+task-close descendant handling, tool-scope close error publishing, and
+task-summary focus identity.
 
 ### CTX-07 — Materializer budget and hot-path correctness
 
