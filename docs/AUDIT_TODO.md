@@ -952,14 +952,29 @@ lower-authority role/structured field. Add malicious file/tool/store evals.
 ### CORE-06 — Cancellation/approval/process cleanup
 
 - Git now kills the direct child, not guaranteed descendants;
-- process-capability cancellation now kills a Unix process group or invokes
-  Windows `taskkill /T`, but shell/Git descendants and Windows Job-Object
-  quota enforcement remain incomplete; every process path still needs bounded
-  artifact/line/decoded-total quotas;
+- process-capability cancellation kills a Unix process group or invokes
+  Windows `taskkill /T`, and `shell.exec` now does the same through the
+  shared `agent_process::kill_process_tree` — a cancelled shell no longer
+  leaves `&` background jobs or `start`-spawned descendants running (the
+  M12 stale-mutation boundary); Git descendants and Windows Job-Object
+  quota enforcement remain incomplete; every process path still needs
+  bounded artifact/line/decoded-total quotas;
 - approval timeout/cancel needs pending cleanup and bounded previews; UI
   defaults must not turn ambiguity/truncation into allow;
 - provider streams need total response/error/SSE byte caps and explicit
   cancellation at EOF/backoff boundaries.
+
+**2026-08-11: `shell.exec` process-tree termination landed.** The tree-kill
+used by the process-capability host is now one shared public primitive
+(`agent_process::kill_process_tree`): Unix process-group SIGKILL (the child
+spawns as a group leader) and Windows `taskkill /T`. `shell.exec` spawns
+its shell as a group leader and calls it on cancel/timeout instead of
+killing only the direct child. Regression test
+`shell_cancellation_kills_descendants` proves a cancelled shell's
+descendant heartbeat freezes. The test command carries no nested quotes —
+Rust's Windows argument escaping would mangle `\"` for cmd.exe. Remaining:
+Git descendants, Windows Job-Object quotas, approval cleanup/bounded
+previews, and provider stream byte caps.
 
 ### CORE-07 — Workspace operations remain TOCTOU-sensitive
 
