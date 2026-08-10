@@ -1141,6 +1141,104 @@ async fn completion_audit_gap_marks_recovery_but_keeps_the_commit() {
     instance.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn thousand_completed_tasks_stay_bounded_and_searchable() {
+    let (instance, context) = simple_instance().await;
+    for index in 0..1000 {
+        instance
+            .handle()
+            .set_focus(format!("task {index}: fix component {index}"))
+            .await
+            .unwrap();
+        instance
+            .handle()
+            .complete_current_task(format!("component {index} fixed"))
+            .await
+            .unwrap();
+    }
+
+    // Every completed task owns exactly one committed outcome: the runtime's
+    // task catalog holds all of them, and the checkpoint persists each one.
+    assert_eq!(instance.handle().list_tasks().await.unwrap().len(), 1000);
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert_eq!(checkpoint.tasks.completed.len(), 1000);
+    assert!(
+        checkpoint
+            .tasks
+            .tasks
+            .iter()
+            .all(|task| task.status == agent_runtime::TaskStatus::Completed)
+    );
+
+    // The context working set stays bounded: completing 1,000 tasks must not
+    // grow the resident heap linearly with the task count. A completed
+    // task's records are storage roots, not residency roots.
+    let diagnostics = context.diagnostics().await.unwrap();
+    assert!(
+        diagnostics.resident_items < 200,
+        "resident heap must stay bounded after 1,000 completed tasks, got {}",
+        diagnostics.resident_items
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn suspend_and_resume_preserves_anchor_without_replaying_transcript() {
+    let (instance, context) = simple_instance().await;
+    instance
+        .handle()
+        .set_focus("task A: refactor auth".into())
+        .await
+        .unwrap();
+    let task_a = instance.handle().list_tasks().await.unwrap()[0].id;
+    let anchor = TaskAnchor {
+        original_goal: "task A: refactor auth".into(),
+        acceptance_criteria: vec!["tests pass".into()],
+        open_loops: vec!["verify edge cases".into()],
+        ..TaskAnchor::default()
+    };
+    let revision = instance
+        .handle()
+        .update_task_anchor(task_a, 0, anchor.clone())
+        .await
+        .unwrap();
+    assert_eq!(revision, 1);
+
+    // Suspend A, work on an unrelated task, run an unrelated GC pass.
+    instance
+        .handle()
+        .set_focus("task B: write docs".into())
+        .await
+        .unwrap();
+    context.gc().await.unwrap();
+
+    // Resume A: the anchor is task authority held by the runtime, not by
+    // the transcript — criteria/open loops survive suspension and an
+    // unrelated GC without any replay.
+    instance.handle().activate_task(task_a).await.unwrap();
+    let resumed = instance
+        .handle()
+        .list_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == task_a)
+        .expect("task A exists");
+    assert_eq!(resumed.anchor_revision, 1);
+    // An equivalent replacement is idempotent at the restored revision:
+    // nothing was lost or rewritten while suspended.
+    let equivalent = instance
+        .handle()
+        .update_task_anchor(task_a, 1, anchor)
+        .await
+        .unwrap();
+    assert_eq!(
+        equivalent, 1,
+        "an equivalent anchor must not bump revision after resume"
+    );
+    instance.shutdown().await.unwrap();
+}
+
 /// The runtime assigns a task id on focus; the context engine must be
 /// focused on the *same* task — runtime and context share one task
 /// identity, never a parallel one.

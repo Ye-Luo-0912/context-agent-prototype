@@ -3594,6 +3594,64 @@ async fn completed_task_blocks_automatic_hot_recall() {
     );
 }
 
+/// A completed task's summary is a *storage* root, not a residency root:
+/// after completion and one full GC pass it leaves the resident heap (its
+/// durable retention keeps it protected in the reversible buffer or the
+/// store), so the heap cannot grow with every completed task.
+#[tokio::test]
+async fn completed_task_summary_leaves_the_resident_heap_but_stays_durable() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_max_generation: 0,
+        ..SimpleContextConfig::default()
+    });
+    let task_a = open_focus(&engine, "auth work").await;
+    engine
+        .ingest(ContextIngress::TaskCompleted {
+            task_id: Some(task_a),
+            summary: "auth fixed".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::TaskCompleted)
+        .await
+        .unwrap();
+
+    let summary_id = {
+        let state = engine.state.lock().await;
+        state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::Summary)
+            .expect("completion summary")
+            .id
+    };
+
+    // One full GC pass must not keep the finished task's summary resident.
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.evicted >= 1,
+        "the completed task's records must leave the heap, got {report:?}"
+    );
+    let state = engine.state.lock().await;
+    assert!(
+        !state.items.iter().any(|item| item.id == summary_id),
+        "the summary must leave the resident heap"
+    );
+    let in_buffer = state
+        .eviction_buffer
+        .iter()
+        .any(|item| item.id == summary_id);
+    let in_store = state
+        .external
+        .iter()
+        .any(|entry| entry.item_id == summary_id);
+    assert!(
+        in_buffer || in_store,
+        "the durable summary must stay recallable from the buffer or the store"
+    );
+}
+
 /// Keep-alive accounting is global across body locations — a warm
 /// buffer item with keep_alive still consumes the cap.
 #[tokio::test]

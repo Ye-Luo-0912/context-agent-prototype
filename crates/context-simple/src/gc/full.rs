@@ -478,8 +478,15 @@ fn mark_roots(
         let legacy_active_task_member = item.scope_id.is_none()
             && active_task.is_some_and(|task| item.task_id == Some(task))
             && item.attention == AttentionState::Active;
-        let durable_session_memory =
-            item.retention == ContextRetention::Durable && item.scope == ContextScope::Session;
+        let durable_session_memory = item.retention == ContextRetention::Durable
+            && item.scope == ContextScope::Session
+            // A completed task's outcome is a *storage* root, not a
+            // residency root: the summary/decision it promoted to the
+            // session is durable (storage GC protects it) but must not keep
+            // the resident heap growing with every completed task. Only an
+            // explicit reason (hot entity of a live task, pin, model
+            // hint/lease) brings it back into the working set.
+            && !task_completed(state, item.task_id);
         // A completed task's records are never roots through the hot set:
         // automatic recall of finished work requires an explicit reason,
         // and the task's own entities may linger in the hot set
@@ -911,7 +918,10 @@ fn reactivation_reason(item: &ContextItem, input: &ReactivationInput) -> Option<
     // retention, affinity) may still be worth reactivating even without a
     // root match — explainable, not learned. Closed-scope members are
     // excluded: their score floor is what kept them resident across turns.
-    if !input.guard.scope_closed {
+    // A completed task's record is excluded the same way: only an explicit
+    // reason (pin, model hint/lease, marked dependency) brings finished
+    // work back, never the residency score floor.
+    if !input.guard.scope_closed && !input.guard.completed_task {
         let breakdown =
             score_item_with_breakdown(item, input.focus, input.hot_entities, input.current_turn);
         if breakdown.total >= input.config.active_threshold {

@@ -508,16 +508,30 @@ impl RuntimeActor {
                                         self.state.task_id = None;
                                         self.state.focus_revision = next_focus_revision;
                                         self.state.generation += 1;
-                                        self.publish_context_transition(
-                                            RuntimeEvent::TaskCompleted {
-                                                task_id,
-                                                anchor_revision,
-                                                summary: event_summary,
-                                            },
-                                            ContextMaintenanceTrigger::TaskCompleted,
-                                            report,
-                                        )
-                                        .await
+                                        let transition = self
+                                            .publish_context_transition(
+                                                RuntimeEvent::TaskCompleted {
+                                                    task_id,
+                                                    anchor_revision,
+                                                    summary: event_summary,
+                                                },
+                                                ContextMaintenanceTrigger::TaskCompleted,
+                                                report,
+                                            )
+                                            .await;
+                                        // The completed task's working set is
+                                        // outside the runtime now: run one
+                                        // full GC pass so its records leave
+                                        // the resident heap (they stay
+                                        // recallable from the buffer/store —
+                                        // durable retention, storage GC
+                                        // protected). A GC failure after the
+                                        // completion committed is surfaced,
+                                        // never allowed to undo the outcome.
+                                        if transition.is_ok() {
+                                            self.compact_after_completion().await;
+                                        }
+                                        transition
                                     }
                                     Err(error) => Err(self.context_transition_failed(error)),
                                 }
@@ -794,6 +808,38 @@ impl RuntimeActor {
         AgentError::RecoveryRequired(format!(
             "context/task transition committed, but its audit event failed ({error})"
         ))
+    }
+
+    /// One full GC pass after a task completed, so the finished task's
+    /// records leave the resident heap and stay recallable from the
+    /// reversible buffer / context store. The completion itself is already
+    /// committed; a GC failure is surfaced as an `Error` event and never
+    /// rolls the outcome back.
+    async fn compact_after_completion(&mut self) {
+        match self.kernel.context_gc().await {
+            Ok(report) => {
+                if let Err(error) = self
+                    .kernel
+                    .emit_event(RuntimeEvent::ContextGc { report })
+                    .await
+                {
+                    let _ = self
+                        .kernel
+                        .emit_event(RuntimeEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                }
+            }
+            Err(error) => {
+                let _ = self
+                    .kernel
+                    .emit_event(RuntimeEvent::Error {
+                        message: format!("post-completion GC failed: {error}"),
+                    })
+                    .await;
+            }
+        }
     }
 
     /// Commit the turn start: user message into the long-term context, then
