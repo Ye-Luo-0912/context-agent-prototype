@@ -839,17 +839,31 @@ saving threshold moved from >50% to >60% because a single turn's flood of
 irrelevant output is now compressed by consumed-archive + generational
 eviction rather than TTL.
 
-Use bounded GC event counters/samples plus an artifact-backed ledger with
-item/revision/axis/from/to/cause/trigger/turn/related-id. Diagnostics must
-cover all body locations; root/externalize/age/recall need item reasons.
-DONE — `ContextDiagnostics.total_items` and `inspect()` are the logical
-catalog (resident heap + warm eviction buffer + external store entries;
-each id has exactly one owner, so the sum is exact) and replay `final_total`
-is a real catalog total. External entries project into `inspect()` from
-their store descriptor (`external_summary`: `externalized_at_tick` as
-`created_tick`, `source = "externalized"`), so fetch/admit/reactivate is a
-location move that never changes the total; the fetch/admit regression
-tests assert the moved entry still projects as `externalized`. Also
+DONE (catalog) — `ContextDiagnostics.total_items` and `inspect()` are the
+logical catalog (resident heap + warm eviction buffer + external store
+entries; each id has exactly one owner, so the sum is exact) and replay
+`final_total` is a real catalog total. External entries project into
+`inspect()` from their store descriptor (`external_summary`:
+`externalized_at_tick` as `created_tick`, `source = "externalized"`), so
+fetch/admit/reactivate is a location move that never changes the total;
+the fetch/admit regression tests assert the moved entry still projects as
+`externalized`.
+
+DONE (ledger) — the bounded, artifact-backed lifecycle ledger records every
+item transition on any axis (`attention` / `semantic` / `residency` / `gc`)
+with item/revision/axis/from/to/cause/trigger/turn/related-id and the
+event-sequence clock, projected where transitions already exist (residency
+pass, scope close, supersession/verification, GC eviction/reactivation/
+externalization/recall, admit/derive directives). The buffer is capped
+(`max_ledger_records`, oldest rows drop, per-item revisions stay
+monotonic), rides the checkpoint (restore keeps it), and `export_ledger`
+writes a JSONL artifact off the hot path (temp file + rename; export
+drains the buffer). Diagnostics already cover all body locations
+(resident/warm/cold/external) and root/externalize/age/recall carry item
+reasons. Regressions: `lifecycle_ledger_records_maintenance_and_gc_rows`,
+`lifecycle_ledger_survives_checkpoint`, plus ledger unit tests for
+boundedness, per-item revisions and checkpoint round-trip.
+
 DONE (audit propagation) — a state change no longer outruns its journal
 event: a failed `ContextMaintained` (BeforeModel) publication fences the
 turn (Error event, model never called, no `TurnCompleted`), and an
@@ -857,9 +871,7 @@ explicit `collect` propagates both a refused GC pass and a failed
 `ContextGc` publication as `Error` events; the turn-boundary GC audit
 fault already fences the commit into `RecoveryRequired`. Regressions:
 `before_model_audit_failure_fences_the_turn`,
-`collect_audit_failure_is_not_silent`. Remaining: bounded GC event
-counters/samples plus an artifact-backed ledger with
-item/revision/axis/from/to/cause/trigger/turn/related-id.
+`collect_audit_failure_is_not_silent`. **CTX-09 closed.**
 
 ### CORE-03 — Checkpoint capture is not an atomic cross-plane snapshot
 

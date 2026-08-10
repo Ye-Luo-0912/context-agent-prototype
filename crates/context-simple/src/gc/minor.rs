@@ -1,6 +1,6 @@
 use agent_contracts::{
-    AttentionState, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextStateTransition,
-    SemanticState,
+    AttentionState, ContextItemId, ContextMaintenanceReport, ContextMaintenanceTrigger,
+    ContextStateTransition, LifecycleAxis, SemanticState,
 };
 
 use crate::diagnostics;
@@ -44,20 +44,63 @@ pub(crate) fn run_minor(
     // changes here: durable outcomes are promoted to the parent scope, the
     // rest of the working set is evicted.
     let closed = scope::drain_closed_scopes(state, turn);
+    // Ledger projection for the transitions produced above: same rows,
+    // cause and turn, with the trigger that caused them.
+    for t in &closed {
+        crate::ledger::record(
+            state,
+            t.item_id,
+            LifecycleAxis::Attention,
+            format!("{:?}", t.from),
+            format!("{:?}", t.to),
+            t.reason.clone(),
+            "scope_close",
+            None,
+        );
+    }
     report.archived += closed.len();
     report.transitions.extend(closed);
 
     // Supersession and verification intents recorded by ingest become
     // observable state changes here, with explainable reasons.
     let superseded = drain_supersessions(state, turn);
+    for t in &superseded {
+        crate::ledger::record(
+            state,
+            t.item_id,
+            LifecycleAxis::Semantic,
+            format!("{:?}", t.from),
+            format!("{:?}", t.to),
+            t.reason.clone(),
+            "supersession",
+            None,
+        );
+    }
     report.archived += superseded.len();
     report.transitions.extend(superseded);
     let verified = drain_verifications(state, turn);
+    for t in &verified {
+        crate::ledger::record(
+            state,
+            t.item_id,
+            LifecycleAxis::Semantic,
+            format!("{:?}", t.from),
+            format!("{:?}", t.to),
+            t.reason.clone(),
+            "verification",
+            None,
+        );
+    }
     report.archived += verified.len();
     report.transitions.extend(verified);
 
+    // Ledger rows for the residency pass below. Collected while the heap
+    // iterator borrows `state`, then applied after the loop (`record` needs
+    // `&mut State`).
+    let mut ledger_rows: Vec<(ContextItemId, LifecycleAxis, String, String, String)> = Vec::new();
     for item in &mut state.items {
         let old_attention = item.attention;
+        let old_semantic = item.semantic;
         let outcome = next_residency(
             item,
             config,
@@ -86,6 +129,16 @@ pub(crate) fn run_minor(
             None => false,
         };
 
+        if item.semantic != old_semantic {
+            ledger_rows.push((
+                item.id,
+                LifecycleAxis::Semantic,
+                format!("{old_semantic:?}"),
+                format!("{:?}", item.semantic),
+                outcome.reason.clone(),
+            ));
+        }
+
         if item.attention != old_attention || tombstoned {
             match item.attention {
                 AttentionState::Active => report.promoted += 1,
@@ -95,7 +148,7 @@ pub(crate) fn run_minor(
             if tombstoned {
                 report.tombstoned += 1;
             }
-            let mut reason = outcome.reason;
+            let mut reason = outcome.reason.clone();
             if tombstoned {
                 reason.push_str(" [semantic]");
             }
@@ -108,7 +161,26 @@ pub(crate) fn run_minor(
                 turn,
                 reason,
             });
+            ledger_rows.push((
+                item.id,
+                LifecycleAxis::Attention,
+                format!("{old_attention:?}"),
+                format!("{:?}", item.attention),
+                outcome.reason,
+            ));
         }
+    }
+    for (item_id, axis, from, to, cause) in ledger_rows {
+        crate::ledger::record(
+            state,
+            item_id,
+            axis,
+            from,
+            to,
+            cause,
+            format!("{trigger:?}"),
+            None,
+        );
     }
 
     report.diagnostics = diagnostics::compute(state);

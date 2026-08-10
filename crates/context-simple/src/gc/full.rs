@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use agent_contracts::{
     AttentionState, ContextEviction, ContextGcReport, ContextItem, ContextItemId,
     ContextReactivation, ContextRef, ContextResidency, ContextRetention, ContextScope,
-    DependencyEdge, FocusState, ScopeId, ScopeKind, ScopeState, TaskId,
+    DependencyEdge, FocusState, LifecycleAxis, ScopeId, ScopeKind, ScopeState, TaskId,
 };
 
 use crate::diagnostics;
@@ -178,13 +178,23 @@ pub(crate) fn plan_full_gc(
                 scope: item.scope,
                 generation,
                 evicted_at_tick: now_tick,
-                reason,
+                reason: reason.clone(),
             });
             plan.evicted += 1;
             state.gc_evicted_total += 1;
             let mut evicted = item;
             evicted.residency = ContextResidency::Warm;
             evicted.evicted_at_tick = Some(now_tick);
+            crate::ledger::record(
+                state,
+                evicted.id,
+                LifecycleAxis::Gc,
+                "Resident",
+                "Warm",
+                reason,
+                "gc",
+                None,
+            );
             state.eviction_buffer.push(evicted);
         } else {
             // Survived this pass without being a root: the generational
@@ -354,6 +364,16 @@ pub(crate) fn commit_full_gc(
             state.gc_epoch,
             Some(checksum),
         ));
+        crate::ledger::record(
+            state,
+            item.id,
+            LifecycleAxis::Gc,
+            "Warm",
+            "Cold",
+            "eviction buffer overflow; externalized to the context store",
+            "gc",
+            None,
+        );
     }
     // ...and successfully recalled entries leave the map: their content is
     // resident again, so keeping the reference would duplicate it.
@@ -370,6 +390,16 @@ pub(crate) fn commit_full_gc(
     for mut item in io.recalled {
         let reason = "entities are hot again in the working set (recalled from the context store)"
             .to_string();
+        crate::ledger::record(
+            state,
+            item.id,
+            LifecycleAxis::Gc,
+            "Cold",
+            "Resident",
+            reason.clone(),
+            "gc",
+            None,
+        );
         recalled_reactivations.push(ContextReactivation {
             item_id: item.id,
             kind: item.kind,
@@ -699,6 +729,16 @@ fn reactivate(
         item.gc_generation = 0;
         item.evicted_at_tick = None;
         item.last_access_tick = now_tick;
+        crate::ledger::record(
+            state,
+            item.id,
+            LifecycleAxis::Gc,
+            "Warm",
+            "Resident",
+            reason.clone(),
+            "gc",
+            None,
+        );
         plan.buffer_reactivations.push(ContextReactivation {
             item_id: item.id,
             kind: item.kind,

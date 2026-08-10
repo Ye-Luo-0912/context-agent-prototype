@@ -92,6 +92,10 @@ pub struct SimpleContextConfig {
     /// pathological single-episode run cannot grow the working set without
     /// bound.
     pub episode_max_user_turns: usize,
+    /// Cap on the in-engine lifecycle ledger buffer. The ledger is bounded
+    /// (oldest rows drop) and is exported to a JSONL artifact on demand —
+    /// never written on the context hot path.
+    pub max_ledger_records: usize,
 }
 
 impl Default for SimpleContextConfig {
@@ -120,6 +124,7 @@ impl Default for SimpleContextConfig {
             max_derived_items_per_turn: 8,
             episode_rotate_threshold: 0.15,
             episode_max_user_turns: 500,
+            max_ledger_records: 4096,
         }
     }
 }
@@ -245,6 +250,19 @@ pub(crate) struct State {
     /// as `admits_this_turn`).
     #[serde(default)]
     pub(crate) derives_this_turn: usize,
+    /// Bounded in-engine lifecycle ledger: every item transition on any
+    /// axis (attention/semantic/residency/gc) with cause, trigger, turn and
+    /// related id. Oldest rows drop past the cap; export to a JSONL
+    /// artifact is explicit and never on the hot path.
+    #[serde(default)]
+    pub(crate) ledger: Vec<agent_contracts::ContextLifecycleRecord>,
+    /// Per-item revision counter backing `ContextLifecycleRecord::revision`.
+    #[serde(default)]
+    pub(crate) ledger_revisions: std::collections::HashMap<ContextItemId, u64>,
+    /// Ledger buffer cap, copied from the config at construction so every
+    /// record site only needs `&mut State`.
+    #[serde(default)]
+    pub(crate) ledger_cap: usize,
 }
 
 pub struct SimpleContextEngine {
@@ -263,11 +281,38 @@ pub struct SimpleContextEngine {
 
 impl SimpleContextEngine {
     pub fn new(config: SimpleContextConfig) -> Self {
+        let state = State {
+            ledger_cap: config.max_ledger_records,
+            ..State::default()
+        };
         Self {
             config,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(state),
             op_gate: Mutex::new(()),
         }
+    }
+
+    /// Export the bounded in-engine lifecycle ledger to a JSONL artifact
+    /// (one `ContextLifecycleRecord` per line) and clear the buffer. This
+    /// is an explicit, off-hot-path operation; a crashed export never
+    /// truncates the previous artifact (temp file + rename).
+    pub async fn export_ledger(&self, path: &std::path::Path) -> AgentResult<usize> {
+        let rows: Vec<agent_contracts::ContextLifecycleRecord> = {
+            let mut state = self.state.lock().await;
+            std::mem::take(&mut state.ledger)
+        };
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let text = crate::ledger::encode(&rows);
+        let tmp = path.with_extension("jsonl.tmp");
+        std::fs::write(&tmp, text).map_err(|error| {
+            agent_contracts::AgentError::Storage(format!("write ledger artifact: {error}"))
+        })?;
+        std::fs::rename(&tmp, path).map_err(|error| {
+            agent_contracts::AgentError::Storage(format!("commit ledger artifact: {error}"))
+        })?;
+        Ok(rows.len())
     }
 }
 

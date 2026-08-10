@@ -543,6 +543,19 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
 fn strip_random_uuids(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
+            // UUID-shaped map keys (the ledger's per-item revision
+            // counters) cannot match across two engines; collapse them
+            // onto one placeholder. Multiple keys collapse the same way on
+            // both sides, so the remaining value stays comparable.
+            let uuid_keys: Vec<String> = map
+                .keys()
+                .filter(|key| key.len() == 36 && is_uuid_window(key.as_bytes()))
+                .cloned()
+                .collect();
+            for key in uuid_keys {
+                let nested = map.remove(&key).expect("key present");
+                map.insert("<uuid>".into(), nested);
+            }
             for (key, nested) in map.iter_mut() {
                 if key == "blob_checksum" && nested.is_string() {
                     *nested = serde_json::Value::String("<checksum>".into());

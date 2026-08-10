@@ -5339,6 +5339,130 @@ async fn substring_entity_match_reaches_the_candidate_universe() {
 }
 
 #[tokio::test]
+async fn lifecycle_ledger_records_maintenance_and_gc_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "shell.exec".into(),
+                ok: true,
+                summary: "ok".into(),
+                model_content: "step 1: fix AuthService.rs".into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    // AfterModel consumes the observation (attention row); the full GC
+    // evicts it (gc row) — both must land in the artifact-backed ledger.
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    engine.gc().await.unwrap();
+
+    let path = dir.path().join("lifecycle.jsonl");
+    let count = engine.export_ledger(&path).await.unwrap();
+    assert!(
+        count >= 2,
+        "maintain + gc must produce ledger rows, got {count}"
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("\"axis\":\"attention\"") && text.contains("\"axis\":\"gc\""),
+        "the artifact must carry attention and gc rows: {text}"
+    );
+    assert!(
+        text.contains("\"trigger\":\"maintain\"") || text.contains("\"trigger\":\"AfterModel\""),
+        "the row names its trigger: {text}"
+    );
+    assert!(
+        text.contains("\"turn\":")
+            && text.contains("\"event_seq\":")
+            && text.contains("\"revision\":"),
+        "the row carries turn, event sequence and per-item revision: {text}"
+    );
+    // Export is explicit and drains the buffer: a second export is empty.
+    assert_eq!(
+        engine.export_ledger(&path).await.unwrap(),
+        0,
+        "export clears the in-engine buffer"
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_ledger_survives_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "shell.exec".into(),
+                ok: true,
+                summary: "ok".into(),
+                model_content: "step 1: fix AuthService.rs".into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    // AfterModel consumes the observation: an attention row lands in the
+    // ledger before the checkpoint.
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+
+    let checkpoint = engine.checkpoint().await.unwrap();
+    let restored = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    restored.restore(checkpoint).await.unwrap();
+
+    let path = dir.path().join("lifecycle-restored.jsonl");
+    let count = restored.export_ledger(&path).await.unwrap();
+    assert!(
+        count >= 1,
+        "the restored engine must keep the ledger across the checkpoint, got {count}"
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("\"cause\":\"ephemeral") || text.contains("\"axis\":\"attention\""),
+        "the restored ledger keeps the cause and axis: {text}"
+    );
+}
+
+#[tokio::test]
 async fn materialize_preview_is_a_read_that_advances_no_clock() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
     engine

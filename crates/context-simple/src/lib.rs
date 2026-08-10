@@ -6,6 +6,7 @@ mod gc;
 mod heap;
 mod index;
 mod item;
+mod ledger;
 mod materializer;
 mod policy;
 mod residency;

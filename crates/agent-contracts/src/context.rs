@@ -581,6 +581,48 @@ pub struct ContextStateTransition {
     pub reason: String,
 }
 
+/// Which lifecycle dimension a ledger row changed. The three orthogonal GC
+/// dimensions (attention, semantic, residency) plus the GC pass itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleAxis {
+    Attention,
+    Semantic,
+    Residency,
+    Gc,
+}
+
+/// One row of the artifact-backed lifecycle ledger: a single item's
+/// transition on one axis, with the cause and the clock it happened on.
+/// Written into a bounded in-engine buffer and exported as a JSONL artifact
+/// on demand (export is never on the context hot path). Every row answers
+/// one of the acceptance questions: entered / selected / cooled-archived /
+/// evicted-reactivated / consumed because of this, at turn N, triggered by X.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextLifecycleRecord {
+    pub item_id: ContextItemId,
+    /// Per-item revision: how many ledger rows this item has accumulated.
+    pub revision: u64,
+    pub axis: LifecycleAxis,
+    /// State the item left ("" for the first row on an axis).
+    pub from: String,
+    /// State the item entered.
+    pub to: String,
+    /// Why (mirrors the transition/eviction reason).
+    pub cause: String,
+    /// What triggered the change: a maintenance trigger name, "gc",
+    /// "scope_close", "directive" or "ingest".
+    pub trigger: String,
+    /// User turn the change happened in.
+    pub turn: u64,
+    /// Related item when the change references one (superseded-by,
+    /// derived-from, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_id: Option<ContextItemId>,
+    /// Event-sequence clock value at the change (orders the ledger).
+    pub event_seq: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextDiagnostics {
     pub total_items: usize,

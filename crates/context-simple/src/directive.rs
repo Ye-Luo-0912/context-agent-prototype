@@ -97,6 +97,16 @@ pub(crate) fn apply_admit(
         let from = item.attention;
         reenter_working_set(&mut item, now_tick, state);
         let transition = admit_transition(&item, from, turn, reason);
+        crate::ledger::record(
+            state,
+            item.id,
+            agent_contracts::LifecycleAxis::Residency,
+            "Warm",
+            "Resident",
+            reason.to_string(),
+            "directive",
+            None,
+        );
         state.items.push(item);
         state.pending_ingest_transitions.push(transition);
         state.admits_this_turn += 1;
@@ -120,6 +130,16 @@ pub(crate) fn apply_admit(
         let from = item.attention;
         reenter_working_set(&mut item, now_tick, state);
         let transition = admit_transition(&item, from, turn, reason);
+        crate::ledger::record(
+            state,
+            item.id,
+            agent_contracts::LifecycleAxis::Residency,
+            "Cold",
+            "Resident",
+            reason.to_string(),
+            "directive",
+            None,
+        );
         state.external.retain(|entry| entry.item_id != item_id);
         state.items.push(item);
         state.pending_ingest_transitions.push(transition);
@@ -178,6 +198,16 @@ pub(crate) fn apply_derive(
         target: item_id,
         kind: DependencyKind::DerivedFrom,
     });
+    crate::ledger::record(
+        state,
+        item.id,
+        agent_contracts::LifecycleAxis::Semantic,
+        "-",
+        "Live",
+        "derived fact minted from the source ref",
+        "directive",
+        Some(item_id),
+    );
     state.items.push(item);
     state.derives_this_turn += 1;
     None
