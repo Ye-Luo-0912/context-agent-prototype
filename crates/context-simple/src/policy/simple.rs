@@ -8,11 +8,15 @@ use agent_contracts::{ContextItem, ContextRetention, ContextScope, FocusState, S
 /// `hot_entities` is the current working set of entities (named by the last
 /// user message and touched by recent tool observations). It feeds the
 /// `entity_affinity` component.
+///
+/// Recency reads `now_turn` (the user-turn clock) against the item's
+/// `last_selected_turn`, never the event sequence: materializing a preview
+/// is a read that must not age an item's recency.
 pub(crate) fn score_item_with_breakdown(
     item: &ContextItem,
     focus: Option<&FocusState>,
     hot_entities: &[String],
-    now_tick: u64,
+    now_turn: u64,
 ) -> ScoreBreakdown {
     if item.retention == ContextRetention::Pinned || item.scope == ContextScope::Pinned {
         return ScoreBreakdown {
@@ -22,7 +26,7 @@ pub(crate) fn score_item_with_breakdown(
         };
     }
 
-    let age = now_tick.saturating_sub(item.last_access_tick) as f32;
+    let age = now_turn.saturating_sub(item.last_selected_turn) as f32;
     let recency = 1.0 / (1.0 + age / 4.0);
     let access = (item.access_count.min(8) as f32) / 8.0;
 
@@ -142,6 +146,7 @@ mod tests {
             access_count: 0,
             created_turn: 0,
             last_access_turn: 0,
+            last_selected_turn: 0,
             dependencies: Vec::new(),
             tags: Vec::new(),
             keep_alive: false,

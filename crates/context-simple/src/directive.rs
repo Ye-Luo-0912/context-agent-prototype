@@ -73,7 +73,7 @@ pub(crate) fn apply_admit(
             state.admits_this_turn, config.max_admits_per_turn
         ));
     }
-    let now_tick = state.tick;
+    let now_tick = state.event_seq;
     let turn = state.turn;
 
     // Already resident: identity is preserved trivially, no transition.

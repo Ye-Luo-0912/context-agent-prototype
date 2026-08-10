@@ -17,7 +17,7 @@ pub(crate) fn run_minor(
     state: &mut State,
     config: &SimpleContextConfig,
     trigger: ContextMaintenanceTrigger,
-    now_tick: u64,
+    now_event_seq: u64,
     turn: u64,
 ) -> ContextMaintenanceReport {
     let mut report = ContextMaintenanceReport {
@@ -62,7 +62,7 @@ pub(crate) fn run_minor(
             item,
             config,
             trigger,
-            now_tick,
+            now_event_seq,
             turn,
             focus.as_ref(),
             &hot_entities,

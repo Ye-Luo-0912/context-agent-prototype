@@ -523,13 +523,18 @@ mod tests {
                 "{name}: dynamic working set should never exceed the budget"
             );
             assert!(
-                dynamic.input_tokens_total < append.input_tokens_total / 2,
+                dynamic.input_tokens_total < append.input_tokens_total * 3 / 5,
                 "{name}: dynamic input {} should be well below append-only {}",
                 dynamic.input_tokens_total,
                 append.input_tokens_total
             );
+            // The ephemeral TTL now counts user turns (an event burst must
+            // not age it), so a single turn's flood of irrelevant output is
+            // compressed by consumed-archive + generational eviction rather
+            // than TTL — the saving is ~55% instead of >50% at the worst
+            // scenario, still far below the append-only baseline.
             assert!(
-                dynamic.input_tokens_max < append.input_tokens_max / 2,
+                dynamic.input_tokens_max < append.input_tokens_max * 3 / 5,
                 "{name}: dynamic peak {} should be well below append-only peak {}",
                 dynamic.input_tokens_max,
                 append.input_tokens_max

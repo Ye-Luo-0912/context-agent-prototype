@@ -21,6 +21,7 @@ pub(crate) fn compute(state: &State) -> ContextDiagnostics {
             .saturating_add(state.external.len()),
         focus_generation: state.focus.as_ref().map_or(0, |f| f.generation),
         turn: state.turn,
+        event_seq: state.event_seq,
         tool_round: state.tool_round,
         resident_items: state.items.len(),
         warm_items: state.eviction_buffer.len(),

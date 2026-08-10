@@ -248,6 +248,13 @@ pub struct ContextItem {
     pub created_turn: u64,
     #[serde(default)]
     pub last_access_turn: u64,
+    /// Last user turn this item was selected into a materialized model
+    /// surface, stamped on consumption acknowledgement. Previews are
+    /// non-consuming and never stamp it, so merely materializing never
+    /// ages an item's recency: recency scoring reads this clock, never the
+    /// event sequence.
+    #[serde(default)]
+    pub last_selected_turn: u64,
     /// Explicit dependency edges to prior items (typed: why the item
     /// references the target).
     #[serde(default)]
@@ -588,6 +595,12 @@ pub struct ContextDiagnostics {
     pub focus_generation: u64,
     #[serde(default)]
     pub turn: u64,
+    /// Monotonic event-sequence clock: advances on every state-changing
+    /// engine operation (ingest/maintain/GC/ack/scope ops), never on
+    /// materialize. TTL rules name their clock explicitly; this one orders
+    /// events and measures event-distance, not age.
+    #[serde(default)]
+    pub event_seq: u64,
     #[serde(default)]
     pub tool_round: u64,
     #[serde(default)]
@@ -1021,6 +1034,10 @@ pub struct ContextItemSummary {
     pub created_tick: u64,
     pub created_turn: u64,
     pub last_access_turn: u64,
+    /// Last user turn the item was selected into a materialized model
+    /// surface (see `ContextItem::last_selected_turn`).
+    #[serde(default)]
+    pub last_selected_turn: u64,
     pub access_count: u32,
     /// Ids of prior items this item explicitly depends on (shared entities).
     #[serde(default)]

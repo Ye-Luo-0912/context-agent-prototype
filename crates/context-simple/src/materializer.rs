@@ -65,7 +65,9 @@ pub(crate) fn materialize(
     config: &SimpleContextConfig,
     query: &ContextQuery,
 ) -> MaterializedContext {
-    let now_tick = state.tick;
+    // Event sequence orders the preview (created_tick comparisons); recency
+    // scoring reads the user-turn clock, so a preview never ages items.
+    let turn = state.turn;
     let focus = state.focus.clone();
 
     // Candidate generation via the indexes instead of a full-heap scan: the
@@ -151,8 +153,7 @@ pub(crate) fn materialize(
         {
             continue;
         }
-        let breakdown =
-            score_item_with_breakdown(item, focus.as_ref(), &state.hot_entities, now_tick);
+        let breakdown = score_item_with_breakdown(item, focus.as_ref(), &state.hot_entities, turn);
         let tokens = approx_tokens(&item.content);
         candidates.push((index, breakdown, tokens));
     }
@@ -288,7 +289,7 @@ pub(crate) fn materialize(
                     continue;
                 }
                 let breakdown =
-                    score_item_with_breakdown(dep, focus.as_ref(), &state.hot_entities, now_tick);
+                    score_item_with_breakdown(dep, focus.as_ref(), &state.hot_entities, turn);
                 if dep.attention == AttentionState::Archived
                     && breakdown.total < config.active_threshold
                 {

@@ -821,9 +821,23 @@ persisted as new ToolObservations.
 
 ### CTX-09 — Lifecycle clocks and observability need explicit semantics
 
-`tick` advances on ingest, maintain, GC and materialize, yet several TTLs
-interpret it as age. Separate `event_seq`, `user_turn`, `gc_epoch` and
-`last_selected_turn`; every rule names its clock.
+DONE (clocks) — `event_seq` (monotonic event sequence, advanced by every
+state-changing operation, never by `materialize`), `turn` (user-turn clock,
+advanced once per user message), `gc_epoch` (full-GC generation, pre-existing)
+and `last_selected_turn` (stamped on consumption acknowledgement) are
+separate clocks and every rule names its. Ephemeral TTL and staleness age
+in user turns (`created_turn`), the consumed-ephemeral check uses event
+distance (`created_tick`), and recency scoring reads `last_selected_turn` —
+so a preview is a read that advances no clock and ages no item, and an event
+burst inside one user turn cannot force TTL death. `ContextDiagnostics`
+exposes `event_seq`; `alias = "tick"` keeps pre-separation checkpoints
+loadable. Regressions:
+`materialize_preview_is_a_read_that_advances_no_clock`,
+`selection_stamp_is_written_only_by_consumption_ack`,
+`ephemeral_ttl_counts_user_turns_not_events`. The replay heavy-scenario
+saving threshold moved from >50% to >60% because a single turn's flood of
+irrelevant output is now compressed by consumed-archive + generational
+eviction rather than TTL.
 
 Use bounded GC event counters/samples plus an artifact-backed ledger with
 item/revision/axis/from/to/cause/trigger/turn/related-id. Diagnostics must

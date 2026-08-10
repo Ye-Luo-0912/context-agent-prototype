@@ -182,6 +182,7 @@ mod tests {
             access_count: 0,
             created_turn: 0,
             last_access_turn: 0,
+            last_selected_turn: 0,
             dependencies: Vec::new(),
             tags: Vec::new(),
             keep_alive: false,

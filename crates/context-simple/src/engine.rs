@@ -152,7 +152,16 @@ pub(crate) struct PendingMaterialization {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct State {
-    pub(crate) tick: u64,
+    /// Monotonic event-sequence clock: advances on every state-changing
+    /// operation (ingest/maintain/GC/reconcile/ack/scope ops). Never
+    /// advances on `materialize` — a preview is a read and must not age
+    /// TTLs or recency. `alias = "tick"` keeps pre-separation checkpoints
+    /// loadable. TTL rules name their clock explicitly; this one orders
+    /// events and measures event-distance, not age.
+    #[serde(default, alias = "tick")]
+    pub(crate) event_seq: u64,
+    /// User-turn clock: advances once per user message. Rules measuring
+    /// age in user turns (ephemeral TTL, staleness) read this.
     pub(crate) turn: u64,
     pub(crate) tool_round: u64,
     /// Monotonic identity of the last materialization preview. Persisted so
@@ -286,6 +295,7 @@ fn stamp_consumed(
         let item = &mut state.items.items_mut()[index];
         item.last_access_tick = now_tick;
         item.last_access_turn = turn;
+        item.last_selected_turn = turn;
         item.access_count = item.access_count.saturating_add(1);
         return true;
     }
@@ -296,6 +306,7 @@ fn stamp_consumed(
     {
         item.last_access_tick = now_tick;
         item.last_access_turn = turn;
+        item.last_selected_turn = turn;
         item.access_count = item.access_count.saturating_add(1);
         return true;
     }
@@ -311,7 +322,7 @@ fn stamp_consumed(
 impl ContextEngine for SimpleContextEngine {
     async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
         let mut state = self.state.lock().await;
-        state.tick += 1;
+        state.event_seq += 1;
 
         match ingress {
             ContextIngress::UserMessage { content } => {
@@ -645,8 +656,8 @@ impl ContextEngine for SimpleContextEngine {
         trigger: ContextMaintenanceTrigger,
     ) -> AgentResult<ContextMaintenanceReport> {
         let mut state = self.state.lock().await;
-        state.tick += 1;
-        let now_tick = state.tick;
+        state.event_seq += 1;
+        let now_tick = state.event_seq;
         let turn = state.turn;
         Ok(minor::run_minor(
             &mut state,
@@ -671,9 +682,10 @@ impl ContextEngine for SimpleContextEngine {
         // 4. delete recalled blobs after the commit, without the lock — a
         //    blob is removed only once its content is resident again.
         let mut state = self.state.lock().await;
-        state.tick += 1;
-        let now_tick = state.tick;
-        let Some(mut plan) = full::plan_full_gc(&mut state, &self.config, now_tick) else {
+        state.event_seq += 1;
+        let now_tick = state.event_seq;
+        let turn = state.turn;
+        let Some(mut plan) = full::plan_full_gc(&mut state, &self.config, now_tick, turn) else {
             return Ok(ContextGcReport {
                 resident: state.items.len(),
                 diagnostics: diagnostics::compute(&state),
@@ -707,7 +719,7 @@ impl ContextEngine for SimpleContextEngine {
         let _gate = self.op_gate.lock().await;
         let (map_checksums, resident_ids) = {
             let mut state = self.state.lock().await;
-            state.tick += 1;
+            state.event_seq += 1;
             let map_checksums: std::collections::HashMap<_, _> = state
                 .external
                 .iter()
@@ -724,7 +736,7 @@ impl ContextEngine for SimpleContextEngine {
         let dir = crate::store::store_dir(&self.config);
         let io = crate::store::run_reconcile_io(&dir, &map_checksums, &resident_ids).await;
         let mut state = self.state.lock().await;
-        let now_tick = state.tick;
+        let now_tick = state.event_seq;
         let gc_epoch = state.gc_epoch;
         Ok(crate::store::commit_reconcile(
             &mut state, io, now_tick, gc_epoch,
@@ -733,7 +745,8 @@ impl ContextEngine for SimpleContextEngine {
 
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
         let mut state = self.state.lock().await;
-        state.tick += 1;
+        // A preview is a read: it must not advance the event-sequence clock,
+        // so merely materializing never ages TTLs or recency scores.
         state.materialization_revision =
             state
                 .materialization_revision
@@ -797,11 +810,11 @@ impl ContextEngine for SimpleContextEngine {
             ));
         }
 
-        let now_tick = state
-            .tick
+        let now_event_seq = state
+            .event_seq
             .checked_add(1)
-            .ok_or_else(|| AgentError::Internal("context tick is exhausted".into()))?;
-        state.tick = now_tick;
+            .ok_or_else(|| AgentError::Internal("context event sequence is exhausted".into()))?;
+        state.event_seq = now_event_seq;
         let turn = state.turn;
         let gc_epoch = state.gc_epoch;
         for item_id in ack.item_ids.iter().chain(&ack.external_item_ids) {
@@ -809,7 +822,11 @@ impl ContextEngine for SimpleContextEngine {
             // stamping is infallible and the acknowledgement commits as one
             // mutation rather than partially reinforcing a prefix.
             debug_assert!(stamp_consumed(
-                &mut state, *item_id, now_tick, turn, gc_epoch
+                &mut state,
+                *item_id,
+                now_event_seq,
+                turn,
+                gc_epoch
             ));
         }
         state.pending_materialization = None;
@@ -818,13 +835,13 @@ impl ContextEngine for SimpleContextEngine {
 
     async fn open_scope(&self, kind: ScopeKind, parent: Option<ScopeId>) -> AgentResult<ScopeId> {
         let mut state = self.state.lock().await;
-        state.tick += 1;
+        state.event_seq += 1;
         Ok(scope::open_scope(&mut state, kind, parent))
     }
 
     async fn close_scope(&self, scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
         let mut state = self.state.lock().await;
-        state.tick += 1;
+        state.event_seq += 1;
         Ok(scope::close_scope(&mut state, scope_id))
     }
 
@@ -880,7 +897,7 @@ impl ContextEngine for SimpleContextEngine {
                 .external
                 .get(item_id)
                 .is_some_and(crate::store::externally_retrievable);
-            (retrievable, state.tick, state.gc_epoch)
+            (retrievable, state.event_seq, state.gc_epoch)
         };
         if !retrievable {
             return Ok(None);
@@ -972,8 +989,8 @@ impl ContextEngine for SimpleContextEngine {
         let _gate = self.op_gate.lock().await;
         let plan = {
             let mut state = self.state.lock().await;
-            state.tick += 1;
-            let now_tick = state.tick;
+            state.event_seq += 1;
+            let now_tick = state.event_seq;
             store::plan_storage_gc(&state, &self.config, now_tick)
         };
         let dir = store::store_dir(&self.config);

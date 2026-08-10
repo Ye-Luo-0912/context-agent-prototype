@@ -75,6 +75,7 @@ pub(crate) fn plan_full_gc(
     state: &mut State,
     config: &SimpleContextConfig,
     now_tick: u64,
+    turn: u64,
 ) -> Option<GcPlan> {
     if !config.gc_enabled
         || (state.items.is_empty() && state.eviction_buffer.is_empty() && state.external.is_empty())
@@ -158,7 +159,7 @@ pub(crate) fn plan_full_gc(
                 .by_id(sid)
                 .is_none_or(|scope| scope.state == ScopeState::Closed)
         });
-        if closed_member || eviction_candidate(&item, config, now_tick, generation) {
+        if closed_member || eviction_candidate(&item, config, turn, generation) {
             let reason = if closed_member {
                 format!(
                     "member of a closed {} scope; evicted to reversible buffer (generation {generation})",
@@ -169,7 +170,7 @@ pub(crate) fn plan_full_gc(
                         .unwrap_or_default()
                 )
             } else {
-                eviction_reason(&item, config, now_tick, generation)
+                eviction_reason(&item, config, turn, generation)
             };
             plan.evictions.push(ContextEviction {
                 item_id: item.id,
@@ -555,7 +556,7 @@ fn in_scope_chain(state: &State, item: &ContextItem, target_id: ScopeId) -> bool
 fn eviction_candidate(
     item: &ContextItem,
     config: &SimpleContextConfig,
-    now_tick: u64,
+    turn: u64,
     generation: u32,
 ) -> bool {
     // Semantic death is terminal: leave the heap now (into the reversible
@@ -576,7 +577,9 @@ fn eviction_candidate(
         // Never evict what the policy keeps active.
         AttentionState::Active => false,
         AttentionState::Cooling | AttentionState::Archived => {
-            let age = now_tick.saturating_sub(item.created_tick);
+            // TTL age is measured in user turns, never event ticks: a
+            // preview or a burst of unrelated events must not age items.
+            let age = turn.saturating_sub(item.created_turn);
             // Long past every TTL, or old enough in generations.
             if item.retention != ContextRetention::Durable && age > config.turn_ttl_ticks * 4 {
                 return true;
@@ -589,7 +592,7 @@ fn eviction_candidate(
 fn eviction_reason(
     item: &ContextItem,
     config: &SimpleContextConfig,
-    now_tick: u64,
+    turn: u64,
     generation: u32,
 ) -> String {
     if item.semantic.is_dead() {
@@ -608,10 +611,10 @@ fn eviction_reason(
     }
     match item.attention {
         AttentionState::Cooling | AttentionState::Archived => {
-            let age = now_tick.saturating_sub(item.created_tick);
+            let age = turn.saturating_sub(item.created_turn);
             if item.retention != ContextRetention::Durable && age > config.turn_ttl_ticks * 4 {
                 format!(
-                    "stale: age {age} > ttl x4 = {}; not reachable from roots",
+                    "stale: age {age} turns > ttl x4 = {}; not reachable from roots",
                     config.turn_ttl_ticks * 4
                 )
             } else {
@@ -679,7 +682,6 @@ fn reactivate(
                 config,
                 focus: focus.as_ref(),
                 hot_entities: &hot_entities,
-                now_tick,
                 current_turn: state.turn,
                 guard: RecallGuard {
                     scope_closed,
@@ -821,7 +823,6 @@ struct ReactivationInput<'a> {
     config: &'a SimpleContextConfig,
     focus: Option<&'a FocusState>,
     hot_entities: &'a [String],
-    now_tick: u64,
     current_turn: u64,
     guard: RecallGuard,
     /// The item was marked during the mark phase because a live root
@@ -872,7 +873,7 @@ fn reactivation_reason(item: &ContextItem, input: &ReactivationInput) -> Option<
     // excluded: their score floor is what kept them resident across turns.
     if !input.guard.scope_closed {
         let breakdown =
-            score_item_with_breakdown(item, input.focus, input.hot_entities, input.now_tick);
+            score_item_with_breakdown(item, input.focus, input.hot_entities, input.current_turn);
         if breakdown.total >= input.config.active_threshold {
             return Some(format!(
                 "score {:.2} >= active threshold {:.2}",

@@ -40,8 +40,8 @@ pub(crate) fn ensure_session(state: &mut State) -> ScopeId {
         state: ScopeState::Active,
         task_id: None,
         goal: None,
-        opened_tick: state.tick,
-        last_active_tick: state.tick,
+        opened_tick: state.event_seq,
+        last_active_tick: state.event_seq,
         closed_tick: None,
     };
     let id = session.id;
@@ -61,7 +61,7 @@ pub(crate) fn ensure_task_scope(state: &mut State, task_id: TaskId) -> ScopeId {
             && scope.state != ScopeState::Closed
     }) {
         existing.state = ScopeState::Active;
-        existing.last_active_tick = state.tick;
+        existing.last_active_tick = state.event_seq;
         existing.id
     } else {
         let scope = Scope {
@@ -71,8 +71,8 @@ pub(crate) fn ensure_task_scope(state: &mut State, task_id: TaskId) -> ScopeId {
             state: ScopeState::Active,
             task_id: Some(task_id),
             goal: state.focus.as_ref().map(|f| f.goal.clone()),
-            opened_tick: state.tick,
-            last_active_tick: state.tick,
+            opened_tick: state.event_seq,
+            last_active_tick: state.event_seq,
             closed_tick: None,
         };
         let id = scope.id;
@@ -105,7 +105,7 @@ pub(crate) fn open_focus_scope(state: &mut State) -> ScopeId {
             && scope.state != ScopeState::Closed
     }) {
         existing.state = ScopeState::Active;
-        existing.last_active_tick = state.tick;
+        existing.last_active_tick = state.event_seq;
         state.active_scope_id = Some(existing.id);
         return existing.id;
     }
@@ -116,8 +116,8 @@ pub(crate) fn open_focus_scope(state: &mut State) -> ScopeId {
         state: ScopeState::Active,
         task_id: Some(task_id),
         goal: state.focus.as_ref().map(|f| f.goal.clone()),
-        opened_tick: state.tick,
-        last_active_tick: state.tick,
+        opened_tick: state.event_seq,
+        last_active_tick: state.event_seq,
         closed_tick: None,
     };
     let id = scope.id;
@@ -138,8 +138,8 @@ pub(crate) fn open_scope(state: &mut State, kind: ScopeKind, parent: Option<Scop
         state: ScopeState::Active,
         task_id: state.focus.as_ref().map(|f| f.task_id),
         goal: None,
-        opened_tick: state.tick,
-        last_active_tick: state.tick,
+        opened_tick: state.event_seq,
+        last_active_tick: state.event_seq,
         closed_tick: None,
     };
     let id = scope.id;
@@ -162,7 +162,7 @@ pub(crate) fn close_scope(state: &mut State, scope_id: ScopeId) -> Vec<ContextSt
     let scope = {
         let scope = state.scopes.get_mut(index).expect("index_of slot exists");
         scope.state = ScopeState::Closed;
-        scope.closed_tick = Some(state.tick);
+        scope.closed_tick = Some(state.event_seq);
         scope.clone()
     };
     let parent_id = nearest_open_parent(state, &scope);
@@ -249,7 +249,7 @@ pub(crate) fn drain_closed_scopes(state: &mut State, turn: u64) -> Vec<ContextSt
         let scope = {
             let scope = state.scopes.get_mut(index).expect("index_of slot exists");
             scope.state = ScopeState::Closed;
-            scope.closed_tick = Some(state.tick);
+            scope.closed_tick = Some(state.event_seq);
             scope.clone()
         };
         let parent_id = nearest_open_parent(state, &scope);

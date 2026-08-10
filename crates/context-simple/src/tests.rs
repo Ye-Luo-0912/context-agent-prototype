@@ -774,6 +774,7 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
             access_count: 0,
             created_turn: 1,
             last_access_turn: 1,
+            last_selected_turn: 1,
             dependencies: vec![agent_contracts::DependencyEdge::shares(dep_id)],
             tags: Vec::new(),
             keep_alive: false,
@@ -801,6 +802,7 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
             access_count: 0,
             created_turn: 1,
             last_access_turn: 1,
+            last_selected_turn: 1,
             dependencies: Vec::new(),
             tags: Vec::new(),
             keep_alive: false,
@@ -872,6 +874,7 @@ async fn dependency_expansion_can_be_disabled() {
             access_count: 0,
             created_turn: 1,
             last_access_turn: 1,
+            last_selected_turn: 1,
             dependencies: vec![agent_contracts::DependencyEdge::shares(dep_id)],
             tags: Vec::new(),
             keep_alive: false,
@@ -899,6 +902,7 @@ async fn dependency_expansion_can_be_disabled() {
             access_count: 0,
             created_turn: 1,
             last_access_turn: 1,
+            last_selected_turn: 1,
             dependencies: Vec::new(),
             tags: Vec::new(),
             keep_alive: false,
@@ -958,6 +962,7 @@ async fn archived_dependency_below_threshold_stays_out() {
             access_count: 0,
             created_turn: 1,
             last_access_turn: 1,
+            last_selected_turn: 1,
             dependencies: vec![agent_contracts::DependencyEdge::shares(dep_id)],
             tags: Vec::new(),
             keep_alive: false,
@@ -985,6 +990,7 @@ async fn archived_dependency_below_threshold_stays_out() {
             access_count: 0,
             created_turn: 1,
             last_access_turn: 1,
+            last_selected_turn: 1,
             dependencies: Vec::new(),
             tags: Vec::new(),
             keep_alive: false,
@@ -1544,6 +1550,7 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
             access_count: 0,
             created_turn: 1,
             last_access_turn: 1,
+            last_selected_turn: 1,
             dependencies: Vec::new(),
             tags: Vec::new(),
             keep_alive: false,
@@ -1571,6 +1578,7 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
             access_count: 0,
             created_turn: 1,
             last_access_turn: 1,
+            last_selected_turn: 1,
             dependencies: Vec::new(),
             tags: Vec::new(),
             keep_alive: false,
@@ -2373,7 +2381,7 @@ async fn external_retrieval_searches_inspects_and_fetches() {
             .iter()
             .find(|e| e.item_id == item_a_id)
             .expect("entry survives the fetch");
-        assert_eq!(entry.last_access_tick, state.tick);
+        assert_eq!(entry.last_access_tick, state.event_seq);
         assert_eq!(entry.last_access_gc_epoch, Some(state.gc_epoch));
     }
 
@@ -5327,6 +5335,213 @@ async fn substring_entity_match_reaches_the_candidate_universe() {
             .any(|item| item.content.contains("auth work on the service")),
         "a substring entity match must reach the candidate universe and be \
          selected, exactly like the scorer's affinity promises"
+    );
+}
+
+#[tokio::test]
+async fn materialize_preview_is_a_read_that_advances_no_clock() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    let before = engine.diagnostics().await.unwrap().event_seq;
+    // Preview three times: a read must not advance the event sequence, so
+    // merely looking at the context never ages TTLs or recency scores.
+    for _ in 0..3 {
+        let preview = engine
+            .materialize(ContextQuery {
+                current_input: "look".into(),
+                budget_tokens: 8_192,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        assert!(!preview.items.is_empty(), "the preview sees the message");
+    }
+    let after = engine.diagnostics().await.unwrap().event_seq;
+    assert_eq!(
+        before, after,
+        "materializing a preview is a read and must not advance the event sequence"
+    );
+    // A state change still advances it.
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "shell.exec".into(),
+                ok: true,
+                summary: "ok".into(),
+                model_content: "tests passed in AuthService.rs".into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    let later = engine.diagnostics().await.unwrap().event_seq;
+    assert!(later > after, "ingest advances the event sequence");
+}
+
+#[tokio::test]
+async fn selection_stamp_is_written_only_by_consumption_ack() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    let first = engine
+        .inspect(usize::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == ContextKind::UserMessage)
+        .expect("the first message is present");
+    assert_eq!(
+        first.last_selected_turn, first.created_turn,
+        "an item is born selected in its own turn"
+    );
+
+    // A second user turn; its preview must not stamp the first message.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "keep going".into(),
+        })
+        .await
+        .unwrap();
+    let preview = engine
+        .materialize(ContextQuery {
+            current_input: "keep going".into(),
+            budget_tokens: 8_192,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    let untouched = engine
+        .inspect(usize::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == ContextKind::UserMessage && s.created_turn == first.created_turn)
+        .expect("the first message survives");
+    assert_eq!(
+        untouched.last_selected_turn, first.created_turn,
+        "a non-consuming preview must not stamp selection"
+    );
+
+    // Consumption stamps it with the turn the model actually saw it.
+    acknowledge_all(&engine, &preview).await;
+    let consumed = engine
+        .inspect(usize::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == ContextKind::UserMessage && s.created_turn == first.created_turn)
+        .expect("the first message survives the ack");
+    assert_eq!(
+        consumed.last_selected_turn, consumed.last_access_turn,
+        "the ack stamps the selection and access turns together"
+    );
+    assert!(
+        consumed.last_selected_turn > first.created_turn,
+        "the item was selected in a later turn than it was born"
+    );
+}
+
+#[tokio::test]
+async fn ephemeral_ttl_counts_user_turns_not_events() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        turn_ttl_ticks: 2,
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    // Turn 1: a consumed ephemeral observation.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "shell.exec".into(),
+                ok: true,
+                summary: "ok".into(),
+                model_content: "step 1: fix AuthService.rs".into(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+
+    // A burst of events inside the same turn (maintain passes + previews)
+    // must not age the TTL: it counts user turns, not event ticks.
+    for _ in 0..10 {
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        engine
+            .materialize(ContextQuery {
+                current_input: "look".into(),
+                budget_tokens: 8_192,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+    }
+    let live = engine
+        .inspect(usize::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == ContextKind::ToolObservation);
+    assert_eq!(
+        live.expect("the observation is in the catalog").semantic,
+        SemanticState::Live,
+        "same-turn events must not tombstone the TTL item"
+    );
+
+    // Two more user turns (created at turn 1, TTL 2): turn 3 is age 2, turn
+    // 4 is age 3 > 2 and the lifecycle ends. The AfterModel branch never
+    // reaches the TTL (a consumed ephemeral observation stays recallable
+    // there); a non-model trigger runs the full residency machine.
+    for _ in 0..3 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "next topic please".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterTool)
+            .await
+            .unwrap();
+    }
+    let dead = engine
+        .inspect(usize::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == ContextKind::ToolObservation);
+    assert_eq!(
+        dead.expect("the observation is in the catalog").semantic,
+        SemanticState::Tombstoned,
+        "the ephemeral TTL expires after turn_ttl_ticks user turns, not events"
     );
 }
 

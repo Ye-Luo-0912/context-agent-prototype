@@ -32,7 +32,7 @@ pub(crate) fn next_residency(
     item: &ContextItem,
     config: &SimpleContextConfig,
     trigger: ContextMaintenanceTrigger,
-    now_tick: u64,
+    now_event_seq: u64,
     turn: u64,
     focus: Option<&FocusState>,
     hot_entities: &[String],
@@ -55,7 +55,10 @@ pub(crate) fn next_residency(
         };
     }
 
-    let age = now_tick.saturating_sub(item.created_tick);
+    // Event distance: the observation must predate this maintenance pass
+    // by at least one event — a tool observation ingested and consumed in
+    // the same pass is not "consumed after the model turn" yet.
+    let event_age = now_event_seq.saturating_sub(item.created_tick);
 
     // The model consumed the observation: it leaves *attention* (Archived),
     // but stays semantically Live so a later hot-entity match can recall it
@@ -63,7 +66,7 @@ pub(crate) fn next_residency(
     let consumed_ephemeral = item.retention == ContextRetention::Ephemeral
         && item.scope == ContextScope::Turn
         && matches!(trigger, ContextMaintenanceTrigger::AfterModel)
-        && age >= 1;
+        && event_age >= 1;
     if consumed_ephemeral {
         return ResidencyOutcome {
             attention: AttentionState::Archived,
@@ -78,21 +81,25 @@ pub(crate) fn next_residency(
 
     // TTL expiry ends the item's *information lifecycle*: Tombstoned. Unlike
     // consumption, this is semantic death — GC will evict it and never
-    // resurrect it; only Storage GC may delete the store file.
-    let ttl_expired = item.retention == ContextRetention::Ephemeral && age > config.turn_ttl_ticks;
+    // resurrect it; only Storage GC may delete the store file. TTL age is
+    // measured in user turns: a preview or a burst of unrelated events must
+    // not age an ephemeral item toward death.
+    let turn_age = turn.saturating_sub(item.created_turn);
+    let ttl_expired =
+        item.retention == ContextRetention::Ephemeral && turn_age > config.turn_ttl_ticks;
     if ttl_expired {
         return ResidencyOutcome {
             attention: AttentionState::Archived,
             semantic: Some(SemanticState::Tombstoned),
             reason: format!(
-                "ephemeral TTL expired (age {age} > {} ticks); tombstoned",
+                "ephemeral TTL expired (age {turn_age} turns > {}); tombstoned",
                 config.turn_ttl_ticks
             ),
             relevance: item.relevance,
         };
     }
 
-    let breakdown = score_item_with_breakdown(item, focus, hot_entities, now_tick);
+    let breakdown = score_item_with_breakdown(item, focus, hot_entities, turn);
     let stale_task = is_stale_task(item, focus);
 
     let next = if stale_task && breakdown.total < config.active_threshold {
@@ -103,14 +110,14 @@ pub(crate) fn next_residency(
         AttentionState::Cooling
     } else if item.retention == ContextRetention::Durable {
         AttentionState::Archived
-    } else if age > config.turn_ttl_ticks * 4 {
+    } else if turn_age > config.turn_ttl_ticks * 4 {
         // A working item that outlived every TTL by a wide margin is not
         // coming back: its lifecycle ends here, terminally.
         return ResidencyOutcome {
             attention: AttentionState::Archived,
             semantic: Some(SemanticState::Tombstoned),
             reason: format!(
-                "stale (age {age} > ttl x4 = {}); tombstoned",
+                "stale (age {turn_age} turns > ttl x4 = {}); tombstoned",
                 config.turn_ttl_ticks * 4
             ),
             relevance: 0.0,

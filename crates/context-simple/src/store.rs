@@ -809,7 +809,7 @@ mod tests {
 
     fn test_item(id: ContextItemId, content: &str) -> ContextItem {
         let state = State {
-            tick: 1,
+            event_seq: 1,
             ..State::default()
         };
         let mut item = make_item(

@@ -16,6 +16,7 @@ pub(crate) fn to_summaries(items: &[ContextItem]) -> Vec<ContextItemSummary> {
             created_tick: item.created_tick,
             created_turn: item.created_turn,
             last_access_turn: item.last_access_turn,
+            last_selected_turn: item.last_selected_turn,
             access_count: item.access_count,
             // The summary is a projection: it exposes the dependency target
             // ids, not the edge kinds (the typed graph lives on the item).
@@ -45,6 +46,7 @@ pub(crate) fn external_summary(entry: &ExternalizedContext) -> ContextItemSummar
         created_tick: entry.externalized_at_tick,
         created_turn: 0,
         last_access_turn: 0,
+        last_selected_turn: 0,
         access_count: 0,
         dependencies: entry.dependencies.iter().map(|edge| edge.target).collect(),
         keep_alive: false,

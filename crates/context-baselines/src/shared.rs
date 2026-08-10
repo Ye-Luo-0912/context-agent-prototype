@@ -52,6 +52,7 @@ impl Record {
             created_tick: 0,
             created_turn: self.created_turn,
             last_access_turn: self.created_turn,
+            last_selected_turn: 0,
             access_count: 0,
             dependencies: Vec::new(),
             keep_alive: false,
