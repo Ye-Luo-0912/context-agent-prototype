@@ -198,13 +198,22 @@ async fn cancellation_terminates_the_child_process() {
     ));
     capability.start().await.unwrap();
 
-    // Give the heartbeat a moment to start ticking, then confirm it moves.
-    tokio::time::sleep(Duration::from_millis(120)).await;
-    let ticking = std::fs::read_to_string(&heartbeat).unwrap_or_default();
-    tokio::time::sleep(Duration::from_millis(120)).await;
-    assert_ne!(
-        std::fs::read_to_string(&heartbeat).unwrap_or_default(),
-        ticking,
+    // The heartbeat thread lives inside the child and rewrites the file
+    // every 50 ms, but on a busy host the child (or its thread) can be
+    // scheduled late. Poll until the counter visibly advances instead of
+    // racing two fixed-sleep reads.
+    let baseline = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+    let mut saw_advance = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if std::fs::read_to_string(&heartbeat).unwrap_or_default() != baseline {
+            saw_advance = true;
+            break;
+        }
+    }
+    assert!(
+        saw_advance,
         "the heartbeat must advance while the child is alive"
     );
 
