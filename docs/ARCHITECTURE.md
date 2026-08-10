@@ -816,15 +816,21 @@ ModuleHost
                      kernel tool_provider -> model tool schemas -> invoke
 ```
 
-Since V1-M9 capability invocation returns a `CapabilityOutcome`, not a raw
-`ToolOutput`: `Value(ToolOutput)`, `EffectRequest { output, effect }`
-(a staged, rollback-able mutation the core commits under the generation
-fence — external capabilities submit *requests*, they do not perform side
-effects themselves), or `RuntimeDirective { output, directive }` (the
-context-control path, gated on the `runtime:context-control` manifest
-permission). The dispatcher maps these onto the kernel's `ToolOutcome`,
-so the effect fence is the same for builtin prepared mutations and for
-dynamic capabilities — there is no second, unfenced side-effect lane.
+Capability invocation returns a `CapabilityOutcome`, not a raw `ToolOutput`:
+`Value(ToolOutput)`, `EffectRequest { output, effect }` (a staged,
+rollback-able mutation the core commits under the generation fence), or
+`RuntimeDirective { output, directive }` (the context-control path, gated on
+the `runtime:context-control` manifest permission). The dispatcher maps these
+onto the kernel's `ToolOutcome`, so trusted in-process capabilities can share
+the builtin prepared-effect fence.
+
+This contract is not yet enforced across the process transport.
+`ProcessCapabilityAdapter` currently decodes only `ToolOutput` and returns
+`CapabilityOutcome::Value`; any mutation performed inside the child has
+already happened before the actor sees the result. `shell.exec` is another
+direct-execution lane. Until both are brokered as typed effects or confined to
+non-mutating authority, M12 is open and process capabilities must not be
+described as rollback-safe.
 
 Since V1-P0-8 the composition root composes into one `RuntimeInstance`
 that owns the `ModuleHost`, the `RuntimeHandle` and the actor `JoinHandle`.
@@ -902,9 +908,10 @@ explicit `ProcessSandbox` (shared `ProcessHost`, since the crate split in
   `TEMP`/`TMP` only, so `OPENAI_API_KEY`, `HOME`, credentials and friends
   never cross the boundary by default. `None` keeps the historical
   inherit-everything behavior (the context-service default).
-- **Dedicated cwd** — `cwd: Option<PathBuf>`: the child runs in its own
-  directory, created at connect, never the parent's cwd — a generated
-  capability cannot roam the workspace by relative paths.
+- **Private cwd** — `cwd: Option<PathBuf>`: the child runs in its own
+  unpredictable directory, created at connect, never the parent's cwd. This
+  limits accidental/relative-path access; it is not `chroot` or a mount
+  namespace and cannot block absolute paths.
 - **Process/job limits and CPU quota** — Unix `pre_exec` rlimits
   (`RLIMIT_CPU`, `RLIMIT_NPROC`) applied right after fork; the adapter
   sets 60 s CPU and 16 processes.
@@ -913,30 +920,32 @@ explicit `ProcessSandbox` (shared `ProcessHost`, since the crate split in
   (user `/cancel`, superseded operation) it poisons the connection and
   kills the whole process tree immediately — Unix: SIGKILL to the process
   group the child was spawned into (`process_group(0)`); Windows:
-  `taskkill /PID <pid> /T /F`. A cancelled capability stops producing
-  side effects *now*, not at the request deadline.
+  `taskkill /PID <pid> /T /F`. This stops future child work; it cannot undo
+  a mutation the child completed before cancellation.
 - **Bounded stderr** — `stderr_capture_bytes`: when set (the capability
   profile uses 64 KiB), the child's stderr is piped and drained by a task
   into a bounded ring kept on the host; `ProcessHost::stderr_tail()`
   surfaces the newest bytes for diagnostics. A chatty child can no longer
   inherit unbounded output into the parent console.
-- **Brokered host APIs** — the child only ever speaks the bounded
-  JSON-lines ops (`ping`/`invoke`); every host side effect goes through
-  the same framed, deadline-bounded, poisoned-connection protocol as the
-  context service.
+- **Bounded control protocol** — the child speaks framed JSON-lines
+  (`ping`/`invoke`) with deadlines and connection poisoning. The protocol
+  bounds messages; it does not broker the child's own filesystem, network or
+  process syscalls.
 
-`ProcessCapabilityAdapter::from_manifest` applies this strict profile to
+`ProcessCapabilityAdapter::from_manifest` applies this hardened profile to
 every process capability; `invoke` forwards the call and the granted
-permissions (informational), but the sandbox — not the manifest — is what
-enforces the boundary. Since the trust-boundary hardening, the manifest
+permissions as informational data. The host enforces env/cwd/rlimit/message
+boundaries, but not permission-specific filesystem/network access. Since the
+trust-boundary hardening, the manifest
 itself is no longer trusted either: the id must pass a conservative
 grammar (`validate_capability_id`, lowercase/digit start, `[a-z0-9._-]`,
 <= 64) before it is embedded in the working directory or any route, and
 the working directory is private and unpredictable
 (`context-agent-capability-<id>-<uuid>`) so no two runs share a path and
 a hostile pre-created directory cannot be predicted. Filesystem isolation
-beyond the dedicated cwd and an explicit network policy are still open (a
-future dedicated capability sandbox); until then **V2 autonomous
+beyond the dedicated cwd, an explicit network policy and cross-platform
+memory/I/O/disk/process quotas are still open M13 acceptance requirements;
+until then **V2 autonomous
 capability generation stays gated** — a generated capability only runs
 after explicit `enable`, and only inside the sandbox above.
 
@@ -961,11 +970,11 @@ until the wire-level effect broker exists. Both enforcement points are
 under test: `undeclared_permissions_receive_no_handle` and
 `capability_authority_is_derived_and_validated_at_registration`
 (agent-runtime) prove the grant-by-construction behavior end to end, and
-`sandboxed_self_check_artifacts_stay_contained` (agent-process) proves
-the V2 loop's test step — a generated capability's self-check — runs
-inside the sandbox and its artifacts cannot escape the dedicated cwd.
+`sandboxed_self_check_artifacts_stay_contained` (agent-process) proves the
+tested self-check writes its artifact into the private cwd. It is not an
+escape-proof test for absolute filesystem or network access.
 
-## 9c. The tool surface: merged meta-tools, a bounded catalog, one generation (V1-M9)
+## 9c. The tool surface: merged meta-tools, bounded catalog, revisioned rounds
 
 The always-visible tool schemas are themselves context. Since V1-M9 the
 runtime control surface is two merged entry points instead of a dozen

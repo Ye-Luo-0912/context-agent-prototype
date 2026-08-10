@@ -2,15 +2,17 @@
 
 ## 1. Purpose
 
-The central claim of this prototype is that a continuously maintained,
-task-focused working set (policy C) beats the two classic baselines on
-real coding workloads:
+The central hypothesis of this prototype is that a continuously maintained,
+task-focused working set (policy C) can beat classic baselines on long coding
+tasks. The current experiment is a deterministic, coding-shaped policy replay;
+it is not yet the real coding-workload acceptance test:
 
 - **A — append-only**: every message and tool result is resent every model
   turn until the window limit forces a stop.
-- **B — rolling summary**: append like A, but when retained history crosses a
-  token threshold, the oldest part (outside a verbatim recency window) is
-  collapsed into a summary marker.
+- **B — rolling marker baseline** (`RollingSummaryEngine`): append like A,
+  but when retained history crosses a threshold, drop the oldest part outside
+  a verbatim recency window and insert a fixed marker. No model-generated
+  compaction is run, so B must not be presented as a competitive summarizer.
 - **C — dynamic working set**: `SimpleContextEngine` (this design).
 
 The comparison is offline and deterministic: the same scripted scenarios are
@@ -45,11 +47,11 @@ Measured per scenario per engine:
 
 | Metric | Meaning |
 | --- | --- |
-| `in_tok_total` | Sum over every model round of (system prompt + `MaterializedContext.approx_tokens`) — total model input consumed by the task. |
-| `in_tok_max` | Largest single model input — the worst single model request. |
+| `in_tok_total` | Sum of the replay's fixed system estimate + `MaterializedContext.approx_tokens`; a context-policy proxy, not total provider input. |
+| `in_tok_max` | Largest replay estimate, not the complete assembled provider request. |
 | `over_budget` | Model inputs exceeding the configured budget (12 K tokens in the comparison). |
-| `churn` | Total lifecycle transitions emitted by maintenance (C: archive/cool/drop; B: collapses). |
-| `final_total` / `final_active` | Items retained vs. active at the end of the scenario. |
+| `churn` | Maintenance transitions only; it does not include all GC/store work. |
+| `final_total` / `final_active` | Engine diagnostics at the end. For `context-simple`, `total_items` currently counts Resident only, not Warm/Cold/External logical records. |
 
 The `--facts` mode adds the completion-quality proxy (`crates/agent-replay/src/facts.rs`):
 each scenario declares key facts — content needles that must be in the
@@ -64,9 +66,11 @@ view on turn N".
 | `forb_viol` | Forbidden facts that leaked into view at least once (stale-instruction leakage). |
 | `coverage` | `req_met / req_viol + req_met` — required-fact coverage ratio. |
 
-Scenario scripts mirror the kernel event pattern (user message → maintain →
-model rounds with tool results → assistant reply → maintain), so replay
-measures the exact same sequence a live run would produce.
+Scenario scripts mirror the main context event pattern (user message →
+maintain → model rounds with tool results → assistant reply → maintain). They
+exercise the same engines, but do not reproduce the full runtime request,
+PromptAssembler roles, tool-surface cost, provider behavior or repository
+outcome.
 
 ## 4. Scenarios
 
@@ -127,8 +131,9 @@ scenario: pinned_constraint - one pin across three tasks
 
 ## 6. Reading the results
 
-- **Token cost (the headline).** On heavy scenarios C costs **5–12× less**
-  model input than A (`84 K` vs `626 K` on `long_refactor`) and never
+- **Estimated context cost (the headline).** On heavy scenarios C costs
+  **5–12× less** under this replay estimator than A (`84 K` vs `626 K` on
+  `long_refactor`) and never
   exceeds the budget, while A blows past it (13–22 over-budget snapshots).
   B bounds its peak with collapses but still pays ~6× C's cost because every
   retained observation is resent verbatim.
@@ -136,7 +141,7 @@ scenario: pinned_constraint - one pin across three tasks
   B) after a switch, and to 10 after a completed task — the old task's
   detail is archived, not resent. A/B keep 73–87 items active (stale
   instructions and completed-task detail leak into every later request).
-- **B's trade-off.** Rolling summary bounds *peak* tokens but loses
+- **B's trade-off.** The rolling-marker baseline bounds *peak* tokens but loses
   history: on `high_volume_irrelevant_output` it keeps only 15 items vs A's
   49 — including, in real use, task-relevant facts that fall outside the
   recency window.
@@ -222,8 +227,9 @@ Reading:
 
 Replay is deterministic: the same scenario events through the same engine
 version produce the same metrics. Metrics are token estimates (`ascii/4 +
-non-ascii`), not vendor tokenizers; absolute numbers differ across providers,
-ratios do not. Scenario content and sizes are fixed in code, not sampled.
+non-ascii`), not vendor tokenizers; absolute numbers and ratios may differ once
+provider tokenization and fixed request layers are counted. Scenario content
+and sizes are fixed in code, not sampled.
 Every outcome/coverage observation starts with its own new engine.
 
 Policy C's P4 features are configurable — decision supersession, error
@@ -232,3 +238,19 @@ verification, entity affinity and dependency expansion
 dependency_expansion }`, default on):
 `SimpleContextConfig::baseline_v0()` turns all four off and reproduces the
 P3-era numbers; `SimpleContextConfig::default()` runs the full P4 policy.
+
+## 9. M15 acceptance still required
+
+Before claiming real-evaluation completion:
+
+- replace or supplement B with actual bounded compaction and count its model
+  cost;
+- run paired feature/bug/refactor tasks with real repository tools and hidden
+  build/test verification;
+- count provider I/O, PromptAssembler/TurnFrame/tool schemas, context and
+  compactor/recall/store work, tool execution and wall time;
+- report repeated runs and a predeclared non-inferiority bound for task
+  success, plus required-fact recall, stale/terminal leakage and recovery
+  faults;
+- add logical-catalog counts, Resident bytes, candidate counts and
+  materialization latency so bounded prompt size cannot hide growing GC work.

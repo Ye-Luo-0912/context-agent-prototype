@@ -1,6 +1,10 @@
 # Prototype Roadmap
 
-The roadmap is ordered to validate the context hypothesis before expanding agent surface area.
+The roadmap is ordered to validate the context hypothesis before expanding
+agent surface area. Early sections retain historical delivery notes; the
+current milestone authority is the code-grounded table under
+"Code-grounded milestone status and ordered route." A feature-path checkmark
+is not evidence that a later trust or real-evaluation acceptance gate passed.
 
 ## P0 — Architecture skeleton (this scaffold)
 
@@ -28,7 +32,9 @@ Establish stable boundaries and a runnable event-driven prototype.
 - tool runtime has no dependency on a context/memory crate;
 - context state changes can be observed while a session runs;
 - raw shell output does not enter model context unbounded;
-- task completion archives task details and retains a summary.
+- legacy `/done` archives task details and retains a free-form summary. This
+  kept the scaffold usable; it is not the authoritative TaskAnchor/
+  CompletionRecord contract required by `CTX-10`.
 
 ### Risk
 
@@ -279,15 +285,14 @@ C. dynamic working set (this design).
 Dynamic context must show a measurable advantage on at least token cost or
 long-task focus without a material regression in task success.
 
-Token-cost and task-switch focus advantages are demonstrated (see
-`docs/EXPERIMENTS.md`). Completion-quality and repeated-mistake metrics
-now have a replay-level proxy — key-fact coverage, `agent-replay
+Estimated context cost and task-switch focus advantages appear in the
+deterministic policy replay (see `docs/EXPERIMENTS.md`). Required/forbidden
+fact visibility has a replay-level proxy — key-fact coverage, `agent-replay
 --facts` (see the V1-M15 section): required facts stay in view and
 forbidden (stale) facts never leak in the dynamic engine, measured per
-turn in CI without a model. A live measurement against a real model
-provider (`agent-eval`, see the V1-M15 section) confirms the direction:
-on the first live workload the dynamic engine passes with 22% less
-input than append-only.
+turn in CI without a model. A no-tool live constraint-retention smoke
+(`agent-eval`, see the V1-M15 section) also points in the same direction.
+Neither result is task-success acceptance on real coding workloads.
 
 ---
 
@@ -953,8 +958,8 @@ context engine; tools still never touch the engine (invariant 3).
   a `ContextDirective` ingest;
 - the model can address items because the context frame exposes each item's
   id (`id=<...>` per frame line in the prompt);
-- the meta-tools are always loaded with the core set
-  (`fs.list`/`fs.read`/`search.grep` + the four `context.*` tools).
+- the merged `context.manage` control/retrieval tool is always loaded with
+  `fs.list`/`fs.read`/`search.grep` and `capability.manage`.
 
 Acceptance: engine tests cover gc_hint keep/release on a consumed
 observation, a hint reaching an evicted buffer item (reactivates on the
@@ -965,11 +970,12 @@ observation ingest;
 tool-runtime tests cover the four schemas and executions. Full workspace
 build/test/clippy/fmt green; A/B/C replay baseline unchanged.
 
-## V1-M9: process sandbox + external store retrieval loop ✅ (implemented)
+## V1-M9: process-host hardening + external recall baseline 🟡
 
-Two review blockers cleared before V2 autonomous capability generation:
+Two useful baseline slices landed, but only recall meets its narrow
+acceptance:
 
-- **The process boundary is a sandbox, not a permission note.**
+- **The process host is hardened, not yet isolated.**
   `ProcessHost` runs every child inside `ProcessSandbox`: env whitelist
   (the process-capability adapter's profile is PATH/SystemRoot/
   SystemDrive/TEMP/TMP only — no inherited secrets, `OPENAI_API_KEY` and
@@ -977,9 +983,9 @@ Two review blockers cleared before V2 autonomous capability generation:
   (RLIMIT_CPU / RLIMIT_NPROC; 60 s / 16 processes), and
   `call_with_cancel` — a cancel (user `/cancel`, superseded operation)
   poisons the connection and kills the whole process tree immediately
-  instead of waiting for the request deadline. V2 autonomous capability
-  generation stays gated until filesystem isolation beyond the cwd and a
-  network policy land.
+  instead of waiting for the request deadline. Absolute filesystem/network
+  access, cross-platform quotas and process-wire effects remain M12/M13
+  blockers; the type name is not milestone acceptance.
 - **The context store is a retrieval loop, not a black hole.** The store
   path is injected at the composition root
   (`workspace.state_dir()/context-store`); the leaked CWD-guessed copy was
@@ -997,13 +1003,13 @@ Two review blockers cleared before V2 autonomous capability generation:
   so real IO errors keep entries; `ContextHeap` makes index consistency
   structural (a stale index is a type error, not a length guard).
 
-## V1-M9: merged tool surface + hardened capability plane ✅ (implemented)
+## V1-M9: merged tool-surface baseline ✅
 
 The always-visible schemas are context too, and the capability plane
 stopped trusting declarations:
 
 - **Merged meta-tools.** `context.manage` (op: gc_hint/tag/lease/collect/
-  search/inspect/fetch) and `capability.manage` (op: search/inspect/load/
+  search/inspect/fetch/admit/derive) and `capability.manage` (op: search/inspect/load/
   unload) replace a dozen single-purpose control tools; the default model
   surface drops from fourteen schemas to five (fs.list / fs.read /
   search.grep / context.manage / capability.manage). The merge is
@@ -1014,28 +1020,28 @@ stopped trusting declarations:
   registration caps tools per capability (32), tool-name length/character
   set, description length and per-schema bytes (4 KiB) — a single
   capability cannot blow up the model surface.
-- **Unified surface generation.** The capability registry carries its own
-  counter bumped on register/activation/load/unload; the dispatcher
-  snapshot combines it with the builtin catalog's generation, so dynamic
-  capability changes are auditably visible.
+- **Auditable round surface.** Builtin/capability catalogs carry separate
+  atomic generations; the runtime adds task/focus source revisions and a
+  monotonic `surface_revision`. One final snapshot drives budget, prompt and
+  tool-call validation.
 - **No callbacks under the registry lock.** Registration reads and
   validates the manifest + tool schemas once, then caches them; every
   catalog query reads the cache. A slow or re-entrant capability can only
   misbehave at register time.
 - **Final budget guard is the input budget.** The assembled request must
   fit `context_window - output_reserve` (rendering overhead may not eat
-  the answer's reserve); with the context frame emptied it auto-unloads
-  optional tools, and an unshrinkable request is a hard error — never a
-  silently over-budget send.
+  the answer's reserve); optional tools may be omitted from that round
+  without changing catalog lifecycle, and an unshrinkable request is a
+  hard error — never a silently over-budget send.
 - **Selection respects scope state.** The materializer's candidate scopes
   are the session, the active task's open task/focus scopes and open tool
   frames — closed tool frames no longer re-enter the prompt by task
   membership alone (they come back via retention, affinity or dependency),
   matching the GC mark phase's closed-scope boundary.
 
-## V1-M10 Runtime Consistency ✅ (implemented)
+## V1-M10 Runtime Consistency 🟡 (transaction baseline implemented)
 
-Three consistency gaps closed before V2:
+Several important consistency gaps are closed:
 
 - **Turn finalization is a commit.** `finalize_turn` walks `Running` →
   `ModelFinished` → `Committing` → `Committed`; every mandatory state write
@@ -1069,11 +1075,16 @@ failure, checkpoint/restore alignment, stale-effect rollback, durability
 failure reporting, directive-before-next-round, child termination on
 cancel, store confinement, exact fetch recovery, full-contract parity,
 window-vs-reserve budget) are in place; see `docs/ARCHITECTURE.md` §9e/§9f.
-The milestone acceptance — the runtime and the context never drift into a
-task/state split-brain — is covered end to end by the runtime tests: the
-actor assigns the task id and the engine carries the same one
-(`runtime_task_id_matches_the_context_task_id`), and checkpoint/restore
-re-aligns both (`runtime_checkpoint_roundtrips_tasks_context_and_capabilities`).
+The transaction baseline is covered end to end: the actor assigns the task
+id, the engine carries the same one
+(`runtime_task_id_matches_the_context_task_id`), failed focus/task changes
+roll context back, and restore validates task/context alignment
+(`runtime_checkpoint_roundtrips_tasks_context_and_capabilities`). The full
+milestone remains open: `RuntimeInstance::checkpoint` still captures actor
+state and the shared capability registry in two steps, public actor-only
+checkpoint APIs can omit host state, and live-restore revision rebasing has
+no mandatory typed audit/barrier. These are `CORE-03`; do not infer the
+global "never split-brain" acceptance from the happy-path round trip.
 
 Performance P1 landed ahead of the milestones below: the external map
 owns its id/entity indexes (`ExternalMap`, O(1) inspect/fetch lookups,
@@ -1094,56 +1105,105 @@ form), and the GC/storage IO phases batch their file operations on a
 operation; see `docs/ARCHITECTURE.md` §9h and
 `docs/CONTEXT_LIFECYCLE.md` §9k.
 
-## Next: V1-M10 → V2 (ordered)
+## Code-grounded milestone status and ordered route
 
-> **2026-08-10 audit correction.** Checkmarks below record that a named
-> feature path exists; they do not prove the trusted acceptance criteria.
-> Adversarial review reopened process effects/sandboxing (M12/M13), journal
-> durability, cross-plane checkpoint capture and the long-task working-set
-> goal. V2 Self-Iteration remains blocked on P0 items in
-> [`docs/AUDIT_TODO.md`](AUDIT_TODO.md). In particular, cwd/env/rlimits are
-> not filesystem/network isolation, and a process capability that mutates in
-> the child does not pass through the actor's Effect fence.
+> **2026-08-10 code audit.** A milestone is complete only when its named
+> acceptance holds, not merely when one implementation path exists. Detailed
+> defects remain authoritative in [`docs/AUDIT_TODO.md`](AUDIT_TODO.md);
+> context/tool design work remains in the two dedicated TODOs.
+
+| Milestone | Status at this code state | Acceptance gap |
+| --- | --- | --- |
+| M10 Runtime Consistency | 🟡 transaction baseline | Cross-plane checkpoint capture and live-restore audit/recovery remain `CORE-03`; `CTX-06` still needs one operation/revision protocol for GC, storage GC, checkpoint and restore. |
+| M11 Context Recall | ✅ narrow retrieval baseline | Search/inspect/fetch, transient results, bounded external view and service parity work. Canonical catalog ownership, complete cross-residency semantics and TaskAnchor/Completion roots remain context-runtime work rather than reasons to call recall itself absent. |
+| M12 Effect Runtime | ⛔ trust blocker | In-process prepared effects use the generation fence, but `shell.exec` mutates directly and the process-capability wire returns only `Value`; child-side effects cannot be rolled back. |
+| M13 Extension Sandbox | ⛔ trust blocker | Env scrub, private cwd, bounded stderr and process-tree cancellation are useful host hardening. A cwd is not a filesystem boundary; absolute filesystem/network access and cross-platform resource isolation are not brokered. |
+| M14 Resource Policy | 🟡 partial | Schema/context quotas, risk/permission validation and final output guards exist. A unified output broker, standing task execution policy and effect-derived approval/resource enforcement remain open. |
+| M15 Real Evaluation | 🧪 instrumentation/smoke only | Replay is a policy proxy and the live run is a no-tool constraint-retention task. There is no paired real coding workload, hidden outcome verification, all-module cost accounting or non-inferiority result. |
+| V2 Self-Iteration | 🔒 blocked | Registry maturity and sandboxed self-checks are foundations only. Autonomous generation/promotion stays disabled until M10 and M12-M15 acceptance gates close. |
+
+The intended order remains M10 → M11 → M12 → M13 → M14 → M15 → V2.
+Code has landed parts of M14 and the M15 harness early; that is acceptable
+defensive/instrumentation work, but it does not advance the completion gate.
+The context target discovered during audit — authoritative TaskAnchor,
+episode outcomes, exact completion output and GC root transfer — belongs to
+the remaining M10/M11 context-consistency work and must be validated before
+M15 can claim long-task success.
+
+The detailed milestone notes below retain implementation landing order, not
+the required gate order; the numbered list and table above are authoritative.
 
 1. **V1-M10 Runtime Consistency** — task authority, transactional task
    transitions, RuntimeCheckpoint, Turn commit. Acceptance: the runtime and
-   the context never drift into a task/state split-brain. ✅ (implemented —
-   see the section above and the consistency invariant suite in
-   `agent-runtime/tests/instance.rs`)
+   the context never drift into a task/state split-brain. 🟡 Close
+   `CORE-03`/`CTX-06`; the transaction baseline is implemented.
 2. **V1-M11 Context Recall** — store injection, `ContextMapView` (the
    type-level bounded view landed in Performance P1),
    `context.search`/`fetch`, `gc_epoch`, async store. Acceptance: external
    information can be pulled back on demand without polluting the prompt.
-   ✅ (implemented — see the section below)
+   ✅ Narrow retrieval baseline implemented; broader lifecycle/catalog work
+   stays in the context queue.
 3. **V1-M12 Effect Runtime** — every capability routes side effects through
    one unified EffectRequest/Effect commit. Acceptance: a cancelled
-   operation produces no avoidable stale mutation. ✅ (implemented — see the
-   section below)
+   operation produces no avoidable stale mutation. ⛔ Close the process-wire
+   and direct-shell escape paths in `CORE-01`/`CORE-06`.
 4. **V1-M13 Extension Sandbox** — process sandbox, env scrub, brokered
    FS/network, cancel. Acceptance: experimental code cannot exceed the
-   permissions granted to it. ✅ (implemented — env scrub, sandboxed cwd,
-   resource limits and cancellation; see the section below)
+   permissions granted to it. ⛔ Host hardening exists, but brokered OS
+   filesystem/network and cross-platform resource enforcement do not.
 5. **V1-M14 Resource Policy** — tool schema budget (the per-round surface
    bound landed in Performance P1), context hint quota,
    RiskClass, PermissionSet. Acceptance: the LLM cannot exhaust runtime
-   resources through meta-tools. ✅ (implemented — see the section below)
+   resources through meta-tools. 🟡 Model-facing bounds exist; output,
+   standing-approval and effect-derived resource policy remain open.
 6. **V1-M15 Real Evaluation** — coding workload A/B/C + lifecycle metrics.
    Acceptance: the dynamic runtime saves tokens without lowering task
-   success rate. ✅ (implemented — see the section below)
+   success rate. 🧪 Replay and one no-tool live smoke exist; real coding
+   non-inferiority remains unmeasured.
 7. **V2 Self-Iteration** — generate → sandbox → test → replay → evaluate →
    canary → stable. The LLM grows capabilities, but cannot modify the
-   evaluation or permission Core. 🚧 (partially implemented — the
-   evaluation/permission Core is protected by test and the test step
-   runs sandboxed; autonomous generate→canary→stable promotion is
-   deferred, see the section below)
+   evaluation or permission Core. 🔒 Blocked; only prerequisite scaffolding
+   exists.
 
 M12/M13 strictly precede Self-Iteration: a capability that can already
 stage effects and a sandbox that can contain it are prerequisites for
 letting the LLM grow capabilities autonomously.
 
-## V1-M13 Extension Sandbox ✅ (implemented)
+### Next optimization order (do not start with smarter scoring)
 
-A process capability runs in a strict, static execution boundary
+1. **Finish state authority (M10).** Serialize or revision-fence context GC,
+   storage GC, checkpoint and restore; capture actor + capability state as one
+   snapshot; make restore rebasing a bounded durable event/recovery
+   transaction.
+2. **Finish the context target (M10/M11).** Fix the episode-local turn counter;
+   introduce the runtime-owned TaskAnchor and immutable CompletionRecord;
+   retain the exact final output/evidence through a completion root transfer;
+   then move lifecycle metadata into one canonical catalog. Historical
+   content must also leave System role (`CORE-05`).
+3. **Close trusted execution (M12/M13).** Extend process IPC with typed
+   prepared effects, broker or confine direct shell/process mutation, and add
+   real filesystem/network/resource isolation with adversarial cancel/escape
+   tests.
+4. **Complete bounded policy (M14).** Put every producer behind one output
+   broker and add a narrow, revocable `TaskExecutionPolicy` so unattended
+   builds/tests inside a granted sandbox do not prompt per call while broader
+   effects remain denied.
+5. **Optimize measured context work.** Give external refs a token budget,
+   pack by fit before top-K exclusion, avoid O(total-history) external/session
+   candidate scans, and make diagnostics count the logical catalog. Record
+   Resident bytes, candidate count and materialization p95 before changing
+   scoring weights.
+6. **Run the real gate (M15).** Compare append-only, actual compaction and
+   dynamic GC on paired coding tasks, with hidden tests and total token/tool/
+   store/latency cost. Only then consider learned/vector recall or V2.
+
+This order preserves the original research goal: continuous GC stays active
+throughout a long task, but correctness, authority and evidence retention are
+fixed before policy sophistication.
+
+## V1-M13 Extension Sandbox ⛔ (host hardening only)
+
+A process capability runs with a hardened process-host profile
 (`ProcessSandbox` in `agent-process`, built by
 `ProcessCapabilityAdapter::from_manifest`):
 
@@ -1154,9 +1214,10 @@ A process capability runs in a strict, static execution boundary
   `agent-process/tests/sandbox.rs` (unlisted secret scrubbed, whitelisted
   variable inherited, explicit grant delivered) and the capability-level
   `strict_sandbox_scrubs_parent_secrets_across_the_wire`.
-- **Sandboxed cwd.** The child runs in its own dedicated working
-  directory, created at connect, never the parent's cwd — a generated
-  capability cannot roam the workspace by relative paths. Covered by
+- **Private cwd.** The child runs in its own unpredictable working directory,
+  created at connect, never the parent's cwd. This blocks accidental and
+  relative-path access; it is not `chroot`/a mount namespace and does not
+  block absolute filesystem paths. Covered by
   `sandbox_cwd_is_created_and_isolates_the_child`.
 - **Resource limits (Unix).** Hard `RLIMIT_CPU` / `RLIMIT_NPROC` ceilings
   applied by the kernel right after fork. Note the `RLIMIT_NPROC` caveat:
@@ -1169,23 +1230,23 @@ A process capability runs in a strict, static execution boundary
   and terminates the child's whole process tree (process group on Unix,
   `taskkill /T /F` on Windows), never a background process still
   producing side effects. Covered by the existing cancellation tests.
-- **Permissions cross the boundary.** The granted permission set is
-  delivered to the child with each invocation (`granted_permissions`
-  arrives intact — `granted_permissions_reach_the_child_intact`), so
-  experimental code only ever acts on what was granted; the static
-  sandbox is the enforcement layer for the environment and resource
-  dimensions.
-- **Scope boundary.** A per-invocation *brokered* FS/network proxy
-  (filtering the child's file/network access by the granted set) is not
-  part of this milestone — the sandbox is a static boundary (env, cwd,
-  limits), the same shape the context service uses. Dynamic per-grant
-  FS/network brokering is deferred until measurement shows the static
-  boundary is the bottleneck (see "Later, only after evidence").
+- **Permissions cross the boundary as data.** The granted set arrives intact
+  (`granted_permissions_reach_the_child_intact`), but the child is not forced
+  to obey it. Authority is enforced only where access is brokered by trusted
+  host APIs.
+- **Missing acceptance boundary.** M13 requires brokered/OS-enforced
+  filesystem and network access, memory/I/O/disk/process quotas (including a
+  Windows Job Object or equivalent), and adversarial escape tests. These are
+  trust prerequisites, not an evidence-gated optimization.
 
-## V1-M14 Resource Policy ✅ (implemented)
+Therefore the current `ProcessSandbox` name denotes host hardening hooks, not
+a completed extension sandbox. External process capabilities must remain
+disabled by default until the M12 wire-level effect broker and this isolation
+boundary are complete.
 
-The model cannot exhaust runtime resources through meta-tools — every
-dimension the meta-tools can reach is bounded and the bounds are tested:
+## V1-M14 Resource Policy 🟡 (model-facing bounds implemented)
+
+Several model-facing dimensions are bounded and tested:
 
 - **Tool schema budget.** The per-round surface is capped by a
   deterministic schema budget (`MAX_TOOL_SURFACE_TOKENS`): control and
@@ -1217,22 +1278,26 @@ dimension the meta-tools can reach is bounded and the bounds are tested:
   refuses an unshrinkable over-budget request), and the external view is
   bounded by `ContextMapView` (cap 32).
 
-## V1-M15 Real Evaluation ✅ (implemented)
+The milestone acceptance is still open. `ToolSpec` has no trusted per-output
+budget/spill policy; decoded process/provider/error fields do not yet pass
+through one output broker; context diagnostics/catalog scans are not all
+bounded by logical history size; and the approval model has no narrow,
+revocable task/session standing grant. Permission declarations also cannot
+contain a hostile child until M13 brokers the underlying resources. See
+`CORE-04`, `CORE-08`, `CTX-07` and `CTX-09`.
 
-Coding-workload A/B/C comparison with lifecycle metrics. The evaluation
-harness itself landed with P3 (`agent-replay`: seven deterministic
-scenarios, generic `run_engine` over any `ContextEngine`, token-cost /
-over-budget / churn / working-set metrics, `--compare` CLI); this
-milestone closes the acceptance's second half — saving tokens must not
-lower task success rate — with an explicit test, and records the
-measurement.
+## V1-M15 Real Evaluation 🧪 (replay and live smoke only)
+
+The evaluation infrastructure has useful deterministic policy comparisons,
+but the named real-coding acceptance is not complete.
 
 - **Harness.** `agent-replay` replays each scripted workload through the
   three engines (A append-only / B rolling-summary / C dynamic) under a
   shared 12 K-token budget and reports input-token totals/peaks,
   over-budget snapshots, lifecycle churn and final working-set size.
-  The engines and the token estimator are the same code the runtime
-  uses, so the comparison measures the policy, not an approximation.
+  It exercises the production context engines, but its token number is a
+  policy proxy: it does not price the complete provider request, TurnFrame,
+  tool schemas, compactor/recall/store work or wall time.
 - **Token saving is measured, not asserted.** On the heavy scenarios the
   dynamic engine costs a small fraction of append-only (budget 12 K):
   `long_refactor` 622,560 → 64,014 input tokens total (peak 17,425 →
@@ -1241,33 +1306,29 @@ measurement.
   C never exceeds the budget (A blows past it 13–22 times). The
   superseded-decisions scenario, where P3 measured a C penalty, now
   costs C 4,469 vs 7,054 — the P4 supersession rules closed that gap.
-- **Success-rate half, covered by test.** The new
+- **Fact-retention proxy.** The
   `dynamic_saves_tokens_without_losing_failure_facts` test asserts, on
   `long_refactor` and `test_fix_loop`, that C's input-token total stays
   below half of A's, C stays in budget, and every failure fact
   (`ContextKind::Error`) in C's trace was selected by at least one model
-  round — the fix always had the failing observation in view while it
-  mattered. A scripted workload can only succeed if the failure facts
-  stay visible, so "selected when needed" is the replay-level proxy for
-  task success.
+  round. This measures necessary-fact visibility, not whether a model edits
+  the repository correctly or passes tests.
 - **Working-set focus.** C archives completed/old-task detail
   (`final_active` 6–24 vs A/B 31–97); the task-switch and
   post-completion contamination scenarios are C's sharpest advantage
   (`task_switch_and_return` 22,476 → 6,708; `completed_then_unrelated`
   140,365 → 16,949).
 
-Acceptance: the dynamic runtime saves tokens without lowering task
-success rate — the token numbers above and the
-`dynamic_saves_tokens_without_losing_failure_facts` test (all
-agent-replay tests green, A/B/C replay baseline unchanged), plus the
-live measurement against a real model below.
+Preliminary result: the dynamic policy saves estimated context tokens and
+usually reduces stale-fact leakage in the scripted traces. Acceptance remains
+open until paired real coding tasks verify repository outcomes and count all
+provider, tool, context, compaction, store and wall-time costs.
 
 ### Live measurement (real model, `agent-eval`)
 
-The follow-up is now runnable: `crates/agent-eval` is a headless
-composition of the real runtime (real OpenAI-compatible provider via
-`OPENAI_API_KEY`/`OPENAI_BASE_URL`/`OPENAI_MODEL`, real tools, one
-context engine) that drives a task end to end and measures **true
+The live-smoke runner is runnable: `crates/agent-eval` composes the real
+runtime and an OpenAI-compatible provider via
+`OPENAI_API_KEY`/`OPENAI_BASE_URL`/`OPENAI_MODEL`, and measures **reported
 provider usage** through the new `RuntimeEvent::ModelUsed` (emitted at
 turn commit with the round's reported input/output tokens).
 
@@ -1277,7 +1338,8 @@ turn commit with the round's reported input/output tokens).
   tools; instead it is exactly the dynamic working set's acceptance
   scenario: five constraints stated up front, eighteen turns of
   unrelated noise, then a question only answerable from what the
-  context frame retained.
+  context frame retained. This is a useful long-context smoke, but it is not
+  a coding workload and does not exercise tool/effect/sandbox behavior.
 - Measured (2026-08-10, 20 turns, real model): all three engines pass
   (A/B/C each answer both facts correctly), and C costs **22% less
   input tokens than A** (133,249 vs 170,240; B 169,778). The gap is
@@ -1323,18 +1385,19 @@ Measured on the seven scenarios (budget 12 K):
   the working set too early. It is the documented input for the next
   non-vector policy iteration, not a hidden pass.
 
-The proxy makes the roadmap's completion-quality metrics (completion
-quality, repeated-mistake rate, stale instruction leakage, incorrect
-eviction rate) replay-level and CI-runnable, and the live measurement
-above confirms the direction against a real model.
+The proxy makes required/forbidden-fact visibility, stale-instruction leakage
+and some incorrect-eviction signals CI-runnable. It does not measure
+completion quality or task success. `M15` requires a real coding suite with
+hidden verification, paired repeats and confidence bounds; see
+`docs/EXPERIMENTS.md`.
 
-## V2 Self-Iteration 🚧 (partially implemented)
+## V2 Self-Iteration 🔒 (blocked; foundations only)
 
 The full vision — the LLM generates a capability, the runtime sandboxes
 it, tests it, replays it, evaluates it, canaries it, and promotes it to
-Stable — is the roadmap's autonomy goal. The reachable slice at this
-head protects the two things the vision says the LLM must never touch,
-and wires the loop's test step to the sandbox:
+Stable — is the roadmap's autonomy goal. The current code contains useful
+prerequisites, but they are not a partial autonomous loop and do not satisfy
+the effect/sandbox gates:
 
 - **The evaluation Core is read-only for capabilities.** The maturity
   ladder (V1-P7) pins every out-of-process registration to
@@ -1355,28 +1418,24 @@ and wires the loop's test step to the sandbox:
   refused with an error naming the missing grant while its reads work,
   the `workspace:write` grant opens the same journaled write path, and
   an unknown permission string grants no handle.
-- **The test step runs inside the sandbox.** A capability's self-check
+- **A self-check runs inside the hardened process host.** A capability's self-check
   is a contained verification: the mock's `self_check` op writes its
   artifact into its own working directory and reports the result, and
   `sandboxed_self_check_artifacts_stay_contained` asserts the artifact
   lands in the sandboxed cwd and never escapes to the parent — the
-  "test" leg of the loop executes generated code in the same strict
-  boundary (`agent-process` sandbox: env whitelist, dedicated cwd,
-  resource limits, cancel-kills-tree) the runtime will later rely on.
+  exercise uses the same env/cwd/limit/cancellation hooks intended for later
+  work. It does not prove containment against absolute filesystem/network
+  access and therefore is not yet the trusted "test" leg.
 
-Deferred (honest remainder): the autonomous generate→compile→register
-loop, canary promotion, and auto-advance to Stable. Those need an
-LLM-authored-code-to-sandbox-test pipeline that is a product decision,
-not a single code change; the evaluation/permission boundary they must
-respect is already tested.
+Blocked remainder: close M10 and M12-M15, then build the autonomous
+generate→compile→register→canary→stable loop. The agent must never be able to
+modify the evaluation, permission or promotion Core.
 
-## V1-M12 Effect Runtime ✅ (implemented)
+## V1-M12 Effect Runtime ⛔ (in-process prepared-effect slice only)
 
-Every side effect — builtin tool or capability — routes through one
-unified `EffectRequest` / `Effect` commit behind the runtime's generation
-fence:
+The contracts and in-process prepared-effect path exist:
 
-- **The contract is one channel.** `Effect` (commit/rollback, structured
+- **The intended contract is one channel.** `Effect` (commit/rollback, structured
   `EffectCommitError`), `ToolOutcome::PreparedEffect` for builtin tools and
   `CapabilityOutcome::EffectRequest` for capabilities; the capability-aware
   dispatcher forwards a capability's `EffectRequest` as a
@@ -1386,7 +1445,7 @@ fence:
 - **The fence is one place.** `on_operation_completed` validates the
   operation against the generation fence: a stale completion (cancelled or
   superseded) rolls the staged effect back, a live one commits it. A
-  cancelled tool or capability never mutates the workspace.
+  cancelled operation cannot commit that staged mutation.
 - **Commit failures are classified, not swallowed.** `NotApplied` tells
   the model nothing happened; `AppliedButDurabilityFailed` surfaces a
   degraded/recovery warning and tells the model the change *did* land but
@@ -1399,7 +1458,16 @@ fence:
   deletes the staging file, durability-failure semantics) is covered by
   `agent-workspace`'s own tests.
 
-## V1-M11 Context Recall ✅ (implemented)
+The milestone is not complete. `ProcessCapabilityAdapter::invoke` decodes a
+`ToolOutput` and returns `CapabilityOutcome::Value`; its own comment states
+that child effects have already happened and staged-effect transport is
+future work. `shell.exec` likewise executes directly in the real workspace
+and returns a value. Cancellation can stop later work, but cannot roll back a
+mutation already performed. M12 closes only when these paths are brokered as
+typed prepared effects (or are explicitly confined to a non-mutating
+authority) and adversarial stale/cancel tests pass.
+
+## V1-M11 Context Recall ✅ (narrow retrieval baseline)
 
 Externalized information is pulled back on demand, and the prompt stays
 refs-only while it is external:
@@ -1416,6 +1484,11 @@ refs-only while it is external:
   is metadata without a store read, `fetch` reads the exact item content
   back from the store and stamps recency + GC generation on the entry —
   a deliberate read, not an automatic reactivation.
+- **Read and re-entry are separate.** Search/inspect/fetch results stay
+  transient in the current TurnFrame and do not create duplicate context
+  observations. `admit` explicitly moves the same id back into the working
+  set; `derive` creates one new fact with a `DerivedFrom` edge. Per-turn quotas,
+  identity/single-owner tests and runtime E2E coverage bound both mutations.
 - **`gc_epoch`-based external TTLs** count real GC passes, and the store
   IO phases are async and batched (Performance P0/P2), so retrieval and
   eviction never stall the context hot path.

@@ -9,35 +9,21 @@ This repository intentionally does **not** include vectors, RAG, knowledge graph
 ## Architecture
 
 ```text
-                          ┌──────────────┐
-                          │   TUI / CLI  │
-                          └──────┬───────┘
-                                 │ RuntimeEvent / UserInput
-                                 v
-                         ┌───────────────┐
-                         │  AgentKernel  │
-                         └───┬────┬──────┘
-                             │    │
-              ContextEngine │    │ ToolDispatcher
-                             │    │
-                  ┌──────────v┐  ┌v──────────────┐
-                  │ Context   │  │ Tool Runtime  │
-                  │ WorkingSet│  │ + Workspace   │
-                  └─────┬─────┘  └──────┬────────┘
-                        │               │
-                        │ Materialized  │ ToolOutput
-                        │ Context       │
-                        v               v
-                       ModelTransport  Artifact Store
-
-                             RuntimeEvent
-                                  │
-                     ┌────────────┴────────────┐
-                     v                         v
-               RunStateAggregator       Event Journal
-                     │                    (JSONL)
-                     v
-                    TUI
+TUI / composition root
+        │
+        v
+RuntimeInstance ── owns ── ModuleHost / capability registry
+        │
+        v
+RuntimeActor (the only turn/task orchestrator)
+        │
+        v
+AgentKernel (stateless trusted facade)
+   ├─ ContextEngine ──> MaterializedContext ──> PromptAssembler
+   ├─ ToolDispatcher ─> bounded ToolOutput / prepared Effect
+   ├─ ModelTransport
+   ├─ ApprovalGate
+   └─ EventJournal ───> RuntimeEvent ──> TUI view state
 ```
 
 ## Hard boundaries
@@ -49,19 +35,29 @@ This repository intentionally does **not** include vectors, RAG, knowledge graph
 5. **Budget is not forgetting.** The context budget is only the final packing constraint after lifecycle/attention decisions.
 6. **Raw tool output is disposable.** Large output lives in artifacts; only a bounded observation enters the model working set.
 7. **Message-scoped data expires by default.** Explicitly pinned items are the exception.
+8. **There is one orchestrator.** `agent-runtime::RuntimeActor` owns task,
+   turn, scope and prompt state. `agent-kernel` stays a stateless trusted
+   facade and concrete implementations are wired only by the composition root.
 
 ## Workspace crates
 
 - `agent-contracts`: stable cross-layer contracts.
 - `context-simple`: first non-vector working-set implementation (dynamic).
-- `context-baselines`: baseline A (append-only) and B (rolling summary) engines for A/B/C experiments.
+- `context-baselines`: baseline A (append-only) and B (rolling-window + fixed
+  marker, despite the legacy `RollingSummaryEngine` name) for A/B/C experiments.
 - `context-contextcore`: `ContextEngine` adapter over a context-service process boundary (the ContextCore integration shape).
 - `agent-context-service`: standalone context-service process speaking the adapter's JSON-lines protocol.
 - `agent-workspace`: workspace root and artifact storage.
 - `tool-runtime`: tool registry — file tools, `search.grep`, `edit.replace`, git status/diff, streaming `shell.exec`.
 - `agent-storage`: append-only JSONL event journal.
-- `agent-kernel`: thin tool/model/context orchestration loop.
+- `agent-process`: framed child-process host, cancellation and sandbox hooks.
+- `agent-capability-process`: process-capability adapter over `agent-process`.
+- `agent-kernel`: stateless context/tool/model/approval/event facade.
+- `agent-runtime`: sole actor/orchestrator, task state, prompt assembly,
+  checkpoints, tool-surface planning and capability host.
 - `agent-replay`: offline deterministic replay of a context lifecycle from a trace, plus the A/B/C scenario comparison.
+- `agent-eval`: headless live-model smoke runner; it is not yet the real
+  coding-workload acceptance suite.
 - `provider-openai`: OpenAI-compatible streaming model provider (also DeepSeek/Qwen/Moonshot/GLM).
 - `agent-tui`: minimal TUI and wiring; mock model by default.
 
@@ -104,9 +100,10 @@ minutes) so a turn can never hang. For fully automatic policy, start with
 cargo run -p agent-tui -- --read-only .
 ```
 
-### P2 tool set
+### Builtin tool set
 
-The kernel exposes eight tools for repository work:
+The builtin dispatcher provides eight repository tools plus two merged
+runtime-control surfaces:
 
 - `fs.list` / `fs.read` / `fs.write` — file browsing with bounded content;
 - `search.grep` — regex search, ignores build artifacts/vendor dirs
@@ -117,6 +114,9 @@ The kernel exposes eight tools for repository work:
 - `shell.exec` — streaming process execution: full log to an artifact,
   bounded ring-buffer tail to the model, `timeout_ms` and `/cancel` kill the
   child.
+- `context.manage` — bounded GC hints/tags/leases/collect and external
+  search/inspect/fetch/admit/derive requests routed by the runtime;
+- `capability.manage` — paged catalog search/inspect/load/unload.
 
 Every mutating tool also appends a `WorkspaceChange` record (tool, path,
 action, old content when small) to `.focus-agent/changes.jsonl` — the
@@ -140,13 +140,15 @@ review/revert substrate for anything the agent changes.
 cargo run -p agent-replay -- .focus-agent/traces/<run>.jsonl
 ```
 
-Prints, per context item: what entered and why, which turns consumed it,
-every state transition with its reason, and the final state.
+Prints, per context item: what entered and why, which successful model turns
+committed its exact id through `ContextConsumed`, every state transition with
+its reason, and the final state. Legacy traces without consumption events keep
+their original replay semantics.
 
 ## A/B/C context-policy experiments (P3)
 
-The same kernel can run against three context policies — append-only (A),
-rolling summary (B), dynamic working set (C, default) — plus the
+The same runtime can run against three context policies — append-only (A),
+rolling-window marker (B), dynamic working set (C, default) — plus the
 process-boundary adapter (P5):
 
 ```bash
@@ -176,4 +178,19 @@ dependencies of selected items into the working set — all recorded as
 lifecycle transitions / dependency edges and covered in
 `docs/CONTEXT_LIFECYCLE.md` §9b–9c.
 
-See `docs/ARCHITECTURE.md`, `docs/CONTEXT_LIFECYCLE.md`, and `docs/ROADMAP.md`.
+See `docs/ARCHITECTURE.md`, `docs/CONTEXT_LIFECYCLE.md`,
+`docs/CONTEXT_RUNTIME_TODO.md` (the code-grounded continuous-GC design queue),
+`docs/TOOL_ECOSYSTEM_TODO.md` (modular trust boundaries, builtin ACI, and
+extension ecosystem design queue),
+and `docs/ROADMAP.md`.
+
+## Current status
+
+The dynamic-context and round-surface baselines are substantial, but this is
+still a research prototype. Runtime transactions, external recall, exact
+model-consumption acknowledgement and store-backed GC are implemented.
+Cross-plane checkpoints, canonical context ownership, TaskAnchor/completion
+semantics, process effect brokering, real filesystem/network isolation,
+standing unattended-task policy and real coding non-inferiority remain open.
+The code-grounded status table in `docs/ROADMAP.md` is authoritative; confirmed
+defects and acceptance tests are tracked in `docs/AUDIT_TODO.md`.

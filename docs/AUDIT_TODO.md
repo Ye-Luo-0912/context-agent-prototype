@@ -460,8 +460,9 @@ Required order:
 7. adversarial tests proving a cancelled/ReadOnly process cannot mutate an
    absolute path, use undeclared network or outlive its operation.
 
-**Closed 2026-08-10 (runtime-owned boundary; OS-level FS/network brokering
-stays M13 — external process capabilities remain Disabled by default).**
+**Partially repaired 2026-08-10.** The in-process/runtime-owned mutation path
+is fenced and external process capabilities remain Disabled by default. The
+process wire and OS isolation defects below keep CORE-01/M12/M13 open.
 
 Implemented:
 
@@ -512,7 +513,7 @@ Implemented:
    `stderr_is_drained_into_a_bounded_tail` (a 4 MiB stderr flood leaves an
    8 KiB tail ending in the newest bytes).
 
-Residual (M12/M13, not closed here): OS-level filesystem/network isolation
+Residual (M12/M13; CORE-01 remains open): OS-level filesystem/network isolation
 for the child process (absolute paths and network remain available to a
 hostile child at the OS layer), Windows Job-Object quota enforcement, and
 the wire-level effect broker that lets a child stage mutations as
@@ -712,8 +713,10 @@ lower-authority role/structured field. Add malicious file/tool/store evals.
 ### CORE-06 — Cancellation/approval/process cleanup
 
 - Git now kills the direct child, not guaranteed descendants;
-- shell/process capabilities need process groups/Job Objects and bounded
-  artifact/line/total-output quotas;
+- process-capability cancellation now kills a Unix process group or invokes
+  Windows `taskkill /T`, but shell/Git descendants and Windows Job-Object
+  quota enforcement remain incomplete; every process path still needs bounded
+  artifact/line/decoded-total quotas;
 - approval timeout/cancel needs pending cleanup and bounded previews; UI
   defaults must not turn ambiguity/truncation into allow;
 - provider streams need total response/error/SSE byte caps and explicit
