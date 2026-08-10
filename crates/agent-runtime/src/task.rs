@@ -13,8 +13,10 @@
 //! scopes. A prepared-but-uncommitted transition is simply discarded.
 
 use agent_contracts::{
-    AgentError, AgentResult, MAX_TASK_TOOL_REQUIREMENTS, MAX_TOOL_REQUIREMENT_NAME_CHARS,
-    MAX_TOOL_REQUIREMENT_REASON_CHARS, TaskId, ToolSurfaceRequirement,
+    AgentError, AgentResult, MAX_TASK_ANCHOR_CHANGED_FIELDS, MAX_TASK_ANCHOR_CLAIMS,
+    MAX_TASK_ANCHOR_ITEM_CHARS, MAX_TASK_ANCHOR_LIST_ITEMS, MAX_TASK_ANCHOR_TEXT_CHARS,
+    MAX_TASK_TOOL_REQUIREMENTS, MAX_TOOL_REQUIREMENT_NAME_CHARS, MAX_TOOL_REQUIREMENT_REASON_CHARS,
+    TaskId, ToolSurfaceRequirement,
 };
 
 /// Lifecycle of a task. `Suspended` tasks keep their scopes in the engine
@@ -38,6 +40,10 @@ pub struct TaskRecord {
     /// Exact tool demand owned by this task. This is declarative demand only:
     /// it neither enables a capability nor grants effect authority.
     pub tool_requirements: TaskToolRequirementSet,
+    /// The task's authoritative anchor: goal interpretation, constraints,
+    /// acceptance criteria, plan, open loops and typed root claims. This is
+    /// task authority, not a scored ContextItem.
+    pub anchor: TaskAnchor,
 }
 
 /// The bounded, revisioned tool-requirement slice of a TaskAnchor.
@@ -51,6 +57,86 @@ pub struct TaskToolRequirementSet {
     pub entries: Vec<ToolSurfaceRequirement>,
 }
 
+/// The actor-owned, bounded, versioned anchor of one task.
+///
+/// The anchor is task authority: it lives with the `TaskManager`, never as a
+/// scored `ContextItem`, so a replaceable context policy cannot collect or
+/// rewrite it, and task state is never duplicated across orchestrators. The
+/// full anchor is persisted in `RuntimeCheckpoint`; events carry only bounded
+/// summaries. Every field is capped (see the `MAX_TASK_ANCHOR_*` bounds), and
+/// the whole anchor is replaced through compare-and-swap so stale writers
+/// cannot silently merge intent.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TaskAnchor {
+    /// Monotonic per-task revision. An anchor at revision 0 is the initial
+    /// empty anchor (goal only, stamped from the task goal at creation);
+    /// every CAS replacement bumps it.
+    pub revision: u64,
+    /// The user-given goal the task was created with. Immutable in practice
+    /// (the task identity keys on it) and carried so restore can re-derive
+    /// the focus goal without replaying the transcript.
+    pub original_goal: String,
+    /// The runtime's current interpretation of the goal, which may have
+    /// evolved as constraints and findings landed.
+    pub current_interpretation: String,
+    /// Hard user-authority constraints the task must respect.
+    pub constraints: Vec<String>,
+    /// Acceptance criteria the completion outcome is measured against.
+    pub acceptance_criteria: Vec<String>,
+    /// Ordered plan progress: what has been done and what is next.
+    pub plan_progress: Vec<String>,
+    /// Open loops the task is still working: unresolved questions,
+    /// pending verifications, follow-ups.
+    pub open_loops: Vec<String>,
+    /// Typed root claims that must stay resident (or recallable) while this
+    /// task is active.
+    pub working_refs: Vec<ContextRootClaim>,
+    /// Typed retention claims that must survive in storage but are not
+    /// automatic prompt/residency roots for unrelated tasks.
+    pub evidence_refs: Vec<ContextRootClaim>,
+}
+
+/// One typed root claim inside a `TaskAnchor`. The role says *why* the claim
+/// exists; the strength says *how strongly* the context policy must hold it.
+/// The ref names a context item id, artifact ref, or exact entity name — the
+/// anchor does not embed item bodies.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ContextRootClaim {
+    pub item_ref: String,
+    pub role: RootClaimRole,
+    pub strength: RootClaimStrength,
+    /// Which anchor field the claim came from (for provenance/audit).
+    pub source_field_id: String,
+}
+
+/// Why a root claim exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootClaimRole {
+    ConstraintSource,
+    AcceptanceEvidence,
+    ActiveDecision,
+    OpenLoopEvidence,
+    WorkingArtifact,
+    Verification,
+}
+
+/// How strongly the context policy must hold a root claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootClaimStrength {
+    /// The claim must be in the model prompt for this task.
+    PromptRequired,
+    /// The claim must stay resident in the working set.
+    ResidentRequired,
+    /// The claim must survive in storage (never permanently deleted).
+    StorageRequired,
+    /// The claim is recallable on demand; no residency guarantee.
+    Recallable,
+}
+
 /// A serializable snapshot for the UI (`/tasks`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskInfo {
@@ -62,6 +148,8 @@ pub struct TaskInfo {
     /// Bounded summary only; requirement content is audited by the change
     /// event and persisted in RuntimeCheckpoint.
     pub tool_requirement_count: usize,
+    /// CAS base callers must use for the next whole-anchor replacement.
+    pub anchor_revision: u64,
 }
 
 /// A pending task-state transition produced by `TaskManager::prepare_*`.
@@ -92,6 +180,11 @@ enum TaskPlan {
     ReplaceToolRequirements {
         target: TaskId,
         replacement: TaskToolRequirementSet,
+    },
+    /// Atomically replace one task's whole anchor (bounded, versioned).
+    ReplaceAnchor {
+        target: TaskId,
+        replacement: TaskAnchor,
     },
 }
 
@@ -231,6 +324,57 @@ impl TaskManager {
         ))
     }
 
+    /// Plan a bounded whole-anchor CAS replacement of a task's authority.
+    ///
+    /// The supplied `base_revision` must match the task's current anchor
+    /// revision. The caller's anchor content is validated and bounded; the
+    /// revision field on the supplied anchor is ignored and re-stamped by the
+    /// CAS (equivalent anchors are idempotent and do not bump it). Completed
+    /// tasks are immutable. Returns the transaction, the resulting revision,
+    /// and the capped list of field names whose content moved.
+    pub fn prepare_replace_anchor(
+        &self,
+        task_id: TaskId,
+        base_revision: u64,
+        mut anchor: TaskAnchor,
+    ) -> AgentResult<(TaskTxn, u64, Vec<String>)> {
+        let task = self.get(task_id).ok_or_else(|| {
+            AgentError::InvalidRequest(format!("task {task_id} is not registered"))
+        })?;
+        if task.status == TaskStatus::Completed {
+            return Err(AgentError::InvalidRequest(format!(
+                "task {task_id} is completed and its anchor is immutable"
+            )));
+        }
+        if task.anchor.revision != base_revision {
+            return Err(AgentError::InvalidRequest(format!(
+                "task {task_id} anchor revision mismatch: expected {}, got {base_revision}",
+                task.anchor.revision
+            )));
+        }
+
+        normalize_anchor(&mut anchor)?;
+        let changed_fields = anchor_changed_fields(&task.anchor, &anchor);
+        let revision = if changed_fields.is_empty() {
+            base_revision
+        } else {
+            base_revision.checked_add(1).ok_or_else(|| {
+                AgentError::InvalidRequest(format!("task {task_id} anchor revision is exhausted"))
+            })?
+        };
+        anchor.revision = revision;
+        Ok((
+            TaskTxn {
+                plan: TaskPlan::ReplaceAnchor {
+                    target: task_id,
+                    replacement: anchor,
+                },
+            },
+            revision,
+            changed_fields,
+        ))
+    }
+
     /// Apply a prepared transition. Call only after the external transition
     /// (the engine's `set_focus` / `clear_focus` / task completion) has
     /// succeeded, so the task table and the engine's scopes stay in sync.
@@ -245,11 +389,15 @@ impl TaskManager {
                 let now = now_ms();
                 self.tasks.push(TaskRecord {
                     id: target,
-                    goal,
+                    goal: goal.clone(),
                     status: TaskStatus::Active,
                     created_at_ms: now,
                     last_active_ms: now,
                     tool_requirements: TaskToolRequirementSet::default(),
+                    anchor: TaskAnchor {
+                        original_goal: goal,
+                        ..TaskAnchor::default()
+                    },
                 });
                 self.active = Some(target);
             }
@@ -282,6 +430,14 @@ impl TaskManager {
             } => {
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == target) {
                     task.tool_requirements = replacement;
+                }
+            }
+            TaskPlan::ReplaceAnchor {
+                target,
+                replacement,
+            } => {
+                if let Some(task) = self.tasks.iter_mut().find(|task| task.id == target) {
+                    task.anchor = replacement;
                 }
             }
         }
@@ -326,6 +482,7 @@ impl TaskManager {
                 status: task.status,
                 tool_requirement_revision: task.tool_requirements.revision,
                 tool_requirement_count: task.tool_requirements.entries.len(),
+                anchor_revision: task.anchor.revision,
             })
             .collect()
     }
@@ -379,6 +536,122 @@ pub(crate) fn normalize_tool_requirements(
     Ok(entries)
 }
 
+/// Validate and bound one task-owned anchor before it enters the task table.
+/// The revision field is owned by the CAS flow and is left untouched here.
+pub(crate) fn normalize_anchor(anchor: &mut TaskAnchor) -> AgentResult<()> {
+    check_bounded_text("anchor original_goal", &anchor.original_goal)?;
+    check_bounded_text(
+        "anchor current_interpretation",
+        &anchor.current_interpretation,
+    )?;
+    for (field, list) in [
+        ("constraints", &anchor.constraints),
+        ("acceptance_criteria", &anchor.acceptance_criteria),
+        ("plan_progress", &anchor.plan_progress),
+        ("open_loops", &anchor.open_loops),
+    ] {
+        check_bounded_list(field, list)?;
+    }
+    for (field, claims) in [
+        ("working_refs", &anchor.working_refs),
+        ("evidence_refs", &anchor.evidence_refs),
+    ] {
+        if claims.len() > MAX_TASK_ANCHOR_CLAIMS {
+            return Err(AgentError::InvalidRequest(format!(
+                "anchor {field} carries {} claims, above the {MAX_TASK_ANCHOR_CLAIMS} cap",
+                claims.len()
+            )));
+        }
+        for claim in claims {
+            check_bounded_text(&format!("{field}.item_ref"), &claim.item_ref)?;
+            check_bounded_text(&format!("{field}.source_field_id"), &claim.source_field_id)?;
+        }
+    }
+    Ok(())
+}
+
+/// The capped list of anchor field names whose content differs from `old`,
+/// used by the bounded `TaskAnchorChanged` audit event. `old` and `new` must
+/// both already be normalized.
+pub(crate) fn anchor_changed_fields(old: &TaskAnchor, new: &TaskAnchor) -> Vec<String> {
+    let mut changed = Vec::new();
+    let consider = |name: &str, different: bool, changed: &mut Vec<String>| {
+        if different && changed.len() < MAX_TASK_ANCHOR_CHANGED_FIELDS {
+            changed.push(name.to_string());
+        }
+    };
+    consider(
+        "original_goal",
+        old.original_goal != new.original_goal,
+        &mut changed,
+    );
+    consider(
+        "current_interpretation",
+        old.current_interpretation != new.current_interpretation,
+        &mut changed,
+    );
+    consider(
+        "constraints",
+        old.constraints != new.constraints,
+        &mut changed,
+    );
+    consider(
+        "acceptance_criteria",
+        old.acceptance_criteria != new.acceptance_criteria,
+        &mut changed,
+    );
+    consider(
+        "plan_progress",
+        old.plan_progress != new.plan_progress,
+        &mut changed,
+    );
+    consider("open_loops", old.open_loops != new.open_loops, &mut changed);
+    consider(
+        "working_refs",
+        old.working_refs != new.working_refs,
+        &mut changed,
+    );
+    consider(
+        "evidence_refs",
+        old.evidence_refs != new.evidence_refs,
+        &mut changed,
+    );
+    changed
+}
+
+fn check_bounded_text(field: &str, value: &str) -> AgentResult<()> {
+    let chars = value.chars().count();
+    if chars > MAX_TASK_ANCHOR_TEXT_CHARS {
+        return Err(AgentError::InvalidRequest(format!(
+            "{field} has {chars} chars, above the {MAX_TASK_ANCHOR_TEXT_CHARS} cap"
+        )));
+    }
+    Ok(())
+}
+
+fn check_bounded_list(field: &str, list: &[String]) -> AgentResult<()> {
+    if list.len() > MAX_TASK_ANCHOR_LIST_ITEMS {
+        return Err(AgentError::InvalidRequest(format!(
+            "{field} carries {} entries, above the {MAX_TASK_ANCHOR_LIST_ITEMS} cap",
+            list.len()
+        )));
+    }
+    for entry in list {
+        let chars = entry.chars().count();
+        if chars == 0 {
+            return Err(AgentError::InvalidRequest(format!(
+                "{field} contains an empty entry"
+            )));
+        }
+        if chars > MAX_TASK_ANCHOR_ITEM_CHARS {
+            return Err(AgentError::InvalidRequest(format!(
+                "{field} entry has {chars} chars, above the {MAX_TASK_ANCHOR_ITEM_CHARS} cap"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Check that a checkpoint-owned set is both valid and already canonical.
 pub(crate) fn validate_tool_requirement_set(
     requirements: &TaskToolRequirementSet,
@@ -392,6 +665,24 @@ pub(crate) fn validate_tool_requirement_set(
     if requirements.revision == 0 && !requirements.entries.is_empty() {
         return Err(AgentError::InvalidRequest(
             "task tool requirements at revision 0 must be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Check that a checkpoint-owned anchor is bounded and its revision is
+/// consistent with the CAS flow: the initial anchor is revision 0 with no
+/// evolved fields (only the original goal), so a checkpoint cannot mint a
+/// zero-revision anchor that pretends to have evolved content.
+pub(crate) fn validate_anchor(anchor: &TaskAnchor) -> AgentResult<()> {
+    normalize_anchor(&mut anchor.clone())?;
+    let empty_evolved = TaskAnchor {
+        original_goal: anchor.original_goal.clone(),
+        ..TaskAnchor::default()
+    };
+    if anchor.revision == 0 && anchor != &empty_evolved {
+        return Err(AgentError::InvalidRequest(
+            "task anchor at revision 0 must carry only the original goal".into(),
         ));
     }
     Ok(())
@@ -610,6 +901,154 @@ mod tests {
         let restored = &tasks.get(task_a).unwrap().tool_requirements;
         assert_eq!(restored.revision, 1);
         assert_eq!(restored.entries[0].tool_name, "fs.read");
+        assert_eq!(tasks.get(task_b).unwrap().status, TaskStatus::Suspended);
+    }
+
+    fn evolved_anchor() -> TaskAnchor {
+        TaskAnchor {
+            revision: 0, // the CAS flow re-stamps this
+            original_goal: "task A".into(),
+            current_interpretation: "refactor the auth module".into(),
+            constraints: vec!["no dependency changes".into()],
+            acceptance_criteria: vec!["tests pass".into(), "api unchanged".into()],
+            plan_progress: vec!["read the module".into()],
+            open_loops: vec!["verify edge cases".into()],
+            working_refs: vec![ContextRootClaim {
+                item_ref: "item:auth".into(),
+                role: RootClaimRole::ActiveDecision,
+                strength: RootClaimStrength::ResidentRequired,
+                source_field_id: "plan_progress".into(),
+            }],
+            evidence_refs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn anchor_is_whole_set_cas_bounded_and_idempotent() {
+        let mut tasks = TaskManager::new();
+        let task_id = create(&mut tasks, "task A");
+
+        // The initial anchor carries only the original goal at revision 0.
+        let initial = tasks.get(task_id).unwrap().anchor.clone();
+        assert_eq!(initial.revision, 0);
+        assert_eq!(initial.original_goal, "task A");
+        assert!(initial.current_interpretation.is_empty());
+        assert!(initial.constraints.is_empty());
+
+        let (txn, revision, changed_fields) = tasks
+            .prepare_replace_anchor(task_id, 0, evolved_anchor())
+            .expect("initial CAS is valid");
+        assert_eq!(revision, 1);
+        assert_eq!(
+            changed_fields,
+            vec![
+                "current_interpretation",
+                "constraints",
+                "acceptance_criteria",
+                "plan_progress",
+                "open_loops",
+                "working_refs"
+            ]
+        );
+        assert_eq!(
+            tasks.get(task_id).unwrap().anchor.revision,
+            0,
+            "prepare is not visible before commit"
+        );
+        tasks.commit(txn);
+        let stored = &tasks.get(task_id).unwrap().anchor;
+        assert_eq!(stored.revision, 1);
+        assert_eq!(stored.current_interpretation, "refactor the auth module");
+        assert_eq!(stored.working_refs[0].role, RootClaimRole::ActiveDecision);
+        assert_eq!(tasks.list()[0].anchor_revision, 1);
+
+        // Equivalent replacement is idempotent and does not bump revision.
+        let (txn, revision, changed_fields) = tasks
+            .prepare_replace_anchor(task_id, 1, evolved_anchor())
+            .expect("equivalent anchor is valid");
+        assert_eq!(revision, 1, "an equivalent anchor must not bump revision");
+        assert!(changed_fields.is_empty());
+        tasks.commit(txn);
+        assert_eq!(tasks.get(task_id).unwrap().anchor.revision, 1);
+
+        // A stale base revision is rejected by CAS.
+        let stale = tasks.prepare_replace_anchor(task_id, 0, evolved_anchor());
+        assert!(matches!(stale, Err(AgentError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn anchor_validation_is_bounded_and_refuses_empty_entries() {
+        let mut tasks = TaskManager::new();
+        let task_id = create(&mut tasks, "task A");
+
+        let mut too_long = evolved_anchor();
+        too_long.current_interpretation = "理".repeat(MAX_TASK_ANCHOR_TEXT_CHARS + 1);
+        assert!(matches!(
+            tasks.prepare_replace_anchor(task_id, 0, too_long),
+            Err(AgentError::InvalidRequest(_))
+        ));
+
+        let mut too_many_loops = evolved_anchor();
+        too_many_loops.open_loops = (0..=MAX_TASK_ANCHOR_LIST_ITEMS)
+            .map(|index| format!("loop {index}"))
+            .collect();
+        assert!(matches!(
+            tasks.prepare_replace_anchor(task_id, 0, too_many_loops),
+            Err(AgentError::InvalidRequest(_))
+        ));
+
+        let mut empty_entry = evolved_anchor();
+        empty_entry.constraints = vec![String::new()];
+        assert!(matches!(
+            tasks.prepare_replace_anchor(task_id, 0, empty_entry),
+            Err(AgentError::InvalidRequest(_))
+        ));
+
+        let mut too_many_claims = evolved_anchor();
+        too_many_claims.working_refs = (0..=MAX_TASK_ANCHOR_CLAIMS)
+            .map(|index| ContextRootClaim {
+                item_ref: format!("item:{index}"),
+                role: RootClaimRole::WorkingArtifact,
+                strength: RootClaimStrength::Recallable,
+                source_field_id: "open_loops".into(),
+            })
+            .collect();
+        assert!(matches!(
+            tasks.prepare_replace_anchor(task_id, 0, too_many_claims),
+            Err(AgentError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn completed_task_rejects_anchor_replacement() {
+        let mut tasks = TaskManager::new();
+        let task_id = create(&mut tasks, "task A");
+        let txn = tasks.prepare_complete().expect("task is active");
+        tasks.commit(txn);
+
+        assert!(matches!(
+            tasks.prepare_replace_anchor(task_id, 0, evolved_anchor()),
+            Err(AgentError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn anchor_survives_suspend_and_resume() {
+        let mut tasks = TaskManager::new();
+        let task_a = create(&mut tasks, "task A");
+        let (replace, _, _) = tasks
+            .prepare_replace_anchor(task_a, 0, evolved_anchor())
+            .unwrap();
+        tasks.commit(replace);
+
+        let task_b = create(&mut tasks, "task B");
+        assert_eq!(tasks.get(task_a).unwrap().status, TaskStatus::Suspended);
+        let activate = tasks.prepare_activate(task_a).unwrap();
+        tasks.commit(activate);
+
+        let restored = &tasks.get(task_a).unwrap().anchor;
+        assert_eq!(restored.revision, 1);
+        assert_eq!(restored.acceptance_criteria.len(), 2);
         assert_eq!(tasks.get(task_b).unwrap().status, TaskStatus::Suspended);
     }
 }

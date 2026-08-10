@@ -426,6 +426,49 @@ impl RuntimeActor {
                 };
                 let _ = reply.send(result);
             }
+            RuntimeCommand::UpdateTaskAnchor {
+                task_id,
+                base_revision,
+                anchor,
+                reply,
+            } => {
+                let result = match self.ensure_idle() {
+                    Err(error) => Err(error),
+                    Ok(()) => match self.state.tasks.prepare_replace_anchor(
+                        task_id,
+                        base_revision,
+                        anchor,
+                    ) {
+                        Err(error) => Err(error),
+                        Ok((txn, revision, changed_fields)) => {
+                            if changed_fields.is_empty() {
+                                // Equivalent anchor: idempotent, no change
+                                // event, no generation bump.
+                                self.state.tasks.commit(txn);
+                                Ok(revision)
+                            } else {
+                                match self
+                                    .kernel
+                                    .emit_event(RuntimeEvent::TaskAnchorChanged {
+                                        task_id,
+                                        revision,
+                                        changed_fields,
+                                    })
+                                    .await
+                                {
+                                    Err(error) => Err(error),
+                                    Ok(()) => {
+                                        self.state.tasks.commit(txn);
+                                        self.state.generation += 1;
+                                        Ok(revision)
+                                    }
+                                }
+                            }
+                        }
+                    },
+                };
+                let _ = reply.send(result);
+            }
             RuntimeCommand::Pin { content, reply } => {
                 let result = match self.ensure_idle() {
                     Ok(()) => {

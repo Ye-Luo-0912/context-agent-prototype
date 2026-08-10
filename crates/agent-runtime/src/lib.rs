@@ -35,4 +35,7 @@ pub use modules::{
     ApprovalModule, ArtifactModule, ContextModule, EventModule, ModelModule, ToolModule,
 };
 pub use prompt::PromptAssembler;
-pub use task::{TaskInfo, TaskManager, TaskRecord, TaskStatus, TaskToolRequirementSet};
+pub use task::{
+    ContextRootClaim, RootClaimRole, RootClaimStrength, TaskAnchor, TaskInfo, TaskManager,
+    TaskRecord, TaskStatus, TaskToolRequirementSet,
+};

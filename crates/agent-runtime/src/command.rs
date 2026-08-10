@@ -7,7 +7,7 @@ use agent_contracts::{
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::checkpoint::RuntimeCheckpoint;
-use crate::task::TaskInfo;
+use crate::task::{TaskAnchor, TaskInfo};
 
 /// Reply channel back to the caller of a command.
 pub type Reply<T> = oneshot::Sender<T>;
@@ -47,6 +47,14 @@ pub enum RuntimeCommand {
         task_id: TaskId,
         base_revision: u64,
         entries: Vec<ToolSurfaceRequirement>,
+        reply: Reply<AgentResult<u64>>,
+    },
+    /// Atomically replace one task's whole anchor (bounded, versioned) when
+    /// `base_revision` still matches.
+    UpdateTaskAnchor {
+        task_id: TaskId,
+        base_revision: u64,
+        anchor: TaskAnchor,
         reply: Reply<AgentResult<u64>>,
     },
     Pin {
@@ -161,6 +169,24 @@ impl RuntimeHandle {
             task_id,
             base_revision,
             entries,
+            reply,
+        })
+        .await
+    }
+
+    /// Replace a task's whole anchor through whole-set CAS and return the
+    /// resulting revision. An equivalent anchor is idempotent and returns
+    /// the existing revision.
+    pub async fn update_task_anchor(
+        &self,
+        task_id: TaskId,
+        base_revision: u64,
+        anchor: TaskAnchor,
+    ) -> AgentResult<u64> {
+        self.call(|reply| RuntimeCommand::UpdateTaskAnchor {
+            task_id,
+            base_revision,
+            anchor,
             reply,
         })
         .await

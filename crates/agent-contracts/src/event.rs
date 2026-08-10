@@ -135,6 +135,16 @@ pub enum RuntimeEvent {
     TaskCompleted {
         summary: String,
     },
+    /// A task's anchor was replaced through whole-set CAS. The event is the
+    /// bounded audit row: task identity, the resulting revision, and the
+    /// names of the fields whose content moved (capped). Full anchor content
+    /// lives in RuntimeCheckpoint, never in the event stream.
+    TaskAnchorChanged {
+        task_id: TaskId,
+        revision: u64,
+        #[serde(default)]
+        changed_fields: Vec<String>,
+    },
     TurnCompleted,
     /// A mandatory turn-commit step failed: the model answered, but the
     /// runtime did not durably commit the turn (observation ingest,

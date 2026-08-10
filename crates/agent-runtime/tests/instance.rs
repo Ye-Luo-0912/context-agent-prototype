@@ -16,7 +16,10 @@ use agent_contracts::{
     ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
-use agent_runtime::{CapabilityId, Module, ModuleHost, RuntimeInstance, ServiceRegistry};
+use agent_runtime::{
+    CapabilityId, ContextRootClaim, Module, ModuleHost, RootClaimRole, RootClaimStrength,
+    RuntimeInstance, ServiceRegistry, TaskAnchor,
+};
 
 /// Build an instance over the real reference engine, so the checkpoint test
 /// exercises items, scopes and focus — not a stub that trivially roundtrips.
@@ -711,6 +714,128 @@ async fn restore_audit_failure_demands_recovery_and_fences_mutation() {
     );
     failing.shutdown().await.unwrap();
     source.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_anchor_update_publishes_a_bounded_event() {
+    let (instance, _context) = simple_instance().await;
+    let mut events = instance.handle().subscribe();
+    instance
+        .handle()
+        .set_focus("refactor auth".into())
+        .await
+        .unwrap();
+    let task_id = instance.handle().list_tasks().await.unwrap()[0].id;
+
+    let anchor = TaskAnchor {
+        original_goal: "refactor auth".into(),
+        current_interpretation: "split the auth module".into(),
+        acceptance_criteria: vec!["tests pass".into()],
+        open_loops: vec!["verify edge cases".into()],
+        ..TaskAnchor::default()
+    };
+    let revision = instance
+        .handle()
+        .update_task_anchor(task_id, 0, anchor)
+        .await
+        .unwrap();
+    assert_eq!(revision, 1);
+
+    // The bounded audit event names the task, the resulting revision and
+    // the fields that moved — never the full anchor content.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw = None;
+    while tokio::time::Instant::now() < deadline && saw.is_none() {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::TaskAnchorChanged {
+                task_id: event_task,
+                revision: event_rev,
+                changed_fields,
+            } = envelope.event
+            {
+                saw = Some((event_task, event_rev, changed_fields));
+                break;
+            }
+        }
+        if saw.is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    let (event_task, event_rev, changed_fields) =
+        saw.expect("anchor update must publish its event");
+    assert_eq!(event_task, task_id);
+    assert_eq!(event_rev, 1);
+    for field in [
+        "current_interpretation",
+        "acceptance_criteria",
+        "open_loops",
+    ] {
+        assert!(
+            changed_fields.iter().any(|name| name == field),
+            "the event must name the moved field {field}: {changed_fields:?}"
+        );
+    }
+    assert!(
+        !changed_fields.iter().any(|name| name == "original_goal"),
+        "an unchanged field must not be named: {changed_fields:?}"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_anchor_survives_checkpoint_restore() {
+    let (instance, _context) = simple_instance().await;
+    instance
+        .handle()
+        .set_focus("refactor auth".into())
+        .await
+        .unwrap();
+    let task_id = instance.handle().list_tasks().await.unwrap()[0].id;
+
+    let anchor = TaskAnchor {
+        original_goal: "refactor auth".into(),
+        current_interpretation: "split the auth module".into(),
+        constraints: vec!["no dependency changes".into()],
+        acceptance_criteria: vec!["tests pass".into()],
+        plan_progress: vec!["read the module".into()],
+        open_loops: vec!["verify edge cases".into()],
+        working_refs: vec![ContextRootClaim {
+            item_ref: "item:auth".into(),
+            role: RootClaimRole::ActiveDecision,
+            strength: RootClaimStrength::ResidentRequired,
+            source_field_id: "plan_progress".into(),
+        }],
+        evidence_refs: Vec::new(),
+        ..TaskAnchor::default()
+    };
+    let revision = instance
+        .handle()
+        .update_task_anchor(task_id, 0, anchor)
+        .await
+        .unwrap();
+    assert_eq!(revision, 1);
+
+    // The checkpoint carries the full anchor (authority, not a scored item).
+    let checkpoint = instance.checkpoint().await.unwrap();
+    let snapshot = &checkpoint.tasks.tasks[0];
+    assert_eq!(snapshot.anchor.revision, 1);
+    assert_eq!(
+        snapshot.anchor.current_interpretation,
+        "split the auth module"
+    );
+    assert_eq!(
+        snapshot.anchor.working_refs[0].role,
+        RootClaimRole::ActiveDecision
+    );
+
+    // Restoring the checkpoint brings the anchor back, revision intact
+    // (anchor revisions are task authority, never rebased like surface
+    // revisions).
+    instance.restore(checkpoint).await.unwrap();
+    let info = &instance.handle().list_tasks().await.unwrap()[0];
+    assert_eq!(info.id, task_id);
+    assert_eq!(info.anchor_revision, 1);
+    instance.shutdown().await.unwrap();
 }
 
 /// The runtime assigns a task id on focus; the context engine must be

@@ -231,6 +231,16 @@ pub const MAX_TASK_TOOL_REQUIREMENTS: usize = 32;
 /// Defensive bounds for task-owned requirement metadata and event rows.
 pub const MAX_TOOL_REQUIREMENT_NAME_CHARS: usize = 96;
 pub const MAX_TOOL_REQUIREMENT_REASON_CHARS: usize = 160;
+/// Defensive bounds for the actor-owned TaskAnchor contract.
+/// Each free-text anchor field is capped; each list (constraints, criteria,
+/// plan steps, open loops) and each typed root-claim list is capped in
+/// length and per-entry size. An event row names at most this many changed
+/// fields so the audit event stays bounded regardless of anchor size.
+pub const MAX_TASK_ANCHOR_TEXT_CHARS: usize = 2_000;
+pub const MAX_TASK_ANCHOR_LIST_ITEMS: usize = 32;
+pub const MAX_TASK_ANCHOR_ITEM_CHARS: usize = 200;
+pub const MAX_TASK_ANCHOR_CLAIMS: usize = 32;
+pub const MAX_TASK_ANCHOR_CHANGED_FIELDS: usize = 8;
 pub const MAX_TOOL_SURFACE_REPORT_SELECTED: usize = 32;
 pub const MAX_TOOL_SURFACE_REPORT_OMITTED: usize = 32;
 pub const MAX_TOOL_SURFACE_REPORT_BLOCKED: usize = 32;

@@ -28,11 +28,12 @@ use agent_contracts::{AgentError, AgentResult, RunId, TaskId};
 use serde::{Deserialize, Serialize};
 
 use crate::task::{
-    TaskManager, TaskRecord, TaskStatus, TaskToolRequirementSet, validate_tool_requirement_set,
+    TaskAnchor, TaskManager, TaskRecord, TaskStatus, TaskToolRequirementSet, validate_anchor,
+    validate_tool_requirement_set,
 };
 
 /// Bump when the checkpoint shape changes; restore rejects mismatches.
-pub const RUNTIME_CHECKPOINT_VERSION: u32 = 2;
+pub const RUNTIME_CHECKPOINT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeCheckpoint {
@@ -82,6 +83,10 @@ pub struct TaskRecordSnapshot {
     /// there is intentionally no v1-to-v2 migration.
     #[serde(default)]
     pub tool_requirements: TaskToolRequirementSet,
+    /// Defaults only to permit explicit rejection of legacy v2 payloads;
+    /// there is intentionally no v2-to-v3 migration.
+    #[serde(default)]
+    pub anchor: TaskAnchor,
 }
 
 /// One dynamic capability's surface state: its activation and whether its
@@ -132,6 +137,12 @@ impl RuntimeCheckpoint {
                     task.id
                 ))
             })?;
+            validate_anchor(&task.anchor).map_err(|error| {
+                AgentError::InvalidRequest(format!(
+                    "checkpoint task {} has an invalid anchor: {error}",
+                    task.id
+                ))
+            })?;
         }
 
         match self.current_task_id {
@@ -174,6 +185,7 @@ impl TaskManagerSnapshot {
                     created_at_ms: task.created_at_ms,
                     last_active_ms: task.last_active_ms,
                     tool_requirements: task.tool_requirements.clone(),
+                    anchor: task.anchor.clone(),
                 })
                 .collect(),
             active: tasks.active(),
@@ -190,6 +202,7 @@ impl From<TaskRecordSnapshot> for TaskRecord {
             created_at_ms: snapshot.created_at_ms,
             last_active_ms: snapshot.last_active_ms,
             tool_requirements: snapshot.tool_requirements,
+            anchor: snapshot.anchor,
         }
     }
 }
