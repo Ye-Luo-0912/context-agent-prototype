@@ -1,11 +1,30 @@
 use agent_contracts::{
-    AgentError, AttentionState, ContextAction, ContextEngine, ContextHints, ContextIngress,
-    ContextItem, ContextItemId, ContextKind, ContextMaintenanceTrigger, ContextQuery,
-    ContextRetention, ContextScope, ContextSearchQuery, CoreLabel, DependencyKind, FocusState,
-    Label, LifecycleLabel, ScopeKind, ScopeState, SemanticState, TaskId, ToolOutput,
+    AgentError, AttentionState, ContextAction, ContextConsumptionAck, ContextEngine, ContextHints,
+    ContextIngress, ContextItem, ContextItemId, ContextKind, ContextMaintenanceTrigger,
+    ContextQuery, ContextRetention, ContextScope, ContextSearchQuery, CoreLabel, DependencyKind,
+    FocusState, Label, LifecycleLabel, MaterializedContext, OperationId, ScopeKind, ScopeState,
+    SemanticState, TaskId, ToolOutput, TurnId,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
+
+async fn acknowledge_all(engine: &SimpleContextEngine, materialized: &MaterializedContext) {
+    engine
+        .acknowledge_consumption(ContextConsumptionAck {
+            turn_id: TurnId::new(),
+            operation_id: OperationId::new(),
+            model_round: 1,
+            materialization_id: materialized.materialization_id,
+            item_ids: materialized.items.iter().map(|item| item.item_id).collect(),
+            external_item_ids: materialized
+                .external
+                .iter()
+                .map(|entry| entry.item_id)
+                .collect(),
+        })
+        .await
+        .unwrap();
+}
 
 /// Open a runtime-owned focus (the engine must never mint a `TaskId`), so
 /// the message that follows lands in a real task scope instead of the
@@ -246,6 +265,7 @@ async fn checkpoint_restore_roundtrip() {
         .map(|selection| selection.item_id)
         .collect();
     assert!(!consumed_ids.is_empty());
+    acknowledge_all(&engine, &snapshot_before).await;
 
     let checkpoint = engine.checkpoint().await.unwrap();
 
@@ -277,6 +297,140 @@ async fn checkpoint_restore_roundtrip() {
         .unwrap();
     let grown = restored.diagnostics().await.unwrap();
     assert_eq!(grown.total_items, after.total_items + 1);
+}
+
+#[tokio::test]
+async fn materialize_is_preview_and_ack_reinforces_only_the_final_subset() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    for content in ["keep constraint alpha", "keep constraint beta"] {
+        engine
+            .ingest(ContextIngress::Pin {
+                content: content.into(),
+                kind: ContextKind::Constraint,
+            })
+            .await
+            .unwrap();
+    }
+    let preview = engine
+        .materialize(ContextQuery {
+            current_input: String::new(),
+            budget_tokens: 8_192,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(preview.items.len(), 2);
+    assert!(
+        engine
+            .inspect(usize::MAX)
+            .await
+            .unwrap()
+            .iter()
+            .all(|item| item.access_count == 0),
+        "previewing candidates must not pretend the model consumed them"
+    );
+
+    let kept = preview.items[0].item_id;
+    engine
+        .acknowledge_consumption(ContextConsumptionAck {
+            turn_id: TurnId::new(),
+            operation_id: OperationId::new(),
+            model_round: 1,
+            materialization_id: preview.materialization_id,
+            item_ids: vec![kept],
+            external_item_ids: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let summaries = engine.inspect(usize::MAX).await.unwrap();
+    assert_eq!(
+        summaries
+            .iter()
+            .find(|item| item.id == kept)
+            .unwrap()
+            .access_count,
+        1
+    );
+    assert!(
+        summaries
+            .iter()
+            .filter(|item| item.id != kept)
+            .all(|item| item.access_count == 0),
+        "an actor-trimmed item must receive no reinforcement"
+    );
+}
+
+#[tokio::test]
+async fn invalid_consumption_ack_is_atomic_and_the_exact_retry_can_commit() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::Pin {
+            content: "retain exact evidence".into(),
+            kind: ContextKind::Constraint,
+        })
+        .await
+        .unwrap();
+    let preview = engine
+        .materialize(ContextQuery {
+            current_input: String::new(),
+            budget_tokens: 8_192,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    let real_id = preview.items[0].item_id;
+    let invalid = ContextConsumptionAck {
+        turn_id: TurnId::new(),
+        operation_id: OperationId::new(),
+        model_round: 1,
+        materialization_id: preview.materialization_id,
+        item_ids: vec![real_id, ContextItemId::new()],
+        external_item_ids: Vec::new(),
+    };
+    assert!(engine.acknowledge_consumption(invalid).await.is_err());
+    assert_eq!(engine.inspect(usize::MAX).await.unwrap()[0].access_count, 0);
+
+    acknowledge_all(&engine, &preview).await;
+    assert_eq!(engine.inspect(usize::MAX).await.unwrap()[0].access_count, 1);
+}
+
+#[tokio::test]
+async fn consumption_ack_rejects_cross_residency_duplicate_ownership() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::Pin {
+            content: "single-owner evidence".into(),
+            kind: ContextKind::Constraint,
+        })
+        .await
+        .unwrap();
+    let preview = engine
+        .materialize(ContextQuery {
+            current_input: String::new(),
+            budget_tokens: 8_192,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    {
+        let mut state = engine.state.lock().await;
+        let duplicate = state.items.iter().next().unwrap().clone();
+        state.eviction_buffer.push(duplicate);
+    }
+
+    let error = engine
+        .acknowledge_consumption(ContextConsumptionAck {
+            turn_id: TurnId::new(),
+            operation_id: OperationId::new(),
+            model_round: 1,
+            materialization_id: preview.materialization_id,
+            item_ids: preview.items.iter().map(|item| item.item_id).collect(),
+            external_item_ids: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("exactly one residency owner"));
+    assert_eq!(engine.inspect(usize::MAX).await.unwrap()[0].access_count, 0);
 }
 
 #[tokio::test]
@@ -2309,6 +2463,68 @@ async fn terminal_external_entries_are_hidden_from_every_retrieval_surface() {
             "fetch must refuse terminal ref {item_id:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn consumption_ack_stamps_an_external_descriptor_without_reactivating_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let item_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "ExternalAck.rs historical decision".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.6,
+            None,
+        );
+        item.entities = crate::index::entity::extract_entities(&item.content);
+        let reference = crate::store::externalize(dir.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item, reference, 0, 0, None,
+        ));
+        item.id
+    };
+
+    let preview = engine
+        .materialize(ContextQuery {
+            current_input: "inspect ExternalAck.rs".into(),
+            budget_tokens: 2_000,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        preview
+            .external
+            .iter()
+            .map(|entry| entry.item_id)
+            .collect::<Vec<_>>(),
+        vec![item_id]
+    );
+    let before = engine.inspect_external(item_id).await.unwrap().unwrap();
+    assert_eq!(before.last_access_tick, 0, "preview must not stamp access");
+
+    acknowledge_all(&engine, &preview).await;
+
+    let after = engine.inspect_external(item_id).await.unwrap().unwrap();
+    assert!(after.last_access_tick > before.last_access_tick);
+    assert_eq!(after.last_access_gc_epoch, Some(0));
+    assert!(
+        engine
+            .inspect(usize::MAX)
+            .await
+            .unwrap()
+            .iter()
+            .all(|item| item.id != item_id),
+        "acknowledging a descriptor must not page its body back into memory"
+    );
 }
 
 #[tokio::test]

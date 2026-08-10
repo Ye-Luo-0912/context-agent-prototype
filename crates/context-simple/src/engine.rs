@@ -1,9 +1,9 @@
 use agent_contracts::{
-    AgentError, AgentResult, ContextAction, ContextDiagnostics, ContextEngine, ContextGcReport,
-    ContextIngress, ContextItem, ContextItemId, ContextItemSummary, ContextKind,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention,
-    ContextScope, ContextStateTransition, CoreLabel, FocusState, Label, MaterializedContext,
-    ScopeId, ScopeKind, ScopeState, StoreReconcileReport,
+    AgentError, AgentResult, ContextAction, ContextConsumptionAck, ContextDiagnostics,
+    ContextEngine, ContextGcReport, ContextIngress, ContextItem, ContextItemId, ContextItemSummary,
+    ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
+    ContextRetention, ContextScope, ContextStateTransition, CoreLabel, FocusState, Label,
+    MaterializedContext, ScopeId, ScopeKind, ScopeState, StoreReconcileReport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -143,11 +143,27 @@ impl SimpleContextConfig {
 /// its secondary indexes bound to it), the focus, the hot-entity set and
 /// the pending lifecycle intents all live here; modules read and mutate it
 /// through `pub(crate)` access.
+#[derive(Debug, Default)]
+pub(crate) struct PendingMaterialization {
+    id: u64,
+    item_ids: std::collections::HashSet<ContextItemId>,
+    external_item_ids: std::collections::HashSet<ContextItemId>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct State {
     pub(crate) tick: u64,
     pub(crate) turn: u64,
     pub(crate) tool_round: u64,
+    /// Monotonic identity of the last materialization preview. Persisted so
+    /// checkpoint/restore cannot reuse an id inside one engine lifetime.
+    #[serde(default)]
+    pub(crate) materialization_revision: u64,
+    /// Single actor-owned preview awaiting a successful model-consumption
+    /// acknowledgement. Ephemeral: checkpoints are taken only at safe points
+    /// and must never resume an in-flight provider request.
+    #[serde(skip)]
+    pub(crate) pending_materialization: Option<PendingMaterialization>,
     pub(crate) focus: Option<FocusState>,
     /// The heap owns its slot/entity/scope indexes: structural mutations
     /// go through `ContextHeap` methods so the indexes cannot drift.
@@ -234,6 +250,51 @@ impl SimpleContextEngine {
             state: Mutex::new(State::default()),
         }
     }
+}
+
+fn has_exactly_one_owner(state: &State, item_id: ContextItemId) -> bool {
+    // The heap and external map own unique id indexes; the reversible Warm
+    // buffer is bounded by config, so checking all three locations is O(1)
+    // plus a small bounded scan rather than O(total history).
+    let resident = usize::from(state.items.indexes().get(item_id).is_some());
+    let warm = usize::from(state.eviction_buffer.iter().any(|item| item.id == item_id));
+    let external = usize::from(state.external.get(item_id).is_some());
+    resident + warm + external == 1
+}
+
+/// Stamp one consumed identity wherever its body/descriptor currently lives.
+/// A successful acknowledgement never changes residency or semantic state;
+/// it only records that the model actually saw the final packed projection.
+fn stamp_consumed(
+    state: &mut State,
+    item_id: ContextItemId,
+    now_tick: u64,
+    turn: u64,
+    gc_epoch: u64,
+) -> bool {
+    if let Some(index) = state.items.indexes().get(item_id) {
+        let item = &mut state.items.items_mut()[index];
+        item.last_access_tick = now_tick;
+        item.last_access_turn = turn;
+        item.access_count = item.access_count.saturating_add(1);
+        return true;
+    }
+    if let Some(item) = state
+        .eviction_buffer
+        .iter_mut()
+        .find(|item| item.id == item_id)
+    {
+        item.last_access_tick = now_tick;
+        item.last_access_turn = turn;
+        item.access_count = item.access_count.saturating_add(1);
+        return true;
+    }
+    if let Some(entry) = state.external.get_mut(item_id) {
+        entry.last_access_tick = now_tick;
+        entry.last_access_gc_epoch = Some(gc_epoch);
+        return true;
+    }
+    false
 }
 
 #[async_trait::async_trait]
@@ -611,7 +672,86 @@ impl ContextEngine for SimpleContextEngine {
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
         let mut state = self.state.lock().await;
         state.tick += 1;
-        Ok(materializer::materialize(&mut state, &self.config, &query))
+        state.materialization_revision =
+            state
+                .materialization_revision
+                .checked_add(1)
+                .ok_or_else(|| {
+                    AgentError::Internal("context materialization id is exhausted".into())
+                })?;
+        let materialization_id = state.materialization_revision;
+        let mut materialized = materializer::materialize(&mut state, &self.config, &query);
+        materialized.materialization_id = materialization_id;
+        state.pending_materialization = Some(PendingMaterialization {
+            id: materialization_id,
+            item_ids: materialized.items.iter().map(|item| item.item_id).collect(),
+            external_item_ids: materialized
+                .external
+                .iter()
+                .map(|entry| entry.item_id)
+                .collect(),
+        });
+        Ok(materialized)
+    }
+
+    async fn acknowledge_consumption(&self, ack: ContextConsumptionAck) -> AgentResult<()> {
+        ack.validate()?;
+        let mut state = self.state.lock().await;
+        let pending = state.pending_materialization.as_ref().ok_or_else(|| {
+            AgentError::InvalidRequest(
+                "context consumption ack has no pending materialization preview".into(),
+            )
+        })?;
+        if pending.id != ack.materialization_id {
+            return Err(AgentError::InvalidRequest(format!(
+                "context consumption ack references materialization {}, but {} is pending",
+                ack.materialization_id, pending.id
+            )));
+        }
+        if ack.item_ids.iter().any(|id| !pending.item_ids.contains(id)) {
+            return Err(AgentError::InvalidRequest(
+                "context consumption ack contains an item outside the referenced preview".into(),
+            ));
+        }
+        if ack
+            .external_item_ids
+            .iter()
+            .any(|id| !pending.external_item_ids.contains(id))
+        {
+            return Err(AgentError::InvalidRequest(
+                "context consumption ack contains an external ref outside the referenced preview"
+                    .into(),
+            ));
+        }
+        if ack
+            .item_ids
+            .iter()
+            .chain(&ack.external_item_ids)
+            .any(|id| !has_exactly_one_owner(&state, *id))
+        {
+            return Err(AgentError::Context(
+                "context consumption ack references an item without exactly one residency owner"
+                    .into(),
+            ));
+        }
+
+        let now_tick = state
+            .tick
+            .checked_add(1)
+            .ok_or_else(|| AgentError::Internal("context tick is exhausted".into()))?;
+        state.tick = now_tick;
+        let turn = state.turn;
+        let gc_epoch = state.gc_epoch;
+        for item_id in ack.item_ids.iter().chain(&ack.external_item_ids) {
+            // Ownership was validated above while holding the same lock, so
+            // stamping is infallible and the acknowledgement commits as one
+            // mutation rather than partially reinforcing a prefix.
+            debug_assert!(stamp_consumed(
+                &mut state, *item_id, now_tick, turn, gc_epoch
+            ));
+        }
+        state.pending_materialization = None;
+        Ok(())
     }
 
     async fn open_scope(&self, kind: ScopeKind, parent: Option<ScopeId>) -> AgentResult<ScopeId> {

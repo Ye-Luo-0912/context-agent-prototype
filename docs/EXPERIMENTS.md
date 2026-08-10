@@ -158,6 +158,13 @@ scenario: pinned_constraint - one pin across three tasks
 
 ## 7. Key-fact coverage (completion-quality proxy, 2026-08-10, `--facts`, budget 12 K)
 
+These numbers were regenerated after fixing the evaluator to run cost and
+fact coverage on independent fresh engine instances. The earlier code replayed
+the scenario twice into one engine before measuring coverage; the corrected
+results below happen to retain the same table values, but they no longer rely
+on contaminated state. A regression compares each aggregate coverage result
+with a standalone fresh replay.
+
 ```
 scenario: task_switch_and_return - task A -> B -> A
   engine              in_tok_total    req_met   req_viol forb_viol coverage
@@ -217,6 +224,7 @@ Replay is deterministic: the same scenario events through the same engine
 version produce the same metrics. Metrics are token estimates (`ascii/4 +
 non-ascii`), not vendor tokenizers; absolute numbers differ across providers,
 ratios do not. Scenario content and sizes are fixed in code, not sampled.
+Every outcome/coverage observation starts with its own new engine.
 
 Policy C's P4 features are configurable — decision supersession, error
 verification, entity affinity and dependency expansion

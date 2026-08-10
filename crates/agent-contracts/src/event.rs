@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentResult, ContextDiagnostics, ContextGcReport, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextSelection, OperationId, RunId, TaskId, ToolCall, ToolOutput,
-    TurnId,
+    AgentResult, ContextConsumptionAck, ContextDiagnostics, ContextGcReport,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextSelection, OperationId, RunId,
+    TaskId, ToolCall, ToolOutput, ToolSurfacePlanReport, ToolSurfaceRequirement, TurnId,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +27,14 @@ pub enum RuntimeEvent {
         goal: String,
     },
     FocusCleared,
+    /// The runtime-owned tool-requirement slice of a Task changed through a
+    /// bounded whole-set CAS update. Requirements describe task demand only;
+    /// they do not enable capabilities or grant effect authority.
+    TaskToolRequirementsChanged {
+        task_id: TaskId,
+        revision: u64,
+        requirements: Vec<ToolSurfaceRequirement>,
+    },
     Pinned {
         content: String,
     },
@@ -34,6 +42,12 @@ pub enum RuntimeEvent {
         diagnostics: ContextDiagnostics,
         #[serde(default)]
         selected: Vec<ContextSelection>,
+    },
+    /// A successful model operation consumed exactly this bounded subset of
+    /// one materialization preview. Failed/cancelled/refused/stale operations
+    /// emit no acknowledgement and receive no access reinforcement.
+    ContextConsumed {
+        ack: ContextConsumptionAck,
     },
     ContextMaintained {
         #[serde(default)]
@@ -46,6 +60,12 @@ pub enum RuntimeEvent {
     ContextGc {
         report: ContextGcReport,
     },
+    /// One bounded, schema-free account of the final round surface decision.
+    /// A Ready report is emitted before ModelStarted; an Unsatisfiable report
+    /// means the provider was not called.
+    ToolSurfacePlanned {
+        report: ToolSurfacePlanReport,
+    },
     /// A model round started. Carries the operation identity so live
     /// consumers (the UI's run-state aggregator) can fence streamed deltas:
     /// a delta whose turn/operation/generation no longer matches the
@@ -54,6 +74,10 @@ pub enum RuntimeEvent {
         turn_id: TurnId,
         operation_id: OperationId,
         generation: u64,
+        #[serde(default)]
+        surface_revision: u64,
+        #[serde(default)]
+        model_round: usize,
     },
     /// Live streamed text delta. Never journaled (the final `AssistantMessage`
     /// carries the complete content); only forwarded to live subscribers.

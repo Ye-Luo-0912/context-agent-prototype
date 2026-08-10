@@ -175,12 +175,14 @@ Tools receive a `ToolExecutionRequest` and return `ToolOutput`.
 
 They do not receive a ContextEngine, memory store, or conversation transcript.
 
-The trait has four members: `specs()`/`snapshot()` (pure — the stable model
-surface for one round), `gc()` (the explicit lifecycle safe point the runtime
-calls once per model round; default no-op) and `execute`. A model round uses
-exactly one `ToolSurfaceSnapshot` (`specs` + `generation`) for the budget,
-the prompt and tool-call validation, so a tool GC'd between the budget and
-the call can never change what the model saw.
+`ToolDispatcher` separates pure discovery/snapshot reads, explicit lifecycle
+maintenance (`gc`, load/unload), omission classification, inspection and
+execution. `snapshot()` returns the complete currently-loaded candidate set;
+it does not perform the final schema-budget projection because only the
+runtime knows the active task's requirements. A model round publishes exactly
+one final `ToolSurfaceSnapshot` and uses it for the budget, prompt and
+tool-call validation, so lifecycle changes after capture cannot change what
+the model saw.
 
 Since V1-M9 the lifecycle contract is unified for builtin tools and dynamic
 capabilities under one catalog:
@@ -196,6 +198,44 @@ capabilities under one catalog:
   cools `Loaded -> Warm -> Unloaded` on idle ticks, and the unified control
   tools (`capability.search/inspect/load/unload`, always visible) drive the
   active set.
+
+#### TaskToolRequirements and round surfaces (first TaskAnchor slice)
+
+The current working tree implements and verifies a deliberately narrow first
+slice:
+
+- each runtime-owned `TaskRecord` carries a bounded, canonical
+  `TaskToolRequirementSet { revision, entries }` and replaces the whole set
+  through actor-serialized compare-and-swap. `TaskInfo` exposes the current
+  revision/count, and live restore rebases against a per-process high-water
+  mark so an older checkpoint cannot create a CAS ABA;
+- requirements use an exact tool name plus `MustSurface`, `PreferSurface`, or
+  `KeepReady`. They express task demand only and cannot enable/quarantine a
+  capability or grant approval/effect authority;
+- after the tool-GC safe point, the runtime refreshes required lifecycle flags
+  and `RoundSurfacePlan` projects the complete loaded candidate set. Mandatory
+  schemas are retained, preferred schemas degrade deterministically under
+  schema/provider budget, and KeepReady remains catalog-ready but prompt-cold;
+- loading a KeepReady entry is currently only a cheap schema/catalog flag
+  refresh. Capability processes remain lazy and start at invocation;
+- the final snapshot carries a runtime `surface_revision`, non-colliding
+  builtin/capability/task/focus source revisions, and bounded omission data.
+  `ToolSurfacePlanned` is the schema-free audit report; `ModelStarted` belongs
+  after a Ready plan and successful final packing.
+
+This slice is not the complete TaskAnchor. It does not add goal interpretation,
+constraints, acceptance criteria, plan/open-loop/evidence authority,
+TaskAnchor context roots, EpisodeOutcome, exact final output retention or
+CompletionRecord root transfer. Dynamic capabilities also
+retain an owner-level loaded flag, so requesting one tool can still mark
+sibling schemas loaded; process state and per-tool schema state remain future
+work. Snapshot consistency is verified for this slice: the builtin registry
+captures specs and generation under one lock, capability capture/mutation uses
+the surface gate, and the composite dispatcher holds that gate while taking
+one atomic base snapshot to form a common source cut without retry;
+concurrency tests cover catalog mutation during capture. Report rows still do
+not distinguish task-authored Prefer from a catalog-loaded optional fallback,
+which remains a CORE-09 provenance residual.
 
 Since V1-M9 the model can also steer the *context* surface through
 read-only meta-tools (`context.gc_hint` / `context.tag` / `context.lease` /
@@ -450,10 +490,29 @@ Two refinements since V1-M9 close the accounting gap:
   `context_window - output_reserve` — the *input* budget. Rendering
   overhead may never eat into the space reserved for the answer. When the
   context frame is emptied and the fixed layers (system + turn + tools)
-  still overshoot, the runtime auto-unloads the largest optional tools
-  (core tools refuse) and re-snapshots; a request that still does not fit
-  is a **hard error** — the runtime refuses to send instead of silently
-  over-budgeting the provider.
+  still overshoot, the round planner omits eligible optional schemas from
+  that request without changing their loaded lifecycle state. Missing or
+  over-budget mandatory tools make the plan unsatisfiable; a request that
+  still does not fit is a **hard error** — the runtime refuses to send
+  instead of silently over-budgeting the provider.
+
+Materialization is now a **non-consuming preview**. Each preview carries a
+monotonic `materialization_id`; it may advance internal clocks/revisions, but
+it does not stamp access or claim model use. The actor caps the preview at
+256 full items, runs `PromptAssembler` and the final provider guard, and then
+binds the surviving full-item ids plus at most 32 external-ref ids to the
+turn, model round and `OperationId` in a bounded `ContextConsumptionAck`.
+
+Only a non-stale successful `ModelOutput` commits that acknowledgement.
+Refused, failed, cancelled and stale operations commit none. The kernel treats
+reinforcement plus the bounded `ContextConsumed` audit event as one context
+transaction: it checkpoints first and restores if either the engine mutation
+or event append fails; the actor aborts the turn rather than committing an
+unaudited output. `context-simple` validates that every id belongs to the
+referenced preview and still has exactly one residency owner, then stamps
+Resident, Warm or External metadata without changing semantic state or
+reactivating a body. This closes the false-reinforcement part of CTX-07;
+candidate cost, external-ref token accounting and fit-before-top-K remain.
 
 ## 6. Context is rebuilt, not replayed
 
@@ -488,9 +547,13 @@ Closed) and own the items created while they were active: closing a task
 scope promotes its durable outcomes (decisions, findings, constraints, open
 loops, artifact/evidence refs, pinned items) to the session and evicts the
 rest of the working set. Tool scopes are execution frames driven by the
-runtime actor: opened at tool start (`ContextEngine::open_scope`), closed
-when the next model round consumes the result (`ContextEngine::close_scope`);
-the observation persisted at turn end stays tagged with the tool scope id.
+runtime actor: opened at tool start (`ContextEngine::open_scope`), and
+currently closed when preparation of the next model round treats the result
+as schedulably consumed (`ContextEngine::close_scope`). The exact content
+acknowledgement now distinguishes that scope heuristic from content actually
+sent to a successful provider round, but scope-root release is not yet driven
+by the acknowledgement; the observation persisted at turn end stays tagged
+with the tool scope id.
 The scope tree is engine state, exposed through `ContextDiagnostics` counts
 and round-tripped by checkpoints; the runtime drives the timing-sensitive
 tool frames explicitly, while session/task/focus open from the focus-state
@@ -599,7 +662,14 @@ context engine is no longer a complete snapshot: the runtime's checkpoint is
 a `RuntimeCheckpoint` (versioned) wrapping the task manager (task rows +
 current task id), the context checkpoint, capability activation state and
 store generation/refs, and `RuntimeInstance::restore` puts the whole runtime
-— task table included — back together. The `TaskManager` applies its
+— task table included — back together. RuntimeCheckpoint v2 additionally
+persists each task's `TaskToolRequirementSet`, the runtime focus revision and
+the last allocated surface revision, so restore cannot reuse a round identity
+or lose this first task-authority subset. It deliberately does not persist a
+derived per-round `ToolSurfaceSnapshot`; the next safe point reconstructs it.
+Version 1 payloads can deserialize only far enough to receive an explicit
+unsupported-version error—there is no silent empty-requirement migration.
+The `TaskManager` applies its
 transitions transactionally: it validates and *prepares* a transition, the
 external side (kernel focus/context) commits first, and only then does the
 manager commit — a failed `set_focus` never leaves the task table changed.
@@ -611,12 +681,14 @@ then publishes audit/UI events. Restore validates the redundant active-task
 fields and restored engine focus before exposing the task table, and applies
 capability flags last. If context rollback itself fails, the actor fences
 further mutation and emits `RecoveryRequired` until a known-good full restore
-succeeds. An audit-event failure after aligned state commits is handled the
-same way: state stays aligned, but the missing record is an explicit recovery
-gap rather than a retryable "nothing happened" result. Cross-plane *capture*
-is not frozen yet (actor state and the shared
-capability registry are sampled separately); `docs/AUDIT_TODO.md` CORE-03
-tracks that remaining gap.
+succeeds. For focus/task transitions, an audit-event failure after aligned
+state commits is handled the same way: state stays aligned, but the missing
+record is an explicit recovery gap rather than a retryable "nothing happened"
+result. Live restore rebases revisions but does not yet publish a bounded typed
+restore/rebase commit event, so that audit-failure transaction remains open.
+Cross-plane *capture* is also not frozen yet (actor state and the shared
+capability registry are sampled separately); `docs/AUDIT_TODO.md` CORE-03 owns
+both remaining gaps.
 
 ## 8c. Runtime actor and module host (V1-M3, hardened V1-P0-1/V1-P0-4)
 
@@ -796,6 +868,7 @@ protocol (see `context-contextcore::wire`):
 ContextIngress      -> request op `ingest`
 ContextQuery        -> request op `materialize`
 MaterializedContext <- response payload
+ContextConsumptionAck -> request op `acknowledge_consumption`
 Diagnostics         <- response payload
 ```
 
@@ -926,12 +999,13 @@ become context pollution:
   `MAX_TOOL_SCHEMA_BYTES` (4 KiB) — a single capability cannot blow up the
   model surface with one giant schema.
 
-`ToolSurfaceSnapshot.generation` is unified: the builtin catalog's
-generation (its load/unload/gc transitions) is combined with the
-capability registry's own counter, which bumps on every capability surface
-change — `register` / `set_activation` / `load_tool` / `unload_tool` — so
-a dynamic capability change is auditably visible in the snapshot instead of
-masquerading as the builtin catalog's generation.
+`ToolSurfaceSnapshot.generation` remains a legacy combined catalog display
+value. The runtime no longer treats arithmetic combination as a unique round
+identity: `ToolSurfaceSourceRevisions` preserves builtin catalog, capability
+catalog, task requirement and focus revisions separately, while the monotonic
+`surface_revision` identifies the final round projection. Execution-policy and
+complete TaskAnchor/Episode revisions remain absent until those authority
+planes exist; zero is not used to pretend they were observed.
 
 The registry never calls back into a capability object under its lock.
 Registration reads and validates the manifest and tool schemas exactly
@@ -975,14 +1049,16 @@ would silently diverge). More importantly, `full_contract_parity_across_
 the_process_boundary` drives a scripted lifecycle covering *every* contract
 method — ingest, maintain, gc, materialize, scope lifecycle, diagnostics,
 inspect, `search_external` / `inspect_external` / `fetch_external`,
-`storage_gc`, checkpoint/restore — through both an in-process engine and
-the service boundary, and asserts the normalized outcomes are identical.
+`storage_gc`, `acknowledge_consumption`, checkpoint/restore — through both an
+in-process engine and the service boundary, and asserts the normalized
+outcomes are identical.
 The checklist lives in one `contract_snapshot` helper: a new trait method
 must be added there, and the parity test then verifies the wire op, the
 service handling and the adapter override automatically. The service is a
-dev-dependency of the adapter crate, so the binary is rebuilt whenever the
-wire protocol changes — a stale service can never masquerade as the
-current protocol.
+dev-dependency of the adapter crate for compile-time contract coverage. The
+standalone executable must also be rebuilt before the process test when its
+wire changes (`cargo build -p agent-context-service`); an old executable is
+rejected by the process test rather than treated as parity evidence.
 
 **Trusted Core direction.** The kernel is not headed toward retirement by
 merging into the runtime. Its stateless primitives — permission/approval,

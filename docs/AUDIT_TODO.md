@@ -39,6 +39,13 @@ Rules for follow-up agents:
 - [x] Pre-epoch external entries receive a real `gc_epoch` anchor and age.
 - [x] The actor enforces a 16,000-character last-line guard on every
   model-facing tool result before TurnFrame/context/event admission.
+- [x] Materialization is a non-consuming preview. A successful non-stale
+  model result commits the exact post-packing inline/external ids through a
+  bounded `ContextConsumptionAck`; trim/refusal/failure/cancel/stale paths do
+  not reinforce, and event-append failure rolls the access mutation back.
+- [x] Replay cost and fact-coverage observations use independent fresh engine
+  instances; a regression compares the aggregate result with a standalone
+  fresh coverage run.
 
 ## P0 — blocks the context goal or trusted execution
 
@@ -375,9 +382,9 @@ must leave exactly the closure survivors alive.
 The runtime can recycle completed-task process detail, but it cannot identify
 or durably protect the actual task result:
 
-- `TaskRecord`/RuntimeCheckpoint only retain id, goal, status and timestamps;
-  suspended work has no authoritative criteria, plan, open loops or resume
-  point;
+- `TaskRecord`/RuntimeCheckpoint now retain the verified bounded
+  `TaskToolRequirementSet` first slice, but suspended work still has no
+  authoritative criteria, plan, open loops, evidence roots or ResumePoint;
 - the model's actual final response is an ordinary Working
   `AssistantMessage`, is truncated before entering ContextItem, and is
   archived with the task's ordinary dialogue;
@@ -528,6 +535,55 @@ Required contract:
 Keep persistence buffered/off the hot path; a barrier need not fsync every
 ordinary event.
 
+**Closed 2026-08-10 (durability choice = OS flush barrier, not fsync).**
+
+Implemented:
+
+1. **Durability contract: the OS flush barrier** — `FileEventJournal::flush`
+   is the turn-commit barrier. The command channel is FIFO, so a successful
+   `flush` guarantees every event appended before it has been drained by the
+   blocking writer and flushed out of each `BufWriter` to the OS; events
+   still sitting in userspace buffers or the pipe are not durable until the
+   barrier passes. The async hot path still only enqueues (`append`), so
+   persistence stays off the hot path and ordinary events are not fsync'd.
+2. **Sticky writer errors** — the first failed write poisons the writer:
+   `failed` is set once and never cleared; every later barrier reports that
+   same error instead of pretending the trace is intact; appends after the
+   failure are still drained from the channel (the event sequence stays
+   consistent) but dropped; the final channel-close flush is skipped when
+   already failed.
+3. **`TurnCompleted` published only after the barrier** — the kernel gains
+   `emit_event_durable` (append → flush → broadcast; a failed barrier
+   broadcasts nothing), and the actor's `finalize_turn` uses it for
+   `TurnCompleted`. A subscriber never sees a committed turn unless every
+   mandatory state write before it (tool observations, assistant message,
+   maintains, GC) has left the process. A failed barrier routes to
+   `commit_failed(TurnCommitPhase::TurnCompletedEvent)`: the runtime emits
+   `TurnCommitFailed` + `RecoveryRequired` and drops the turn frame instead
+   of claiming a commit that never landed.
+4. **Fault tests** — agent-storage: `flush_is_a_durability_barrier_over_
+   prior_appends`, `writer_errors_are_sticky_at_the_next_barrier` (a
+   directory squatting on a trace path makes the writer's open fail on every
+   platform — is-a-directory on unix, access-denied on windows), and
+   `events_are_not_durable_until_the_barrier` (crash-immediately-after-
+   commit shape: the buffered tail is invisible on disk until the barrier,
+   the flushed prefix survives). agent-runtime actor tests:
+   `turn_completed_is_broadcast_only_after_the_barrier` (TurnCompleted is
+   the last event appended before the flush, and the barrier has passed by
+   the time the broadcast is observed) and
+   `failed_barrier_blocks_turn_completed_and_marks_recovery_required` (no
+   TurnCompleted broadcast, `TurnCommitFailed` phase `turn_completed_event`,
+   `RecoveryRequired` emitted, turn frame dropped).
+
+Acceptance: a subscriber observes `TurnCompleted` only after a flush barrier
+has covered every mandatory state write; a failed barrier surfaces
+`TurnCommitFailed`/`RecoveryRequired` and never broadcasts `TurnCompleted`.
+
+Residual (not closed here): crash-recovery replay that re-reads the trace to
+rebuild runtime state after a barrier failure — this closes the barrier
+contract itself, not the recovery machinery; a genuinely full disk is covered
+by the sticky-error path but not exercised with a real full volume.
+
 ## P1 — confirmed defects and hardening
 
 ### CTX-06 — Full GC/storage operation semantics
@@ -550,6 +606,24 @@ layers. Longer term use `context_revision + base_revision` CAS.
 
 ### CTX-07 — Materializer budget and hot-path correctness
 
+**Partially repaired 2026-08-10.** The false-consumption subissue is closed:
+
+- `materialize` returns a monotonic, non-consuming preview and records the
+  bounded ids eligible for one acknowledgement;
+- the actor's final frame produces
+  `ContextConsumptionAck { turn_id, operation_id, model_round,
+  materialization_id, item_ids, external_item_ids }` only after a successful
+  non-stale model operation;
+- `context-simple` validates the exact preview subset and all residency owners
+  before atomically stamping access; it does not reactivate external bodies;
+- the kernel couples reinforcement to the bounded `ContextConsumed` event
+  with checkpoint rollback, and replay commits only on that event (legacy
+  traces retain explicit compatibility behavior);
+- actor trim, refusal, cancellation/stale output, journal failure, external
+  descriptor, invalid-retry, replay and service-parity tests cover the path.
+
+Remaining CTX-07 work:
+
 - dependency reserve is taken when expansion is disabled/impossible;
 - score top-K happens before fit packing, so an oversized top item can hide a
   lower-ranked item that fits;
@@ -560,8 +634,8 @@ layers. Longer term use `context_revision + base_revision` CAS.
   despite documentation claiming constant cost.
 
 Add packing properties and candidate-count/materialize-p95 metrics. A finite
-runtime `max_selected_items` is defense in depth, not a replacement for
-CTX-01.
+runtime `max_selected_items` and ack cap are defense in depth, not a
+replacement for CTX-01 or bounded candidate work.
 
 ### CTX-08 — Mid-turn tool discoveries do not update recall signals
 
@@ -597,6 +671,23 @@ also omits host capability state.
 Move capability surface under one actor-owned snapshot protocol or add a
 shared freeze/generation handshake. Make partial APIs crate-private or name
 them explicitly actor-only.
+
+Live restore has a separate audit-transaction residual. The runtime now rebases
+focus, surface and task-requirement revisions against live high-water marks so
+an old checkpoint cannot create CAS ABA, but that semantic rewrite has no
+bounded typed `RuntimeRestored` / `TaskRequirementsRebased` event. A journal
+failure after context + task authority become visible therefore cannot be
+reported with the same explicit recovery-required transaction semantics as a
+failed focus/task-transition audit record.
+
+Required: publish one bounded restore-commit event carrying checkpoint/run
+identity, old/restored/effective revisions, rebased task count plus a capped
+sample (artifact spill for full detail), and whether capability state was
+applied. If this mandatory audit record/barrier fails after restore commits,
+keep the restored aligned state but set `recovery_required`, emit the standard
+recovery signal when possible, and reject normal mutation until a known-good
+restore. Fault tests must cover event append/flush failure after rebase without
+retrying the restore as if nothing changed.
 
 ### CORE-04 — Output broker/resource policy is incomplete
 
@@ -672,61 +763,90 @@ produces no privilege expansion and no five-minute-per-call stall.
 
 ### CORE-09 — Tool schema budget mutates lifecycle and can forget required capability
 
-Status: **[~] P0 lifecycle-mutation defect fixed; TaskAnchor-driven surface
-semantics remain open.**
+Status: **[~] TaskToolRequirements/round-surface slice verified; complete
+TaskAnchor policy and per-tool capability lifecycle remain open.**
 
-The final input guard now performs pure round-local schema omission against a
-caller-owned snapshot. It no longer calls `tool_unload`, budget omission does
-not bump catalog generation, the snapshot is published to turn state only
-after final packing succeeds, and a later larger-budget round can surface the
-same still-loaded tool without another load. Both the dispatcher's initial
-4096-token cap and the actor's provider-window guard use the same fail-closed
-`may_omit_from_round` classification; unknown/unclassified tools are
-mandatory. Regression tests cover non-mutation, budget recovery,
-deterministic largest-optional omission, and an oversized fail-closed schema.
+The verified first slice makes runtime-owned `RoundSurfacePlan` the sole
+schema-budget projection over the complete loaded candidate catalog. Each
+TaskRecord now owns a bounded, revisioned, whole-set-CAS requirement set with
+`MustSurface`, `PreferSurface`, and `KeepReady`. Budget omission is round-local
+and never unloads a catalog entry; Must either appears or produces a typed
+pre-provider refusal; KeepReady repairs GC eviction but remains prompt-cold.
+The final immutable snapshot and bounded, schema-free `ToolSurfacePlanned`
+report carry a monotonic surface revision plus non-colliding catalog/task/focus
+source revisions. `ModelStarted` is emitted only after successful final
+packing. RuntimeCheckpoint v2 persists task requirements and counters, never a
+derived round surface.
 
-This is deliberately only the P0 stopgap. No TaskAnchor/Focus root or
-MustSurface-vs-PreferSurface policy yet prevents a task-critical editor/test
-tool from being omitted for one round. Dynamic capabilities also use one
-owner-level `loaded: bool`, so loading one tool exposes every sibling schema
-and they do not receive builtin idle cooling. Omission reasons and a unique
-round-surface revision are not yet emitted as bounded runtime diagnostics.
+Regression tests cover non-mutation, deterministic omission and budget
+recovery, KeepReady reload, Must refusal with no provider call or
+`ModelStarted`, event ordering/bounds, revision monotonicity, and
+checkpoint/suspend/restore reconstruction. They also cover atomic builtin
+capture, capability surface-gate serialization, and a composite common cut
+under concurrent catalog mutation. Full workspace tests and strict Clippy
+pass.
+
+This still is not the complete TaskAnchor. Requirements are explicit exact
+tool names rather than projections from typed goal/phase/open-loop/acceptance
+state. Dynamic capabilities also use one owner-level `loaded: bool`, so
+loading one tool can mark sibling schemas loaded and external tools do not yet
+receive independent builtin-style idle cooling. Snapshot consistency is closed
+for the first slice: builtin specs/generation share one registry lock,
+capability mutations and capture share the surface gate, and the composite
+dispatcher holds that gate across one atomic base snapshot so both sources
+form one common cut without retry. One explainability
+gap remains in the first-slice surface itself:
+
+- report rows collapse a task-authored `PreferSurface` requirement and an
+  ordinary catalog-loaded optional candidate into the same demand value. A
+  selected/omitted row cannot yet answer whether it entered because of Task
+  intent, dispatcher/core policy, explicit catalog load, or fallback packing.
 
 Required direction:
 
-- separate catalog/authority, operational lifecycle, and one-round surface;
-- token/schema budget performs pure round-local packing and never unloads a
-  tool or changes its lifecycle;
-- actor supplies typed TaskAnchor/Focus/Active-call roots at the existing
-  BeforeModel safe point;
-- `MustSurface` tools are selected or produce explicit
-  `ToolSurfaceUnsatisfiable`; `PreferSurface` omissions are observable but do
-  not mutate lifecycle; `KeepReady` tools stay cheap to reactivate without
-  entering every prompt;
-- make external capability lifecycle per tool while process start/stop remains
+- [x] separate catalog/authority, operational lifecycle, and one-round
+  surface for the TaskToolRequirements slice;
+- [x] token/schema budget performs pure round-local packing and never unloads
+  a tool or changes its lifecycle;
+- [ ] derive typed tool roots from the complete TaskAnchor/Focus/Episode and
+  Active-call policy at the existing BeforeModel safe point;
+- [x] `MustSurface` tools are selected or produce explicit unsatisfiable
+  reports; `PreferSurface` omissions are observable but do not mutate
+  lifecycle; `KeepReady` stays cheap to reactivate without entering prompts;
+- [ ] make external capability lifecycle per tool while process start/stop remains
   owner-level; loading one tool must not expose all siblings;
-- replace generation arithmetic with one monotonic surface revision covering
-  catalog, Anchor, Focus, and execution-policy revisions;
-- publish a bounded round-surface event/ledger entry with selected/omitted
+- [~] use one monotonic surface revision with separate catalog,
+  task-requirement and focus sources; complete Anchor/Episode/execution-policy
+  source revisions later;
+- [x] pair builtin specs/generation under one lock, serialize capability
+  capture and mutation through the surface gate, and hold that gate while
+  taking one atomic base snapshot; concurrency tests verify recorded source
+  revisions agree with the captured specs;
+- [ ] add bounded per-row provenance (`TaskRequirement` with requirement
+  revision/reason ref, `DispatcherRequired`, `CatalogLoadedOptional`, later
+  Focus/Active/RecentUse) so Task Prefer is distinguishable from a legacy
+  catalog optional in both selected and omitted reports;
+- [x] publish a bounded round-surface event/ledger entry with selected/omitted
   names, reasons, schema-token totals, provider input budget and source
   revisions; emit `ModelStarted` only after final packing succeeds;
-- checkpoint authority/Anchor requirements and durable leases, not a derived
-  per-round surface or `Active` state.
+- [x] checkpoint task requirement authority and counters, not a derived
+  per-round surface or `Active` state; complete Anchor/lease authority later.
 
 Acceptance: shrinking then restoring a provider budget produces identical
 catalog lifecycle; every rooted required tool appears or the round fails with
 an explicit reason; optional omission never bumps catalog generation; one
 capability tool does not surface siblings; quarantine after snapshot still
 revokes execution; suspend/resume reconstructs the surface from TaskAnchor
-without transcript replay.
+without transcript replay. Under concurrent catalog mutation, every snapshot's
+specs match its recorded generations, and every surface row explains which
+authority/demand source put it into consideration.
 
 ## P2 — policy quality and evaluation
 
 - terminal semantic checks should precede pinned retention;
 - replace weak `SharesEntities` pseudo-dependencies with typed edges;
 - add store corruption/reconcile and lifecycle growth-slope metrics;
-- make fact comparison replay each policy on a fresh engine; the current
-  observing run and coverage run reuse one engine, contaminating the latter;
+- [x] fact comparison replays cost and coverage on independent fresh engines;
 - replace the fixed-marker rolling baseline with real compaction and account
   for actor, compactor, recall, store, tool-schema and wall-time cost;
 - audit process parity whenever `ContextEngine` gains a method;
@@ -763,11 +883,16 @@ savings.
    before policy changes.
 3. **Store integrity:** CTX-04/05 plus crash injection/reconcile; no scoring
    edits.
-4. **Context concurrency:** CTX-06 with operation gate/restore validation.
-5. **Materializer:** CTX-07/08 and budget/candidate metrics; no store edits.
+4. **Context/runtime consistency:** CTX-06 operation gate plus CORE-03
+   cross-plane capture and live-restore rebase audit transaction.
+5. **Materializer:** remaining CTX-07/08 packing, candidate-cost and immediate
+   tool-signal work; no store edits.
 6. **Trusted effect + sandbox:** CORE-01/06/07/08 in M12 -> M14 order.
 7. **Durability:** CORE-02 plus recovery replay, isolated from policy.
 8. **Prompt/resource boundary:** CORE-04/05 with adversarial evals.
+9. **Tool-surface hardening:** CORE-09 per-row demand provenance and per-tool
+   capability lifecycle; do not fold in the complete
+   TaskAnchor/CompletionRecord package.
 
 Do not run packages editing the same crate concurrently unless file ownership
 is explicitly partitioned.

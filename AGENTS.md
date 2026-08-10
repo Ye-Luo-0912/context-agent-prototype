@@ -4,6 +4,25 @@ This repository is an experimental coding-agent runtime whose primary research t
 
 Before changing architecture, preserve the invariants below.
 
+## Working principles (apply to every code change)
+
+1. **Understand the code before changing it.** Read the module, its callers
+   and its tests first; say explicitly what behavior is being preserved and
+   what is being changed. Never edit code whose current semantics you cannot
+   explain.
+2. **Reuse before writing.** Prefer the existing abstraction; extract small,
+   composable primitives instead of copying logic; keep public APIs minimal
+   and documented. Do not hard-code one caller's assumptions into a shared
+   function.
+3. **High performance, measured.** Keep work off the hot path and large
+   results out of clones (see Performance rules); only optimize what
+   profiling proves hot; never regress the runtime's boundedness or
+   latency for the sake of cleverness.
+4. **Maintainable.** Small, single-purpose functions; clear names; explicit
+   comments explaining *why*; a reader should be able to explain any line's
+   purpose and any test's failure without reverse-engineering the whole
+   system.
+
 ## Non-negotiable invariants
 
 1. **Do not make the conversation transcript the source of model context.**

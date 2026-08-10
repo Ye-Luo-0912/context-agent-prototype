@@ -242,6 +242,12 @@ pub struct CapabilityCatalogEntry {
 /// published mid-run and its tools appear on the next model request.
 #[derive(Default)]
 pub struct CapabilityRegistry {
+    /// Coordinates a unified snapshot with surface mutations without holding
+    /// `inner` across the lower dispatcher's `snapshot()` callback. Writers
+    /// always acquire this gate before `inner`; readers may consequently
+    /// freeze the capability half while the independent base snapshot is
+    /// captured at one common linearization point.
+    surface_gate: RwLock<()>,
     inner: RwLock<HashMap<String, Entry>>,
     /// Tool names the runtime owns (builtin core tools plus the unified
     /// control tools). A capability may never shadow them: routing would
@@ -308,6 +314,10 @@ impl CapabilityRegistry {
         validate_manifest_authority(&manifest, &tool_specs)?;
         let tool_names: Vec<&str> = tool_specs.iter().map(|spec| spec.name.as_str()).collect();
 
+        let _surface = self
+            .surface_gate
+            .write()
+            .expect("capability registry poisoned");
         let mut inner = self.inner.write().expect("capability registry poisoned");
         if inner.contains_key(&manifest.id) {
             return Err(AgentError::InvalidRequest(format!(
@@ -408,6 +418,10 @@ impl CapabilityRegistry {
     /// surface and block further calls. Enabling is the operator/evaluator
     /// action that external capabilities wait for.
     pub fn set_activation(&self, id: &str, activation: CapabilityActivation) -> AgentResult<()> {
+        let _surface = self
+            .surface_gate
+            .write()
+            .expect("capability registry poisoned");
         let mut inner = self.inner.write().expect("capability registry poisoned");
         let entry = inner.get_mut(id).ok_or_else(|| {
             AgentError::InvalidRequest(format!("capability '{id}' is not registered"))
@@ -466,12 +480,21 @@ impl CapabilityRegistry {
     /// invisible, so the prompt does not grow with every registered
     /// capability and a suspended one cannot linger on the surface.
     pub fn loaded_tool_specs(&self) -> Vec<ToolSpec> {
+        self.loaded_surface().0
+    }
+
+    /// Loaded schemas and their exact registry generation. Surface writers
+    /// bump the generation before releasing `inner`, so this single read
+    /// lock pairs the two values atomically.
+    fn loaded_surface(&self) -> (Vec<ToolSpec>, u64) {
         let inner = self.inner.read().expect("capability registry poisoned");
-        inner
+        let specs = inner
             .values()
             .filter(|entry| entry.loaded && entry.activation.usable())
             .flat_map(|entry| entry.tool_specs.iter().cloned())
-            .collect()
+            .collect();
+        let generation = self.generation.load(Ordering::Relaxed);
+        (specs, generation)
     }
 
     /// The capability that owns a tool name, if any.
@@ -506,6 +529,10 @@ impl CapabilityRegistry {
         let owner = self
             .owner_of(tool_name)
             .ok_or_else(|| AgentError::Tool(format!("unknown tool: {tool_name}")))?;
+        let _surface = self
+            .surface_gate
+            .write()
+            .expect("capability registry poisoned");
         let mut inner = self.inner.write().expect("capability registry poisoned");
         let entry = inner
             .get_mut(&owner)
@@ -529,6 +556,10 @@ impl CapabilityRegistry {
         let owner = self
             .owner_of(tool_name)
             .ok_or_else(|| AgentError::Tool(format!("unknown tool: {tool_name}")))?;
+        let _surface = self
+            .surface_gate
+            .write()
+            .expect("capability registry poisoned");
         let mut inner = self.inner.write().expect("capability registry poisoned");
         if let Some(entry) = inner.get_mut(&owner) {
             entry.loaded = false;
@@ -674,8 +705,12 @@ impl CapabilityRegistry {
     /// then the loaded flag (a loaded flag without a usable activation is
     /// dropped — activation is the gate in front of the model surface).
     pub fn restore(&self, state: &[crate::checkpoint::CapabilitySnapshot]) {
+        let _surface = self
+            .surface_gate
+            .write()
+            .expect("capability registry poisoned");
+        let mut inner = self.inner.write().expect("capability registry poisoned");
         for entry in state {
-            let mut inner = self.inner.write().expect("poisoned");
             let Some(current) = inner.get_mut(&entry.id) else {
                 // The capability is not registered in this run; its flags
                 // have nothing to apply to.
@@ -948,41 +983,152 @@ impl CapabilityAwareDispatcher {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::{Mutex, mpsc},
+        thread,
+        time::Duration,
+    };
+
+    struct BlockingBase {
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolDispatcher for BlockingBase {
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "base.test".into(),
+                description: "base test tool".into(),
+                input_schema: json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            }]
+        }
+
+        fn snapshot(&self) -> ToolSurfaceSnapshot {
+            self.entered
+                .lock()
+                .expect("entered lock poisoned")
+                .take()
+                .expect("snapshot is called once")
+                .send(())
+                .expect("test receiver dropped");
+            self.release
+                .lock()
+                .expect("release lock poisoned")
+                .recv()
+                .expect("test sender dropped");
+            ToolSurfaceSnapshot {
+                specs: self.specs(),
+                generation: 41,
+                source_revisions: agent_contracts::ToolSurfaceSourceRevisions {
+                    builtin_catalog_generation: 41,
+                    ..Default::default()
+                },
+                ..ToolSurfaceSnapshot::default()
+            }
+        }
+
+        async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+            unreachable!("this dispatcher is snapshot-only")
+        }
+    }
+
+    #[test]
+    fn unified_snapshot_fences_capability_mutation_while_base_is_captured() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let registry = Arc::new(CapabilityRegistry::new());
+        let dispatcher = Arc::new(CapabilityAwareDispatcher::new(
+            Arc::new(BlockingBase {
+                entered: Mutex::new(Some(entered_tx)),
+                release: Mutex::new(release_rx),
+            }),
+            registry.clone(),
+        ));
+
+        let snapshot_thread = thread::spawn(move || dispatcher.snapshot());
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("base snapshot was not entered");
+
+        let (attempted_tx, attempted_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let mutation_registry = registry.clone();
+        let mutation_thread = thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            // Restore is a surface mutation even when this empty test
+            // registry has no matching capability entries.
+            mutation_registry.restore(&[]);
+            finished_tx.send(()).unwrap();
+        });
+        attempted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mutation thread did not start");
+        let finished_early = finished_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+
+        release_tx.send(()).unwrap();
+        let snapshot = snapshot_thread.join().unwrap();
+        if !finished_early {
+            finished_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("mutation did not resume after snapshot");
+        }
+        mutation_thread.join().unwrap();
+
+        assert!(
+            !finished_early,
+            "a capability surface mutation crossed the unified snapshot"
+        );
+        assert_eq!(snapshot.source_revisions.builtin_catalog_generation, 41);
+        assert_eq!(snapshot.source_revisions.capability_catalog_generation, 0);
+        assert_eq!(snapshot.generation, 41);
+        assert_eq!(registry.generation(), 1);
+    }
+}
+
 #[async_trait]
 impl ToolDispatcher for CapabilityAwareDispatcher {
     fn specs(&self) -> Vec<ToolSpec> {
-        let mut specs: Vec<ToolSpec> = self
-            .base
-            .specs()
+        // Keep the compatibility read just as coherent as the round path;
+        // `snapshot` no longer delegates back to `specs`, so this cannot
+        // recurse.
+        self.snapshot().specs
+    }
+
+    fn snapshot(&self) -> ToolSurfaceSnapshot {
+        // Return the complete currently-loaded candidate surface. The
+        // RuntimeActor's RoundSurfacePlan owns the only schema-budget
+        // projection because Task Must/Prefer/KeepReady demands must be able
+        // to participate before anything is omitted.
+        // Freeze capability surface writers while the independent base
+        // dispatcher captures its own atomic snapshot. `inner` is not held
+        // across that callback, and the base layer cannot depend on this
+        // runtime registry, so the two source revisions describe one real
+        // common cut without retries or an unstable fallback.
+        let _surface = self
+            .capabilities
+            .surface_gate
+            .read()
+            .expect("capability registry poisoned");
+        let (capability_specs, capability_generation) = self.capabilities.loaded_surface();
+        let base_snapshot = self.base.snapshot();
+        let base_generation = base_snapshot.generation;
+        let mut source_revisions = base_snapshot.source_revisions;
+        source_revisions.capability_catalog_generation = capability_generation;
+        let mut specs: Vec<ToolSpec> = base_snapshot
+            .specs
             .into_iter()
             // The unified control tool lives here; drop the builtin's own
             // copy so the surface has no duplicate.
             .filter(|spec| spec.name != CAPABILITY_MANAGE)
             .collect();
-        specs.extend(self.capabilities.loaded_tool_specs());
+        specs.extend(capability_specs);
         specs.extend(Self::control_specs());
         specs.sort_by(|a, b| a.name.cmp(&b.name));
-        specs
-    }
-
-    fn snapshot(&self) -> ToolSurfaceSnapshot {
-        // The round surface is bounded by a deterministic schema budget:
-        // control + core tools always, optional tools smallest-first up to
-        // `MAX_TOOL_SURFACE_TOKENS`. Budget, prompt and tool-call
-        // validation all read this one snapshot, so the model sees — and
-        // the runtime prices and validates — exactly the bounded surface.
-        let specs = self.specs();
-        // Use the same pure classification as the actor's final guard. A
-        // dispatcher whose default is fail-closed therefore protects every
-        // schema it cannot classify, even when that mandatory set itself is
-        // above the cap; the actor can then fail explicitly instead of
-        // silently losing a required tool.
-        let protected: HashSet<String> = specs
-            .iter()
-            .filter(|spec| !self.may_omit_from_round(&spec.name))
-            .map(|spec| spec.name.clone())
-            .collect();
-        let specs = crate::budget::bounded_tool_surface(specs, &protected);
         ToolSurfaceSnapshot {
             specs,
             // The unified surface generation: the base catalog's generation
@@ -991,11 +1137,9 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
             // dynamic capability change is auditably visible in the
             // snapshot — the generation tracks the whole surface, not just
             // the builtin half of it.
-            generation: self
-                .base
-                .snapshot()
-                .generation
-                .wrapping_add(self.capabilities.generation()),
+            generation: base_generation.wrapping_add(capability_generation),
+            source_revisions,
+            ..ToolSurfaceSnapshot::default()
         }
     }
 

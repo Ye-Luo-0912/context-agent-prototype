@@ -1,6 +1,7 @@
 use agent_contracts::{
     ContextDiagnostics, ContextSelection, ContextStateTransition, OperationId, RunId, RuntimeEvent,
-    RuntimeEventEnvelope, TurnId,
+    RuntimeEventEnvelope, ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfacePlanReport,
+    ToolSurfacePlanStatus, TurnId,
 };
 use agent_kernel::ApprovalRequest;
 
@@ -27,6 +28,128 @@ pub struct PendingApproval {
 }
 
 const MAX_PANEL_TRANSITIONS: usize = 100;
+const MAX_TOOL_SURFACE_PREVIEW_ROWS_PER_KIND: usize = 3;
+const MAX_TOOL_SURFACE_PREVIEW_NAME_CHARS: usize = 48;
+const MAX_TOOL_SURFACE_MESSAGE_CHARS: usize = 640;
+
+fn demand_label(demand: ToolSurfaceDemand) -> &'static str {
+    match demand {
+        ToolSurfaceDemand::KeepReady => "ready",
+        ToolSurfaceDemand::PreferSurface => "prefer",
+        ToolSurfaceDemand::MustSurface => "must",
+    }
+}
+
+fn block_reason_label(reason: ToolSurfaceBlockReason) -> &'static str {
+    match reason {
+        ToolSurfaceBlockReason::Unavailable => "unavailable",
+        ToolSurfaceBlockReason::SchemaBudget => "required schema budget",
+        ToolSurfaceBlockReason::ProviderInputBudget => "provider input budget",
+    }
+}
+
+fn bounded_tool_name(name: &str) -> String {
+    let mut chars = name.chars();
+    let mut bounded: String = chars
+        .by_ref()
+        .take(MAX_TOOL_SURFACE_PREVIEW_NAME_CHARS)
+        .collect();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn bounded_tool_surface_message(report: &ToolSurfacePlanReport) -> String {
+    let status = match report.status {
+        ToolSurfacePlanStatus::Ready => "ready".to_string(),
+        ToolSurfacePlanStatus::Unsatisfiable { reason } => {
+            format!("blocked ({})", block_reason_label(reason))
+        }
+    };
+    let mut message = format!(
+        "tool surface r{} round {}: {status}; selected {} (≈{} tok), omitted {}, blocked {}; input ≈{}/{} tok",
+        report.surface_revision,
+        report.model_round,
+        report.selected_total,
+        report.selected_schema_tokens,
+        report.omitted_total,
+        report.blocked_total,
+        report.estimated_input_tokens,
+        report.input_budget_tokens,
+    );
+
+    let selected: Vec<String> = report
+        .selected
+        .iter()
+        .take(MAX_TOOL_SURFACE_PREVIEW_ROWS_PER_KIND)
+        .map(|entry| {
+            format!(
+                "{}:{}",
+                bounded_tool_name(&entry.tool_name),
+                demand_label(entry.demand)
+            )
+        })
+        .collect();
+    if !selected.is_empty() {
+        let total = report.selected_total.max(report.selected.len());
+        message.push_str(&format!("; selected [{}]", selected.join(", ")));
+        if total > selected.len() {
+            message.push_str(&format!(" +{} more", total - selected.len()));
+        }
+    }
+
+    let omitted: Vec<String> = report
+        .omitted
+        .iter()
+        .take(MAX_TOOL_SURFACE_PREVIEW_ROWS_PER_KIND)
+        .map(|entry| {
+            format!(
+                "{}:{}",
+                bounded_tool_name(&entry.tool_name),
+                entry.reason.as_str()
+            )
+        })
+        .collect();
+    if !omitted.is_empty() {
+        let total = report.omitted_total.max(report.omitted.len());
+        message.push_str(&format!("; omitted [{}]", omitted.join(", ")));
+        if total > omitted.len() {
+            message.push_str(&format!(" +{} more", total - omitted.len()));
+        }
+    }
+
+    let blocked: Vec<String> = report
+        .blocked
+        .iter()
+        .take(MAX_TOOL_SURFACE_PREVIEW_ROWS_PER_KIND)
+        .map(|entry| {
+            format!(
+                "{}:{}",
+                bounded_tool_name(&entry.tool_name),
+                block_reason_label(entry.reason)
+            )
+        })
+        .collect();
+    if !blocked.is_empty() {
+        let total = report.blocked_total.max(report.blocked.len());
+        message.push_str(&format!("; blocked [{}]", blocked.join(", ")));
+        if total > blocked.len() {
+            message.push_str(&format!(" +{} more", total - blocked.len()));
+        }
+    }
+
+    if message.chars().count() > MAX_TOOL_SURFACE_MESSAGE_CHARS {
+        let mut bounded: String = message
+            .chars()
+            .take(MAX_TOOL_SURFACE_MESSAGE_CHARS.saturating_sub(1))
+            .collect();
+        bounded.push('…');
+        bounded
+    } else {
+        message
+    }
+}
 
 pub struct AppState {
     pub run_id: RunId,
@@ -138,6 +261,16 @@ impl AppState {
             RuntimeEvent::FocusCleared => {
                 self.push_system("focus cleared (task suspended)".into());
             }
+            RuntimeEvent::TaskToolRequirementsChanged {
+                task_id,
+                revision,
+                requirements,
+            } => {
+                self.push_system(format!(
+                    "task {task_id} tool requirements r{revision}: {} entries",
+                    requirements.len()
+                ));
+            }
             RuntimeEvent::Pinned { content } => {
                 self.push_system(format!("pinned: {content}"));
             }
@@ -148,6 +281,13 @@ impl AppState {
                 self.context = diagnostics;
                 self.context_selected = selected;
                 self.status = "model context prepared".into();
+            }
+            RuntimeEvent::ContextConsumed { ack } => {
+                self.status = format!(
+                    "model consumed {} context items and {} external refs",
+                    ack.item_ids.len(),
+                    ack.external_item_ids.len()
+                );
             }
             RuntimeEvent::ContextMaintained { report, .. } => {
                 self.context = report.diagnostics;
@@ -201,15 +341,36 @@ impl AppState {
                     ));
                 }
             }
+            RuntimeEvent::ToolSurfacePlanned { report } => {
+                let ready = matches!(report.status, ToolSurfacePlanStatus::Ready);
+                let message = bounded_tool_surface_message(&report);
+                if ready {
+                    self.status = "tool surface prepared".into();
+                } else {
+                    // An unsatisfiable report means no provider operation was
+                    // started, so clear any stale live-stream fence.
+                    self.current_op = None;
+                    self.busy = false;
+                    self.streaming = false;
+                    self.status = "tool surface blocked".into();
+                }
+                self.push_system(message);
+            }
             RuntimeEvent::ModelStarted {
                 turn_id,
                 operation_id,
                 generation,
+                surface_revision,
+                model_round,
             } => {
                 self.current_op = Some((turn_id, operation_id, generation));
                 self.busy = true;
                 self.streaming = false;
-                self.status = "model".into();
+                self.status = if surface_revision == 0 {
+                    "model".into()
+                } else {
+                    format!("model round {model_round} (surface {surface_revision})")
+                };
             }
             RuntimeEvent::ModelDelta {
                 turn_id,
@@ -329,7 +490,10 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::RuntimeEventEnvelope;
+    use agent_contracts::{
+        RuntimeEventEnvelope, ToolSurfaceBlock, ToolSurfaceOmission, ToolSurfaceOmissionReason,
+        ToolSurfaceSelection, ToolSurfaceSourceRevisions,
+    };
 
     fn envelope(event: RuntimeEvent) -> RuntimeEventEnvelope {
         RuntimeEventEnvelope {
@@ -360,6 +524,8 @@ mod tests {
             turn_id: turn,
             operation_id: op_a,
             generation: 3,
+            surface_revision: 8,
+            model_round: 2,
         }));
 
         // The current operation's deltas render.
@@ -395,5 +561,104 @@ mod tests {
             .map(|m| m.content.clone())
             .collect();
         assert_eq!(rendered, "hello world", "post-turn deltas must be dropped");
+    }
+
+    #[test]
+    fn tool_surface_event_is_rendered_with_defensive_bounds() {
+        let mut app = AppState::new(RunId::new());
+        let long_name = "very-long-tool-name-".repeat(20);
+        let selected = (0..100)
+            .map(|index| ToolSurfaceSelection {
+                tool_name: format!("{long_name}{index}"),
+                demand: ToolSurfaceDemand::PreferSurface,
+                approx_tokens: 10,
+            })
+            .collect();
+        let omitted = (0..100)
+            .map(|index| ToolSurfaceOmission {
+                tool_name: format!("{long_name}{index}"),
+                demand: ToolSurfaceDemand::PreferSurface,
+                reason: ToolSurfaceOmissionReason::SchemaBudget,
+                approx_tokens: 10,
+            })
+            .collect();
+        let blocked = (0..100)
+            .map(|index| ToolSurfaceBlock {
+                tool_name: format!("{long_name}{index}"),
+                demand: ToolSurfaceDemand::MustSurface,
+                reason: ToolSurfaceBlockReason::ProviderInputBudget,
+            })
+            .collect();
+
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolSurfacePlanned {
+            report: ToolSurfacePlanReport {
+                turn_id: TurnId::new(),
+                model_round: 4,
+                surface_revision: 21,
+                source_revisions: ToolSurfaceSourceRevisions::default(),
+                status: ToolSurfacePlanStatus::Ready,
+                selected,
+                selected_total: 100,
+                omitted,
+                omitted_total: 100,
+                blocked,
+                blocked_total: 100,
+                selected_schema_tokens: 900,
+                mandatory_schema_tokens: 100,
+                estimated_input_tokens: 1_200,
+                input_budget_tokens: 2_000,
+            },
+        }));
+
+        let rendered = &app.messages.last().expect("surface summary").content;
+        assert!(rendered.contains("tool surface r21 round 4"));
+        assert!(rendered.contains("+97 more"));
+        assert!(rendered.chars().count() <= MAX_TOOL_SURFACE_MESSAGE_CHARS);
+        assert_eq!(app.status, "tool surface prepared");
+    }
+
+    #[test]
+    fn unsatisfiable_surface_clears_a_stale_model_fence() {
+        let mut app = AppState::new(RunId::new());
+        let turn = TurnId::new();
+        let operation = OperationId::new();
+        app.apply_runtime_event(envelope(RuntimeEvent::ModelStarted {
+            turn_id: turn,
+            operation_id: operation,
+            generation: 5,
+            surface_revision: 3,
+            model_round: 1,
+        }));
+
+        app.apply_runtime_event(envelope(RuntimeEvent::ToolSurfacePlanned {
+            report: ToolSurfacePlanReport {
+                turn_id: turn,
+                model_round: 2,
+                surface_revision: 4,
+                source_revisions: ToolSurfaceSourceRevisions::default(),
+                status: ToolSurfacePlanStatus::Unsatisfiable {
+                    reason: ToolSurfaceBlockReason::ProviderInputBudget,
+                },
+                selected: Vec::new(),
+                selected_total: 0,
+                omitted: Vec::new(),
+                omitted_total: 0,
+                blocked: Vec::new(),
+                blocked_total: 1,
+                selected_schema_tokens: 0,
+                mandatory_schema_tokens: 1_000,
+                estimated_input_tokens: 1_500,
+                input_budget_tokens: 900,
+            },
+        }));
+        app.apply_runtime_event(envelope(delta(turn, operation, 5, "LATE")));
+
+        assert_eq!(app.status, "tool surface blocked");
+        assert!(!app.busy);
+        assert!(
+            app.messages
+                .iter()
+                .all(|message| !message.content.contains("LATE"))
+        );
     }
 }

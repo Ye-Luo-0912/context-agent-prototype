@@ -41,6 +41,7 @@ impl ContextEngine for TestContextEngine {
     }
     async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
         Ok(MaterializedContext {
+            materialization_id: 0,
             focus: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
@@ -182,6 +183,7 @@ impl ContextEngine for RecordingContextEngine {
     async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
         self.activity.lock().await.push("Materialize".into());
         Ok(MaterializedContext {
+            materialization_id: 0,
             focus: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
@@ -547,6 +549,7 @@ impl ContextEngine for ScopeRecordingEngine {
     }
     async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
         Ok(MaterializedContext {
+            materialization_id: 0,
             focus: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
@@ -1448,6 +1451,7 @@ impl ContextEngine for FailingAssistantIngestEngine {
     }
     async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
         Ok(MaterializedContext {
+            materialization_id: 0,
             focus: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),

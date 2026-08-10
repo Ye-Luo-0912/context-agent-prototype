@@ -161,9 +161,22 @@ impl BuiltinToolDispatcher {
     /// catalog generation at capture time. The runtime calls this once per
     /// round, right after `gc()`.
     pub fn surface(&self) -> ToolSurfaceSnapshot {
-        let specs = self.specs();
+        // Every surface mutation updates `generation` before releasing the
+        // catalog write lock. Reading both under the matching read lock
+        // therefore gives the snapshot one exact catalog revision instead
+        // of pairing old specs with a newer generation.
+        let catalog = self.catalog.read().expect("tool catalog poisoned");
+        let specs = Self::surface_specs(&catalog);
         let generation = self.generation.load(Ordering::Relaxed);
-        ToolSurfaceSnapshot { specs, generation }
+        ToolSurfaceSnapshot {
+            specs,
+            generation,
+            source_revisions: agent_contracts::ToolSurfaceSourceRevisions {
+                builtin_catalog_generation: generation,
+                ..Default::default()
+            },
+            ..ToolSurfaceSnapshot::default()
+        }
     }
 
     /// Snapshot of the catalog for `capability.search`.
@@ -238,6 +251,17 @@ impl BuiltinToolDispatcher {
             },
         ]
     }
+
+    fn surface_specs(catalog: &HashMap<String, ToolEntry>) -> Vec<ToolSpec> {
+        let mut specs: Vec<ToolSpec> = catalog
+            .values()
+            .filter(|entry| entry.state.in_surface())
+            .map(|entry| entry.tool.spec())
+            .collect();
+        specs.extend(Self::meta_specs());
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
+        specs
+    }
 }
 
 #[derive(Deserialize)]
@@ -272,14 +296,7 @@ impl ToolDispatcher for BuiltinToolDispatcher {
         // safe point (`gc()`), never here, so one model round sees a stable
         // tool surface for budget, prompt and validation alike.
         let catalog = self.catalog.read().expect("tool catalog poisoned");
-        let mut specs: Vec<ToolSpec> = catalog
-            .iter()
-            .filter(|(_, entry)| entry.state.in_surface())
-            .map(|(_, entry)| entry.tool.spec())
-            .collect();
-        specs.extend(Self::meta_specs());
-        specs.sort_by(|a, b| a.name.cmp(&b.name));
-        specs
+        Self::surface_specs(&catalog)
     }
 
     fn gc(&self) {
@@ -291,6 +308,21 @@ impl ToolDispatcher for BuiltinToolDispatcher {
 
     fn snapshot(&self) -> ToolSurfaceSnapshot {
         self.surface()
+    }
+
+    fn may_omit_from_round(&self, name: &str) -> bool {
+        // The catalog configuration is the authority for builtin core
+        // membership. Runtime controls are fail-closed even when a custom
+        // configuration accidentally leaves one out of `always_loaded`;
+        // unknown names are also fail-closed rather than guessed optional.
+        if matches!(name, CAPABILITY_MANAGE | CONTEXT_MANAGE) {
+            return false;
+        }
+        self.catalog
+            .read()
+            .expect("tool catalog poisoned")
+            .contains_key(name)
+            && !self.config.always_loaded.iter().any(|core| core == name)
     }
 
     fn catalog(&self) -> Vec<ToolCatalogEntry> {
@@ -752,6 +784,47 @@ mod tests {
         // Core tools cannot be unloaded.
         let core = dispatcher.unload("fs.read");
         assert!(core.is_err(), "core tools must stay loaded");
+    }
+
+    #[tokio::test]
+    async fn round_omission_classification_preserves_core_and_controls() {
+        let dispatcher = dispatcher().await;
+        assert!(!dispatcher.may_omit_from_round("fs.read"));
+        assert!(!dispatcher.may_omit_from_round(CONTEXT_MANAGE));
+        assert!(!dispatcher.may_omit_from_round(CAPABILITY_MANAGE));
+        assert!(!dispatcher.may_omit_from_round("unknown.tool"));
+        assert!(dispatcher.may_omit_from_round("git.status"));
+    }
+
+    #[tokio::test]
+    async fn surface_specs_and_generation_are_one_catalog_revision() {
+        let dispatcher = Arc::new(dispatcher().await);
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_dispatcher = dispatcher.clone();
+        let writer_finished = finished.clone();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..2_000 {
+                writer_dispatcher.load("git.status").unwrap();
+                writer_dispatcher.unload("git.status").unwrap();
+            }
+            writer_finished.store(true, Ordering::Release);
+        });
+
+        while !finished.load(Ordering::Acquire) {
+            let snapshot = dispatcher.surface();
+            let loaded = snapshot.specs.iter().any(|spec| spec.name == "git.status");
+            assert_eq!(
+                loaded,
+                snapshot.generation % 2 == 1,
+                "specs do not describe generation {}",
+                snapshot.generation
+            );
+            assert_eq!(
+                snapshot.source_revisions.builtin_catalog_generation,
+                snapshot.generation
+            );
+        }
+        writer.join().unwrap();
     }
 
     #[tokio::test]

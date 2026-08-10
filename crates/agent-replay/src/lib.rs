@@ -7,7 +7,8 @@
 //! materialize calls, then reports, per item:
 //!
 //! - what entered and why (`source`, `kind`, entry turn);
-//! - which model turns consumed it (from `ContextPrepared` selections);
+//! - which model turns consumed it (from `ContextConsumed`; legacy traces
+//!   without that event retain the old `ContextPrepared` behavior);
 //! - every state transition, with the maintenance turn and reason;
 //! - the final state.
 //!
@@ -19,12 +20,17 @@
 mod facts;
 mod scenarios;
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+};
 
 use agent_contracts::{
-    AttentionState, ContextDiagnostics, ContextEngine, ContextHints, ContextIngress, ContextItemId,
-    ContextItemSummary, ContextKind, ContextQuery, FocusState, MaterializedItem, RuntimeEvent,
-    RuntimeEventEnvelope, tokens,
+    AttentionState, ContextConsumptionAck, ContextDiagnostics, ContextEngine, ContextHints,
+    ContextIngress, ContextItemId, ContextItemSummary, ContextKind, ContextQuery, ContextSelection,
+    FocusState, MaterializedContext, MaterializedItem, OperationId, RuntimeEvent,
+    RuntimeEventEnvelope, TurnId, tokens,
 };
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 
@@ -131,6 +137,11 @@ pub(crate) async fn run_engine_observing(
     config: &ReplayConfig,
     mut observe: impl FnMut(u64, &[MaterializedItem]),
 ) -> anyhow::Result<ReplayOutcome> {
+    struct PendingReplayContext {
+        materialized: MaterializedContext,
+        selected_item_ids: Vec<ContextItemId>,
+    }
+
     let mut current_input = String::new();
     let mut current_turn = 0u64;
     let mut total_tool_rounds = 0u64;
@@ -144,6 +155,13 @@ pub(crate) async fn run_engine_observing(
     let mut transitions_total = 0usize;
     let mut gc_evictions = 0usize;
     let mut gc_reactivations = 0usize;
+    // New traces distinguish a preview from a successful provider
+    // consumption. A whole-trace feature check keeps old JSONL journals and
+    // synthetic benchmark scenarios replayable without inventing ack events.
+    let has_explicit_consumption = events
+        .iter()
+        .any(|envelope| matches!(envelope.event, RuntimeEvent::ContextConsumed { .. }));
+    let mut pending_context: Option<PendingReplayContext> = None;
 
     for envelope in events {
         events_consumed += 1;
@@ -216,7 +234,7 @@ pub(crate) async fn run_engine_observing(
                         });
                 }
             }
-            RuntimeEvent::ContextPrepared { .. } => {
+            RuntimeEvent::ContextPrepared { selected, .. } => {
                 let materialized = engine
                     .materialize(ContextQuery {
                         current_input: current_input.clone(),
@@ -234,14 +252,85 @@ pub(crate) async fn run_engine_observing(
                 if input_tokens > config.budget_tokens {
                     over_budget_snapshots += 1;
                 }
-                // The fact-coverage evaluation keys on exactly what the model
-                // would have seen, so the observer gets the working-set items.
-                observe(current_turn, &materialized.items);
-                for selection in materialized.selected {
-                    consumed
-                        .entry(selection.item_id)
-                        .or_default()
-                        .push(current_turn);
+                if has_explicit_consumption {
+                    // Runtime ids are random and cannot be replayed directly.
+                    // ContextPrepared carries the final selection metadata in
+                    // engine order, so map that subsequence onto the fresh
+                    // engine's preview and wait for ContextConsumed to commit.
+                    let selected_item_ids = map_recorded_selection(&materialized, selected)?;
+                    pending_context = Some(PendingReplayContext {
+                        materialized,
+                        selected_item_ids,
+                    });
+                } else {
+                    // Compatibility for journals written before consumption
+                    // acknowledgements existed: materialize used to reinforce
+                    // its whole preview immediately.
+                    let ack = ContextConsumptionAck {
+                        turn_id: TurnId::new(),
+                        operation_id: OperationId::new(),
+                        model_round: snapshot_builds,
+                        materialization_id: materialized.materialization_id,
+                        item_ids: materialized.items.iter().map(|item| item.item_id).collect(),
+                        external_item_ids: materialized
+                            .external
+                            .iter()
+                            .map(|entry| entry.item_id)
+                            .collect(),
+                    };
+                    engine.acknowledge_consumption(ack).await?;
+                    observe(current_turn, &materialized.items);
+                    for item in materialized.items {
+                        consumed.entry(item.item_id).or_default().push(current_turn);
+                    }
+                }
+            }
+            RuntimeEvent::ContextConsumed { ack } => {
+                let pending = pending_context.take().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ContextConsumed for operation {} has no pending ContextPrepared preview",
+                        ack.operation_id
+                    )
+                })?;
+                if ack.item_ids.len() != pending.selected_item_ids.len() {
+                    anyhow::bail!(
+                        "ContextConsumed item count {} differs from the replayed final selection count {}",
+                        ack.item_ids.len(),
+                        pending.selected_item_ids.len()
+                    );
+                }
+                if ack.external_item_ids.len() != pending.materialized.external.len() {
+                    anyhow::bail!(
+                        "ContextConsumed external-ref count {} differs from the replayed preview count {}",
+                        ack.external_item_ids.len(),
+                        pending.materialized.external.len()
+                    );
+                }
+                let local_ack = ContextConsumptionAck {
+                    turn_id: ack.turn_id,
+                    operation_id: ack.operation_id,
+                    model_round: ack.model_round,
+                    materialization_id: pending.materialized.materialization_id,
+                    item_ids: pending.selected_item_ids.clone(),
+                    external_item_ids: pending
+                        .materialized
+                        .external
+                        .iter()
+                        .map(|entry| entry.item_id)
+                        .collect(),
+                };
+                engine.acknowledge_consumption(local_ack).await?;
+
+                let selected_ids: HashSet<_> = pending.selected_item_ids.iter().copied().collect();
+                let visible: Vec<_> = pending
+                    .materialized
+                    .items
+                    .into_iter()
+                    .filter(|item| selected_ids.contains(&item.item_id))
+                    .collect();
+                observe(current_turn, &visible);
+                for item_id in pending.selected_item_ids {
+                    consumed.entry(item_id).or_default().push(current_turn);
                 }
             }
             RuntimeEvent::ContextGc { .. } => {
@@ -274,6 +363,39 @@ pub(crate) async fn run_engine_observing(
         gc_evictions,
         gc_reactivations,
     })
+}
+
+/// Map the final selection recorded by a live run onto a fresh replay
+/// engine. Runtime budget packing only removes entries from the engine's
+/// ordered preview, so the event must be an exact metadata subsequence.
+fn map_recorded_selection(
+    materialized: &MaterializedContext,
+    recorded: &[ContextSelection],
+) -> anyhow::Result<Vec<ContextItemId>> {
+    let mut cursor = 0usize;
+    let mut mapped = Vec::with_capacity(recorded.len());
+    for expected in recorded {
+        let Some((offset, local)) = materialized.selected[cursor..]
+            .iter()
+            .enumerate()
+            .find(|(_, local)| selection_metadata_matches(local, expected))
+        else {
+            anyhow::bail!(
+                "recorded ContextPrepared selection cannot be mapped to the replay preview (tokens={}, reason={:?})",
+                expected.approx_tokens,
+                expected.reason
+            );
+        };
+        cursor += offset + 1;
+        mapped.push(local.item_id);
+    }
+    Ok(mapped)
+}
+
+fn selection_metadata_matches(left: &ContextSelection, right: &ContextSelection) -> bool {
+    left.approx_tokens == right.approx_tokens
+        && left.reason == right.reason
+        && (left.score - right.score).abs() <= f32::EPSILON
 }
 
 /// Read a JSONL trace file (one `RuntimeEventEnvelope` per line) and replay it.
@@ -445,6 +567,33 @@ mod tests {
         }
     }
 
+    async fn recorded_pin_preview(contents: &[&str]) -> MaterializedContext {
+        let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+        for content in contents {
+            engine
+                .ingest(ContextIngress::Pin {
+                    content: (*content).into(),
+                    kind: ContextKind::Constraint,
+                })
+                .await
+                .unwrap();
+        }
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "continue".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .materialize(ContextQuery {
+                current_input: "continue".into(),
+                budget_tokens: ReplayConfig::default().budget_tokens,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn replay_answers_lifecycle_questions() {
         let run = RunId::new();
@@ -600,6 +749,150 @@ mod tests {
         let report = render_report(&outcome);
         assert!(report.contains("UserMessage"));
         assert!(report.contains("AssistantMessage"));
+    }
+
+    #[tokio::test]
+    async fn explicit_consumption_replays_only_the_final_recorded_subset() {
+        let preview = recorded_pin_preview(&["constraint alpha", "constraint beta"]).await;
+        assert_eq!(preview.selected.len(), 2);
+        let recorded = preview.selected[1].clone();
+        let run = RunId::new();
+        let events = vec![
+            envelope(
+                run,
+                1,
+                RuntimeEvent::Pinned {
+                    content: "constraint alpha".into(),
+                },
+            ),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::Pinned {
+                    content: "constraint beta".into(),
+                },
+            ),
+            envelope(
+                run,
+                3,
+                RuntimeEvent::UserMessageAccepted {
+                    content: "continue".into(),
+                },
+            ),
+            envelope(
+                run,
+                4,
+                RuntimeEvent::ContextPrepared {
+                    diagnostics: ContextDiagnostics::default(),
+                    selected: vec![recorded.clone()],
+                },
+            ),
+            envelope(
+                run,
+                5,
+                RuntimeEvent::ContextConsumed {
+                    ack: ContextConsumptionAck {
+                        turn_id: TurnId::new(),
+                        operation_id: OperationId::new(),
+                        model_round: 0,
+                        materialization_id: preview.materialization_id,
+                        item_ids: vec![recorded.item_id],
+                        external_item_ids: Vec::new(),
+                    },
+                },
+            ),
+        ];
+
+        let outcome = replay_events(&events, &ReplayConfig::default())
+            .await
+            .unwrap();
+        let constraints: Vec<_> = outcome
+            .items
+            .iter()
+            .filter(|item| item.kind == ContextKind::Constraint)
+            .collect();
+        assert_eq!(constraints.len(), 2);
+        assert_eq!(
+            constraints
+                .iter()
+                .filter(|item| item.consumed_turns == vec![1])
+                .count(),
+            1,
+            "only the final post-packing subset may be recorded as consumed"
+        );
+        assert_eq!(
+            constraints
+                .iter()
+                .map(|item| item.access_count)
+                .sum::<u32>(),
+            1,
+            "only one replay item may receive access reinforcement"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unacknowledged_preview_receives_no_replay_reinforcement() {
+        let preview = recorded_pin_preview(&["preview only constraint"]).await;
+        let run = RunId::new();
+        let events = vec![
+            envelope(
+                run,
+                1,
+                RuntimeEvent::Pinned {
+                    content: "preview only constraint".into(),
+                },
+            ),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::UserMessageAccepted {
+                    content: "continue".into(),
+                },
+            ),
+            envelope(
+                run,
+                3,
+                RuntimeEvent::ContextPrepared {
+                    diagnostics: ContextDiagnostics::default(),
+                    selected: preview.selected,
+                },
+            ),
+            // A later empty frame succeeds. It supersedes the first pending
+            // preview; the first provider attempt never produced an ack.
+            envelope(
+                run,
+                4,
+                RuntimeEvent::ContextPrepared {
+                    diagnostics: ContextDiagnostics::default(),
+                    selected: Vec::new(),
+                },
+            ),
+            envelope(
+                run,
+                5,
+                RuntimeEvent::ContextConsumed {
+                    ack: ContextConsumptionAck {
+                        turn_id: TurnId::new(),
+                        operation_id: OperationId::new(),
+                        model_round: 1,
+                        materialization_id: 2,
+                        item_ids: Vec::new(),
+                        external_item_ids: Vec::new(),
+                    },
+                },
+            ),
+        ];
+
+        let outcome = replay_events(&events, &ReplayConfig::default())
+            .await
+            .unwrap();
+        let constraint = outcome
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::Constraint)
+            .unwrap();
+        assert!(constraint.consumed_turns.is_empty());
+        assert_eq!(constraint.access_count, 0);
     }
 
     #[tokio::test]

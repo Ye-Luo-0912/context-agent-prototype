@@ -55,19 +55,19 @@ fn is_runtime_control(name: &str) -> bool {
 }
 
 /// Bound one round's tool surface to [`MAX_TOOL_SURFACE_TOKENS`] schema
-/// tokens. Deterministic: always-visible tools (runtime control + the
-/// base catalog's core set) stay; the rest are kept in ascending schema
+/// tokens. Deterministic: protected tools (runtime control + every schema
+/// the dispatcher says may not be omitted) stay; the rest are kept in ascending schema
 /// cost (name as the tie-break) until the cap, so the widest possible
 /// surface survives within the bound. The output keeps the canonical
 /// name-sorted order the dispatcher already uses.
 pub fn bounded_tool_surface(
     specs: Vec<ToolSpec>,
-    core_tools: &std::collections::HashSet<String>,
+    protected_tools: &std::collections::HashSet<String>,
 ) -> Vec<ToolSpec> {
     let mut always = Vec::new();
     let mut optional = Vec::new();
     for spec in specs {
-        if core_tools.contains(&spec.name) || is_runtime_control(&spec.name) {
+        if protected_tools.contains(&spec.name) || is_runtime_control(&spec.name) {
             always.push(spec);
         } else {
             optional.push(spec);
@@ -91,6 +91,28 @@ pub fn bounded_tool_surface(
     }
     always.sort_by(|a, b| a.name.cmp(&b.name));
     always
+}
+
+/// Remove the largest schema that the dispatcher explicitly classifies as
+/// optional for this model round. This is deliberately a mutation of the
+/// caller-owned snapshot only: catalog lifecycle and generation are outside
+/// the function and therefore cannot be changed by provider token pressure.
+#[cfg(test)]
+pub(crate) fn omit_largest_optional_tool(
+    specs: &mut Vec<ToolSpec>,
+    may_omit: impl Fn(&str) -> bool,
+) -> Option<ToolSpec> {
+    let index = specs
+        .iter()
+        .enumerate()
+        .filter(|(_, spec)| may_omit(&spec.name))
+        .max_by(|(_, left), (_, right)| {
+            approx_layer_tokens(*left)
+                .cmp(&approx_layer_tokens(*right))
+                .then_with(|| left.name.cmp(&right.name))
+        })
+        .map(|(index, _)| index)?;
+    Some(specs.remove(index))
 }
 
 /// One request's budget breakdown. `context_frame_budget` is what gets handed
@@ -261,5 +283,47 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted, "the surface keeps its canonical order");
+    }
+
+    #[test]
+    fn final_guard_omits_only_the_largest_explicit_optional_schema() {
+        use agent_contracts::{ToolRisk, ToolSpec};
+        use serde_json::json;
+
+        let make = |name: &str, description: &str| ToolSpec {
+            name: name.into(),
+            description: description.into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+        };
+        let mut specs = vec![
+            make("core.read", "mandatory"),
+            make("optional.small", "small"),
+            make("optional.large", &"x".repeat(2_000)),
+        ];
+
+        let omitted = omit_largest_optional_tool(&mut specs, |name| name.starts_with("optional."))
+            .expect("one optional schema must be omitted");
+
+        assert_eq!(omitted.name, "optional.large");
+        assert!(specs.iter().any(|spec| spec.name == "core.read"));
+        assert!(specs.iter().any(|spec| spec.name == "optional.small"));
+        assert!(specs.iter().all(|spec| spec.name != "optional.large"));
+    }
+
+    #[test]
+    fn final_guard_cannot_omit_mandatory_schemas() {
+        use agent_contracts::{ToolRisk, ToolSpec};
+        use serde_json::json;
+
+        let mut specs = vec![ToolSpec {
+            name: "core.read".into(),
+            description: "mandatory".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+        }];
+        assert!(omit_largest_optional_tool(&mut specs, |_| false).is_none());
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "core.read");
     }
 }

@@ -7,12 +7,13 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentError, AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, ContextEngine,
-    ContextGcReport, ContextIngress, ContextItemSummary, ContextKind, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery, ContextStateTransition,
-    EngineQuery, EventJournal, FocusState, MaterializedContext, ModelCapabilities, ModelEventSink,
-    ModelOutput, ModelRequest, ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, ScopeId,
-    ScopeKind, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput,
+    AgentError, AgentResult, ApprovalDecision, ApprovalGate, CancellationToken,
+    ContextConsumptionAck, ContextEngine, ContextGcReport, ContextIngress, ContextItemSummary,
+    ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
+    ContextSearchQuery, ContextStateTransition, EngineQuery, EventJournal, FocusState,
+    MaterializedContext, ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest,
+    ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, TaskId,
+    ToolCall, ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput,
     ToolSpec, ToolSurfaceSnapshot,
 };
 use tokio::sync::broadcast;
@@ -127,6 +128,13 @@ impl AgentKernel {
         self.tools.snapshot()
     }
 
+    /// Pure classification used by the runtime's final input guard. A true
+    /// result permits a schema to be omitted from the current round only;
+    /// it does not authorize unloading or any catalog lifecycle mutation.
+    pub fn tool_may_omit_from_round(&self, name: &str) -> bool {
+        self.tools.may_omit_from_round(name)
+    }
+
     /// Run the tool lifecycle GC at a runtime safe point. `specs()` is pure;
     /// the actor ages the tool catalog exactly once per model round, before
     /// the surface is captured for the budget and the prompt.
@@ -134,9 +142,22 @@ impl AgentKernel {
         self.tools.gc();
     }
 
-    /// Unload an optional tool from the model surface (used by the final
-    /// budget guard when the fixed layers overshoot the input budget).
-    /// Core tools refuse to unload — they are part of the minimal surface.
+    /// Pure discovery state used by the runtime's Task requirement safe
+    /// point. The dispatcher remains unaware of TaskManager/Focus policy.
+    pub fn tool_catalog(&self) -> Vec<ToolCatalogEntry> {
+        self.tools.catalog()
+    }
+
+    /// Re-activate one exact Task-rooted tool at the BeforeModel safe point.
+    /// This is a lifecycle decision caused by a Task requirement, never by
+    /// provider token pressure and never an authority/approval grant.
+    pub fn tool_load(&self, name: &str) -> AgentResult<()> {
+        self.tools.load_tool(name)
+    }
+
+    /// Explicitly unload an optional tool from the catalog surface. Provider
+    /// input budgeting never calls this: budget pressure only omits schemas
+    /// from its immutable per-round snapshot. Core tools refuse to unload.
     pub fn tool_unload(&self, name: &str) -> AgentResult<()> {
         self.tools.unload_tool(name)
     }
@@ -156,6 +177,24 @@ impl AgentKernel {
     /// Journal + broadcast one runtime event (the single write path).
     pub async fn emit_event(&self, event: RuntimeEvent) -> AgentResult<()> {
         self.emit(event).await
+    }
+
+    /// Journal + broadcast one runtime event *after a durability barrier*:
+    /// the event is appended, then `flush()` guarantees every event
+    /// appended before it (the channel is FIFO) has left the process before
+    /// the event is broadcast. Used at the turn-commit boundary: a
+    /// subscriber never sees `TurnCompleted` unless the mandatory state
+    /// writes before it are durable. A failed barrier returns the error and
+    /// broadcasts nothing — the caller fences the turn instead of claiming
+    /// a commit that never landed.
+    pub async fn emit_event_durable(&self, event: RuntimeEvent) -> AgentResult<()> {
+        let envelope = self.make_envelope(event);
+        if let Some(journal) = &self.journal {
+            journal.append(&envelope).await?;
+            journal.flush().await?;
+        }
+        let _ = self.event_tx.send(envelope);
+        Ok(())
     }
 
     /// Surface a runtime-level warning through the normal event stream.
@@ -189,6 +228,25 @@ impl AgentKernel {
         query: ContextQuery,
     ) -> AgentResult<MaterializedContext> {
         self.context.materialize(query).await
+    }
+
+    /// Commit model-consumption reinforcement and its bounded audit record as
+    /// one context transaction. If either the engine mutation or event append
+    /// fails, restore the pre-ack checkpoint so GC never observes an
+    /// unaudited/partial access stamp.
+    pub async fn acknowledge_context_consumption(
+        &self,
+        ack: ContextConsumptionAck,
+    ) -> AgentResult<()> {
+        ack.validate()?;
+        let checkpoint = self.context.checkpoint().await?;
+        let result = async {
+            self.context.acknowledge_consumption(ack.clone()).await?;
+            self.emit(RuntimeEvent::ContextConsumed { ack }).await
+        }
+        .await;
+        self.finish_context_transaction("acknowledge context consumption", checkpoint, result)
+            .await
     }
 
     /// Open a scope (runtime-driven, e.g. a tool scope at tool start).
@@ -378,20 +436,9 @@ impl AgentKernel {
             .find(|spec| spec.name == call.name)
             .cloned();
         let Some(spec) = spec else {
-            // The round surface is bounded by the schema budget; a loaded
-            // tool trimmed off this round is not "unknown" — tell the model
-            // it exists but is not on the current surface.
-            let trimmed = self.tools.specs().iter().any(|s| s.name == call.name);
             return ToolOutcome::Value(tool_error_output(
                 &call,
-                if trimmed {
-                    format!(
-                        "tool '{}' is loaded but not on this round's model surface (schema budget); swap it in with capability.manage load",
-                        call.name
-                    )
-                } else {
-                    format!("unknown tool: {}", call.name)
-                },
+                tool_not_on_surface_message(&call, surface),
             ));
         };
 
@@ -592,14 +639,17 @@ impl AgentKernel {
             .await
     }
 
-    async fn emit(&self, event: RuntimeEvent) -> AgentResult<()> {
-        let envelope = RuntimeEventEnvelope {
+    fn make_envelope(&self, event: RuntimeEvent) -> RuntimeEventEnvelope {
+        RuntimeEventEnvelope {
             run_id: self.run_id,
             seq: self.seq.fetch_add(1, Ordering::Relaxed) + 1,
             timestamp_ms: now_ms(),
             event,
-        };
+        }
+    }
 
+    async fn emit(&self, event: RuntimeEvent) -> AgentResult<()> {
+        let envelope = self.make_envelope(event);
         if let Some(journal) = &self.journal {
             journal.append(&envelope).await?;
         }
@@ -620,9 +670,88 @@ fn tool_error_output(call: &ToolCall, message: String) -> ToolOutput {
     }
 }
 
+/// Explain a rejected call strictly from the immutable surface the model
+/// received. Looking at the live catalog here would race lifecycle changes
+/// after capture and could misclassify a round-local omission; live authority
+/// checks still happen inside the dispatcher for calls that are on-surface.
+fn tool_not_on_surface_message(call: &ToolCall, surface: &ToolSurfaceSnapshot) -> String {
+    let captured_surface = if surface.surface_revision == 0 {
+        "this round's captured model surface".to_string()
+    } else {
+        format!("model surface revision {}", surface.surface_revision)
+    };
+    match surface
+        .omissions
+        .iter()
+        .find(|omission| omission.tool_name == call.name)
+    {
+        Some(omission) => format!(
+            "tool '{}' was not exposed on {captured_surface}: {}",
+            call.name,
+            omission.reason.as_str()
+        ),
+        None => format!(
+            "tool '{}' was not exposed on {captured_surface}; only schemas in that captured surface may be called",
+            call.name
+        ),
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_contracts::{ToolSurfaceDemand, ToolSurfaceOmission, ToolSurfaceOmissionReason};
+
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            id: "call-1".into(),
+            name: name.into(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn off_surface_rejection_uses_only_the_captured_omission_reason() {
+        let surface = ToolSurfaceSnapshot {
+            surface_revision: 9,
+            omissions: vec![ToolSurfaceOmission {
+                tool_name: "optional.large".into(),
+                demand: ToolSurfaceDemand::PreferSurface,
+                reason: ToolSurfaceOmissionReason::ProviderInputBudget,
+                approx_tokens: 2_500,
+            }],
+            omitted_total: 1,
+            ..ToolSurfaceSnapshot::default()
+        };
+
+        let message = tool_not_on_surface_message(&call("optional.large"), &surface);
+
+        assert!(message.contains("model surface revision 9"));
+        assert!(message.contains("provider input budget"));
+        assert!(!message.contains("capability.manage"));
+        assert!(!message.contains("load"));
+    }
+
+    #[test]
+    fn unrecorded_off_surface_call_is_rejected_without_live_catalog_claims() {
+        let surface = ToolSurfaceSnapshot {
+            surface_revision: 12,
+            omitted_total: 7,
+            ..ToolSurfaceSnapshot::default()
+        };
+
+        let message = tool_not_on_surface_message(&call("unlisted.tool"), &surface);
+
+        assert!(message.contains("model surface revision 12"));
+        assert!(message.contains("only schemas in that captured surface may be called"));
+        assert!(!message.contains("unknown tool"));
+        assert!(!message.contains("loaded"));
+    }
 }

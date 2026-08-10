@@ -6,8 +6,8 @@
 //! for a real ContextCore runtime.
 
 use agent_contracts::{
-    ContextIngress, ContextItemId, ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery,
-    ScopeId, ScopeKind,
+    ContextConsumptionAck, ContextIngress, ContextItemId, ContextMaintenanceTrigger, ContextQuery,
+    ContextSearchQuery, ScopeId, ScopeKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -53,6 +53,11 @@ pub enum ServiceOp {
     ReconcileStore,
     Materialize {
         query: ContextQuery,
+    },
+    /// Commit access reinforcement for the exact final context frame used by
+    /// one successful model operation.
+    AcknowledgeConsumption {
+        ack: ContextConsumptionAck,
     },
     OpenScope {
         kind: ScopeKind,
@@ -129,7 +134,9 @@ impl ServiceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{ContextItemId, ContextKind, ContextScope, ContextSearchQuery};
+    use agent_contracts::{
+        ContextItemId, ContextKind, ContextScope, ContextSearchQuery, OperationId, TurnId,
+    };
 
     #[test]
     fn request_response_round_trip() {
@@ -228,6 +235,36 @@ mod tests {
                 }
                 other => panic!("unexpected recall op: {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn consumption_ack_round_trips_with_operation_and_preview_identity() {
+        let item_id = ContextItemId::new();
+        let external_id = ContextItemId::new();
+        let ack = ContextConsumptionAck {
+            turn_id: TurnId::new(),
+            operation_id: OperationId::new(),
+            model_round: 3,
+            materialization_id: 17,
+            item_ids: vec![item_id],
+            external_item_ids: vec![external_id],
+        };
+        let request = ServiceRequest {
+            id: 19,
+            version: PROTOCOL_VERSION,
+            op: ServiceOp::AcknowledgeConsumption { ack: ack.clone() },
+        };
+
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(
+            encoded.contains("\"op\":\"acknowledge_consumption\""),
+            "{encoded}"
+        );
+        let decoded: ServiceRequest = serde_json::from_str(&encoded).unwrap();
+        match decoded.op {
+            ServiceOp::AcknowledgeConsumption { ack: decoded } => assert_eq!(decoded, ack),
+            other => panic!("unexpected op: {other:?}"),
         }
     }
 }

@@ -1,7 +1,11 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentResult, ContextItemId, Label, ScopeId, TaskId, ToolOutput};
+use std::collections::HashSet;
+
+use crate::{
+    AgentError, AgentResult, ContextItemId, Label, OperationId, ScopeId, TaskId, ToolOutput, TurnId,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContextKind {
@@ -468,6 +472,62 @@ pub struct ContextHints {
     pub max_selected_items: Option<usize>,
 }
 
+/// Hard bound on full working-set item ids carried by one consumption
+/// acknowledgement. The runtime applies the same cap to materialization, so
+/// the audit/event payload cannot grow with the history length.
+pub const CONTEXT_CONSUMPTION_ACK_ITEM_CAP: usize = 256;
+
+/// Exact, bounded acknowledgement of the context frame a successful model
+/// operation consumed. `materialize` is a non-consuming preview; only this
+/// commit may reinforce access/recency. Refused, failed, cancelled or stale
+/// operations never send an acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextConsumptionAck {
+    pub turn_id: TurnId,
+    pub operation_id: OperationId,
+    pub model_round: usize,
+    /// Opaque id returned by the exact `materialize` preview used to build
+    /// the provider request.
+    pub materialization_id: u64,
+    /// Full context bodies actually rendered into the final request.
+    pub item_ids: Vec<ContextItemId>,
+    /// Lightweight external descriptors actually rendered into the final
+    /// request. These are ids, not copied summaries/bodies.
+    #[serde(default)]
+    pub external_item_ids: Vec<ContextItemId>,
+}
+
+impl ContextConsumptionAck {
+    pub fn validate(&self) -> AgentResult<()> {
+        if self.item_ids.len() > CONTEXT_CONSUMPTION_ACK_ITEM_CAP {
+            return Err(AgentError::InvalidRequest(format!(
+                "context consumption ack carries {} item ids, above the {} cap",
+                self.item_ids.len(),
+                CONTEXT_CONSUMPTION_ACK_ITEM_CAP
+            )));
+        }
+        if self.external_item_ids.len() > CONTEXT_MAP_VIEW_CAP {
+            return Err(AgentError::InvalidRequest(format!(
+                "context consumption ack carries {} external ids, above the {} cap",
+                self.external_item_ids.len(),
+                CONTEXT_MAP_VIEW_CAP
+            )));
+        }
+        let mut seen = HashSet::with_capacity(self.item_ids.len() + self.external_item_ids.len());
+        if self.item_ids.iter().any(|id| !seen.insert(*id)) {
+            return Err(AgentError::InvalidRequest(
+                "context consumption ack contains duplicate item ids".into(),
+            ));
+        }
+        if self.external_item_ids.iter().any(|id| !seen.insert(*id)) {
+            return Err(AgentError::InvalidRequest(
+                "context consumption ack contains a duplicate item identity".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScoreBreakdown {
     pub importance: f32,
@@ -590,6 +650,10 @@ fn default_retention() -> ContextRetention {
 /// is the prompt assembler's job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaterializedContext {
+    /// Opaque identity of this preview. It is echoed by
+    /// `ContextConsumptionAck` only after the final provider request succeeds.
+    #[serde(default)]
+    pub materialization_id: u64,
     pub focus: Option<FocusState>,
     pub items: Vec<MaterializedItem>,
     /// The lightweight context map: externalized items the model can only
@@ -978,6 +1042,14 @@ pub trait ContextEngine: Send + Sync {
     /// turns them into prompt text via its prompt assembler.
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext>;
 
+    /// Commit the exact subset of a materialization preview that a successful
+    /// model operation consumed. Engines without reinforcement state may keep
+    /// the validated default no-op; stateful engines must reject stale ids or
+    /// ids that were not part of the referenced preview.
+    async fn acknowledge_consumption(&self, ack: ContextConsumptionAck) -> AgentResult<()> {
+        ack.validate()
+    }
+
     /// Open a fresh scope under `parent` (or the current active scope when
     /// `parent` is `None`) and make it the active scope. The runtime drives
     /// tool scopes this way — a scope opens when its tool starts, not when
@@ -1117,6 +1189,51 @@ mod tests {
         let bytes = serde_json::to_vec(&entries).unwrap();
         let err = serde_json::from_slice::<ContextMapView>(&bytes).unwrap_err();
         assert!(err.to_string().contains("exceeds the cap"));
+    }
+
+    #[test]
+    fn context_consumption_ack_enforces_bounded_unique_id_sets() {
+        let valid = ContextConsumptionAck {
+            turn_id: TurnId::new(),
+            operation_id: OperationId::new(),
+            model_round: 0,
+            materialization_id: 1,
+            item_ids: vec![ContextItemId::new()],
+            external_item_ids: vec![ContextItemId::new()],
+        };
+        valid.validate().unwrap();
+
+        let duplicate = ContextItemId::new();
+        let mut invalid = valid.clone();
+        invalid.item_ids = vec![duplicate, duplicate];
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate item ids")
+        );
+
+        invalid.item_ids = (0..=CONTEXT_CONSUMPTION_ACK_ITEM_CAP)
+            .map(|_| ContextItemId::new())
+            .collect();
+        assert!(invalid.validate().unwrap_err().to_string().contains("cap"));
+
+        invalid.item_ids = vec![duplicate];
+        invalid.external_item_ids = vec![duplicate];
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate item identity")
+        );
+
+        invalid.item_ids.clear();
+        invalid.external_item_ids = (0..=CONTEXT_MAP_VIEW_CAP)
+            .map(|_| ContextItemId::new())
+            .collect();
+        assert!(invalid.validate().unwrap_err().to_string().contains("cap"));
     }
 
     #[test]

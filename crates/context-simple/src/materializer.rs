@@ -318,18 +318,6 @@ pub(crate) fn materialize(
     }
 
     selected_indices.sort_by_key(|index| state.items[*index].created_tick);
-    let turn = state.turn;
-
-    // Access reinforcement happens on every materialization: an item that
-    // reached the working set earns a fresh access stamp. Access stamps are
-    // not indexed, so the raw mutable slice is safe here.
-    for index in &selected_indices {
-        let item = &mut state.items.items_mut()[*index];
-        item.last_access_tick = now_tick;
-        item.last_access_turn = turn;
-        item.access_count = item.access_count.saturating_add(1);
-    }
-
     let items: Vec<MaterializedItem> = selected_indices
         .iter()
         .map(|index| {
@@ -360,6 +348,7 @@ pub(crate) fn materialize(
             .sum::<usize>();
 
     MaterializedContext {
+        materialization_id: 0,
         focus,
         items,
         // The lightweight context map: a *bounded* slice of the external

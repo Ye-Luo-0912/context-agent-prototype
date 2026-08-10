@@ -1024,8 +1024,8 @@ mod tests {
 
     /// A Live stored record that nothing resident references is still a
     /// root: it cannot be deleted, and its strong edges must keep its
-    /// evidence targets alive — the CTX-05 defect. The weak-edge
-    /// counterpart is covered by `weak_shares_edges_never_protect...`.
+    /// evidence targets alive. The weak-edge counterpart is covered by
+    /// `weak_shares_edges_never_protect...`.
     #[test]
     fn storage_gc_roots_live_stored_records_through_strong_edges() {
         let dir = tempfile::tempdir().unwrap();

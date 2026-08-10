@@ -247,10 +247,23 @@ pub async fn compare_facts(
 ) -> anyhow::Result<Vec<(&'static str, ReplayOutcome, FactCoverage)>> {
     let facts = scenario_key_facts(scenario.name);
     let mut results = Vec::new();
-    for (label, engine) in crate::engine_variants() {
+    // Outcome and fact coverage are two observations of the same scripted
+    // run, but each must start from a fresh engine. Replaying both into one
+    // instance accumulated the scenario twice and made A/B/C fact results
+    // depend on state left by the cost measurement.
+    let outcome_engines = crate::engine_variants();
+    let coverage_engines = crate::engine_variants();
+    for ((label, outcome_engine), (coverage_label, coverage_engine)) in
+        outcome_engines.into_iter().zip(coverage_engines)
+    {
+        anyhow::ensure!(
+            label == coverage_label,
+            "engine variant order drifted between independent replay runs"
+        );
         let outcome =
-            run_engine_observing(engine.clone(), &scenario.events, config, |_, _| {}).await?;
-        let coverage = measure_fact_coverage(engine, &scenario.events, config, &facts).await?;
+            run_engine_observing(outcome_engine, &scenario.events, config, |_, _| {}).await?;
+        let coverage =
+            measure_fact_coverage(coverage_engine, &scenario.events, config, &facts).await?;
         results.push((label, outcome, coverage));
     }
     Ok(results)
@@ -415,6 +428,33 @@ mod tests {
                 !coverage.violated(),
                 "the pinned constraint must be visible in every engine"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn comparison_coverage_matches_an_independent_fresh_replay() {
+        let config = compare_config();
+        let scenario = all_scenarios()
+            .into_iter()
+            .find(|s| s.name == "completed_then_unrelated")
+            .expect("completed_then_unrelated");
+        let facts = scenario_key_facts(scenario.name);
+        let compared = compare_facts(&scenario, &config).await.unwrap();
+
+        for ((label, _, actual), (fresh_label, fresh_engine)) in
+            compared.iter().zip(engine_variants())
+        {
+            assert_eq!(*label, fresh_label);
+            let expected = measure_fact_coverage(fresh_engine, &scenario.events, &config, &facts)
+                .await
+                .unwrap();
+            assert_eq!(actual.required_turns, expected.required_turns);
+            assert_eq!(actual.required_met, expected.required_met);
+            assert_eq!(
+                actual.forbidden_violations, expected.forbidden_violations,
+                "{label} comparison coverage must not inherit the outcome run's state"
+            );
+            assert_eq!(actual.coverage_ratio, expected.coverage_ratio);
         }
     }
 

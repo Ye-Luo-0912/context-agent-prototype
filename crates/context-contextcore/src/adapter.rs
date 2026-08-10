@@ -14,10 +14,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_contracts::{
-    AgentError, AgentResult, ContextDiagnostics, ContextEngine, ContextGcReport, ContextIngress,
-    ContextItem, ContextItemId, ContextItemSummary, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery, ContextStateTransition,
-    ExternalizedContext, MaterializedContext, ScopeId, ScopeKind,
+    AgentError, AgentResult, ContextConsumptionAck, ContextDiagnostics, ContextEngine,
+    ContextGcReport, ContextIngress, ContextItem, ContextItemId, ContextItemSummary,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery,
+    ContextStateTransition, ExternalizedContext, MaterializedContext, ScopeId, ScopeKind,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -180,6 +180,11 @@ impl ContextEngine for ContextServiceAdapter {
         let value = self.call(ServiceOp::Materialize { query }).await?;
         serde_json::from_value(value)
             .map_err(|e| AgentError::Context(format!("decode materialized context: {e}")))
+    }
+
+    async fn acknowledge_consumption(&self, ack: ContextConsumptionAck) -> AgentResult<()> {
+        self.call(ServiceOp::AcknowledgeConsumption { ack }).await?;
+        Ok(())
     }
 
     async fn open_scope(&self, kind: ScopeKind, parent: Option<ScopeId>) -> AgentResult<ScopeId> {

@@ -135,6 +135,25 @@ context + turn + tool schemas, including the rendering overhead the
 engine never sees) and trims the context frame if the wire estimate
 exceeds the provider window. The engine proposes; the runtime disposes.
 
+Selection and consumption are separate operations:
+
+```text
+ContextEngine::materialize -> bounded, non-consuming preview + materialization_id
+PromptAssembler/final guard -> exact provider frame
+successful, non-stale ModelOutput
+  -> ContextConsumptionAck(turn, operation, round, preview, item/ref ids)
+  -> access reinforcement + bounded ContextConsumed event in one transaction
+```
+
+Previewed items removed by runtime packing receive no reinforcement. Refused,
+failed, cancelled and stale operations send no acknowledgement. The simple
+engine accepts only an exact subset of its one pending preview, validates all
+owners before mutating any record, and stamps Resident/Warm bodies or External
+descriptors without changing residency or semantic state. The runtime caps a
+full-item acknowledgement at 256 ids and external descriptors at the
+`ContextMapView` cap of 32. This makes GC recency/access signals describe
+successful model use rather than candidate generation.
+
 ## 6b. The selection universe: secondary indexes
 
 Since V1-M9 the engine keeps slot-based secondary indexes beside the
@@ -303,7 +322,9 @@ scope is the current attention container (`active_scope_id`).
   its task closes.
 - `Tool` is an execution frame driven by the runtime (V1-P0-3): it opens
   when the tool starts (`ContextEngine::open_scope`) and closes when the
-  next model round consumes the result (`ContextEngine::close_scope`).
+  runtime prepares the next model round (`ContextEngine::close_scope`). That
+  close remains a scheduling heuristic; `ContextConsumed` is the exact record
+  of which result ids a successful model operation actually received.
   The observation persisted at turn end carries the tool scope id, so
   membership is authoritative even though persistence is batched. Tool
   scopes are containers, not eviction passes: durable members promote to
@@ -799,6 +820,12 @@ external refs) temporary references; 100 K refs therefore do **not** cost the
 same as 32. Indexed/streaming top-K work is tracked in `docs/AUDIT_TODO.md`
 CTX-07.
 
+External descriptors participate in the same consumption commit as inline
+items. Merely previewing a ref does not update it; a successful acknowledged
+frame stamps `last_access_tick`/`last_access_gc_epoch` without fetching or
+reactivating the body. `fetch_external` remains a separate deliberate read
+and records its own access.
+
 Cold recall pre-filters in memory instead of reading the disk:
 `ExternalizedContext` keeps the item's entity signature (`entities`),
 `tags`, `dependencies` and `task_id`, so with thousands of Cold entries
@@ -989,18 +1016,23 @@ answer exactly:
 - why it entered (source/kind + turn attribution);
 - when it left (turn-stamped `ContextStateTransition`);
 - why it left (transition reason string);
-- which model turns consumed it (selections recorded per `ContextPrepared`);
+- which model turns consumed it (exact ids recorded by `ContextConsumed`;
+  legacy traces without the event retain the old `ContextPrepared` behavior);
 - whether it was later reactivated (`Archived/Cooling -> Active` transitions).
 
 ### 11.1 What the journal records per item
 
 - **Entry**: item `created_turn` plus `source` (user / assistant / tool:<name> /
   explicit-pin / task-summary) and kind.
-- **Selection**: every `ContextPrepared` event carries the selected items with
-  `score`, `approx_tokens`, and a `ScoreBreakdown`
+- **Selection preview**: every `ContextPrepared` event carries the final
+  post-packing selected items with `score`, `approx_tokens`, and a `ScoreBreakdown`
   (`importance`, `focus`, `recency`, `access`, `scope_bonus`, `retention_bonus`,
-  `total`). `materialize` also bumps `access_count` and
-  `last_access_turn` on consumed items.
+  `total`). It does not itself claim successful consumption.
+- **Consumption commit**: `ContextConsumed` carries the bounded
+  `ContextConsumptionAck` with turn/operation/model-round/materialization
+  identities plus exact full-item and external-ref ids. Only this event's
+  transaction bumps `access_count`/`last_access_turn` (or external access
+  stamps). No event means no reinforcement.
 - **Transitions**: every `ContextMaintained` event carries
   `report.transitions: Vec<ContextStateTransition>` with `item_id`, `kind`,
   `scope`, `from`, `to`, `turn`, and a human-readable `reason`
@@ -1016,8 +1048,12 @@ answer exactly:
 
 `crates/agent-replay` walks a JSONL trace and drives a fresh
 `SimpleContextEngine` with the same ingest / maintain / materialize calls
-the runtime made (maintenance triggers are recorded on `ContextMaintained`
-events). Output is a per-item lifecycle report plus final diagnostics.
+the runtime made, then maps each recorded final selection onto the fresh
+engine and commits it only when the matching `ContextConsumed` arrives
+(maintenance triggers are recorded on `ContextMaintained` events). Output is
+a per-item lifecycle report plus final diagnostics. Cost and fact-coverage
+passes use independent fresh engines, so one measurement cannot seed the
+other's state.
 
 ```bash
 cargo run -p agent-replay -- .focus-agent/traces/<run>.jsonl
@@ -1071,3 +1107,12 @@ answered, but the context frame was not durably updated. This is what makes
 the long-term record trustworthy: "the model said X" and "the context frame
 reflects X" can only diverge when an explicit recovery-required signal says
 so, never silently.
+
+`TurnCompleted` itself is published through the kernel's `emit_event_durable`
+path: append to the event journal, then flush it, then broadcast. Because
+the journal channel is FIFO, a successful flush is an OS-level durability
+barrier covering every event appended before it — the subscriber never sees
+a committed turn unless all mandatory state writes have left the process. A
+failed barrier broadcasts nothing and routes to `TurnCommitFailed`; ordinary
+events (not turn boundaries) are still append-only and flush on stop, so the
+hot path stays off the persistence path.

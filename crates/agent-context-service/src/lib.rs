@@ -69,6 +69,10 @@ pub async fn handle(op: ServiceOp, engine: &dyn ContextEngine) -> Result<Value, 
             let materialized = engine.materialize(query).await?;
             serde_json::to_value(materialized).map_err(|e| AgentError::Context(e.to_string()))
         }
+        ServiceOp::AcknowledgeConsumption { ack } => {
+            engine.acknowledge_consumption(ack).await?;
+            Ok(Value::Null)
+        }
         ServiceOp::OpenScope { kind, parent } => {
             let scope_id = engine.open_scope(kind, parent).await?;
             serde_json::to_value(scope_id).map_err(|e| AgentError::Context(e.to_string()))

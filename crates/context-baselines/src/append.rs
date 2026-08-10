@@ -24,6 +24,8 @@ use crate::shared::{
 struct AppendState {
     records: Vec<Record>,
     turn: u64,
+    #[serde(default)]
+    materialization_revision: u64,
 }
 
 /// Baseline A context engine: append-only, no maintenance.
@@ -81,7 +83,14 @@ impl ContextEngine for AppendOnlyEngine {
     }
 
     async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
-        let state = self.state.lock().expect("append-only state poisoned");
+        let mut state = self.state.lock().expect("append-only state poisoned");
+        state.materialization_revision =
+            state
+                .materialization_revision
+                .checked_add(1)
+                .ok_or_else(|| {
+                    AgentError::Internal("context materialization id is exhausted".into())
+                })?;
         let items = materialized_items(&state.records, None);
         let approx_tokens_total: usize = items
             .iter()
@@ -99,6 +108,7 @@ impl ContextEngine for AppendOnlyEngine {
             })
             .collect();
         Ok(MaterializedContext {
+            materialization_id: state.materialization_revision,
             focus: None,
             items,
             external: agent_contracts::ContextMapView::default(),

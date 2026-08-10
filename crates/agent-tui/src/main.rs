@@ -299,8 +299,12 @@ async fn run_ui(
                                 Ok(tasks) => {
                                     for task in tasks {
                                         println!(
-                                            "task {} [{:?}] {}",
-                                            task.id, task.status, task.goal
+                                            "task {} [{:?}] tools=r{}/{} {}",
+                                            task.id,
+                                            task.status,
+                                            task.tool_requirement_revision,
+                                            task.tool_requirement_count,
+                                            task.goal
                                         );
                                     }
                                 }

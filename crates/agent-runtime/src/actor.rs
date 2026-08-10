@@ -5,21 +5,28 @@
 //! it (context ingest/maintenance, turn-frame pushes, events). Stale results
 //! are dropped — they never race into the new state.
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
 
 use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, ContextHints, ContextIngress,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect,
-    EffectCommitError, ModelInput, ModelRequest, OperationId, OperationOutcome, OperationResult,
-    RuntimeDirective, RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall, ToolOutcome, ToolOutput,
-    ToolResultDisposition, ToolSurfaceSnapshot, TurnFrame, TurnFrameStep, TurnId,
+    AgentError, AgentResult, CONTEXT_CONSUMPTION_ACK_ITEM_CAP, CancellationToken,
+    ContextConsumptionAck, ContextHints, ContextIngress, ContextMaintenanceReport,
+    ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect, EffectCommitError,
+    ModelInput, ModelRequest, OperationId, OperationOutcome, OperationResult, RuntimeDirective,
+    RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall, ToolOutcome, ToolOutput,
+    ToolResultDisposition, ToolSurfaceBlock, ToolSurfaceBlockReason, ToolSurfaceDemand,
+    ToolSurfaceSnapshot, TurnFrame, TurnFrameStep, TurnId,
 };
 use agent_kernel::AgentKernel;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::budget::{DEFAULT_OUTPUT_RESERVE, ModelBudget, approx_layer_tokens};
+use crate::budget::{
+    DEFAULT_OUTPUT_RESERVE, MAX_TOOL_SURFACE_TOKENS, ModelBudget, approx_layer_tokens,
+};
 use crate::checkpoint::{
     RUNTIME_CHECKPOINT_VERSION, RunMetadata, RuntimeCheckpoint, TaskManagerSnapshot,
 };
@@ -27,7 +34,8 @@ use crate::command::{Reply, RuntimeCommand, RuntimeHandle};
 use crate::output::bound_tool_output;
 use crate::prompt::PromptAssembler;
 use crate::sink::LiveSink;
-use crate::task::TaskManager;
+use crate::surface::{RoundSurfacePlan, SurfaceReportContext};
+use crate::task::{TaskManager, normalize_tool_requirements};
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -142,6 +150,10 @@ pub(crate) struct OperationCompletion {
     /// Engine-query results (context search/inspect/fetch) are transient:
     /// they must not duplicate fetched evidence under a new id.
     disposition: ToolResultDisposition,
+    /// Exact final context projection associated with a model operation.
+    /// Committed only after a non-stale successful ModelOutput; tool,
+    /// failed and cancelled operations carry/commit none.
+    context_ack: Option<ContextConsumptionAck>,
 }
 
 /// Mutable runtime state, owned exclusively by the actor loop. Callers never
@@ -151,10 +163,22 @@ struct ActorState {
     /// Focus epoch. Bumped on every accepted turn, focus change and cancel;
     /// operations tagged with an older generation are stale.
     generation: u64,
+    /// Runtime-owned revision of the active focus input used to explain the
+    /// source of a derived round surface. This is independent of the
+    /// operation generation fence above.
+    focus_revision: u64,
+    /// Last issued immutable round-surface identity. Persisted in the
+    /// runtime checkpoint so restore never reuses a revision.
+    last_surface_revision: u64,
     /// The task the runtime believes is current (updated by `set_focus`).
     task_id: Option<TaskId>,
     /// Long-lived task records; focus is attention inside the current task.
     tasks: TaskManager,
+    /// Per-process CAS high-water marks survive live restore even when an
+    /// older checkpoint temporarily removes a task. Old actor handles cannot
+    /// exist after a process restart, so this fence is intentionally not
+    /// checkpoint authority.
+    task_requirement_high_water: HashMap<TaskId, u64>,
     /// A context transaction failed and its checkpoint rollback also failed.
     /// The two authority planes can no longer be proven aligned, so no
     /// further mutation is accepted until the process is recovered from a
@@ -245,8 +269,8 @@ impl RuntimeActor {
                 self.start_turn(content, reply, op_tx).await;
             }
             RuntimeCommand::SetFocus { goal, reply } => {
-                let result = match self.ensure_idle() {
-                    Ok(()) => {
+                let result = match self.ensure_idle().and_then(|_| self.next_focus_revision()) {
+                    Ok(next_focus_revision) => {
                         // A task is the long-lived entity; focus is the
                         // attention inside it. `prepare_create` resumes a
                         // non-completed task with the same goal, so
@@ -260,6 +284,11 @@ impl RuntimeActor {
                             Ok(report) => {
                                 self.state.tasks.commit(txn);
                                 self.state.task_id = Some(task_id);
+                                self.state
+                                    .task_requirement_high_water
+                                    .entry(task_id)
+                                    .or_insert(0);
+                                self.state.focus_revision = next_focus_revision;
                                 self.state.generation += 1;
                                 self.publish_context_transition(
                                     RuntimeEvent::FocusChanged {
@@ -279,8 +308,8 @@ impl RuntimeActor {
                 let _ = reply.send(result);
             }
             RuntimeCommand::ActivateTask { task_id, reply } => {
-                let result = match self.ensure_idle() {
-                    Ok(()) => match self.state.tasks.prepare_activate(task_id) {
+                let result = match self.ensure_idle().and_then(|_| self.next_focus_revision()) {
+                    Ok(next_focus_revision) => match self.state.tasks.prepare_activate(task_id) {
                         None => Err(AgentError::InvalidRequest(format!(
                             "task {task_id} does not exist or is completed"
                         ))),
@@ -296,6 +325,11 @@ impl RuntimeActor {
                                 Ok(report) => {
                                     self.state.tasks.commit(txn);
                                     self.state.task_id = Some(task_id);
+                                    self.state
+                                        .task_requirement_high_water
+                                        .entry(task_id)
+                                        .or_insert(0);
+                                    self.state.focus_revision = next_focus_revision;
                                     self.state.generation += 1;
                                     self.publish_context_transition(
                                         RuntimeEvent::FocusChanged {
@@ -316,13 +350,14 @@ impl RuntimeActor {
                 let _ = reply.send(result);
             }
             RuntimeCommand::SuspendTask { reply } => {
-                let result = match self.ensure_idle() {
-                    Ok(()) => match self.state.tasks.prepare_suspend() {
+                let result = match self.ensure_idle().and_then(|_| self.next_focus_revision()) {
+                    Ok(next_focus_revision) => match self.state.tasks.prepare_suspend() {
                         None => Ok(()),
                         Some(txn) => match self.kernel.clear_focus().await {
                             Ok(report) => {
                                 self.state.tasks.commit(txn);
                                 self.state.task_id = None;
+                                self.state.focus_revision = next_focus_revision;
                                 self.state.generation += 1;
                                 self.publish_context_transition(
                                     RuntimeEvent::FocusCleared,
@@ -340,6 +375,56 @@ impl RuntimeActor {
             }
             RuntimeCommand::ListTasks { reply } => {
                 let _ = reply.send(Ok(self.state.tasks.list()));
+            }
+            RuntimeCommand::ReplaceTaskToolRequirements {
+                task_id,
+                base_revision,
+                entries,
+                reply,
+            } => {
+                let result = match self.ensure_idle() {
+                    Err(error) => Err(error),
+                    Ok(()) => match normalize_tool_requirements(entries) {
+                        Err(error) => Err(error),
+                        Ok(entries) => {
+                            match self.state.tasks.prepare_replace_tool_requirements(
+                                task_id,
+                                base_revision,
+                                entries.clone(),
+                            ) {
+                                Err(error) => Err(error),
+                                Ok((txn, revision)) => {
+                                    let changed = revision != base_revision;
+                                    if changed {
+                                        match self
+                                            .kernel
+                                            .emit_event(RuntimeEvent::TaskToolRequirementsChanged {
+                                                task_id,
+                                                revision,
+                                                requirements: entries,
+                                            })
+                                            .await
+                                        {
+                                            Err(error) => Err(error),
+                                            Ok(()) => {
+                                                self.state.tasks.commit(txn);
+                                                self.state
+                                                    .task_requirement_high_water
+                                                    .insert(task_id, revision);
+                                                self.state.generation += 1;
+                                                Ok(revision)
+                                            }
+                                        }
+                                    } else {
+                                        self.state.tasks.commit(txn);
+                                        Ok(revision)
+                                    }
+                                }
+                            }
+                        }
+                    },
+                };
+                let _ = reply.send(result);
             }
             RuntimeCommand::Pin { content, reply } => {
                 let result = match self.ensure_idle() {
@@ -364,8 +449,8 @@ impl RuntimeActor {
                 let _ = reply.send(result);
             }
             RuntimeCommand::CompleteTask { summary, reply } => {
-                let result = match self.ensure_idle() {
-                    Ok(()) => match self.state.tasks.prepare_complete() {
+                let result = match self.ensure_idle().and_then(|_| self.next_focus_revision()) {
+                    Ok(next_focus_revision) => match self.state.tasks.prepare_complete() {
                         None => Err(AgentError::InvalidRequest(
                             "no active task to complete".into(),
                         )),
@@ -380,6 +465,7 @@ impl RuntimeActor {
                                 Ok(report) => {
                                     self.state.tasks.commit(txn);
                                     self.state.task_id = None;
+                                    self.state.focus_revision = next_focus_revision;
                                     self.state.generation += 1;
                                     self.publish_context_transition(
                                         RuntimeEvent::TaskCompleted {
@@ -409,6 +495,8 @@ impl RuntimeActor {
                             },
                             tasks: TaskManagerSnapshot::from_manager(&self.state.tasks),
                             current_task_id: self.state.task_id,
+                            focus_revision: self.state.focus_revision,
+                            last_surface_revision: self.state.last_surface_revision,
                             context,
                             // The actor does not own the host: the capability
                             // surface is merged in by RuntimeInstance.
@@ -428,12 +516,66 @@ impl RuntimeActor {
                         match checkpoint.validate() {
                             Err(error) => Err(error),
                             Ok(()) => {
+                                // Restore may load an older checkpoint into a
+                                // still-running actor. Treat the restored
+                                // focus as a new epoch so source revisions
+                                // never move backwards or alias a surface
+                                // prepared before the restore.
+                                let restored_focus_revision = match self
+                                    .state
+                                    .focus_revision
+                                    .max(checkpoint.focus_revision)
+                                    .checked_add(1)
+                                {
+                                    Some(revision) => revision,
+                                    None => {
+                                        let _ = reply.send(Err(AgentError::Internal(
+                                            "runtime focus revision is exhausted".into(),
+                                        )));
+                                        return;
+                                    }
+                                };
                                 let RuntimeCheckpoint {
-                                    tasks,
+                                    mut tasks,
                                     current_task_id,
+                                    last_surface_revision,
                                     context,
                                     ..
                                 } = checkpoint;
+                                let mut restored_requirement_high_water =
+                                    self.state.task_requirement_high_water.clone();
+                                for task in self.state.tasks.list_records() {
+                                    restored_requirement_high_water
+                                        .entry(task.id)
+                                        .and_modify(|revision| {
+                                            *revision =
+                                                (*revision).max(task.tool_requirements.revision);
+                                        })
+                                        .or_insert(task.tool_requirements.revision);
+                                }
+                                for task in &mut tasks.tasks {
+                                    if let Some(live_revision) =
+                                        restored_requirement_high_water.get(&task.id).copied()
+                                        && live_revision >= task.tool_requirements.revision
+                                    {
+                                        task.tool_requirements.revision = match live_revision
+                                            .checked_add(1)
+                                        {
+                                            Some(revision) => revision,
+                                            None => {
+                                                let _ = reply.send(Err(
+                                                        AgentError::Internal(format!(
+                                                            "task {} tool-requirement revision is exhausted",
+                                                            task.id
+                                                        )),
+                                                    ));
+                                                return;
+                                            }
+                                        };
+                                    }
+                                    restored_requirement_high_water
+                                        .insert(task.id, task.tool_requirements.revision);
+                                }
                                 match self.kernel.restore(context, current_task_id).await {
                                     Err(error) => Err(self.context_transition_failed(error)),
                                     Ok(()) => {
@@ -442,6 +584,13 @@ impl RuntimeActor {
                                         // become visible together.
                                         self.state.tasks.restore(tasks);
                                         self.state.task_id = current_task_id;
+                                        self.state.task_requirement_high_water =
+                                            restored_requirement_high_water;
+                                        self.state.focus_revision = restored_focus_revision;
+                                        self.state.last_surface_revision = self
+                                            .state
+                                            .last_surface_revision
+                                            .max(last_surface_revision);
                                         self.state.generation += 1;
                                         self.state.recovery_required = false;
                                         Ok(())
@@ -480,6 +629,23 @@ impl RuntimeActor {
         } else {
             self.ensure_no_active_turn()
         }
+    }
+
+    fn next_focus_revision(&self) -> AgentResult<u64> {
+        self.state
+            .focus_revision
+            .checked_add(1)
+            .ok_or_else(|| AgentError::Internal("runtime focus revision is exhausted".into()))
+    }
+
+    fn issue_surface_revision(&mut self) -> AgentResult<u64> {
+        let revision = self
+            .state
+            .last_surface_revision
+            .checked_add(1)
+            .ok_or_else(|| AgentError::Internal("round surface revision is exhausted".into()))?;
+        self.state.last_surface_revision = revision;
+        Ok(revision)
     }
 
     fn ensure_no_active_turn(&self) -> AgentResult<()> {
@@ -556,6 +722,13 @@ impl RuntimeActor {
         // change lands before the message is ingested, exactly like an
         // explicit `/focus`.
         if self.state.tasks.active().is_none() {
+            let next_focus_revision = match self.next_focus_revision() {
+                Ok(revision) => revision,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
             let (txn, task_id) = self.state.tasks.prepare_create(content.trim());
             match self.kernel.set_focus(task_id, content.clone()).await {
                 Err(error) => {
@@ -566,6 +739,11 @@ impl RuntimeActor {
                 Ok(report) => {
                     self.state.tasks.commit(txn);
                     self.state.task_id = Some(task_id);
+                    self.state
+                        .task_requirement_high_water
+                        .entry(task_id)
+                        .or_insert(0);
+                    self.state.focus_revision = next_focus_revision;
                     if let Err(error) = self
                         .publish_context_transition(
                             RuntimeEvent::FocusChanged {
@@ -703,12 +881,21 @@ impl RuntimeActor {
         // consumes their results (they ride in the turn frame).
         self.close_tool_frames().await;
 
-        let Some(turn) = self.state.turn.as_mut() else {
-            return;
+        // Copy the immutable round inputs out of ActorState before awaiting.
+        // The actor is serialized, but short borrows also make it impossible
+        // to accidentally publish a partially packed surface into ActiveTurn.
+        let (turn_id, model_round, current_input, turn_frame) = {
+            let Some(turn) = self.state.turn.as_mut() else {
+                return;
+            };
+            turn.model_round += 1;
+            (
+                turn.turn_id,
+                turn.model_round,
+                turn.turn_frame.user_message.clone(),
+                turn.turn_frame.clone(),
+            )
         };
-        turn.model_round += 1;
-        let current_input = turn.turn_frame.user_message.clone();
-        let turn_id = turn.turn_id;
 
         match self
             .kernel
@@ -736,22 +923,196 @@ impl RuntimeActor {
             }
         }
 
-        // Tool lifecycle safe point: age the tool catalog exactly once per
-        // model round, then capture the round's tool surface snapshot. The
-        // budget, the prompt and tool-call validation all use this one
-        // snapshot, so the model sees — and the runtime validates against —
-        // exactly the surface that was priced.
+        // Tool lifecycle safe point. Task demand is declarative only: reload
+        // can restore catalog/schema readiness, but cannot enable a disabled
+        // capability, grant a permission or bypass approval/effect policy.
         self.kernel.tool_gc();
-        let tool_surface = self.kernel.tool_snapshot();
-        turn.tool_surface = Some(tool_surface.clone());
+        let (task_requirement_revision, requirements) = self
+            .state
+            .task_id
+            .and_then(|task_id| self.state.tasks.get(task_id))
+            .map(|task| {
+                (
+                    Some(task.tool_requirements.revision),
+                    task.tool_requirements.entries.clone(),
+                )
+            })
+            .unwrap_or((None, Vec::new()));
+
+        // Reload only requirements that GC actually moved off-surface. The
+        // final snapshot below is authoritative, so a refused load is
+        // represented as Unavailable without leaking provider error text.
+        let mut visible_names: HashSet<String> = self
+            .kernel
+            .tool_specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        visible_names.extend(
+            self.kernel
+                .tool_catalog()
+                .into_iter()
+                .filter(|entry| entry.state.in_surface())
+                .map(|entry| entry.name),
+        );
+        for requirement in &requirements {
+            if !visible_names.contains(&requirement.tool_name) {
+                let _ = self.kernel.tool_load(&requirement.tool_name);
+            }
+        }
+
+        // Dispatcher snapshot is the complete currently-loaded candidate
+        // set. Runtime owns the sole bounded projection so Task MustSurface
+        // can never disappear inside a provider adapter before policy sees it.
+        let candidates = self.kernel.tool_snapshot();
+        let candidate_names: HashSet<_> = candidates
+            .specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect();
+        let mut unavailable_must = Vec::new();
+        let mut unavailable_optional = Vec::new();
+        for requirement in &requirements {
+            if !candidate_names.contains(requirement.tool_name.as_str()) {
+                if requirement.demand == ToolSurfaceDemand::MustSurface {
+                    unavailable_must.push(ToolSurfaceBlock {
+                        tool_name: requirement.tool_name.clone(),
+                        demand: requirement.demand,
+                        reason: ToolSurfaceBlockReason::Unavailable,
+                    });
+                } else {
+                    unavailable_optional.push(requirement.clone());
+                }
+            }
+        }
+
+        let mut surface_plan = RoundSurfacePlan::build(candidates, &requirements, |name| {
+            self.kernel.tool_may_omit_from_round(name)
+        });
+        surface_plan
+            .source_revisions_mut()
+            .task_requirement_revision = task_requirement_revision;
+        surface_plan.source_revisions_mut().focus_revision =
+            self.state.task_id.map(|_| self.state.focus_revision);
+        for requirement in &unavailable_optional {
+            surface_plan.add_unavailable(requirement);
+        }
+
+        if !unavailable_must.is_empty() {
+            let surface_revision = match self.issue_surface_revision() {
+                Ok(revision) => revision,
+                Err(error) => {
+                    let _ = self
+                        .kernel
+                        .emit_event(RuntimeEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    self.state.turn = None;
+                    return;
+                }
+            };
+            let report = surface_plan.unsatisfiable_report(
+                SurfaceReportContext {
+                    turn_id,
+                    model_round,
+                    surface_revision,
+                    estimated_input_tokens: 0,
+                    input_budget_tokens: 0,
+                },
+                ToolSurfaceBlockReason::Unavailable,
+                unavailable_must,
+            );
+            if let Err(error) = self
+                .kernel
+                .emit_event(RuntimeEvent::ToolSurfacePlanned { report })
+                .await
+            {
+                let _ = self
+                    .kernel
+                    .emit_event(RuntimeEvent::Error {
+                        message: format!(
+                            "failed to persist the unavailable-tool surface decision ({error}); refusing to start the model round"
+                        ),
+                    })
+                    .await;
+                self.state.turn = None;
+                return;
+            }
+            let _ = self
+                .kernel
+                .emit_event(RuntimeEvent::Error {
+                    message: "the active task requires a tool that is unavailable; refusing to start the model round"
+                        .into(),
+                })
+                .await;
+            self.state.turn = None;
+            return;
+        }
+
+        if surface_plan.mandatory_schema_tokens() > MAX_TOOL_SURFACE_TOKENS {
+            let surface_revision = match self.issue_surface_revision() {
+                Ok(revision) => revision,
+                Err(error) => {
+                    let _ = self
+                        .kernel
+                        .emit_event(RuntimeEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    self.state.turn = None;
+                    return;
+                }
+            };
+            let blocked = surface_plan.mandatory_blocks(ToolSurfaceBlockReason::SchemaBudget);
+            let report = surface_plan.unsatisfiable_report(
+                SurfaceReportContext {
+                    turn_id,
+                    model_round,
+                    surface_revision,
+                    estimated_input_tokens: surface_plan.mandatory_schema_tokens(),
+                    input_budget_tokens: MAX_TOOL_SURFACE_TOKENS,
+                },
+                ToolSurfaceBlockReason::SchemaBudget,
+                blocked,
+            );
+            if let Err(error) = self
+                .kernel
+                .emit_event(RuntimeEvent::ToolSurfacePlanned { report })
+                .await
+            {
+                let _ = self
+                    .kernel
+                    .emit_event(RuntimeEvent::Error {
+                        message: format!(
+                            "failed to persist the schema-budget surface decision ({error}); refusing to start the model round"
+                        ),
+                    })
+                    .await;
+                self.state.turn = None;
+                return;
+            }
+            let _ = self
+                .kernel
+                .emit_event(RuntimeEvent::Error {
+                    message: format!(
+                        "mandatory tool schemas exceed the per-round schema budget ({} > {} tokens); refusing to start the model round",
+                        surface_plan.mandatory_schema_tokens(),
+                        MAX_TOOL_SURFACE_TOKENS
+                    ),
+                })
+                .await;
+            self.state.turn = None;
+            return;
+        }
 
         // The engine only ever sees its own slice of the provider window:
         // the output reserve, system policy, turn frame and active tool
         // schemas are the runtime's share and are subtracted before the
         // engine budgets the working set.
         let capabilities = self.kernel.model_capabilities();
-        let turn_frame_tokens = approx_layer_tokens(&turn.turn_frame.messages());
-        let active_tools_tokens = approx_layer_tokens(&tool_surface.specs);
+        let turn_frame_tokens = approx_layer_tokens(&turn_frame.messages());
+        let active_tools_tokens = approx_layer_tokens(&surface_plan.specs());
         let provider_window = capabilities
             .context_window
             .unwrap_or_else(|| self.kernel.context_budget_tokens());
@@ -774,7 +1135,9 @@ impl RuntimeActor {
             .context_materialize(ContextQuery {
                 current_input: current_input.clone(),
                 budget_tokens: model_budget.context_frame_budget,
-                hints: ContextHints::default(),
+                hints: ContextHints {
+                    max_selected_items: Some(CONTEXT_CONSUMPTION_ACK_ITEM_CAP),
+                },
             })
             .await
         {
@@ -790,39 +1153,20 @@ impl RuntimeActor {
                 return;
             }
         };
-        let _ = self
-            .kernel
-            .emit_event(RuntimeEvent::ContextPrepared {
-                diagnostics: materialized.diagnostics.clone(),
-                selected: materialized.selected.clone(),
-            })
-            .await;
-        let operation_id = OperationId::new();
-        let generation = self.state.generation;
-        let _ = self
-            .kernel
-            .emit_event(RuntimeEvent::ModelStarted {
-                turn_id,
-                operation_id,
-                generation,
-            })
-            .await;
-
         // Runtime final guard: the engine priced the working-set content,
         // but the assembler's rendering overhead (section headers, per-item
         // frame labels) is the runtime's share. The assembled request must
         // fit the *input* budget — the window minus the output reserve —
         // because the answer must always have room. Trim the context frame
         // until it fits; if the fixed layers alone (system + turn + tools)
-        // still overshoot, unload the largest optional tools; a request
-        // that still does not fit is a hard error, never a silently
-        // over-budget send.
+        // still overshoot, omit optional schemas from this round snapshot;
+        // a request whose mandatory fixed layers still do not fit is a hard
+        // error, never a lifecycle mutation or silently over-budget send.
         let max_input_budget = provider_window.saturating_sub(output_reserve);
         let mut materialized = materialized;
-        let mut tool_surface = tool_surface;
         let mut input =
             self.assembler
-                .assemble(&materialized, &turn.turn_frame, tool_surface.specs.clone());
+                .assemble(&materialized, &turn_frame, surface_plan.specs().to_vec());
         let assembled_total = |input: &ModelInput| {
             approx_layer_tokens(&input.into_messages()) + approx_layer_tokens(&input.tool_schemas)
         };
@@ -854,48 +1198,96 @@ impl RuntimeActor {
             materialized.approx_tokens = materialized
                 .approx_tokens
                 .saturating_sub(approx_tokens(&dropped.content));
-            input = self.assembler.assemble(
-                &materialized,
-                &turn.turn_frame,
-                tool_surface.specs.clone(),
-            );
+            input =
+                self.assembler
+                    .assemble(&materialized, &turn_frame, surface_plan.specs().to_vec());
         }
 
         // The context frame is empty but the fixed layers still overshoot:
-        // unload the largest optional tools one by one (core tools refuse
-        // and are skipped) so the request goes out with the leanest
-        // surface, then re-snapshot so the round validates against exactly
-        // the surface that was priced.
-        let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // omit optional schemas from this round's snapshot only. Provider
+        // token pressure must never unload a catalog entry, bump its
+        // generation or make a later, larger-budget round forget the tool.
+        // The trimmed snapshot remains the one source for prompt assembly,
+        // accounting and tool-call validation in this round.
         while assembled_total(&input) > max_input_budget {
-            let Some((name, _)) = tool_surface
-                .specs
-                .iter()
-                .filter(|spec| !tried.contains(&spec.name))
-                .map(|spec| (spec.name.clone(), approx_layer_tokens(spec)))
-                .max_by_key(|(_, tokens)| *tokens)
-            else {
+            if surface_plan.omit_largest_for_provider_budget().is_none() {
                 break;
-            };
-            tried.insert(name.clone());
-            if self.kernel.tool_unload(&name).is_ok() {
-                tool_surface = self.kernel.tool_snapshot();
-                turn.tool_surface = Some(tool_surface.clone());
-                input = self.assembler.assemble(
-                    &materialized,
-                    &turn.turn_frame,
-                    tool_surface.specs.clone(),
-                );
             }
+            input =
+                self.assembler
+                    .assemble(&materialized, &turn_frame, surface_plan.specs().to_vec());
         }
-        if assembled_total(&input) > max_input_budget {
+
+        let estimated_input_tokens = assembled_total(&input);
+        let surface_revision = match self.issue_surface_revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                let _ = self
+                    .kernel
+                    .emit_event(RuntimeEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                self.state.turn = None;
+                return;
+            }
+        };
+
+        // ContextPrepared now describes the final packed frame, not the
+        // engine's larger preview before runtime rendering overhead was paid.
+        if let Err(error) = self
+            .kernel
+            .emit_event(RuntimeEvent::ContextPrepared {
+                diagnostics: materialized.diagnostics.clone(),
+                selected: materialized.selected.clone(),
+            })
+            .await
+        {
+            let _ = self
+                .kernel
+                .emit_event(RuntimeEvent::Error {
+                    message: error.to_string(),
+                })
+                .await;
+            self.state.turn = None;
+            return;
+        }
+
+        if estimated_input_tokens > max_input_budget {
+            let blocked =
+                surface_plan.mandatory_blocks(ToolSurfaceBlockReason::ProviderInputBudget);
+            let report = surface_plan.unsatisfiable_report(
+                SurfaceReportContext {
+                    turn_id,
+                    model_round,
+                    surface_revision,
+                    estimated_input_tokens,
+                    input_budget_tokens: max_input_budget,
+                },
+                ToolSurfaceBlockReason::ProviderInputBudget,
+                blocked,
+            );
+            if let Err(error) = self
+                .kernel
+                .emit_event(RuntimeEvent::ToolSurfacePlanned { report })
+                .await
+            {
+                let _ = self
+                    .kernel
+                    .emit_event(RuntimeEvent::Error {
+                        message: format!(
+                            "failed to persist the provider-budget surface decision ({error}); refusing to start the model round"
+                        ),
+                    })
+                    .await;
+                self.state.turn = None;
+                return;
+            }
             let _ = self
                 .kernel
                 .emit_event(RuntimeEvent::Error {
                     message: format!(
-                        "model input exceeds the provider window even with the context frame emptied and optional tools unloaded ({} > {} input tokens); refusing to send",
-                        assembled_total(&input),
-                        max_input_budget
+                        "model input exceeds the provider window even with the context frame emptied and optional tool schemas omitted for this round ({estimated_input_tokens} > {max_input_budget} input tokens); refusing to send"
                     ),
                 })
                 .await;
@@ -903,7 +1295,38 @@ impl RuntimeActor {
             return;
         }
 
+        let report = surface_plan.ready_report(SurfaceReportContext {
+            turn_id,
+            model_round,
+            surface_revision,
+            estimated_input_tokens,
+            input_budget_tokens: max_input_budget,
+        });
+        let tool_surface = surface_plan.into_snapshot(surface_revision);
+        let operation_id = OperationId::new();
+        let context_ack = ContextConsumptionAck {
+            turn_id,
+            operation_id,
+            model_round,
+            materialization_id: materialized.materialization_id,
+            item_ids: materialized.items.iter().map(|item| item.item_id).collect(),
+            external_item_ids: materialized
+                .external
+                .iter()
+                .map(|entry| entry.item_id)
+                .collect(),
+        };
+        let generation = self.state.generation;
         let cancel = CancellationToken::new();
+
+        // Publish exactly once, after final packing succeeds. The provider
+        // request and every later tool-call validation in this round now
+        // share this immutable, round-local snapshot; failed trial packing
+        // never becomes turn state.
+        let Some(turn) = self.state.turn.as_mut() else {
+            return;
+        };
+        turn.tool_surface = Some(tool_surface);
         turn.op = Some(InFlightOp {
             operation_id,
             turn_id,
@@ -911,6 +1334,41 @@ impl RuntimeActor {
             scope_id: None,
             cancel: cancel.clone(),
         });
+
+        if let Err(error) = self
+            .kernel
+            .emit_event(RuntimeEvent::ToolSurfacePlanned { report })
+            .await
+        {
+            let _ = self
+                .kernel
+                .emit_event(RuntimeEvent::Error {
+                    message: error.to_string(),
+                })
+                .await;
+            self.state.turn = None;
+            return;
+        }
+        if let Err(error) = self
+            .kernel
+            .emit_event(RuntimeEvent::ModelStarted {
+                turn_id,
+                operation_id,
+                generation,
+                surface_revision,
+                model_round,
+            })
+            .await
+        {
+            let _ = self
+                .kernel
+                .emit_event(RuntimeEvent::Error {
+                    message: error.to_string(),
+                })
+                .await;
+            self.state.turn = None;
+            return;
+        }
 
         let kernel = self.kernel.clone();
         let sink = LiveSink::new(
@@ -935,6 +1393,8 @@ impl RuntimeActor {
                             "run_id": run_id.to_string(),
                             "context_selected": materialized.selected.len(),
                             "context_approx_tokens": materialized.approx_tokens,
+                            "model_round": model_round,
+                            "tool_surface_revision": surface_revision,
                         }),
                         cancel: cancel.clone(),
                     },
@@ -967,6 +1427,7 @@ impl RuntimeActor {
                     effect: None,
                     directive: None,
                     disposition: ToolResultDisposition::PersistObservation,
+                    context_ack: Some(context_ack),
                 })
                 .await;
         });
@@ -1118,6 +1579,7 @@ impl RuntimeActor {
                     effect,
                     directive,
                     disposition,
+                    context_ack: None,
                 })
                 .await;
         });
@@ -1166,6 +1628,7 @@ impl RuntimeActor {
         }
 
         let op_scope_id = completion.operation.scope_id;
+        let context_ack = completion.context_ack;
         if let Some(turn) = self.state.turn.as_mut() {
             turn.op = None;
         }
@@ -1175,6 +1638,19 @@ impl RuntimeActor {
                 tool_calls,
                 usage,
             } => {
+                if let Some(ack) = context_ack
+                    && let Err(error) = self.kernel.acknowledge_context_consumption(ack).await
+                {
+                    let error = self.context_transition_failed(error);
+                    let _ = self
+                        .kernel
+                        .emit_event(RuntimeEvent::Error {
+                            message: format!("failed to commit model context consumption: {error}"),
+                        })
+                        .await;
+                    self.state.turn = None;
+                    return;
+                }
                 // Report the round's true provider usage to live consumers
                 // (the eval harness, a token meter). Best-effort: a journal
                 // failure here must not abort the turn commit.
@@ -1473,9 +1949,18 @@ impl RuntimeActor {
         {
             return self.commit_failed(TurnCommitPhase::GcEvent, error).await;
         }
-        // Every mandatory state write is durable: the turn is Committed,
-        // and the completion itself is journaled.
-        if let Err(error) = self.kernel.emit_event(RuntimeEvent::TurnCompleted).await {
+        // The durability barrier: `emit_event_durable` appends TurnCompleted
+        // and then flushes the event journal, so every mandatory state write
+        // before it (tool observations, assistant message, maintains, GC)
+        // has left the process before the turn is Committed — the channel
+        // is FIFO, so the flush covers everything appended before it. A
+        // failed barrier means the trace has a gap: the turn is not
+        // Committed, and TurnCompleted is never broadcast.
+        if let Err(error) = self
+            .kernel
+            .emit_event_durable(RuntimeEvent::TurnCompleted)
+            .await
+        {
             return self
                 .commit_failed(TurnCommitPhase::TurnCompletedEvent, error)
                 .await;

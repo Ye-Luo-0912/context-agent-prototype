@@ -37,6 +37,7 @@ impl ContextEngine for StubContextEngine {
     }
     async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
         Ok(MaterializedContext {
+            materialization_id: 0,
             focus: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),

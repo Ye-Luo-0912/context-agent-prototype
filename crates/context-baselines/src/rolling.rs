@@ -51,6 +51,8 @@ struct RollingState {
     /// Total number of records folded into the marker.
     collapsed: usize,
     turn: u64,
+    #[serde(default)]
+    materialization_revision: u64,
 }
 
 impl RollingState {
@@ -185,7 +187,14 @@ impl ContextEngine for RollingSummaryEngine {
     }
 
     async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
-        let state = self.state.lock().expect("rolling state poisoned");
+        let mut state = self.state.lock().expect("rolling state poisoned");
+        state.materialization_revision =
+            state
+                .materialization_revision
+                .checked_add(1)
+                .ok_or_else(|| {
+                    AgentError::Internal("context materialization id is exhausted".into())
+                })?;
         let items = materialized_items(&state.records, state.summary.as_ref());
         let approx_tokens_total: usize = items
             .iter()
@@ -209,6 +218,7 @@ impl ContextEngine for RollingSummaryEngine {
             breakdown: ScoreBreakdown::default(),
         }));
         Ok(MaterializedContext {
+            materialization_id: state.materialization_revision,
             focus: None,
             items,
             external: agent_contracts::ContextMapView::default(),

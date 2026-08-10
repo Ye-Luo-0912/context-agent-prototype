@@ -11,9 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_contracts::{
-    AgentResult, ContextEngine, ContextIngress, ContextItemSummary, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextQuery, MaterializedContext, ModelCapabilities, ModelOutput,
-    ModelRequest, ModelTransport, RuntimeEvent, ToolOutcome, ToolOutput,
+    AgentResult, ContextConsumptionAck, ContextEngine, ContextIngress, ContextItemSummary,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, MaterializedContext,
+    ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, OperationId, RuntimeEvent,
+    ToolOutcome, ToolOutput, TurnId,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
 use context_contextcore::{ContextServiceAdapter, ContextServiceConfig, ServiceEngine};
@@ -99,9 +100,33 @@ async fn full_contract_round_trip_across_the_process_boundary() {
             .any(|item| item.content.contains("never touch generated files")),
         "pinned constraint must cross the wire"
     );
+    engine
+        .acknowledge_consumption(ContextConsumptionAck {
+            turn_id: TurnId::new(),
+            operation_id: OperationId::new(),
+            model_round: 0,
+            materialization_id: snapshot.materialization_id,
+            item_ids: snapshot.items.iter().map(|item| item.item_id).collect(),
+            external_item_ids: snapshot
+                .external
+                .iter()
+                .map(|entry| entry.item_id)
+                .collect(),
+        })
+        .await
+        .unwrap();
 
     let items: Vec<ContextItemSummary> = engine.inspect(100).await.unwrap();
     assert_eq!(items.len(), 2);
+    assert!(
+        snapshot.items.iter().all(|selected| {
+            items
+                .iter()
+                .find(|item| item.id == selected.item_id)
+                .is_some_and(|item| item.access_count > 0)
+        }),
+        "the sidecar must commit access reinforcement for every item in the exact preview"
+    );
 
     // Scope lifecycle crosses the wire: open a tool scope, close it.
     let scope_id = engine
@@ -379,6 +404,28 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
         })
         .await
         .unwrap();
+    engine
+        .acknowledge_consumption(ContextConsumptionAck {
+            turn_id: TurnId::new(),
+            operation_id: OperationId::new(),
+            model_round: 0,
+            materialization_id: materialized.materialization_id,
+            item_ids: materialized.items.iter().map(|item| item.item_id).collect(),
+            external_item_ids: materialized
+                .external
+                .iter()
+                .map(|entry| entry.item_id)
+                .collect(),
+        })
+        .await
+        .unwrap();
+    let post_ack_access_count: u32 = engine
+        .inspect(100)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|item| item.access_count)
+        .sum();
     let scope_id = engine
         .open_scope(agent_contracts::ScopeKind::Tool, None)
         .await
@@ -466,6 +513,7 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
         "maintain": maintain,
         "materialized_item_count": materialized.items.len(),
         "materialized_approx_tokens": materialized.approx_tokens,
+        "post_ack_access_count": post_ack_access_count,
         "gc": gc,
         "scope_close_transitions": transitions.len(),
         "inspect": inspect,

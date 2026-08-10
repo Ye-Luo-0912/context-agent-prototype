@@ -4,10 +4,10 @@ use serde_json::Value;
 
 use crate::{
     AgentError, AgentResult, CancellationToken, ContextAction, ContextItemId, ContextKind,
-    ContextScope, RunId, TaskId,
+    ContextScope, RunId, TaskId, TurnId,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ToolRisk {
     ReadOnly,
     WorkspaceWrite,
@@ -225,15 +225,164 @@ impl std::fmt::Debug for ToolOutcome {
     }
 }
 
+/// Maximum number of exact tool requirements one task may retain. This is a
+/// runtime resource-policy bound, not a model-context packing hint.
+pub const MAX_TASK_TOOL_REQUIREMENTS: usize = 32;
+/// Defensive bounds for task-owned requirement metadata and event rows.
+pub const MAX_TOOL_REQUIREMENT_NAME_CHARS: usize = 96;
+pub const MAX_TOOL_REQUIREMENT_REASON_CHARS: usize = 160;
+pub const MAX_TOOL_SURFACE_REPORT_SELECTED: usize = 32;
+pub const MAX_TOOL_SURFACE_REPORT_OMITTED: usize = 32;
+pub const MAX_TOOL_SURFACE_REPORT_BLOCKED: usize = 32;
+/// UTF-8 byte cap for every tool name copied into a round-plan event row.
+pub const MAX_TOOL_SURFACE_REPORT_NAME_BYTES: usize = 64;
+
+/// A task's demand for one exact tool id. This is orthogonal to catalog
+/// lifecycle and authority: it neither enables a capability nor grants an
+/// approval/effect permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSurfaceDemand {
+    KeepReady,
+    PreferSurface,
+    MustSurface,
+}
+
+impl ToolSurfaceDemand {
+    /// Explicit priority for conflict resolution and deterministic reports.
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::KeepReady => 1,
+            Self::PreferSurface => 2,
+            Self::MustSurface => 3,
+        }
+    }
+}
+
+/// One exact, bounded task-owned tool requirement. `reason` is explanatory
+/// metadata only; it never enters a provider request or changes authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSurfaceRequirement {
+    pub tool_name: String,
+    pub demand: ToolSurfaceDemand,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSurfaceOmissionReason {
+    KeepReady,
+    SchemaBudget,
+    ProviderInputBudget,
+    Unavailable,
+}
+
+impl ToolSurfaceOmissionReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::KeepReady => "kept ready outside the prompt",
+            Self::SchemaBudget => "round schema budget",
+            Self::ProviderInputBudget => "provider input budget",
+            Self::Unavailable => "not available at the safe point",
+        }
+    }
+}
+
+/// Why a MustSurface requirement prevented a model request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSurfaceBlockReason {
+    Unavailable,
+    SchemaBudget,
+    ProviderInputBudget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSurfaceSelection {
+    pub tool_name: String,
+    pub demand: ToolSurfaceDemand,
+    pub approx_tokens: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSurfaceOmission {
+    pub tool_name: String,
+    pub demand: ToolSurfaceDemand,
+    pub reason: ToolSurfaceOmissionReason,
+    pub approx_tokens: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSurfaceBlock {
+    pub tool_name: String,
+    pub demand: ToolSurfaceDemand,
+    pub reason: ToolSurfaceBlockReason,
+}
+
+/// Exact source revisions used to derive one round surface. Optional fields
+/// stay `None` until the corresponding policy plane exists; zero never
+/// pretends to be a real Task/Focus/policy revision.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSurfaceSourceRevisions {
+    pub builtin_catalog_generation: u64,
+    pub capability_catalog_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_requirement_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_policy_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSurfacePlanStatus {
+    Ready,
+    Unsatisfiable { reason: ToolSurfaceBlockReason },
+}
+
+/// Bounded, schema-free audit record for one round's surface decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSurfacePlanReport {
+    pub turn_id: TurnId,
+    pub model_round: usize,
+    pub surface_revision: u64,
+    pub source_revisions: ToolSurfaceSourceRevisions,
+    pub status: ToolSurfacePlanStatus,
+    pub selected: Vec<ToolSurfaceSelection>,
+    pub selected_total: usize,
+    pub omitted: Vec<ToolSurfaceOmission>,
+    pub omitted_total: usize,
+    pub blocked: Vec<ToolSurfaceBlock>,
+    pub blocked_total: usize,
+    pub selected_schema_tokens: usize,
+    pub mandatory_schema_tokens: usize,
+    pub estimated_input_tokens: usize,
+    pub input_budget_tokens: usize,
+}
+
 /// One immutable view of the tool surface captured at a runtime safe point.
-/// A model round captures exactly one snapshot after the tool lifecycle GC
-/// and uses it for everything: the budget, the prompt and tool-call
-/// validation. `generation` is the catalog generation at capture time, so a
-/// round's surface is auditably identifiable.
+/// A model round publishes exactly one final snapshot and uses it for the
+/// budget, prompt and tool-call validation. `generation` remains a legacy
+/// catalog display value; `surface_revision` is the unique round identity and
+/// `source_revisions` preserves the non-colliding source generations.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolSurfaceSnapshot {
     pub specs: Vec<ToolSpec>,
     pub generation: u64,
+    #[serde(default)]
+    pub surface_revision: u64,
+    #[serde(default)]
+    pub source_revisions: ToolSurfaceSourceRevisions,
+    /// Bounded host-only decisions used for precise call rejection. Valid
+    /// tool names remain exact up to `MAX_TOOL_REQUIREMENT_NAME_CHARS`; the
+    /// tighter event-display cap is applied only when constructing
+    /// `ToolSurfacePlanReport`. Full diagnostics never enter the prompt.
+    #[serde(default)]
+    pub omissions: Vec<ToolSurfaceOmission>,
+    #[serde(default)]
+    pub omitted_total: usize,
 }
 
 /// The unified tool/capability lifecycle shared by the builtin catalog and
@@ -320,7 +469,21 @@ pub trait ToolDispatcher: Send + Sync {
         ToolSurfaceSnapshot {
             specs: self.specs(),
             generation: 0,
+            source_revisions: ToolSurfaceSourceRevisions::default(),
+            ..ToolSurfaceSnapshot::default()
         }
+    }
+
+    /// Whether this tool's schema may be omitted from one model round when
+    /// the provider's final input budget is smaller than the captured tool
+    /// surface. This is a pure classification query: omitting a schema from
+    /// a round must not unload the tool or otherwise change catalog state.
+    ///
+    /// The default is fail-closed because a dispatcher that cannot
+    /// distinguish its core/required tools from optional tools must never
+    /// let token pressure silently hide one of them.
+    fn may_omit_from_round(&self, _name: &str) -> bool {
+        false
     }
 
     /// Explicit lifecycle maintenance safe point, called by the runtime

@@ -2,6 +2,7 @@
 
 use agent_contracts::{
     AgentError, AgentResult, ContextItemSummary, RunId, RuntimeEventEnvelope, TaskId,
+    ToolSurfaceRequirement,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -39,6 +40,14 @@ pub enum RuntimeCommand {
     /// List the tasks the runtime knows (for the UI's `/tasks`).
     ListTasks {
         reply: Reply<AgentResult<Vec<TaskInfo>>>,
+    },
+    /// Atomically replace one task's complete tool-demand set when
+    /// `base_revision` still matches.
+    ReplaceTaskToolRequirements {
+        task_id: TaskId,
+        base_revision: u64,
+        entries: Vec<ToolSurfaceRequirement>,
+        reply: Reply<AgentResult<u64>>,
     },
     Pin {
         content: String,
@@ -137,6 +146,24 @@ impl RuntimeHandle {
     /// Snapshot of the tasks the runtime knows.
     pub async fn list_tasks(&self) -> AgentResult<Vec<TaskInfo>> {
         self.call(|reply| RuntimeCommand::ListTasks { reply }).await
+    }
+
+    /// Replace a task's bounded tool-demand set through whole-set CAS and
+    /// return the resulting revision. An equivalent set is idempotent and
+    /// returns the existing revision.
+    pub async fn replace_task_tool_requirements(
+        &self,
+        task_id: TaskId,
+        base_revision: u64,
+        entries: Vec<ToolSurfaceRequirement>,
+    ) -> AgentResult<u64> {
+        self.call(|reply| RuntimeCommand::ReplaceTaskToolRequirements {
+            task_id,
+            base_revision,
+            entries,
+            reply,
+        })
+        .await
     }
 
     pub async fn pin(&self, content: String) -> AgentResult<()> {
