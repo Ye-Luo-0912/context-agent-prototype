@@ -850,8 +850,16 @@ their store descriptor (`external_summary`: `externalized_at_tick` as
 `created_tick`, `source = "externalized"`), so fetch/admit/reactivate is a
 location move that never changes the total; the fetch/admit regression
 tests assert the moved entry still projects as `externalized`. Also
-propagate audit failures from `BeforeModel` maintenance and explicit
-collect; a state change must not silently outrun its journal event.
+DONE (audit propagation) — a state change no longer outruns its journal
+event: a failed `ContextMaintained` (BeforeModel) publication fences the
+turn (Error event, model never called, no `TurnCompleted`), and an
+explicit `collect` propagates both a refused GC pass and a failed
+`ContextGc` publication as `Error` events; the turn-boundary GC audit
+fault already fences the commit into `RecoveryRequired`. Regressions:
+`before_model_audit_failure_fences_the_turn`,
+`collect_audit_failure_is_not_silent`. Remaining: bounded GC event
+counters/samples plus an artifact-backed ledger with
+item/revision/axis/from/to/cause/trigger/turn/related-id.
 
 ### CORE-03 — Checkpoint capture is not an atomic cross-plane snapshot
 

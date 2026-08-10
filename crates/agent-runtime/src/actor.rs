@@ -903,13 +903,26 @@ impl RuntimeActor {
             .await
         {
             Ok(report) => {
-                let _ = self
+                if let Err(error) = self
                     .kernel
                     .emit_event(RuntimeEvent::ContextMaintained {
                         trigger: ContextMaintenanceTrigger::BeforeModel,
                         report,
                     })
-                    .await;
+                    .await
+                {
+                    // The maintenance state change landed but its audit
+                    // event did not: fence the turn instead of letting the
+                    // state silently outrun its journal event.
+                    let _ = self
+                        .kernel
+                        .emit_event(RuntimeEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    self.state.turn = None;
+                    return;
+                }
             }
             Err(error) => {
                 let _ = self
@@ -1796,11 +1809,34 @@ impl RuntimeActor {
     async fn execute_directive(&mut self, directive: RuntimeDirective) {
         match directive {
             RuntimeDirective::Context(agent_contracts::ContextAction::Collect) => {
-                if let Ok(report) = self.kernel.context_gc().await {
-                    let _ = self
-                        .kernel
-                        .emit_event(RuntimeEvent::ContextGc { report })
-                        .await;
+                match self.kernel.context_gc().await {
+                    Ok(report) => {
+                        if let Err(error) = self
+                            .kernel
+                            .emit_event(RuntimeEvent::ContextGc { report })
+                            .await
+                        {
+                            // The GC state change landed but its audit
+                            // event did not: surface it instead of letting
+                            // the state silently outrun its journal event.
+                            let _ = self
+                                .kernel
+                                .emit_event(RuntimeEvent::Error {
+                                    message: error.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                    Err(error) => {
+                        // A failed explicit collect is not silent: the model
+                        // asked for a pass and the engine refused it.
+                        let _ = self
+                            .kernel
+                            .emit_event(RuntimeEvent::Error {
+                                message: error.to_string(),
+                            })
+                            .await;
+                    }
                 }
             }
             RuntimeDirective::Context(other) => {

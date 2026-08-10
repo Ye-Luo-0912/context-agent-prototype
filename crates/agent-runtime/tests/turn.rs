@@ -15,7 +15,7 @@ use agent_contracts::{
     CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
     CapabilityTransport, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemId,
     ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextQuery, ContextScope, ContextStateTransition, Effect, EffectCommitError,
+    ContextQuery, ContextScope, ContextStateTransition, Effect, EffectCommitError, EventJournal,
     MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage, ModelOutput,
     ModelRequest, ModelRole, ModelTransport, OperationId, RuntimeEvent, RuntimeEventEnvelope,
     ScopeId, ScopeKind, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome,
@@ -1176,6 +1176,149 @@ async fn actor_routes_collect_directive_into_a_full_gc_pass() {
     assert_eq!(
         *gcs, 2,
         "the manual collect adds one GC pass on top of the regular turn-boundary pass"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Audit failures must be propagated, not silent: a state change must never
+// outrun its journal event (CTX-09 audit-failure propagation).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct FailBeforeModelJournal;
+
+#[async_trait::async_trait]
+impl EventJournal for FailBeforeModelJournal {
+    async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+        if matches!(
+            envelope.event,
+            RuntimeEvent::ContextMaintained {
+                trigger: ContextMaintenanceTrigger::BeforeModel,
+                ..
+            }
+        ) {
+            return Err(AgentError::Storage(
+                "simulated before-model journal failure".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct FailGcEventJournal;
+
+#[async_trait::async_trait]
+impl EventJournal for FailGcEventJournal {
+    async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+        if matches!(envelope.event, RuntimeEvent::ContextGc { .. }) {
+            return Err(AgentError::Storage(
+                "simulated gc-event journal failure".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn before_model_audit_failure_fences_the_turn() {
+    // The BeforeModel maintenance state change landed, but its
+    // ContextMaintained audit event did not: the turn must be fenced —
+    // the model is never called and no TurnCompleted is emitted, so state
+    // cannot silently outrun its journal event.
+    let model = Arc::new(DirectiveModel {
+        tool_name: "context.collect",
+        rounds: AtomicUsize::new(0),
+    });
+    let rounds_ref = model.clone();
+    let kernel = Arc::new(AgentKernel::new(
+        AgentKernelConfig::default(),
+        Arc::new(RecordingContextEngine::default()),
+        model,
+        Arc::new(DirectiveToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        Some(Arc::new(FailBeforeModelJournal)),
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle.user_message("hello".into()).await.unwrap();
+
+    let mut seen: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            seen.push(format!("{:?}", envelope.event));
+        }
+        if seen.iter().any(|e| e.contains("Error")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        seen.iter()
+            .any(|e| e.contains("simulated before-model journal failure")),
+        "the audit failure must surface as an Error event, saw: {seen:?}"
+    );
+    assert_eq!(
+        rounds_ref.rounds.load(Ordering::SeqCst),
+        0,
+        "the fenced turn must never reach the model"
+    );
+    assert!(
+        !seen.iter().any(|e| e.contains("TurnCompleted")),
+        "no TurnCompleted may be emitted for a turn whose audit event failed, saw: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn collect_audit_failure_is_not_silent() {
+    // `context.collect` runs a full GC pass at operation-commit time; when
+    // the resulting ContextGc audit event cannot be journaled, the runtime
+    // must surface the failure as an Error event instead of dropping it.
+    let context = Arc::new(RecordingContextEngine::default());
+    let kernel = Arc::new(AgentKernel::new(
+        AgentKernelConfig::default(),
+        context.clone(),
+        Arc::new(DirectiveModel {
+            tool_name: "context.collect",
+            rounds: AtomicUsize::new(0),
+        }),
+        Arc::new(DirectiveToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        Some(Arc::new(FailGcEventJournal)),
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle.user_message("collect now".into()).await.unwrap();
+
+    let mut seen: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            seen.push(format!("{:?}", envelope.event));
+        }
+        if seen.iter().any(|e| e.contains("RecoveryRequired")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        seen.iter()
+            .any(|e| e.contains("simulated gc-event journal failure")),
+        "the collect audit failure must surface as an Error event, saw: {seen:?}"
+    );
+    // The GC state change itself still happened (the failure is the event,
+    // not the pass): the turn-boundary GC plus the manual collect.
+    let gcs = context.gcs.lock().await;
+    assert_eq!(*gcs, 2, "both GC passes still ran");
+    // And the same journal fault at the turn-boundary GC audit is not
+    // silent either: the turn commit fails and the runtime demands
+    // recovery instead of claiming a commit whose audit never landed.
+    assert!(
+        seen.iter().any(|e| e.contains("RecoveryRequired")),
+        "a failed GC audit event must fence the turn into recovery, saw: {seen:?}"
     );
 }
 
