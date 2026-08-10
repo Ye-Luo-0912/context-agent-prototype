@@ -198,7 +198,10 @@ pub(crate) fn close_focus_episode(state: &mut State) -> Vec<ContextStateTransiti
     close_scope(state, focus_id)
 }
 
-/// Queue the completed task's scope, plus its focus child, for close. The
+/// Queue the completed task's scope and every open descendant (focus
+/// episodes and the tool frames inside them) for close. A task close must
+/// not leave deep descendants open: a tool frame under the task's focus
+/// would otherwise keep pointing at scopes that are already closed. The
 /// close (promotion + eviction) is applied by maintenance so the resulting
 /// transitions are observable.
 pub(crate) fn queue_task_scope_close(state: &mut State, task_id: TaskId) {
@@ -215,9 +218,17 @@ pub(crate) fn queue_task_scope_close(state: &mut State, task_id: TaskId) {
         return;
     };
     state.pending_closed_scopes.push(task_scope);
-    for scope in &state.scopes {
-        if scope.parent == Some(task_scope) && scope.state != ScopeState::Closed {
-            state.pending_closed_scopes.push(scope.id);
+    // Depth-first walk collects every open descendant, not just the direct
+    // focus child: a tool frame nested under the focus is a descendant of
+    // the task and must close with it, or it keeps pointing at scopes that
+    // are already closed.
+    let mut frontier = vec![task_scope];
+    while let Some(parent) = frontier.pop() {
+        for scope in &state.scopes {
+            if scope.parent == Some(parent) && scope.state != ScopeState::Closed {
+                state.pending_closed_scopes.push(scope.id);
+                frontier.push(scope.id);
+            }
         }
     }
 }
@@ -395,8 +406,7 @@ fn close_members(
         if !belongs_to_external(&state.scopes, entry, scope) {
             continue;
         }
-        if !entry.semantic.is_live() || !retention_or_tag_promotable(entry.retention, &entry.tags)
-        {
+        if !entry.semantic.is_live() || !retention_or_tag_promotable(entry.retention, &entry.tags) {
             continue;
         }
         // Same no-op guard as the resident promote: already a member of
@@ -435,11 +445,7 @@ fn close_members(
 /// but tool frames stay out: their observations leave through residency and
 /// error verification, not scope close. Items without a `scope_id` (restored
 /// old checkpoints) fall back to the pre-scope inference.
-fn belongs_to(
-    scopes: &crate::scope_tree::ScopeTree,
-    item: &ContextItem,
-    scope: &Scope,
-) -> bool {
+fn belongs_to(scopes: &crate::scope_tree::ScopeTree, item: &ContextItem, scope: &Scope) -> bool {
     let Some(item_scope_id) = item.scope_id else {
         return legacy_belongs_to(item, scope);
     };

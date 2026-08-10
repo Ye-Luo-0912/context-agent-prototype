@@ -4575,8 +4575,7 @@ async fn warm_buffer_durable_outcome_is_promoted_on_scope_close() {
 #[tokio::test]
 async fn external_durable_outcome_is_promoted_on_scope_close() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
-    let (session_id, task_scope_id, focus_scope_id, durable_id, legacy_id, working_id, other_id) =
-        {
+    let (session_id, task_scope_id, focus_scope_id, durable_id, legacy_id, working_id, other_id) = {
         let mut state = engine.state.lock().await;
         let session_id = crate::scope::ensure_session(&mut state);
         let task_id = TaskId::new();
@@ -4625,9 +4624,13 @@ async fn external_durable_outcome_is_promoted_on_scope_close() {
         durable.scope_id = Some(focus_scope_id);
         durable.attention = AttentionState::Archived;
         let durable_id = durable.id;
-        state
-            .external
-            .push(crate::store::to_external_entry(&durable, reference(durable.id), 1, 1, None));
+        state.external.push(crate::store::to_external_entry(
+            &durable,
+            reference(durable.id),
+            1,
+            1,
+            None,
+        ));
 
         // Working body of the same focus: durable-outcome promotion must
         // leave it alone — it is not a durable outcome of the scope.
@@ -4645,9 +4648,13 @@ async fn external_durable_outcome_is_promoted_on_scope_close() {
         working.scope_id = Some(focus_scope_id);
         working.attention = AttentionState::Archived;
         let working_id = working.id;
-        state
-            .external
-            .push(crate::store::to_external_entry(&working, reference(working.id), 1, 1, None));
+        state.external.push(crate::store::to_external_entry(
+            &working,
+            reference(working.id),
+            1,
+            1,
+            None,
+        ));
 
         // Legacy entry that predates the scope stamp: the task id decides.
         let mut legacy = crate::item::make_item(
@@ -4664,9 +4671,13 @@ async fn external_durable_outcome_is_promoted_on_scope_close() {
         legacy.scope_id = None;
         legacy.attention = AttentionState::Archived;
         let legacy_id = legacy.id;
-        state
-            .external
-            .push(crate::store::to_external_entry(&legacy, reference(legacy.id), 1, 1, None));
+        state.external.push(crate::store::to_external_entry(
+            &legacy,
+            reference(legacy.id),
+            1,
+            1,
+            None,
+        ));
 
         // Durable entry of a *different* task: no task match, so neither
         // close may touch it.
@@ -4684,11 +4695,23 @@ async fn external_durable_outcome_is_promoted_on_scope_close() {
         other.scope_id = None;
         other.attention = AttentionState::Archived;
         let other_id = other.id;
-        state
-            .external
-            .push(crate::store::to_external_entry(&other, reference(other.id), 1, 1, None));
+        state.external.push(crate::store::to_external_entry(
+            &other,
+            reference(other.id),
+            1,
+            1,
+            None,
+        ));
 
-        (session_id, task_scope_id, focus_scope_id, durable_id, legacy_id, working_id, other_id)
+        (
+            session_id,
+            task_scope_id,
+            focus_scope_id,
+            durable_id,
+            legacy_id,
+            working_id,
+            other_id,
+        )
     };
 
     // Focus close: durable and legacy promote to the task scope; the
@@ -4734,7 +4757,9 @@ async fn external_durable_outcome_is_promoted_on_scope_close() {
     }
     assert!(
         transitions.iter().any(|t| {
-            t.item_id == durable_id && t.from == AttentionState::Archived && t.to == AttentionState::Active
+            t.item_id == durable_id
+                && t.from == AttentionState::Archived
+                && t.to == AttentionState::Active
         }),
         "the durable external promotion must be observable as a transition"
     );
@@ -4765,10 +4790,127 @@ async fn external_durable_outcome_is_promoted_on_scope_close() {
         assert_eq!(state.external.get(other_id).unwrap().scope_id, None);
     }
     assert!(
-        transitions
-            .iter()
-            .all(|t| t.item_id != durable_id),
+        transitions.iter().all(|t| t.item_id != durable_id),
         "an already-active external entry must not emit a second transition \
          (promotion records attention changes, like the resident pass)"
+    );
+}
+
+/// A task close queues the task scope and *every* open descendant — the
+/// focus episode and the tool frames nested under it — so a deep descendant
+/// never keeps pointing at scopes that are already closed. The durable
+/// outcome of the deepest tool frame still promotes to the nearest open
+/// ancestor (the session, once task and focus are closed).
+#[tokio::test]
+async fn task_close_closes_deep_descendants_and_promotes_their_outcomes() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let (session_id, task_scope_id, focus_scope_id, tool_scope_id, item_id) = {
+        let mut state = engine.state.lock().await;
+        let session_id = crate::scope::ensure_session(&mut state);
+        let task_id = TaskId::new();
+        let task_scope_id = state.scopes.push(agent_contracts::Scope {
+            id: ScopeId::new(),
+            parent: Some(session_id),
+            kind: ScopeKind::Task,
+            state: ScopeState::Active,
+            task_id: Some(task_id),
+            goal: None,
+            opened_tick: 1,
+            last_active_tick: 1,
+            closed_tick: None,
+        });
+        let focus_scope_id = state.scopes.push(agent_contracts::Scope {
+            id: ScopeId::new(),
+            parent: Some(task_scope_id),
+            kind: ScopeKind::Focus,
+            state: ScopeState::Active,
+            task_id: Some(task_id),
+            goal: None,
+            opened_tick: 2,
+            last_active_tick: 2,
+            closed_tick: None,
+        });
+        let tool_scope_id = state.scopes.push(agent_contracts::Scope {
+            id: ScopeId::new(),
+            parent: Some(focus_scope_id),
+            kind: ScopeKind::Tool,
+            state: ScopeState::Active,
+            task_id: Some(task_id),
+            goal: None,
+            opened_tick: 3,
+            last_active_tick: 3,
+            closed_tick: None,
+        });
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "durable tool outcome".into(),
+            ContextKind::Decision,
+            ContextScope::Turn,
+            ContextRetention::Durable,
+            0.9,
+            None,
+        );
+        item.task_id = Some(task_id);
+        item.scope_id = Some(tool_scope_id);
+        item.attention = AttentionState::Archived;
+        let item_id = item.id;
+        state.items.push(item);
+        crate::scope::queue_task_scope_close(&mut state, task_id);
+        (
+            session_id,
+            task_scope_id,
+            focus_scope_id,
+            tool_scope_id,
+            item_id,
+        )
+    };
+
+    let transitions = {
+        let mut state = engine.state.lock().await;
+        crate::scope::drain_closed_scopes(&mut state, 1)
+    };
+    {
+        let state = engine.state.lock().await;
+        let closed = |id: ScopeId| {
+            state
+                .scopes
+                .by_id(id)
+                .is_some_and(|scope| scope.state == ScopeState::Closed)
+        };
+        assert!(
+            closed(task_scope_id),
+            "the task scope itself must be closed by the queued close"
+        );
+        assert!(
+            closed(focus_scope_id),
+            "the focus descendant must be closed with the task"
+        );
+        assert!(
+            closed(tool_scope_id),
+            "a deep tool-frame descendant must be closed with the task, \
+             not left pointing at closed scopes"
+        );
+        let promoted = state.items.iter().find(|item| item.id == item_id).unwrap();
+        assert_eq!(
+            promoted.scope_id,
+            Some(session_id),
+            "the tool frame's durable outcome must promote to the nearest open \
+             ancestor once task and focus are closed"
+        );
+        assert_eq!(promoted.scope, ContextScope::Session);
+        assert!(
+            promoted
+                .tags
+                .iter()
+                .any(|tag| tag.is_lifecycle(LifecycleLabel::Promoted)),
+            "the promotion must be labeled"
+        );
+    }
+    assert!(
+        transitions
+            .iter()
+            .any(|t| t.item_id == item_id && t.to == AttentionState::Active),
+        "the promotion must be observable as a transition"
     );
 }

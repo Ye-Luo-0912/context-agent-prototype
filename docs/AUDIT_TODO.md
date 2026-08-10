@@ -692,8 +692,20 @@ The membership walk now uses the scope tree's O(1) id index instead of a
 linear scan, so the close pass stays O(items) even when the tree holds many
 closed scopes.
 
-Remaining CTX-06 work: task-close descendant handling, tool-scope close
-error publishing, and task-summary focus identity.
+**Task-close descendant handling closed 2026-08-10.** The task-close queue
+collected only the task scope and its direct focus child, so a tool frame
+nested under the focus stayed open — still Active and pointing at scopes
+that were already closed. `queue_task_scope_close` now walks the scope tree
+depth-first and queues every open descendant (focus episodes and the tool
+frames inside them); each queued close promotes durable outcomes to the
+nearest open ancestor, so the deepest tool frame's outcome lands in the
+session once task and focus are closed. Regression:
+`task_close_closes_deep_descendants_and_promotes_their_outcomes` (a
+four-level session/task/focus/tool tree: every scope closes and the tool
+frame's Durable decision is promoted, labeled and observable).
+
+Remaining CTX-06 work: tool-scope close error publishing, and task-summary
+focus identity.
 
 ### CTX-07 — Materializer budget and hot-path correctness
 
