@@ -476,6 +476,26 @@ impl AppState {
                 self.busy = false;
                 self.status = "recovery_required".into();
             }
+            RuntimeEvent::RuntimeRestored {
+                checkpoint_version,
+                restored_run_id,
+                rebased_tasks,
+                capabilities_applied,
+                ..
+            } => {
+                // A live restore committed: surface the bounded audit
+                // summary as a system line; full detail stays in the event.
+                self.status = "restored".into();
+                self.push_system(format!(
+                    "restore committed: checkpoint v{checkpoint_version} from run {restored_run_id}, \
+                     {rebased_tasks} task requirement set(s) rebased, capabilities {}",
+                    if capabilities_applied {
+                        "applied"
+                    } else {
+                        "unchanged"
+                    }
+                ));
+            }
             RuntimeEvent::ModelUsed {
                 input_tokens,
                 output_tokens,
