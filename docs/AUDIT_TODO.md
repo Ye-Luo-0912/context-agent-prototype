@@ -799,6 +799,26 @@ at final commit.
 Acceptance: discovering `AuthService.rs` can make the very next model round
 recall Warm/Cold evidence without duplicating the tool body.
 
+**Closed 2026-08-10.** The actor now emits a bounded, no-body
+`ContextIngress::WorkingSetSignal` when a tool result commits to the turn
+frame: the engine merges the entities extracted from the tool's bounded
+output into the hot set immediately, so the very next model round's
+candidate generation and scoring see them (recall of cooled evidence needs
+a hot entity to fire). No item is created and nothing is persisted — the
+observation body still lands only at turn-end finalization, so the tool
+body is never duplicated. Regressions:
+`working_set_signal_extends_hot_entities_without_creating_a_body` (the
+engine merges the signaled entities with no item created) and
+`tool_commit_signals_discovered_entities_before_the_next_round` (the actor
+sends the signal at tool commit, before the turn-end observation ingest;
+the observed ingest order in the turn test now shows `WorkingSetSignal`
+between the user message and the persisted tool observation). The existing
+recall end-to-end test now exercises the acceptance directly: a fetch tool
+that discovers `AuthService.rs` signals it, and the turn-boundary GC
+recalls the seeded Warm/Cold entries into the resident heap under their
+original ids — while the fetch/search/inspect results themselves are never
+persisted as new ToolObservations.
+
 ### CTX-09 — Lifecycle clocks and observability need explicit semantics
 
 `tick` advances on ingest, maintain, GC and materialize, yet several TTLs

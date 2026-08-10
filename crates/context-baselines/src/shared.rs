@@ -121,6 +121,10 @@ pub(crate) fn records_for_ingress(ingress: &ContextIngress, turn: u64) -> Vec<Re
         // Directives modify existing items; they produce no records in the
         // append/rolling baselines (which only accumulate history).
         ContextIngress::ContextDirective { .. } => Vec::new(),
+        // A working-set signal carries no body; baselines accumulate history
+        // records, so it produces nothing (the tool observation that follows
+        // at turn end is the record).
+        ContextIngress::WorkingSetSignal { .. } => Vec::new(),
     }
 }
 

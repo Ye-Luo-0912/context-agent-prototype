@@ -165,6 +165,7 @@ impl ContextEngine for RecordingContextEngine {
             ContextIngress::Pin { .. } => "Pin",
             ContextIngress::TaskCompleted { .. } => "TaskCompleted",
             ContextIngress::ContextDirective { .. } => "ContextDirective",
+            ContextIngress::WorkingSetSignal { .. } => "WorkingSetSignal",
         };
         self.ingests.lock().await.push(label.to_string());
         self.activity.lock().await.push(label.to_string());
@@ -488,14 +489,17 @@ async fn turn_frame_is_execution_stack_not_long_term_memory() {
 
     // The observation reached the context engine only after the turn ended,
     // in ingest order: the implicit task's focus (established before the
-    // message), then the user message, then the persisted tool observation,
-    // then the final assistant message.
+    // message), then the user message, then the mid-turn working-set signal
+    // from the tool commit (the tool's discovered entities become hot for
+    // the next round), then the persisted tool observation, then the final
+    // assistant message.
     let ingests = context.ingests.lock().await;
     assert_eq!(
         ingests.as_slice(),
         &[
             "FocusChanged",
             "UserMessage",
+            "WorkingSetSignal",
             "ToolObservation",
             "AssistantMessage"
         ]
@@ -838,6 +842,128 @@ async fn tool_scope_close_failure_is_published_as_an_error() {
     assert!(
         error.contains("closing tool scope"),
         "the error must name the failing close, got: {error}"
+    );
+}
+
+/// Records every `ContextIngress` the actor sends, so the test can assert
+/// that a tool commit signals its discovered entities *before* the turn-end
+/// observation is persisted.
+#[derive(Debug, Default)]
+struct IngestRecordingEngine {
+    ingests: Arc<Mutex<Vec<ContextIngress>>>,
+}
+
+#[async_trait::async_trait]
+impl ContextEngine for IngestRecordingEngine {
+    async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+        self.ingests.lock().await.push(ingress);
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            materialization_id: 0,
+            focus: None,
+            items: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
+            selected: Vec::new(),
+            approx_tokens: 0,
+            diagnostics: ContextDiagnostics::default(),
+        })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+}
+
+/// A read-only tool whose bounded output names a discovered entity, so the
+/// test can assert the runtime signals it before the next model round.
+struct EntitySignalingDispatcher;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for EntitySignalingDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "fs.read".into(),
+            description: "read a file".into(),
+            input_schema: json!({"type": "object"}),
+            risk: agent_contracts::ToolRisk::ReadOnly,
+        }]
+    }
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        Ok(ToolOutcome::Value(ToolOutput {
+            call_id: request.call.id,
+            tool_name: request.call.name,
+            ok: true,
+            summary: "found it".into(),
+            model_content: "discovered AuthService.rs".into(),
+            artifact_ref: None,
+            metadata: json!({}),
+        }))
+    }
+}
+
+/// A tool commit signals the entities its output discovered to the context
+/// engine — before the observation body is persisted at turn end — so the
+/// very next model round can recall evidence without duplicating the tool
+/// body.
+#[tokio::test]
+async fn tool_commit_signals_discovered_entities_before_the_next_round() {
+    let context = Arc::new(IngestRecordingEngine::default());
+    let handle = spawn_with(
+        Arc::new(TwoRoundToolModel::default()) as Arc<dyn ModelTransport>,
+        context.clone() as Arc<dyn ContextEngine>,
+        Arc::new(EntitySignalingDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("go".into()).await.unwrap();
+    wait_for_turn_completion(&mut events).await;
+
+    let ingests = context.ingests.lock().await;
+    let signal = ingests
+        .iter()
+        .find_map(|ingress| match ingress {
+            ContextIngress::WorkingSetSignal { content } => Some(content.clone()),
+            _ => None,
+        })
+        .expect("a WorkingSetSignal must be sent at tool commit");
+    assert!(
+        signal.contains("AuthService.rs"),
+        "the tool's discovered entity must be signaled, got: {signal}"
+    );
+    let signal_pos = ingests
+        .iter()
+        .position(|ingress| matches!(ingress, ContextIngress::WorkingSetSignal { .. }))
+        .expect("the signal must be present");
+    let observation_pos = ingests
+        .iter()
+        .position(|ingress| matches!(ingress, ContextIngress::ToolObservation { .. }))
+        .expect("the observation must be persisted at turn end");
+    assert!(
+        signal_pos < observation_pos,
+        "the signal must reach the engine before the observation body is \
+         persisted at turn end"
     );
 }
 

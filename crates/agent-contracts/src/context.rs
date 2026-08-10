@@ -374,6 +374,15 @@ pub enum ContextIngress {
         #[serde(default)]
         scope_id: Option<ScopeId>,
     },
+    /// A lightweight, bounded mid-turn working-set signal from the runtime:
+    /// a tool's output named entities the *next* model round should treat
+    /// as hot, before the observation body is persisted at turn end. No
+    /// item is created and nothing is externalized — the signal only
+    /// extends the hot-entity set, so Warm/Cold evidence can be recalled
+    /// immediately without duplicating the tool body.
+    WorkingSetSignal {
+        content: String,
+    },
     /// A structured context directive from a tool's output (gc hint, tag,
     /// lease). Tools never touch the engine — the runtime routes the
     /// directive here and the engine applies it or ignores it when the

@@ -5405,3 +5405,40 @@ async fn external_view_surfaces_hot_matches_beyond_the_recency_tail() {
          the entity index"
     );
 }
+
+/// A mid-turn working-set signal extends the hot-entity set so the next
+/// model round can recall evidence, without creating an item — the body is
+/// persisted later, at turn end, by the runtime.
+#[tokio::test]
+async fn working_set_signal_extends_hot_entities_without_creating_a_body() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "start".into(),
+        })
+        .await
+        .unwrap();
+    let items_before = engine.state.lock().await.items.len();
+
+    engine
+        .ingest(ContextIngress::WorkingSetSignal {
+            content: "discovered AuthService.rs and CacheStore.rs".into(),
+        })
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    assert!(
+        state.hot_entities.iter().any(|e| e == "AuthService.rs"),
+        "the signal's entities must become hot for the next round"
+    );
+    assert!(
+        state.hot_entities.iter().any(|e| e == "CacheStore.rs"),
+        "every signal entity must be merged"
+    );
+    assert_eq!(
+        state.items.len(),
+        items_before,
+        "a working-set signal must not create an item"
+    );
+}

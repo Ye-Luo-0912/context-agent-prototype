@@ -501,6 +501,19 @@ impl ContextEngine for SimpleContextEngine {
                     state.active_scope_id = Some(session.id);
                 }
             }
+            ContextIngress::WorkingSetSignal { content } => {
+                // A mid-turn signal from a tool commit: the entities the
+                // tool just touched become hot for the *next* model round,
+                // without persisting a body yet (the observation lands at
+                // turn end). Bounded merge, no item, no scope change — the
+                // signal only extends the hot-entity set.
+                if self.config.entity_affinity {
+                    entity::merge_hot_entities(
+                        &mut state.hot_entities,
+                        entity::extract_entities(&content),
+                    );
+                }
+            }
             ContextIngress::Pin { content, kind } => {
                 // A pin is session-level: it guarantees the session scope
                 // exists even when no task has started yet.

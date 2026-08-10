@@ -414,10 +414,13 @@ async fn recall_turn_pulls_external_content_back_without_polluting_the_prompt() 
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut completed = false;
+    let mut reactivated = 0usize;
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
-            if matches!(envelope.event, RuntimeEvent::TurnCompleted) {
-                completed = true;
+            match envelope.event {
+                RuntimeEvent::TurnCompleted => completed = true,
+                RuntimeEvent::ContextGc { report } => reactivated += report.reactivated,
+                _ => {}
             }
         }
         if completed {
@@ -450,28 +453,58 @@ async fn recall_turn_pulls_external_content_back_without_polluting_the_prompt() 
 
     // Fetch/search/inspect results are transient. They reached the model
     // through the turn frame, but finalization must not persist them as
-    // new observations. The turn's own user + assistant messages are
-    // expected to persist; a retrieval result would show up as an extra
-    // ToolObservation.
+    // new observations — the turn's own user + assistant messages are
+    // expected to persist, and a retrieval result would show up as an
+    // extra ToolObservation. The mid-turn WorkingSetSignal, however, made
+    // the fetched content's entities hot again, so the turn-boundary GC
+    // *recalls* the seeded entries (same ids, from warm/cold back to the
+    // resident heap) — that is the CTX-08 behavior, not a new observation.
     let after = engine.diagnostics().await.unwrap();
     let summaries = engine.inspect(100).await.unwrap();
     assert_eq!(
         after.total_items,
-        catalog_before + 2,
-        "only the turn's user + assistant messages may be added, got {} -> {}",
+        catalog_before + 2 + reactivated,
+        "the turn adds its user + assistant messages and recalls the seeded \
+         entries (same ids, warm/cold -> resident), got {} -> {}",
         catalog_before,
         after.total_items
     );
     assert!(
+        reactivated >= 1,
+        "the signaled entities must recall the seeded warm/cold evidence"
+    );
+    // The ToolObservations in the catalog are the *seeded* ones — recalled
+    // with their original ids, not new items. A fetch/search/inspect result
+    // persisted as a fresh observation would carry the turn's own
+    // `created_turn`; every ToolObservation predates it.
+    let user_turn = summaries
+        .iter()
+        .filter(|s| s.kind == ContextKind::UserMessage)
+        .map(|s| s.created_turn)
+        .max()
+        .expect("the turn's user message is present");
+    assert!(
         summaries
             .iter()
-            .all(|s| s.kind != ContextKind::ToolObservation),
-        "context fetch/search/inspect must not persist ToolObservations: {:?}",
-        summaries.iter().map(|s| s.kind).collect::<Vec<_>>()
+            .filter(|s| s.kind == ContextKind::ToolObservation)
+            .all(|s| s.created_turn < user_turn),
+        "context fetch/search/inspect must not persist new ToolObservations: {:?}",
+        summaries
+            .iter()
+            .filter(|s| s.kind == ContextKind::ToolObservation)
+            .map(|s| (s.created_turn, s.source.as_deref()))
+            .collect::<Vec<_>>()
+    );
+    // The signaled entities recalled the seeded entry into the working set
+    // (same id, warm/cold -> resident — the CTX-08 acceptance). It is no
+    // longer an external ref; it must be resident with its original id.
+    assert!(
+        summaries.iter().any(|s| s.id == target_id),
+        "the recalled entry must be resident with its original id"
     );
     assert!(
-        engine.inspect_external(target_id).await.unwrap().is_some(),
-        "the fetched entry keeps its original id and stays retrievable"
+        engine.inspect_external(target_id).await.unwrap().is_none(),
+        "a recalled entry leaves the external map (it lives in the heap again)"
     );
 }
 
