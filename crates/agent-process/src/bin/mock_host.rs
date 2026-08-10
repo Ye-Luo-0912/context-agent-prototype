@@ -170,7 +170,45 @@ async fn server_loop() {
                     metadata: json!({}),
                 })
                 .expect("ToolOutput serializes");
-                reply(&mut writer, id, output).await;
+                // `stage_write: {"path": ..., "content": ...}` — the mock
+                // declares a workspace-write *wire effect* instead of
+                // mutating anything itself: the wire effect broker test
+                // asserts the adapter stages it through the confined handle
+                // and the runtime commits it behind the generation fence.
+                let stage_write = request
+                    .get("call")
+                    .and_then(|call| call.get("arguments"))
+                    .and_then(|args| args.get("stage_write"))
+                    .and_then(Value::as_object);
+                let value = match stage_write {
+                    Some(spec) => {
+                        let path = spec
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .unwrap_or("staged.txt")
+                            .to_string();
+                        let content = spec
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .as_bytes()
+                            .to_vec();
+                        let content_b64 = base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            &content,
+                        );
+                        json!({
+                            "output": output,
+                            "effects": [{
+                                "op": "workspace_write",
+                                "path": path,
+                                "content_b64": content_b64,
+                            }],
+                        })
+                    }
+                    None => output,
+                };
+                reply(&mut writer, id, value).await;
             }
             "big" => {
                 // Stream far more than any test's `max_frame_bytes` without

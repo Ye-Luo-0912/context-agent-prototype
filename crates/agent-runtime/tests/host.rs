@@ -677,8 +677,10 @@ async fn capability_authority_is_derived_and_validated_at_registration() {
         "the refusal must name the missing grant: {error}"
     );
 
-    // A process capability cannot stage in-process Rust effects, so
-    // workspace:write is refused until the effect broker exists.
+    // A process capability may declare workspace:write now that the wire
+    // effect broker exists: the child stages structured wire effects and
+    // the adapter commits them through the confined workspace handle behind
+    // the generation fence — the child itself never writes.
     let process_write = DemoCapability::with_authority(
         "proc-write",
         &["workspace:write"],
@@ -696,13 +698,8 @@ async fn capability_authority_is_derived_and_validated_at_registration() {
         };
         capability
     };
-    let error = host
-        .register_capability(Arc::new(process_write))
-        .expect_err("process mutation is not brokered yet");
-    assert!(
-        error.to_string().contains("not brokered"),
-        "the refusal must name the missing broker: {error}"
-    );
+    host.register_capability(Arc::new(process_write))
+        .expect("a process capability may declare workspace:write through the wire effect broker");
 
     // A read-only process capability is fine: read authority, ReadOnly
     // tool, no broker needed.

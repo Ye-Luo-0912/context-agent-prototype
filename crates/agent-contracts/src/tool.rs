@@ -103,6 +103,33 @@ pub trait Effect: Send + Sync {
     async fn rollback(self: Box<Self>, reason: &str);
 }
 
+/// Several effects committed in order as one operation. Used by the
+/// process-capability adapter when a child declares more than one wire
+/// effect: each is staged through its own confined handle, and this
+/// composite commits them one after the other behind the generation fence.
+/// Each sub-effect is itself atomic; a mid-list failure stops the rest and
+/// reports `NotApplied` for the failed one — effects already committed stay
+/// committed (they are separate atomic operations, not one transaction).
+#[async_trait::async_trait]
+impl Effect for Vec<Box<dyn Effect>> {
+    fn describe(&self) -> String {
+        format!("composite of {} staged effects", self.len())
+    }
+
+    async fn commit(self: Box<Self>) -> Result<(), EffectCommitError> {
+        for effect in (*self).into_iter() {
+            effect.commit().await?;
+        }
+        Ok(())
+    }
+
+    async fn rollback(self: Box<Self>, reason: &str) {
+        for effect in (*self).into_iter() {
+            effect.rollback(reason).await;
+        }
+    }
+}
+
 /// Why an effect commit failed. The distinction is load-bearing: after a
 /// `NotApplied` failure the world is unchanged (tell the model "nothing
 /// happened"); after `AppliedButDurabilityFailed` the side effect already
@@ -534,4 +561,139 @@ pub trait ToolDispatcher: Send + Sync {
     }
 
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Records whether it was committed or rolled back, optionally failing
+    /// its own commit — the observable trace for the composite semantics.
+    struct RecordingEffect {
+        label: &'static str,
+        commits: Arc<AtomicUsize>,
+        rollbacks: Arc<AtomicUsize>,
+        fail_commit: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Effect for RecordingEffect {
+        fn describe(&self) -> String {
+            self.label.into()
+        }
+        async fn commit(self: Box<Self>) -> Result<(), EffectCommitError> {
+            self.commits.fetch_add(1, Ordering::SeqCst);
+            if self.fail_commit {
+                Err(EffectCommitError::NotApplied(AgentError::Io("boom".into())))
+            } else {
+                Ok(())
+            }
+        }
+        async fn rollback(self: Box<Self>, _reason: &str) {
+            self.rollbacks.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn composite(effects: Vec<Box<dyn Effect>>) -> Box<dyn Effect> {
+        Box::new(effects)
+    }
+
+    #[tokio::test]
+    async fn composite_effect_commits_every_sub_effect_in_order() {
+        let commits = Arc::new(AtomicUsize::new(0));
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let effect = composite(vec![
+            Box::new(RecordingEffect {
+                label: "a",
+                commits: commits.clone(),
+                rollbacks: rollbacks.clone(),
+                fail_commit: false,
+            }),
+            Box::new(RecordingEffect {
+                label: "b",
+                commits: commits.clone(),
+                rollbacks: rollbacks.clone(),
+                fail_commit: false,
+            }),
+            Box::new(RecordingEffect {
+                label: "c",
+                commits: commits.clone(),
+                rollbacks: rollbacks.clone(),
+                fail_commit: false,
+            }),
+        ]);
+        effect.commit().await.expect("all sub-effects commit");
+        assert_eq!(commits.load(Ordering::SeqCst), 3);
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn composite_effect_stops_at_the_first_failure() {
+        // A mid-list failure must stop the rest and report `NotApplied`:
+        // effects already committed stay committed (they are separate
+        // atomic operations), but nothing after the failure runs — a
+        // cancelled operation cannot keep mutating the world.
+        let ca = Arc::new(AtomicUsize::new(0));
+        let cb = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::new(AtomicUsize::new(0));
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let effect = composite(vec![
+            Box::new(RecordingEffect {
+                label: "a",
+                commits: ca.clone(),
+                rollbacks: rollbacks.clone(),
+                fail_commit: false,
+            }),
+            Box::new(RecordingEffect {
+                label: "b",
+                commits: cb.clone(),
+                rollbacks: rollbacks.clone(),
+                fail_commit: true,
+            }),
+            Box::new(RecordingEffect {
+                label: "c",
+                commits: cc.clone(),
+                rollbacks: rollbacks.clone(),
+                fail_commit: false,
+            }),
+        ]);
+        let error = effect.commit().await.unwrap_err();
+        assert!(
+            matches!(error, EffectCommitError::NotApplied(_)),
+            "the composite must report the failed sub-effect: {error:?}"
+        );
+        assert_eq!(ca.load(Ordering::SeqCst), 1, "'a' committed first");
+        assert_eq!(cb.load(Ordering::SeqCst), 1, "'b' attempted and failed");
+        assert_eq!(
+            cc.load(Ordering::SeqCst),
+            0,
+            "'c' must never run after the failure"
+        );
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn composite_effect_rolls_back_every_sub_effect() {
+        let commits = Arc::new(AtomicUsize::new(0));
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let effect = composite(vec![
+            Box::new(RecordingEffect {
+                label: "a",
+                commits: commits.clone(),
+                rollbacks: rollbacks.clone(),
+                fail_commit: false,
+            }),
+            Box::new(RecordingEffect {
+                label: "b",
+                commits: commits.clone(),
+                rollbacks: rollbacks.clone(),
+                fail_commit: false,
+            }),
+        ]);
+        effect.rollback("superseded").await;
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 2);
+    }
 }

@@ -316,6 +316,34 @@ pub enum CapabilityOutcome {
     },
 }
 
+/// One structured side effect a *process* capability asks the runtime to
+/// commit. The child never applies the mutation itself: it declares intent
+/// over the wire, the adapter validates it against the capability's
+/// declared permissions and stages it through the confined workspace
+/// handle, and the runtime commits it behind the generation fence — the
+/// capability computes, the core executes, exactly like a builtin tool's
+/// `PreparedEffect`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum WireEffect {
+    /// Write a file inside the workspace root. Requires the capability to
+    /// have declared `workspace:write`; the adapter resolves and stages the
+    /// write through the confined handle, never on the child's behalf
+    /// directly. Content is base64 so arbitrary bytes cross JSON safely.
+    WorkspaceWrite { path: String, content_b64: String },
+}
+
+/// The wire response of a process-capability `invoke`: the bounded output
+/// plus the structured effects the child asks the runtime to commit.
+/// Backward compatible — a plain `ToolOutput` value is still accepted by
+/// the adapter as a response with no effects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessInvokeResponse {
+    pub output: ToolOutput,
+    #[serde(default)]
+    pub effects: Vec<WireEffect>,
+}
+
 impl std::fmt::Debug for CapabilityOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -421,5 +449,38 @@ mod tests {
         assert!(permission_is_side_effecting(PROCESS_RUN));
         assert!(permission_is_side_effecting(RUNTIME_CONTEXT_CONTROL));
         assert!(permission_is_side_effecting("artifact:write"));
+    }
+
+    #[test]
+    fn wire_effect_round_trips_binary_content_over_json() {
+        // A process capability's mutation intent crosses the boundary as a
+        // tagged JSON object; base64 keeps arbitrary bytes safe through
+        // serde_json. The decode must reconstruct the exact byte sequence —
+        // a text-only wire would silently mangle binary file content.
+        let binary: Vec<u8> = (0u8..=255u8).collect();
+        let content_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &binary);
+        let effect = WireEffect::WorkspaceWrite {
+            path: "out.bin".into(),
+            content_b64,
+        };
+
+        let value = serde_json::to_value(&effect).unwrap();
+        assert_eq!(value["op"], "workspace_write", "the tag must be snake_case");
+        assert_eq!(value["path"], "out.bin");
+        assert!(value["content_b64"].is_string());
+
+        let back: WireEffect = serde_json::from_value(value).unwrap();
+        match back {
+            WireEffect::WorkspaceWrite { path, content_b64 } => {
+                assert_eq!(path, "out.bin");
+                let decoded = base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &content_b64,
+                )
+                .expect("the wire payload must be valid base64");
+                assert_eq!(decoded, binary, "every byte must survive the round trip");
+            }
+        }
     }
 }

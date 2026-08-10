@@ -9,6 +9,7 @@ dependencies = [
  "agent-contracts",
  "agent-process",
  "async-trait",
+ "base64",
  "serde_json",
  "tempfile",
  "tokio",
@@ -32,6 +33,7 @@ name = "agent-contracts"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -76,6 +78,7 @@ name = "agent-process"
 version = "0.1.0"
 dependencies = [
  "agent-contracts",
+ "base64",
  "libc",
  "serde_json",
  "tempfile",

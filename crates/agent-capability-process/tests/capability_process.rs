@@ -11,9 +11,10 @@ use std::time::Duration;
 
 use agent_capability_process::ProcessCapabilityAdapter;
 use agent_contracts::{
-    AgentResult, CancellationToken, Capability, CapabilityInvocationContext, CapabilityKind,
-    CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
-    CapabilityTransport, ToolCall, ToolRisk, ToolSpec,
+    AgentError, AgentResult, CancellationToken, Capability, CapabilityInvocationContext,
+    CapabilityKind, CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
+    CapabilityTransport, Effect, EffectCommitError, ToolCall, ToolRisk, ToolSpec, WORKSPACE_WRITE,
+    WorkspaceHandle,
 };
 use agent_process::ProcessHostConfig;
 use serde_json::json;
@@ -39,6 +40,77 @@ fn manifest_with_program(program: &str) -> CapabilityManifest {
             program: program.into(),
         },
     }
+}
+
+/// A manifest for a write-capable process: declares `workspace:write` and a
+/// non-ReadOnly tool, so the adapter accepts it (risk is derived from
+/// declared authority, never self-declared).
+fn write_manifest_with_program(program: &str) -> CapabilityManifest {
+    let mut manifest = manifest_with_program(program);
+    manifest.permissions = vec![WORKSPACE_WRITE.into()];
+    manifest.tools = vec![ToolSpec {
+        name: "process-demo.invoke".into(),
+        description: "invoke the process capability".into(),
+        input_schema: json!({"type": "object"}),
+        risk: ToolRisk::WorkspaceWrite,
+    }];
+    manifest
+}
+
+/// A test double for the confined workspace handle: a real temp directory
+/// whose `prepare_write` returns an effect that writes on commit. The
+/// wire-effect integration test asserts the staged mutation lands exactly
+/// like a builtin tool's `PreparedEffect` — the double only stands in for
+/// the runtime's journaled handle, the adapter path is the code under test.
+struct TestWorkspace {
+    root: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl WorkspaceHandle for TestWorkspace {
+    fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    async fn resolve(&self, relative: &str) -> AgentResult<std::path::PathBuf> {
+        Ok(self.root.join(relative))
+    }
+
+    async fn read(&self, relative: &str) -> AgentResult<Vec<u8>> {
+        std::fs::read(self.root.join(relative)).map_err(|e| AgentError::Io(e.to_string()))
+    }
+
+    async fn write(&self, relative: &str, content: &[u8]) -> AgentResult<()> {
+        std::fs::write(self.root.join(relative), content).map_err(|e| AgentError::Io(e.to_string()))
+    }
+
+    async fn prepare_write(&self, relative: &str, content: &[u8]) -> AgentResult<Box<dyn Effect>> {
+        Ok(Box::new(TestWriteEffect {
+            path: self.root.join(relative),
+            content: content.to_vec(),
+        }))
+    }
+}
+
+/// The staged write effect the test double returns: commit writes the file,
+/// rollback leaves it untouched.
+struct TestWriteEffect {
+    path: std::path::PathBuf,
+    content: Vec<u8>,
+}
+
+#[async_trait::async_trait]
+impl Effect for TestWriteEffect {
+    fn describe(&self) -> String {
+        format!("test write to {}", self.path.display())
+    }
+
+    async fn commit(self: Box<Self>) -> Result<(), EffectCommitError> {
+        std::fs::write(&self.path, &self.content)
+            .map_err(|e| EffectCommitError::NotApplied(AgentError::Io(e.to_string())))
+    }
+
+    async fn rollback(self: Box<Self>, _reason: &str) {}
 }
 
 #[tokio::test]
@@ -465,4 +537,172 @@ async fn invoke_before_start_fails_with_a_clear_error() {
         result.unwrap_err().to_string().contains("not started"),
         "invoking an unstarted process capability must fail fast"
     );
+}
+
+#[tokio::test]
+async fn staged_wire_write_returns_an_effect_request() {
+    // The mock declares a workspace-write wire effect; the adapter must
+    // validate the grant, stage it through the confined handle, and hand
+    // the runtime an `EffectRequest` — the child never mutates anything
+    // itself, it declares intent. Nothing lands until the runtime commits
+    // the effect behind the generation fence.
+    let dir = tempfile::tempdir().unwrap();
+    let program = common::locate_mock_host().expect("mock_host built");
+    let capability: Arc<dyn Capability> = Arc::new(ProcessCapabilityAdapter::with_config(
+        write_manifest_with_program(&program.to_string_lossy()),
+        ProcessHostConfig {
+            program: program.to_string_lossy().into_owned(),
+            args: vec!["--serve".into()],
+            env: vec![("MOCK_MARKER".into(), "1".into())],
+            startup_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+            max_frame_bytes: 1024 * 1024,
+            sandbox: Default::default(),
+        },
+    ));
+    capability.start().await.unwrap();
+
+    let workspace: Arc<dyn WorkspaceHandle> = Arc::new(TestWorkspace {
+        root: dir.path().to_path_buf(),
+    });
+    let outcome = capability
+        .invoke(
+            ToolCall {
+                id: "c6".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({
+                    "stage_write": {
+                        "path": "staged.txt",
+                        "content": "staged content",
+                    }
+                }),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec![WORKSPACE_WRITE.into()],
+                workspace: Some(workspace.clone()),
+                artifacts: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let (output, effect) = match outcome {
+        CapabilityOutcome::EffectRequest { output, effect } => (output, effect),
+        other => panic!("expected an EffectRequest, got {other:?}"),
+    };
+    assert!(output.ok);
+    assert!(
+        output.model_content.contains("process capability handled"),
+        "the child's ToolOutput must cross the boundary: {}",
+        output.model_content
+    );
+
+    // The mutation is staged, not applied: the file must not exist until
+    // the runtime commits the effect.
+    assert!(
+        !dir.path().join("staged.txt").exists(),
+        "the wire effect must be staged, never applied by the child or the adapter"
+    );
+    effect.commit().await.expect("the staged effect commits");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("staged.txt")).unwrap(),
+        "staged content",
+        "the staged bytes must land exactly as declared"
+    );
+    capability.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn wire_write_without_the_grant_is_refused() {
+    // The child declared a write intent, but this invocation was not
+    // granted `workspace:write`: the adapter must refuse before anything
+    // is staged. Declared permission sets are enforced, never assumed —
+    // an over-granted effect must not reach the workspace handle.
+    let program = common::locate_mock_host().expect("mock_host built");
+    let capability: Arc<dyn Capability> = Arc::new(ProcessCapabilityAdapter::with_config(
+        write_manifest_with_program(&program.to_string_lossy()),
+        ProcessHostConfig {
+            program: program.to_string_lossy().into_owned(),
+            args: vec!["--serve".into()],
+            env: vec![("MOCK_MARKER".into(), "1".into())],
+            startup_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+            max_frame_bytes: 1024 * 1024,
+            sandbox: Default::default(),
+        },
+    ));
+    capability.start().await.unwrap();
+    let result = capability
+        .invoke(
+            ToolCall {
+                id: "c7".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({
+                    "stage_write": {
+                        "path": "x.txt",
+                        "content": "x",
+                    }
+                }),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec!["workspace:read".into()],
+                workspace: None,
+                artifacts: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await;
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("without 'workspace:write' permission"),
+        "the refusal must name the missing grant: {message}"
+    );
+    capability.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn wire_write_without_a_workspace_handle_is_refused() {
+    // Even with the permission string present, a capability that never
+    // received a confined workspace handle cannot stage a write — the
+    // handle is the enforcement, not the permission string.
+    let program = common::locate_mock_host().expect("mock_host built");
+    let capability: Arc<dyn Capability> = Arc::new(ProcessCapabilityAdapter::with_config(
+        write_manifest_with_program(&program.to_string_lossy()),
+        ProcessHostConfig {
+            program: program.to_string_lossy().into_owned(),
+            args: vec!["--serve".into()],
+            env: vec![("MOCK_MARKER".into(), "1".into())],
+            startup_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+            max_frame_bytes: 1024 * 1024,
+            sandbox: Default::default(),
+        },
+    ));
+    capability.start().await.unwrap();
+    let result = capability
+        .invoke(
+            ToolCall {
+                id: "c8".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({
+                    "stage_write": {
+                        "path": "x.txt",
+                        "content": "x",
+                    }
+                }),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec![WORKSPACE_WRITE.into()],
+                workspace: None,
+                artifacts: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await;
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("no workspace handle"),
+        "the refusal must name the missing handle: {message}"
+    );
+    capability.stop().await.unwrap();
 }

@@ -164,9 +164,10 @@ fn validate_tool_specs(manifest_id: &str, specs: &[ToolSpec]) -> AgentResult<()>
 ///   any tool `ReadOnly` (a process that can write must not auto-allow);
 /// - a tool's risk may not exceed its grant (a `WorkspaceWrite` tool needs
 ///   `workspace:write`, a `ProcessExecution` tool needs `process:run`);
-/// - a process-transport capability cannot stage in-process Rust effects,
-///   so `workspace:write` is refused until the effect broker exists — a
-///   process mutation would otherwise be an unbrokered side effect.
+/// - a process-transport capability may declare `workspace:write` because
+///   the wire effect broker stages its mutations: the adapter validates the
+///   child's structured wire effects against the grant and commits them
+///   through the confined handle behind the generation fence.
 fn validate_manifest_authority(
     manifest: &CapabilityManifest,
     tool_specs: &[ToolSpec],
@@ -214,14 +215,13 @@ fn validate_manifest_authority(
             ToolRisk::ReadOnly => {}
         }
     }
-    if matches!(manifest.transport, CapabilityTransport::Process { .. })
-        && manifest.permissions.iter().any(|p| p == WORKSPACE_WRITE)
-    {
-        return Err(AgentError::InvalidRequest(format!(
-            "capability '{}' is a process capability and declares '{WORKSPACE_WRITE}': process mutations are not brokered yet — declare read-only access, or stage effects through the wire protocol when the effect broker lands",
-            manifest.id
-        )));
-    }
+    // A process capability may declare `workspace:write` — but only because
+    // the wire effect broker exists: the child stages structured wire
+    // effects and the adapter commits them through the confined workspace
+    // handle behind the generation fence. The child itself never writes.
+    // Enforcement of the write path is the adapter's job; a process whose
+    // adapter is not the wire-brokering one simply cannot be registered
+    // (there is only one adapter).
     Ok(())
 }
 

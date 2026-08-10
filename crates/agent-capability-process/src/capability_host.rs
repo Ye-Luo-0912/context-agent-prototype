@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use agent_contracts::{
     AgentError, AgentResult, Capability, CapabilityInvocationContext, CapabilityManifest,
-    CapabilityOutcome, CapabilityTransport, ToolCall, ToolOutput, ToolRisk, WORKSPACE_WRITE,
-    validate_capability_id,
+    CapabilityOutcome, CapabilityTransport, ProcessInvokeResponse, ToolCall, ToolOutput, ToolRisk,
+    WORKSPACE_WRITE, WireEffect, validate_capability_id,
 };
 use agent_process::{ProcessHost, ProcessHostConfig, ProcessSandbox};
 use async_trait::async_trait;
@@ -145,11 +145,14 @@ impl Capability for ProcessCapabilityAdapter {
             ))
         })?;
         // The process receives the call plus the granted permissions so it
-        // knows what it may do; the sandbox enforcing those grants is a
-        // later concern, like the context service's own boundary. The
-        // invocation context's cancellation token aborts a long-running
-        // call immediately: `/cancel` or a superseded operation kills the
-        // subprocess tree instead of waiting for the request deadline.
+        // knows what it may do. The response is either a plain `ToolOutput`
+        // (no side effects — the historical shape) or a
+        // `ProcessInvokeResponse` carrying structured wire effects the child
+        // asks the runtime to commit: the child never mutates anything
+        // itself, it declares intent. The adapter validates every effect
+        // against the granted permissions and stages it through the
+        // confined workspace handle, so a process mutation crosses the same
+        // generation-fence effect commit as a builtin tool's `PreparedEffect`.
         let value = host
             .call_with_cancel(
                 json!({
@@ -160,13 +163,68 @@ impl Capability for ProcessCapabilityAdapter {
                 &ctx.cancel,
             )
             .await?;
-        let output: ToolOutput = serde_json::from_value(value)
-            .map_err(|e| AgentError::Context(format!("decode capability output: {e}")))?;
-        // An out-of-process capability applies its own side effects inside
-        // the subprocess; across the wire the runtime only ever sees a
-        // completed value. Staged effect / directive transport is a future
-        // protocol extension.
-        Ok(CapabilityOutcome::Value(output))
+        match serde_json::from_value::<ProcessInvokeResponse>(value.clone()) {
+            Ok(response) if !response.effects.is_empty() => {
+                let effects = self.stage_wire_effects(&response.effects, &ctx).await?;
+                Ok(CapabilityOutcome::EffectRequest {
+                    output: response.output,
+                    effect: Box::new(effects),
+                })
+            }
+            _ => {
+                // No wire effects: either the child answered with the
+                // historical plain `ToolOutput` shape, or it declared an
+                // empty effect list. Either way the output passes through.
+                let output: ToolOutput = serde_json::from_value(value)
+                    .map_err(|e| AgentError::Context(format!("decode capability output: {e}")))?;
+                Ok(CapabilityOutcome::Value(output))
+            }
+        }
+    }
+}
+
+impl ProcessCapabilityAdapter {
+    /// Validate every wire effect against the granted permissions and stage
+    /// it through the confined workspace handle. The child declared intent;
+    /// the runtime's handle does the actual path resolution and staging, so
+    /// an undeclared or over-granted effect is refused before anything can
+    /// land.
+    async fn stage_wire_effects(
+        &self,
+        effects: &[WireEffect],
+        ctx: &CapabilityInvocationContext,
+    ) -> AgentResult<Vec<Box<dyn agent_contracts::Effect>>> {
+        let mut staged: Vec<Box<dyn agent_contracts::Effect>> = Vec::new();
+        for effect in effects {
+            match effect {
+                WireEffect::WorkspaceWrite { path, content_b64 } => {
+                    if !ctx.granted_permissions.iter().any(|p| p == WORKSPACE_WRITE) {
+                        return Err(AgentError::InvalidRequest(format!(
+                            "capability '{}' declared a workspace write effect without '{WORKSPACE_WRITE}' permission",
+                            self.manifest.id
+                        )));
+                    }
+                    let workspace = ctx.workspace.as_ref().ok_or_else(|| {
+                        AgentError::InvalidRequest(format!(
+                            "capability '{}' has no workspace handle: '{WORKSPACE_WRITE}' was not granted",
+                            self.manifest.id
+                        ))
+                    })?;
+                    let content = base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        content_b64,
+                    )
+                    .map_err(|e| {
+                        AgentError::Context(format!(
+                            "capability '{}' sent an invalid base64 write payload: {e}",
+                            self.manifest.id
+                        ))
+                    })?;
+                    staged.push(workspace.prepare_write(path, &content).await?);
+                }
+            }
+        }
+        Ok(staged)
     }
 }
 
