@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 agent-contracts.workspace = true
+agent-process.workspace = true
 agent-workspace.workspace = true
 async-trait.workspace = true
 regex.workspace = true

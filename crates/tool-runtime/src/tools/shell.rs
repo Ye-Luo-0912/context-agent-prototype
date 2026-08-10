@@ -10,6 +10,7 @@ use std::{collections::VecDeque, process::Stdio};
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
+use agent_process::kill_process_tree;
 use agent_workspace::Workspace;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -102,6 +103,13 @@ impl Tool for ShellExecTool {
         command.stderr(Stdio::piped());
         command.kill_on_drop(true);
 
+        // Make the shell a process-group leader on Unix so a cancellation
+        // or timeout can kill its whole tree (`kill(-pgid)`), not just the
+        // direct shell — a `&` background job must not survive its caller
+        // and keep mutating after the operation was cancelled.
+        #[cfg(unix)]
+        command.process_group(0);
+
         let mut child = command
             .spawn()
             .map_err(|e| AgentError::Tool(format!("spawn command: {e}")))?;
@@ -157,11 +165,16 @@ impl Tool for ShellExecTool {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
+                    // Kill the whole process tree, not just the shell: a
+                    // descendant that outlives the cancel is an avoidable
+                    // stale mutation (the M12 boundary).
+                    kill_process_tree(child.id().unwrap_or(0));
                     let _ = child.kill().await;
                     outcome = "cancelled";
                     break;
                 }
                 _ = &mut deadline => {
+                    kill_process_tree(child.id().unwrap_or(0));
                     let _ = child.kill().await;
                     outcome = "timed out";
                     break;
@@ -399,6 +412,95 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(8),
             "cancellation took too long: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_cancellation_kills_descendants() {
+        // A cancelled shell must not leave its background children alive:
+        // the command starts a long-lived foreground process that also
+        // spawned a background descendant rewriting a heartbeat file every
+        // ~50 ms. After the cancel, the counter must freeze — the whole
+        // process tree is dead, not just the direct shell (the M12
+        // boundary: a cancelled operation produces no avoidable stale
+        // mutation).
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ShellExecTool::new(workspace.clone());
+        let heartbeat = dir.path().join("descendant-heartbeat.txt");
+
+        // A foreground loop that itself spawns a per-iteration child
+        // (`ping`) is the descendant: the tree kill must stop the loop and
+        // the in-flight child, not just the direct shell. The command
+        // carries no quotes — on Windows `Command::arg` would escape any
+        // `"` for CreateProcess, and cmd.exe does not honor `\"`, so nested
+        // quotes would never reach the loop.
+        #[cfg(windows)]
+        let command = format!(
+            "for /l %i in (1,1,6000) do (echo tick>> {} & ping -n 1 -w 50 127.0.0.1 >nul)",
+            heartbeat.display()
+        );
+        #[cfg(not(windows))]
+        let command = format!(
+            "(while true; do echo tick >> '{}'; sleep 0.05; done) >/dev/null 2>&1 & sleep 300",
+            heartbeat.display()
+        );
+
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let handle = tokio::spawn(async move {
+            tool.execute(
+                RunId::new(),
+                "c",
+                json!({"command": command, "timeout_ms": 60000}),
+                cancel_for_task,
+            )
+            .await
+            .unwrap()
+        });
+
+        // Wait until the descendant's heartbeat visibly advances: the
+        // background writer is alive before we cancel anything.
+        let baseline = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+        let mut saw_advance = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if std::fs::read_to_string(&heartbeat).unwrap_or_default() != baseline {
+                saw_advance = true;
+                break;
+            }
+        }
+
+        // Always cancel, even if the heartbeat never advanced: a failed
+        // assertion must not leave the command running until its 300 s
+        // timeout — the test binary would hang on the spawned task.
+        cancel.cancel();
+        assert!(
+            saw_advance,
+            "the descendant must write the heartbeat while alive"
+        );
+
+        let output = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("tool did not stop after cancellation")
+            .unwrap();
+        let output = value(output);
+        assert!(!output.ok, "cancelled command must report failure");
+        assert!(
+            output.summary.contains("cancel"),
+            "summary should mention cancellation: {}",
+            output.summary
+        );
+
+        // The heartbeat must freeze: the descendant is dead, not a
+        // background process still producing side effects.
+        let frozen = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            std::fs::read_to_string(&heartbeat).unwrap_or_default(),
+            frozen,
+            "the descendant must be terminated after cancellation — the heartbeat stopped"
         );
     }
 }

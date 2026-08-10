@@ -445,30 +445,19 @@ impl ProcessHost {
     /// effects (spawned subprocesses, writers) die with it.
     fn kill_tree(&self) {
         let pid = self.pid.load(Ordering::Relaxed);
-        if pid == 0 {
-            return;
-        }
+        kill_process_tree(pid);
+        // Defense in depth: on Unix, a `kill(-pgid)` ESRCH (group already
+        // gone) must not leave the direct child alive; on other platforms
+        // without a tree kill, the direct child is the whole kill.
         #[cfg(unix)]
         {
-            // Negative pid = the process group. The child was spawned with
-            // `process_group(0)`, so its pgid == its pid and SIGKILL to
-            // -pid reaches the whole tree. On ESRCH (no such group) fall
-            // back to killing the direct child.
-            let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-            if result != 0
+            let pid = self.pid.load(Ordering::Relaxed);
+            if pid != 0
+                && unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } != 0
                 && let Ok(mut child) = self.child.try_lock()
             {
                 let _ = child.start_kill();
             }
-        }
-        #[cfg(windows)]
-        {
-            // `taskkill /T` walks the tree from the pid; `/F` force-kills.
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -477,6 +466,42 @@ impl ProcessHost {
             }
         }
     }
+}
+
+/// Kill a process and every descendant, without touching the caller's own
+/// process group. A cancelled or timed-out operation must not leave a
+/// runaway subtree alive — the child's own side effects (spawned
+/// subprocesses, writers) die with it.
+///
+/// The child must have been spawned as a process-group leader on Unix
+/// (`process_group(0)`, so `kill(-pid)` reaches the whole tree); on Windows
+/// `taskkill /T` walks the tree from the pid. Shared by `ProcessHost`
+/// (its child's whole tree) and the builtin `shell.exec` tool, so every
+/// process path kills the same way — a direct `child.kill()` alone would
+/// leave descendants running after cancellation.
+pub fn kill_process_tree(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        // Negative pid = the process group. The child was spawned with
+        // `process_group(0)`, so its pgid == its pid and SIGKILL to -pid
+        // reaches the whole tree. On ESRCH (no such group) the tree is
+        // already gone; callers fall back to the direct child.
+        let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    }
+    #[cfg(windows)]
+    {
+        // `taskkill /T` walks the tree from the pid; `/F` force-kills.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {}
 }
 
 /// Locate a process binary: explicit env var (`CARGO_BIN_EXE_*` in tests),
