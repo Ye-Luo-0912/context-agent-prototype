@@ -1,4 +1,4 @@
-use agent_contracts::{ContextItem, ContextItemSummary};
+use agent_contracts::{ContextItem, ContextItemSummary, ExternalizedContext};
 
 /// Project items into bounded UI/replay summaries.
 pub(crate) fn to_summaries(items: &[ContextItem]) -> Vec<ContextItemSummary> {
@@ -25,4 +25,30 @@ pub(crate) fn to_summaries(items: &[ContextItem]) -> Vec<ContextItemSummary> {
             source: item.source.clone(),
         })
         .collect()
+}
+
+/// Project an external store entry into a summary so `inspect` covers the
+/// whole logical catalog, not just the resident share. The lightweight
+/// descriptor has no per-item lifecycle stamps (content lives in the store);
+/// `externalized_at_tick` stands in for `created_tick` so ordering stays
+/// meaningful.
+pub(crate) fn external_summary(entry: &ExternalizedContext) -> ContextItemSummary {
+    ContextItemSummary {
+        id: entry.item_id,
+        kind: entry.kind,
+        scope: entry.scope,
+        scope_id: entry.scope_id,
+        attention: entry.attention,
+        semantic: entry.semantic,
+        importance: 0.0,
+        relevance: 0.0,
+        created_tick: entry.externalized_at_tick,
+        created_turn: 0,
+        last_access_turn: 0,
+        access_count: 0,
+        dependencies: entry.dependencies.iter().map(|edge| edge.target).collect(),
+        keep_alive: false,
+        lease_until_turn: None,
+        source: Some("externalized".to_string()),
+    }
 }

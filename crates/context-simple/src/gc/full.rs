@@ -947,7 +947,10 @@ mod tests {
             after.warm_items, 1,
             "the consumed observation leaves the heap for the reversible buffer"
         );
-        assert_eq!(after.total_items, 1, "only the user message stays resident");
+        assert_eq!(
+            after.total_items, 2,
+            "the logical catalog keeps the user message in the heap and the consumed observation in the warm buffer"
+        );
     }
 
     #[tokio::test]

@@ -463,9 +463,10 @@ async fn recall_turn_pulls_external_content_back_without_polluting_the_prompt() 
     let summaries = engine.inspect(100).await.unwrap();
     assert_eq!(
         after.total_items,
-        catalog_before + 2 + reactivated,
-        "the turn adds its user + assistant messages and recalls the seeded \
-         entries (same ids, warm/cold -> resident), got {} -> {}",
+        catalog_before + 2,
+        "the turn adds its user + assistant messages; the recalled entries \
+         were already part of the logical catalog (warm/cold -> resident is \
+         a location move, not a new item), got {} -> {}",
         catalog_before,
         after.total_items
     );
@@ -616,13 +617,15 @@ async fn admit_and_derive_through_the_runtime_never_duplicate_observations() {
     // The admitted item is back under its original id (identity preserved,
     // no copy) and the derived Note was minted — and neither directive
     // result became a ToolObservation, so the total grew by exactly:
-    // user + assistant messages + admitted + derived = 4.
+    // user + assistant messages + derived Note = 3. (The admit is a
+    // location move from the external map back into the heap — the entry
+    // was already part of the logical catalog.)
     let after = engine.diagnostics().await.unwrap();
     let summaries = engine.inspect(100).await.unwrap();
     assert_eq!(
         after.total_items,
-        catalog_before + 4,
-        "expected user+assistant+admitted+derived, got {} -> {}",
+        catalog_before + 3,
+        "expected user+assistant+derived (admit is a location move), got {} -> {}",
         catalog_before,
         after.total_items
     );
@@ -639,14 +642,15 @@ async fn admit_and_derive_through_the_runtime_never_duplicate_observations() {
         engine.inspect_external(target_id).await.unwrap().is_none(),
         "the admitted item must leave the external map (no duplicate owner)"
     );
-    // The only ToolObservation-capable evidence is the admitted item
-    // itself; the directives' own results were not persisted.
+    // The two seeded step observations remain the only ToolObservations in
+    // the logical catalog (one warm in the buffer, one admitted back into
+    // the heap); the directives' own results were not persisted.
     let tool_observations = summaries
         .iter()
         .filter(|s| s.kind == ContextKind::ToolObservation)
         .count();
     assert_eq!(
-        tool_observations, 1,
-        "only the admitted item may be a ToolObservation, got {summaries:?}"
+        tool_observations, 2,
+        "only the two seeded steps may be ToolObservations, got {summaries:?}"
     );
 }

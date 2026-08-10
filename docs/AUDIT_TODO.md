@@ -828,10 +828,16 @@ interpret it as age. Separate `event_seq`, `user_turn`, `gc_epoch` and
 Use bounded GC event counters/samples plus an artifact-backed ledger with
 item/revision/axis/from/to/cause/trigger/turn/related-id. Diagnostics must
 cover all body locations; root/externalize/age/recall need item reasons.
-`ContextDiagnostics.total_items` and `inspect()` currently count Resident
-only, so replay `final_total` is not a logical-catalog total. Also propagate
-audit failures from `BeforeModel` maintenance and explicit collect; a state
-change must not silently outrun its journal event.
+DONE — `ContextDiagnostics.total_items` and `inspect()` are the logical
+catalog (resident heap + warm eviction buffer + external store entries;
+each id has exactly one owner, so the sum is exact) and replay `final_total`
+is a real catalog total. External entries project into `inspect()` from
+their store descriptor (`external_summary`: `externalized_at_tick` as
+`created_tick`, `source = "externalized"`), so fetch/admit/reactivate is a
+location move that never changes the total; the fetch/admit regression
+tests assert the moved entry still projects as `externalized`. Also
+propagate audit failures from `BeforeModel` maintenance and explicit
+collect; a state change must not silently outrun its journal event.
 
 ### CORE-03 — Checkpoint capture is not an atomic cross-plane snapshot
 

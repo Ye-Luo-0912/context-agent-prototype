@@ -6,9 +6,19 @@ use crate::item::approx_tokens;
 /// Counts of the current heap by attention state and semantic death, the
 /// active token estimate, the scope tree by lifecycle state and the GC
 /// residency split (resident / warm buffer / cold store / external).
+///
+/// `total_items` is the *logical catalog*: every item the engine knows
+/// across all body locations (resident heap + warm buffer + cold/external
+/// store entries). Each id lives in exactly one location
+/// (`has_exactly_one_owner`), so the sum is exact and replay's `final_total`
+/// is a real catalog total, not just the resident share.
 pub(crate) fn compute(state: &State) -> ContextDiagnostics {
     let mut diagnostics = ContextDiagnostics {
-        total_items: state.items.len(),
+        total_items: state
+            .items
+            .len()
+            .saturating_add(state.eviction_buffer.len())
+            .saturating_add(state.external.len()),
         focus_generation: state.focus.as_ref().map_or(0, |f| f.generation),
         turn: state.turn,
         tool_round: state.tool_round,

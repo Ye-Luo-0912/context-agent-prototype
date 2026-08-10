@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use crate::checkpoint;
 use crate::diagnostics;
 use crate::gc::{full, minor, reachability};
-use crate::heap;
+use crate::heap::external_summary;
 use crate::index::{dependency, entity};
 use crate::item;
 use crate::materializer;
@@ -835,7 +835,13 @@ impl ContextEngine for SimpleContextEngine {
 
     async fn inspect(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
         let state = self.state.lock().await;
-        let mut summaries = heap::to_summaries(&state.items);
+        // The logical catalog, not just the resident share: the heap, the
+        // reversible warm buffer and the external store entries are all
+        // known items. External entries project from their lightweight
+        // descriptor (externalized_at_tick as their created_tick).
+        let mut summaries = crate::heap::to_summaries(&state.items);
+        summaries.extend(crate::heap::to_summaries(&state.eviction_buffer));
+        summaries.extend(state.external.iter().map(external_summary));
         summaries.sort_by_key(|summary| summary.created_tick);
         summaries.truncate(limit);
         Ok(summaries)

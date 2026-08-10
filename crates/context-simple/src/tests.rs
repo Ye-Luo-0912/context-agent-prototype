@@ -2377,10 +2377,17 @@ async fn external_retrieval_searches_inspects_and_fetches() {
         assert_eq!(entry.last_access_gc_epoch, Some(state.gc_epoch));
     }
 
-    // The item stays externalized: fetch is a read, not a reactivation.
+    // The item stays externalized: fetch is a read, not a reactivation. The
+    // logical catalog still lists the entry, but projected from its store
+    // descriptor — not as a resident body.
     let items = engine.inspect(usize::MAX).await.unwrap();
-    assert!(
-        items.iter().all(|item| item.id != item_a_id),
+    let entry = items
+        .iter()
+        .find(|item| item.id == item_a_id)
+        .expect("the fetched item stays part of the logical catalog");
+    assert_eq!(
+        entry.source.as_deref(),
+        Some("externalized"),
         "fetch must not re-enter the working set"
     );
 }
@@ -2518,13 +2525,17 @@ async fn consumption_ack_stamps_an_external_descriptor_without_reactivating_it()
     let after = engine.inspect_external(item_id).await.unwrap().unwrap();
     assert!(after.last_access_tick > before.last_access_tick);
     assert_eq!(after.last_access_gc_epoch, Some(0));
-    assert!(
-        engine
-            .inspect(usize::MAX)
-            .await
-            .unwrap()
-            .iter()
-            .all(|item| item.id != item_id),
+    // The acknowledged descriptor stays in the logical catalog, but only as
+    // an external projection — acknowledging must not page its body back
+    // into the resident heap.
+    let catalog = engine.inspect(usize::MAX).await.unwrap();
+    let entry = catalog
+        .iter()
+        .find(|item| item.id == item_id)
+        .expect("the acknowledged descriptor stays part of the logical catalog");
+    assert_eq!(
+        entry.source.as_deref(),
+        Some("externalized"),
         "acknowledging a descriptor must not page its body back into memory"
     );
 }
