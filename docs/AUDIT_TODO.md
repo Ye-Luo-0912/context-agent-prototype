@@ -718,7 +718,23 @@ transitions the engine returned and the closed scope id matches) and
 `tool_scope_close_failure_is_published_as_an_error` (a failing close
 surfaces an `Error` naming the close instead of being swallowed).
 
-Remaining CTX-06 work: task-summary focus identity.
+**Task-summary focus identity closed 2026-08-10.** The summary item built
+for a `TaskCompleted` ingest inherited whatever identity happened to be
+active at build time: the focus was cleared before the item was made (so an
+unnamed completion lost its task id) and a *named* completion arriving
+while another task was focused stamped the summary with the focused task's
+id and scope. The summary now belongs to the completed task line: its
+task id and scope (the completed task's open task scope, or the session as
+a fallback) are captured before the focus/close machinery runs and the item
+is re-stamped after `make_item`, so a summary never inherits the current
+focus identity. Regressions:
+`named_task_summary_does_not_inherit_the_current_focus` (A completes while
+B is focused: the summary carries A's id and scope and B's focus stays
+untouched) and `unnamed_task_summary_keeps_the_focused_tasks_identity` (an
+unnamed completion keeps the focused task's id even though the focus is
+cleared while the item is built).
+
+CTX-06 closed.
 
 ### CTX-07 — Materializer budget and hot-path correctness
 

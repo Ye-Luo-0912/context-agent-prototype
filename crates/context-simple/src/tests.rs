@@ -4914,3 +4914,97 @@ async fn task_close_closes_deep_descendants_and_promotes_their_outcomes() {
         "the promotion must be observable as a transition"
     );
 }
+
+/// A named task summary belongs to the *completed* task, never to whatever
+/// scope is active when the completion arrives: when task A completes while
+/// task B is focused, the summary must carry A's task id and scope, and B's
+/// focus must stay untouched.
+#[tokio::test]
+async fn named_task_summary_does_not_inherit_the_current_focus() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let task_a = open_focus(&engine, "finish task A").await;
+    // Switch focus to task B: task A's scope suspends, B's opens.
+    let task_b = open_focus(&engine, "work on task B").await;
+
+    engine
+        .ingest(ContextIngress::TaskCompleted {
+            task_id: Some(task_a),
+            summary: "A is done".into(),
+        })
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    assert_eq!(
+        state.focus.as_ref().map(|f| f.task_id),
+        Some(task_b),
+        "completing an unrelated task must not clear the focused task"
+    );
+    let summary = state
+        .items
+        .iter()
+        .find(|item| item.kind == ContextKind::Summary)
+        .expect("a summary item must exist");
+    assert_eq!(
+        summary.task_id,
+        Some(task_a),
+        "the summary must belong to the completed task, not the focused one"
+    );
+    let task_a_scope = state
+        .scopes
+        .iter()
+        .find(|scope| scope.kind == ScopeKind::Task && scope.task_id == Some(task_a))
+        .map(|scope| scope.id)
+        .expect("task A must have a scope");
+    assert_eq!(
+        summary.scope_id,
+        Some(task_a_scope),
+        "the summary must point at the completed task's scope"
+    );
+}
+
+/// An unnamed task completion (the runtime's focus is the completed task)
+/// still stamps the summary with the focused task's identity — the summary
+/// must not lose its task/scope stamp because the focus is cleared while
+/// the item is built.
+#[tokio::test]
+async fn unnamed_task_summary_keeps_the_focused_tasks_identity() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let task_a = open_focus(&engine, "finish task A").await;
+
+    engine
+        .ingest(ContextIngress::TaskCompleted {
+            task_id: None,
+            summary: "A is done".into(),
+        })
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    assert!(
+        state.focus.is_none(),
+        "completing the focused task must clear the focus"
+    );
+    let summary = state
+        .items
+        .iter()
+        .find(|item| item.kind == ContextKind::Summary)
+        .expect("a summary item must exist");
+    assert_eq!(
+        summary.task_id,
+        Some(task_a),
+        "the summary must keep the completed task's id even though the \
+         focus was cleared while it was built"
+    );
+    let task_a_scope = state
+        .scopes
+        .iter()
+        .find(|scope| scope.kind == ScopeKind::Task && scope.task_id == Some(task_a))
+        .map(|scope| scope.id)
+        .expect("task A must have a scope");
+    assert_eq!(
+        summary.scope_id,
+        Some(task_a_scope),
+        "the summary must point at the completed task's scope"
+    );
+}

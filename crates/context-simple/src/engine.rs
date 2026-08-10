@@ -522,6 +522,29 @@ impl ContextEngine for SimpleContextEngine {
                 // durable outcomes, eviction of the working set) happens in
                 // maintain(TaskCompleted) so it is observable.
                 let completed_task = task_id.or_else(|| state.focus.as_ref().map(|f| f.task_id));
+                // The summary belongs to the completed task line, not to
+                // whatever scope happens to be active right now: capture the
+                // completed task's scope *before* the focus/close machinery
+                // runs, so a named summary never inherits the current focus
+                // identity (a completed task can arrive while another task
+                // is focused, and `state.focus` is cleared below before the
+                // item is built).
+                let summary_scope_id = completed_task
+                    .and_then(|task| {
+                        state.scopes.iter().find(|scope| {
+                            scope.kind == ScopeKind::Task
+                                && scope.task_id == Some(task)
+                                && scope.state != ScopeState::Closed
+                        })
+                    })
+                    .map(|scope| scope.id)
+                    .or_else(|| {
+                        state
+                            .scopes
+                            .iter()
+                            .find(|scope| scope.kind == ScopeKind::Session)
+                            .map(|scope| scope.id)
+                    });
                 if let Some(completed_task) = completed_task {
                     if state.focus.as_ref().map(|f| f.task_id) == Some(completed_task) {
                         state.focus = None;
@@ -546,7 +569,7 @@ impl ContextEngine for SimpleContextEngine {
                     }
                     scope::queue_task_scope_close(&mut state, completed_task);
                 }
-                let item = item::make_item(
+                let mut item = item::make_item(
                     &state,
                     &self.config,
                     summary,
@@ -556,6 +579,13 @@ impl ContextEngine for SimpleContextEngine {
                     0.84,
                     Some("task-summary".to_string()),
                 );
+                // Re-stamp the identity the focus machinery above may have
+                // cleared or displaced: the summary belongs to the completed
+                // task and its scope, never to the current focus.
+                item.task_id = completed_task;
+                if let Some(scope_id) = summary_scope_id {
+                    item.scope_id = Some(scope_id);
+                }
                 dependency::push_linked(&mut state, &self.config, item);
             }
             ContextIngress::ContextDirective { action } => {
