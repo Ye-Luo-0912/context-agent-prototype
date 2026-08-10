@@ -85,6 +85,59 @@ impl ContextEngine for TestContextEngine {
     }
 }
 
+/// A context engine that refuses the completion ingest, so the runtime's
+/// completion transaction fails *before* the task authority plane commits.
+/// Everything else behaves like the trivial `TestContextEngine`.
+#[derive(Debug, Default)]
+struct FailingCompleteEngine;
+
+#[async_trait::async_trait]
+impl ContextEngine for FailingCompleteEngine {
+    async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+        if matches!(ingress, ContextIngress::TaskCompleted { .. }) {
+            return Err(agent_contracts::AgentError::Internal(
+                "simulated completion ingest failure".into(),
+            ));
+        }
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            materialization_id: 0,
+            focus: None,
+            items: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
+            selected: Vec::new(),
+            approx_tokens: 0,
+            diagnostics: ContextDiagnostics::default(),
+        })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+}
+
 struct CheckpointCapability {
     manifest: CapabilityManifest,
 }
@@ -552,6 +605,24 @@ impl EventJournal for FailRestoreEventJournal {
     }
 }
 
+/// A journal that refuses the typed completion event, so the runtime must
+/// surface an audit gap *after* the completion committed instead of
+/// pretending the outcome never happened.
+#[derive(Debug)]
+struct FailCompletionEventJournal;
+
+#[async_trait::async_trait]
+impl EventJournal for FailCompletionEventJournal {
+    async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+        if matches!(envelope.event, RuntimeEvent::TaskCompleted { .. }) {
+            return Err(agent_contracts::AgentError::Storage(
+                "simulated completion event journal failure".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn restore_emits_the_bounded_restore_commit_event() {
     let (instance, _context) = simple_instance().await;
@@ -940,6 +1011,132 @@ async fn restore_rejects_completed_task_without_a_completion_record() {
     assert!(
         error.to_string().contains("no committed completion record"),
         "a completed task must own exactly one outcome: {error}"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn completion_failure_never_leaves_a_half_closed_task() {
+    // The context side refuses the completion ingest: the transaction must
+    // fail before the task authority plane commits, so the task stays
+    // Active, the active slot stays, and no outcome record exists.
+    let instance = RuntimeInstance::spawn(
+        ModuleHost::new(),
+        Arc::new(AgentKernel::new(
+            AgentKernelConfig::default(),
+            Arc::new(FailingCompleteEngine),
+            Arc::new(QuietModel),
+            Arc::new(EmptyTools),
+            Arc::new(PolicyApprovalGate::read_only()),
+            None,
+        )),
+    );
+    instance.start().await.unwrap();
+    instance
+        .handle()
+        .set_focus("refactor auth".into())
+        .await
+        .unwrap();
+    let before = instance.handle().list_tasks().await.unwrap();
+
+    let error = instance
+        .handle()
+        .complete_current_task("shipped".into())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("simulated completion ingest failure"),
+        "the completion failure must surface: {error}"
+    );
+
+    // No half-closed task: still Active, active slot intact, no record.
+    let after = instance.handle().list_tasks().await.unwrap();
+    assert_eq!(after, before, "a failed completion changes nothing");
+    assert_eq!(after[0].status, agent_runtime::TaskStatus::Active);
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert!(
+        checkpoint.tasks.completed.is_empty(),
+        "no outcome was committed"
+    );
+    assert_eq!(checkpoint.current_task_id, before[0].id.into());
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn completion_audit_gap_marks_recovery_but_keeps_the_commit() {
+    // The completion itself commits (context + task authority together), but
+    // the mandatory typed event cannot be journaled: the runtime must keep
+    // the aligned committed state, mark recovery-required and emit the
+    // standard recovery signal — never report an un-audited success.
+    let instance = RuntimeInstance::spawn(
+        ModuleHost::new(),
+        Arc::new(AgentKernel::new(
+            AgentKernelConfig::default(),
+            Arc::new(context_simple::SimpleContextEngine::new(
+                context_simple::SimpleContextConfig::default(),
+            )),
+            Arc::new(QuietModel),
+            Arc::new(EmptyTools),
+            Arc::new(PolicyApprovalGate::read_only()),
+            Some(Arc::new(FailCompletionEventJournal)),
+        )),
+    );
+    instance.start().await.unwrap();
+    let mut events = instance.handle().subscribe();
+    instance
+        .handle()
+        .set_focus("refactor auth".into())
+        .await
+        .unwrap();
+
+    let error = instance
+        .handle()
+        .complete_current_task("shipped".into())
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("audit event failed"),
+        "the audit gap must surface explicitly: {error}"
+    );
+
+    // The standard recovery signal is emitted.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_recovery = false;
+    while tokio::time::Instant::now() < deadline && !saw_recovery {
+        while let Ok(envelope) = events.try_recv() {
+            if matches!(envelope.event, RuntimeEvent::RecoveryRequired) {
+                saw_recovery = true;
+            }
+        }
+        if !saw_recovery {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    assert!(saw_recovery, "the runtime must emit the recovery signal");
+
+    // The aligned state stayed committed: the task is Completed and the
+    // runtime fences normal mutation until a known-good restore. (Checkpoint
+    // itself is refused while recovery is required — that refusal is part of
+    // the fence, and restore is the one mutation that may clear it.)
+    let tasks = instance.handle().list_tasks().await.unwrap();
+    assert_eq!(tasks[0].status, agent_runtime::TaskStatus::Completed);
+    let fenced = instance
+        .handle()
+        .set_focus("another task".into())
+        .await
+        .unwrap_err();
+    assert!(
+        fenced.to_string().contains("recovery is required"),
+        "mutation must be fenced after an audit gap: {fenced}"
+    );
+    let fenced_checkpoint = instance.checkpoint().await.unwrap_err();
+    assert!(
+        fenced_checkpoint
+            .to_string()
+            .contains("recovery is required"),
+        "checkpoint must also be fenced while recovery is required"
     );
     instance.shutdown().await.unwrap();
 }
