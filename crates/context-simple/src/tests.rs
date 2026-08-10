@@ -5008,3 +5008,400 @@ async fn unnamed_task_summary_keeps_the_focused_tasks_identity() {
         "the summary must point at the completed task's scope"
     );
 }
+
+/// The dependency-expansion token reserve is only carved out when expansion
+/// can actually run: with expansion disabled the whole budget belongs to the
+/// working set, so an item that fits the budget must not be pushed out by a
+/// reserve that is never spent.
+#[tokio::test]
+async fn dependency_reserve_is_not_taken_when_expansion_is_disabled() {
+    // ~900 tokens of content: fits an 900-token budget only when the
+    // expansion reserve (min(1024, budget) = 900) is not carved out.
+    let content = "x".repeat(3_600);
+
+    let off = SimpleContextEngine::new(SimpleContextConfig {
+        dependency_expansion: false,
+        ..SimpleContextConfig::default()
+    });
+    {
+        let mut state = off.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &off.config,
+            content.clone(),
+            ContextKind::Note,
+            ContextScope::Session,
+            ContextRetention::Working,
+            0.5,
+            None,
+        );
+        item.scope_id = None;
+        state.items.push(item);
+    }
+    let with_off = off
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 900,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !with_off.items.is_empty(),
+        "with expansion disabled the full budget must be spendable on the \
+         working set, got {} items",
+        with_off.items.len()
+    );
+
+    let on = SimpleContextEngine::new(SimpleContextConfig {
+        dependency_expansion: true,
+        ..SimpleContextConfig::default()
+    });
+    {
+        let mut state = on.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &on.config,
+            content,
+            ContextKind::Note,
+            ContextScope::Session,
+            ContextRetention::Working,
+            0.5,
+            None,
+        );
+        item.scope_id = None;
+        state.items.push(item);
+    }
+    let with_on = on
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 900,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        with_on.items.is_empty(),
+        "with expansion enabled the reserve must be carved out first, so an \
+         item exactly at the budget no longer fits"
+    );
+}
+
+/// Fit packing must not hide a lower-ranked item that fits behind an
+/// oversized top item: candidates are scored first, but the working set is
+/// packed afterwards, so an item too big for the remaining budget must not
+/// consume the cap and bury everything below it.
+#[tokio::test]
+async fn oversized_top_item_does_not_hide_a_lower_ranked_item_that_fits() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        dependency_expansion: false,
+        ..SimpleContextConfig::default()
+    });
+    let (big_id, small_id) = {
+        let mut state = engine.state.lock().await;
+        // High-importance (top-ranked) but ~2000 tokens: cannot fit a
+        // 150-token budget.
+        let mut big = crate::item::make_item(
+            &state,
+            &engine.config,
+            "y".repeat(8_000),
+            ContextKind::Note,
+            ContextScope::Session,
+            ContextRetention::Working,
+            1.0,
+            None,
+        );
+        big.scope_id = None;
+        big.importance = 1.0;
+        let big_id = big.id;
+        state.items.push(big);
+        // Low-importance but ~100 tokens: fits the same budget.
+        let mut small = crate::item::make_item(
+            &state,
+            &engine.config,
+            "z".repeat(400),
+            ContextKind::Note,
+            ContextScope::Session,
+            ContextRetention::Working,
+            0.1,
+            None,
+        );
+        small.scope_id = None;
+        small.importance = 0.1;
+        let small_id = small.id;
+        state.items.push(small);
+        (big_id, small_id)
+    };
+
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 150,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        materialized
+            .items
+            .iter()
+            .any(|item| item.item_id == small_id),
+        "the item that fits must be selected even though the top-ranked item \
+         is too big for the budget"
+    );
+    assert!(
+        !materialized.items.iter().any(|item| item.item_id == big_id),
+        "the oversized top item must not be forced into the frame"
+    );
+}
+
+/// External refs are token-capped (not just count-capped) and their token
+/// cost is charged against the snapshot: long summaries stop the ranked
+/// walk early, and `approx_tokens` reflects the refs the model sees.
+#[tokio::test]
+async fn external_refs_are_token_capped_and_charged() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let long_id = {
+        let mut state = engine.state.lock().await;
+        // Two entries whose summaries alone would exceed the 512-token
+        // external-ref bound: the ranked walk must stop after the first.
+        let mut first = crate::item::make_item(
+            &state,
+            &engine.config,
+            "first external body".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.9,
+            None,
+        );
+        first.scope_id = None;
+        let first_id = first.id;
+        let mut second = crate::item::make_item(
+            &state,
+            &engine.config,
+            "second external body".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.9,
+            None,
+        );
+        second.scope_id = None;
+        let second_id = second.id;
+        let reference = |id: ContextItemId, summary: String| agent_contracts::ContextRef {
+            uri: format!("context://run/{id}"),
+            item_id: id,
+            kind: ContextKind::Note,
+            scope: ContextScope::Task,
+            summary,
+            created_tick: 0,
+        };
+        // ~300 tokens per summary; two of them exceed the 512 bound. The
+        // entries rank by recency, so the more recent one (tick 2) is
+        // walked first and must survive the token cap.
+        let long_summary = "s".repeat(1_200);
+        state.external.push(crate::store::to_external_entry(
+            &first,
+            reference(first_id, long_summary.clone()),
+            2,
+            1,
+            None,
+        ));
+        state.external.push(crate::store::to_external_entry(
+            &second,
+            reference(second_id, long_summary),
+            1,
+            1,
+            None,
+        ));
+        first_id
+    };
+
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 8_192,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        materialized.external.len(),
+        1,
+        "long summaries must stop the ranked ref walk at the token bound, \
+         got {} refs",
+        materialized.external.len()
+    );
+    assert_eq!(
+        materialized.external.as_slice()[0].item_id,
+        long_id,
+        "the first-ranked ref must survive the token cap"
+    );
+    let external_tokens: usize = materialized
+        .external
+        .iter()
+        .map(|entry| {
+            crate::item::approx_tokens(&entry.context_ref.uri)
+                + crate::item::approx_tokens(&entry.context_ref.summary)
+        })
+        .sum();
+    assert!(
+        materialized.approx_tokens >= external_tokens,
+        "the snapshot's token total must include the external refs' cost"
+    );
+}
+
+/// Candidate generation and scoring share one matching universe: the exact
+/// entity index cannot express a substring overlap (`src/auth/AuthService.rs`
+/// vs a hot `AuthService.rs`), so the residual pass must bring the item into
+/// the candidate set or the scorer's substring affinity can never fire for
+/// it.
+#[tokio::test]
+async fn substring_entity_match_reaches_the_candidate_universe() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let closed_scope_id = {
+        let mut state = engine.state.lock().await;
+        let session_id = crate::scope::ensure_session(&mut state);
+        let closed = state.scopes.push(agent_contracts::Scope {
+            id: ScopeId::new(),
+            parent: Some(session_id),
+            kind: ScopeKind::Focus,
+            state: ScopeState::Closed,
+            task_id: None,
+            goal: None,
+            opened_tick: 1,
+            last_active_tick: 1,
+            closed_tick: Some(2),
+        });
+        // An item in a closed scope with an entity that only overlaps the
+        // hot entity as a substring: the exact index misses it, the scorer
+        // would match it — the residual pass must close the gap.
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "auth work on the service".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.8,
+            None,
+        );
+        item.scope_id = Some(closed);
+        item.entities = vec!["src/auth/AuthService.rs".into()];
+        state.items.push(item);
+        closed
+    };
+    // A hot entity naming the substring overlap.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs now".into(),
+        })
+        .await
+        .unwrap();
+    let _ = closed_scope_id;
+
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "work on AuthService.rs now".into(),
+            budget_tokens: 8_192,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        materialized
+            .items
+            .iter()
+            .any(|item| item.content.contains("auth work on the service")),
+        "a substring entity match must reach the candidate universe and be \
+         selected, exactly like the scorer's affinity promises"
+    );
+}
+
+/// The external ref view never walks the whole map: a hot-entity match from
+/// the *head* of a large external map (long past the recency tail) must
+/// still surface through the entity index, without materializing the rest.
+#[tokio::test]
+async fn external_view_surfaces_hot_matches_beyond_the_recency_tail() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let hot_id = {
+        let mut state = engine.state.lock().await;
+        let reference = |id: ContextItemId, summary: String| agent_contracts::ContextRef {
+            uri: format!("context://run/{id}"),
+            item_id: id,
+            kind: ContextKind::Note,
+            scope: ContextScope::Task,
+            summary,
+            created_tick: 0,
+        };
+        // One hot-entity entry at the head of the map...
+        let mut hot = crate::item::make_item(
+            &state,
+            &engine.config,
+            "hot stored decision".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.9,
+            None,
+        );
+        hot.scope_id = None;
+        hot.entities = vec!["CacheStore.rs".into()];
+        let hot_id = hot.id;
+        state.external.push(crate::store::to_external_entry(
+            &hot,
+            reference(hot_id, "hot decision".into()),
+            1,
+            1,
+            None,
+        ));
+        // ...followed by a thousand entries that push it far past the
+        // recency tail.
+        for i in 0..1_000 {
+            let mut filler = crate::item::make_item(
+                &state,
+                &engine.config,
+                format!("filler {i}"),
+                ContextKind::Note,
+                ContextScope::Task,
+                ContextRetention::Working,
+                0.2,
+                None,
+            );
+            filler.scope_id = None;
+            let filler_id = filler.id;
+            state.external.push(crate::store::to_external_entry(
+                &filler,
+                reference(filler_id, format!("filler {i}")),
+                i + 2,
+                1,
+                None,
+            ));
+        }
+        hot_id
+    };
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "check CacheStore.rs".into(),
+        })
+        .await
+        .unwrap();
+
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "check CacheStore.rs".into(),
+            budget_tokens: 8_192,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        materialized
+            .external
+            .iter()
+            .any(|entry| entry.item_id == hot_id),
+        "a hot-entity match far beyond the recency tail must surface through \
+         the entity index"
+    );
+}

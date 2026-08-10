@@ -108,12 +108,38 @@ pub(crate) fn materialize(
         }
     }
 
-    let mut candidates: Vec<(usize, ScoreBreakdown, usize)> = Vec::new();
-    for id in state
+    let mut candidate_ids = state
         .items
         .indexes()
-        .candidate_ids(&active_scopes, &state.hot_entities)
-    {
+        .candidate_ids(&active_scopes, &state.hot_entities);
+    // Substring residual: the candidate index matches entities *exactly*,
+    // but the scorer matches substrings (`hot.contains(entity) ||
+    // entity.contains(hot)`), so an item whose signature contains the hot
+    // entity as a substring (e.g. `src/auth/AuthService.rs` vs
+    // `AuthService.rs`) is not in the exact bucket and would never be
+    // scored. The heap is bounded by GC, so one residual pass keeps
+    // candidate generation and scoring on the same matching universe —
+    // the exact index answers the common case, this pass covers the
+    // overlap the index cannot express.
+    if !state.hot_entities.is_empty() {
+        let seen: HashSet<ContextItemId> = candidate_ids.iter().copied().collect();
+        for item in state.items.iter() {
+            if seen.contains(&item.id) {
+                continue;
+            }
+            let hot = item.entities.iter().any(|entity| {
+                state
+                    .hot_entities
+                    .iter()
+                    .any(|hot| hot.contains(entity) || entity.contains(hot))
+            });
+            if hot {
+                candidate_ids.push(item.id);
+            }
+        }
+    }
+    let mut candidates: Vec<(usize, ScoreBreakdown, usize)> = Vec::new();
+    for id in candidate_ids {
         let Some(index) = state.items.indexes().get(id) else {
             continue;
         };
@@ -133,22 +159,18 @@ pub(crate) fn materialize(
 
     // Deterministic candidate order: score descending, slot index as the
     // tie-break (the old unstable sort left equal-score order undefined).
-    // When the caller caps the working set, quickselect trims the candidate
-    // universe to that bound *before* sorting — the cap also bounds how
-    // many items can ever be selected, so trimming cannot change the
-    // outcome, and the sort cost drops from O(n log n) to O(n + k log k).
+    // The heap is bounded by GC, so sorting the whole candidate universe is
+    // O(heap log heap), not O(total history). The candidate list is *not*
+    // pre-trimmed to `max_selected_items`: fit packing runs after scoring,
+    // and an oversized top item that cannot fit must not hide a lower-ranked
+    // item that does fit — packing's own `selections.len() >= max` checks
+    // enforce the cap, so trimming here would only lose candidates.
     let by_score = |a: &(usize, ScoreBreakdown, usize), b: &(usize, ScoreBreakdown, usize)| {
         b.1.total
             .partial_cmp(&a.1.total)
             .unwrap_or(Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     };
-    if let Some(max) = query.hints.max_selected_items
-        && max < candidates.len()
-    {
-        candidates.select_nth_unstable_by(max, by_score);
-        candidates.truncate(max);
-    }
     candidates.sort_by(by_score);
 
     // The engine owns the focus frame and the selected items; the current
@@ -160,9 +182,16 @@ pub(crate) fn materialize(
         .unwrap_or_default();
     // A small slice of the budget is reserved for dependency expansion so
     // traceability items can follow the working set without letting the
-    // snapshot exceed the budget.
+    // snapshot exceed the budget. The reserve is only carved out when
+    // expansion can actually run — with expansion disabled the whole budget
+    // belongs to the working set, and reserving a slice that is never spent
+    // would shrink the frame for no reason.
     let total_budget = query.budget_tokens.saturating_sub(fixed_tokens);
-    let expansion_reserve = EXPANSION_RESERVE_TOKENS.min(total_budget);
+    let expansion_reserve = if config.dependency_expansion {
+        EXPANSION_RESERVE_TOKENS.min(total_budget)
+    } else {
+        0
+    };
     let mut remaining = total_budget - expansion_reserve;
     let mut selected_indices = Vec::new();
     let mut selections = Vec::new();
@@ -335,9 +364,13 @@ pub(crate) fn materialize(
         })
         .collect();
 
-    // The engine-side token share: focus frame + selected items. The system
-    // prompt, turn frame and tool schemas are the runtime's share and are
-    // charged by the model budget before this snapshot is requested.
+    // The engine-side token share: focus frame + selected items + the
+    // external refs surfaced in this snapshot. The system prompt, turn
+    // frame and tool schemas are the runtime's share and are charged by the
+    // model budget before this snapshot is requested. Refs are model-visible
+    // (uri + summary), so they are charged here with the same measure the
+    // selection walked — not free.
+    let external = external_view(state, &state.hot_entities);
     let approx_tokens_total = focus
         .as_ref()
         .map(|f| approx_tokens(&f.goal) + approx_tokens(&f.current_query))
@@ -345,7 +378,8 @@ pub(crate) fn materialize(
         + items
             .iter()
             .map(|item| approx_tokens(&item.content))
-            .sum::<usize>();
+            .sum::<usize>()
+        + external.iter().map(external_ref_tokens).sum::<usize>();
 
     MaterializedContext {
         materialization_id: 0,
@@ -357,7 +391,7 @@ pub(crate) fn materialize(
         // the run (10K/100K refs) and the prompt does not use it anyway.
         // The view prefers hot-entity matches, open loops, then recency —
         // the entries the model is most likely to deliberately pull.
-        external: external_view(state, &state.hot_entities),
+        external,
         selected: selections,
         approx_tokens: approx_tokens_total,
         diagnostics: diagnostics::compute(state),
@@ -369,32 +403,73 @@ pub(crate) fn materialize(
 /// keeps the producer within it.
 const MAX_EXTERNAL_REFS: usize = CONTEXT_MAP_VIEW_CAP;
 
-/// Build a small, deterministic slice of the external map: hot-entity
-/// matches and open loops first, then most-recently-accessed entries, up
-/// to `CONTEXT_MAP_VIEW_CAP`. Quickselect keeps this O(n) without cloning
-/// the whole map; the bounded `ContextMapView` enforces the cap at the
-/// type level.
+/// Token bound on the external refs surfaced in one materialized context.
+/// Refs are model-visible (uri + summary), so the item-count cap alone does
+/// not bound the prompt: 32 long summaries could still cost more than the
+/// frame allows. The ranked selection is walked in order and stops when the
+/// summaries would exceed this bound.
+const EXTERNAL_REF_TOKENS: usize = 512;
+
+/// Build a small, deterministic slice of the external map without walking
+/// the whole map: hot-entity matches come from the entity index (O(bucket)
+/// per hot entity), and the rest is the most-recently-externalized tail —
+/// the map stores entries in externalize order, so the tail is a bounded
+/// O(1) recency approximation (a `fetch`/`ack` stamps access but does not
+/// reorder, so exact global recency would need a second index; the tail
+/// keeps the hot path independent of total history). The union is ranked
+/// (hot-entity match, open loop, recency), capped to `CONTEXT_MAP_VIEW_CAP`
+/// refs and `EXTERNAL_REF_TOKENS` of summary tokens; the bounded
+/// `ContextMapView` enforces the cap at the type level.
 fn external_view(state: &State, hot_entities: &[String]) -> ContextMapView {
-    let mut ranked: Vec<&agent_contracts::ExternalizedContext> = state
-        .external
-        .iter()
-        .filter(|entry| crate::store::externally_retrievable(entry))
-        .collect();
-    let k = ranked.len().min(MAX_EXTERNAL_REFS);
-    if k == 0 {
+    let mut seen: HashSet<ContextItemId> = HashSet::new();
+    let mut ranked: Vec<&agent_contracts::ExternalizedContext> = Vec::new();
+    for hot in hot_entities {
+        for id in state.external.ids_for_entity(hot) {
+            if seen.insert(*id)
+                && let Some(entry) = state.external.get(*id)
+                && crate::store::externally_retrievable(entry)
+            {
+                ranked.push(entry);
+            }
+        }
+    }
+    let total = state.external.len();
+    let tail_start = total.saturating_sub(MAX_EXTERNAL_REFS);
+    for entry in &state.external[tail_start..] {
+        if seen.insert(entry.item_id) && crate::store::externally_retrievable(entry) {
+            ranked.push(entry);
+        }
+    }
+    if ranked.is_empty() {
         return ContextMapView::default();
     }
-    ranked.select_nth_unstable_by(k - 1, |a, b| {
-        external_view_key(b, hot_entities).cmp(&external_view_key(a, hot_entities))
-    });
-    ranked.truncate(k);
-    // Stable final order: rank, then item id as a deterministic tie-break.
+    // Small bounded set: sort directly (no quickselect needed), then apply
+    // the token cap in the same ranked order the model sees. A long summary
+    // costs prompt tokens, so the first-ranked refs win and the walk stops
+    // once the bound is exhausted.
     ranked.sort_by(|a, b| {
         external_view_key(b, hot_entities)
             .cmp(&external_view_key(a, hot_entities))
             .then_with(|| a.item_id.0.cmp(&b.item_id.0))
     });
-    ContextMapView::new(ranked.into_iter().cloned().collect())
+    let mut ref_tokens = 0usize;
+    let mut capped = Vec::with_capacity(ranked.len());
+    for entry in ranked {
+        let tokens = external_ref_tokens(entry);
+        if ref_tokens.saturating_add(tokens) > EXTERNAL_REF_TOKENS {
+            break;
+        }
+        ref_tokens += tokens;
+        capped.push(entry.clone());
+    }
+    ContextMapView::new(capped)
+}
+
+/// The model-visible token cost of one external ref: its uri plus its
+/// bounded summary. The materializer charges the same amount against the
+/// snapshot's `approx_tokens`, so the refs are no longer free.
+fn external_ref_tokens(entry: &agent_contracts::ExternalizedContext) -> usize {
+    approx_tokens(&entry.context_ref.uri) + approx_tokens(&entry.context_ref.summary)
 }
 
 /// (hot-entity match, open loop, recency) — higher sorts first. Open loops

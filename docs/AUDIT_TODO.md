@@ -754,16 +754,36 @@ CTX-06 closed.
 - actor trim, refusal, cancellation/stale output, journal failure, external
   descriptor, invalid-retry, replay and service-parity tests cover the path.
 
-Remaining CTX-07 work:
+**Budget and hot-path repair closed 2026-08-10.** The five remaining
+materializer subissues are closed:
 
-- dependency reserve is taken when expansion is disabled/impossible;
-- score top-K happens before fit packing, so an oversized top item can hide a
-  lower-ranked item that fits;
-- external preview has item cap but no token cap and is omitted from
-  `approx_tokens`; runtime trimming removes items, not refs;
-- exact indexes and substring entity matching disagree;
-- external preview and session/focus candidates remain O(total history),
-  despite documentation claiming constant cost.
+- **Dependency reserve** is only carved out when `dependency_expansion` is
+  enabled — with expansion disabled the whole budget belongs to the working
+  set instead of a reserve that is never spent. Regression:
+  `dependency_reserve_is_not_taken_when_expansion_is_disabled`.
+- **Top-K no longer precedes fit packing.** The candidate list is no longer
+  pre-trimmed to `max_selected_items` before the budget pack: an oversized
+  top item that cannot fit no longer hides a lower-ranked item that does
+  (packing's own cap checks enforce the bound). Regression:
+  `oversized_top_item_does_not_hide_a_lower_ranked_item_that_fits`.
+- **External refs are token-capped and charged.** The ranked ref walk stops
+  at a 512-token summary bound (uri + summary), and `approx_tokens` now
+  includes the refs' cost — refs are model-visible, not free. Regression:
+  `external_refs_are_token_capped_and_charged`.
+- **Candidate generation and scoring share one matching universe.** The
+  exact entity index cannot express a substring overlap
+  (`src/auth/AuthService.rs` vs a hot `AuthService.rs`), so the materializer
+  runs a bounded residual pass over the GC-bounded heap to bring such items
+  into the candidate set — the scorer's substring affinity can finally fire
+  for them. Regression: `substring_entity_match_reaches_the_candidate_universe`.
+- **The external ref view no longer walks the whole map.** Hot-entity
+  matches come from the entity index (O(bucket) per hot entity) and the
+  rest is the most-recently-externalized tail (the map stores in
+  externalize order, so the tail is a bounded O(1) recency approximation),
+  keeping the view independent of total history. Regression:
+  `external_view_surfaces_hot_matches_beyond_the_recency_tail`.
+
+CTX-07 closed.
 
 Add packing properties and candidate-count/materialize-p95 metrics. A finite
 runtime `max_selected_items` and ack cap are defense in depth, not a
