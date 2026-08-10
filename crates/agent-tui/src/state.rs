@@ -418,6 +418,16 @@ impl AppState {
                     ),
                 });
             }
+            RuntimeEvent::ToolScopeClosed {
+                scope_id,
+                transitions,
+            } => {
+                // A tool frame closed: show the lifecycle transitions the
+                // close produced (promotions out of the frame) in the same
+                // panel as every other transition.
+                self.push_system(format!("tool scope {scope_id} closed"));
+                self.record_transitions(transitions);
+            }
             RuntimeEvent::Diagnostics { diagnostics } => {
                 self.context = diagnostics.clone();
                 self.push_system(format!(

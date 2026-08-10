@@ -2009,7 +2009,33 @@ impl RuntimeActor {
             }
         }
         for scope_id in scope_ids {
-            let _ = self.kernel.context_close_scope(scope_id).await;
+            match self.kernel.context_close_scope(scope_id).await {
+                Ok(transitions) => {
+                    // The close is an auditable result: publish the
+                    // lifecycle transitions it produced (a tool frame's
+                    // durable outcomes promoted out of the frame). An empty
+                    // transition list is a no-op close — nothing to report.
+                    if !transitions.is_empty() {
+                        let _ = self
+                            .kernel
+                            .emit_event(RuntimeEvent::ToolScopeClosed {
+                                scope_id,
+                                transitions,
+                            })
+                            .await;
+                    }
+                }
+                Err(error) => {
+                    // A failed close must not be swallowed: surface it so
+                    // the audit trail explains why the frame stayed open.
+                    let _ = self
+                        .kernel
+                        .emit_event(RuntimeEvent::Error {
+                            message: format!("closing tool scope {scope_id} failed: {error}"),
+                        })
+                        .await;
+                }
+            }
         }
     }
 

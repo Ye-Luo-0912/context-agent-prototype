@@ -704,8 +704,21 @@ session once task and focus are closed. Regression:
 four-level session/task/focus/tool tree: every scope closes and the tool
 frame's Durable decision is promoted, labeled and observable).
 
-Remaining CTX-06 work: tool-scope close error publishing, and task-summary
-focus identity.
+**Tool-scope close error publishing closed 2026-08-10.** The runtime's
+`close_tool_frames` discarded both the close error and the returned
+transitions (`let _ = context_close_scope(...)`), so a failed tool-frame
+close was silent and the promotions it produced were never observable. The
+close is now an auditable result: a successful close publishes a
+`ToolScopeClosed` event carrying the transitions (durable outcomes promoted
+out of the frame); a failed close publishes an `Error` naming the scope and
+the failure. The TUI renders the transitions in the same lifecycle panel as
+every other transition. Regressions:
+`tool_scope_close_publishes_its_transitions` (the event carries the
+transitions the engine returned and the closed scope id matches) and
+`tool_scope_close_failure_is_published_as_an_error` (a failing close
+surfaces an `Error` naming the close instead of being swallowed).
+
+Remaining CTX-06 work: task-summary focus identity.
 
 ### CTX-07 — Materializer budget and hot-path correctness
 

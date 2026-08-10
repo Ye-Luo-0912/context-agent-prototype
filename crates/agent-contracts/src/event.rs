@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentResult, ContextConsumptionAck, ContextDiagnostics, ContextGcReport,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextSelection, OperationId, RunId,
-    TaskId, ToolCall, ToolOutput, ToolSurfacePlanReport, ToolSurfaceRequirement, TurnId,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextSelection, ContextStateTransition,
+    OperationId, RunId, ScopeId, TaskId, ToolCall, ToolOutput, ToolSurfacePlanReport,
+    ToolSurfaceRequirement, TurnId,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +98,15 @@ pub enum RuntimeEvent {
     },
     ToolFinished {
         output: ToolOutput,
+    },
+    /// A tool frame closed: the runtime published the lifecycle transitions
+    /// the close produced (durable outcomes promoted out of the tool frame),
+    /// so a tool scope close is an auditable result instead of a silent
+    /// discard. A failed close is reported as an `Error` event instead.
+    ToolScopeClosed {
+        scope_id: ScopeId,
+        #[serde(default)]
+        transitions: Vec<ContextStateTransition>,
     },
     Diagnostics {
         diagnostics: ContextDiagnostics,

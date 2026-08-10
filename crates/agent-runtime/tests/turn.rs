@@ -11,12 +11,13 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentError, AgentResult, Capability, CapabilityInvocationContext, CapabilityLifecycle,
-    CapabilityManifest, CapabilityOutcome, CapabilityStatus, CapabilityTransport,
-    ContextDiagnostics, ContextEngine, ContextIngress, ContextItemId, ContextItemSummary,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
-    Effect, EffectCommitError, MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink,
-    ModelMessage, ModelOutput, ModelRequest, ModelRole, ModelTransport, OperationId, RuntimeEvent,
+    AgentError, AgentResult, AttentionState, Capability, CapabilityInvocationContext,
+    CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
+    CapabilityTransport, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemId,
+    ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
+    ContextQuery, ContextScope, ContextStateTransition, Effect, EffectCommitError,
+    MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage, ModelOutput,
+    ModelRequest, ModelRole, ModelTransport, OperationId, RuntimeEvent, RuntimeEventEnvelope,
     ScopeId, ScopeKind, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome,
     ToolOutput, ToolRisk, ToolSpec,
 };
@@ -637,6 +638,206 @@ async fn tool_scope_opens_at_tool_start_and_closes_when_consumed() {
         observation_scopes.as_slice(),
         &[Some(tool_scope)],
         "the tool observation must carry its producing scope"
+    );
+}
+
+/// A context engine that records the scopes the actor closes and returns a
+/// fixed promotion transition from `close_scope`, so the test can assert
+/// that the runtime publishes the close as an auditable event instead of
+/// discarding it.
+#[derive(Debug, Default)]
+struct PublishingScopeEngine {
+    closes: Arc<Mutex<Vec<ScopeId>>>,
+}
+
+#[async_trait::async_trait]
+impl ContextEngine for PublishingScopeEngine {
+    async fn ingest(&self, _ingress: ContextIngress) -> AgentResult<()> {
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            materialization_id: 0,
+            focus: None,
+            items: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
+            selected: Vec::new(),
+            approx_tokens: 0,
+            diagnostics: ContextDiagnostics::default(),
+        })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        self.closes.lock().await.push(scope_id);
+        Ok(vec![ContextStateTransition {
+            item_id: ContextItemId::new(),
+            kind: ContextKind::Note,
+            scope: ContextScope::Turn,
+            from: AttentionState::Archived,
+            to: AttentionState::Active,
+            turn: 0,
+            reason: "promoted by tool scope close".into(),
+        }])
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+}
+
+/// A context engine whose `close_scope` always fails, so the test can assert
+/// that a failed tool-frame close is surfaced as an `Error` event instead of
+/// being swallowed by `let _ =`.
+#[derive(Debug, Default)]
+struct FailingCloseScopeEngine;
+
+#[async_trait::async_trait]
+impl ContextEngine for FailingCloseScopeEngine {
+    async fn ingest(&self, _ingress: ContextIngress) -> AgentResult<()> {
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            materialization_id: 0,
+            focus: None,
+            items: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
+            selected: Vec::new(),
+            approx_tokens: 0,
+            diagnostics: ContextDiagnostics::default(),
+        })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Err(AgentError::Context("simulated close failure".into()))
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+}
+
+/// Wait for the turn to complete (two model rounds, one tool call),
+/// collecting every event seen on the way so the caller can assert on
+/// events that precede `TurnCompleted` (a broadcast receiver drops events
+/// once they are consumed, so a separate post-completion read would miss
+/// them).
+async fn wait_for_turn_completion(
+    events: &mut tokio::sync::broadcast::Receiver<RuntimeEventEnvelope>,
+) -> Vec<RuntimeEvent> {
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let mut done = false;
+        while let Ok(envelope) = events.try_recv() {
+            done |= matches!(envelope.event, RuntimeEvent::TurnCompleted);
+            seen.push(envelope.event);
+        }
+        if done {
+            return seen;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the turn did not complete in time"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The tool-frame close is published as an auditable result: the runtime
+/// emits `ToolScopeClosed` with the transitions the close produced instead
+/// of discarding them.
+#[tokio::test]
+async fn tool_scope_close_publishes_its_transitions() {
+    let context = Arc::new(PublishingScopeEngine::default());
+    let handle = spawn_with(
+        Arc::new(TwoRoundToolModel::default()) as Arc<dyn ModelTransport>,
+        context.clone() as Arc<dyn ContextEngine>,
+        Arc::new(OkToolDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("go".into()).await.unwrap();
+    let seen = wait_for_turn_completion(&mut events).await;
+
+    let (scope_id, transitions) = seen
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::ToolScopeClosed {
+                scope_id,
+                transitions,
+            } => Some((*scope_id, transitions)),
+            _ => None,
+        })
+        .expect("a ToolScopeClosed event must be published");
+    assert!(
+        !transitions.is_empty(),
+        "the transitions produced by the close must ride the event"
+    );
+    let closes = context.closes.lock().await;
+    assert_eq!(
+        closes.as_slice(),
+        &[scope_id],
+        "the closed scope id must match the scope the engine actually closed"
+    );
+}
+
+/// A failed tool-frame close is surfaced as an `Error` event instead of
+/// being silently discarded.
+#[tokio::test]
+async fn tool_scope_close_failure_is_published_as_an_error() {
+    let handle = spawn_with(
+        Arc::new(TwoRoundToolModel::default()) as Arc<dyn ModelTransport>,
+        Arc::new(FailingCloseScopeEngine),
+        Arc::new(OkToolDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("go".into()).await.unwrap();
+    let seen = wait_for_turn_completion(&mut events).await;
+
+    let error = seen
+        .iter()
+        .find_map(|event| match event {
+            RuntimeEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("a failed tool-frame close must publish an Error event");
+    assert!(
+        error.contains("closing tool scope"),
+        "the error must name the failing close, got: {error}"
     );
 }
 
