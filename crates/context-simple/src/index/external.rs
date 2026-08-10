@@ -211,6 +211,7 @@ mod tests {
         ExternalizedContext {
             item_id: id,
             task_id: None,
+            scope_id: None,
             kind: ContextKind::Note,
             scope: ContextScope::Task,
             retention: ContextRetention::Working,

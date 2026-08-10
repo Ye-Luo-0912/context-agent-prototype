@@ -669,13 +669,31 @@ promoted item re-enters the heap: promotion means resident, not just
 re-stamped. Regression:
 `warm_buffer_durable_outcome_is_promoted_on_scope_close` (a Durable
 decision in the buffer is promoted to the task scope, labeled, and becomes
-resident again when the focus episode closes). External entries (Cold/
-External) still cannot be promoted — they carry `task_id` but no `scope_id`,
-so scope membership there needs a new signal; that is a separate slice.
+resident again when the focus episode closes).
 
-Remaining CTX-06 work: Cold/External scope-close promotion signal,
-task-close descendant handling, tool-scope close error publishing, and
-task-summary focus identity.
+**External scope-close promotion signal closed 2026-08-10.** External
+entries (Cold/External) previously carried only `task_id`, so a scope close
+could not tell whether a stored entry belonged to the closing scope — a
+durable outcome that had already left the engine lost its membership
+promotion and kept pointing at the closed scope. `ExternalizedContext` now
+captures the `scope_id` stamp at externalize time (legacy entries restore
+with `None` and fall back to task-id matching, which is the safe
+approximation for the whole task line), and the scope-close pass promotes
+stored entries exactly like resident and warm bodies: scope/scope_id
+re-stamp to the nearest open ancestor, retention upgrades to durable, the
+move is labeled, and attention moves to Active like a resident promotion —
+with the same no-op guard (already a member of the promotion target) and
+the same terminal-semantics exclusion. The promotion re-stamps the
+identity; the content stays in the store. Regression:
+`external_durable_outcome_is_promoted_on_scope_close` (a stored Durable
+decision promotes to the task scope on focus close and to the session on
+task close, while a Working body and another task's entry stay untouched).
+The membership walk now uses the scope tree's O(1) id index instead of a
+linear scan, so the close pass stays O(items) even when the tree holds many
+closed scopes.
+
+Remaining CTX-06 work: task-close descendant handling, tool-scope close
+error publishing, and task-summary focus identity.
 
 ### CTX-07 — Materializer budget and hot-path correctness
 

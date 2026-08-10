@@ -10,10 +10,17 @@ use crate::gc::reachability::is_excluded;
 /// durable outcomes of the scope. Everything else in a closed scope is
 /// released.
 fn should_promote(item: &ContextItem) -> bool {
+    retention_or_tag_promotable(item.retention, &item.tags)
+}
+
+/// The durable-outcome test shared by resident items and external entries
+/// (both carry `retention` and `tags`; the external body lives in the store
+/// but its membership identity is promoted the same way).
+fn retention_or_tag_promotable(retention: ContextRetention, tags: &[Label]) -> bool {
     matches!(
-        item.retention,
+        retention,
         ContextRetention::Pinned | ContextRetention::Durable
-    ) || item.tags.iter().any(|tag| tag.is_promotable())
+    ) || tags.iter().any(|tag| tag.is_promotable())
 }
 
 /// Lazily open the single session scope of the run. Every run has exactly
@@ -287,19 +294,12 @@ fn close_members(
                 ScopeKind::Task | ScopeKind::Focus => ContextScope::Task,
                 ScopeKind::Tool => ContextScope::Turn,
             });
-    // A precomputed view of the tree so membership can be checked while
-    // items are mutated.
-    let scope_index: Vec<(ScopeId, ScopeKind, Option<ScopeId>)> = state
-        .scopes
-        .iter()
-        .map(|scope| (scope.id, scope.kind, scope.parent))
-        .collect();
     // Promotions re-stamp `scope_id`; the matching index moves are queued
     // here and applied after the heap loop (the loop holds `state.items`
     // mutably, so the index cannot be touched inside it).
     let mut scope_updates: Vec<(ContextItemId, Option<ScopeId>, Option<ScopeId>)> = Vec::new();
     for item in &mut state.items {
-        if !belongs_to(&scope_index, item, scope) {
+        if !belongs_to(&state.scopes, item, scope) {
             continue;
         }
         // Terminal semantic death always wins: a semantically dead item
@@ -361,7 +361,7 @@ fn close_members(
         index -= 1;
         let promote_this = {
             let item = &state.eviction_buffer[index];
-            belongs_to(&scope_index, item, scope)
+            belongs_to(&state.scopes, item, scope)
                 && item.semantic.is_live()
                 && !is_excluded(item)
                 && should_promote(item)
@@ -380,6 +380,52 @@ fn close_members(
             state.items.push(item);
         }
     }
+
+    // External entries of the closing scope get the same membership
+    // promotion as resident and warm bodies. Their content lives in the
+    // store, so there is nothing to re-enter — the promotion re-stamps the
+    // *identity*: scope/scope_id point at the nearest open ancestor,
+    // retention upgrades to durable, the move is labeled, and attention
+    // moves to Active exactly like a resident promotion (recall always
+    // re-enters the working set anyway, so this never misleads the
+    // materializer). Legacy entries without a scope stamp fall back to the
+    // task id. Non-durable bodies stay where they are; terminal semantics
+    // never resurrect, even as identity.
+    for entry in &mut state.external {
+        if !belongs_to_external(&state.scopes, entry, scope) {
+            continue;
+        }
+        if !entry.semantic.is_live() || !retention_or_tag_promotable(entry.retention, &entry.tags)
+        {
+            continue;
+        }
+        // Same no-op guard as the resident promote: already a member of
+        // the promotion target means the entry was promoted by an earlier
+        // close (or was created there) — do not re-stamp or double-label.
+        if entry.scope_id.is_some_and(|sid| Some(sid) == parent_id) {
+            continue;
+        }
+        let from = entry.attention;
+        entry.scope = parent_scope;
+        entry.scope_id = parent_id;
+        entry.retention = ContextRetention::Durable;
+        entry.tags.push(Label::lifecycle(LifecycleLabel::Promoted));
+        if entry.attention != AttentionState::Active {
+            entry.attention = AttentionState::Active;
+            transitions.push(ContextStateTransition {
+                item_id: entry.item_id,
+                kind: entry.kind,
+                scope: entry.scope,
+                from,
+                to: AttentionState::Active,
+                turn,
+                reason: format!(
+                    "external entry promoted by {} scope close",
+                    kind_name(scope.kind)
+                ),
+            });
+        }
+    }
     transitions
 }
 
@@ -390,13 +436,28 @@ fn close_members(
 /// error verification, not scope close. Items without a `scope_id` (restored
 /// old checkpoints) fall back to the pre-scope inference.
 fn belongs_to(
-    scopes: &[(ScopeId, ScopeKind, Option<ScopeId>)],
+    scopes: &crate::scope_tree::ScopeTree,
     item: &ContextItem,
     scope: &Scope,
 ) -> bool {
     let Some(item_scope_id) = item.scope_id else {
         return legacy_belongs_to(item, scope);
     };
+    scope_id_in_subtree(scopes, item_scope_id, scope)
+}
+
+/// Whether `item_scope_id` is `scope.id` itself or a descendant of it in
+/// the scope tree. Tool frames stop the walk: an item inside a tool frame
+/// does not belong to the enclosing task/focus scope, exactly like the heap
+/// rule. `ScopeTree::by_id` is an O(1) index lookup, so membership checks
+/// stay O(depth) even when the tree accumulates many closed scopes — the
+/// close pass visits every member of a large scope, and a linear scan would
+/// turn that into a quadratic hot path.
+fn scope_id_in_subtree(
+    scopes: &crate::scope_tree::ScopeTree,
+    item_scope_id: ScopeId,
+    scope: &Scope,
+) -> bool {
     if scope.kind == ScopeKind::Tool {
         return item_scope_id == scope.id;
     }
@@ -405,15 +466,33 @@ fn belongs_to(
         if sid == scope.id {
             return true;
         }
-        let Some((_, kind, parent)) = scopes.iter().find(|(id, ..)| *id == sid) else {
+        let Some(found) = scopes.by_id(sid) else {
             return false;
         };
-        if *kind == ScopeKind::Tool {
+        if found.kind == ScopeKind::Tool {
             return false;
         }
-        current = *parent;
+        current = found.parent;
     }
     false
+}
+
+/// External entries carry the same membership stamp as resident items. When
+/// the stamp exists the scope subtree decides; legacy entries that predate
+/// it fall back to the task id — a task or focus close promotes the whole
+/// task line, so matching the task is the safe approximation (tool scopes
+/// never match by task: a tool frame is not a task container).
+fn belongs_to_external(
+    scopes: &crate::scope_tree::ScopeTree,
+    entry: &agent_contracts::ExternalizedContext,
+    scope: &Scope,
+) -> bool {
+    let Some(item_scope_id) = entry.scope_id else {
+        return scope.kind != ScopeKind::Tool
+            && scope.task_id.is_some()
+            && scope.task_id == entry.task_id;
+    };
+    scope_id_in_subtree(scopes, item_scope_id, scope)
 }
 
 /// The pre-`scope_id` membership rule, kept for items without a scope stamp.

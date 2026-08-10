@@ -4564,3 +4564,211 @@ async fn warm_buffer_durable_outcome_is_promoted_on_scope_close() {
         "the promotion must be labeled"
     );
 }
+
+/// A durable outcome already externalized to the context store is promoted
+/// by the same scope-close pass as resident and warm bodies: the membership
+/// identity re-stamps to the nearest open ancestor (focus close -> task
+/// scope, task close -> session), retention upgrades, the move is labeled
+/// and attention moves to Active exactly like a resident promotion. Working
+/// bodies and semantically dead entries stay where they are; legacy entries
+/// without a scope stamp fall back to the task id.
+#[tokio::test]
+async fn external_durable_outcome_is_promoted_on_scope_close() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let (session_id, task_scope_id, focus_scope_id, durable_id, legacy_id, working_id, other_id) =
+        {
+        let mut state = engine.state.lock().await;
+        let session_id = crate::scope::ensure_session(&mut state);
+        let task_id = TaskId::new();
+        let task_scope_id = state.scopes.push(agent_contracts::Scope {
+            id: ScopeId::new(),
+            parent: Some(session_id),
+            kind: ScopeKind::Task,
+            state: ScopeState::Active,
+            task_id: Some(task_id),
+            goal: None,
+            opened_tick: 1,
+            last_active_tick: 1,
+            closed_tick: None,
+        });
+        let focus_scope_id = state.scopes.push(agent_contracts::Scope {
+            id: ScopeId::new(),
+            parent: Some(task_scope_id),
+            kind: ScopeKind::Focus,
+            state: ScopeState::Active,
+            task_id: Some(task_id),
+            goal: None,
+            opened_tick: 2,
+            last_active_tick: 2,
+            closed_tick: None,
+        });
+        let reference = |id: ContextItemId| agent_contracts::ContextRef {
+            uri: format!("context://run/{id}"),
+            item_id: id,
+            kind: ContextKind::Decision,
+            scope: ContextScope::Task,
+            summary: "stored".into(),
+            created_tick: 0,
+        };
+
+        let mut durable = crate::item::make_item(
+            &state,
+            &engine.config,
+            "stored durable decision".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.9,
+            None,
+        );
+        durable.task_id = Some(task_id);
+        durable.scope_id = Some(focus_scope_id);
+        durable.attention = AttentionState::Archived;
+        let durable_id = durable.id;
+        state
+            .external
+            .push(crate::store::to_external_entry(&durable, reference(durable.id), 1, 1, None));
+
+        // Working body of the same focus: durable-outcome promotion must
+        // leave it alone — it is not a durable outcome of the scope.
+        let mut working = crate::item::make_item(
+            &state,
+            &engine.config,
+            "stored working note".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.4,
+            None,
+        );
+        working.task_id = Some(task_id);
+        working.scope_id = Some(focus_scope_id);
+        working.attention = AttentionState::Archived;
+        let working_id = working.id;
+        state
+            .external
+            .push(crate::store::to_external_entry(&working, reference(working.id), 1, 1, None));
+
+        // Legacy entry that predates the scope stamp: the task id decides.
+        let mut legacy = crate::item::make_item(
+            &state,
+            &engine.config,
+            "legacy stored decision".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.8,
+            None,
+        );
+        legacy.task_id = Some(task_id);
+        legacy.scope_id = None;
+        legacy.attention = AttentionState::Archived;
+        let legacy_id = legacy.id;
+        state
+            .external
+            .push(crate::store::to_external_entry(&legacy, reference(legacy.id), 1, 1, None));
+
+        // Durable entry of a *different* task: no task match, so neither
+        // close may touch it.
+        let mut other = crate::item::make_item(
+            &state,
+            &engine.config,
+            "other task decision".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.8,
+            None,
+        );
+        other.task_id = Some(TaskId::new());
+        other.scope_id = None;
+        other.attention = AttentionState::Archived;
+        let other_id = other.id;
+        state
+            .external
+            .push(crate::store::to_external_entry(&other, reference(other.id), 1, 1, None));
+
+        (session_id, task_scope_id, focus_scope_id, durable_id, legacy_id, working_id, other_id)
+    };
+
+    // Focus close: durable and legacy promote to the task scope; the
+    // working body and the other-task entry stay untouched.
+    let transitions = engine.close_scope(focus_scope_id).await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        let durable = state.external.get(durable_id).unwrap();
+        assert_eq!(
+            durable.scope_id,
+            Some(task_scope_id),
+            "a stored durable outcome must promote to the task scope on focus close"
+        );
+        assert_eq!(durable.scope, ContextScope::Task);
+        assert_eq!(
+            durable.attention,
+            AttentionState::Active,
+            "external promotion must move attention to Active like a resident promotion"
+        );
+        assert!(
+            durable
+                .tags
+                .iter()
+                .any(|tag| tag.is_lifecycle(LifecycleLabel::Promoted)),
+            "the external promotion must be labeled"
+        );
+        let legacy = state.external.get(legacy_id).unwrap();
+        assert_eq!(
+            legacy.scope_id,
+            Some(task_scope_id),
+            "a legacy entry without a scope stamp must promote by task id"
+        );
+        assert_eq!(
+            state.external.get(working_id).unwrap().scope_id,
+            Some(focus_scope_id),
+            "a working body is not a durable outcome and must not be promoted"
+        );
+        assert_eq!(
+            state.external.get(other_id).unwrap().scope_id,
+            None,
+            "an entry of another task must not be promoted by this close"
+        );
+    }
+    assert!(
+        transitions.iter().any(|t| {
+            t.item_id == durable_id && t.from == AttentionState::Archived && t.to == AttentionState::Active
+        }),
+        "the durable external promotion must be observable as a transition"
+    );
+    assert!(
+        transitions.iter().any(|t| t.item_id == legacy_id),
+        "the legacy external promotion must be observable as a transition"
+    );
+
+    // Task close: the same entries promote once more, to the session scope;
+    // the working body still stays behind in the closed focus.
+    let transitions = engine.close_scope(task_scope_id).await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        let durable = state.external.get(durable_id).unwrap();
+        assert_eq!(
+            durable.scope_id,
+            Some(session_id),
+            "a stored durable outcome must promote to the session scope on task close"
+        );
+        assert_eq!(durable.scope, ContextScope::Session);
+        let legacy = state.external.get(legacy_id).unwrap();
+        assert_eq!(legacy.scope_id, Some(session_id));
+        assert_eq!(
+            state.external.get(working_id).unwrap().scope_id,
+            Some(focus_scope_id),
+            "the working body must still point at the closed focus"
+        );
+        assert_eq!(state.external.get(other_id).unwrap().scope_id, None);
+    }
+    assert!(
+        transitions
+            .iter()
+            .all(|t| t.item_id != durable_id),
+        "an already-active external entry must not emit a second transition \
+         (promotion records attention changes, like the resident pass)"
+    );
+}

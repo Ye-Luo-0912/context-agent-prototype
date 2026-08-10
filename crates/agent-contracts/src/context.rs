@@ -774,6 +774,14 @@ pub struct ExternalizedContext {
     /// deterministic retrieval can filter by task without reading the file.
     #[serde(default)]
     pub task_id: Option<TaskId>,
+    /// Scope the item belonged to when it was externalized. Kept so a
+    /// scope close can re-stamp the membership of external entries exactly
+    /// like resident and warm bodies — the scope-close promotion must not
+    /// lose items whose content already left the engine. `None` for
+    /// entries externalized before the stamp existed (or by runtimes that
+    /// do not use scopes); task closes fall back to `task_id`.
+    #[serde(default)]
+    pub scope_id: Option<ScopeId>,
     pub kind: ContextKind,
     pub scope: ContextScope,
     pub retention: ContextRetention,
@@ -1136,6 +1144,7 @@ mod tests {
         ExternalizedContext {
             item_id: ContextItemId::new(),
             task_id: None,
+            scope_id: None,
             kind: ContextKind::Note,
             scope: ContextScope::Task,
             retention: ContextRetention::Working,

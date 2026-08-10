@@ -74,6 +74,16 @@ pub(crate) fn validate(state: &State) -> AgentResult<()> {
             )));
         }
     }
+    for entry in state.external.iter() {
+        if let Some(scope_id) = entry.scope_id
+            && state.scopes.by_id(scope_id).is_none()
+        {
+            return Err(violation(format!(
+                "external entry {} references missing scope {scope_id}",
+                entry.item_id
+            )));
+        }
+    }
     Ok(())
 }
 

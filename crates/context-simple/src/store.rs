@@ -222,6 +222,7 @@ pub(crate) fn to_external_entry(
     ExternalizedContext {
         item_id: item.id,
         task_id: item.task_id,
+        scope_id: item.scope_id,
         kind: item.kind,
         scope: item.scope,
         retention: item.retention,

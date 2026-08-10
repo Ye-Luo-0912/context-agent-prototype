@@ -828,9 +828,13 @@ and records its own access.
 
 Cold recall pre-filters in memory instead of reading the disk:
 `ExternalizedContext` keeps the item's entity signature (`entities`),
-`tags`, `dependencies` and `task_id`, so with thousands of Cold entries
-only the entity-matching ids are read in the IO phase (10 K refs -> a few
-reads), never the reverse.
+`tags`, `dependencies`, `task_id` and the scope stamp (`scope_id`), so with
+thousands of Cold entries only the entity-matching ids are read in the IO
+phase (10 K refs -> a few reads), never the reverse. The `scope_id` stamp
+is captured at externalize time so a scope close can re-stamp stored
+entries' membership exactly like resident and warm bodies; entries
+externalized before the stamp existed restore with `None` and fall back to
+task-id matching on task/focus closes.
 
 External TTLs count *generations*, not ticks. `State::gc_epoch`
 increments only on a full GC pass; `ExternalizedContext::last_access_gc_epoch`
