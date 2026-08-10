@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use agent_contracts::{
     AgentError, AttentionState, ContextAction, ContextConsumptionAck, ContextEngine, ContextHints,
     ContextIngress, ContextItem, ContextItemId, ContextKind, ContextMaintenanceTrigger,
@@ -4213,4 +4215,75 @@ async fn reconcile_store_converges_a_crash_injected_directory() {
         search.iter().all(|e| e.item_id != resident_id),
         "the reclaimed id is not duplicated in the map"
     );
+}
+
+/// The operation gate serializes the multi-phase/whole-state operations.
+/// While the gate is held — exactly as when a sibling operation is
+/// mid-flight between its plan and its commit — a GC, storage GC, store
+/// reconcile, checkpoint or restore must block. Releasing the gate lets
+/// every one of them run to completion. Without the gate a restore could
+/// replace the whole state between a GC's plan and its commit, and the
+/// stale plan would land on top of the restored state.
+#[tokio::test]
+async fn multi_phase_operations_are_serialized_by_the_operation_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    }));
+    let empty_checkpoint = engine.checkpoint().await.unwrap();
+
+    // Hold the gate from the test task: every multi-phase/whole-state
+    // operation must wait for it, exactly as it would wait for a sibling
+    // operation currently mid-flight.
+    let _gate = engine.op_gate.lock().await;
+
+    let gc = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move { engine.gc().await })
+    };
+    let storage_gc = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move { engine.storage_gc().await })
+    };
+    let reconcile = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move { engine.reconcile_store().await })
+    };
+    let checkpoint = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move { engine.checkpoint().await })
+    };
+    let restore = {
+        let engine = Arc::clone(&engine);
+        let checkpoint = empty_checkpoint.clone();
+        tokio::spawn(async move { engine.restore(checkpoint).await })
+    };
+
+    // None of the five may complete while the gate is held.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!gc.is_finished(), "gc must wait for the operation gate");
+    assert!(
+        !storage_gc.is_finished(),
+        "storage gc must wait for the operation gate"
+    );
+    assert!(
+        !reconcile.is_finished(),
+        "store reconcile must wait for the operation gate"
+    );
+    assert!(
+        !checkpoint.is_finished(),
+        "checkpoint must wait for the operation gate"
+    );
+    assert!(
+        !restore.is_finished(),
+        "restore must wait for the operation gate"
+    );
+
+    drop(_gate);
+    gc.await.unwrap().unwrap();
+    storage_gc.await.unwrap().unwrap();
+    reconcile.await.unwrap().unwrap();
+    checkpoint.await.unwrap().unwrap();
+    restore.await.unwrap().unwrap();
 }

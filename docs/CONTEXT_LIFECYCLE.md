@@ -850,6 +850,14 @@ map, recalled items re-enter the heap, failed writes return to the front
 of the buffer so overflow retries next pass). The tail latency of a
 growing store stops being synchronous with the state lock.
 
+Because the state lock is released between the phases, the multi-phase
+operations (GC, storage GC, store reconcile, checkpoint, restore) are
+serialized by an engine-level operation gate: a plan computed against one
+state can never be committed against a state a concurrent restore or
+storage GC replaced in between. Single-phase operations (ingest, maintain,
+materialize, ...) remain atomic under the state lock alone and never take
+the gate — lock order is always gate, then state.
+
 Storage GC is the only place information is permanently deleted, and it is
 now a *strong-edge reachability closure* rather than a single
 incoming-edge check. The dependency graph is typed, and the closure

@@ -241,6 +241,15 @@ pub(crate) struct State {
 pub struct SimpleContextEngine {
     pub(crate) config: SimpleContextConfig,
     pub(crate) state: Mutex<State>,
+    /// Serializes the multi-phase and whole-state operations. GC, storage
+    /// GC, store reconcile, checkpoint and restore each span several state
+    /// lock acquisitions (deliberately releasing the state lock across disk
+    /// IO); the gate keeps them from interleaving, so a plan computed
+    /// against one state can never be committed against a state another
+    /// operation replaced in between. Single-phase operations (ingest,
+    /// maintain, materialize, ...) are atomic under the state lock alone
+    /// and never take the gate — lock order is always gate, then state.
+    pub(crate) op_gate: Mutex<()>,
 }
 
 impl SimpleContextEngine {
@@ -248,6 +257,7 @@ impl SimpleContextEngine {
         Self {
             config,
             state: Mutex::new(State::default()),
+            op_gate: Mutex::new(()),
         }
     }
 }
@@ -605,6 +615,11 @@ impl ContextEngine for SimpleContextEngine {
     }
 
     async fn gc(&self) -> AgentResult<ContextGcReport> {
+        // Serialize against the other multi-phase/whole-state operations:
+        // the plan computed below must commit against the same state it was
+        // planned against, never one a concurrent restore/storage-GC
+        // replaced in the meantime.
+        let _gate = self.op_gate.lock().await;
         // Four phases so the state lock is not held across disk IO:
         // 1. plan under the lock (mark/sweep/reactivate/age — in memory);
         // 2. store writes and recall reads without the lock;
@@ -643,6 +658,10 @@ impl ContextEngine for SimpleContextEngine {
         // checksums and the resident ids under the lock, scan + classify
         // the directory without it, then re-own rebuilt blobs under a
         // fresh lock (re-checking that nothing claimed the id meanwhile).
+        // The gate keeps this three-phase operation from interleaving with
+        // GC/storage-GC/checkpoint/restore, so the re-ownership commit
+        // always runs against the state the plan was derived from.
+        let _gate = self.op_gate.lock().await;
         let (map_checksums, resident_ids) = {
             let mut state = self.state.lock().await;
             state.tick += 1;
@@ -839,11 +858,18 @@ impl ContextEngine for SimpleContextEngine {
     }
 
     async fn checkpoint(&self) -> AgentResult<Value> {
+        // Serialized with the multi-phase operations so a checkpoint never
+        // captures a state torn across a GC/storage-GC commit boundary.
+        let _gate = self.op_gate.lock().await;
         let state = self.state.lock().await;
         checkpoint::serialize(&state)
     }
 
     async fn restore(&self, data: Value) -> AgentResult<()> {
+        // Whole-state replacement must not interleave with a multi-phase
+        // plan: a GC plan computed before the restore would otherwise
+        // commit stale transitions against the restored state.
+        let _gate = self.op_gate.lock().await;
         let mut state = self.state.lock().await;
         *state = checkpoint::deserialize(data)?;
         // Old checkpoints predate the entity signature cache; backfill it
@@ -887,7 +913,10 @@ impl ContextEngine for SimpleContextEngine {
 
     async fn storage_gc(&self) -> AgentResult<agent_contracts::StorageGcReport> {
         // Plan under the lock, delete outside it, commit under a fresh
-        // lock — the state lock is never held across disk IO.
+        // lock — the state lock is never held across disk IO. The gate
+        // serializes this with GC/reconcile/checkpoint/restore so the
+        // commit always sees the state the plan was derived from.
+        let _gate = self.op_gate.lock().await;
         let plan = {
             let mut state = self.state.lock().await;
             state.tick += 1;

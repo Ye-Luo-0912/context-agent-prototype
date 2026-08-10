@@ -605,6 +605,29 @@ by the sticky-error path but not exercised with a real full volume.
 First safe step: serialize GC/storage-GC/checkpoint/restore and validate all
 layers. Longer term use `context_revision + base_revision` CAS.
 
+**First safe step (serialization) closed 2026-08-10.** The engine now owns an
+operation gate that serializes the multi-phase/whole-state operations — GC,
+storage GC, store reconcile, checkpoint and restore. Each of those spans
+several state-lock acquisitions (the state lock is deliberately released
+across disk IO), so without the gate a plan computed against one state could
+be committed against a state a concurrent restore/storage-GC replaced in
+between. The gate is acquired before the state lock in every gated operation
+(consistent lock order, no deadlock), and single-phase operations (ingest,
+maintain, materialize, acknowledge, scope/search/fetch/inspect) are untouched
+— they stay atomic under the state lock alone and never take the gate.
+Observability is unchanged: the operations' existing bounded events
+(`ContextGc`, the storage-GC wire report) remain the runtime surface;
+serialization itself is a structural guarantee, proven by
+`multi_phase_operations_are_serialized_by_the_operation_gate` (each of the
+five operations blocks while the gate is held and completes after release —
+a regression that fails the moment any gated operation stops waiting).
+
+Remaining CTX-06 work: restore layer validation (duplicate ids, scope
+ancestry, body location, store files), the mark/sweep/reactivation universe
+disagreement, external-only GC skipping, scope-close promotion for non-
+resident bodies, task-close descendant handling, tool-scope close error
+publishing, and task-summary focus identity.
+
 ### CTX-07 — Materializer budget and hot-path correctness
 
 **Partially repaired 2026-08-10.** The false-consumption subissue is closed:
