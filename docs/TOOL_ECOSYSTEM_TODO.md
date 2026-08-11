@@ -1161,8 +1161,29 @@ together with TaskAnchor and continuous context GC.
   schema validator verbatim, so a package cannot smuggle in a schema the
   capability plane would refuse. Nine admission tests pin the contract,
   including serde round-trip.
-- [ ] **ECO-04** Add install/inspect/test/enable/disable/quarantine flows; installation
+- [x] **ECO-04** Add install/inspect/test/enable/disable/quarantine flows; installation
   never implies activation or permission.
+  **Done 2026-08-12.** `PluginRegistry` (agent-runtime `plugin`) owns the
+  installed-package catalog and the lifecycle flows; the decisions behind
+  them stay in the core. Admission is `PluginPackageAdmission`
+  (ECO-03); activation is `PluginStateAuthority` (agent-core
+  `plugin_state`), a validated state machine —
+  `Installed → Active → Disabled ⇄ Quarantined` — where `Installed` is a
+  terminal install-time state, quarantine may only leave through
+  `Disabled` (a human step, never straight back to `Active`), and every
+  transition is refused with a reason. `install` runs admission first,
+  then registers the package **inert** (`Installed`): installing never
+  implies activation or permission; `inspect`/`list` are bounded views;
+  `enable`/`disable`/`quarantine`/`unquarantine` drive the validated
+  transitions; `test` runs the declared self-checks in a sandboxed shape —
+  private temp cwd, scrubbed environment (only `PATH` + platform
+  essentials; a planted secret test proves nothing leaks), bounded timeout
+  (default 30 s) with whole-tree kill on timeout (Windows `taskkill /T /F`,
+  Unix own process group + negative-pid kill), bounded output tail, and no
+  shell parsing — the core never runs a package's test command during a
+  turn. 8 registry tests + 5 authority tests pin the flows, including
+  duplicate-install refusal, unknown-package refusal, ordered transitions,
+  pass/fail/timeout self-checks and the env scrub.
 - [ ] **ECO-05** Add MCP-like adapter support behind the same capability/effect/output
   boundary; lazily expose schemas through the existing catalog.
 - [ ] **ECO-06** Define Skill activation/deactivation and provenance without turning

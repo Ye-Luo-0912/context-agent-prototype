@@ -4,6 +4,7 @@ mod capability_admission;
 mod capability_state;
 mod kernel;
 mod plugin_admission;
+mod plugin_state;
 
 pub use approval::{
     ApprovalBroker, ApprovalRequest, GrantAuditEntry, InteractiveApprovalGate, PolicyApprovalGate,
@@ -25,3 +26,4 @@ pub use plugin_admission::{
     MAX_RANGE_CHARS, MAX_REFERENCE_CHARS, MAX_SKILLS_PER_PACKAGE, MAX_TESTS_PER_PACKAGE,
     MAX_TOOLS_PER_PACKAGE, MAX_VERSION_CHARS, PluginPackageAdmission,
 };
+pub use plugin_state::PluginStateAuthority;

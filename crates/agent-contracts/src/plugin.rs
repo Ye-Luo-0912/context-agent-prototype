@@ -41,6 +41,35 @@ pub enum HookMode {
     Gate,
 }
 
+/// Activation state of an installed plugin package. Installation never
+/// implies activation (ECO-04): a package enters `Installed` and stays
+/// inert — nothing loaded, nothing run — until an explicit operator action
+/// moves it. A misbehaving package can be suspended without uninstalling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginActivation {
+    /// Installed but inert: nothing is loaded, nothing runs.
+    #[default]
+    Installed,
+    /// Explicitly enabled: components may be exercised.
+    Active,
+    /// Explicitly disabled after being active.
+    Disabled,
+    /// Quarantined after misbehavior; nothing runs until unquarantined.
+    Quarantined,
+}
+
+impl PluginActivation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Active => "active",
+            Self::Disabled => "disabled",
+            Self::Quarantined => "quarantined",
+        }
+    }
+}
+
 /// A declared skill: versioned procedural knowledge built from existing
 /// tools. Metadata only (ECO-01): never executed, never injected into
 /// context, adds no authority.

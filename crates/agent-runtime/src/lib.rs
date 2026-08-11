@@ -11,6 +11,7 @@ pub mod host;
 mod instance;
 pub mod modules;
 mod output;
+mod plugin;
 mod policy;
 mod prompt;
 mod services;
@@ -35,6 +36,10 @@ pub use host::{
 pub use instance::RuntimeInstance;
 pub use modules::{
     ApprovalModule, ArtifactModule, ContextModule, EventModule, ModelModule, ToolModule,
+};
+pub use plugin::{
+    PLUGIN_TEST_OUTPUT_TAIL_CHARS, PLUGIN_TEST_TIMEOUT, PluginPackageView, PluginRegistry,
+    PluginTestReport, PluginTestResult,
 };
 pub use prompt::PromptAssembler;
 pub use services::RuntimeServices;
