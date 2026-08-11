@@ -154,8 +154,8 @@ The repository is already partially aligned with this architecture.
 | Contract-first dependencies | [x] | `agent-contracts` defines `ContextEngine`, `ToolDispatcher`, capability, effect, model, and event contracts. Concrete context/tool implementations are composed outside `agent-runtime`. |
 | Single orchestrator | [x] | `RuntimeActor` owns turn state; `agent-kernel` remains a stateless facade. Preserve this boundary. |
 | Typed composition modules | [x] / needs naming | `agent-runtime/src/host.rs` publishes context/model/tool/approval/event/artifact services through a typed registry. This is a trusted composition plane, not the boundary for arbitrary model-authored plugins. |
-| Dynamic capability catalog | [x] / lifecycle gap | `CapabilityRegistry` validates/caches declared tool schemas, prevents name shadowing, tracks activation/maturity, and merges them through one dispatcher. Loading one tool currently loads every sibling schema owned by that capability, and dynamic capabilities do not participate in builtin idle cooling/GC. |
-| Bounded active tool surface | [x] TaskToolRequirements first slice; broader `CORE-09` remains partial | Bounded task-owned exact-tool requirements, `MustSurface`/`PreferSurface`/`KeepReady`, the runtime-owned `RoundSurfacePlan`, bounded selection/omission/block reports, source revisions, and a monotonic round `surface_revision` are implemented and verified. RuntimeCheckpoint v2 persists requirements and counters rather than a derived snapshot. This is not the full TaskAnchor policy, and owner-level capability loading still exposes sibling lifecycle state. |
+| Dynamic capability catalog | [x] / lifecycle gap | `CapabilityRegistry` validates/caches declared tool schemas, prevents name shadowing, tracks activation/maturity, and merges them through one dispatcher. Lifecycle is per tool: loading one tool never surfaces its siblings (process start/stop stays owner-level). Dynamic capabilities still do not participate in builtin idle cooling/GC. |
+| Bounded active tool surface | [x] | Bounded task-owned exact-tool requirements, `MustSurface`/`PreferSurface`/`KeepReady`, the runtime-owned `RoundSurfacePlan`, bounded selection/omission/block reports with per-row provenance, source revisions, and a monotonic round `surface_revision` are implemented and verified. A typed-root policy derives family roots from the TaskAnchor/focus/active-call state at BeforeModel. RuntimeCheckpoint v2 persists requirements, anchors and counters rather than a derived snapshot. |
 | Builtin effect staging | [x] baseline | `fs.write` and `edit.replace` return `PreparedEffect`; the runtime generation fence decides commit/rollback. |
 | Generic shell effects | [~] confirmed blocker | `shell.exec` starts a shell in the real workspace and returns `Value`; commands may mutate before any prepared-effect fence. Sandboxing, standing policy, process-tree cleanup, and effect observability must make this escape hatch safe (`CORE-06`/`CORE-08`). |
 | External effect enforcement | [~] confirmed blocker | Process capabilities currently execute inside the child and return a value, so side effects can bypass the effect fence. Keep the `CORE-01` defect in `AUDIT_TODO.md` authoritative. |
@@ -458,10 +458,10 @@ boundary is narrower and must remain visible in status reports:
 | Implemented in the working tree | `TaskToolRequirementSet` is owned by `TaskRecord`, bounded to 32 exact tool names, canonicalized, revisioned and replaced through whole-set CAS. Stale writers and completed-task mutation are rejected; equivalent replacements do not churn the revision. `TaskInfo` exposes revision/count and live restore uses a per-process high-water mark so an older checkpoint cannot create a CAS ABA. |
 | Implemented in the working tree | Contracts define `MustSurface`, `PreferSurface`, `KeepReady`, bounded selected/omitted/blocked decisions, source revisions, and a schema-free `ToolSurfacePlanReport`. RuntimeCheckpoint v2 persists task requirements plus focus/surface counters and explicitly rejects v1 rather than silently treating missing authority as empty. |
 | Implemented and verified | Runtime-owned `RoundSurfacePlan` is the sole schema-budget projection. Actor tests cover task-demand lifecycle refresh, missing/over-budget Must refusal before provider start, KeepReady prompt exclusion, provider-budget degradation and recovery, one final immutable snapshot, bounded `ToolSurfacePlanned`, `ModelStarted` ordering, monotonic revisions, atomic builtin capture, capability surface-gate serialization, composite common-cut capture, and checkpoint/suspend/restore reconstruction. Full workspace tests and strict Clippy pass. |
-| Still future | Complete TaskAnchor/Focus/Episode-derived requirements, execution-policy revision, per-tool external-capability lifecycle, process/schema warmth separation, structured completion controls, CompletionRecord root transfer, and task/episode/operation requirement lifetimes. |
+| Still future | Process/schema warmth separation (dynamic capabilities do not cool on builtin idle ticks), structured completion controls, CompletionRecord root transfer, and task/episode/operation requirement lifetimes. |
 
-This is therefore the **TaskToolRequirements/round-surface first slice**, not
-the complete TaskAnchor integration promised later in this section.
+This closes the **TaskToolRequirements/round-surface** slice: typed tool-root
+derivation, per-tool capability lifecycle and per-row provenance are verified.
 
 Final review leaves two tool-surface hardening items. Their authoritative issue
 descriptions live in `AUDIT_TODO.md` (`CORE-03`, `CORE-09`) rather
@@ -470,9 +470,11 @@ than being assigned duplicate defects here:
 - live restore's high-water rebase needs a bounded typed commit event; an
   event/barrier failure after restored state becomes visible must fence normal
   mutation as recovery-required;
-- every selected/omitted row needs demand provenance. A task-authored
-  `PreferSurface` must not be indistinguishable from a merely loaded catalog
-  optional that the planner currently treats as a preference candidate.
+- every selected/omitted row carries per-row provenance
+  (`TaskRequirement` / `DispatcherRequired` / `CatalogLoadedOptional` /
+  `Unknown` for legacy rows), so a task-authored `PreferSurface` is no longer
+  indistinguishable from a merely loaded catalog optional. Future
+  Focus/Active/RecentUse provenance planes remain open.
 
 The adjacent CTX-07 consumption gap is closed: actor packing now produces an
 exact bounded `ContextConsumptionAck`, and trimmed/refused/failed/cancelled/

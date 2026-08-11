@@ -189,8 +189,8 @@ capabilities under one catalog:
 
 - `catalog()` — every known tool (builtin + capability) with lifecycle state
   and owner, for `capability.search` / `capability.inspect`;
-- `load_tool(name)` / `unload_tool(name)` — move a tool (or the capability
-  owning it) on/off the model surface;
+- `load_tool(name)` / `unload_tool(name)` — move exactly one tool on/off the
+  model surface; loading one capability tool never surfaces its siblings;
 - `inspect_tool(name)` — one tool's full spec;
 - `ToolLifecycle::{Available, Loaded, Active, Warm, Unloaded}` is the one
   lifecycle shared by both planes: registered-but-not-loaded capability
@@ -199,10 +199,10 @@ capabilities under one catalog:
   tools (`capability.search/inspect/load/unload`, always visible) drive the
   active set.
 
-#### TaskToolRequirements and round surfaces (first TaskAnchor slice)
+#### TaskToolRequirements, typed roots and round surfaces
 
-The current working tree implements and verifies a deliberately narrow first
-slice:
+The runtime owns the sole schema-budget projection over the complete loaded
+candidate set:
 
 - each runtime-owned `TaskRecord` carries a bounded, canonical
   `TaskToolRequirementSet { revision, entries }` and replaces the whole set
@@ -212,30 +212,35 @@ slice:
 - requirements use an exact tool name plus `MustSurface`, `PreferSurface`, or
   `KeepReady`. They express task demand only and cannot enable/quarantine a
   capability or grant approval/effect authority;
+- a pure typed-root policy derives additional roots at the BeforeModel safe
+  point: the task anchor's structured fields map to explicit tool families
+  (acceptance criteria -> verification, open loops -> exploration, plan
+  progress -> mutation, working refs -> artifact access), the focus goal
+  without a task derives exploration, and the active-call policy pins the
+  executing tool as `MustSurface`. Derivation is deterministic,
+  de-duplicated, catalog-filtered and bounded, and the explicit task-owned
+  set stays the authority;
 - after the tool-GC safe point, the runtime refreshes required lifecycle flags
   and `RoundSurfacePlan` projects the complete loaded candidate set. Mandatory
   schemas are retained, preferred schemas degrade deterministically under
   schema/provider budget, and KeepReady remains catalog-ready but prompt-cold;
-- loading a KeepReady entry is currently only a cheap schema/catalog flag
-  refresh. Capability processes remain lazy and start at invocation;
 - the final snapshot carries a runtime `surface_revision`, non-colliding
-  builtin/capability/task/focus source revisions, and bounded omission data.
+  builtin / capability / task-requirement / anchor / focus /
+  execution-policy source revisions, and bounded omission data.
   `ToolSurfacePlanned` is the schema-free audit report; `ModelStarted` belongs
   after a Ready plan and successful final packing.
 
-This slice is not the complete TaskAnchor. It does not add goal interpretation,
-constraints, acceptance criteria, plan/open-loop/evidence authority,
-TaskAnchor context roots, EpisodeOutcome, exact final output retention or
-CompletionRecord root transfer. Dynamic capabilities also
-retain an owner-level loaded flag, so requesting one tool can still mark
-sibling schemas loaded; process state and per-tool schema state remain future
-work. Snapshot consistency is verified for this slice: the builtin registry
-captures specs and generation under one lock, capability capture/mutation uses
-the surface gate, and the composite dispatcher holds that gate while taking
-one atomic base snapshot to form a common source cut without retry;
-concurrency tests cover catalog mutation during capture. Report rows still do
-not distinguish task-authored Prefer from a catalog-loaded optional fallback,
-which remains a CORE-09 provenance residual.
+Capability lifecycle is per tool: loading one tool of a capability never
+surfaces its siblings, while process start/stop stays owner-level, and
+checkpoint restore migrates legacy whole-capability flags to per-tool lists.
+Every selected/omitted round row carries per-row provenance
+(`TaskRequirement` / `DispatcherRequired` / `CatalogLoadedOptional` /
+`Unknown` for legacy rows), so task-authored Prefer is distinguishable from
+a catalog-loaded optional fallback. Snapshot consistency is verified: the
+builtin registry captures specs and generation under one lock, capability
+capture/mutation uses the surface gate, and the composite dispatcher holds
+that gate while taking one atomic base snapshot to form a common source cut
+without retry; concurrency tests cover catalog mutation during capture.
 
 Since V1-M9 the model can also steer the *context* surface through
 read-only meta-tools (`context.gc_hint` / `context.tag` / `context.lease` /

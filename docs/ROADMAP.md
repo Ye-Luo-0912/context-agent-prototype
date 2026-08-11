@@ -1311,6 +1311,23 @@ Several model-facing dimensions are bounded and tested:
   on paths and lexical on command tokens, consumption is bounded per call,
   and an expired/exhausted grant falls through to the underlying gate, so a
   missing responder denies without privilege expansion (`CORE-08`).
+- **Round-surface authority, provenance and per-tool capability
+  lifecycle** (`CORE-09`). The runtime owns the sole schema-budget
+  projection: budget packing is round-local and never mutates catalog
+  lifecycle. On top of the explicit exact-name requirement set, a pure
+  typed-root policy derives roots at the BeforeModel safe point from the
+  task anchor's structured fields (acceptance criteria -> verification,
+  open loops -> exploration, plan progress -> mutation, working refs ->
+  artifact access), the focus goal (exploration when no task is active),
+  and the active-call state (the executing tool stays `MustSurface`);
+  derivation is deterministic, catalog-filtered and bounded. Capability
+  lifecycle is per tool: loading one tool of a capability never surfaces
+  its siblings, while process start/stop stays owner-level, and checkpoint
+  restore migrates legacy whole-capability flags to per-tool lists. Every
+  selected/omitted round row carries per-row provenance
+  (`TaskRequirement` / `DispatcherRequired` / `CatalogLoadedOptional` /
+  `Unknown` for legacy rows), and the surface report records catalog /
+  task-requirement / anchor / focus / execution-policy source revisions.
 
 The milestone acceptance is still open. `ToolSpec` has no trusted per-output
 budget/spill policy; context diagnostics/catalog scans are not all

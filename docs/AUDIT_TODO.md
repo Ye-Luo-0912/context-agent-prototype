@@ -1156,45 +1156,47 @@ oversized_write`, `grant_rejects_invalid_targets_and_shapes`,
 `zero_responder_without_grant_denies_without_expansion` (agent-kernel).
 
 ### CORE-09 — Tool schema budget mutates lifecycle and can forget required capability
+Status: **Closed 2026-08-11 - typed tool-root derivation, per-tool
+capability lifecycle and per-row provenance verified; surface sources
+complete.**
 
-Status: **[~] TaskToolRequirements/round-surface slice verified; complete
-TaskAnchor policy and per-tool capability lifecycle remain open.**
-
-The verified first slice makes runtime-owned `RoundSurfacePlan` the sole
-schema-budget projection over the complete loaded candidate catalog. Each
-TaskRecord now owns a bounded, revisioned, whole-set-CAS requirement set with
-`MustSurface`, `PreferSurface`, and `KeepReady`. Budget omission is round-local
-and never unloads a catalog entry; Must either appears or produces a typed
+Runtime-owned `RoundSurfacePlan` is the sole schema-budget projection over the
+complete loaded candidate catalog. Each TaskRecord owns a bounded,
+revisioned, whole-set-CAS requirement set with `MustSurface`,
+`PreferSurface`, and `KeepReady`. Budget omission is round-local and never
+unloads a catalog entry; Must either appears or produces a typed
 pre-provider refusal; KeepReady repairs GC eviction but remains prompt-cold.
 The final immutable snapshot and bounded, schema-free `ToolSurfacePlanned`
-report carry a monotonic surface revision plus non-colliding catalog/task/focus
-source revisions. `ModelStarted` is emitted only after successful final
-packing. RuntimeCheckpoint v2 persists task requirements and counters, never a
-derived round surface.
+report carry a monotonic surface revision plus non-colliding catalog /
+task-requirement / anchor / focus / execution-policy source revisions.
+`ModelStarted` is emitted only after successful final packing.
+RuntimeCheckpoint v2 persists task requirements, anchors and counters, never
+a derived round surface.
+
+On top of the explicit exact-name set, a pure typed-root policy derives
+roots at the BeforeModel safe point: the task anchor's structured fields map
+to explicit tool families (acceptance criteria -> verification, open loops
+-> exploration, plan progress -> mutation, working refs -> artifact access),
+the focus goal without a task derives exploration, and the active-call
+policy pins the executing tool as `MustSurface`. Derivation is deterministic,
+de-duplicated, catalog-filtered and bounded; the explicit task-owned set
+stays the authority. Dynamic capability lifecycle is per tool: loading one
+tool of a capability never surfaces its siblings, while process start/stop
+stays owner-level, and checkpoint restore migrates legacy whole-capability
+flags to per-tool lists. Every selected/omitted round row carries per-row
+provenance (`TaskRequirement` / `DispatcherRequired` / `CatalogLoadedOptional`
+/ `Unknown` for legacy rows), so Task Prefer is distinguishable from a
+catalog load in both selected and omitted reports.
 
 Regression tests cover non-mutation, deterministic omission and budget
 recovery, KeepReady reload, Must refusal with no provider call or
-`ModelStarted`, event ordering/bounds, revision monotonicity, and
-checkpoint/suspend/restore reconstruction. They also cover atomic builtin
-capture, capability surface-gate serialization, and a composite common cut
-under concurrent catalog mutation. Full workspace tests and strict Clippy
-pass.
-
-This still is not the complete TaskAnchor. Requirements are explicit exact
-tool names rather than projections from typed goal/phase/open-loop/acceptance
-state. Dynamic capabilities also use one owner-level `loaded: bool`, so
-loading one tool can mark sibling schemas loaded and external tools do not yet
-receive independent builtin-style idle cooling. Snapshot consistency is closed
-for the first slice: builtin specs/generation share one registry lock,
-capability mutations and capture share the surface gate, and the composite
-dispatcher holds that gate across one atomic base snapshot so both sources
-form one common cut without retry. One explainability
-gap remains in the first-slice surface itself:
-
-- report rows collapse a task-authored `PreferSurface` requirement and an
-  ordinary catalog-loaded optional candidate into the same demand value. A
-  selected/omitted row cannot yet answer whether it entered because of Task
-  intent, dispatcher/core policy, explicit catalog load, or fallback packing.
+`ModelStarted`, event ordering/bounds, revision monotonicity,
+checkpoint/suspend/restore reconstruction, atomic builtin capture,
+capability surface-gate serialization, a composite common cut under
+concurrent catalog mutation, per-tool capability loading/unloading,
+snapshot/restore round-tripping the per-tool surface with legacy migration,
+typed family derivation, active-call pinning, and per-row provenance on
+selected/omitted rows. Full workspace tests and strict Clippy pass.
 
 Required direction:
 
@@ -1202,21 +1204,22 @@ Required direction:
   surface for the TaskToolRequirements slice;
 - [x] token/schema budget performs pure round-local packing and never unloads
   a tool or changes its lifecycle;
-- [ ] derive typed tool roots from the complete TaskAnchor/Focus/Episode and
+- [x] derive typed tool roots from the complete TaskAnchor/Focus/Episode and
   Active-call policy at the existing BeforeModel safe point;
 - [x] `MustSurface` tools are selected or produce explicit unsatisfiable
   reports; `PreferSurface` omissions are observable but do not mutate
   lifecycle; `KeepReady` stays cheap to reactivate without entering prompts;
-- [ ] make external capability lifecycle per tool while process start/stop remains
+- [x] make external capability lifecycle per tool while process start/stop remains
   owner-level; loading one tool must not expose all siblings;
-- [~] use one monotonic surface revision with separate catalog,
-  task-requirement and focus sources; complete Anchor/Episode/execution-policy
-  source revisions later;
+- [x] use one monotonic surface revision with separate catalog,
+  task-requirement, anchor, focus and execution-policy sources (the focus
+  scope rotation doubles as the episode boundary, so its revision covers the
+  Episode plane);
 - [x] pair builtin specs/generation under one lock, serialize capability
   capture and mutation through the surface gate, and hold that gate while
   taking one atomic base snapshot; concurrency tests verify recorded source
   revisions agree with the captured specs;
-- [ ] add bounded per-row provenance (`TaskRequirement` with requirement
+- [x] add bounded per-row provenance (`TaskRequirement` with requirement
   revision/reason ref, `DispatcherRequired`, `CatalogLoadedOptional`, later
   Focus/Active/RecentUse) so Task Prefer is distinguishable from a legacy
   catalog optional in both selected and omitted reports;
