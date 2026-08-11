@@ -15,14 +15,17 @@ The first version therefore prioritizes runtime/context boundaries over model fe
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ Presentation                                                │
-│ agent-tui                                                   │
+│ agent-tui (composition root)                                │
 │ RuntimeEvent -> RunStateAggregator/AppState -> TUI          │
 └─────────────────────────────┬───────────────────────────────┘
                               │ User command / RuntimeEvent
 ┌─────────────────────────────v───────────────────────────────┐
-│ Runtime                                                     │
-│ agent-core                                                │
-│ Agent loop / budgets / approval / event publication        │
+│ Orchestrator (evolvable)                                    │
+│ agent-runtime                                               │
+│ RuntimeActor: turn state machine, task manager, scope       │
+│   lifecycle, prompt assembly, effect fence                  │
+│ RuntimeServices: context/model/tool/config scheduling       │
+│ ModuleHost + capability registry + plugin registry          │
 └──────────────┬───────────────────┬──────────────────────────┘
                │                   │
      ContextEngine          ToolDispatcher / ModelTransport
@@ -38,9 +41,63 @@ The first version therefore prioritizes runtime/context boundaries over model fe
                          │ cwd boundary / artifacts         │
                          └──────────────────────────────────┘
 
+Trusted core (stateless, the agent cannot modify):
+agent-core: CoreAuthority — events / approval / effects / output /
+  tool-execution wiring, plus the admission and state authorities
+  (capability_admission / capability_state / plugin_admission /
+  plugin_state)
+
 RuntimeEvent ───────────────────────────────> agent-storage
                                                JSONL files
 ```
+
+## 2b. Trust model: four rings, one orchestrator
+
+The system arranges its components into four trust rings. Trust here
+means "who can modify what, and at what point in the run"; each ring has a
+distinct registration path and a distinct default posture.
+
+1. **Trusted core (`agent-core`)** — stateless authority primitives the
+   agent can never modify: `CoreAuthority` (event envelope identity /
+   sequence / durability, approval verdict normalization, effect
+   commit/rollback behind the generation fence, bounded output brokering)
+   and the admission/state authorities (capability admission, activation /
+   quarantine / maturity, plugin package admission, plugin activation).
+   `CoreAuthority` owns no turn state; it is the seam that grows into the
+   long-term Trusted Core.
+2. **Runtime orchestrator (`agent-runtime`)** — everything evolvable:
+   `RuntimeActor` owns the turn state machine (turn frame, generation,
+   what to commit), the task manager, scope lifecycle, prompt assembly and
+   the effect fence; `RuntimeServices` owns scheduling; the module host,
+   capability registry and plugin registry own the extension catalogs.
+   There is exactly one orchestrator: no other component owns turn state
+   or a second command loop.
+3. **Trusted composition plane (`agent-tui` + trusted modules)** —
+   operator-trusted wiring. `ModuleHost::add_module` and
+   `ServiceRegistry::register` publish typed services (context, model,
+   tool, approval, event, artifact) at composition time; a module is
+   refused after the host started. Composition adapters are not ordinary
+   plugins: they extend the trusted core plane, never the model-visible
+   catalog.
+4. **Dynamic capability plane (tool-runtime tools, process capabilities,
+   MCP adapters, plugin packages)** — runtime-loadable and permissioned.
+   Capabilities register through `register_capability` mid-run; every
+   out-of-process transport is pinned to `Experimental` + `Disabled` at
+   registration and enters the model surface only after explicit enable.
+   Their tools join the dispatcher under the registered grant; skills and
+   hooks are declared metadata that never execute in v0.
+
+The rule that binds all four rings: **there is one orchestrator**. The
+runtime actor drives every turn; the core stays stateless and never gains
+a turn loop; a second orchestrator is never introduced, and dynamic
+capabilities can never reach the trusted core plane.
+
+Vocabulary: *composition module/adapter* names operator-trusted services
+on the composition plane; *capability* names runtime-loadable
+actions/services on the dynamic plane; *Skill*, *Hook* and *Plugin
+Package* are defined separately in the manifest (ECO-01/ECO-03/ECO-06/
+ECO-07) — skills and hooks are validated metadata, only tools are
+interpreted.
 
 ## 3. Dependency direction
 
@@ -54,10 +111,15 @@ agent-contracts
       ├──────── tool-runtime
       ├──────── agent-storage
       ├──────── agent-process          (framed IPC / child lifecycle / sandbox)
-      └──────── agent-core
-                    ^                  ├── agent-capability-process -> agent-process
-                    │                  └── context-contextcore      -> agent-process
-                 agent-tui
+      └──────── agent-core             (stateless authority facade)
+                   ^
+                   ├── agent-runtime   (orchestrator: actor + services +
+                   │                    module host + registries)
+                   │
+                   │   agent-capability-process -> agent-process
+                   │   context-contextcore      -> agent-process
+                 agent-tui             (composition root; wires all
+                                        implementations)
 ```
 
 Important consequences:
@@ -65,6 +127,9 @@ Important consequences:
 - `agent-core` does not import `context-simple`.
 - `tool-runtime` does not import `context-simple` or any memory implementation.
 - `agent-tui` is the composition root and chooses concrete implementations.
+- `agent-runtime` is the only orchestrator and never imports a concrete
+  context engine or tool dispatcher; `agent-core` never imports
+  `agent-runtime`.
 - `context-contextcore` implements `ContextEngine` over a process without
   changing the kernel; the framed transport it uses is the shared
   `agent-process` host, so every process boundary (context service and

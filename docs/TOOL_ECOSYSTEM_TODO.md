@@ -782,11 +782,38 @@ together with TaskAnchor and continuous context GC.
 
 ### Gate 0: approve boundaries and vocabulary
 
-- [ ] **MOD-01** Confirm the four trust rings and the rule that there is one
+- [x] **MOD-01** Confirm the four trust rings and the rule that there is one
   orchestrator.
-- [ ] **MOD-02** Reserve "composition module/adapter" for operator-trusted services;
+  **Verified 2026-08-12.** The four rings are (1) the trusted core
+  (`agent-core`: stateless `CoreAuthority` seams — events, approval,
+  effects, output — plus the admission/state authorities; owns no turn
+  state, the agent can never modify it), (2) the runtime orchestrator
+  (`agent-runtime`: `RuntimeActor` owns the turn state machine, task
+  manager, scope lifecycle, prompt assembly and effect fence;
+  `RuntimeServices` owns scheduling), (3) the trusted composition plane
+  (`agent-tui` composition root + `ModuleHost::add_module` /
+  `ServiceRegistry::register`: operator-trusted typed services, refused
+  after the host started) and (4) the dynamic capability plane
+  (`register_capability`, capability registry, process/MCP adapters,
+  plugin packages: runtime-loadable, permissioned, out-of-process
+  transports pinned to Experimental + Disabled). The one-orchestrator
+  rule holds: `CoreAuthority` "owns no turn state" (kernel.rs) and no
+  second command loop exists; documented in `docs/ARCHITECTURE.md` §2b.
+- [x] **MOD-02** Reserve "composition module/adapter" for operator-trusted services;
   reserve "capability" for runtime-loadable actions/services; define Skill,
   Hook, and Plugin Package separately.
+  **Verified 2026-08-12.** Names and authority: `ModuleHost::add_module`
+  + `ServiceRegistry::register` publish typed services at composition
+  time (trusted core plane, refused after start) while
+  `register_capability` accepts dynamic capabilities mid-run (see
+  MOD-03); the two planes are distinct entry points with different
+  admission. Skill, Hook and Plugin Package are separate manifest
+  declarations — `SkillDeclaration` (provenance + activation, ECO-06),
+  `HookDeclaration` (ordering/bounds/failure policy/permission subset,
+  ECO-07), `PluginPackageManifest` (versioned unit with tools/skills/
+  hooks/adapters/dependencies/permissions/tests, ECO-03) — skills and
+  hooks are validated metadata, only tools are interpreted. Vocabulary
+  recorded in `docs/ARCHITECTURE.md` §2b.
 - [x] **ECO-01** Decide whether Skills and Hooks are first-class contracts now or remain
     package metadata until the base ACI is measured.
     **Decision 2026-08-12: Skills and Hooks remain *declared package
