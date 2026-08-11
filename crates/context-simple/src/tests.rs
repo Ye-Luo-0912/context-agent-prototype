@@ -3305,6 +3305,169 @@ async fn open_focus_ordinary_dialogue_ages_out_without_rotation() {
     );
 }
 
+/// A live item that moved to the warm buffer shares the same lifecycle
+/// clock as a resident one: an ephemeral observation evicted to the
+/// reversible buffer is tombstoned when its TTL passes, so it cannot be
+/// reactivated forever from a location the residency pass no longer
+/// visits.
+#[tokio::test]
+async fn warm_ephemeral_item_is_tombstoned_by_ttl_not_only_resident() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "fix AuthService.rs").await;
+
+    // A consumed ephemeral tool observation leaves the heap at GC time.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "inspect AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    tool_observation(&engine, "1", "read AuthService.rs").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    engine.gc().await.unwrap();
+    let obs_id = {
+        let state = engine.state.lock().await;
+        state
+            .eviction_buffer
+            .iter()
+            .find(|item| item.kind == ContextKind::ToolObservation)
+            .map(|item| item.id)
+    };
+    let obs_id = obs_id.expect("consumed observation must sit in the warm buffer");
+    {
+        let state = engine.state.lock().await;
+        let item = state
+            .eviction_buffer
+            .iter()
+            .find(|item| item.id == obs_id)
+            .expect("warm item");
+        assert!(item.semantic.is_live(), "a warm item starts live");
+    }
+
+    // Advance past the ephemeral TTL (default 5 turns) with unrelated
+    // user turns; the warm buffer must tombstone it there.
+    for turn in 1..=6u64 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: format!("keep working in round {turn}"),
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+    }
+    {
+        let state = engine.state.lock().await;
+        let item = state
+            .eviction_buffer
+            .iter()
+            .find(|item| item.id == obs_id)
+            .expect("warm item");
+        assert_eq!(
+            item.semantic,
+            SemanticState::Tombstoned,
+            "the ephemeral TTL must reach the warm buffer"
+        );
+    }
+
+    // A tombstoned warm item is never reactivated, even when its entity
+    // is hot again.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "read AuthService.rs again".into(),
+        })
+        .await
+        .unwrap();
+    tool_observation(&engine, "2", "touched AuthService.rs").await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    engine.gc().await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            !state.items.iter().any(|item| item.id == obs_id),
+            "a tombstoned warm item must never reactivate"
+        );
+        let item = state
+            .eviction_buffer
+            .iter()
+            .find(|item| item.id == obs_id)
+            .expect("warm item stays in the buffer");
+        assert_eq!(item.semantic, SemanticState::Tombstoned);
+    }
+}
+
+/// A Working item that aged into the warm buffer shares the same
+/// staleness clock: after ttl x 4 turns it is tombstoned there too, so
+/// the reversible buffer cannot keep stale ordinary dialogue
+/// reactivatable forever.
+#[tokio::test]
+async fn warm_working_item_is_tombstoned_by_staleness() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "keep working on the auth service").await;
+
+    // Related messages with no entities age out of the open episode
+    // (ordinary-dialogue rule) into the warm buffer; the buffer's
+    // staleness clock then tombstones them.
+    for turn in 1..=30u64 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: format!("keep working on the auth cache in round {turn}"),
+            })
+            .await
+            .unwrap();
+        tool_observation(
+            &engine,
+            &turn.to_string(),
+            &format!("patched Item{}", turn % 7),
+        )
+        .await;
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        if turn % 5 == 0 {
+            engine.gc().await.unwrap();
+        }
+    }
+
+    // One more pass so messages the final GC just moved into the buffer
+    // get their staleness check there.
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+
+    // At turn 30 every warm UserMessage older than 20 turns must be
+    // tombstoned — the buffer must not keep it reactivatable forever.
+    let state = engine.state.lock().await;
+    let stale_in_buffer: Vec<_> = state
+        .eviction_buffer
+        .iter()
+        .filter(|item| item.kind == ContextKind::UserMessage)
+        .filter(|item| state.turn.saturating_sub(item.created_turn) > 20)
+        .collect();
+    assert!(
+        !stale_in_buffer.is_empty(),
+        "expected aged ordinary dialogue in the warm buffer"
+    );
+    assert!(
+        stale_in_buffer.iter().all(|item| !item.semantic.is_live()),
+        "stale warm dialogue must be tombstoned, not kept reactivatable: {:?}",
+        stale_in_buffer
+            .iter()
+            .map(|item| (item.created_turn, item.semantic))
+            .collect::<Vec<_>>()
+    );
+}
+
 /// A terminal semantic transition (supersession) must reach the target
 /// wherever its body currently sits. A decision externalized to the store
 /// (Cold) and one sitting in the warm buffer are still the same decisions:

@@ -1,6 +1,6 @@
 use agent_contracts::{
     AttentionState, ContextItemId, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextStateTransition, LifecycleAxis, SemanticState,
+    ContextRetention, ContextStateTransition, LifecycleAxis, SemanticState,
 };
 
 use crate::diagnostics;
@@ -169,6 +169,64 @@ pub(crate) fn run_minor(
                 outcome.reason,
             ));
         }
+    }
+    // Warm-buffer items share the same lifecycle clock: a live item that
+    // moved to the reversible buffer must not escape TTL/staleness aging
+    // just because it is no longer resident. The same windows residency
+    // uses (ephemeral TTL, then the ttl x 4 staleness) tombstone it here,
+    // so a dead warm item is never reactivated and Storage GC can
+    // eventually delete it. Pinned and keep-alive/lease items are exempt,
+    // exactly like the resident root set.
+    for item in &mut state.eviction_buffer {
+        if !item.semantic.is_live() {
+            continue;
+        }
+        if item.retention == ContextRetention::Pinned
+            || item.keep_alive
+            || item.lease_until_turn.is_some_and(|until| turn <= until)
+        {
+            continue;
+        }
+        let turn_age = turn.saturating_sub(item.created_turn);
+        let ttl_expired =
+            item.retention == ContextRetention::Ephemeral && turn_age > config.turn_ttl_ticks;
+        let stale =
+            item.retention != ContextRetention::Durable && turn_age > config.turn_ttl_ticks * 4;
+        if !ttl_expired && !stale {
+            continue;
+        }
+        let reason = if ttl_expired {
+            format!(
+                "ephemeral TTL expired in the warm buffer (age {turn_age} turns > {}); tombstoned",
+                config.turn_ttl_ticks
+            )
+        } else {
+            format!(
+                "stale in the warm buffer (age {turn_age} turns > ttl x4 = {}); tombstoned",
+                config.turn_ttl_ticks * 4
+            )
+        };
+        let old_attention = item.attention;
+        item.semantic = SemanticState::Tombstoned;
+        item.attention = AttentionState::Archived;
+        report.tombstoned += 1;
+        report.archived += 1;
+        report.transitions.push(ContextStateTransition {
+            item_id: item.id,
+            kind: item.kind,
+            scope: item.scope,
+            from: old_attention,
+            to: AttentionState::Archived,
+            turn,
+            reason: format!("{reason} [semantic]"),
+        });
+        ledger_rows.push((
+            item.id,
+            LifecycleAxis::Semantic,
+            "Live".to_string(),
+            "Tombstoned".to_string(),
+            reason,
+        ));
     }
     for (item_id, axis, from, to, cause) in ledger_rows {
         crate::ledger::record(
