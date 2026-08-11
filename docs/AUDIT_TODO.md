@@ -1058,31 +1058,46 @@ The current policy has two extremes:
 - `InteractiveApprovalGate` prompts on every non-read-only call, waits up to
   five minutes, then denies on timeout.
 
-There is no task/session-scoped standing grant, target/path restriction,
-effect/reversibility classification, expiry/revocation, interruption budget,
-batched boundary request, or “deny this effect and continue independent work”
-contract. Coarse `ProcessExecution` also treats a bounded local test and a
-dangerous external command as the same interaction burden.
+**2026-08-11: closed.** `TaskApprovalGate`
+(`crates/agent-kernel/src/approval.rs`) wraps any inner `ApprovalGate` with
+task-scoped standing grants established by the composition root
+(`agent-tui` parses `--grant=<json>`), revocable via `revoke` and visible
+via `/grants`:
 
-Required direction (after/unified with M12 Effect Runtime and M14 Resource
-Policy):
+1. **Standing-grant structure** - `StandingGrant` (agent-contracts) binds one
+   `ToolRisk` effect to a `GrantTarget` (workspace path prefix and/or
+   process command prefix) with a `GrantConstraint` (`max_content_bytes`,
+   `max_runs`) and `expires_at_ms`. The model can *use* a matching grant
+   (no per-call prompt) but can never create, widen or extend one:
+   `grant()` is composition-root/UI-only, `ReadOnly` grants and scope-less
+   grants are rejected at grant time, and an expired, revoked or exhausted
+   grant silently stops matching and falls through to the underlying gate.
+2. **Component-aware target matching** - a workspace write matches only when
+   its path is at or under the granted prefix at the component level
+   (`src/../outside/x`, `../src/x`, absolute paths and drive-qualified paths
+   never match), and a process call matches only when its command starts
+   with the granted whitespace-token prefix (`cargo testx` does not match
+   `cargo test`).
+3. **Bounded consumption** - `max_runs` is consumed once per matched process
+   call; `max_content_bytes` caps the write content; expiry is checked on
+   every decision and in `active_grants`.
+4. **Zero-responder semantics** - a granted call resolves without waiting
+   (test asserts < 40 ms); an ungranted call falls through to the inner
+   gate, so a missing responder can never expand privileges. Residual: an
+   ungranted call behind the interactive gate still waits its configurable
+   `answer_timeout` (default 5 minutes), so fully avoiding the per-call
+   stall needs a shorter inner timeout or deny-by-default; the "aggregate
+   unavoidable boundary choices at a checkpoint" direction remains future
+   work.
 
-- trusted `TaskExecutionPolicy` with narrow effect + target + constraint +
-  expiry grants; the model can use but never widen it;
-- automatic operation inside the standing sandbox/task grant;
-- derive risk from the prepared effect, target scope and reversibility, not
-  only a tool's declaration;
-- no responder means deny/skip and continue safe independent work, never
-  implicit allow and never an indefinitely blocked run;
-- aggregate unavoidable goal/scope/irreversible boundary choices at a
-  checkpoint with an interruption cap;
-- finish `Partial`/`Blocked` with one consolidated boundary report when an
-  ungranted effect is truly essential.
-
-Acceptance: a long coding task can edit its granted workspace and run bounded
-local tests without per-call prompts; it cannot push/deploy/delete broadly or
-access secrets/network without the matching narrow grant; zero user responses
-produces no privilege expansion and no five-minute-per-call stall.
+Regression coverage (the audit's "zero responses produces no privilege
+expansion and no per-call stall"): `standing_grant_allows_matching_write_
+without_prompt`, `write_outside_grant_delegates_to_inner`, `grant_prefix_is_
+component_aware`, `parent_and_absolute_writes_never_match_a_grant`,
+`expired_grant_stops_matching`, `revoked_grant_stops_matching`,
+`process_grant_limits_runs_and_prefix_is_lexical`, `content_cap_rejects_
+oversized_write`, `grant_rejects_invalid_targets_and_shapes`,
+`zero_responder_without_grant_denies_without_expansion` (agent-kernel).
 
 ### CORE-09 — Tool schema budget mutates lifecycle and can forget required capability
 

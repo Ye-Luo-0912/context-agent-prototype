@@ -398,7 +398,8 @@ silently change promotion or GC behavior.
 
 ### Approval flow
 
-`agent-kernel` owns the `ApprovalGate` contract. Two implementations exist:
+`agent-kernel` owns the `ApprovalGate` contract. Three implementations
+exist:
 
 - `PolicyApprovalGate` — automatic policy (`read_only()`, `permissive()`, or a
   custom mix). No UI involved.
@@ -408,12 +409,24 @@ silently change promotion or GC behavior.
   shows the tool name and a bounded args preview, and answers y/n/Enter/Esc
   through `InteractiveApprovalGate::respond`. Late subscribers can drain
   `broker.pending()`.
+- `TaskApprovalGate` — task-scoped standing grants wrapping any inner gate.
+  A grant binds one `ToolRisk` effect to a target (workspace path prefix,
+  process command prefix) with a bounded constraint (`max_content_bytes`,
+  `max_runs`) and an expiry. The model can use a matching grant without a
+  per-call prompt but can never create, widen or extend one: grants are
+  established by the composition root (`agent-tui` parses `--grant=<json>`),
+  listed via `/grants`, revoked via `revoke`, and an expired or exhausted
+  grant silently falls through to the inner gate. Matching is component-aware
+  on paths and lexical on command tokens, so `src/../outside/x` or
+  `cargo testx` never borrows a `src/` / `cargo test` grant. A granted call
+  resolves with zero interaction; an ungranted call falls through, so a
+  missing responder denies without privilege expansion.
 
 Read-only tools always auto-allow. The wait for an answer is bounded
 (default 5 minutes, configurable): if nobody responds, the request is denied
 and the pending queue is cleaned, so a missing responder can never hang a
 turn. `agent-tui` runs in interactive mode by default; `--read-only` selects
-`PolicyApprovalGate::read_only()`.
+`PolicyApprovalGate::read_only()` (and rejects `--grant`).
 
 ```text
 kernel execute_tool

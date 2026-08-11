@@ -1120,7 +1120,7 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 | M11 Context Recall | ✅ narrow retrieval baseline | Search/inspect/fetch, transient results, bounded external view and service parity work. Canonical catalog ownership and complete cross-residency semantics remain context-runtime work rather than reasons to call recall itself absent. TaskAnchor/Completion roots are now implemented (`CTX-10`). |
 | M12 Effect Runtime | ✅ | In-process prepared effects and process-capability wire effects commit behind the generation fence (`CORE-01`), a cancelled operation kills its whole process tree (`CORE-06`: shell/git/capability share one tree-kill) and cleans up every pending approval entry, provider streams are byte-capped, and Windows Job-Object quotas are kernel-enforced. The standing-grant `TaskExecutionPolicy` (CORE-08) is M14 approval-policy work, not an M12 gap. |
 | M13 Extension Sandbox | 🟡 partial | Env scrub, private cwd, bounded stderr, process-tree cancellation and Windows Job-Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE) are enforced; Unix rlimits cover CPU/process count; workspace filesystem access is confined to directory-handle-relative opens with reparse substitution rejected at open time (`CORE-07`). A cwd is still not a filesystem boundary: absolute filesystem/network access is not brokered, which keeps M13 open. |
-| M14 Resource Policy | 🟡 partial | Schema/context quotas, risk/permission validation and final output guards exist. A unified output broker, standing task execution policy and effect-derived approval/resource enforcement remain open. |
+| M14 Resource Policy | 🟡 partial | Schema/context quotas, risk/permission validation and final output guards exist, and the narrow standing `TaskExecutionPolicy` is landed (`CORE-08`: effect + target + constraint + expiry grants, revocable, zero-responder deny/skip). A unified output broker and effect-derived approval/resource enforcement remain open. |
 | M15 Real Evaluation | 🧪 instrumentation/smoke only | Replay is a policy proxy and the live run is a no-tool constraint-retention task. There is no paired real coding workload, hidden outcome verification, all-module cost accounting or non-inferiority result. |
 | V2 Self-Iteration | 🔒 blocked | Registry maturity and sandboxed self-checks are foundations only. Autonomous generation/promotion stays disabled until M10 and M12-M15 acceptance gates close. |
 
@@ -1167,8 +1167,9 @@ the required gate order; the numbered list and table above are authoritative.
 5. **V1-M14 Resource Policy** — tool schema budget (the per-round surface
    bound landed in Performance P1), context hint quota,
    RiskClass, PermissionSet. Acceptance: the LLM cannot exhaust runtime
-   resources through meta-tools. 🟡 Model-facing bounds exist; output,
-   standing-approval and effect-derived resource policy remain open.
+   resources through meta-tools. 🟡 Model-facing bounds exist, and the
+   narrow standing `TaskExecutionPolicy` (`CORE-08`) is landed; a unified
+   output broker and effect-derived resource policy remain open.
 6. **V1-M15 Real Evaluation** — coding workload A/B/C + lifecycle metrics.
    Acceptance: the dynamic runtime saves tokens without lowering task
    success rate. 🧪 Replay and one no-tool live smoke exist; real coding
@@ -1202,9 +1203,10 @@ letting the LLM grow capabilities autonomously.
    real filesystem/network/resource isolation with adversarial cancel/escape
    tests.
 4. **Complete bounded policy (M14).** Put every producer behind one output
-   broker and add a narrow, revocable `TaskExecutionPolicy` so unattended
-   builds/tests inside a granted sandbox do not prompt per call while broader
-   effects remain denied.
+   broker. The narrow, revocable `TaskExecutionPolicy` is landed (`CORE-08`):
+   unattended builds/tests inside a granted scope no longer prompt per call
+   while broader effects remain denied; effect-derived resource policy
+   remains.
 5. **Optimize measured context work.** Give external refs a token budget,
    pack by fit before top-K exclusion, avoid O(total-history) external/session
    candidate scans, and make diagnostics count the logical catalog. Record
@@ -1261,7 +1263,7 @@ a completed extension sandbox. External process capabilities must remain
 disabled by default until the M12 wire-level effect broker and this isolation
 boundary are complete.
 
-## V1-M14 Resource Policy 🟡 (model-facing bounds implemented)
+## V1-M14 Resource Policy 🟡 (model-facing bounds + standing task execution policy implemented)
 
 Several model-facing dimensions are bounded and tested:
 
@@ -1294,12 +1296,26 @@ Several model-facing dimensions are bounded and tested:
   request (engine prices the working set, the runtime's final guard
   refuses an unshrinkable over-budget request), and the external view is
   bounded by `ContextMapView` (cap 32).
+- **Standing task execution policy.** `TaskApprovalGate` (agent-kernel)
+  wraps any inner gate with narrow, revocable standing grants: one
+  `ToolRisk` effect bound to a `GrantTarget` (workspace path prefix,
+  process command prefix) with a `GrantConstraint` (`max_content_bytes`,
+  `max_runs`) and an expiry. The model can use a matching grant without a
+  per-call prompt but can never create, widen or extend one — grants are
+  established by the composition root (`agent-tui` parses `--grant=<json>`),
+  listed via `/grants` and revoked via `revoke`. Matching is component-aware
+  on paths and lexical on command tokens, consumption is bounded per call,
+  and an expired/exhausted grant falls through to the underlying gate, so a
+  missing responder denies without privilege expansion (`CORE-08`).
 
 The milestone acceptance is still open. `ToolSpec` has no trusted per-output
 budget/spill policy; decoded process/provider/error fields do not yet pass
 through one output broker; context diagnostics/catalog scans are not all
-bounded by logical history size; and the approval model has no narrow,
-revocable task/session standing grant. Permission declarations also cannot
+bounded by logical history size. The narrow, revocable standing
+`TaskExecutionPolicy` (`CORE-08`) is now implemented: effect + target +
+constraint + expiry grants established by the composition root, consumed per
+call, revoked or expired by shrinking, with a zero-responder deny/skip
+fallback that never expands privileges. Permission declarations also cannot
 contain a hostile child until M13 brokers the underlying resources. See
 `CORE-04`, `CORE-08`, `CTX-07` and `CTX-09`.
 
