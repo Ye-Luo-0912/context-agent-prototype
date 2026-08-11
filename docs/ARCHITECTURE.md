@@ -867,6 +867,18 @@ cannot promote its own module), while trusted in-process capabilities
 keep their declared status. The registry exposes the effective status and
 a catalog snapshot for the discovery surface.
 
+Since the capability-ownership split, admission is a **core** decision:
+`agent-core`'s `CapabilityAdmission` authority owns the registration caps
+(schema size, name/description length, per-capability tool count), the
+lock-free static validation (id shape, tool schemas, authority
+derivation — risk is derived from declared permissions, never
+self-declared), the collision pass (duplicate id, missing `requires`,
+reserved/owned tool names) against a registry-built `AdmissionContext`,
+and the `initial_status`/`initial_activation` decisions. The runtime's
+`CapabilityRegistry` delegates to it, so the same admission rules apply no
+matter which registry (or future host) asks; the registry still owns the
+mutable surface state (activation, loaded tools, run lifecycle).
+
 Since V1-P8 the manifest speaks `provides: Vec<CapabilityKind>`
 (tool/skill/service) and `requires` (the old `dependencies` name still
 deserializes). External extensions are out-of-process over a framed

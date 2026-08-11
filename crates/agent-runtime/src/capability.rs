@@ -19,10 +19,9 @@ use agent_contracts::{
     AgentError, AgentResult, ArtifactHandle, CAPABILITY_MANAGE, CAPABILITY_SEARCH_DEFAULT_LIMIT,
     CAPABILITY_SEARCH_MAX_LIMIT, Capability, CapabilityActivation, CapabilityInvocationContext,
     CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
-    CapabilityTransport, Effect, PROCESS_RUN, RUNTIME_CONTEXT_CONTROL, ToolCatalogEntry,
-    ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolRisk,
-    ToolSpec, ToolSurfaceSnapshot, WORKSPACE_READ, WORKSPACE_WRITE, WorkspaceHandle,
-    is_known_permission, validate_capability_id,
+    CapabilityTransport, Effect, RUNTIME_CONTEXT_CONTROL, ToolCatalogEntry, ToolDispatcher,
+    ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolSpec, ToolSurfaceSnapshot,
+    WORKSPACE_READ, WORKSPACE_WRITE, WorkspaceHandle,
 };
 use agent_workspace::{ArtifactStoreHandle, ConfinedWorkspaceHandle, Workspace};
 use async_trait::async_trait;
@@ -88,143 +87,6 @@ struct Entry {
     loaded_tools: HashSet<String>,
     /// A tool of this capability is executing right now.
     active: bool,
-}
-
-/// Registration limits for capability-declared tool schemas: a single
-/// capability must not be able to grow the model surface without bound — a
-/// huge schema, a huge description or a huge tool count is itself context
-/// pollution. The limits are enforced at registration (validated once, then
-/// cached), so a runaway capability is rejected before it ever reaches the
-/// catalog.
-pub const MAX_TOOLS_PER_CAPABILITY: usize = 32;
-pub const MAX_TOOL_NAME_CHARS: usize = 64;
-pub const MAX_TOOL_DESCRIPTION_CHARS: usize = 200;
-pub const MAX_TOOL_SCHEMA_BYTES: usize = 4 * 1024;
-
-/// Validate the tool schemas a capability declares at registration: name
-/// shape/length, description length, per-schema byte size, duplicate names
-/// within the capability, and the per-capability tool count.
-fn validate_tool_specs(manifest_id: &str, specs: &[ToolSpec]) -> AgentResult<()> {
-    if specs.len() > MAX_TOOLS_PER_CAPABILITY {
-        return Err(AgentError::InvalidRequest(format!(
-            "capability '{manifest_id}' declares {} tools, above the {MAX_TOOLS_PER_CAPABILITY} per-capability cap",
-            specs.len()
-        )));
-    }
-    let mut names = std::collections::HashSet::new();
-    for spec in specs {
-        if spec.name.is_empty() || spec.name.len() > MAX_TOOL_NAME_CHARS {
-            return Err(AgentError::InvalidRequest(format!(
-                "capability '{manifest_id}' declares a tool name of {} chars (allowed 1..={MAX_TOOL_NAME_CHARS})",
-                spec.name.len()
-            )));
-        }
-        let well_formed = spec
-            .name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'));
-        if !well_formed {
-            return Err(AgentError::InvalidRequest(format!(
-                "capability '{manifest_id}' declares tool name '{}': only [A-Za-z0-9._:-] are allowed",
-                spec.name
-            )));
-        }
-        if !names.insert(spec.name.clone()) {
-            return Err(AgentError::InvalidRequest(format!(
-                "capability '{manifest_id}' declares tool '{name}' twice",
-                name = spec.name
-            )));
-        }
-        if spec.description.len() > MAX_TOOL_DESCRIPTION_CHARS {
-            return Err(AgentError::InvalidRequest(format!(
-                "capability '{manifest_id}' tool '{}' description is {} chars, above the {MAX_TOOL_DESCRIPTION_CHARS} cap",
-                spec.name,
-                spec.description.len()
-            )));
-        }
-        let bytes = serde_json::to_vec(&spec.input_schema)
-            .unwrap_or_default()
-            .len();
-        if bytes > MAX_TOOL_SCHEMA_BYTES {
-            return Err(AgentError::InvalidRequest(format!(
-                "capability '{manifest_id}' tool '{}' input schema is {bytes} bytes, above the {MAX_TOOL_SCHEMA_BYTES} cap",
-                spec.name
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Validate the authority a manifest declares against what the runtime will
-/// actually enforce. The approval gate auto-allows `ReadOnly` tools, so the
-/// risk label must be *derived* from the declared authority, never
-/// self-declared by a side-effecting capability:
-///
-/// - every declared permission must be a known permission string (unknown
-///   access is denied by refusing the declaration);
-/// - a capability that declares any side-effecting permission may not mark
-///   any tool `ReadOnly` (a process that can write must not auto-allow);
-/// - a tool's risk may not exceed its grant (a `WorkspaceWrite` tool needs
-///   `workspace:write`, a `ProcessExecution` tool needs `process:run`);
-/// - a process-transport capability may declare `workspace:write` because
-///   the wire effect broker stages its mutations: the adapter validates the
-///   child's structured wire effects against the grant and commits them
-///   through the confined handle behind the generation fence.
-fn validate_manifest_authority(
-    manifest: &CapabilityManifest,
-    tool_specs: &[ToolSpec],
-) -> AgentResult<()> {
-    for permission in &manifest.permissions {
-        if !is_known_permission(permission) {
-            return Err(AgentError::InvalidRequest(format!(
-                "capability '{}' declares unknown permission '{permission}'; allowed: workspace:read, workspace:write, process:run, runtime:context-control, artifact:*",
-                manifest.id
-            )));
-        }
-    }
-    let declares_approval_gated_mutation = manifest
-        .permissions
-        .iter()
-        .any(|p| p == WORKSPACE_WRITE || p == PROCESS_RUN);
-    if declares_approval_gated_mutation {
-        for spec in tool_specs {
-            if spec.risk == ToolRisk::ReadOnly {
-                return Err(AgentError::InvalidRequest(format!(
-                    "capability '{}' declares workspace-write/process-run authority but tool '{}' self-declares ReadOnly; risk is derived from declared authority, never self-declared (ReadOnly auto-allows at the approval gate)",
-                    manifest.id, spec.name
-                )));
-            }
-        }
-    }
-    for spec in tool_specs {
-        match spec.risk {
-            ToolRisk::WorkspaceWrite => {
-                if !manifest.permissions.iter().any(|p| p == WORKSPACE_WRITE) {
-                    return Err(AgentError::InvalidRequest(format!(
-                        "capability '{}' tool '{}' needs the '{WORKSPACE_WRITE}' permission, which is not declared",
-                        manifest.id, spec.name
-                    )));
-                }
-            }
-            ToolRisk::ProcessExecution => {
-                if !manifest.permissions.iter().any(|p| p == PROCESS_RUN) {
-                    return Err(AgentError::InvalidRequest(format!(
-                        "capability '{}' tool '{}' needs the '{PROCESS_RUN}' permission, which is not declared",
-                        manifest.id, spec.name
-                    )));
-                }
-            }
-            ToolRisk::ReadOnly => {}
-        }
-    }
-    // A process capability may declare `workspace:write` — but only because
-    // the wire effect broker exists: the child stages structured wire
-    // effects and the adapter commits them through the confined workspace
-    // handle behind the generation fence. The child itself never writes.
-    // Enforcement of the write path is the adapter's job; a process whose
-    // adapter is not the wire-brokering one simply cannot be registered
-    // (there is only one adapter).
-    Ok(())
 }
 
 /// One row of the platform's capability catalog (the discovery surface).
@@ -309,11 +171,11 @@ impl CapabilityRegistry {
         // time — never under the registry's lock.
         let manifest = capability.manifest().clone();
         let tool_specs = capability.tool_specs();
-        // The id is identity: it is validated before anything derived from
-        // it (tool names, routes, directories).
-        validate_capability_id(&manifest.id).map_err(AgentError::InvalidRequest)?;
-        validate_tool_specs(&manifest.id, &tool_specs)?;
-        validate_manifest_authority(&manifest, &tool_specs)?;
+        // Admission is a core decision: the core's stateless authority
+        // validates the manifest, tool schemas and authority derivation
+        // lock-free, then checks collisions against this registry's live
+        // state (duplicate id, missing requires, shadowed/owned tool names).
+        agent_core::CapabilityAdmission::validate_static(&manifest, &tool_specs)?;
         let tool_names: Vec<&str> = tool_specs.iter().map(|spec| spec.name.as_str()).collect();
 
         let _surface = self
@@ -321,60 +183,29 @@ impl CapabilityRegistry {
             .write()
             .expect("capability registry poisoned");
         let mut inner = self.inner.write().expect("capability registry poisoned");
-        if inner.contains_key(&manifest.id) {
-            return Err(AgentError::InvalidRequest(format!(
-                "capability '{}' is already registered",
-                manifest.id
-            )));
-        }
-        for requirement in &manifest.requires {
-            if !inner.contains_key(requirement) {
-                return Err(AgentError::InvalidRequest(format!(
-                    "capability '{}' requires '{}' which is not registered",
-                    manifest.id, requirement
-                )));
-            }
-        }
         let reserved = self.reserved.read().expect("capability registry poisoned");
-        for name in &tool_names {
-            if reserved.contains(*name) {
-                return Err(AgentError::InvalidRequest(format!(
-                    "capability '{}' declares tool '{name}', which is reserved by the runtime; capabilities cannot shadow core tools",
-                    manifest.id
-                )));
-            }
-        }
+        let ctx = agent_core::AdmissionContext {
+            is_registered: &|id| inner.contains_key(id),
+            reserved_names: &reserved,
+            owner_of_tool: &|name| {
+                inner.iter().find_map(|(id, entry)| {
+                    entry
+                        .tool_specs
+                        .iter()
+                        .any(|spec| spec.name == name)
+                        .then(|| id.clone())
+                })
+            },
+        };
+        agent_core::CapabilityAdmission::validate_collisions(&manifest, &tool_names, &ctx)?;
         drop(reserved);
-        for name in &tool_names {
-            if let Some((owner, _)) = inner.iter().find(|(_, entry)| {
-                entry
-                    .tool_specs
-                    .iter()
-                    .any(|spec| spec.name.as_str() == *name)
-            }) {
-                return Err(AgentError::InvalidRequest(format!(
-                    "capability '{}' declares tool '{name}', which is already owned by capability '{owner}'",
-                    manifest.id
-                )));
-            }
-        }
-        // The maturity ladder is climbed, not declared: out-of-process
-        // (external/LLM-authored) capabilities always start Experimental.
-        let status = if manifest.transport != CapabilityTransport::Builtin
-            && manifest.status != CapabilityStatus::Experimental
-        {
-            CapabilityStatus::Experimental
-        } else {
-            manifest.status
-        };
-        // Activation is granted, not declared: only the trusted in-process
-        // core is usable immediately; external capabilities enter Disabled
-        // and need an explicit enable before anything runs.
-        let activation = if manifest.transport == CapabilityTransport::Builtin {
-            CapabilityActivation::Enabled
-        } else {
-            CapabilityActivation::Disabled
-        };
+
+        // Maturity and activation are decided by the core's admission
+        // authority, never declared: external capabilities always start
+        // Experimental and Disabled; only the trusted in-process core keeps
+        // its declared status and starts Enabled.
+        let status = agent_core::CapabilityAdmission::initial_status(&manifest);
+        let activation = agent_core::CapabilityAdmission::initial_activation(&manifest);
         inner.insert(
             manifest.id.clone(),
             Entry {
@@ -1041,6 +872,7 @@ impl CapabilityAwareDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_contracts::ToolRisk;
     use std::{
         sync::{Mutex, mpsc},
         thread,

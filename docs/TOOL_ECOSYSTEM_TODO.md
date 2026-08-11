@@ -943,9 +943,21 @@ together with TaskAnchor and continuous context GC.
   actor routes every scheduling trigger through `services`, keeps the
   authority facade on `kernel`. See `docs/TOOL_ECOSYSTEM_TODO.md`
   "Incremental Core migration" slices 3-4.
-- [ ] **MOD-05** Split capability ownership: Core owns admission, grants,
+- [~] **MOD-05** Split capability ownership: Core owns admission, grants,
   activation/quarantine, and maturity authority; Runtime owns catalog views,
   load/unload scheduling, active state, and per-round surface snapshots.
+  **Slice 1 landed 2026-08-12** — admission is now a core decision:
+  `agent-core::capability_admission` owns the registration caps
+  (`MAX_TOOLS_PER_CAPABILITY` etc.), `validate_static` (id shape, tool
+  schema shape/size, manifest-authority derivation, all lock-free) and the
+  collision pass `validate_collisions` (duplicate id, missing requires,
+  reserved/owned tool names) driven by a registry-built `AdmissionContext`,
+  plus the `initial_status`/`initial_activation` decisions (external ->
+  Experimental + Disabled). The runtime registry delegates to it with
+  identical error messages and check order; behavior is unchanged
+  (existing capability registration/surface tests still pass). Remaining
+  slices: activation/quarantine/maturity state ownership moves into a core
+  authority seam, then catalog/lifecycle synchronization with that state.
 - [ ] **COMPOSE-01** Extract reusable application/bootstrap composition from
   `agent-tui` for TUI/CLI/eval while keeping it stateless and actor-free.
 - [x] **ECO-02** Make manifest identity/path/source validation and process stdout/stderr
