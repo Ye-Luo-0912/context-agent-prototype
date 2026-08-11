@@ -220,6 +220,12 @@ async fn server_loop() {
                     .and_then(|args| args.get("ask_unknown_system"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                let ask_fs_flood = request
+                    .get("call")
+                    .and_then(|call| call.get("arguments"))
+                    .and_then(|args| args.get("ask_fs_flood"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let probe = if let Some(path) = ask_fs_read {
                     Some(SystemProbe::FsRead { path })
                 } else if ask_net_fetch {
@@ -246,7 +252,27 @@ async fn server_loop() {
                 .expect("ToolOutput serializes");
                 // When a broker hook is set, run one system round trip now
                 // and overwrite the model content with its outcome.
-                let output = if let Some(probe) = probe {
+                // `ask_fs_flood` instead fires `MAX_SYSTEM_REQUESTS_PER_CALL
+                // + 1` mid-invoke `fs.read` frames: the host must enforce
+                // its per-call system-request cap and poison + kill the
+                // tree. The final answer read fails (the tree is dead), so
+                // the mock can only report the flood ran; the parent-side
+                // test asserts the invoke itself failed with the poisoned
+                // connection.
+                let output = if ask_fs_flood {
+                    let cap = agent_process::MAX_SYSTEM_REQUESTS_PER_CALL;
+                    for _ in 0..(cap + 1) {
+                        let _ = system_round_trip(
+                            &mut writer,
+                            &mut lines,
+                            json!({ "system": "fs.read", "path": "x" }),
+                        )
+                        .await;
+                    }
+                    let mut output = output;
+                    output["model_content"] = json!("FLOOD_DONE");
+                    output
+                } else if let Some(probe) = probe {
                     let answer = system_round_trip(&mut writer, &mut lines, probe.frame()).await;
                     let model_content = match (
                         answer.get("system_ok").and_then(Value::as_bool),

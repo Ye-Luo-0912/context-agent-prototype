@@ -918,13 +918,18 @@ the `runtime:context-control` manifest permission). The dispatcher maps these
 onto the kernel's `ToolOutcome`, so trusted in-process capabilities can share
 the builtin prepared-effect fence.
 
-This contract is not yet enforced across the process transport.
-`ProcessCapabilityAdapter` currently decodes only `ToolOutput` and returns
-`CapabilityOutcome::Value`; any mutation performed inside the child has
-already happened before the actor sees the result. `shell.exec` is another
-direct-execution lane. Until both are brokered as typed effects or confined to
-non-mutating authority, M12 is open and process capabilities must not be
-described as rollback-safe.
+The process transport now enforces this contract. `ProcessCapabilityAdapter`
+decodes `ProcessInvokeResponse`: a plain `ToolOutput` still passes through
+as `CapabilityOutcome::Value`, while declared `WireEffect`s are validated
+against the invocation's granted permissions and staged through the
+confined workspace handle as `CapabilityOutcome::EffectRequest` — the core
+commits them behind the generation fence, exactly like a builtin tool's
+`PreparedEffect`. A child that mutates *outside* the wire contract (direct
+filesystem writes, network sockets) is not rollback-safe by construction:
+the mid-invoke system broker confines the brokered surface
+(permission-gated `fs.read`, deny-by-default network), but direct OS
+syscalls remain the child's own until the M13 residual (OS-level
+filtering) closes.
 
 Since V1-P0-8 the composition root composes into one `RuntimeInstance`
 that owns the `ModuleHost`, the `RuntimeHandle` and the actor `JoinHandle`.
@@ -1023,23 +1028,33 @@ explicit `ProcessSandbox` (shared `ProcessHost`, since the crate split in
   inherit unbounded output into the parent console.
 - **Bounded control protocol** — the child speaks framed JSON-lines
   (`ping`/`invoke`) with deadlines and connection poisoning. The protocol
-  bounds messages; it does not broker the child's own filesystem, network or
-  process syscalls.
+  bounds messages; the adapter's system broker gates the child's brokered
+  filesystem reads and denies network by default, but raw process syscalls
+  remain the child's own.
 
 `ProcessCapabilityAdapter::from_manifest` applies this hardened profile to
 every process capability; `invoke` forwards the call and the granted
-permissions as informational data. The host enforces env/cwd/rlimit/message
-boundaries, but not permission-specific filesystem/network access. Since the
+permissions to the child. The host enforces env/cwd/rlimit/message
+boundaries, and the adapter's mid-invoke *system broker* enforces the
+permission-specific access: a child `{"system": "fs.read", ...}` request is
+answered only when the invocation holds `workspace:read`, only through the
+confined workspace handle, and only for relative, non-escaping paths;
+network system ops (`net.fetch`, `net.connect`, `http.get`, `http.request`)
+are refused by design — no network permission word exists. Without a broker
+installed, any system frame fails closed (poison + kill), and a per-call
+cap (`MAX_SYSTEM_REQUESTS_PER_CALL`) bounds how many system frames one call
+may issue. Since the
 trust-boundary hardening, the manifest
 itself is no longer trusted either: the id must pass a conservative
 grammar (`validate_capability_id`, lowercase/digit start, `[a-z0-9._-]`,
 <= 64) before it is embedded in the working directory or any route, and
 the working directory is private and unpredictable
 (`context-agent-capability-<id>-<uuid>`) so no two runs share a path and
-a hostile pre-created directory cannot be predicted. Filesystem isolation
-beyond the dedicated cwd, an explicit network policy and cross-platform
-memory/I/O/disk/process quotas are still open M13 acceptance requirements;
-until then **V2 autonomous
+a hostile pre-created directory cannot be predicted. The broker confines
+the *brokered* surface; OS-level filesystem/network filtering (a hostile
+child opening arbitrary absolute paths or sockets directly at the OS
+layer), plus cross-platform memory/I/O/disk quotas, remain open M13
+acceptance requirements; until then **V2 autonomous
 capability generation stays gated** — a generated capability only runs
 after explicit `enable`, and only inside the sandbox above.
 

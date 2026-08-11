@@ -1119,7 +1119,7 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 | M10 Runtime Consistency | ✅ | Cross-plane checkpoint capture and live-restore audit/recovery are closed (`CORE-03`), the GC/storage/checkpoint/restore operation protocol is closed (`CTX-06`), the task authority/completion contract is closed (`CTX-10`: TaskAnchor, CompletionRecord, atomic root transfer, storage-root outcomes), and the standing recovery-replay path is closed (`CORE-02` residual: `agent-replay --recover` locates the durability barrier and failure phase, checks envelope-sequence integrity, rebuilds the context-engine state from the trace, and proves checkpoint restore + tail replay equals the full rebuild). M10's named acceptance (runtime and context never drift into a task/state split-brain) is exercised by the invariant suite plus the engine-level restore-consistency proof. |
 | M11 Context Recall | ✅ narrow retrieval baseline | Search/inspect/fetch, transient results, bounded external view and service parity work. Canonical catalog ownership and complete cross-residency semantics remain context-runtime work rather than reasons to call recall itself absent. TaskAnchor/Completion roots are now implemented (`CTX-10`). |
 | M12 Effect Runtime | ✅ | In-process prepared effects and process-capability wire effects commit behind the generation fence (`CORE-01`), a cancelled operation kills its whole process tree (`CORE-06`: shell/git/capability share one tree-kill) and cleans up every pending approval entry, provider streams are byte-capped, and Windows Job-Object quotas are kernel-enforced. The standing-grant `TaskExecutionPolicy` (CORE-08) is M14 approval-policy work, not an M12 gap. |
-| M13 Extension Sandbox | 🟡 partial | Env scrub, private cwd, bounded stderr, process-tree cancellation and Windows Job-Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE) are enforced; Unix rlimits cover CPU/process count; workspace filesystem access is confined to directory-handle-relative opens with reparse substitution rejected at open time (`CORE-07`). A cwd is still not a filesystem boundary: absolute filesystem/network access is not brokered, which keeps M13 open. |
+| M13 Extension Sandbox | 🟡 partial | Env scrub, private cwd, bounded stderr, process-tree cancellation, Windows Job-Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE), Unix rlimits (CPU/process) and directory-handle-relative workspace opens with reparse substitution rejected at open time (`CORE-07`) are enforced. Mid-invoke filesystem access is now brokered: a child's `fs.read` system request is answered only under the invocation's `workspace:read` grant, only through a confined workspace handle, and only for relative non-escaping paths (absolute/rooted and `..` paths refused before the handle is consulted); network is explicitly deny-by-default (no network permission word exists; recognized network ops get a named refusal). OS-level filesystem/network filtering — a hostile child opening arbitrary absolute paths or sockets at the OS layer — remains the residual gap (`CORE-01` open). |
 | M14 Resource Policy | 🟡 partial | Schema/context quotas, risk/permission validation and final output guards exist; the narrow standing `TaskExecutionPolicy` is landed (`CORE-08`: effect + target + constraint + expiry grants, revocable, zero-responder deny/skip); the kernel-level trusted output broker is landed (`CORE-04`: capped fields, one-time artifact spill, execution-enforced query limits); a declared per-tool output budget on `ToolSpec` is enforced by the broker (clamped to the global hard cap); approval is now effect-derived: `EffectIntent` (contract type) is derived from the validated arguments and standing grants match the concrete intent (path, content bytes, command prefix) instead of re-parsing raw arguments; and commit-time resource enforcement is landed (`AuthorityLease`: every side-effecting call mints a short-lived lease at approval, and the actor refuses to commit a staged effect whose lease expired or whose operation generation moved — rollback, never commit). |
 | M15 Real Evaluation | 🧪 instrumentation/smoke only | Replay is a policy proxy and the live run is a no-tool constraint-retention task. The A/B/C/D evaluation inputs (four tool-surface arms + four coding fixtures with hidden verification, `agent-eval --fixtures`), the all-module cost-accounting aggregation (`agent-eval --metrics`), a deterministic fixture runner (`agent-eval --fixture <id>`, scripted model driving the real builtin tool surface end to end), a live fixture path (`agent-eval --fixture-live <id>`, real provider when `OPENAI_API_KEY` is set), and a cross-engine fixture comparison (`agent-eval --compare-arm <id>`, append-only / rolling-summary / dynamic on the same five-turn scripted model and the same real tool surface: every engine passes the hidden verification and dynamic feeds the model measurably fewer input tokens) are landed; there is still no paired real coding workload run with a real model, or a non-inferiority result. |
 | V2 Self-Iteration | 🔒 blocked | Registry maturity and sandboxed self-checks are foundations only. Autonomous generation/promotion stays disabled until M10 and M12-M15 acceptance gates close. |
@@ -1165,8 +1165,13 @@ the required gate order; the numbered list and table above are authoritative.
    permissions granted to it. 🟡 Host hardening plus Windows Job-Object
    quotas and Unix rlimits exist; workspace filesystem access is confined
    (directory-handle-relative opens, reparse substitution rejected at open
-   time — `CORE-07`); brokered OS filesystem/network access is still not
-   implemented.
+   time — `CORE-07`); mid-invoke filesystem reads are brokered (`fs.read`
+   system requests answered only with a `workspace:read` grant through a
+   confined handle, path-shape preflight before the handle) and network is
+   explicitly deny-by-default (no network permission word; recognized
+   network ops refused by name; undeclared ops refused). OS-level
+   filesystem/network filtering (seccomp/AppContainer-style) remains the
+   residual gap.
 5. **V1-M14 Resource Policy** — tool schema budget (the per-round surface
    bound landed in Performance P1), context hint quota,
    RiskClass, PermissionSet. Acceptance: the LLM cannot exhaust runtime
@@ -1248,7 +1253,7 @@ This order preserves the original research goal: continuous GC stays active
 throughout a long task, but correctness, authority and evidence retention are
 fixed before policy sophistication.
 
-## V1-M13 Extension Sandbox ⛔ (host hardening only)
+## V1-M13 Extension Sandbox 🟡 (host hardening + brokered FS/network)
 
 A process capability runs with a hardened process-host profile
 (`ProcessSandbox` in `agent-process`, built by
@@ -1279,17 +1284,47 @@ A process capability runs with a hardened process-host profile
   producing side effects. Covered by the existing cancellation tests.
 - **Permissions cross the boundary as data.** The granted set arrives intact
   (`granted_permissions_reach_the_child_intact`), but the child is not forced
-  to obey it. Authority is enforced only where access is brokered by trusted
-  host APIs.
-- **Missing acceptance boundary.** M13 requires brokered/OS-enforced
-  filesystem and network access, memory/I/O/disk/process quotas (including a
-  Windows Job Object or equivalent), and adversarial escape tests. These are
-  trust prerequisites, not an evidence-gated optimization.
+  to obey it. Authority is enforced where access is brokered by trusted host
+  APIs — and the mid-invoke system broker is exactly that: every brokered
+  request is checked against the invocation's actual grant.
+- **Brokered filesystem reads.** A child can ask for a file mid-invoke
+  (`{"system": "fs.read", "path": <relative>}`) and the adapter's
+  `SystemBroker` answers it from the confined workspace handle — but only
+  when the invocation holds `workspace:read`, and only for relative,
+  non-escaping, non-rooted paths: absolute/rooted paths (e.g. `/etc/passwd`,
+  rejected even where the OS does not call them absolute, as on Windows) and
+  `..` escapes are refused before the handle is ever consulted, so the
+  security boundary does not depend on the handle's implementation. The
+  broker never hands an absolute path to the workspace handle. Covered by
+  `brokered_fs_read_serves_files_inside_the_workspace`,
+  `brokered_fs_read_refuses_absolute_and_escaping_paths` and
+  `brokered_fs_read_without_the_grant_is_refused`.
+- **Network is deny-by-default.** The permission vocabulary has no network
+  word, so there is nothing to grant: recognized network system ops
+  (`net.fetch`, `net.connect`, `http.get`, `http.request`) get an explicit
+  refusal naming the policy, every undeclared op is refused, and a
+  networkish grant string cannot unlock the network. Covered by
+  `brokered_network_requests_are_refused_by_default` and
+  `network_requests_are_refused_even_with_a_networkish_grant`.
+- **System frames are bounded and fail closed.** A system frame with no
+  broker installed poisons the connection and kills the tree
+  (`system_frames_without_a_broker_poison_and_kill_the_connection`); a
+  per-call cap (`MAX_SYSTEM_REQUESTS_PER_CALL`) bounds how many frames one
+  call may issue, so a child cannot flood the host
+  (`a_system_request_flood_poisons_and_kills_the_connection`); a refused
+  system request is an answer, not a connection failure
+  (`a_refused_system_request_does_not_poison_the_connection`).
+- **Residual.** The brokered surface is confined; the child's *direct* OS
+  access is not. A hostile child can still open arbitrary absolute paths or
+  sockets itself at the OS layer — seccomp-bpf / AppContainer-style
+  filtering is out of v0 scope and stays gated with V2. Cross-platform
+  memory/I/O/disk quotas also remain (Windows Job-Object memory ceilings
+  and Unix rlimits cover part of it). These keep M13 from closing.
 
-Therefore the current `ProcessSandbox` name denotes host hardening hooks, not
-a completed extension sandbox. External process capabilities must remain
-disabled by default until the M12 wire-level effect broker and this isolation
-boundary are complete.
+Therefore `ProcessSandbox` covers host hardening plus a brokered
+filesystem/network surface; it is not an OS-level sandbox. External process
+capabilities remain disabled by default until the isolation boundary is
+complete.
 
 ## V1-M14 Resource Policy 🟡 (model-facing bounds + standing task execution policy implemented)
 

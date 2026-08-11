@@ -956,3 +956,119 @@ async fn network_requests_are_refused_even_with_a_networkish_grant() {
     );
     capability.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_refused_system_request_does_not_poison_the_connection() {
+    // A broker *refusal* is an answer, not a connection failure: after an
+    // unknown-op refusal the same capability must still serve normal
+    // invokes. Only a broker-less frame or a flood is fatal to the
+    // connection.
+    let capability = started_readonly_capability().await;
+    let output = capability
+        .invoke(
+            ToolCall {
+                id: "c14".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({ "ask_unknown_system": true }),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec!["workspace:read".into()],
+                workspace: None,
+                artifacts: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let model_content = match output {
+        CapabilityOutcome::Value(output) => output.model_content,
+        other => panic!("the wire only carries plain values, got: {other:?}"),
+    };
+    assert!(
+        model_content.contains("FS_REFUSED:") && model_content.contains("unknown system op"),
+        "the first call must surface the refusal: {model_content}"
+    );
+
+    // Same capability, same connection: a plain invoke still works.
+    let output = capability
+        .invoke(
+            ToolCall {
+                id: "c15".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({}),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec!["workspace:read".into()],
+                workspace: None,
+                artifacts: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let model_content = match output {
+        CapabilityOutcome::Value(output) => output.model_content,
+        other => panic!("the wire only carries plain values, got: {other:?}"),
+    };
+    assert!(
+        model_content.contains("process capability handled"),
+        "a refused system request must not break the connection: {model_content}"
+    );
+    capability.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_system_request_flood_poisons_and_kills_the_connection() {
+    // The host caps mid-invoke system frames per call
+    // (`MAX_SYSTEM_REQUESTS_PER_CALL`): a child that keeps asking must be
+    // refused and killed, not served forever — the flood is an
+    // availability attack on the host.
+    let capability = started_readonly_capability().await;
+    let result = capability
+        .invoke(
+            ToolCall {
+                id: "c16".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({ "ask_fs_flood": true }),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec!["workspace:read".into()],
+                workspace: None,
+                artifacts: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await;
+    let message = match result {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("a system flood must fail the invoke"),
+    };
+    assert!(
+        message.contains("too many system requests") || message.contains("poisoned"),
+        "the flood must be refused with the cap or poison named: {message}"
+    );
+
+    // The connection is dead: a follow-up invoke fails fast instead of
+    // riding a dead pipe.
+    let after = capability
+        .invoke(
+            ToolCall {
+                id: "c17".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({}),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec!["workspace:read".into()],
+                workspace: None,
+                artifacts: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await;
+    let message = after.unwrap_err().to_string();
+    assert!(
+        message.contains("poisoned"),
+        "the flood must poison the connection: {message}"
+    );
+    capability.stop().await.unwrap();
+}

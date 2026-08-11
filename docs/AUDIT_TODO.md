@@ -475,14 +475,16 @@ Confirmed chain:
   `invoke`; only the sibling `prepare_write` path reaches a staged Effect;
 - a side-effecting process tool can self-declare `ReadOnly`, which approval
   auto-allows;
-- cwd + env filtering + Unix rlimits are not filesystem/network isolation;
-  absolute FS/network remain available and Windows has no equivalent rlimit;
+- cwd + env filtering + Unix rlimits are not OS-level isolation; a hostile
+  child can still open absolute paths or sockets directly at the OS layer
+  (brokered access is permission-gated; direct OS access is not) and
+  Windows has no equivalent of the Unix rlimits;
 - `manifest.id` enters a predictable temp path without strict path-safe id
   validation;
 - inherited stderr is unbounded.
 
-External process capabilities must remain disabled until this closes; M12/
-M13 are not implemented trust boundaries yet.
+External process capabilities must remain disabled until this closes; M13
+is not yet a completed trust boundary (M12's wire effect broker has landed).
 
 Required order:
 
@@ -496,11 +498,13 @@ Required order:
 7. adversarial tests proving a cancelled/ReadOnly process cannot mutate an
    absolute path, use undeclared network or outlive its operation.
 
-**Partially repaired 2026-08-10; wire broker landed 2026-08-11.** The
+**Partially repaired 2026-08-10; wire broker landed 2026-08-11; mid-invoke
+system broker landed 2026-08-12.** The
 in-process/runtime-owned mutation path is fenced, process mutations now
-cross a brokered wire effect path, and external process capabilities remain
-Disabled by default. The OS isolation defects below keep CORE-01/M12/M13
-open.
+cross a brokered wire effect path, mid-invoke filesystem reads and network
+requests are brokered and permission-gated (item 9 below), and external
+process capabilities remain Disabled by default. The OS-level isolation
+defect below keeps CORE-01/M13 open.
 
 Implemented:
 
@@ -571,13 +575,42 @@ Implemented:
    `staged_wire_write_returns_an_effect_request` (nothing lands until the
    runtime commits), `wire_write_without_the_grant_is_refused` and
    `wire_write_without_a_workspace_handle_is_refused`.
+9. **Mid-invoke system broker** — a child can issue `{"system": <op>, ...}`
+   frames during an invoke; `ProcessHost` (`agent-process`,
+   `call_with_cancel_and_broker`) routes them to a `SystemBroker` the
+   adapter installs (`InvokeFsBroker` in `agent-capability-process`) and
+   continues the exchange, so the broker is the enforcement point for
+   "experimental code cannot exceed the permissions granted to it".
+   `fs.read` is served only with the invocation's `workspace:read` grant,
+   only through the confined workspace handle, and only for relative,
+   non-escaping, non-rooted paths — absolute/rooted paths are refused even
+   where the OS does not call them absolute (Windows), so the boundary does
+   not depend on the handle's implementation. Network system ops
+   (`net.fetch`, `net.connect`, `http.get`, `http.request`) are refused by
+   design: the permission vocabulary has no network word, so there is
+   nothing to grant. A system frame with no broker installed fails closed
+   (connection poisoned, child tree killed); a per-call cap
+   (`MAX_SYSTEM_REQUESTS_PER_CALL`) bounds frames so a child cannot flood
+   the host; a refused system request is an answer, not a connection
+   failure. Tests: `brokered_fs_read_serves_files_inside_the_workspace`,
+   `brokered_fs_read_refuses_absolute_and_escaping_paths`,
+   `brokered_fs_read_without_the_grant_is_refused`,
+   `unknown_system_ops_are_refused`,
+   `brokered_network_requests_are_refused_by_default`,
+   `network_requests_are_refused_even_with_a_networkish_grant`,
+   `a_refused_system_request_does_not_poison_the_connection`,
+   `a_system_request_flood_poisons_and_kills_the_connection` (capability
+   level) and `system_frames_without_a_broker_poison_and_kill_the_connection`
+   (host level).
 
-Residual (M12/M13; CORE-01 remains open): OS-level filesystem/network isolation
-for the child process (absolute paths and network remain available to a
-hostile child at the OS layer) and Windows Job-Object quota enforcement.
-The wire-level effect broker is implemented: a child stages structured
-mutations as `EffectRequest`s and the core commits them behind the
-generation fence.
+Residual (M13; CORE-01 remains open): OS-level filesystem/network isolation
+for the child process — a hostile child can still open arbitrary absolute
+paths or sockets directly at the OS layer (seccomp-bpf / AppContainer-style
+filtering is out of v0 scope) — and Windows Job-Object quota enforcement.
+The wire-level effect broker and the mid-invoke system broker are
+implemented: mutations are staged as `EffectRequest`s the core commits
+behind the generation fence, and filesystem reads / network requests are
+brokered and permission-gated.
 
 ### CORE-02 — Event-journal enqueue is not a durable turn commit
 
