@@ -3155,6 +3155,156 @@ async fn long_task_10k_turns_keeps_the_working_set_episode_bounded() {
     );
 }
 
+/// Cadence regression for the episode-local turn budget: one overlong
+/// episode that rotates on the `episode_max_user_turns` guard must not
+/// permanently exhaust every later episode's budget. The rotation resets
+/// the counter, so the next episode's related messages do not rotate until
+/// their own turn budget is exhausted — without the reset the guard fires
+/// on the very next user message and rotates a fresh single-turn episode.
+#[tokio::test]
+async fn one_overlong_episode_does_not_exhaust_later_episode_budgets() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        // Related messages never fire the semantic signal (threshold 0
+        // means overlap can never fall below it), so only the turn budget
+        // can rotate the episode.
+        episode_rotate_threshold: 0.0,
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "keep working on the auth service").await;
+
+    // Drive the episode past its turn budget. `FocusState.generation` is
+    // bumped once by `FocusChanged`, so the guard fires at turn `max_turns`
+    // (the budget itself): the counter reaches the cap on the last
+    // in-budget message and the next message observes it.
+    let max_turns = SimpleContextConfig::default().episode_max_user_turns as u64;
+    let mut rotated_at: Option<u64> = None;
+    for turn in 1..=max_turns + 1 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: format!("keep working on the auth cache in round {turn}"),
+            })
+            .await
+            .unwrap();
+        let report = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        if report
+            .transitions
+            .iter()
+            .any(|t| t.reason.contains("episode rotated"))
+            && rotated_at.is_none()
+        {
+            rotated_at = Some(turn);
+        }
+    }
+    // The overlong episode survives its full budget: the guard fires at
+    // the budget boundary, not immediately.
+    let rotated_at = rotated_at.expect("the turn-budget guard must rotate the overlong episode");
+    assert!(
+        rotated_at >= max_turns.saturating_sub(1),
+        "the episode must survive its full turn budget before rotating, rotated at turn {rotated_at}"
+    );
+
+    // A fresh episode starts with a reset budget: five related messages
+    // must not rotate again (a rotation would evict this episode's
+    // ordinary dialogue), and the dialogue stays resident.
+    let mut resident_turns = Vec::new();
+    for turn in 1..=5u64 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: format!("keep working on the auth cache in round {turn}"),
+            })
+            .await
+            .unwrap();
+        let report = engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        assert!(
+            !report
+                .transitions
+                .iter()
+                .any(|t| t.reason.contains("episode rotated")),
+            "a fresh episode must not rotate on the exhausted-budget guard (round {turn})"
+        );
+        resident_turns = engine
+            .state
+            .lock()
+            .await
+            .items
+            .iter()
+            .filter(|item| item.kind == ContextKind::UserMessage)
+            .map(|item| item.created_turn)
+            .collect();
+    }
+    assert!(
+        resident_turns.len() >= 5,
+        "the fresh episode's ordinary dialogue must stay resident, got {resident_turns:?}"
+    );
+}
+
+/// Ordinary dialogue of the *open* focus episode ages out of the working
+/// set: related messages share tokens, so the score floor keeps them
+/// Active and the focus-scope root would otherwise accumulate every turn
+/// of a long episode (a 500-turn episode would hold ~500 messages even
+/// though no rotation fires). After the staleness window (ttl x 4) the
+/// dialogue leaves the heap into the reversible buffer and is not bounced
+/// back by its own high score, so the resident working set stays bounded
+/// without relying on episode rotation.
+#[tokio::test]
+async fn open_focus_ordinary_dialogue_ages_out_without_rotation() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "keep working on the auth service").await;
+
+    // Related messages across several staleness windows (default ttl x 4 =
+    // 20 turns), with periodic GC. The resident heap must not accumulate
+    // every message: aged ordinary dialogue leaves Resident even though
+    // its score floor keeps it Active.
+    let mut max_resident = 0usize;
+    for turn in 1..=120u64 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: format!("keep working on the auth cache in round {turn}"),
+            })
+            .await
+            .unwrap();
+        tool_observation(
+            &engine,
+            &turn.to_string(),
+            &format!("patched Item{}", turn % 7),
+        )
+        .await;
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        if turn % 10 == 0 {
+            engine.gc().await.unwrap();
+            let resident = engine.state.lock().await.items.len();
+            max_resident = max_resident.max(resident);
+        }
+    }
+    assert!(
+        max_resident < 60,
+        "open-episode ordinary dialogue must age out, peak resident was {max_resident}"
+    );
+
+    // The bound comes from the aging rule, not from episode rotation: the
+    // focus scope stays open the whole run (120 turns < the 500-turn
+    // budget), so no closed-scope eviction ever fired.
+    let state = engine.state.lock().await;
+    let open_focus_scopes = state
+        .scopes
+        .iter()
+        .filter(|s| s.kind == ScopeKind::Focus && s.state == ScopeState::Active)
+        .count();
+    assert_eq!(
+        open_focus_scopes, 1,
+        "the episode must stay open (no rotation); the bound must come from aging"
+    );
+}
+
 /// A terminal semantic transition (supersession) must reach the target
 /// wherever its body currently sits. A decision externalized to the store
 /// (Cold) and one sitting in the warm buffer are still the same decisions:

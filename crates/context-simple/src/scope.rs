@@ -15,8 +15,9 @@ fn should_promote(item: &ContextItem) -> bool {
 
 /// The durable-outcome test shared by resident items and external entries
 /// (both carry `retention` and `tags`; the external body lives in the store
-/// but its membership identity is promoted the same way).
-fn retention_or_tag_promotable(retention: ContextRetention, tags: &[Label]) -> bool {
+/// but its membership identity is promoted the same way). GC uses the same
+/// test to decide which open-episode members ordinary dialogue may age out.
+pub(crate) fn retention_or_tag_promotable(retention: ContextRetention, tags: &[Label]) -> bool {
     matches!(
         retention,
         ContextRetention::Pinned | ContextRetention::Durable
@@ -195,6 +196,15 @@ pub(crate) fn close_focus_episode(state: &mut State) -> Vec<ContextStateTransiti
     let Some(focus_id) = focus_id else {
         return Vec::new();
     };
+    // Episode-local turn budget: `FocusState.generation` counts user turns
+    // *inside the current episode*, so a rotation must reset it. Without
+    // the reset, one overlong episode (the `episode_max_user_turns` guard)
+    // permanently exhausts every later episode's budget — the guard would
+    // fire on the very next user message and rotate a fresh single-turn
+    // episode.
+    if let Some(focus) = state.focus.as_mut() {
+        focus.generation = 0;
+    }
     close_scope(state, focus_id)
 }
 

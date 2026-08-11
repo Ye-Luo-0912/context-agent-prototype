@@ -115,6 +115,20 @@ pub(crate) fn plan_full_gc(
     let focus = state.focus.clone();
     let hot_entities = state.hot_entities.clone();
     let marked = mark_roots(state, config, focus.as_ref(), &hot_entities);
+    // The ids of items whose entities are hot right now, mirroring the
+    // mark phase's `hot` test. The sweep exempts hot items from the
+    // ordinary-dialogue aging rule, and the reactivate phase applies the
+    // same exemption, so "hot" stays a fresh causal reason in both passes.
+    let hot_ids: HashSet<ContextItemId> = state
+        .items
+        .iter()
+        .filter(|item| {
+            !task_completed(state, item.task_id)
+                && !hot_entities.is_empty()
+                && entities_match(&item.entities, &hot_entities)
+        })
+        .map(|item| item.id)
+        .collect();
 
     // ----- Sweep phase: unmarked items ------------------------------
     // Roots protect *live* items. A semantically dead item is dead no
@@ -137,7 +151,17 @@ pub(crate) fn plan_full_gc(
         let consumed_ephemeral = item.attention == AttentionState::Archived
             && item.retention == ContextRetention::Ephemeral
             && item.scope == ContextScope::Turn;
-        let alive_root = item.semantic.is_live()
+        // Ordinary dialogue of the *open* focus episode has a shelf life
+        // too: related messages share tokens, so the score floor keeps
+        // them Active forever and the focus-scope root would accumulate
+        // every turn of a long episode. A Working item with no promotable
+        // outcome, no hot entities, no model directive, older than the
+        // staleness window (ttl x 4), leaves the heap even though it is
+        // marked — it stays Live in the reversible buffer, so this is
+        // aging, not death.
+        let aged_ordinary = aged_ordinary_dialogue(&item, config, turn, hot_ids.contains(&item.id));
+        let alive_root = !aged_ordinary
+            && item.semantic.is_live()
             && marked.contains(&item.id)
             && (model_directed || !consumed_ephemeral);
         if alive_root {
@@ -159,8 +183,14 @@ pub(crate) fn plan_full_gc(
                 .by_id(sid)
                 .is_none_or(|scope| scope.state == ScopeState::Closed)
         });
-        if closed_member || eviction_candidate(&item, config, turn, generation) {
-            let reason = if closed_member {
+        if aged_ordinary || closed_member || eviction_candidate(&item, config, turn, generation) {
+            let reason = if aged_ordinary {
+                let age = turn.saturating_sub(item.created_turn);
+                format!(
+                    "ordinary dialogue aged out of the open focus episode (age {age} turns > ttl x4 = {}); evicted to reversible buffer (generation {generation})",
+                    config.turn_ttl_ticks * 4
+                )
+            } else if closed_member {
                 format!(
                     "member of a closed {} scope; evicted to reversible buffer (generation {generation})",
                     state
@@ -586,6 +616,32 @@ fn in_scope_chain(state: &State, item: &ContextItem, target_id: ScopeId) -> bool
     false
 }
 
+/// Whether a Working item is ordinary dialogue that outlived its shelf
+/// life inside the *open* focus episode. Related messages share tokens, so
+/// the score floor keeps them Active forever and the focus-scope root
+/// would otherwise accumulate every turn of a long episode (a 500-turn
+/// episode would hold ~500 messages). An item that carries no promotable
+/// outcome (decision / finding / constraint / open-loop / artifact or
+/// evidence ref), is not hot right now, is not model-directed, and is
+/// older than the same staleness window residency uses (ttl x 4) leaves
+/// the heap even though it is marked — it stays semantically Live in the
+/// reversible buffer, so this is aging, not death. A hot item is exempt:
+/// "entities are hot again" is a fresh causal reason, so hot ordinary
+/// dialogue stays (or comes back).
+fn aged_ordinary_dialogue(
+    item: &ContextItem,
+    config: &SimpleContextConfig,
+    turn: u64,
+    hot: bool,
+) -> bool {
+    item.retention == ContextRetention::Working
+        && !crate::scope::retention_or_tag_promotable(item.retention, &item.tags)
+        && !item.keep_alive
+        && !item.lease_until_turn.is_some_and(|until| turn <= until)
+        && !hot
+        && turn.saturating_sub(item.created_turn) > config.turn_ttl_ticks * 4
+}
+
 /// Whether an unmarked item is an eviction candidate this pass. GC only
 /// evicts what the semantic machine already demoted (or killed), so GC
 /// never fights the policy: active items stay until attention cools them,
@@ -710,6 +766,16 @@ fn reactivate(
             // Semantic death is terminal: a superseded decision, a
             // verified-fixed error or a tombstoned item stays evicted
             // however hot it looks.
+            continue;
+        }
+        // Aged ordinary dialogue stays out of the working set: its score
+        // floor is exactly what the aging rule exists to bound, so a high
+        // score (or its focus-scope membership) must not bounce it back
+        // and forth across the heap/buffer boundary every GC pass. Only a
+        // hot entity right now (a fresh causal reason, checked by
+        // `aged_ordinary_dialogue` itself) exempts it.
+        let hot_now = !hot_entities.is_empty() && entities_match(&item.entities, &hot_entities);
+        if aged_ordinary_dialogue(item, config, state.turn, hot_now) {
             continue;
         }
         let live_root_dep = marked.contains(&item.id);
