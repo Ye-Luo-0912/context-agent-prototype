@@ -13,7 +13,8 @@
 //! older than the storage TTL, and not referenced by any resident/warm
 //! item's dependency edges. Pinned and durable items are never touched.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use agent_contracts::{
@@ -140,61 +141,112 @@ pub(crate) async fn read_item_async(dir: &Path, item_id: ContextItemId) -> Optio
 /// kind, scope, task), ranks entity matches above recency, and caps the
 /// answer. The full content stays in the store; the model decides what to
 /// fetch after seeing the refs.
+///
+/// Bounded by construction: only the `limit` best matches are kept while
+/// streaming, so memory stays O(limit) even when the store is large — a
+/// model-driven search must not cost proportional to logical history size.
 pub(crate) fn search_entries(
     entries: &[ExternalizedContext],
     query: &agent_contracts::ContextSearchQuery,
 ) -> Vec<ExternalizedContext> {
     let needle = query.query.to_lowercase();
-    let mut hits: Vec<&ExternalizedContext> = entries
-        .iter()
-        .filter(|entry| {
-            if !externally_retrievable(entry) {
-                return false;
-            }
-            if let Some(kind) = query.kind
-                && entry.kind != kind
-            {
-                return false;
-            }
-            if let Some(scope) = query.scope
-                && entry.scope != scope
-            {
-                return false;
-            }
-            if let Some(task) = query.task_id
-                && entry.task_id != Some(task)
-            {
-                return false;
-            }
-            if needle.is_empty() {
-                return true;
-            }
-            entry
-                .entities
-                .iter()
-                .any(|entity| entity.to_lowercase().contains(&needle))
-                || entry.context_ref.summary.to_lowercase().contains(&needle)
-                || entry.context_ref.uri.to_lowercase().contains(&needle)
-        })
-        .collect();
-    hits.sort_by(|a, b| {
-        let a_entity = a
-            .entities
-            .iter()
-            .any(|entity| entity.to_lowercase().contains(&needle));
-        let b_entity = b
-            .entities
-            .iter()
-            .any(|entity| entity.to_lowercase().contains(&needle));
-        b_entity
-            .cmp(&a_entity)
-            .then_with(|| b.last_access_tick.cmp(&a.last_access_tick))
-            .then_with(|| b.externalized_at_tick.cmp(&a.externalized_at_tick))
-            .then_with(|| a.item_id.0.cmp(&b.item_id.0))
-    });
     let limit = if query.limit == 0 { 16 } else { query.limit };
-    hits.truncate(limit);
-    hits.into_iter().cloned().collect()
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    // A max-heap of the `limit` *best* matches so far: the peek is the
+    // current worst kept, and a better candidate (smaller under
+    // `SearchEntry::cmp`, which is the ascending order the old full sort
+    // produced) evicts it, so the heap never grows past `limit` regardless
+    // of the store's history size. `SearchEntry::cmp` reproduces the
+    // previous full sort exactly (entity matches first, then recency, then
+    // externalization order, then id).
+    let mut top: BinaryHeap<SearchEntry> = BinaryHeap::with_capacity(limit.min(64));
+    for entry in entries {
+        if !externally_retrievable(entry) {
+            continue;
+        }
+        if let Some(kind) = query.kind
+            && entry.kind != kind
+        {
+            continue;
+        }
+        if let Some(scope) = query.scope
+            && entry.scope != scope
+        {
+            continue;
+        }
+        if let Some(task) = query.task_id
+            && entry.task_id != Some(task)
+        {
+            continue;
+        }
+        let entity_match = entry
+            .entities
+            .iter()
+            .any(|entity| entity.to_lowercase().contains(&needle));
+        if !needle.is_empty()
+            && !entity_match
+            && !entry.context_ref.summary.to_lowercase().contains(&needle)
+            && !entry.context_ref.uri.to_lowercase().contains(&needle)
+        {
+            continue;
+        }
+        let candidate = SearchEntry {
+            entity_match,
+            last_access_tick: entry.last_access_tick,
+            externalized_at_tick: entry.externalized_at_tick,
+            id: entry.item_id,
+            entry,
+        };
+        if top.len() < limit {
+            top.push(candidate);
+        } else if candidate.cmp(top.peek().expect("non-empty under the guard")) == Ordering::Less {
+            top.pop();
+            top.push(candidate);
+        }
+    }
+    let mut rows: Vec<SearchEntry> = top.into_vec();
+    rows.sort();
+    rows.into_iter().map(|row| row.entry.clone()).collect()
+}
+
+/// One search hit under its ranking key, so the bounded heap can order by
+/// the exact same comparison the previous full sort used: entity matches
+/// first, then recency, then externalization order, then id (ascending).
+/// `ContextItemId` itself is not `Ord`; the id's `Uuid` is.
+struct SearchEntry<'a> {
+    entity_match: bool,
+    last_access_tick: u64,
+    externalized_at_tick: u64,
+    id: ContextItemId,
+    entry: &'a ExternalizedContext,
+}
+
+impl PartialEq for SearchEntry<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for SearchEntry<'_> {}
+
+impl PartialOrd for SearchEntry<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SearchEntry<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .entity_match
+            .cmp(&self.entity_match)
+            .then_with(|| other.last_access_tick.cmp(&self.last_access_tick))
+            .then_with(|| other.externalized_at_tick.cmp(&self.externalized_at_tick))
+            .then_with(|| self.id.0.cmp(&other.id.0))
+    }
 }
 
 /// Whether an external-map entry may be exposed through the model-facing
@@ -907,6 +959,69 @@ mod tests {
         assert_eq!(entry.dependencies, item.dependencies);
         assert_eq!(entry.last_access_gc_epoch, Some(3));
         assert!(entry.entities.iter().any(|e| e == "AuthService.rs"));
+    }
+
+    #[test]
+    fn search_entries_is_bounded_and_ranks_matches_first() {
+        // Six entries, three carrying the `AuthService.rs` entity. The
+        // bounded heap must answer at most `limit` hits with entity
+        // matches first and recency breaking ties — identical to the old
+        // collect-all-then-sort, but with O(limit) memory even when the
+        // store is large.
+        let mut entries: Vec<ExternalizedContext> = Vec::new();
+        let contents = [
+            "fix AuthService.rs",
+            "fix CacheStore.rs",
+            "touch AuthService.rs",
+            "read AuthService docs",
+            "garden plan",
+            "shopping list",
+        ];
+        for (i, content) in contents.into_iter().enumerate() {
+            let item = test_item(ContextItemId::new(), content);
+            let reference = ContextRef {
+                uri: format!("context://run/{i}"),
+                item_id: item.id,
+                kind: item.kind,
+                scope: item.scope,
+                summary: String::new(),
+                created_tick: 0,
+            };
+            let mut entry = to_external_entry(&item, reference, i as u64 + 1, 1, None);
+            if content.contains("AuthService") {
+                entry.entities = vec!["AuthService.rs".to_string()];
+            }
+            entry.last_access_tick = i as u64;
+            entries.push(entry);
+        }
+
+        let hits = search_entries(
+            &entries,
+            &agent_contracts::ContextSearchQuery::new("AuthService", 2),
+        );
+        assert_eq!(hits.len(), 2, "the limit caps the answer");
+        assert!(
+            hits.iter()
+                .all(|entry| entry.entities.iter().any(|e| e == "AuthService.rs")),
+            "entity matches rank above everything else: {:?}",
+            hits.iter()
+                .map(|e| (&e.entities, e.last_access_tick))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            hits[0].last_access_tick, 3,
+            "among equal entity matches the newest is first"
+        );
+        assert_eq!(hits[1].last_access_tick, 2);
+
+        // No limit: all three matches, newest first.
+        let all = search_entries(
+            &entries,
+            &agent_contracts::ContextSearchQuery::new("AuthService", 0),
+        );
+        assert_eq!(all.len(), 3);
+        let ticks: Vec<u64> = all.iter().map(|e| e.last_access_tick).collect();
+        assert_eq!(ticks, vec![3, 2, 0], "recency-descending");
     }
 
     #[test]
