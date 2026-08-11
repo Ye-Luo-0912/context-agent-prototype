@@ -11,6 +11,7 @@ pub mod host;
 mod instance;
 pub mod modules;
 mod output;
+mod policy;
 mod prompt;
 mod sink;
 mod surface;

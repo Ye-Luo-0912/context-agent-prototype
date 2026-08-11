@@ -187,6 +187,10 @@ struct ActorState {
     /// The runtime's view of the current scope (filled once the context
     /// engine exposes its scope tree through the contract).
     scope_id: Option<ScopeId>,
+    /// The tool call currently executing, if any. The active-call policy
+    /// reads this at the BeforeModel safe point so the round that consumes
+    /// a tool's result still offers the tool.
+    active_tool: Option<String>,
     turn: Option<ActiveTurn>,
 }
 
@@ -966,6 +970,10 @@ impl RuntimeActor {
             }
         }
 
+        // A new turn has no active call from a previous turn: the
+        // active-call policy only pins tools while the turn that issued
+        // them still consumes their results.
+        self.state.active_tool = None;
         self.state.turn = Some(ActiveTurn {
             turn_id,
             turn_frame: TurnFrame::new(content),
@@ -1098,10 +1106,11 @@ impl RuntimeActor {
         // can restore catalog/schema readiness, but cannot enable a disabled
         // capability, grant a permission or bypass approval/effect policy.
         self.kernel.tool_gc();
-        let (task_requirement_revision, requirements) = self
+        let active_task = self
             .state
             .task_id
-            .and_then(|task_id| self.state.tasks.get(task_id))
+            .and_then(|task_id| self.state.tasks.get(task_id));
+        let (task_requirement_revision, mut requirements) = active_task
             .map(|task| {
                 (
                     Some(task.tool_requirements.revision),
@@ -1136,11 +1145,28 @@ impl RuntimeActor {
         // set. Runtime owns the sole bounded projection so Task MustSurface
         // can never disappear inside a provider adapter before policy sees it.
         let candidates = self.kernel.tool_snapshot();
-        let candidate_names: HashSet<_> = candidates
+        let candidate_names: HashSet<String> = candidates
             .specs
             .iter()
-            .map(|spec| spec.name.as_str())
+            .map(|spec| spec.name.clone())
             .collect();
+
+        // Derive typed tool roots from the task anchor / focus goal and the
+        // active-call policy, then merge them into the explicit requirement
+        // set. Derivation is a pure function of the safe-point state and
+        // only names tools that exist in the candidate catalog; the explicit
+        // task-owned set stays the authority (higher demand ranks win).
+        let anchor = active_task.map(|task| &task.anchor);
+        let active_tool = self.state.active_tool.as_deref();
+        requirements.extend(crate::policy::derive_task_roots(
+            crate::policy::TaskRootInput {
+                anchor,
+                focus_goal: active_task.map(|task| task.goal.as_str()),
+                active_tool,
+                catalog_names: &candidate_names,
+            },
+        ));
+
         let mut unavailable_must = Vec::new();
         let mut unavailable_optional = Vec::new();
         for requirement in &requirements {
@@ -1163,8 +1189,13 @@ impl RuntimeActor {
         surface_plan
             .source_revisions_mut()
             .task_requirement_revision = task_requirement_revision;
+        surface_plan.source_revisions_mut().anchor_revision = anchor.map(|a| a.revision);
         surface_plan.source_revisions_mut().focus_revision =
             self.state.task_id.map(|_| self.state.focus_revision);
+        surface_plan
+            .source_revisions_mut()
+            .execution_policy_revision =
+            crate::policy::derive_execution_policy_revision(active_tool);
         for requirement in &unavailable_optional {
             surface_plan.add_unavailable(requirement);
         }
@@ -1645,6 +1676,7 @@ impl RuntimeActor {
         let cancel = CancellationToken::new();
         let operation_id = OperationId::new();
         let generation = self.state.generation;
+        self.state.active_tool = Some(call.name.clone());
         turn.op = Some(InFlightOp {
             operation_id,
             turn_id,

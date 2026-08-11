@@ -433,6 +433,10 @@ pub struct ToolSurfaceSourceRevisions {
     pub capability_catalog_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_requirement_revision: Option<u64>,
+    /// TaskAnchor revision the derived roots came from. None when no task
+    /// is active (focus-only rounds have no anchor plane).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
