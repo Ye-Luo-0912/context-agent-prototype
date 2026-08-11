@@ -19,7 +19,7 @@ use agent_runtime::{
     ModelModule, ModuleHost, RuntimeHandle, RuntimeInstance, ToolModule,
 };
 use agent_storage::FileEventJournal;
-use agent_workspace::Workspace;
+use agent_workspace::{Workspace, WorkspaceOutputBroker};
 use anyhow::Context;
 use context_baselines::{AppendOnlyEngine, RollingConfig, RollingSummaryEngine};
 use context_contextcore::{ContextServiceConfig, ServiceEngine, connect_engine};
@@ -148,7 +148,15 @@ async fn main() -> anyhow::Result<()> {
     host.start().await?;
 
     let kernel = Arc::new(AgentKernel::new(
-        AgentKernelConfig::default(),
+        AgentKernelConfig {
+            // The composition-root output broker: bounds every model-facing
+            // tool field and spills oversized content under the run's
+            // artifact directory before it reaches the actor.
+            output_broker: Some(Arc::new(WorkspaceOutputBroker::new(
+                workspace.clone().into(),
+            ))),
+            ..AgentKernelConfig::default()
+        },
         host.registry().context_service()?,
         host.registry().model_provider()?,
         host.registry().tool_provider()?,

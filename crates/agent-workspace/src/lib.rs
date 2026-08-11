@@ -6,9 +6,11 @@ use serde::Serialize;
 use tokio::fs;
 use uuid::Uuid;
 
+mod broker;
 mod confined;
 mod handles;
 
+pub use broker::WorkspaceOutputBroker;
 pub use confined::{ConfinedDir, ConfinedFile};
 pub use handles::{ArtifactStoreHandle, ConfinedWorkspaceHandle};
 

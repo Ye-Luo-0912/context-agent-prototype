@@ -2159,3 +2159,102 @@ async fn failed_barrier_blocks_turn_completed_and_marks_recovery_required() {
     journal.fail_flush.store(false, Ordering::SeqCst);
     handle.stop().await.unwrap();
 }
+
+/// CORE-04 end to end: the composition-root output broker runs inside the
+/// kernel, spills an oversized tool result to the run's artifact directory
+/// and the model-facing preview stays bounded — the truncated middle is no
+/// longer lost for a producer that did not spill.
+#[tokio::test]
+async fn output_broker_spills_oversized_tool_output_end_to_end() {
+    use agent_contracts::{CancellationToken, MAX_TOOL_MODEL_CONTENT_CHARS, ToolCall, ToolOutput};
+    use agent_workspace::{Workspace, WorkspaceOutputBroker};
+
+    struct BigOutputDispatcher {
+        output: ToolOutput,
+    }
+    #[async_trait::async_trait]
+    impl ToolDispatcher for BigOutputDispatcher {
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "big.tool".into(),
+                description: "oversized".into(),
+                input_schema: serde_json::json!({}),
+                risk: ToolRisk::ReadOnly,
+            }]
+        }
+        async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+            Ok(ToolOutcome::Value(self.output.clone()))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(Workspace::open(dir.path()).await.unwrap());
+    let full_content = format!("BEGIN{}\nEND", "payload".repeat(10_000));
+    let kernel = Arc::new(AgentKernel::new(
+        AgentKernelConfig {
+            output_broker: Some(Arc::new(WorkspaceOutputBroker::new(workspace.clone()))),
+            ..AgentKernelConfig::default()
+        },
+        Arc::new(TestContextEngine),
+        Arc::new(StreamingModel),
+        Arc::new(BigOutputDispatcher {
+            output: ToolOutput {
+                call_id: "c1".into(),
+                tool_name: "big.tool".into(),
+                ok: true,
+                summary: "done".into(),
+                model_content: full_content.clone(),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+
+    let surface = ToolSurfaceSnapshot {
+        specs: vec![ToolSpec {
+            name: "big.tool".into(),
+            description: "oversized".into(),
+            input_schema: serde_json::json!({}),
+            risk: ToolRisk::ReadOnly,
+        }],
+        ..ToolSurfaceSnapshot::default()
+    };
+    let outcome = kernel
+        .execute_tool(
+            ToolCall {
+                id: "c1".into(),
+                name: "big.tool".into(),
+                arguments: serde_json::json!({}),
+            },
+            CancellationToken::new(),
+            &surface,
+        )
+        .await;
+    let ToolOutcome::Value(output) = outcome else {
+        panic!("expected a plain value outcome");
+    };
+    assert!(
+        output.model_content.chars().count() <= MAX_TOOL_MODEL_CONTENT_CHARS,
+        "the model-facing preview must stay bounded"
+    );
+    assert!(output.model_content.contains("output broker truncated"));
+    let reference = output.artifact_ref.expect("oversized output must spill");
+    assert!(reference.starts_with("artifact://"));
+
+    // The full content was stored once under the run's artifact directory.
+    let run_dir = workspace
+        .state_dir()
+        .join("artifacts")
+        .join(kernel.run_id().to_string());
+    let mut found = None;
+    let mut entries = tokio::fs::read_dir(&run_dir).await.unwrap();
+    while let Some(entry) = entries.next_entry().await.unwrap() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("tool-output-") {
+            found = Some(tokio::fs::read_to_string(entry.path()).await.unwrap());
+        }
+    }
+    assert_eq!(found.expect("spilled artifact"), full_content);
+}

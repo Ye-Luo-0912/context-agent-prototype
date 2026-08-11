@@ -7,22 +7,38 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentError, AgentResult, ApprovalDecision, ApprovalGate, CancellationToken,
-    ContextConsumptionAck, ContextEngine, ContextGcReport, ContextIngress, ContextItemSummary,
-    ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
-    ContextSearchQuery, ContextStateTransition, EngineQuery, EventJournal, FocusState,
-    MaterializedContext, ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest,
-    ModelTransport, RunId, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, TaskId,
-    ToolCall, ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput,
-    ToolSpec, ToolSurfaceSnapshot,
+    AgentError, AgentResult, ApprovalDecision, ApprovalGate, CONTEXT_SEARCH_MAX_LIMIT,
+    CancellationToken, ContextConsumptionAck, ContextEngine, ContextGcReport, ContextIngress,
+    ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
+    ContextQuery, ContextSearchQuery, ContextStateTransition, EngineQuery, EventJournal,
+    FocusState, MaterializedContext, ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest,
+    ModelTransport, OutputBroker, RunId, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind,
+    TaskId, ToolCall, ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolOutcome,
+    ToolOutput, ToolSpec, ToolSurfaceSnapshot,
 };
 use tokio::sync::broadcast;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentKernelConfig {
     pub system_prompt: String,
     pub context_budget_tokens: usize,
     pub max_tool_rounds: usize,
+    /// Optional trusted output broker: bounds every model-facing field of a
+    /// tool result and spills oversized content to an artifact before the
+    /// `ToolOutcome` reaches the actor. `None` keeps the runtime's last-line
+    /// truncation (bounded but no artifact spill).
+    pub output_broker: Option<Arc<dyn OutputBroker>>,
+}
+
+impl std::fmt::Debug for AgentKernelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentKernelConfig")
+            .field("system_prompt", &self.system_prompt)
+            .field("context_budget_tokens", &self.context_budget_tokens)
+            .field("max_tool_rounds", &self.max_tool_rounds)
+            .field("output_broker", &"<output broker>")
+            .finish()
+    }
 }
 
 impl Default for AgentKernelConfig {
@@ -36,6 +52,7 @@ impl Default for AgentKernelConfig {
             .to_string(),
             context_budget_tokens: 24_000,
             max_tool_rounds: 16,
+            output_broker: None,
         }
     }
 }
@@ -283,6 +300,11 @@ impl AgentKernel {
                 task_id,
                 limit,
             } => {
+                // Query limits are enforced in execution, not only by the
+                // JSON schema: a hostile or stale limit is clamped before it
+                // reaches the engine, so the model can never ask for an
+                // unbounded hit set. 0 keeps the engine default.
+                let limit = limit.min(CONTEXT_SEARCH_MAX_LIMIT);
                 let search = ContextSearchQuery {
                     query,
                     kind,
@@ -404,7 +426,14 @@ impl AgentKernel {
                 }
             }
         }
-        output
+        // Context fetches can return large stored content; the output broker
+        // bounds it and spills the full item to an artifact before the model
+        // ever sees a truncated middle.
+        if let Some(broker) = &self.config.output_broker {
+            broker.bound(self.run_id, output).await
+        } else {
+            output
+        }
     }
 
     /// One model round: stream the request to the provider. The result is a
@@ -458,7 +487,7 @@ impl AgentKernel {
             }
         }
 
-        match self
+        let outcome = match self
             .tools
             .execute(ToolExecutionRequest {
                 run_id: self.run_id,
@@ -469,6 +498,32 @@ impl AgentKernel {
         {
             Ok(outcome) => outcome,
             Err(error) => ToolOutcome::Value(tool_error_output(&call, error.to_string())),
+        };
+
+        // Trusted output broker: bound every model-facing field and spill
+        // oversized content before the outcome reaches the actor. Engine
+        // queries carry a placeholder output here (their real content is
+        // produced by `resolve_engine_query`, which bounds it there), so the
+        // broker runs on all four variants uniformly.
+        let Some(broker) = &self.config.output_broker else {
+            return outcome;
+        };
+        match outcome {
+            ToolOutcome::Value(output) => {
+                ToolOutcome::Value(broker.bound(self.run_id, output).await)
+            }
+            ToolOutcome::PreparedEffect { output, effect } => ToolOutcome::PreparedEffect {
+                output: broker.bound(self.run_id, output).await,
+                effect,
+            },
+            ToolOutcome::RuntimeDirective { output, directive } => ToolOutcome::RuntimeDirective {
+                output: broker.bound(self.run_id, output).await,
+                directive,
+            },
+            ToolOutcome::EngineQuery { output, query } => ToolOutcome::EngineQuery {
+                output: broker.bound(self.run_id, output).await,
+                query,
+            },
         }
     }
 
@@ -707,7 +762,11 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{ToolSurfaceDemand, ToolSurfaceOmission, ToolSurfaceOmissionReason};
+    use agent_contracts::{
+        AttentionState, ContextDiagnostics, ContextItem, ContextItemId, ContextResidency,
+        ContextRetention, ContextScope, ExternalizedContext, SemanticState, ToolRisk,
+        ToolSurfaceDemand, ToolSurfaceOmission, ToolSurfaceOmissionReason,
+    };
 
     fn call(name: &str) -> ToolCall {
         ToolCall {
@@ -753,5 +812,418 @@ mod tests {
         assert!(message.contains("only schemas in that captured surface may be called"));
         assert!(!message.contains("unknown tool"));
         assert!(!message.contains("loaded"));
+    }
+
+    // --- CORE-04: trusted output broker + execution-enforced query limits ---
+
+    #[derive(Default)]
+    struct RecordingBroker {
+        calls: std::sync::Mutex<usize>,
+        last_output: std::sync::Mutex<Option<ToolOutput>>,
+    }
+
+    #[async_trait::async_trait]
+    impl OutputBroker for RecordingBroker {
+        async fn bound(&self, _run_id: RunId, output: ToolOutput) -> ToolOutput {
+            *self.calls.lock().unwrap() += 1;
+            *self.last_output.lock().unwrap() = Some(output.clone());
+            output
+        }
+    }
+
+    struct BigOutputDispatcher {
+        output: ToolOutput,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolDispatcher for BigOutputDispatcher {
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "big.tool".into(),
+                description: "returns oversized output".into(),
+                input_schema: serde_json::json!({}),
+                risk: ToolRisk::ReadOnly,
+            }]
+        }
+        async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+            assert_eq!(request.call.name, "big.tool");
+            Ok(ToolOutcome::Value(self.output.clone()))
+        }
+    }
+
+    struct AllowAllApproval;
+
+    #[async_trait::async_trait]
+    impl ApprovalGate for AllowAllApproval {
+        async fn authorize(
+            &self,
+            _call: &ToolCall,
+            _spec: &ToolSpec,
+            _cancel: &CancellationToken,
+        ) -> AgentResult<ApprovalDecision> {
+            Ok(ApprovalDecision::Allow)
+        }
+    }
+
+    struct UnusedModel;
+
+    #[async_trait::async_trait]
+    impl ModelTransport for UnusedModel {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::default()
+        }
+        async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+            unimplemented!("tests never run a model round")
+        }
+    }
+
+    struct RecordingEngine {
+        searched_limits: std::sync::Mutex<Vec<usize>>,
+        fetched: std::sync::Mutex<Option<ContextItem>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContextEngine for RecordingEngine {
+        async fn ingest(&self, _ingress: ContextIngress) -> AgentResult<()> {
+            unimplemented!()
+        }
+        async fn maintain(
+            &self,
+            _trigger: ContextMaintenanceTrigger,
+        ) -> AgentResult<ContextMaintenanceReport> {
+            unimplemented!()
+        }
+        async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+            unimplemented!()
+        }
+        async fn open_scope(
+            &self,
+            _kind: ScopeKind,
+            _parent: Option<ScopeId>,
+        ) -> AgentResult<ScopeId> {
+            unimplemented!()
+        }
+        async fn close_scope(
+            &self,
+            _scope_id: ScopeId,
+        ) -> AgentResult<Vec<ContextStateTransition>> {
+            unimplemented!()
+        }
+        async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+            unimplemented!()
+        }
+        async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+            Ok(Vec::new())
+        }
+        async fn search_external(
+            &self,
+            query: ContextSearchQuery,
+        ) -> AgentResult<Vec<ExternalizedContext>> {
+            self.searched_limits.lock().unwrap().push(query.limit);
+            Ok(Vec::new())
+        }
+        async fn fetch_external(
+            &self,
+            _item_id: ContextItemId,
+        ) -> AgentResult<Option<ContextItem>> {
+            Ok(self.fetched.lock().unwrap().clone())
+        }
+        async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+        async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+            Ok(())
+        }
+    }
+
+    fn test_item(content: String) -> ContextItem {
+        ContextItem {
+            id: ContextItemId::new(),
+            task_id: None,
+            scope_id: None,
+            content,
+            kind: ContextKind::Note,
+            scope: ContextScope::Task,
+            retention: ContextRetention::Working,
+            attention: AttentionState::Active,
+            semantic: SemanticState::Live,
+            importance: 0.0,
+            relevance: 0.0,
+            created_tick: 0,
+            last_access_tick: 0,
+            access_count: 0,
+            created_turn: 0,
+            last_access_turn: 0,
+            last_selected_turn: 0,
+            dependencies: Vec::new(),
+            tags: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
+            source: None,
+            residency: ContextResidency::Resident,
+            gc_generation: 0,
+            evicted_at_tick: None,
+            entities: Vec::new(),
+        }
+    }
+
+    fn test_kernel(
+        engine: Arc<dyn ContextEngine>,
+        dispatcher: Arc<dyn ToolDispatcher>,
+        broker: Option<Arc<dyn OutputBroker>>,
+    ) -> Arc<AgentKernel> {
+        Arc::new(AgentKernel::new(
+            AgentKernelConfig {
+                output_broker: broker,
+                ..AgentKernelConfig::default()
+            },
+            engine,
+            Arc::new(UnusedModel),
+            dispatcher,
+            Arc::new(AllowAllApproval),
+            None,
+        ))
+    }
+
+    fn surface_with(name: &str) -> ToolSurfaceSnapshot {
+        ToolSurfaceSnapshot {
+            specs: vec![ToolSpec {
+                name: name.into(),
+                description: "x".into(),
+                input_schema: serde_json::json!({}),
+                risk: ToolRisk::ReadOnly,
+            }],
+            ..ToolSurfaceSnapshot::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn output_broker_bounds_tool_results_before_the_actor() {
+        let broker = Arc::new(RecordingBroker::default());
+        let dispatcher = Arc::new(BigOutputDispatcher {
+            output: ToolOutput {
+                call_id: "c1".into(),
+                tool_name: "big.tool".into(),
+                ok: true,
+                summary: "done".into(),
+                model_content: "x".repeat(100_000),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+        });
+        let kernel = test_kernel(
+            Arc::new(RecordingEngine {
+                searched_limits: Default::default(),
+                fetched: Default::default(),
+            }),
+            dispatcher,
+            Some(broker.clone()),
+        );
+        let outcome = kernel
+            .execute_tool(
+                call("big.tool"),
+                CancellationToken::new(),
+                &surface_with("big.tool"),
+            )
+            .await;
+        assert_eq!(*broker.calls.lock().unwrap(), 1, "broker must run once");
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("expected a plain value");
+        };
+        assert_eq!(output.model_content.len(), 100_000);
+        let seen = broker
+            .last_output
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("broker saw the output");
+        assert_eq!(seen.model_content, "x".repeat(100_000));
+    }
+
+    #[tokio::test]
+    async fn no_broker_keeps_the_outcome_untouched() {
+        let dispatcher = Arc::new(BigOutputDispatcher {
+            output: ToolOutput {
+                call_id: "c1".into(),
+                tool_name: "big.tool".into(),
+                ok: true,
+                summary: "done".into(),
+                model_content: "x".repeat(100_000),
+                artifact_ref: None,
+                metadata: serde_json::Value::Null,
+            },
+        });
+        let kernel = test_kernel(
+            Arc::new(RecordingEngine {
+                searched_limits: Default::default(),
+                fetched: Default::default(),
+            }),
+            dispatcher,
+            None,
+        );
+        let outcome = kernel
+            .execute_tool(
+                call("big.tool"),
+                CancellationToken::new(),
+                &surface_with("big.tool"),
+            )
+            .await;
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("expected a plain value");
+        };
+        assert_eq!(output.model_content.len(), 100_000);
+    }
+
+    #[tokio::test]
+    async fn context_fetch_results_are_bounded_after_resolve() {
+        let broker = Arc::new(RecordingBroker::default());
+        let engine = Arc::new(RecordingEngine {
+            searched_limits: Default::default(),
+            fetched: std::sync::Mutex::new(Some(test_item("big".repeat(200_000)))),
+        });
+        let kernel = test_kernel(
+            engine,
+            Arc::new(BigOutputDispatcher {
+                output: ToolOutput {
+                    call_id: "c1".into(),
+                    tool_name: "context.manage".into(),
+                    ok: true,
+                    summary: "placeholder".into(),
+                    model_content: "placeholder".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                },
+            }),
+            Some(broker.clone()),
+        );
+        let placeholder = ToolOutput {
+            call_id: "c1".into(),
+            tool_name: "context.manage".into(),
+            ok: true,
+            summary: "placeholder".into(),
+            model_content: "placeholder".into(),
+            artifact_ref: None,
+            metadata: serde_json::Value::Null,
+        };
+        let output = kernel
+            .resolve_engine_query(
+                placeholder,
+                EngineQuery::FetchExternal {
+                    item_id: ContextItemId::new(),
+                },
+            )
+            .await;
+        assert_eq!(
+            *broker.calls.lock().unwrap(),
+            1,
+            "broker must bound the fetch result"
+        );
+        assert!(output.model_content.contains("big"));
+        let seen = broker
+            .last_output
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("broker saw the output");
+        assert!(
+            seen.model_content.contains("big"),
+            "the full fetched content reaches the broker"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_limit_is_clamped_in_execution() {
+        let engine = Arc::new(RecordingEngine {
+            searched_limits: Default::default(),
+            fetched: Default::default(),
+        });
+        let kernel = test_kernel(
+            engine.clone(),
+            Arc::new(BigOutputDispatcher {
+                output: ToolOutput {
+                    call_id: "c1".into(),
+                    tool_name: "context.manage".into(),
+                    ok: true,
+                    summary: "placeholder".into(),
+                    model_content: "placeholder".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                },
+            }),
+            None,
+        );
+        let placeholder = ToolOutput {
+            call_id: "c1".into(),
+            tool_name: "context.manage".into(),
+            ok: true,
+            summary: "placeholder".into(),
+            model_content: "placeholder".into(),
+            artifact_ref: None,
+            metadata: serde_json::Value::Null,
+        };
+        let _ = kernel
+            .resolve_engine_query(
+                placeholder.clone(),
+                EngineQuery::SearchExternal {
+                    query: "x".into(),
+                    kind: None,
+                    scope: None,
+                    task_id: None,
+                    limit: 1_000_000,
+                },
+            )
+            .await;
+        let limits = engine.searched_limits.lock().unwrap();
+        assert_eq!(limits.as_slice(), &[CONTEXT_SEARCH_MAX_LIMIT]);
+    }
+
+    #[tokio::test]
+    async fn search_limit_zero_keeps_the_engine_default() {
+        let engine = Arc::new(RecordingEngine {
+            searched_limits: Default::default(),
+            fetched: Default::default(),
+        });
+        let kernel = test_kernel(
+            engine.clone(),
+            Arc::new(BigOutputDispatcher {
+                output: ToolOutput {
+                    call_id: "c1".into(),
+                    tool_name: "context.manage".into(),
+                    ok: true,
+                    summary: "placeholder".into(),
+                    model_content: "placeholder".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                },
+            }),
+            None,
+        );
+        let placeholder = ToolOutput {
+            call_id: "c1".into(),
+            tool_name: "context.manage".into(),
+            ok: true,
+            summary: "placeholder".into(),
+            model_content: "placeholder".into(),
+            artifact_ref: None,
+            metadata: serde_json::Value::Null,
+        };
+        let _ = kernel
+            .resolve_engine_query(
+                placeholder,
+                EngineQuery::SearchExternal {
+                    query: "x".into(),
+                    kind: None,
+                    scope: None,
+                    task_id: None,
+                    limit: 0,
+                },
+            )
+            .await;
+        let limits = engine.searched_limits.lock().unwrap();
+        assert_eq!(
+            limits.as_slice(),
+            &[0],
+            "0 must stay 0 so the engine default applies"
+        );
     }
 }

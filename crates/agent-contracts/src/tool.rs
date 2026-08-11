@@ -7,6 +7,40 @@ use crate::{
     ContextScope, RunId, TaskId, TurnId,
 };
 
+/// Hard cap on the model-facing `model_content` of a tool result (chars).
+/// Producers may choose smaller limits; none may make the model-facing
+/// result larger. Matches the reference context engine's per-item ceiling.
+pub const MAX_TOOL_MODEL_CONTENT_CHARS: usize = 16_000;
+
+/// Hard cap on the `summary` field of a tool result (chars).
+pub const MAX_TOOL_SUMMARY_CHARS: usize = 2_000;
+
+/// Hard cap on the serialized size of the `metadata` field of a tool
+/// result (bytes of JSON). Oversized metadata is replaced by a bounded
+/// marker that keeps the decoded total honest.
+pub const MAX_TOOL_METADATA_BYTES: usize = 8_000;
+
+/// Decoded-total cap: the model-facing view (`summary` + `model_content` +
+/// serialized `metadata`) must stay under this many chars even when each
+/// field individually fits. The broker trims `model_content` first.
+pub const MAX_TOOL_OUTPUT_TOTAL_CHARS: usize = 24_000;
+
+/// Cap on `context.search` limit enforced in execution (the JSON schema
+/// advertises the same maximum; execution is authoritative).
+pub const CONTEXT_SEARCH_MAX_LIMIT: usize = 50;
+
+/// A trusted output broker: bounds every model-facing field of a tool
+/// output and spills oversized content to an artifact once, returning a
+/// bounded preview plus a reference. The kernel applies it before a
+/// `ToolOutcome` reaches the actor, so a producer that did not spill cannot
+/// lose the truncated middle and no field can blow past its cap.
+#[async_trait]
+pub trait OutputBroker: Send + Sync {
+    /// Bound `output` under the run's artifact store. `run_id` selects the
+    /// artifact directory so spills land with the run's other artifacts.
+    async fn bound(&self, run_id: RunId, output: ToolOutput) -> ToolOutput;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ToolRisk {
     ReadOnly,

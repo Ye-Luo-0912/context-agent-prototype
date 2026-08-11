@@ -1580,7 +1580,7 @@ impl RuntimeActor {
                 },
                 Err(AgentError::Cancelled) => OperationOutcome::Cancelled,
                 Err(error) => OperationOutcome::Failed {
-                    message: error.to_string(),
+                    message: crate::output::bound_error_message(error.to_string()),
                 },
             };
             let _ = op_tx
