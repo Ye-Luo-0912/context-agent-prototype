@@ -800,9 +800,15 @@ together with TaskAnchor and continuous context GC.
 
 ### Gate 2: close correctness/security blockers
 
-- [ ] **CORE-GATE-01** Close `CORE-01`, `CORE-04`, `CORE-06`, `CORE-07`, `CORE-08`, and `CORE-09` from
+- [x] **CORE-GATE-01** Close `CORE-01`, `CORE-04`, `CORE-06`, `CORE-07`, `CORE-08`, and `CORE-09` from
   `AUDIT_TODO.md`; external process capabilities remain disabled by default
   until the actual effect/sandbox path passes adversarial tests.
+  **Closed 2026-08-11.** All six dependencies are closed (process-boundary
+  parity, output broker, cancellation/sandbox, confined directory-handle
+  operations, standing grants, and the round-surface slice); external
+  (out-of-process) capabilities still enter `Disabled` at registration and
+  stay off the surface until an explicit enable, so the default remains
+  safe while the M12 wire-level effect broker is finalized.
 - [ ] **MOD-03** Separate trusted composition registration from dynamic capability
   registration in names, docs, and authority checks.
 - [ ] **MOD-04** Isolate the first real authority slice inside the existing
