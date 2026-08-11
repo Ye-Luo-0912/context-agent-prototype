@@ -92,6 +92,7 @@ fn build_model() -> anyhow::Result<Arc<dyn ModelTransport>> {
         timeout: Duration::from_secs(120),
         send_stream_options: true,
         send_max_tokens: true,
+        max_stream_bytes: provider_openai::DEFAULT_MAX_STREAM_BYTES,
     });
     Ok(Arc::new(RetryingTransport::new(
         provider,

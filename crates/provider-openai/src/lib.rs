@@ -43,11 +43,21 @@ pub struct OpenAiConfig {
     /// Send `max_tokens`. Some compatible providers reject it for certain
     /// models (reasoning models may want `max_completion_tokens` instead).
     pub send_max_tokens: bool,
+    /// Total bytes accepted from one streaming response before the
+    /// transport fails (`DEFAULT_MAX_STREAM_BYTES` unless overridden). A
+    /// broken or malicious provider cannot make the runtime buffer an
+    /// unbounded stream.
+    pub max_stream_bytes: usize,
 }
 
 /// Cap on the provider error body carried in the error string, so a huge
 /// HTML error page cannot blow up the failure message.
 const MAX_ERROR_BODY_CHARS: usize = 512;
+
+/// Total bytes accepted from one streaming response before the transport
+/// fails: a broken or malicious provider must not make the runtime buffer
+/// an unbounded model stream (the M14 resource boundary).
+pub const DEFAULT_MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 
 fn truncate_error_body(body: &str) -> String {
     let trimmed = body.trim();
@@ -127,6 +137,8 @@ impl ModelTransport for OpenAiProvider {
         let reader = StreamReader::new(byte_stream);
         let mut lines = FramedRead::new(reader, LinesCodec::new());
 
+        let max_stream_bytes = self.config.max_stream_bytes;
+        let mut total_bytes = 0usize;
         let mut accumulator = StreamAccumulator::default();
         loop {
             tokio::select! {
@@ -136,6 +148,19 @@ impl ModelTransport for OpenAiProvider {
                 line = lines.next() => {
                     match line {
                         Some(Ok(line)) => {
+                            // Every decoded line counts toward the stream
+                            // cap (line content plus its newline): a
+                            // provider that streams without end is refused
+                            // instead of growing the accumulator forever.
+                            total_bytes = total_bytes.saturating_add(line.len() + 1);
+                            if total_bytes > max_stream_bytes {
+                                return Err(AgentError::Transport {
+                                    retryable: false,
+                                    message: format!(
+                                        "stream exceeded the {max_stream_bytes} byte cap; provider response is not bounded"
+                                    ),
+                                });
+                            }
                             let Some(payload) = parse_sse_data(&line) else {
                                 continue;
                             };
@@ -272,6 +297,7 @@ impl ModelEventSink for NoopSink {
 mod tests {
     use super::*;
     use agent_contracts::{CancellationToken, ModelMessage, ToolSpec};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn builds_wire_request() {
@@ -303,6 +329,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             send_stream_options: true,
             send_max_tokens: true,
+            max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
         };
         let wire = build_wire_request(&request, &config);
         assert_eq!(wire["model"], "deepseek-chat");
@@ -347,6 +374,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             send_stream_options: false,
             send_max_tokens: false,
+            max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
         };
         let wire = build_wire_request(&request, &config);
         assert!(
@@ -372,5 +400,60 @@ mod tests {
         assert!(bounded.contains("(10000 chars total)"));
         let small = "boom";
         assert_eq!(truncate_error_body(small), "boom");
+    }
+
+    #[tokio::test]
+    async fn stream_over_cap_fails_bounded() {
+        // A provider that streams SSE without end must be refused at the
+        // byte cap instead of growing the accumulator forever: a broken or
+        // malicious upstream cannot exhaust the runtime's memory.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            let _ = socket.write_all(headers.as_bytes()).await;
+            // Stream deltas forever; the client must stop at its cap.
+            let mut n = 0u64;
+            loop {
+                let body = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"chunk{n}\"}}}}]}}\n\n"
+                );
+                let frame = format!("{:x}\r\n{}\r\n", body.len(), body);
+                if socket.write_all(frame.as_bytes()).await.is_err() {
+                    break;
+                }
+                n += 1;
+            }
+        });
+
+        let config = OpenAiConfig {
+            api_key: "secret".into(),
+            base_url: format!("http://{addr}/v1"),
+            model: "mock".into(),
+            max_output_tokens: 2048,
+            timeout: Duration::from_secs(10),
+            send_stream_options: true,
+            send_max_tokens: true,
+            max_stream_bytes: 512, // deliberately tiny cap
+        };
+        let provider = OpenAiProvider::new(config);
+        let request = ModelRequest {
+            messages: vec![ModelMessage::user("hi")],
+            tools: Vec::new(),
+            metadata: json!({}),
+            cancel: CancellationToken::new(),
+        };
+        let error = provider.complete(request).await.unwrap_err().to_string();
+        assert!(
+            error.contains("stream exceeded"),
+            "the cap refusal must name the bound: {error}"
+        );
+        assert!(
+            error.contains("512"),
+            "the cap value must be surfaced: {error}"
+        );
     }
 }
