@@ -60,7 +60,7 @@ impl ProcessCapabilityAdapter {
                 )));
             }
         };
-        let mut config = ProcessHostConfig {
+        let config = ProcessHostConfig {
             program,
             args: Vec::new(),
             env: Vec::new(),
@@ -93,15 +93,13 @@ impl ProcessCapabilityAdapter {
                 // The child's stderr is piped and drained into a bounded
                 // tail, never inherited unbounded into the parent console.
                 stderr_capture_bytes: 64 * 1024,
-                ..ProcessSandbox::default()
+                // A per-process memory ceiling enforced by the Job-Object,
+                // so a runaway capability child cannot exhaust the machine.
+                // Unix relies on rlimits only.
+                #[cfg(windows)]
+                job_max_memory_bytes: 512 * 1024 * 1024,
             },
         };
-        #[cfg(windows)]
-        {
-            // A per-process memory ceiling enforced by the Job-Object, so a
-            // runaway capability child cannot exhaust the machine.
-            config.sandbox.job_max_memory_bytes = 512 * 1024 * 1024;
-        }
         Ok(Self::with_config(manifest, config))
     }
 
