@@ -261,6 +261,7 @@ impl ToolDispatcher for OkToolDispatcher {
             description: "read a file".into(),
             input_schema: json!({"type": "object"}),
             risk: agent_contracts::ToolRisk::ReadOnly,
+            output_budget: None,
         }]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -908,6 +909,7 @@ impl ToolDispatcher for EntitySignalingDispatcher {
             description: "read a file".into(),
             input_schema: json!({"type": "object"}),
             risk: agent_contracts::ToolRisk::ReadOnly,
+            output_budget: None,
         }]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -1023,12 +1025,14 @@ impl ToolDispatcher for DirectiveToolDispatcher {
                 description: "lease an item".into(),
                 input_schema: json!({"type": "object"}),
                 risk: agent_contracts::ToolRisk::ReadOnly,
+                output_budget: None,
             },
             ToolSpec {
                 name: "context.collect".into(),
                 description: "run GC now".into(),
                 input_schema: json!({"type": "object"}),
                 risk: agent_contracts::ToolRisk::ReadOnly,
+                output_budget: None,
             },
         ]
     }
@@ -1442,6 +1446,7 @@ impl ToolDispatcher for EffectToolDispatcher {
             description: "stages an effect".into(),
             input_schema: json!({"type": "object"}),
             risk: agent_contracts::ToolRisk::ReadOnly,
+            output_budget: None,
         }]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -1573,6 +1578,7 @@ impl StagingCapability {
                     description: "stages an effect".into(),
                     input_schema: json!({"type": "object"}),
                     risk: ToolRisk::ReadOnly,
+                    output_budget: None,
                 }],
                 lifecycle: CapabilityLifecycle::Lazy,
                 transport: CapabilityTransport::Builtin,
@@ -1798,6 +1804,7 @@ impl ToolDispatcher for FailingEffectDispatcher {
             description: "stages a failing effect".into(),
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -2074,6 +2081,7 @@ impl ToolDispatcher for HintToolDispatcher {
             description: "keep an item alive across GC passes".into(),
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {

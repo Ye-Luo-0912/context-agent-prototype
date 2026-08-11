@@ -70,6 +70,7 @@ impl Tool for ShellExecTool {
                 }
             }),
             risk: ToolRisk::ProcessExecution,
+            output_budget: None,
         }
     }
 

@@ -122,6 +122,7 @@ impl Tool for SearchGrepTool {
                 }
             }),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }
     }
 

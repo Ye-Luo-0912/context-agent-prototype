@@ -65,6 +65,7 @@ impl Tool for EditReplaceTool {
                 }
             }),
             risk: ToolRisk::WorkspaceWrite,
+            output_budget: None,
         }
     }
 

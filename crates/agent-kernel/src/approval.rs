@@ -505,6 +505,7 @@ mod tests {
             description: "write a file".into(),
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::WorkspaceWrite,
+            output_budget: None,
         }
     }
 
@@ -674,6 +675,7 @@ mod tests {
             description: "run a command".into(),
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ProcessExecution,
+            output_budget: None,
         }
     }
 

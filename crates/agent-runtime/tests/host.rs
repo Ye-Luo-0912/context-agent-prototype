@@ -120,6 +120,7 @@ impl ToolDispatcher for RequiredLargeTools {
             description: "x".repeat(20_000),
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }]
     }
 
@@ -383,6 +384,7 @@ impl Capability for DemoCapability {
                 description: "demo tool".into(),
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
+                output_budget: None,
             })
             .collect()
     }
@@ -462,6 +464,7 @@ impl Capability for ContextCapturingCapability {
             description: "recording tool".into(),
             input_schema: json!({"type": "object"}),
             risk,
+            output_budget: None,
         }]
     }
     async fn start(&self) -> AgentResult<()> {
@@ -668,6 +671,7 @@ async fn capability_authority_is_derived_and_validated_at_registration() {
             description: "writes".into(),
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::WorkspaceWrite,
+            output_budget: None,
         }],
     );
     let error = host
@@ -690,6 +694,7 @@ async fn capability_authority_is_derived_and_validated_at_registration() {
             description: "writes".into(),
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::WorkspaceWrite,
+            output_budget: None,
         }],
     );
     let process_write = {
@@ -1216,6 +1221,7 @@ async fn registration_rejects_oversized_or_malformed_tool_schemas() {
         description: "x".into(),
         input_schema: json!({"padding": "x".repeat(5 * 1024)}),
         risk: ToolRisk::ReadOnly,
+        output_budget: None,
     }];
     let error = registry
         .register(Arc::new(big))

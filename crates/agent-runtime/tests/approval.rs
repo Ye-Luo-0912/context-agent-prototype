@@ -78,18 +78,21 @@ impl ToolDispatcher for RiskToolDispatcher {
                 description: "read-only probe".into(),
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
+                output_budget: None,
             },
             ToolSpec {
                 name: "write.tool".into(),
                 description: "workspace write probe".into(),
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::WorkspaceWrite,
+                output_budget: None,
             },
             ToolSpec {
                 name: "proc.tool".into(),
                 description: "process execution probe".into(),
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ProcessExecution,
+                output_budget: None,
             },
         ]
     }

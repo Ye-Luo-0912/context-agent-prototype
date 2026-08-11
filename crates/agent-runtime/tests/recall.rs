@@ -129,6 +129,7 @@ impl ToolDispatcher for EngineQueryTools {
                 }
             }),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }]
     }
 

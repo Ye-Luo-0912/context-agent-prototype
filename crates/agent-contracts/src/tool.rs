@@ -34,11 +34,16 @@ pub const CONTEXT_SEARCH_MAX_LIMIT: usize = 50;
 /// bounded preview plus a reference. The kernel applies it before a
 /// `ToolOutcome` reaches the actor, so a producer that did not spill cannot
 /// lose the truncated middle and no field can blow past its cap.
+///
+/// `budget` is the declaring tool's own model-content cap (`ToolSpec.
+/// output_budget`): `Some(n)` bounds `model_content` at `n` chars (never
+/// above the global cap), `None` falls back to the global cap. Producers
+/// may choose smaller limits; none may make the model-facing result larger.
 #[async_trait]
 pub trait OutputBroker: Send + Sync {
     /// Bound `output` under the run's artifact store. `run_id` selects the
     /// artifact directory so spills land with the run's other artifacts.
-    async fn bound(&self, run_id: RunId, output: ToolOutput) -> ToolOutput;
+    async fn bound(&self, run_id: RunId, budget: Option<usize>, output: ToolOutput) -> ToolOutput;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -54,6 +59,14 @@ pub struct ToolSpec {
     pub description: String,
     pub input_schema: Value,
     pub risk: ToolRisk,
+    /// Declared model-content cap for this tool's results, in chars. A
+    /// tool that produces verbose output declares a smaller budget so the
+    /// broker spills sooner; `None` uses the global
+    /// `MAX_TOOL_MODEL_CONTENT_CHARS`. Execution is authoritative — the
+    /// broker enforces `min(budget, global)` regardless of the declared
+    /// value, so a declaration can never exceed the hard cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_budget: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

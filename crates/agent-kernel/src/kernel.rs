@@ -428,9 +428,10 @@ impl AgentKernel {
         }
         // Context fetches can return large stored content; the output broker
         // bounds it and spills the full item to an artifact before the model
-        // ever sees a truncated middle.
+        // ever sees a truncated middle. No tool spec applies here (the
+        // result comes from the engine query path), so the global cap rules.
         if let Some(broker) = &self.config.output_broker {
-            broker.bound(self.run_id, output).await
+            broker.bound(self.run_id, None, output).await
         } else {
             output
         }
@@ -504,24 +505,27 @@ impl AgentKernel {
         // oversized content before the outcome reaches the actor. Engine
         // queries carry a placeholder output here (their real content is
         // produced by `resolve_engine_query`, which bounds it there), so the
-        // broker runs on all four variants uniformly.
+        // broker runs on all four variants uniformly. The declaring tool's
+        // own budget (`ToolSpec::output_budget`) is enforced here — a
+        // verbose tool spills sooner, a quiet tool never exceeds its cap.
         let Some(broker) = &self.config.output_broker else {
             return outcome;
         };
+        let budget = spec.output_budget;
         match outcome {
             ToolOutcome::Value(output) => {
-                ToolOutcome::Value(broker.bound(self.run_id, output).await)
+                ToolOutcome::Value(broker.bound(self.run_id, budget, output).await)
             }
             ToolOutcome::PreparedEffect { output, effect } => ToolOutcome::PreparedEffect {
-                output: broker.bound(self.run_id, output).await,
+                output: broker.bound(self.run_id, budget, output).await,
                 effect,
             },
             ToolOutcome::RuntimeDirective { output, directive } => ToolOutcome::RuntimeDirective {
-                output: broker.bound(self.run_id, output).await,
+                output: broker.bound(self.run_id, budget, output).await,
                 directive,
             },
             ToolOutcome::EngineQuery { output, query } => ToolOutcome::EngineQuery {
-                output: broker.bound(self.run_id, output).await,
+                output: broker.bound(self.run_id, budget, output).await,
                 query,
             },
         }
@@ -825,7 +829,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl OutputBroker for RecordingBroker {
-        async fn bound(&self, _run_id: RunId, output: ToolOutput) -> ToolOutput {
+        async fn bound(
+            &self,
+            _run_id: RunId,
+            _budget: Option<usize>,
+            output: ToolOutput,
+        ) -> ToolOutput {
             *self.calls.lock().unwrap() += 1;
             *self.last_output.lock().unwrap() = Some(output.clone());
             output
@@ -844,6 +853,7 @@ mod tests {
                 description: "returns oversized output".into(),
                 input_schema: serde_json::json!({}),
                 risk: ToolRisk::ReadOnly,
+                output_budget: None,
             }]
         }
         async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -993,6 +1003,7 @@ mod tests {
                 description: "x".into(),
                 input_schema: serde_json::json!({}),
                 risk: ToolRisk::ReadOnly,
+                output_budget: None,
             }],
             ..ToolSurfaceSnapshot::default()
         }

@@ -82,7 +82,19 @@ impl WorkspaceOutputBroker {
 
 #[async_trait]
 impl OutputBroker for WorkspaceOutputBroker {
-    async fn bound(&self, run_id: RunId, mut output: ToolOutput) -> ToolOutput {
+    async fn bound(
+        &self,
+        run_id: RunId,
+        budget: Option<usize>,
+        mut output: ToolOutput,
+    ) -> ToolOutput {
+        // The effective model-content cap: the tool's declared budget,
+        // clamped to the global hard cap so a declaration can never make
+        // the model-facing result larger than the contract allows.
+        let content_cap = budget
+            .unwrap_or(MAX_TOOL_MODEL_CONTENT_CHARS)
+            .min(MAX_TOOL_MODEL_CONTENT_CHARS);
+
         // 1. Every field gets its own cap; the marker names what was cut.
         output.summary =
             truncate_with_marker(&output.summary, MAX_TOOL_SUMMARY_CHARS, "summary", None);
@@ -93,7 +105,7 @@ impl OutputBroker for WorkspaceOutputBroker {
         //    spill no longer loses the truncated middle — the full content
         //    is stored and the preview points at it.
         let char_count = output.model_content.chars().count();
-        if char_count > MAX_TOOL_MODEL_CONTENT_CHARS {
+        if char_count > content_cap {
             if output.artifact_ref.is_none() {
                 match self
                     .workspace
@@ -112,7 +124,7 @@ impl OutputBroker for WorkspaceOutputBroker {
                             "{}\n...[output broker could not spill oversized tool output to an artifact: {error}]...\n",
                             truncate_with_marker(
                                 &output.model_content,
-                                MAX_TOOL_MODEL_CONTENT_CHARS,
+                                content_cap,
                                 "model_content",
                                 None
                             )
@@ -123,7 +135,7 @@ impl OutputBroker for WorkspaceOutputBroker {
             }
             output.model_content = truncate_with_marker(
                 &output.model_content,
-                MAX_TOOL_MODEL_CONTENT_CHARS,
+                content_cap,
                 "model_content",
                 output.artifact_ref.as_deref(),
             );
@@ -210,7 +222,7 @@ mod tests {
             json!({"k": "v"}),
             None,
         );
-        let bounded = broker.bound(RunId::new(), out.clone()).await;
+        let bounded = broker.bound(RunId::new(), None, out.clone()).await;
         assert_eq!(bounded.model_content, out.model_content);
         assert_eq!(bounded.summary, "done");
         assert_eq!(bounded.metadata, json!({"k": "v"}));
@@ -226,6 +238,7 @@ mod tests {
         let bounded = broker
             .bound(
                 run_id,
+                None,
                 output(content.clone(), "done".into(), Value::Null, None),
             )
             .await;
@@ -254,6 +267,7 @@ mod tests {
         let bounded = broker
             .bound(
                 RunId::new(),
+                None,
                 output(
                     content,
                     "done".into(),
@@ -273,6 +287,7 @@ mod tests {
         let bounded = broker
             .bound(
                 RunId::new(),
+                None,
                 output(
                     "body".into(),
                     "s".repeat(MAX_TOOL_SUMMARY_CHARS * 2),
@@ -297,7 +312,11 @@ mod tests {
         let content = "c".repeat(MAX_TOOL_MODEL_CONTENT_CHARS - 1);
         let summary = "s".repeat(MAX_TOOL_SUMMARY_CHARS);
         let bounded = broker
-            .bound(RunId::new(), output(content, summary, Value::Null, None))
+            .bound(
+                RunId::new(),
+                None,
+                output(content, summary, Value::Null, None),
+            )
             .await;
         let total = bounded.summary.chars().count()
             + bounded.model_content.chars().count()
@@ -308,6 +327,55 @@ mod tests {
         assert!(
             total <= MAX_TOOL_OUTPUT_TOTAL_CHARS,
             "decoded total {total} must stay under the cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_tool_budget_bounds_content_before_the_global_cap() {
+        let (workspace, _dir) = workspace().await;
+        let broker = WorkspaceOutputBroker::new(workspace);
+        let declared: usize = 256;
+        let content = format!("START{}END", "x".repeat(declared * 2));
+        let bounded = broker
+            .bound(
+                RunId::new(),
+                Some(declared),
+                output(content.clone(), "done".into(), Value::Null, None),
+            )
+            .await;
+        assert_eq!(
+            bounded.model_content.chars().count(),
+            declared,
+            "the declared tool budget must bound content below the global cap"
+        );
+        assert!(bounded.model_content.starts_with("START"));
+        assert!(bounded.model_content.ends_with("END"));
+        assert!(
+            bounded.model_content.contains("output broker truncated"),
+            "the truncation marker must name the cut"
+        );
+        assert!(
+            bounded.artifact_ref.is_some(),
+            "oversized content still spills to an artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_budget_never_exceeds_the_global_hard_cap() {
+        let (workspace, _dir) = workspace().await;
+        let broker = WorkspaceOutputBroker::new(workspace);
+        let content = "x".repeat(MAX_TOOL_MODEL_CONTENT_CHARS * 2);
+        let bounded = broker
+            .bound(
+                RunId::new(),
+                Some(MAX_TOOL_MODEL_CONTENT_CHARS * 10),
+                output(content.clone(), "done".into(), Value::Null, None),
+            )
+            .await;
+        assert_eq!(
+            bounded.model_content.chars().count(),
+            MAX_TOOL_MODEL_CONTENT_CHARS,
+            "a declaration can never exceed the global hard cap"
         );
     }
 }

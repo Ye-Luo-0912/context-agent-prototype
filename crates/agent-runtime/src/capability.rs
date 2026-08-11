@@ -1024,6 +1024,7 @@ impl CapabilityAwareDispatcher {
                     }
                 }),
                 risk: agent_contracts::ToolRisk::ReadOnly,
+                output_budget: None,
             },
         ]
     }
@@ -1059,6 +1060,7 @@ mod tests {
                 description: "base test tool".into(),
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
+                output_budget: None,
             }]
         }
 
@@ -1170,6 +1172,7 @@ mod tests {
             description: "demo tool".into(),
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         };
         DemoCapability {
             manifest: CapabilityManifest {

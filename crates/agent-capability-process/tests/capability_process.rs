@@ -34,6 +34,7 @@ fn manifest_with_program(program: &str) -> CapabilityManifest {
             description: "invoke the process capability".into(),
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }],
         lifecycle: CapabilityLifecycle::Lazy,
         transport: CapabilityTransport::Process {
@@ -53,6 +54,7 @@ fn write_manifest_with_program(program: &str) -> CapabilityManifest {
         description: "invoke the process capability".into(),
         input_schema: json!({"type": "object"}),
         risk: ToolRisk::WorkspaceWrite,
+        output_budget: None,
     }];
     manifest
 }

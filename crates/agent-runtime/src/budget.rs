@@ -210,12 +210,14 @@ mod tests {
                 description: "read a file".into(),
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
+                output_budget: None,
             },
             ToolSpec {
                 name: CONTEXT_MANAGE.into(),
                 description: "runtime control".into(),
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
+                output_budget: None,
             },
         ];
         // A wall of optional tools far above the cap.
@@ -225,6 +227,7 @@ mod tests {
                 description: "x".repeat(200),
                 input_schema: json!({"type": "object", "properties": {"p": {"type": "string"}}}),
                 risk: ToolRisk::ReadOnly,
+                output_budget: None,
             });
         }
         let bounded = bounded_tool_surface(specs, &core);
@@ -255,6 +258,7 @@ mod tests {
             description: "d".into(),
             input_schema: schema,
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         };
         // A big-schema tool and many small ones: smallest-schema-first keeps
         // the most tools visible under the cap, and the result is stable.
@@ -295,6 +299,7 @@ mod tests {
             description: description.into(),
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         };
         let mut specs = vec![
             make("core.read", "mandatory"),
@@ -321,6 +326,7 @@ mod tests {
             description: "mandatory".into(),
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }];
         assert!(omit_largest_optional_tool(&mut specs, |_| false).is_none());
         assert_eq!(specs.len(), 1);

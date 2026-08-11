@@ -317,6 +317,7 @@ mod tests {
                 description: "list files".into(),
                 input_schema: json!({"type": "object"}),
                 risk: agent_contracts::ToolRisk::ReadOnly,
+                output_budget: None,
             }],
             metadata: json!({}),
             cancel: CancellationToken::new(),

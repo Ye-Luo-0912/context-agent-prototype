@@ -174,6 +174,7 @@ impl Capability for CheckpointCapability {
             description: "checkpoint test tool".into(),
             input_schema: serde_json::json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }]
     }
 

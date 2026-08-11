@@ -202,6 +202,7 @@ impl Tool for GitStatusTool {
             description: "Show `git status --short` for the workspace (read-only).".into(),
             input_schema: json!({"type": "object", "properties": {}}),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }
     }
 
@@ -241,6 +242,7 @@ impl Tool for GitDiffTool {
                 }
             }),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }
     }
 

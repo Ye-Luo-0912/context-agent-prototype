@@ -52,6 +52,7 @@ impl Tool for FsListTool {
                 }
             }),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }
     }
 
@@ -176,6 +177,7 @@ impl Tool for FsReadTool {
                 }
             }),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }
     }
 
@@ -277,6 +279,7 @@ impl Tool for FsWriteTool {
                 }
             }),
             risk: ToolRisk::WorkspaceWrite,
+            output_budget: None,
         }
     }
 

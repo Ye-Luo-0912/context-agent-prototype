@@ -136,6 +136,7 @@ impl Tool for ContextManageTool {
                 }
             }),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }
     }
 

@@ -375,6 +375,7 @@ impl ToolDispatcher for OneToolDispatcher {
             description: "read a workspace file".into(),
             input_schema: serde_json::json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }]
     }
     async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -1063,6 +1064,7 @@ impl ToolDispatcher for RoundLocalToolDispatcher {
             description: "mandatory core reader".into(),
             input_schema: serde_json::json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }];
         if self.optional_loaded() {
             specs.push(ToolSpec {
@@ -1072,6 +1074,7 @@ impl ToolDispatcher for RoundLocalToolDispatcher {
                 description: "x".repeat(self.optional_description_chars),
                 input_schema: serde_json::json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
+                output_budget: None,
             });
         }
         specs
@@ -2180,6 +2183,7 @@ async fn output_broker_spills_oversized_tool_output_end_to_end() {
                 description: "oversized".into(),
                 input_schema: serde_json::json!({}),
                 risk: ToolRisk::ReadOnly,
+                output_budget: None,
             }]
         }
         async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -2218,6 +2222,7 @@ async fn output_broker_spills_oversized_tool_output_end_to_end() {
             description: "oversized".into(),
             input_schema: serde_json::json!({}),
             risk: ToolRisk::ReadOnly,
+            output_budget: None,
         }],
         ..ToolSurfaceSnapshot::default()
     };
