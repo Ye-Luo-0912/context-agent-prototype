@@ -640,10 +640,42 @@ Acceptance: a subscriber observes `TurnCompleted` only after a flush barrier
 has covered every mandatory state write; a failed barrier surfaces
 `TurnCommitFailed`/`RecoveryRequired` and never broadcasts `TurnCompleted`.
 
-Residual (not closed here): crash-recovery replay that re-reads the trace to
-rebuild runtime state after a barrier failure — this closes the barrier
-contract itself, not the recovery machinery; a genuinely full disk is covered
-by the sticky-error path but not exercised with a real full volume.
+Residual — **closed 2026-08-11 (crash-recovery replay)**. The recovery
+machinery now re-reads the trace to rebuild state after a barrier failure.
+`agent-replay` gains a recovery module (`src/recovery.rs`) and a
+`--recover <trace.jsonl>` CLI mode that:
+
+1. **Locates the durability barrier** — the last successful `TurnCompleted`
+   seq is the committed boundary; the first `TurnCommitFailed` is reported
+   with its phase and message (there is at most one: the runtime drops the
+   turn frame at the first failure), and the count of events after the
+   failure is surfaced (the runtime fences mutation after
+   `RecoveryRequired`, so a large tail is itself a red flag).
+2. **Checks the envelope sequence** — seq must be contiguous from 1; the
+   first gap `(expected, found)` is reported so lost/duplicated events on
+   disk cannot masquerade as a complete trace.
+3. **Rebuilds the context-engine state from the events** — a fresh engine
+   replays the run deterministically (ingest/maintain/materialize/GC/
+   consumption), producing the final diagnostics a recovery can trust.
+   Scope honesty: the trace is an audit stream, not a state-replay log —
+   the context plane is fully reconstructible; `TaskManager` detail
+   (anchor content, requirement revisions) is checkpoint-only by design.
+4. **Proves restore consistency** — `verify_restore_consistency`: restore a
+   context checkpoint into a fresh engine, replay the events after its
+   cover seq, and compare every diagnostics dimension with a full rebuild.
+   Agreement is the engine-level guarantee that the runtime and the context
+   never drift apart after a crash recovery; a wrong cover seq (the caller
+   claiming a checkpoint covers fewer events than it captured) is detected
+   as a divergence.
+
+Regressions: `recovery_locates_the_last_committed_barrier`,
+`recovery_reports_the_turn_commit_failure_and_fences_after`,
+`recovery_detects_seq_gaps`, `recovery_rebuilds_context_state_
+deterministically`, `restore_then_incremental_replay_matches_full_rebuild`
+and `verify_restore_consistency_detects_a_wrong_cover_seq`. A genuinely
+full disk remains covered by the sticky-error path but is still not
+exercised with a real full volume (the barrier contract and the recovery
+machinery are closed; the volume-level exercise stays an ops concern).
 
 ## P1 — confirmed defects and hardening
 

@@ -1116,7 +1116,7 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 
 | Milestone | Status at this code state | Acceptance gap |
 | --- | --- | --- |
-| M10 Runtime Consistency | 🟡 transaction baseline | Cross-plane checkpoint capture and live-restore audit/recovery are closed (`CORE-03`), the GC/storage/checkpoint/restore operation protocol is closed (`CTX-06`), and the task authority/completion contract is closed (`CTX-10`: TaskAnchor, CompletionRecord, atomic root transfer, storage-root outcomes). M10's named acceptance (runtime and context never drift into a task/state split-brain) is exercised by the invariant suite; the remaining gap is a single standing recovery-replay path (`CORE-02` residual) rather than a missing transaction primitive. |
+| M10 Runtime Consistency | ✅ | Cross-plane checkpoint capture and live-restore audit/recovery are closed (`CORE-03`), the GC/storage/checkpoint/restore operation protocol is closed (`CTX-06`), the task authority/completion contract is closed (`CTX-10`: TaskAnchor, CompletionRecord, atomic root transfer, storage-root outcomes), and the standing recovery-replay path is closed (`CORE-02` residual: `agent-replay --recover` locates the durability barrier and failure phase, checks envelope-sequence integrity, rebuilds the context-engine state from the trace, and proves checkpoint restore + tail replay equals the full rebuild). M10's named acceptance (runtime and context never drift into a task/state split-brain) is exercised by the invariant suite plus the engine-level restore-consistency proof. |
 | M11 Context Recall | ✅ narrow retrieval baseline | Search/inspect/fetch, transient results, bounded external view and service parity work. Canonical catalog ownership and complete cross-residency semantics remain context-runtime work rather than reasons to call recall itself absent. TaskAnchor/Completion roots are now implemented (`CTX-10`). |
 | M12 Effect Runtime | ✅ | In-process prepared effects and process-capability wire effects commit behind the generation fence (`CORE-01`), a cancelled operation kills its whole process tree (`CORE-06`: shell/git/capability share one tree-kill) and cleans up every pending approval entry, provider streams are byte-capped, and Windows Job-Object quotas are kernel-enforced. The standing-grant `TaskExecutionPolicy` (CORE-08) is M14 approval-policy work, not an M12 gap. |
 | M13 Extension Sandbox | 🟡 partial | Env scrub, private cwd, bounded stderr, process-tree cancellation and Windows Job-Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE) are enforced; Unix rlimits cover CPU/process count; workspace filesystem access is confined to directory-handle-relative opens with reparse substitution rejected at open time (`CORE-07`). A cwd is still not a filesystem boundary: absolute filesystem/network access is not brokered, which keeps M13 open. |
@@ -1142,8 +1142,11 @@ the required gate order; the numbered list and table above are authoritative.
 
 1. **V1-M10 Runtime Consistency** — task authority, transactional task
    transitions, RuntimeCheckpoint, Turn commit. Acceptance: the runtime and
-   the context never drift into a task/state split-brain. 🟡 Close
-   `CORE-03`/`CTX-06`; the transaction baseline is implemented.
+   the context never drift into a task/state split-brain. ✅
+   `CORE-03`/`CTX-06`/`CTX-10` are closed and the recovery-replay path
+   (`CORE-02` residual) is closed: `agent-replay --recover` rebuilds the
+   context-engine state from the trace and proves checkpoint restore +
+   tail replay equals the full rebuild.
 2. **V1-M11 Context Recall** — store injection, `ContextMapView` (the
    type-level bounded view landed in Performance P1),
    `context.search`/`fetch`, `gc_epoch`, async store. Acceptance: external
