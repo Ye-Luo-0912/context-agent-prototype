@@ -36,6 +36,13 @@ const MAX_ENV_KEYS: usize = 64;
 const MAX_ENV_VALUE_CHARS: usize = 16_384;
 const MAX_SESSIONS: usize = 16;
 
+/// Bounded wait for a child's remaining buffered output after it exits:
+/// process exit and pipe EOF are two different events, and a poll must not
+/// report "exited" until the readers are at EOF so the model-facing tail
+/// is complete. The bound only bites when a reader is wedged (e.g. a
+/// grandchild holding the pipe open); a later poll keeps draining.
+const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// A running (or finished-but-unreaped) session: the live child plus the
 /// drained-output state. The output reader tasks keep pushing lines into
 /// the channel; `poll` drains them into the bounded tail and the artifact.
@@ -77,6 +84,31 @@ impl ProcessSession {
             }
         }
         if let Ok(Some(_status)) = self.child.try_wait() {
+            // The child exited, but its pipes may still hold buffered
+            // output the reader tasks have not delivered yet: process exit
+            // and pipe EOF are two different events. Block (bounded) until
+            // the channel disconnects — the readers' EOF — so a poll that
+            // reports "exited" always carries the complete model-facing
+            // tail. The bound is a safety valve: a wedged reader (a
+            // grandchild holding the pipe open) must never block a poll
+            // forever, and a later poll keeps draining.
+            loop {
+                match tokio::time::timeout(EXIT_DRAIN_TIMEOUT, self.rx.recv()).await {
+                    Ok(Some(StreamLine::Stdout(line))) | Ok(Some(StreamLine::Stderr(line))) => {
+                        record_line(
+                            &line,
+                            &mut self.tail,
+                            artifact,
+                            &mut self.total_lines,
+                            &mut self.total_chars,
+                        )
+                        .await?;
+                        new_lines += 1;
+                    }
+                    Ok(None) => break, // all readers at EOF
+                    Err(_) => break,   // bounded: never block a poll forever
+                }
+            }
             exited = true;
         }
         Ok((new_lines, exited))
