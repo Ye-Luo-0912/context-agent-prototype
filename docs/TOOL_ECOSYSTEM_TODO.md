@@ -826,7 +826,21 @@ together with TaskAnchor and continuous context GC.
   runtime behavior changed. Open questions (structured error codes on
   `ok:false`, marker-assertion granularity for the harness, artifact TTL)
   are tracked for `TOOLS-04`/`M15`.
-- [ ] **TOOLS-04** Define the conformance harness and A/B/C/D evaluation fixtures first.
+- [~] **TOOLS-04** Define the conformance harness and A/B/C/D evaluation fixtures first.
+  **Harness closed 2026-08-11; A/B/C/D fixtures remain (M15 input).** New
+  crate `agent-conformance`: the shared harness every tool/capability must
+  pass — schema contract (well-formed identity, `type: object`, bounded
+  schema size), output envelope (summary/model-content/metadata/decoded
+  total against the global caps, non-empty failure summary, `artifact://`
+  refs) against the TOOLS-03 specification, structured error envelope
+  (never an `Internal` leak), path confinement (absolute/parent-escaping
+  workspace paths refused), and surface/lifecycle rules (core + control
+  always visible, fail-closed omission, core tools unloadable-proof).
+  The builtin catalog (all ten tools) passes the full harness in
+  `agent-conformance/tests/builtin.rs`. Remaining for this item: the
+  A/B/C/D evaluation fixtures (the M15 workload inputs) and the
+  cancellation/timeout/effect-fence checks for external capabilities once
+  they are loadable.
 
 ### Gate 2: close correctness/security blockers
 
