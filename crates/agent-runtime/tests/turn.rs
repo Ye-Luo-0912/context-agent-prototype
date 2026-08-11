@@ -21,8 +21,11 @@ use agent_contracts::{
     RuntimeEventEnvelope, ScopeId, ScopeKind, TaskId, ToolCall, ToolDispatcher,
     ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
-use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
-use agent_runtime::{CapabilityAwareDispatcher, CapabilityRegistry, RuntimeHandle, spawn_runtime};
+
+use agent_kernel::{AgentKernelConfig, PolicyApprovalGate};
+use agent_runtime::{
+    CapabilityAwareDispatcher, CapabilityRegistry, RuntimeHandle, RuntimeServices, spawn_runtime,
+};
 use serde_json::json;
 use tokio::sync::Mutex;
 
@@ -282,7 +285,7 @@ async fn spawn_with(
     context: Arc<dyn ContextEngine>,
     tools: Arc<dyn ToolDispatcher>,
 ) -> RuntimeHandle {
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         context,
         model,
@@ -1235,7 +1238,7 @@ async fn before_model_audit_failure_fences_the_turn() {
         rounds: AtomicUsize::new(0),
     });
     let rounds_ref = model.clone();
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         Arc::new(RecordingContextEngine::default()),
         model,
@@ -1281,7 +1284,7 @@ async fn collect_audit_failure_is_not_silent() {
     // the resulting ContextGc audit event cannot be journaled, the runtime
     // must surface the failure as an Error event instead of dropping it.
     let context = Arc::new(RecordingContextEngine::default());
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         context.clone(),
         Arc::new(DirectiveModel {
@@ -2297,7 +2300,7 @@ async fn expired_authority_lease_rolls_back_the_staged_effect() {
         committed: committed.clone(),
         rolled_back: rolled_back.clone(),
     });
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig {
             // 1ms window: any real dispatch overruns it deterministically.
             lease_ttl_ms: Some(1),

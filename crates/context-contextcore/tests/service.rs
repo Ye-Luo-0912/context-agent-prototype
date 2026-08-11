@@ -16,7 +16,7 @@ use agent_contracts::{
     ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, OperationId, RuntimeEvent,
     ToolOutcome, ToolOutput, TurnId,
 };
-use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
+use agent_kernel::{AgentKernelConfig, PolicyApprovalGate};
 use context_contextcore::{ContextServiceAdapter, ContextServiceConfig, ServiceEngine};
 use serde_json::json;
 
@@ -157,7 +157,7 @@ async fn full_contract_round_trip_across_the_process_boundary() {
 async fn adapter_plugs_into_a_real_kernel_without_rewrites() {
     let engine = connect().await;
 
-    let kernel = Arc::new(AgentKernel::new(
+    let services = Arc::new(agent_runtime::RuntimeServices::new(
         AgentKernelConfig::default(),
         engine,
         Arc::new(PlainModel),
@@ -165,7 +165,7 @@ async fn adapter_plugs_into_a_real_kernel_without_rewrites() {
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     ));
-    let (handle, _runtime_task) = agent_runtime::spawn_runtime(kernel);
+    let (handle, _runtime_task) = agent_runtime::spawn_runtime(services);
     let mut events = handle.subscribe();
     handle.start().await.unwrap();
 

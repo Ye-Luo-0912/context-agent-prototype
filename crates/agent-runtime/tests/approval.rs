@@ -15,8 +15,9 @@ use agent_contracts::{
     ModelTransport, RuntimeEvent, ScopeId, ScopeKind, ToolCall, ToolDispatcher,
     ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
-use agent_kernel::{AgentKernel, AgentKernelConfig, ApprovalBroker, InteractiveApprovalGate};
-use agent_runtime::{RuntimeHandle, spawn_runtime};
+
+use agent_kernel::{AgentKernelConfig, ApprovalBroker, InteractiveApprovalGate};
+use agent_runtime::{RuntimeHandle, RuntimeServices, spawn_runtime};
 use serde_json::json;
 
 #[derive(Debug)]
@@ -151,7 +152,7 @@ impl ModelTransport for OneToolCallModel {
 }
 
 async fn spawn_with(model: Arc<dyn ModelTransport>, gate: Arc<dyn ApprovalGate>) -> RuntimeHandle {
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         Arc::new(TestContextEngine),
         model,

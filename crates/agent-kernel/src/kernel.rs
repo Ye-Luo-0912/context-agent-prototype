@@ -2,12 +2,9 @@ use std::sync::Arc;
 
 use agent_contracts::{
     AgentError, AgentResult, AuthorityLease, CONTEXT_SEARCH_MAX_LIMIT, CancellationToken,
-    ContextConsumptionAck, ContextEngine, ContextGcReport, ContextIngress, ContextItemSummary,
-    ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
-    ContextSearchQuery, ContextStateTransition, EngineQuery, FocusState, MaterializedContext,
-    ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest, ModelTransport, OutputBroker,
-    RunId, RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall, ToolCatalogEntry, ToolDispatcher,
-    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec, ToolSurfaceSnapshot,
+    ContextConsumptionAck, ContextEngine, ContextMaintenanceTrigger, ContextQuery,
+    ContextSearchQuery, EngineQuery, OutputBroker, RunId, RuntimeEvent, TaskId, ToolCall,
+    ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSurfaceSnapshot,
     derive_effect_intent,
 };
 
@@ -87,7 +84,6 @@ pub struct AgentKernel {
     run_id: RunId,
     config: AgentKernelConfig,
     context: Arc<dyn ContextEngine>,
-    model: Arc<dyn ModelTransport>,
     tools: Arc<dyn ToolDispatcher>,
     event: EventAuthority,
     approval: ApprovalAuthority,
@@ -99,7 +95,6 @@ impl AgentKernel {
     pub fn new(
         config: AgentKernelConfig,
         context: Arc<dyn ContextEngine>,
-        model: Arc<dyn ModelTransport>,
         tools: Arc<dyn ToolDispatcher>,
         approval: Arc<dyn agent_contracts::ApprovalGate>,
         journal: Option<Arc<dyn agent_contracts::EventJournal>>,
@@ -118,7 +113,6 @@ impl AgentKernel {
             run_id: RunId::new(),
             config,
             context,
-            model,
             tools,
             event: EventAuthority::new(journal, event_tx, seq),
             approval,
@@ -170,70 +164,6 @@ impl AgentKernel {
         self.event.seq()
     }
 
-    /// Configuration accessors the actor drives the turn loop with.
-    pub fn system_prompt(&self) -> String {
-        self.config.system_prompt.clone()
-    }
-
-    pub fn context_budget_tokens(&self) -> usize {
-        self.config.context_budget_tokens
-    }
-
-    pub fn max_tool_rounds(&self) -> usize {
-        self.config.max_tool_rounds
-    }
-
-    pub fn model_capabilities(&self) -> ModelCapabilities {
-        self.model.capabilities()
-    }
-
-    pub fn tool_specs(&self) -> Vec<ToolSpec> {
-        self.tools.specs()
-    }
-
-    /// Capture the tool surface for one model round: the runtime calls this
-    /// once per round right after `tool_gc()`, then threads the snapshot
-    /// through the budget, the prompt and tool-call validation so the model
-    /// always sees — and the runtime always validates against — the same
-    /// surface.
-    pub fn tool_snapshot(&self) -> ToolSurfaceSnapshot {
-        self.tools.snapshot()
-    }
-
-    /// Pure classification used by the runtime's final input guard. A true
-    /// result permits a schema to be omitted from the current round only;
-    /// it does not authorize unloading or any catalog lifecycle mutation.
-    pub fn tool_may_omit_from_round(&self, name: &str) -> bool {
-        self.tools.may_omit_from_round(name)
-    }
-
-    /// Run the tool lifecycle GC at a runtime safe point. `specs()` is pure;
-    /// the actor ages the tool catalog exactly once per model round, before
-    /// the surface is captured for the budget and the prompt.
-    pub fn tool_gc(&self) {
-        self.tools.gc();
-    }
-
-    /// Pure discovery state used by the runtime's Task requirement safe
-    /// point. The dispatcher remains unaware of TaskManager/Focus policy.
-    pub fn tool_catalog(&self) -> Vec<ToolCatalogEntry> {
-        self.tools.catalog()
-    }
-
-    /// Re-activate one exact Task-rooted tool at the BeforeModel safe point.
-    /// This is a lifecycle decision caused by a Task requirement, never by
-    /// provider token pressure and never an authority/approval grant.
-    pub fn tool_load(&self, name: &str) -> AgentResult<()> {
-        self.tools.load_tool(name)
-    }
-
-    /// Explicitly unload an optional tool from the catalog surface. Provider
-    /// input budgeting never calls this: budget pressure only omits schemas
-    /// from its immutable per-round snapshot. Core tools refuse to unload.
-    pub fn tool_unload(&self, name: &str) -> AgentResult<()> {
-        self.tools.unload_tool(name)
-    }
-
     pub async fn start(&self) -> AgentResult<()> {
         self.event.emit(self.run_id, RuntimeEvent::RunStarted).await
     }
@@ -267,38 +197,13 @@ impl AgentKernel {
         self.event.warning(self.run_id, message).await
     }
 
-    /// Context primitives: the actor decides when they run.
-    pub async fn context_ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
-        self.context.ingest(ingress).await
-    }
-
-    pub async fn context_maintain(
-        &self,
-        trigger: ContextMaintenanceTrigger,
-    ) -> AgentResult<ContextMaintenanceReport> {
-        self.context.maintain(trigger).await
-    }
-
-    /// Run a full GC pass (mark roots, sweep, reversible eviction). Called
-    /// by the actor at turn boundaries; engines without a GC pass return an
-    /// empty report.
-    pub async fn context_gc(&self) -> AgentResult<ContextGcReport> {
-        self.context.gc().await
-    }
-
-    /// Materialize the working set for one model request. The result is
-    /// structured items; prompt assembly happens in the runtime actor.
-    pub async fn context_materialize(
-        &self,
-        query: ContextQuery,
-    ) -> AgentResult<MaterializedContext> {
-        self.context.materialize(query).await
-    }
-
     /// Commit model-consumption reinforcement and its bounded audit record as
     /// one context transaction. If either the engine mutation or event append
     /// fails, restore the pre-ack checkpoint so GC never observes an
-    /// unaudited/partial access stamp.
+    /// unaudited/partial access stamp. Context scheduling (ingest, maintain,
+    /// GC, scopes, focus) lives on `RuntimeServices`; this one stays on the
+    /// kernel because it is an *authority transaction* — the access stamp
+    /// plus its mandatory audit event commit or roll back together.
     pub async fn acknowledge_context_consumption(
         &self,
         ack: ContextConsumptionAck,
@@ -312,23 +217,6 @@ impl AgentKernel {
         .await;
         self.finish_context_transaction("acknowledge context consumption", checkpoint, result)
             .await
-    }
-
-    /// Open a scope (runtime-driven, e.g. a tool scope at tool start).
-    pub async fn context_open_scope(
-        &self,
-        kind: ScopeKind,
-        parent: Option<ScopeId>,
-    ) -> AgentResult<ScopeId> {
-        self.context.open_scope(kind, parent).await
-    }
-
-    /// Close a scope the runtime opened; returns the close transitions.
-    pub async fn context_close_scope(
-        &self,
-        scope_id: ScopeId,
-    ) -> AgentResult<Vec<ContextStateTransition>> {
-        self.context.close_scope(scope_id).await
     }
 
     /// Resolve a tool's engine query (context.search/inspect/fetch) against
@@ -482,17 +370,6 @@ impl AgentKernel {
         self.output.bound(self.run_id, None, output).await
     }
 
-    /// One model round: stream the request to the provider. The result is a
-    /// value for the actor to validate and commit — nothing is committed
-    /// here.
-    pub async fn run_model_round(
-        &self,
-        request: ModelRequest,
-        sink: &dyn ModelEventSink,
-    ) -> AgentResult<ModelOutput> {
-        self.model.complete_stream(request, sink).await
-    }
-
     /// Execute one tool call: validate it against the round's tool surface
     /// snapshot (the same surface the model saw and the budget used), run
     /// approval, mint the commit-time authority lease for side-effecting
@@ -632,116 +509,10 @@ impl AgentKernel {
         (outcome, lease)
     }
 
-    /// Switch the runtime's focus to a task's goal. The task id comes from
-    /// the runtime's `TaskManager` — re-focusing an existing task resumes
-    /// its scopes in the context engine (suspension/resume is keyed on the
-    /// task id), while a fresh task id opens a fresh task scope.
-    pub async fn set_focus(
-        &self,
-        task_id: TaskId,
-        goal: String,
-    ) -> AgentResult<ContextMaintenanceReport> {
-        let checkpoint = self.context.checkpoint().await?;
-        let focus = FocusState::for_task(task_id, goal.clone());
-        let transition = async {
-            self.context
-                .ingest(ContextIngress::FocusChanged { focus })
-                .await?;
-            self.context
-                .maintain(ContextMaintenanceTrigger::FocusChanged)
-                .await
-        }
-        .await;
-        self.finish_context_transaction("set focus", checkpoint, transition)
-            .await
-    }
-
-    /// Suspend the current focus without completing the task: the engine
-    /// clears its focus and suspends the active task's scopes, so a later
-    /// `set_focus` with the same task id resumes them.
-    pub async fn clear_focus(&self) -> AgentResult<ContextMaintenanceReport> {
-        let checkpoint = self.context.checkpoint().await?;
-        let transition = async {
-            self.context.ingest(ContextIngress::FocusCleared).await?;
-            self.context
-                .maintain(ContextMaintenanceTrigger::FocusChanged)
-                .await
-        }
-        .await;
-        self.finish_context_transaction("clear focus", checkpoint, transition)
-            .await
-    }
-
-    pub async fn pin(&self, content: String) -> AgentResult<ContextMaintenanceReport> {
-        let checkpoint = self.context.checkpoint().await?;
-        let transition = async {
-            self.context
-                .ingest(ContextIngress::Pin {
-                    content,
-                    kind: ContextKind::Constraint,
-                })
-                .await?;
-            self.context
-                .maintain(ContextMaintenanceTrigger::FocusChanged)
-                .await
-        }
-        .await;
-        self.finish_context_transaction("pin context", checkpoint, transition)
-            .await
-    }
-
-    pub async fn complete_current_task(
-        &self,
-        task_id: TaskId,
-        summary: String,
-    ) -> AgentResult<ContextMaintenanceReport> {
-        let checkpoint = self.context.checkpoint().await?;
-        let transition = async {
-            self.context
-                .ingest(ContextIngress::TaskCompleted {
-                    task_id: Some(task_id),
-                    summary,
-                })
-                .await?;
-            self.context
-                .maintain(ContextMaintenanceTrigger::TaskCompleted)
-                .await
-        }
-        .await;
-        self.finish_context_transaction("complete task", checkpoint, transition)
-            .await
-    }
-
-    /// Complete a context-only transaction. Context engines are replaceable
-    /// and their mutation methods are fallible, so the stateless core takes a
-    /// portable checkpoint before a multi-step transition and restores it if
-    /// either ingest or maintenance fails. Task state is committed by the
-    /// runtime actor only after this method returns `Ok`.
-    async fn finish_context_transaction<T>(
-        &self,
-        operation: &'static str,
-        checkpoint: serde_json::Value,
-        result: AgentResult<T>,
-    ) -> AgentResult<T> {
-        match result {
-            Ok(value) => Ok(value),
-            Err(error) => match self.context.restore(checkpoint).await {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(AgentError::RecoveryRequired(format!(
-                    "{operation} failed ({error}); rollback failed ({rollback_error})"
-                ))),
-            },
-        }
-    }
-
     pub async fn emit_diagnostics(&self) -> AgentResult<()> {
         let diagnostics = self.context.diagnostics().await?;
         self.emit_event(RuntimeEvent::Diagnostics { diagnostics })
             .await
-    }
-
-    pub async fn inspect_context(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
-        self.context.inspect(limit).await
     }
 
     pub async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
@@ -799,6 +570,28 @@ impl AgentKernel {
         self.finish_context_transaction("restore context", checkpoint, restored)
             .await
     }
+
+    /// Complete an authority transaction. Context engines are replaceable
+    /// and their mutation methods are fallible, so the kernel takes a
+    /// portable checkpoint before a multi-step transition and restores it
+    /// if the engine mutation fails. Task state is committed by the runtime
+    /// actor only after the authority transaction returns `Ok`.
+    async fn finish_context_transaction<T>(
+        &self,
+        operation: &'static str,
+        checkpoint: serde_json::Value,
+        result: AgentResult<T>,
+    ) -> AgentResult<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => match self.context.restore(checkpoint).await {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(AgentError::RecoveryRequired(format!(
+                    "{operation} failed ({error}); rollback failed ({rollback_error})"
+                ))),
+            },
+        }
+    }
 }
 
 fn tool_error_output(call: &ToolCall, message: String) -> ToolOutput {
@@ -851,9 +644,11 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use agent_contracts::{
-        ApprovalDecision, ApprovalGate, AttentionState, ContextDiagnostics, ContextItem,
-        ContextItemId, ContextResidency, ContextRetention, ContextScope, ExternalizedContext,
-        SemanticState, ToolRisk, ToolSurfaceDemand, ToolSurfaceOmission, ToolSurfaceOmissionReason,
+        ApprovalDecision, ApprovalGate, AttentionState, ContextDiagnostics, ContextIngress,
+        ContextItem, ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
+        ContextResidency, ContextRetention, ContextScope, ContextStateTransition,
+        ExternalizedContext, MaterializedContext, ScopeId, ScopeKind, SemanticState, ToolRisk,
+        ToolSpec, ToolSurfaceDemand, ToolSurfaceOmission, ToolSurfaceOmissionReason,
     };
 
     fn call(name: &str) -> ToolCall {
@@ -976,18 +771,6 @@ mod tests {
         }
     }
 
-    struct UnusedModel;
-
-    #[async_trait::async_trait]
-    impl ModelTransport for UnusedModel {
-        fn capabilities(&self) -> ModelCapabilities {
-            ModelCapabilities::default()
-        }
-        async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
-            unimplemented!("tests never run a model round")
-        }
-    }
-
     struct RecordingEngine {
         searched_limits: std::sync::Mutex<Vec<usize>>,
         fetched: std::sync::Mutex<Option<ContextItem>>,
@@ -1089,7 +872,6 @@ mod tests {
                 ..AgentKernelConfig::default()
             },
             engine,
-            Arc::new(UnusedModel),
             dispatcher,
             Arc::new(AllowAllApproval),
             None,
@@ -1380,7 +1162,6 @@ mod tests {
                 searched_limits: Default::default(),
                 fetched: Default::default(),
             }),
-            Arc::new(UnusedModel),
             Arc::new(BigOutputDispatcher {
                 output: ToolOutput {
                     call_id: "c1".into(),
@@ -1468,7 +1249,6 @@ mod tests {
                 searched_limits: Default::default(),
                 fetched: Default::default(),
             }),
-            Arc::new(UnusedModel),
             Arc::new(EchoDispatcher {
                 output: ToolOutput {
                     call_id: "c1".into(),
@@ -1565,7 +1345,6 @@ mod tests {
                 searched_limits: Default::default(),
                 fetched: Default::default(),
             }),
-            Arc::new(UnusedModel),
             Arc::new(EchoDispatcher {
                 output: ToolOutput {
                     call_id: "c1".into(),

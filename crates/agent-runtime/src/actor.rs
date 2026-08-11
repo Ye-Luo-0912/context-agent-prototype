@@ -33,6 +33,7 @@ use crate::checkpoint::{
 use crate::command::{Reply, RuntimeCommand, RuntimeHandle};
 use crate::output::bound_tool_output;
 use crate::prompt::PromptAssembler;
+use crate::services::RuntimeServices;
 use crate::sink::LiveSink;
 use crate::surface::{RoundSurfacePlan, SurfaceReportContext};
 use crate::task::{TaskManager, normalize_tool_requirements};
@@ -201,7 +202,14 @@ struct ActorState {
 }
 
 pub struct RuntimeActor {
+    /// The authority facade: events, approval, effects, output, and the
+    /// tool-execution wiring (execute_tool). Scheduling — context
+    /// maintenance, model calls, tool lifecycle — lives on `services`.
     kernel: Arc<AgentKernel>,
+    /// The scheduling seam: context/model/tool/config operations the actor
+    /// triggers. The actor decides every trigger and order; the services
+    /// execute the call.
+    services: Arc<RuntimeServices>,
     /// Owns the system prompt and renders the five-layer model input. The
     /// context engine only ever returns structured items.
     assembler: PromptAssembler,
@@ -209,10 +217,11 @@ pub struct RuntimeActor {
 }
 
 impl RuntimeActor {
-    pub fn new(kernel: Arc<AgentKernel>) -> Self {
+    pub fn new(kernel: Arc<AgentKernel>, services: Arc<RuntimeServices>) -> Self {
         Self {
-            assembler: PromptAssembler::new(kernel.system_prompt()),
+            assembler: PromptAssembler::new(services.system_prompt()),
             kernel,
+            services,
             state: ActorState::default(),
         }
     }
@@ -290,7 +299,7 @@ impl RuntimeActor {
                         // can never diverge.
                         let (txn, task_id) = self.state.tasks.prepare_create(&goal);
                         let event_goal = goal.clone();
-                        match self.kernel.set_focus(task_id, goal).await {
+                        match self.services.set_focus(task_id, goal).await {
                             Ok(report) => {
                                 self.state.tasks.commit(txn);
                                 self.state.task_id = Some(task_id);
@@ -331,7 +340,7 @@ impl RuntimeActor {
                                 .map(|task| task.goal.clone())
                                 .unwrap_or_default();
                             let event_goal = goal.clone();
-                            match self.kernel.set_focus(task_id, goal).await {
+                            match self.services.set_focus(task_id, goal).await {
                                 Ok(report) => {
                                     self.state.tasks.commit(txn);
                                     self.state.task_id = Some(task_id);
@@ -363,7 +372,7 @@ impl RuntimeActor {
                 let result = match self.ensure_idle().and_then(|_| self.next_focus_revision()) {
                     Ok(next_focus_revision) => match self.state.tasks.prepare_suspend() {
                         None => Ok(()),
-                        Some(txn) => match self.kernel.clear_focus().await {
+                        Some(txn) => match self.services.clear_focus().await {
                             Ok(report) => {
                                 self.state.tasks.commit(txn);
                                 self.state.task_id = None;
@@ -483,7 +492,7 @@ impl RuntimeActor {
                 let result = match self.ensure_idle() {
                     Ok(()) => {
                         let event_content = content.clone();
-                        match self.kernel.pin(content).await {
+                        match self.services.pin(content).await {
                             Ok(report) => {
                                 self.publish_context_transition(
                                     RuntimeEvent::Pinned {
@@ -527,7 +536,7 @@ impl RuntimeActor {
                                 let task_id = record.task_id;
                                 let anchor_revision = record.anchor_revision;
                                 let event_summary = record.summary.clone();
-                                match self.kernel.complete_current_task(task_id, summary).await {
+                                match self.services.complete_current_task(task_id, summary).await {
                                     Ok(report) => {
                                         self.state.tasks.commit(txn);
                                         self.state.task_id = None;
@@ -744,7 +753,7 @@ impl RuntimeActor {
                 let _ = reply.send(self.kernel.emit_diagnostics().await);
             }
             RuntimeCommand::InspectContext { limit, reply } => {
-                let _ = reply.send(self.kernel.inspect_context(limit).await);
+                let _ = reply.send(self.services.inspect_context(limit).await);
             }
             RuntimeCommand::CancelTurn { reply } => {
                 self.cancel_turn().await;
@@ -841,7 +850,7 @@ impl RuntimeActor {
     /// committed; a GC failure is surfaced as an `Error` event and never
     /// rolls the outcome back.
     async fn compact_after_completion(&mut self) {
-        match self.kernel.context_gc().await {
+        match self.services.context_gc().await {
             Ok(report) => {
                 if let Err(error) = self
                     .kernel
@@ -898,7 +907,7 @@ impl RuntimeActor {
                 }
             };
             let (txn, task_id) = self.state.tasks.prepare_create(content.trim());
-            match self.kernel.set_focus(task_id, content.clone()).await {
+            match self.services.set_focus(task_id, content.clone()).await {
                 Err(error) => {
                     let error = self.context_transition_failed(error);
                     let _ = reply.send(Err(error));
@@ -943,7 +952,7 @@ impl RuntimeActor {
             return;
         }
         if let Err(error) = self
-            .kernel
+            .services
             .context_ingest(ContextIngress::UserMessage {
                 content: content.clone(),
             })
@@ -953,7 +962,7 @@ impl RuntimeActor {
             return;
         }
         match self
-            .kernel
+            .services
             .context_maintain(ContextMaintenanceTrigger::UserInput)
             .await
         {
@@ -1019,12 +1028,12 @@ impl RuntimeActor {
         match action {
             Action::Model => {
                 let over_budget = self.state.turn.as_ref().is_some_and(|turn| {
-                    turn.op.is_none() && turn.model_round >= self.kernel.max_tool_rounds()
+                    turn.op.is_none() && turn.model_round >= self.services.max_tool_rounds()
                 });
                 if over_budget {
                     let message = format!(
                         "tool round budget exhausted after {} rounds",
-                        self.kernel.max_tool_rounds()
+                        self.services.max_tool_rounds()
                     );
                     let _ = self
                         .kernel
@@ -1070,7 +1079,7 @@ impl RuntimeActor {
         };
 
         match self
-            .kernel
+            .services
             .context_maintain(ContextMaintenanceTrigger::BeforeModel)
             .await
         {
@@ -1111,7 +1120,7 @@ impl RuntimeActor {
         // Tool lifecycle safe point. Task demand is declarative only: reload
         // can restore catalog/schema readiness, but cannot enable a disabled
         // capability, grant a permission or bypass approval/effect policy.
-        self.kernel.tool_gc();
+        self.services.tool_gc();
         let active_task = self
             .state
             .task_id
@@ -1129,13 +1138,13 @@ impl RuntimeActor {
         // final snapshot below is authoritative, so a refused load is
         // represented as Unavailable without leaking provider error text.
         let mut visible_names: HashSet<String> = self
-            .kernel
+            .services
             .tool_specs()
             .into_iter()
             .map(|spec| spec.name)
             .collect();
         visible_names.extend(
-            self.kernel
+            self.services
                 .tool_catalog()
                 .into_iter()
                 .filter(|entry| entry.state.in_surface())
@@ -1143,14 +1152,14 @@ impl RuntimeActor {
         );
         for requirement in &requirements {
             if !visible_names.contains(&requirement.tool_name) {
-                let _ = self.kernel.tool_load(&requirement.tool_name);
+                let _ = self.services.tool_load(&requirement.tool_name);
             }
         }
 
         // Dispatcher snapshot is the complete currently-loaded candidate
         // set. Runtime owns the sole bounded projection so Task MustSurface
         // can never disappear inside a provider adapter before policy sees it.
-        let candidates = self.kernel.tool_snapshot();
+        let candidates = self.services.tool_snapshot();
         let candidate_names: HashSet<String> = candidates
             .specs
             .iter()
@@ -1190,7 +1199,7 @@ impl RuntimeActor {
         }
 
         let mut surface_plan = RoundSurfacePlan::build(candidates, &requirements, |name| {
-            self.kernel.tool_may_omit_from_round(name)
+            self.services.tool_may_omit_from_round(name)
         });
         surface_plan
             .source_revisions_mut()
@@ -1318,12 +1327,12 @@ impl RuntimeActor {
         // the output reserve, system policy, turn frame and active tool
         // schemas are the runtime's share and are subtracted before the
         // engine budgets the working set.
-        let capabilities = self.kernel.model_capabilities();
+        let capabilities = self.services.model_capabilities();
         let turn_frame_tokens = approx_layer_tokens(&turn_frame.messages());
         let active_tools_tokens = approx_layer_tokens(&surface_plan.specs());
         let provider_window = capabilities
             .context_window
-            .unwrap_or_else(|| self.kernel.context_budget_tokens());
+            .unwrap_or_else(|| self.services.context_budget_tokens());
         // The output reserve is a hard subtraction: the answer must always
         // have room, and rendering overhead must never eat into it.
         let output_reserve = if capabilities.max_output_tokens > 0 {
@@ -1339,7 +1348,7 @@ impl RuntimeActor {
             active_tools_tokens,
         );
         let materialized = match self
-            .kernel
+            .services
             .context_materialize(ContextQuery {
                 current_input: current_input.clone(),
                 budget_tokens: model_budget.context_frame_budget,
@@ -1579,6 +1588,7 @@ impl RuntimeActor {
         }
 
         let kernel = self.kernel.clone();
+        let services = self.services.clone();
         let sink = LiveSink::new(
             kernel.event_sender(),
             kernel.seq(),
@@ -1592,7 +1602,7 @@ impl RuntimeActor {
         let task_id = self.state.task_id;
         let scope_id = self.state.scope_id;
         tokio::spawn(async move {
-            let outcome = match kernel
+            let outcome = match services
                 .run_model_round(
                     ModelRequest {
                         messages: input.into_messages(),
@@ -1662,7 +1672,7 @@ impl RuntimeActor {
 
         // The tool scope opens when the tool starts — it is an execution
         // frame, not a batch artifact of turn-end persistence.
-        let tool_scope = match self.kernel.context_open_scope(ScopeKind::Tool, None).await {
+        let tool_scope = match self.services.context_open_scope(ScopeKind::Tool, None).await {
             Ok(scope) => Some(scope),
             Err(error) => {
                 let _ = self
@@ -2018,7 +2028,7 @@ impl RuntimeActor {
                 // hot-entity extension: Warm/Cold evidence can be recalled
                 // immediately without duplicating the tool body.
                 let _ = self
-                    .kernel
+                    .services
                     .context_ingest(ContextIngress::WorkingSetSignal {
                         content: output.model_content.clone(),
                     })
@@ -2082,7 +2092,7 @@ impl RuntimeActor {
     async fn execute_directive(&mut self, directive: RuntimeDirective) {
         match directive {
             RuntimeDirective::Context(agent_contracts::ContextAction::Collect) => {
-                match self.kernel.context_gc().await {
+                match self.services.context_gc().await {
                     Ok(report) => {
                         if let Err(error) = self
                             .kernel
@@ -2114,7 +2124,7 @@ impl RuntimeActor {
             }
             RuntimeDirective::Context(other) => {
                 if let Err(error) = self
-                    .kernel
+                    .services
                     .context_ingest(ContextIngress::ContextDirective { action: other })
                     .await
                 {
@@ -2166,7 +2176,7 @@ impl RuntimeActor {
                     continue;
                 }
                 if let Err(error) = self
-                    .kernel
+                    .services
                     .context_ingest(ContextIngress::ToolObservation {
                         output: output.clone(),
                         scope_id: *scope_id,
@@ -2185,7 +2195,7 @@ impl RuntimeActor {
         }
         if ingested {
             let report = match self
-                .kernel
+                .services
                 .context_maintain(ContextMaintenanceTrigger::AfterTool)
                 .await
             {
@@ -2210,7 +2220,7 @@ impl RuntimeActor {
             }
         }
         if let Err(error) = self
-            .kernel
+            .services
             .context_ingest(ContextIngress::AssistantMessage {
                 content: content.clone(),
             })
@@ -2230,7 +2240,7 @@ impl RuntimeActor {
                 .await;
         }
         let report = match self
-            .kernel
+            .services
             .context_maintain(ContextMaintenanceTrigger::AfterModel)
             .await
         {
@@ -2256,7 +2266,7 @@ impl RuntimeActor {
         // Turn boundary: the full GC pass compacts what the per-event
         // residency machine demoted. Eviction is reversible, and the report
         // explains every eviction and reactivation.
-        let report = match self.kernel.context_gc().await {
+        let report = match self.services.context_gc().await {
             Ok(report) => report,
             Err(error) => {
                 return self.commit_failed(TurnCommitPhase::Gc, error).await;
@@ -2329,7 +2339,7 @@ impl RuntimeActor {
             }
         }
         for scope_id in scope_ids {
-            match self.kernel.context_close_scope(scope_id).await {
+            match self.services.context_close_scope(scope_id).await {
                 Ok(transitions) => {
                     // The close is an auditable result: publish the
                     // lifecycle transitions it produced (a tool frame's
@@ -2381,11 +2391,14 @@ impl RuntimeActor {
     }
 }
 
-/// Start the runtime: create the actor task and hand back a cloneable handle.
-pub fn spawn_runtime(kernel: Arc<AgentKernel>) -> (RuntimeHandle, JoinHandle<()>) {
+/// Start the runtime: derive the authority facade from the services, create
+/// the actor task and hand back a cloneable handle. The kernel is shared
+/// with the handle (same event channel and run identity).
+pub fn spawn_runtime(services: Arc<RuntimeServices>) -> (RuntimeHandle, JoinHandle<()>) {
+    let kernel = services.kernel();
     let (tx, rx) = mpsc::channel(64);
     let (op_tx, op_rx) = mpsc::channel(16);
-    let actor = RuntimeActor::new(kernel.clone());
+    let actor = RuntimeActor::new(kernel.clone(), services);
     let handle = RuntimeHandle::new(tx, kernel.event_sender(), kernel.run_id());
     let task = tokio::spawn(actor.run(rx, op_tx, op_rx));
     (handle, task)

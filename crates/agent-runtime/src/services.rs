@@ -1,27 +1,35 @@
 //! The composition seam (MOD-04A): the concrete implementations one run
 //! needs, resolved from the module host's typed registry or built directly
 //! in tests. A composition root constructs one `RuntimeServices` and hands
-//! it to the runtime; the runtime splits it into the kernel's authority
-//! inputs. This is the seam the incremental Core migration targets: the
-//! kernel should be *given* its services, never construct or schedule
-//! them, so a future Core stays a pure authority while all scheduling
-//! (context maintenance, model calls, tool lifecycle) lives here in the
-//! runtime.
+//! it to the runtime; the runtime uses it for *all* scheduling — context
+//! maintenance and focus transactions, model calls, tool lifecycle and
+//! surface scheduling, config access — while the kernel it derives from the
+//! services stays authority-only (events, approval, effects, output, and
+//! the tool-execution wiring that combines them). This is the seam the
+//! incremental Core migration targets: the kernel is *given* its services,
+//! never constructs or schedules them, so a future Core stays a pure
+//! authority.
 
 use std::sync::Arc;
 
 use agent_contracts::{
-    AgentResult, ApprovalGate, ContextEngine, EventJournal, ModelTransport, ToolDispatcher,
+    AgentError, AgentResult, ApprovalGate, ContextEngine, ContextGcReport,
+    ContextIngress, ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger,
+    ContextQuery, ContextStateTransition, EventJournal, FocusState, MaterializedContext,
+    ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest, ModelTransport, ScopeId,
+    ScopeKind, TaskId, ToolCatalogEntry, ToolDispatcher, ToolSpec, ToolSurfaceSnapshot,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig};
 
 use crate::host::ServiceRegistry;
 
-/// The concrete implementations one run needs. The kernel is built from
-/// these (authority-only: events, approval, effects, output); scheduling —
-/// context maintenance, tool lifecycle, model calls — is the runtime's
-/// job, which is why the services live here rather than inside the kernel.
+/// The concrete implementations one run needs, plus the kernel derived from
+/// them. Scheduling — context maintenance, model calls, tool lifecycle —
+/// lives here in the runtime; the kernel is the authority facade
+/// (`services.kernel()`) the actor consults for events, approval, effects,
+/// output and tool-execution wiring.
 pub struct RuntimeServices {
+    kernel: Arc<AgentKernel>,
     pub kernel_config: AgentKernelConfig,
     pub context: Arc<dyn ContextEngine>,
     pub model: Arc<dyn ModelTransport>,
@@ -32,8 +40,11 @@ pub struct RuntimeServices {
 
 impl RuntimeServices {
     /// Build services directly (tests, standalone composition roots). The
-    /// argument order matches `AgentKernel::new` so the mechanical move is
-    /// a drop-in replacement.
+    /// kernel is derived once here, so every caller that later asks for
+    /// `kernel()` shares one authority instance (same run id, sequence and
+    /// event channel). The model transport is a *scheduling* service: the
+    /// kernel (authority facade) does not call the provider, so it is not
+    /// part of the kernel's inputs.
     pub fn new(
         kernel_config: AgentKernelConfig,
         context: Arc<dyn ContextEngine>,
@@ -42,7 +53,15 @@ impl RuntimeServices {
         approval: Arc<dyn ApprovalGate>,
         journal: Option<Arc<dyn EventJournal>>,
     ) -> Self {
+        let kernel = Arc::new(AgentKernel::new(
+            kernel_config.clone(),
+            context.clone(),
+            tools.clone(),
+            approval.clone(),
+            journal.clone(),
+        ));
         Self {
+            kernel,
             kernel_config,
             context,
             model,
@@ -60,28 +79,235 @@ impl RuntimeServices {
         registry: &ServiceRegistry,
         kernel_config: AgentKernelConfig,
     ) -> AgentResult<Self> {
-        Ok(Self {
+        Ok(Self::new(
             kernel_config,
-            context: registry.context_service()?,
-            model: registry.model_provider()?,
-            tools: registry.tool_provider()?,
-            approval: registry.approval_policy()?,
-            journal: registry.event_store()?,
-        })
+            registry.context_service()?,
+            registry.model_provider()?,
+            registry.tool_provider()?,
+            registry.approval_policy()?,
+            registry.event_store()?,
+        ))
     }
 
-    /// The kernel this run uses: the four authority seams over the
-    /// resolved services. The kernel is rebuilt from the services so a
-    /// composition root never constructs the authority facade directly.
-    pub fn kernel(&self) -> AgentKernel {
-        AgentKernel::new(
-            self.kernel_config.clone(),
-            self.context.clone(),
-            self.model.clone(),
-            self.tools.clone(),
-            self.approval.clone(),
-            self.journal.clone(),
-        )
+    /// The kernel this run uses: the authority facade (events, approval,
+    /// effects, output) plus the tool-execution wiring. Shared by the actor
+    /// and the spawn seam — one instance per run.
+    pub fn kernel(&self) -> Arc<AgentKernel> {
+        self.kernel.clone()
+    }
+
+    // --- configuration (moved out of the kernel) ---
+
+    pub fn system_prompt(&self) -> String {
+        self.kernel_config.system_prompt.clone()
+    }
+
+    pub fn context_budget_tokens(&self) -> usize {
+        self.kernel_config.context_budget_tokens
+    }
+
+    pub fn max_tool_rounds(&self) -> usize {
+        self.kernel_config.max_tool_rounds
+    }
+
+    // --- model scheduling (moved out of the kernel) ---
+
+    pub fn model_capabilities(&self) -> ModelCapabilities {
+        self.model.capabilities()
+    }
+
+    /// One model round: stream the request to the provider. The result is a
+    /// value for the actor to validate and commit — nothing is committed
+    /// here.
+    pub async fn run_model_round(
+        &self,
+        request: ModelRequest,
+        sink: &dyn ModelEventSink,
+    ) -> AgentResult<ModelOutput> {
+        self.model.complete_stream(request, sink).await
+    }
+
+    // --- context scheduling (moved out of the kernel) ---
+
+    /// Context primitives: the actor decides when they run.
+    pub async fn context_ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+        self.context.ingest(ingress).await
+    }
+
+    pub async fn context_maintain(
+        &self,
+        trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        self.context.maintain(trigger).await
+    }
+
+    /// Run a full GC pass (mark roots, sweep, reversible eviction). Called
+    /// by the actor at turn boundaries; engines without a GC pass return an
+    /// empty report.
+    pub async fn context_gc(&self) -> AgentResult<ContextGcReport> {
+        self.context.gc().await
+    }
+
+    /// Materialize the working set for one model request. The result is
+    /// structured items; prompt assembly happens in the runtime actor.
+    pub async fn context_materialize(
+        &self,
+        query: ContextQuery,
+    ) -> AgentResult<MaterializedContext> {
+        self.context.materialize(query).await
+    }
+
+    /// Open a scope (runtime-driven, e.g. a tool scope at tool start).
+    pub async fn context_open_scope(
+        &self,
+        kind: ScopeKind,
+        parent: Option<ScopeId>,
+    ) -> AgentResult<ScopeId> {
+        self.context.open_scope(kind, parent).await
+    }
+
+    /// Close a scope the runtime opened; returns the close transitions.
+    pub async fn context_close_scope(
+        &self,
+        scope_id: ScopeId,
+    ) -> AgentResult<Vec<ContextStateTransition>> {
+        self.context.close_scope(scope_id).await
+    }
+
+    pub async fn inspect_context(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        self.context.inspect(limit).await
+    }
+
+    /// Switch the runtime's focus to a task's goal. The task id comes from
+    /// the runtime's `TaskManager` — re-focusing an existing task resumes
+    /// its scopes in the context engine (suspension/resume is keyed on the
+    /// task id), while a fresh task id opens a fresh task scope.
+    pub async fn set_focus(
+        &self,
+        task_id: TaskId,
+        goal: String,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        let checkpoint = self.context.checkpoint().await?;
+        let focus = FocusState::for_task(task_id, goal.clone());
+        let transition = async {
+            self.context
+                .ingest(ContextIngress::FocusChanged { focus })
+                .await?;
+            self.context
+                .maintain(ContextMaintenanceTrigger::FocusChanged)
+                .await
+        }
+        .await;
+        self.finish_context_transaction("set focus", checkpoint, transition)
+            .await
+    }
+
+    /// Suspend the current focus without completing the task: the engine
+    /// clears its focus and suspends the active task's scopes, so a later
+    /// `set_focus` with the same task id resumes them.
+    pub async fn clear_focus(&self) -> AgentResult<ContextMaintenanceReport> {
+        let checkpoint = self.context.checkpoint().await?;
+        let transition = async {
+            self.context.ingest(ContextIngress::FocusCleared).await?;
+            self.context
+                .maintain(ContextMaintenanceTrigger::FocusChanged)
+                .await
+        }
+        .await;
+        self.finish_context_transaction("clear focus", checkpoint, transition)
+            .await
+    }
+
+    pub async fn pin(&self, content: String) -> AgentResult<ContextMaintenanceReport> {
+        let checkpoint = self.context.checkpoint().await?;
+        let transition = async {
+            self.context
+                .ingest(ContextIngress::Pin {
+                    content,
+                    kind: agent_contracts::ContextKind::Constraint,
+                })
+                .await?;
+            self.context
+                .maintain(ContextMaintenanceTrigger::FocusChanged)
+                .await
+        }
+        .await;
+        self.finish_context_transaction("pin context", checkpoint, transition)
+            .await
+    }
+
+    pub async fn complete_current_task(
+        &self,
+        task_id: TaskId,
+        summary: String,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        let checkpoint = self.context.checkpoint().await?;
+        let transition = async {
+            self.context
+                .ingest(ContextIngress::TaskCompleted {
+                    task_id: Some(task_id),
+                    summary,
+                })
+                .await?;
+            self.context
+                .maintain(ContextMaintenanceTrigger::TaskCompleted)
+                .await
+        }
+        .await;
+        self.finish_context_transaction("complete task", checkpoint, transition)
+            .await
+    }
+
+    /// Complete a context-only transaction. Context engines are replaceable
+    /// and their mutation methods are fallible, so the runtime takes a
+    /// portable checkpoint before a multi-step transition and restores it
+    /// if either ingest or maintenance fails. Task state is committed by
+    /// the runtime actor only after this method returns `Ok`.
+    async fn finish_context_transaction<T>(
+        &self,
+        operation: &'static str,
+        checkpoint: serde_json::Value,
+        result: AgentResult<T>,
+    ) -> AgentResult<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => match self.context.restore(checkpoint).await {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(AgentError::RecoveryRequired(format!(
+                    "{operation} failed ({error}); rollback failed ({rollback_error})"
+                ))),
+            },
+        }
+    }
+
+    // --- tool lifecycle and surface scheduling (moved out of the kernel) ---
+
+    pub fn tool_specs(&self) -> Vec<ToolSpec> {
+        self.tools.specs()
+    }
+
+    pub fn tool_snapshot(&self) -> ToolSurfaceSnapshot {
+        self.tools.snapshot()
+    }
+
+    pub fn tool_may_omit_from_round(&self, name: &str) -> bool {
+        self.tools.may_omit_from_round(name)
+    }
+
+    pub fn tool_gc(&self) {
+        self.tools.gc();
+    }
+
+    pub fn tool_catalog(&self) -> Vec<ToolCatalogEntry> {
+        self.tools.catalog()
+    }
+
+    pub fn tool_load(&self, name: &str) -> AgentResult<()> {
+        self.tools.load_tool(name)
+    }
+
+    pub fn tool_unload(&self, name: &str) -> AgentResult<()> {
+        self.tools.unload_tool(name)
     }
 }
 
@@ -89,13 +315,9 @@ impl RuntimeServices {
 mod tests {
     use super::*;
     use agent_contracts::{
-        AgentError, ContextDiagnostics, ContextIngress, ContextMaintenanceReport,
-        ContextMaintenanceTrigger, ContextQuery, ContextStateTransition, MaterializedContext,
-        ModelCapabilities, ModelOutput, ModelRequest, ScopeId, ScopeKind, ToolExecutionRequest,
-        ToolOutcome, ToolSpec,
+        ContextDiagnostics, ModelCapabilities, ToolExecutionRequest, ToolOutcome,
     };
     use agent_kernel::PolicyApprovalGate;
-    use std::sync::Arc;
 
     #[derive(Debug)]
     struct StubContext;
@@ -129,10 +351,7 @@ mod tests {
         ) -> AgentResult<ScopeId> {
             Ok(ScopeId::new())
         }
-        async fn close_scope(
-            &self,
-            _scope_id: ScopeId,
-        ) -> AgentResult<Vec<ContextStateTransition>> {
+        async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
             Ok(Vec::new())
         }
         async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
@@ -183,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn services_build_a_kernel_and_round_trip_the_registry() {
+    fn services_share_one_kernel_and_round_trip_the_registry() {
         let services = RuntimeServices::new(
             AgentKernelConfig::default(),
             Arc::new(StubContext),
@@ -192,11 +411,14 @@ mod tests {
             Arc::new(PolicyApprovalGate::read_only()),
             None,
         );
+        // The kernel is derived once: two `kernel()` calls share one
+        // authority instance (same run id), so a subscriber on one sees
+        // the other's events.
         let kernel = services.kernel();
-        // The kernel facade carries the same identity the run will use.
-        assert_eq!(kernel.system_prompt(), services.kernel_config.system_prompt);
+        assert_eq!(kernel.run_id(), services.kernel().run_id());
+        assert_eq!(services.system_prompt(), services.kernel_config.system_prompt);
         assert_eq!(
-            kernel.context_budget_tokens(),
+            services.context_budget_tokens(),
             services.kernel_config.context_budget_tokens
         );
 
@@ -224,6 +446,10 @@ mod tests {
             .unwrap();
         let resolved = RuntimeServices::from_registry(&registry, AgentKernelConfig::default())
             .expect("every required service is present");
-        assert_eq!(resolved.kernel().system_prompt(), kernel.system_prompt());
+        assert_eq!(
+            resolved.system_prompt(),
+            services.system_prompt(),
+            "from_registry preserves the root's configuration"
+        );
     }
 }

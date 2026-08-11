@@ -36,8 +36,8 @@ impl RuntimeInstance {
     /// is derived from the services inside this seam — a composition root
     /// never constructs the authority facade itself.
     pub fn spawn(host: ModuleHost, services: RuntimeServices) -> Self {
-        let kernel = Arc::new(services.kernel());
-        let (handle, task) = crate::actor::spawn_runtime(kernel);
+        let services = Arc::new(services);
+        let (handle, task) = crate::actor::spawn_runtime(services);
         Self { host, handle, task }
     }
 

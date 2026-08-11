@@ -18,8 +18,10 @@ use agent_contracts::{
     ToolSpec, ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceOmissionReason,
     ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceRequirement, ToolSurfaceSnapshot,
 };
-use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
-use agent_runtime::{ModelBudget, RuntimeHandle, approx_layer_tokens, spawn_runtime};
+use agent_kernel::{AgentKernelConfig, PolicyApprovalGate};
+use agent_runtime::{
+    ModelBudget, RuntimeHandle, RuntimeServices, approx_layer_tokens, spawn_runtime,
+};
 
 #[derive(Debug)]
 struct TestContextEngine;
@@ -135,15 +137,15 @@ impl ModelTransport for StreamingModel {
     }
 }
 
-fn kernel(model: Arc<dyn ModelTransport>) -> Arc<AgentKernel> {
+fn kernel(model: Arc<dyn ModelTransport>) -> Arc<RuntimeServices> {
     kernel_with(model, Arc::new(TestContextEngine))
 }
 
 fn kernel_with(
     model: Arc<dyn ModelTransport>,
     context: Arc<dyn ContextEngine>,
-) -> Arc<AgentKernel> {
-    Arc::new(AgentKernel::new(
+) -> Arc<RuntimeServices> {
+    Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         context,
         model,
@@ -388,7 +390,7 @@ impl ToolDispatcher for OneToolDispatcher {
 #[tokio::test]
 async fn engine_receives_only_the_context_frame_budget() {
     let context = Arc::new(RecordingContextEngine::default());
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         context.clone(),
         Arc::new(BudgetModel),
@@ -426,7 +428,7 @@ async fn dropping_all_handles_still_shuts_down_cleanly() {
     // An independent subscriber survives the handle drop and must still see
     // the teardown events: the actor runs full shutdown when every caller
     // handle is gone instead of returning silently.
-    let mut events = kernel.subscribe();
+    let mut events = kernel.kernel().subscribe();
     let (handle, task) = spawn_runtime(kernel);
     handle.start().await.unwrap();
     drop(handle);
@@ -713,7 +715,7 @@ async fn journal_failure_after_focus_never_splits_task_and_context() {
     let context = Arc::new(context_simple::SimpleContextEngine::new(
         context_simple::SimpleContextConfig::default(),
     ));
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         context.clone(),
         Arc::new(SilentModel),
@@ -1273,7 +1275,7 @@ async fn final_guard_trims_to_the_input_budget_not_the_window() {
     // request eat into the output reserve).
     let model = Arc::new(RecordingModel::default());
     let context = Arc::new(BigContextEngine::default());
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         context.clone(),
         model.clone(),
@@ -1316,7 +1318,7 @@ async fn final_guard_trims_to_the_input_budget_not_the_window() {
 async fn final_guard_omits_optional_schema_without_unloading_it() {
     let model = Arc::new(VariableWindowModel::new(1_600));
     let tools = Arc::new(RoundLocalToolDispatcher::new());
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         Arc::new(TestContextEngine),
         model.clone(),
@@ -1410,7 +1412,7 @@ async fn final_guard_omits_optional_schema_without_unloading_it() {
 async fn keep_ready_reloads_after_gc_without_entering_the_model_surface() {
     let model = Arc::new(VariableWindowModel::new(16_000));
     let tools = Arc::new(RoundLocalToolDispatcher::evicting_on_gc());
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         Arc::new(TestContextEngine),
         model.clone(),
@@ -1481,7 +1483,7 @@ async fn keep_ready_reloads_after_gc_without_entering_the_model_surface() {
 async fn checkpoint_restore_rebuilds_surface_from_suspended_task_requirements() {
     let model = Arc::new(VariableWindowModel::new(16_000));
     let tools = Arc::new(RoundLocalToolDispatcher::evicting_on_gc());
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         Arc::new(TestContextEngine),
         model,
@@ -1564,7 +1566,7 @@ async fn checkpoint_restore_rebuilds_surface_from_suspended_task_requirements() 
 #[tokio::test]
 async fn live_restore_cas_high_water_survives_a_checkpoint_that_removes_the_task() {
     let model = Arc::new(VariableWindowModel::new(16_000));
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         Arc::new(TestContextEngine),
         model,
@@ -1620,7 +1622,7 @@ async fn live_restore_cas_high_water_survives_a_checkpoint_that_removes_the_task
 async fn must_surface_overflow_is_unsatisfiable_before_model_start() {
     let model = Arc::new(VariableWindowModel::new(1_600));
     let tools = Arc::new(RoundLocalToolDispatcher::new());
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         Arc::new(TestContextEngine),
         model.clone(),
@@ -1684,7 +1686,7 @@ async fn must_surface_overflow_is_unsatisfiable_before_model_start() {
 #[tokio::test]
 async fn unavailable_must_surface_is_reported_before_model_start() {
     let model = Arc::new(VariableWindowModel::new(16_000));
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         Arc::new(TestContextEngine),
         model.clone(),
@@ -1734,7 +1736,7 @@ async fn unavailable_must_surface_is_reported_before_model_start() {
 #[tokio::test]
 async fn mandatory_schema_cap_is_reported_before_model_start() {
     let model = Arc::new(VariableWindowModel::new(32_000));
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         Arc::new(TestContextEngine),
         model.clone(),
@@ -1779,7 +1781,7 @@ async fn mandatory_schema_cap_is_reported_before_model_start() {
 #[tokio::test]
 async fn surface_event_failure_aborts_before_model_start_and_provider_call() {
     let model = Arc::new(VariableWindowModel::new(16_000));
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         Arc::new(TestContextEngine),
         model.clone(),
@@ -1827,7 +1829,7 @@ async fn consumption_event_failure_rolls_back_reinforcement_and_aborts_the_turn(
     let context = Arc::new(context_simple::SimpleContextEngine::new(
         context_simple::SimpleContextConfig::default(),
     ));
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         context.clone(),
         Arc::new(SilentModel),
@@ -1905,7 +1907,7 @@ async fn consumption_event_failure_rolls_back_reinforcement_and_aborts_the_turn(
 #[tokio::test]
 async fn unsatisfiable_surface_event_failure_is_reported_and_provider_fenced() {
     let model = Arc::new(VariableWindowModel::new(16_000));
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         Arc::new(TestContextEngine),
         model.clone(),
@@ -1975,7 +1977,7 @@ async fn final_guard_refuses_an_unshrinkable_over_budget_request() {
     // send instead of silently over-budgeting the provider.
     let model = Arc::new(TinyWindowModel::default());
     let context = Arc::new(BigContextEngine::default());
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         context.clone(),
         model.clone(),
@@ -2045,8 +2047,8 @@ impl EventJournal for BarrierJournal {
     }
 }
 
-fn kernel_with_journal(journal: Arc<dyn EventJournal>) -> Arc<AgentKernel> {
-    Arc::new(AgentKernel::new(
+fn kernel_with_journal(journal: Arc<dyn EventJournal>) -> Arc<RuntimeServices> {
+    Arc::new(RuntimeServices::new(
         AgentKernelConfig::default(),
         Arc::new(TestContextEngine),
         Arc::new(SilentModel),
@@ -2194,7 +2196,7 @@ async fn output_broker_spills_oversized_tool_output_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Arc::new(Workspace::open(dir.path()).await.unwrap());
     let full_content = format!("BEGIN{}\nEND", "payload".repeat(10_000));
-    let kernel = Arc::new(AgentKernel::new(
+    let kernel = Arc::new(RuntimeServices::new(
         AgentKernelConfig {
             output_broker: Some(Arc::new(WorkspaceOutputBroker::new(workspace.clone()))),
             ..AgentKernelConfig::default()
@@ -2227,6 +2229,7 @@ async fn output_broker_spills_oversized_tool_output_end_to_end() {
         ..ToolSurfaceSnapshot::default()
     };
     let (outcome, lease) = kernel
+        .kernel()
         .execute_tool(
             ToolCall {
                 id: "c1".into(),
@@ -2257,7 +2260,7 @@ async fn output_broker_spills_oversized_tool_output_end_to_end() {
     let run_dir = workspace
         .state_dir()
         .join("artifacts")
-        .join(kernel.run_id().to_string());
+        .join(kernel.kernel().run_id().to_string());
     let mut found = None;
     let mut entries = tokio::fs::read_dir(&run_dir).await.unwrap();
     while let Some(entry) = entries.next_entry().await.unwrap() {
