@@ -396,7 +396,7 @@ mod tests {
         let input = ModelInput {
             system_policy: vec![ModelMessage::system("policy")],
             focus_frame: Some("goal text".into()),
-            context_frame: vec![ModelMessage::system("SELECTED WORKING CONTEXT")],
+            context_frame: vec![ModelMessage::user("SELECTED WORKING CONTEXT")],
             turn_frame: turn,
             tool_schemas: Vec::new(),
         };
@@ -410,7 +410,7 @@ mod tests {
             vec![
                 (ModelRole::System, "policy"),
                 (ModelRole::System, "goal text"),
-                (ModelRole::System, "SELECTED WORKING CONTEXT"),
+                (ModelRole::User, "SELECTED WORKING CONTEXT"),
                 (ModelRole::User, "continue"),
                 (ModelRole::Assistant, ""),
                 (ModelRole::Tool, "content"),
