@@ -544,17 +544,40 @@ fn strip_random_uuids(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             // UUID-shaped map keys (the ledger's per-item revision
-            // counters) cannot match across two engines; collapse them
-            // onto one placeholder. Multiple keys collapse the same way on
-            // both sides, so the remaining value stays comparable.
+            // counters) cannot match across two engines. The old
+            // last-wins collapse picked the surviving value by HashMap
+            // iteration order, which differs per process (RandomState),
+            // so a map with a few divergent values flaked the parity
+            // comparison. Instead strip every value, sort the result and
+            // re-key with deterministic placeholders: equal value
+            // multisets now always compare equal, and a real divergence
+            // (a revision counted once more on one side) still fails.
             let uuid_keys: Vec<String> = map
                 .keys()
                 .filter(|key| key.len() == 36 && is_uuid_window(key.as_bytes()))
                 .cloned()
                 .collect();
-            for key in uuid_keys {
-                let nested = map.remove(&key).expect("key present");
-                map.insert("<uuid>".into(), nested);
+            if !uuid_keys.is_empty() {
+                let mut stripped: Vec<serde_json::Value> = Vec::with_capacity(uuid_keys.len());
+                for key in &uuid_keys {
+                    let mut nested = map.remove(key).expect("key present");
+                    strip_random_uuids(&mut nested);
+                    stripped.push(nested);
+                }
+                // serde_json::Value has no Ord/PartialOrd; sort by the
+                // canonical serialization instead. serde_json's Map is
+                // BTreeMap-backed (no preserve_order feature), so to_string
+                // is deterministic and the sorted sequence depends only on
+                // the value multiset, never on HashMap iteration order.
+                stripped.sort_by_key(|value| value.to_string());
+                for (index, nested) in stripped.into_iter().enumerate() {
+                    let placeholder = if index == 0 {
+                        "<uuid>".to_string()
+                    } else {
+                        format!("<uuid>{index}>")
+                    };
+                    map.insert(placeholder, nested);
+                }
             }
             for (key, nested) in map.iter_mut() {
                 if key == "blob_checksum" && nested.is_string() {
