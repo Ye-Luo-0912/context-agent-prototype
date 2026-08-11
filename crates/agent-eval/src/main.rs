@@ -11,6 +11,7 @@
 
 mod driver;
 mod task;
+mod workload;
 
 fn usage() -> ! {
     eprintln!(
@@ -18,7 +19,13 @@ fn usage() -> ! {
          \n\
          Runs the constraint-retention task through the selected context\n\
          engine(s) with a real model and prints token cost vs. task success.\n\
-         Requires OPENAI_API_KEY (and optionally OPENAI_BASE_URL / OPENAI_MODEL).\n"
+         Requires OPENAI_API_KEY (and optionally OPENAI_BASE_URL / OPENAI_MODEL).\n\
+         \n\
+         usage: agent-eval --fixtures\n\
+         \n\
+         Lists the M15 evaluation inputs — the A/B/C/D tool-surface arms and\n\
+         the coding workload fixtures (seed + hidden verification) — without\n\
+         calling a model.\n"
     );
     std::process::exit(2);
 }
@@ -30,6 +37,11 @@ async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--fixtures" => {
+                workload::verify_fixture_inputs()?;
+                print!("{}", workload::render_fixtures());
+                return Ok(());
+            }
             "--all" => engines = vec!["append", "rolling", "dynamic"],
             "--engine" => {
                 let Some(value) = args.next() else {

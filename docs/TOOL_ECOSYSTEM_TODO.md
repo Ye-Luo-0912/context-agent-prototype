@@ -826,21 +826,21 @@ together with TaskAnchor and continuous context GC.
   runtime behavior changed. Open questions (structured error codes on
   `ok:false`, marker-assertion granularity for the harness, artifact TTL)
   are tracked for `TOOLS-04`/`M15`.
-- [~] **TOOLS-04** Define the conformance harness and A/B/C/D evaluation fixtures first.
-  **Harness closed 2026-08-11; A/B/C/D fixtures remain (M15 input).** New
-  crate `agent-conformance`: the shared harness every tool/capability must
-  pass — schema contract (well-formed identity, `type: object`, bounded
-  schema size), output envelope (summary/model-content/metadata/decoded
-  total against the global caps, non-empty failure summary, `artifact://`
-  refs) against the TOOLS-03 specification, structured error envelope
-  (never an `Internal` leak), path confinement (absolute/parent-escaping
-  workspace paths refused), and surface/lifecycle rules (core + control
-  always visible, fail-closed omission, core tools unloadable-proof).
-  The builtin catalog (all ten tools) passes the full harness in
-  `agent-conformance/tests/builtin.rs`. Remaining for this item: the
-  A/B/C/D evaluation fixtures (the M15 workload inputs) and the
-  cancellation/timeout/effect-fence checks for external capabilities once
-  they are loadable.
+- [x] **TOOLS-04** Define the conformance harness and A/B/C/D evaluation fixtures first.
+  **Done 2026-08-11.** The shared harness (`agent-conformance`) is closed —
+  schema contract, output envelope (TOOLS-03 caps), structured error
+  envelope, path confinement, surface/lifecycle rules; the builtin catalog
+  passes clean (`tests/builtin.rs`). The A/B/C/D fixtures are closed
+  (`agent-eval/src/workload.rs`, listed by `agent-eval --fixtures`): the
+  four tool-surface arms (shell-only / current builtin / minimal structured
+  ACI with `patch.apply`+`process.run`+`task.complete` / C plus on-demand
+  capability loading) and four deterministic coding fixtures with seed
+  workspaces and hidden file-content verification
+  (`fix_off_by_one`, `implement_stub`, `rename_symbol`, `add_test`),
+  self-checked by unit tests and the `--fixtures` input health check. The
+  cancellation/timeout/effect-fence checks for *loadable external
+  capabilities* remain part of the capability-admission gate (`MOD-05`/
+  `ECO-05`), not an open item of this definition.
 
 ### Gate 2: close correctness/security blockers
 
