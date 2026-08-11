@@ -3,14 +3,17 @@ mod edit;
 mod fs;
 mod git;
 mod patch;
+mod process;
 mod search;
 mod shell;
+mod stream;
 
 pub(crate) use context::ContextManageTool;
 pub(crate) use edit::EditReplaceTool;
 pub(crate) use fs::{FsListTool, FsReadTool, FsWriteTool};
 pub(crate) use git::{GitDiffTool, GitStatusTool};
 pub(crate) use patch::EditPatchTool;
+pub(crate) use process::ProcessRunTool;
 pub(crate) use search::SearchGrepTool;
 pub(crate) use shell::ShellExecTool;
 

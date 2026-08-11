@@ -24,7 +24,7 @@ use serde_json::json;
 
 use crate::tools::{
     ContextManageTool, EditPatchTool, EditReplaceTool, FsListTool, FsReadTool, FsWriteTool,
-    GitDiffTool, GitStatusTool, SearchGrepTool, ShellExecTool, Tool,
+    GitDiffTool, GitStatusTool, ProcessRunTool, SearchGrepTool, ShellExecTool, Tool,
 };
 
 /// Control tools are now defined by the unified catalog contract.
@@ -97,6 +97,7 @@ impl BuiltinToolDispatcher {
             Arc::new(GitStatusTool::new(workspace.clone())),
             Arc::new(GitDiffTool::new(workspace.clone())),
             Arc::new(ShellExecTool::new(workspace.clone())),
+            Arc::new(ProcessRunTool::new(workspace.clone())),
             Arc::new(ContextManageTool::new()),
         ];
         let catalog = tools

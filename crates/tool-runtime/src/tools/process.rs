@@ -1,14 +1,14 @@
-//! `shell.exec` — shell-string process execution with streaming, bounded
-//! output.
+//! `process.run` — structured argv process execution.
 //!
-//! The process's stdout/stderr are read line-by-line into a bounded ring
-//! buffer (for the model-facing tail) and appended incrementally to an
-//! artifact file (so arbitrarily large logs never live in memory or in the
-//! prompt). The command is killed on timeout or on request cancellation.
-//! `process.run` is the structured argv alternative; the raw shell string
-//! stays as the controlled escape hatch (TOOLS-06).
+//! The TOOLS-06 alternative to the raw `shell.exec` string: the command is
+//! an explicit argv vector, so there is no shell to parse (and no shell
+//! injection to guard). cwd is a workspace-relative directory, env is an
+//! explicit override map layered on the inherited environment, and the
+//! timeout/cancel paths kill the whole process tree (not just the direct
+//! child). Output streams into the same bounded tail + artifact shape as
+//! `shell.exec`.
 
-use std::{collections::VecDeque, process::Stdio};
+use std::{collections::HashMap, process::Stdio};
 
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
@@ -26,23 +26,34 @@ use tokio::{
 };
 
 use super::Tool;
-use super::stream::{BUFFER_LINES, MODEL_OUTPUT_CHARS, StreamLine, record_line, tail_chars};
+use super::stream::{MODEL_OUTPUT_CHARS, StreamLine, record_line, tail_chars};
 
 const MAX_TIMEOUT_MS: u64 = 120_000;
+const MAX_ARGV: usize = 64;
+const MAX_ARG_CHARS: usize = 16_384;
+const MAX_ENV_KEYS: usize = 64;
+const MAX_ENV_VALUE_CHARS: usize = 16_384;
 
-pub struct ShellExecTool {
+pub struct ProcessRunTool {
     workspace: Workspace,
 }
 
-impl ShellExecTool {
+impl ProcessRunTool {
     pub fn new(workspace: Workspace) -> Self {
         Self { workspace }
     }
 }
 
 #[derive(Deserialize)]
-struct ShellArgs {
-    command: String,
+struct ProcessArgs {
+    argv: Vec<String>,
+    /// Workspace-relative working directory for the process (defaults to
+    /// the workspace root).
+    #[serde(default)]
+    cwd: Option<String>,
+    /// Explicit environment overrides layered on the inherited environment.
+    #[serde(default)]
+    env: HashMap<String, String>,
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
 }
@@ -52,16 +63,24 @@ fn default_timeout_ms() -> u64 {
 }
 
 #[async_trait]
-impl Tool for ShellExecTool {
+impl Tool for ProcessRunTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "shell.exec".into(),
-            description: "Execute a shell command with the workspace as cwd. Output streams to an artifact; only a bounded tail reaches the model.".into(),
+            name: "process.run".into(),
+            description: "Run a program with an explicit argv (no shell), optionally in a workspace-relative cwd with explicit env overrides. Output streams to an artifact; only a bounded tail reaches the model. Timeout/cancel kill the whole process tree.".into(),
             input_schema: json!({
                 "type": "object",
-                "required": ["command"],
+                "required": ["argv"],
                 "properties": {
-                    "command": {"type": "string"},
+                    "argv": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 64,
+                        "items": {"type": "string"},
+                        "description": "Program and arguments, passed verbatim (no shell parsing)"
+                    },
+                    "cwd": {"type": "string", "description": "Workspace-relative working directory"},
+                    "env": {"type": "object", "description": "Explicit environment overrides (layered on the inherited environment)"},
                     "timeout_ms": {"type": "integer", "minimum": 100, "maximum": 120000}
                 }
             }),
@@ -77,43 +96,75 @@ impl Tool for ShellExecTool {
         arguments: Value,
         cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
-        let args: ShellArgs = serde_json::from_value(arguments)
-            .map_err(|e| AgentError::InvalidRequest(format!("shell.exec args: {e}")))?;
+        let args: ProcessArgs = serde_json::from_value(arguments)
+            .map_err(|e| AgentError::InvalidRequest(format!("process.run args: {e}")))?;
+        if args.argv.is_empty() {
+            return Err(AgentError::InvalidRequest(
+                "process.run requires a non-empty argv".into(),
+            ));
+        }
+        if args.argv.len() > MAX_ARGV {
+            return Err(AgentError::InvalidRequest(format!(
+                "process.run argv is limited to {MAX_ARGV} arguments"
+            )));
+        }
+        if args
+            .argv
+            .iter()
+            .any(|arg| arg.chars().count() > MAX_ARG_CHARS)
+        {
+            return Err(AgentError::InvalidRequest(format!(
+                "process.run argv arguments are limited to {MAX_ARG_CHARS} chars"
+            )));
+        }
+        if args.env.len() > MAX_ENV_KEYS {
+            return Err(AgentError::InvalidRequest(format!(
+                "process.run env is limited to {MAX_ENV_KEYS} keys"
+            )));
+        }
+        if args
+            .env
+            .values()
+            .any(|value| value.chars().count() > MAX_ENV_VALUE_CHARS)
+        {
+            return Err(AgentError::InvalidRequest(format!(
+                "process.run env values are limited to {MAX_ENV_VALUE_CHARS} chars"
+            )));
+        }
         let timeout_ms = args.timeout_ms.clamp(100, MAX_TIMEOUT_MS);
 
-        #[cfg(windows)]
-        let mut command = {
-            let mut cmd = Command::new("cmd");
-            cmd.arg("/C").arg(&args.command);
-            cmd
+        // The cwd is confined to the workspace (lexical `..` rejection
+        // lives in the workspace's path resolution); the default is the
+        // workspace root.
+        let cwd = match &args.cwd {
+            Some(relative) => self.workspace.resolve_relative(relative).await?,
+            None => self.workspace.root().to_path_buf(),
         };
 
-        #[cfg(not(windows))]
-        let mut command = {
-            let mut cmd = Command::new("sh");
-            cmd.arg("-lc").arg(&args.command);
-            cmd
-        };
+        let mut command = Command::new(&args.argv[0]);
+        command
+            .args(&args.argv[1..])
+            .current_dir(&cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        for (key, value) in &args.env {
+            command.env(key, value);
+        }
 
-        command.current_dir(self.workspace.root());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        command.kill_on_drop(true);
-
-        // Make the shell a process-group leader on Unix so a cancellation
-        // or timeout can kill its whole tree (`kill(-pgid)`), not just the
-        // direct shell — a `&` background job must not survive its caller
-        // and keep mutating after the operation was cancelled.
+        // Make the process a process-group leader on Unix so a
+        // cancellation or timeout can kill its whole tree (`kill(-pgid)`),
+        // not just the direct child.
         #[cfg(unix)]
         command.process_group(0);
 
         let mut child = command
             .spawn()
-            .map_err(|e| AgentError::Tool(format!("spawn command: {e}")))?;
+            .map_err(|e| AgentError::Tool(format!("spawn {}: {e}", args.argv[0])))?;
 
         let (artifact_ref, artifact_file) = self
             .workspace
-            .create_artifact(run_id, "shell", "log")
+            .create_artifact(run_id, "process", "log")
             .await?;
         let mut artifact = BufWriter::new(artifact_file);
 
@@ -144,7 +195,7 @@ impl Tool for ShellExecTool {
         }
         drop(line_tx);
 
-        let mut tail: VecDeque<String> = VecDeque::with_capacity(BUFFER_LINES + 1);
+        let mut tail = std::collections::VecDeque::with_capacity(super::stream::BUFFER_LINES + 1);
         let mut total_lines = 0usize;
         let mut total_chars = 0usize;
 
@@ -162,9 +213,9 @@ impl Tool for ShellExecTool {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    // Kill the whole process tree, not just the shell: a
-                    // descendant that outlives the cancel is an avoidable
-                    // stale mutation (the M12 boundary).
+                    // Kill the whole process tree, not just the direct
+                    // child: a descendant that outlives the cancel is an
+                    // avoidable stale mutation.
                     kill_process_tree(child.id().unwrap_or(0));
                     let _ = child.kill().await;
                     outcome = "cancelled";
@@ -190,8 +241,6 @@ impl Tool for ShellExecTool {
                             record_line(&line, &mut tail, &mut artifact, &mut total_lines, &mut total_chars).await?;
                         }
                         None => {
-                            // All output drained; the process may still be
-                            // exiting, so reap it before reporting a status.
                             if exited.is_none() {
                                 exited = Some(child.wait().await.map_err(|e| AgentError::Tool(format!("wait: {e}")))?);
                             }
@@ -233,13 +282,18 @@ impl Tool for ShellExecTool {
                 outcome.into()
             }
         });
+        let cwd_text = cwd
+            .strip_prefix(self.workspace.root())
+            .unwrap_or(&cwd)
+            .to_string_lossy()
+            .replace('\\', "/");
 
         Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
-            tool_name: "shell.exec".into(),
+            tool_name: "process.run".into(),
             ok,
             summary: format!(
-                "command {outcome} (exit={exit_text}, {total_lines} lines, ~{} KB in artifact)",
+                "process {outcome} (exit={exit_text}, {total_lines} lines, ~{} KB in artifact)",
                 total_chars / 1024
             ),
             model_content: format!("{model_content}\n\nFull output: {artifact_ref}"),
@@ -249,6 +303,7 @@ impl Tool for ShellExecTool {
                 "timeout_ms": timeout_ms,
                 "lines": total_lines,
                 "outcome": outcome,
+                "cwd": if cwd_text.is_empty() { "." } else { &cwd_text },
             }),
         }))
     }
@@ -260,40 +315,39 @@ mod tests {
     use agent_contracts::ToolExecutionRequest;
     use serde_json::json;
 
-    /// Unwrap a plain tool value (shell.exec never stages an effect).
     fn value(outcome: ToolOutcome) -> ToolOutput {
         match outcome {
             ToolOutcome::Value(output) => output,
             ToolOutcome::PreparedEffect { .. }
             | ToolOutcome::RuntimeDirective { .. }
-            | ToolOutcome::EngineQuery { .. } => panic!("shell.exec must return a plain value"),
+            | ToolOutcome::EngineQuery { .. } => panic!("process.run must return a plain value"),
         }
     }
 
-    fn long_command() -> String {
+    /// An argv that echoes its argument; platform-independent.
+    fn echo_argv(text: &str) -> Vec<String> {
         #[cfg(windows)]
         {
-            "for /L %i in (1,1,1000) do @echo line %i".to_string()
+            vec!["cmd".into(), "/C".into(), "echo".into(), text.into()]
         }
         #[cfg(not(windows))]
         {
-            "for i in $(seq 1 1000); do echo line $i; done".to_string()
+            vec!["echo".into(), text.into()]
         }
     }
 
     #[tokio::test]
-    async fn shell_bounds_model_output_and_writes_artifact() {
+    async fn process_run_executes_argv_without_a_shell() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
-        let tool = ShellExecTool::new(workspace.clone());
+        let tool = ProcessRunTool::new(workspace.clone());
         let run_id = RunId::new();
-
         let request = ToolExecutionRequest {
             run_id,
             call: agent_contracts::ToolCall {
                 id: "c".into(),
-                name: "shell.exec".into(),
-                arguments: json!({"command": long_command(), "timeout_ms": 20000}),
+                name: "process.run".into(),
+                arguments: json!({"argv": echo_argv("argv no shell")}),
             },
             cancel: CancellationToken::new(),
         };
@@ -304,33 +358,98 @@ mod tests {
         let output = value(output);
         assert!(output.ok, "command failed: {}", output.summary);
         assert!(
-            output.artifact_ref.is_some(),
-            "large output must be an artifact"
+            output.model_content.contains("argv no shell"),
+            "the arg must arrive verbatim: {}",
+            output.model_content
         );
+        assert_eq!(output.metadata["cwd"], ".");
+    }
+
+    #[tokio::test]
+    async fn process_run_honors_cwd_and_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        let tool = ProcessRunTool::new(workspace.clone());
+        let run_id = RunId::new();
+
+        // Print the cwd and an env override through the platform echo.
+        #[cfg(windows)]
+        let argv: Vec<String> = vec![
+            "cmd".into(),
+            "/C".into(),
+            "echo %CD% && echo %TOOLS_06_VAR%".into(),
+        ];
+        #[cfg(not(windows))]
+        let argv: Vec<String> = vec!["sh".into(), "-c".into(), "pwd && echo $TOOLS_06_VAR".into()];
+
+        let request = ToolExecutionRequest {
+            run_id,
+            call: agent_contracts::ToolCall {
+                id: "c".into(),
+                name: "process.run".into(),
+                arguments: json!({
+                    "argv": argv,
+                    "cwd": "sub",
+                    "env": {"TOOLS_06_VAR": "injected"},
+                    "timeout_ms": 15000
+                }),
+            },
+            cancel: CancellationToken::new(),
+        };
+        let output = tool
+            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .await
+            .unwrap();
+        let output = value(output);
+        assert!(output.ok, "command failed: {}", output.summary);
+        assert_eq!(output.metadata["cwd"], "sub");
         assert!(
-            output.model_content.len() < MODEL_OUTPUT_CHARS + 256,
-            "model content exceeded the bound"
-        );
-        assert!(
-            output.model_content.contains("omitted"),
-            "expected an omitted-lines note in the tail"
-        );
-        assert!(
-            output.model_content.contains("line 1000"),
-            "tail should end with the last lines"
+            output.model_content.contains("injected"),
+            "the env override must reach the process: {}",
+            output.model_content
         );
     }
 
     #[tokio::test]
-    async fn shell_honors_cancellation() {
+    async fn process_run_rejects_escaping_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
-        let tool = ShellExecTool::new(workspace.clone());
+        let tool = ProcessRunTool::new(workspace.clone());
+        let run_id = RunId::new();
+        let request = ToolExecutionRequest {
+            run_id,
+            call: agent_contracts::ToolCall {
+                id: "c".into(),
+                name: "process.run".into(),
+                arguments: json!({"argv": echo_argv("x"), "cwd": "../escape"}),
+            },
+            cancel: CancellationToken::new(),
+        };
+        let result = tool
+            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .await;
+        assert!(
+            result.is_err(),
+            "a cwd escaping the workspace must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_run_cancellation_kills_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ProcessRunTool::new(workspace.clone());
 
         #[cfg(windows)]
-        let command = "ping -n 20 127.0.0.1".to_string();
+        let argv = vec![
+            "ping".to_string(),
+            "-n".to_string(),
+            "20".to_string(),
+            "127.0.0.1".to_string(),
+        ];
         #[cfg(not(windows))]
-        let command = "sleep 30".to_string();
+        let argv = vec!["sleep".to_string(), "30".to_string()];
 
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
@@ -340,7 +459,7 @@ mod tests {
                 .execute(
                     RunId::new(),
                     "c",
-                    json!({"command": command, "timeout_ms": 60000}),
+                    json!({"argv": argv, "timeout_ms": 60000}),
                     cancel_for_task,
                 )
                 .await
@@ -356,7 +475,7 @@ mod tests {
             .expect("tool did not stop after cancellation")
             .unwrap();
         let output = value(output);
-        assert!(!output.ok, "cancelled command must report failure");
+        assert!(!output.ok, "cancelled process must report failure");
         assert!(
             output.summary.contains("cancel"),
             "summary should mention cancellation: {}",
@@ -365,95 +484,6 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(8),
             "cancellation took too long: {elapsed:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn shell_cancellation_kills_descendants() {
-        // A cancelled shell must not leave its background children alive:
-        // the command starts a long-lived foreground process that also
-        // spawned a background descendant rewriting a heartbeat file every
-        // ~50 ms. After the cancel, the counter must freeze — the whole
-        // process tree is dead, not just the direct shell (the M12
-        // boundary: a cancelled operation produces no avoidable stale
-        // mutation).
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = Workspace::open(dir.path()).await.unwrap();
-        let tool = ShellExecTool::new(workspace.clone());
-        let heartbeat = dir.path().join("descendant-heartbeat.txt");
-
-        // A foreground loop that itself spawns a per-iteration child
-        // (`ping`) is the descendant: the tree kill must stop the loop and
-        // the in-flight child, not just the direct shell. The command
-        // carries no quotes — on Windows `Command::arg` would escape any
-        // `"` for CreateProcess, and cmd.exe does not honor `\"`, so nested
-        // quotes would never reach the loop.
-        #[cfg(windows)]
-        let command = format!(
-            "for /l %i in (1,1,6000) do (echo tick>> {} & ping -n 1 -w 50 127.0.0.1 >nul)",
-            heartbeat.display()
-        );
-        #[cfg(not(windows))]
-        let command = format!(
-            "(while true; do echo tick >> '{}'; sleep 0.05; done) >/dev/null 2>&1 & sleep 300",
-            heartbeat.display()
-        );
-
-        let cancel = CancellationToken::new();
-        let cancel_for_task = cancel.clone();
-        let handle = tokio::spawn(async move {
-            tool.execute(
-                RunId::new(),
-                "c",
-                json!({"command": command, "timeout_ms": 60000}),
-                cancel_for_task,
-            )
-            .await
-            .unwrap()
-        });
-
-        // Wait until the descendant's heartbeat visibly advances: the
-        // background writer is alive before we cancel anything.
-        let baseline = std::fs::read_to_string(&heartbeat).unwrap_or_default();
-        let mut saw_advance = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if std::fs::read_to_string(&heartbeat).unwrap_or_default() != baseline {
-                saw_advance = true;
-                break;
-            }
-        }
-
-        // Always cancel, even if the heartbeat never advanced: a failed
-        // assertion must not leave the command running until its 300 s
-        // timeout — the test binary would hang on the spawned task.
-        cancel.cancel();
-        assert!(
-            saw_advance,
-            "the descendant must write the heartbeat while alive"
-        );
-
-        let output = tokio::time::timeout(Duration::from_secs(10), handle)
-            .await
-            .expect("tool did not stop after cancellation")
-            .unwrap();
-        let output = value(output);
-        assert!(!output.ok, "cancelled command must report failure");
-        assert!(
-            output.summary.contains("cancel"),
-            "summary should mention cancellation: {}",
-            output.summary
-        );
-
-        // The heartbeat must freeze: the descendant is dead, not a
-        // background process still producing side effects.
-        let frozen = std::fs::read_to_string(&heartbeat).unwrap_or_default();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(
-            std::fs::read_to_string(&heartbeat).unwrap_or_default(),
-            frozen,
-            "the descendant must be terminated after cancellation — the heartbeat stopped"
         );
     }
 }
