@@ -1,0 +1,202 @@
+{
+  "generated": "2026-08-11",
+  "purpose": "TOOLS-01 machine-readable matrix: inventory of the current tool schemas, limits, context dispositions, effects and platform behavior as of this commit. The code remains authoritative; this file is the ACI specification input for TOOLS-02/03/04.",
+  "surface": {
+    "core": ["fs.list", "fs.read", "search.grep"],
+    "control": ["context.manage", "capability.manage"],
+    "catalog_optional": ["fs.write", "edit.replace", "git.status", "git.diff", "shell.exec"]
+  },
+  "global_limits": {
+    "MAX_TOOL_MODEL_CONTENT_CHARS": 16000,
+    "MAX_TOOL_SUMMARY_CHARS": 2000,
+    "MAX_TOOL_METADATA_BYTES": 8000,
+    "MAX_TOOL_OUTPUT_TOTAL_CHARS": 24000,
+    "MAX_TOOL_SURFACE_TOKENS": 4096,
+    "MAX_TOOL_SURFACE_REPORT_WIRE_BYTES": 18432,
+    "MAX_TOOL_SURFACE_REPORT_SELECTED": 32,
+    "MAX_TOOL_SURFACE_REPORT_OMITTED": 32,
+    "MAX_TOOL_SURFACE_REPORT_BLOCKED": 32,
+    "MAX_TOOL_SURFACE_REPORT_NAME_BYTES": 64,
+    "CONTEXT_SEARCH_MAX_LIMIT": 50,
+    "CONTEXT_MAP_VIEW_CAP": 32
+  },
+  "tools": {
+    "fs.list": {
+      "risk": "ReadOnly",
+      "surface_class": "core",
+      "schema": {
+        "path": {"type": "string", "note": "workspace-relative; resolved through the confinement check"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 200}
+      },
+      "limits": {"max_list_entries": 2000},
+      "effects": ["read:workspace"],
+      "context_disposition": "PersistObservation",
+      "platform": {}
+    },
+    "fs.read": {
+      "risk": "ReadOnly",
+      "surface_class": "core",
+      "schema": {
+        "path": {"type": "string", "required": true},
+        "start_line": {"type": "integer", "minimum": 1},
+        "end_line": {"type": "integer", "minimum": 1}
+      },
+      "limits": {
+        "max_read_bytes": 2097152,
+        "max_read_lines": 400,
+        "note": "file larger than max_read_bytes is rejected outright (use a narrower tool)"
+      },
+      "effects": ["read:workspace"],
+      "context_disposition": "PersistObservation",
+      "platform": {"note": "directory-handle-relative confined open; reparse/link swap rejected at open time (CORE-07)"}
+    },
+    "search.grep": {
+      "risk": "ReadOnly",
+      "surface_class": "core",
+      "schema": {
+        "pattern": {"type": "string", "required": true, "note": "rg-style regex"},
+        "path": {"type": "string", "note": "optional workspace-relative directory"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 1000}
+      },
+      "limits": {
+        "max_files_scanned": 5000,
+        "max_bytes_per_file": 2097152,
+        "model_hits": 100,
+        "note": "hit sets above model_hits spill to an artifact; ignored dirs: .git, .focus-agent, target, node_modules, vendor, dist, build"
+      },
+      "effects": ["read:workspace"],
+      "context_disposition": "PersistObservation",
+      "platform": {}
+    },
+    "fs.write": {
+      "risk": "WorkspaceWrite",
+      "surface_class": "catalog_optional",
+      "schema": {
+        "path": {"type": "string", "required": true},
+        "content": {"type": "string", "required": true}
+      },
+      "limits": {"note": "state dir (.focus-agent) rejected via resolve_mutation; journaled transaction"},
+      "effects": ["write:workspace", "journal:changes.jsonl"],
+      "context_disposition": "PersistObservation",
+      "platform": {}
+    },
+    "edit.replace": {
+      "risk": "WorkspaceWrite",
+      "surface_class": "catalog_optional",
+      "schema": {
+        "path": {"type": "string", "required": true},
+        "old": {"type": "string", "required": true, "note": "exact text; unambiguous single match unless occurrence/replace_all"},
+        "new": {"type": "string", "required": true},
+        "occurrence": {"type": "integer", "minimum": 1},
+        "replace_all": {"type": "boolean"}
+      },
+      "limits": {
+        "max_file_bytes": 4194304,
+        "note": "no-op edits rejected; occurrence and replace_all are mutually exclusive; old content captured to the change journal when the file is small enough"
+      },
+      "effects": ["write:workspace", "journal:changes.jsonl"],
+      "context_disposition": "PersistObservation",
+      "platform": {}
+    },
+    "git.status": {
+      "risk": "ReadOnly",
+      "surface_class": "catalog_optional",
+      "schema": {},
+      "limits": {
+        "model_output_chars": 12000,
+        "timeout_ms": 20000,
+        "note": "tail bounded; larger output spills to an artifact"
+      },
+      "effects": ["read:git"],
+      "context_disposition": "PersistObservation",
+      "platform": {}
+    },
+    "git.diff": {
+      "risk": "ReadOnly",
+      "surface_class": "catalog_optional",
+      "schema": {
+        "path": {"type": "string"},
+        "staged": {"type": "boolean"}
+      },
+      "limits": {
+        "model_output_chars": 12000,
+        "timeout_ms": 20000,
+        "note": "tail bounded; larger output spills to an artifact"
+      },
+      "effects": ["read:git"],
+      "context_disposition": "PersistObservation",
+      "platform": {}
+    },
+    "shell.exec": {
+      "risk": "ProcessExecution",
+      "surface_class": "catalog_optional",
+      "schema": {
+        "command": {"type": "string", "required": true},
+        "timeout_ms": {"type": "integer", "minimum": 100, "maximum": 120000, "default": 30000}
+      },
+      "limits": {
+        "max_timeout_ms": 120000,
+        "model_output_chars": 12000,
+        "buffer_lines": 200,
+        "max_line_chars": 4000,
+        "note": "full log streams to an artifact; bounded ring-buffer tail reaches the model; kill-on-drop and cooperative cancellation"
+      },
+      "effects": ["process:exec"],
+      "context_disposition": "PersistObservation",
+      "platform": {
+        "unix": "RLIMIT_CPU / RLIMIT_NPROC applied; process-group tree kill on cancel",
+        "windows": "Job Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE); taskkill /T /F tree kill"
+      }
+    },
+    "context.manage": {
+      "risk": "ReadOnly",
+      "surface_class": "control",
+      "schema": {
+        "op": {"type": "string", "enum": ["gc_hint", "tag", "lease", "collect", "search", "inspect", "fetch", "admit", "derive"], "required": true},
+        "item_id": {"type": "string"},
+        "keep": {"type": "boolean"},
+        "tag": {"type": "string"},
+        "turns": {"type": "integer", "minimum": 1},
+        "reason": {"type": "string"},
+        "fact": {"type": "string"},
+        "query": {"type": "string"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 64, "default": 16},
+        "kind": {"type": "string"},
+        "scope": {"type": "string"},
+        "task_id": {"type": "string"}
+      },
+      "limits": {
+        "search_execution_cap": 50,
+        "note": "schema advertises maximum 64 for search limit, execution clamps to CONTEXT_SEARCH_MAX_LIMIT=50 (execution is authoritative); keep_alive/lease quotas live in the context engine (max_keep_alive_items, max_lease_turns, max_leased_items/tokens per task, max_admits/max_derived per turn)"
+      },
+      "effects": ["context:directive", "context:read"],
+      "context_disposition": {
+        "gc_hint/tag/lease/collect": "PersistObservation",
+        "admit": "AccessEventOnly",
+        "derive": "TransientNoPersist",
+        "search/inspect/fetch": "TransientNoPersist"
+      },
+      "platform": {}
+    },
+    "capability.manage": {
+      "risk": "ReadOnly",
+      "surface_class": "control",
+      "schema": {
+        "op": {"type": "string", "enum": ["search", "inspect", "load", "unload"], "required": true},
+        "name": {"type": "string"}
+      },
+      "limits": {
+        "note": "load/unload move exactly one tool on/off the model surface; process start/stop stays owner-level; registration caps apply to capability-declared schemas"
+      },
+      "effects": ["catalog:lifecycle"],
+      "context_disposition": "PersistObservation",
+      "platform": {}
+    }
+  },
+  "cross_tool_notes": {
+    "per_tool_output_budget": "ToolSpec::output_budget (Option<usize>) declares a model-content cap per tool; the trusted output broker clamps it to MAX_TOOL_MODEL_CONTENT_CHARS and spills at the declared limit (M14).",
+    "approval": "ReadOnly auto-allows; WorkspaceWrite/ProcessExecution prompt the interactive gate (or deny under --read-only); standing grants (TaskExecutionPolicy, CORE-08) can cover matching effects.",
+    "workspace_confinement": "all paths resolve through the workspace confinement check (lexical + canonical walk); mutations additionally reject the state dir and use journaled transactions.",
+    "model_surface": "core + control tools are always on the surface; catalog-optional tools load on demand and cool to unloaded after idle GC; the per-round surface is packed under MAX_TOOL_SURFACE_TOKENS with mandatory tools never trimmed."
+  }
+}

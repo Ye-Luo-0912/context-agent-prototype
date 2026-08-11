@@ -789,8 +789,15 @@ together with TaskAnchor and continuous context GC.
 
 ### Gate 1: specify the base ACI before adding tools
 
-- [ ] **TOOLS-01** Inventory current tool schemas, limits, context dispositions, effects,
+- [x] **TOOLS-01** Inventory current tool schemas, limits, context dispositions, effects,
   and platform behavior in a machine-readable matrix.
+  **Done 2026-08-11** — [`docs/TOOL_INVENTORY.json`](TOOL_INVENTORY.json): the ten
+  current tools (core `fs.list`/`fs.read`/`search.grep`, control
+  `context.manage`/`capability.manage`, catalog-optional
+  `fs.write`/`edit.replace`/`git.status`/`git.diff`/`shell.exec`) with their
+  schemas, hard limits (per-tool and global broker caps), context
+  dispositions (persist / transient / access-event / directive), effects and
+  platform behavior; the code remains authoritative.
 - [ ] **TOOLS-02** Draft split `ModelToolSpec` / `HostToolPolicy`, concrete
   `EffectIntent`/`EffectReceipt`, and `PermissionSet`/standing-grant
   contracts without
