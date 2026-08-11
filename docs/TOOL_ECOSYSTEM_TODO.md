@@ -1040,8 +1040,22 @@ together with TaskAnchor and continuous context GC.
   lifecycle refresh, bounded decision events, one final snapshot, runtime
   surface revision, and RuntimeCheckpoint v2. This item does not include the
   complete TaskAnchor or completion transaction.
-- [ ] **TOOLS-08** Add TaskAnchor-driven tool roots and structured completion controls only with the
-  `CTX-10` CompletionRecord transaction and GC root transfer.
+- [x] **TOOLS-08** Add TaskAnchor-driven tool roots and structured completion controls with the
+  `CTX-10` CompletionRecord transaction and GC root transfer. The active
+  task's tool-demand set is the tool-lifecycle GC root set: the runtime
+  passes the task's requirement names to `gc()` at the per-round safe
+  point, so a tool the task requires (Must/Prefer/KeepReady alike) is
+  never aged off the surface by idle GC — roots protect the silent idle
+  path; an explicit unload still works and surface planning fails closed
+  on Must demand. Completion is now a structured model control:
+  `task.complete` packages a bounded summary plus bounded `artifact://`
+  refs as a typed `RuntimeDirective::CompleteTask`; the runtime validates
+  it (same caps as a persisted `CompletionRecord`) and commits it at the
+  turn's safe point — after the turn commits, never mid-operation —
+  through the same CTX-10 transaction as `/done` (prepare, engine
+  transition, task flip, `TaskCompleted`, post-completion GC). No active
+  task at the safe point drops the proposal with a warning; a committed
+  turn is never undone by a completion failure.
 - [ ] **TOOLS-08A** Split capability process state from per-tool surface
   state; loading one tool must not expose all sibling schemas, and external
   tools must receive the same root/idle cooling semantics as builtins.

@@ -25,7 +25,7 @@ use serde_json::json;
 use crate::tools::{
     ArtifactReadTool, ContextManageTool, EditPatchTool, EditReplaceTool, FsListTool, FsReadTool,
     FsWriteTool, GitDiffTool, GitStatusTool, ProcessRunTool, ProcessSession, ProcessSessionTool,
-    SearchGrepTool, ShellExecTool, Tool,
+    SearchGrepTool, ShellExecTool, TaskCompleteTool, Tool,
 };
 
 /// Control tools are now defined by the unified catalog contract.
@@ -54,6 +54,9 @@ impl Default for ToolLifecycleConfig {
                 // read side of that contract, so it must always be on the
                 // surface.
                 "artifact.read".into(),
+                // Completion is a task-level control: the model can always
+                // propose a structured outcome.
+                "task.complete".into(),
                 // The merged control surface: one `context.manage` (gc hints,
                 // tags, leases, manual collect, and the on-demand retrieval
                 // loop over externalized refs) and one `capability.manage`
@@ -112,6 +115,7 @@ impl BuiltinToolDispatcher {
             Arc::new(ProcessRunTool::new(workspace.clone())),
             Arc::new(ProcessSessionTool::new(workspace.clone(), sessions)),
             Arc::new(ContextManageTool::new()),
+            Arc::new(TaskCompleteTool::new()),
         ];
         let catalog = tools
             .into_iter()

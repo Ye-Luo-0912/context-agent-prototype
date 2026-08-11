@@ -9,6 +9,7 @@ mod search;
 mod session;
 mod shell;
 mod stream;
+mod task;
 
 pub(crate) use artifact::ArtifactReadTool;
 pub(crate) use context::ContextManageTool;
@@ -20,6 +21,7 @@ pub(crate) use process::ProcessRunTool;
 pub(crate) use search::SearchGrepTool;
 pub(crate) use session::{ProcessSession, ProcessSessionTool};
 pub(crate) use shell::ShellExecTool;
+pub(crate) use task::TaskCompleteTool;
 
 use agent_contracts::{AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolSpec};
 use agent_workspace::Workspace;

@@ -2,7 +2,7 @@
   "generated": "2026-08-11",
   "purpose": "TOOLS-01 machine-readable matrix: inventory of the current tool schemas, limits, context dispositions, effects and platform behavior as of this commit. The code remains authoritative; this file is the ACI specification input for TOOLS-02/03/04.",
   "surface": {
-    "core": ["fs.list", "fs.read", "artifact.read", "search.grep"],
+    "core": ["fs.list", "fs.read", "artifact.read", "search.grep", "task.complete"],
     "control": ["context.manage", "capability.manage"],
     "catalog_optional": ["fs.write", "edit.replace", "edit.patch", "git.status", "git.diff", "shell.exec", "process.run", "process.session"]
   },
@@ -289,6 +289,23 @@
         "note": "load/unload move exactly one tool on/off the model surface; process start/stop stays owner-level; registration caps apply to capability-declared schemas"
       },
       "effects": ["catalog:lifecycle"],
+      "context_disposition": "PersistObservation",
+      "platform": {}
+    },
+    "task.complete": {
+      "risk": "ReadOnly",
+      "surface_class": "core",
+      "schema": {
+        "summary": {"type": "string", "required": true, "note": "bounded completion summary"},
+        "artifacts": {"type": "array", "items": {"type": "string"}, "note": "optional artifact:// refs produced by the completion"}
+      },
+      "limits": {
+        "max_completion_summary_chars": 2000,
+        "max_completion_artifacts": 32,
+        "max_completion_ref_chars": 256,
+        "note": "the tool performs no side effect itself: it attaches a typed RuntimeDirective::CompleteTask that the runtime validates (same caps as a persisted CompletionRecord) and commits at the turn's safe point — after the turn commits, never mid-operation — through the CTX-10 transaction used by /done; a completed task owns exactly one CompletionRecord with the proposal's summary and artifact refs"
+      },
+      "effects": ["task:complete"],
       "context_disposition": "PersistObservation",
       "platform": {}
     }

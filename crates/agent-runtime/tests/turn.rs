@@ -2367,4 +2367,154 @@ async fn expired_authority_lease_rolls_back_the_staged_effect() {
         "the failed write must reach the model: {serialized}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Structured completion: `task.complete` attaches a typed proposal that the
+// runtime commits at the turn's safe point (after the turn commits) as the
+// active task's CompletionRecord — the CTX-10 transaction.
+// ---------------------------------------------------------------------------
+
+/// Calls `task.complete` with the given summary on round 0, then finishes.
+#[derive(Debug)]
+struct CompletionProposalModel {
+    summary: &'static str,
+    rounds: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for CompletionProposalModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        if round == 0 {
+            Ok(ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "task.complete".into(),
+                    arguments: json!({"summary": self.summary, "artifacts": ["artifact://.focus-agent/artifacts/r1/out.txt"]}),
+                }],
+                usage: Default::default(),
+            })
+        } else {
+            Ok(ModelOutput {
+                content: "done".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            })
+        }
+    }
+}
+
+/// Serves `task.complete` by attaching the typed completion directive,
+/// exactly like the real tool.
+#[derive(Debug)]
+struct CompletionToolDispatcher;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for CompletionToolDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "task.complete".into(),
+            description: "propose completion".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+        }]
+    }
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        let summary: String = request.call.arguments["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let artifacts: Vec<String> = request.call.arguments["artifacts"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|value| value.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(ToolOutcome::RuntimeDirective {
+            output: ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "completion proposed".into(),
+                model_content: "completion proposed".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            directive: agent_contracts::RuntimeDirective::CompleteTask(
+                agent_contracts::CompletionProposal { summary, artifacts },
+            ),
+        })
+    }
+}
+
+#[tokio::test]
+async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
+    let handle = spawn_with(
+        Arc::new(CompletionProposalModel {
+            summary: "the task is done",
+            rounds: AtomicUsize::new(0),
+        }),
+        Arc::new(TestContextEngine),
+        Arc::new(CompletionToolDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle.user_message("finish the work".into()).await.unwrap();
+
+    let mut completed_event = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::TaskCompleted {
+                task_id,
+                anchor_revision,
+                summary,
+            } = &envelope.event
+            {
+                completed_event = Some((*task_id, *anchor_revision, summary.clone()));
+            }
+            if matches!(envelope.event, RuntimeEvent::TurnCompleted) {
+                break;
+            }
+        }
+        if completed_event.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (task_id, anchor_revision, summary) =
+        completed_event.expect("the completion proposal must commit");
+    assert_eq!(summary, "the task is done");
+
+    // The typed record is durable in the checkpoint, with the proposal's
+    // artifact ref attached — the CTX-10 transaction end to end.
+    let checkpoint = handle.checkpoint().await.unwrap();
+    let record = checkpoint
+        .tasks
+        .completed
+        .iter()
+        .find(|record| record.task_id == task_id)
+        .expect("a completed task owns exactly one CompletionRecord");
+    assert_eq!(record.anchor_revision, anchor_revision);
+    assert_eq!(record.summary, "the task is done");
+    assert_eq!(
+        record.artifacts,
+        vec!["artifact://.focus-agent/artifacts/r1/out.txt"]
+    );
+    assert!(
+        record.final_output_digest.is_some(),
+        "the final output digest must be retained"
+    );
+    handle.stop().await.unwrap();
+}
 // ---------------------------------------------------------------------------

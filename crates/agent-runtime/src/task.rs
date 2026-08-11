@@ -13,10 +13,11 @@
 //! scopes. A prepared-but-uncommitted transition is simply discarded.
 
 use agent_contracts::{
-    AgentError, AgentResult, MAX_TASK_ANCHOR_CHANGED_FIELDS, MAX_TASK_ANCHOR_CLAIMS,
-    MAX_TASK_ANCHOR_ITEM_CHARS, MAX_TASK_ANCHOR_LIST_ITEMS, MAX_TASK_ANCHOR_TEXT_CHARS,
-    MAX_TASK_TOOL_REQUIREMENTS, MAX_TOOL_REQUIREMENT_NAME_CHARS, MAX_TOOL_REQUIREMENT_REASON_CHARS,
-    TaskId, ToolSurfaceRequirement,
+    AgentError, AgentResult, CompletionProposal, MAX_COMPLETION_ARTIFACTS,
+    MAX_COMPLETION_REF_CHARS, MAX_COMPLETION_SUMMARY_CHARS, MAX_TASK_ANCHOR_CHANGED_FIELDS,
+    MAX_TASK_ANCHOR_CLAIMS, MAX_TASK_ANCHOR_ITEM_CHARS, MAX_TASK_ANCHOR_LIST_ITEMS,
+    MAX_TASK_ANCHOR_TEXT_CHARS, MAX_TASK_TOOL_REQUIREMENTS, MAX_TOOL_REQUIREMENT_NAME_CHARS,
+    MAX_TOOL_REQUIREMENT_REASON_CHARS, TaskId, ToolSurfaceRequirement,
 };
 
 /// Lifecycle of a task. `Suspended` tasks keep their scopes in the engine
@@ -164,6 +165,45 @@ pub struct CompletionRecord {
     pub artifacts: Vec<String>,
 }
 
+/// Validate a structured completion proposal from `task.complete` before
+/// the runtime accepts it: a non-empty, bounded summary, a bounded number
+/// of artifact refs, each a genuine `artifact://` reference of bounded
+/// length. The same caps that guard a persisted `CompletionRecord` guard
+/// the proposal, so a committed record can never exceed them.
+pub(crate) fn validate_completion_proposal(proposal: &CompletionProposal) -> AgentResult<()> {
+    if proposal.summary.trim().is_empty() {
+        return Err(AgentError::InvalidRequest(
+            "completion summary must not be empty".into(),
+        ));
+    }
+    if proposal.summary.chars().count() > MAX_COMPLETION_SUMMARY_CHARS {
+        return Err(AgentError::InvalidRequest(format!(
+            "completion summary has {} chars, above the {MAX_COMPLETION_SUMMARY_CHARS} cap",
+            proposal.summary.chars().count()
+        )));
+    }
+    if proposal.artifacts.len() > MAX_COMPLETION_ARTIFACTS {
+        return Err(AgentError::InvalidRequest(format!(
+            "completion proposal carries {} artifacts, above the {MAX_COMPLETION_ARTIFACTS} cap",
+            proposal.artifacts.len()
+        )));
+    }
+    for artifact in &proposal.artifacts {
+        if !artifact.starts_with("artifact://") {
+            return Err(AgentError::InvalidRequest(format!(
+                "completion artifact must be an artifact:// reference: {artifact:?}"
+            )));
+        }
+        if artifact.chars().count() > MAX_COMPLETION_REF_CHARS {
+            return Err(AgentError::InvalidRequest(format!(
+                "completion artifact ref has {} chars, above the {MAX_COMPLETION_REF_CHARS} cap",
+                artifact.chars().count()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A serializable snapshot for the UI (`/tasks`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskInfo {
@@ -307,14 +347,17 @@ impl TaskManager {
     /// Plan to complete the active task, committing its typed outcome with
     /// the status flip. `None` when nothing is active. The record captures
     /// the task identity and the anchor revision the outcome is measured
-    /// against; the bounded summary comes from the caller (`/done` text).
-    /// `final_output_ref`/`final_output_digest` name the exact final output
-    /// body (if retained) so the outcome stays byte-for-byte verifiable.
+    /// against; the bounded summary comes from the caller (`/done` text or
+    /// a `task.complete` proposal). `final_output_ref`/`final_output_digest`
+    /// name the exact final output body (if retained) so the outcome stays
+    /// byte-for-byte verifiable; `artifacts` are the completion's bounded
+    /// `artifact://` refs recorded on the outcome.
     pub fn prepare_complete(
         &self,
         summary: String,
         final_output_ref: Option<String>,
         final_output_digest: Option<String>,
+        artifacts: Vec<String>,
     ) -> Option<(TaskTxn, CompletionRecord)> {
         let active = self.active?;
         let anchor_revision = self
@@ -330,7 +373,7 @@ impl TaskManager {
             completed_at_ms: now_ms(),
             final_output_ref,
             final_output_digest,
-            artifacts: Vec::new(),
+            artifacts,
         };
         Some((
             TaskTxn {
@@ -834,7 +877,7 @@ mod tests {
         assert_eq!(tasks.get(b).map(|t| t.status), Some(TaskStatus::Suspended));
 
         let (txn, _record) = tasks
-            .prepare_complete("done".into(), None, None)
+            .prepare_complete("done".into(), None, None, Vec::new())
             .expect("a is active");
         tasks.commit(txn);
         assert_eq!(tasks.get(a).map(|t| t.status), Some(TaskStatus::Completed));
@@ -860,7 +903,11 @@ mod tests {
     fn unknown_task_ids_are_rejected() {
         let tasks = TaskManager::new();
         assert!(tasks.prepare_activate(TaskId::new()).is_none());
-        assert!(tasks.prepare_complete("done".into(), None, None).is_none());
+        assert!(
+            tasks
+                .prepare_complete("done".into(), None, None, Vec::new())
+                .is_none()
+        );
     }
 
     #[test]
@@ -968,7 +1015,7 @@ mod tests {
         let mut tasks = TaskManager::new();
         let task_id = create(&mut tasks, "task A");
         let (txn, _record) = tasks
-            .prepare_complete("done".into(), None, None)
+            .prepare_complete("done".into(), None, None, Vec::new())
             .expect("task is active");
         tasks.commit(txn);
 
@@ -1122,7 +1169,7 @@ mod tests {
         let mut tasks = TaskManager::new();
         let task_id = create(&mut tasks, "task A");
         let (txn, _record) = tasks
-            .prepare_complete("done".into(), None, None)
+            .prepare_complete("done".into(), None, None, Vec::new())
             .expect("task is active");
         tasks.commit(txn);
 
@@ -1162,7 +1209,7 @@ mod tests {
         tasks.commit(replace);
 
         let (txn, record) = tasks
-            .prepare_complete("auth refactor shipped".into(), None, None)
+            .prepare_complete("auth refactor shipped".into(), None, None, Vec::new())
             .unwrap();
         assert_eq!(record.task_id, task_id);
         assert_eq!(

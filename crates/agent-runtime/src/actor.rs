@@ -13,12 +13,13 @@ use std::{
 use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
     AgentError, AgentResult, AuthorityLease, CONTEXT_CONSUMPTION_ACK_ITEM_CAP, CancellationToken,
-    ContextConsumptionAck, ContextHints, ContextIngress, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect, EffectDurability,
-    EffectReceipt, ModelInput, ModelRequest, OperationId, OperationOutcome, OperationResult,
-    RestoreRevision, RuntimeDirective, RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall,
-    ToolOutcome, ToolOutput, ToolResultDisposition, ToolSurfaceBlock, ToolSurfaceBlockReason,
-    ToolSurfaceDemand, ToolSurfaceSnapshot, TurnFrame, TurnFrameStep, TurnId,
+    CompletionProposal, ContextConsumptionAck, ContextHints, ContextIngress,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect,
+    EffectDurability, EffectReceipt, ModelInput, ModelRequest, OperationId, OperationOutcome,
+    OperationResult, RestoreRevision, RuntimeDirective, RuntimeEvent, ScopeId, ScopeKind, TaskId,
+    ToolCall, ToolOutcome, ToolOutput, ToolResultDisposition, ToolSurfaceBlock,
+    ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceSnapshot, TurnFrame, TurnFrameStep,
+    TurnId,
 };
 use agent_core::CoreAuthority;
 use tokio::sync::mpsc;
@@ -36,7 +37,7 @@ use crate::prompt::PromptAssembler;
 use crate::services::RuntimeServices;
 use crate::sink::LiveSink;
 use crate::surface::{RoundSurfacePlan, SurfaceReportContext};
-use crate::task::{TaskManager, normalize_tool_requirements};
+use crate::task::{TaskManager, normalize_tool_requirements, validate_completion_proposal};
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -80,6 +81,11 @@ struct ActiveTurn {
     /// Where the turn is in its commit lifecycle (see `TurnState`).
     turn_state: TurnState,
     op: Option<InFlightOp>,
+    /// A structured completion proposal the model attached to a tool call
+    /// (`task.complete`). Committed at the turn's safe point — after the
+    /// turn commits — through the CTX-10 transaction, so completion never
+    /// races an in-flight operation.
+    pending_completion: Option<CompletionProposal>,
 }
 
 /// The commit lifecycle of a turn. `ModelFinished` means the model has
@@ -513,64 +519,8 @@ impl RuntimeActor {
             RuntimeCommand::CompleteTask { summary, reply } => {
                 let result = match self.ensure_idle().and_then(|_| self.next_focus_revision()) {
                     Ok(next_focus_revision) => {
-                        // The exact final-output body is the completion
-                        // summary itself in this prototype: retain its
-                        // digest so the outcome stays byte-for-byte
-                        // verifiable, with a deterministic ref naming the
-                        // task's completion record.
-                        let final_output_digest = Some(crate::task::sha256_hex(summary.as_bytes()));
-                        let final_output_ref = self
-                            .state
-                            .tasks
-                            .active()
-                            .map(|task_id| format!("task:{task_id}:completion"));
-                        match self.state.tasks.prepare_complete(
-                            summary.clone(),
-                            final_output_ref,
-                            final_output_digest,
-                        ) {
-                            None => Err(AgentError::InvalidRequest(
-                                "no active task to complete".into(),
-                            )),
-                            Some((txn, record)) => {
-                                let task_id = record.task_id;
-                                let anchor_revision = record.anchor_revision;
-                                let event_summary = record.summary.clone();
-                                match self.services.complete_current_task(task_id, summary).await {
-                                    Ok(report) => {
-                                        self.state.tasks.commit(txn);
-                                        self.state.task_id = None;
-                                        self.state.focus_revision = next_focus_revision;
-                                        self.state.generation += 1;
-                                        let transition = self
-                                            .publish_context_transition(
-                                                RuntimeEvent::TaskCompleted {
-                                                    task_id,
-                                                    anchor_revision,
-                                                    summary: event_summary,
-                                                },
-                                                ContextMaintenanceTrigger::TaskCompleted,
-                                                report,
-                                            )
-                                            .await;
-                                        // The completed task's working set is
-                                        // outside the runtime now: run one
-                                        // full GC pass so its records leave
-                                        // the resident heap (they stay
-                                        // recallable from the buffer/store —
-                                        // durable retention, storage GC
-                                        // protected). A GC failure after the
-                                        // completion committed is surfaced,
-                                        // never allowed to undo the outcome.
-                                        if transition.is_ok() {
-                                            self.compact_after_completion().await;
-                                        }
-                                        transition
-                                    }
-                                    Err(error) => Err(self.context_transition_failed(error)),
-                                }
-                            }
-                        }
+                        self.commit_completion(summary, Vec::new(), next_focus_revision)
+                            .await
                     }
                     Err(error) => Err(error),
                 };
@@ -997,6 +947,9 @@ impl RuntimeActor {
             tool_surface: None,
             turn_state: TurnState::Running,
             op: None,
+            // A `task.complete` proposal lands here and is committed at the
+            // turn's safe point (after the turn commits), never mid-turn.
+            pending_completion: None,
         });
         self.advance_turn(op_tx).await;
         let _ = reply.send(Ok(()));
@@ -2156,7 +2109,97 @@ impl RuntimeActor {
                         .await;
                 }
             }
+            RuntimeDirective::CompleteTask(proposal) => {
+                // Validated and stored on the turn; the CTX-10 transaction
+                // runs at the turn's safe point (after the turn commits),
+                // never mid-operation, so the completion cannot race an
+                // in-flight tool or model call.
+                if let Err(error) = self.accept_completion_proposal(proposal) {
+                    let _ = self
+                        .kernel
+                        .emit_warning(format!("completion proposal refused: {error}"))
+                        .await;
+                }
+            }
         }
+    }
+
+    /// Validate and accept a structured completion proposal from
+    /// `task.complete`. It is stored on the turn and committed at the
+    /// turn's safe point; a later proposal replaces an earlier one. The
+    /// model-facing tool result already told the model the proposal was
+    /// submitted — the refusal path here only fires for malformed input.
+    fn accept_completion_proposal(&mut self, proposal: CompletionProposal) -> AgentResult<()> {
+        validate_completion_proposal(&proposal)?;
+        let Some(turn) = self.state.turn.as_mut() else {
+            return Err(AgentError::InvalidRequest(
+                "no active turn to complete".into(),
+            ));
+        };
+        turn.pending_completion = Some(proposal);
+        Ok(())
+    }
+
+    /// Commit the active task's typed CompletionRecord — the CTX-10
+    /// transaction: prepare the record, run the engine's focus/context
+    /// transition, commit the task flip, publish `TaskCompleted`, then one
+    /// full GC pass so the completed task's records leave the resident
+    /// heap (durable retention; a GC failure after the commit is surfaced,
+    /// never allowed to undo the outcome). Shared by the `/done` command
+    /// and the model's `task.complete` proposal.
+    async fn commit_completion(
+        &mut self,
+        summary: String,
+        artifacts: Vec<String>,
+        next_focus_revision: u64,
+    ) -> AgentResult<()> {
+        // The exact final-output body is the completion summary itself in
+        // this prototype: retain its digest so the outcome stays
+        // byte-for-byte verifiable, with a deterministic ref naming the
+        // task's completion record.
+        let final_output_digest = Some(crate::task::sha256_hex(summary.as_bytes()));
+        let final_output_ref = self
+            .state
+            .tasks
+            .active()
+            .map(|task_id| format!("task:{task_id}:completion"));
+        let Some((txn, record)) = self.state.tasks.prepare_complete(
+            summary.clone(),
+            final_output_ref,
+            final_output_digest,
+            artifacts,
+        ) else {
+            return Err(AgentError::InvalidRequest(
+                "no active task to complete".into(),
+            ));
+        };
+        let task_id = record.task_id;
+        let anchor_revision = record.anchor_revision;
+        let event_summary = record.summary.clone();
+        let report = self
+            .services
+            .complete_current_task(task_id, summary)
+            .await
+            .map_err(|error| self.context_transition_failed(error))?;
+        self.state.tasks.commit(txn);
+        self.state.task_id = None;
+        self.state.focus_revision = next_focus_revision;
+        self.state.generation += 1;
+        let transition = self
+            .publish_context_transition(
+                RuntimeEvent::TaskCompleted {
+                    task_id,
+                    anchor_revision,
+                    summary: event_summary,
+                },
+                ContextMaintenanceTrigger::TaskCompleted,
+                report,
+            )
+            .await;
+        if transition.is_ok() {
+            self.compact_after_completion().await;
+        }
+        transition
     }
 
     /// When the model stops calling tools, the turn's tool observations
@@ -2317,7 +2360,46 @@ impl RuntimeActor {
         if let Some(turn) = self.state.turn.as_mut() {
             turn.turn_state = TurnState::Committed;
         }
+        // A `task.complete` proposal must run at the safe point — after the
+        // turn is durably committed and no operation is in flight — through
+        // the same CTX-10 transaction as `/done`. A completion failure here
+        // is surfaced, never allowed to undo the committed turn.
+        let pending_completion = self
+            .state
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.pending_completion.clone());
         self.state.turn = None;
+        if let Some(proposal) = pending_completion {
+            self.process_pending_completion(proposal).await;
+        }
+    }
+
+    /// Run a deferred structured completion proposal after the turn
+    /// committed. This is the model-side `task.complete` path: the proposal
+    /// becomes the active task's typed CompletionRecord. No active task
+    /// (suspended/completed meanwhile) drops the proposal with a warning —
+    /// it never fails the already-committed turn.
+    async fn process_pending_completion(&mut self, proposal: CompletionProposal) {
+        if self.state.tasks.active().is_none() {
+            let _ = self
+                .kernel
+                .emit_warning("completion proposal dropped: no active task".to_string())
+                .await;
+            return;
+        }
+        let Some(next_focus_revision) = self.next_focus_revision().ok() else {
+            return;
+        };
+        if let Err(error) = self
+            .commit_completion(proposal.summary, proposal.artifacts, next_focus_revision)
+            .await
+        {
+            let _ = self
+                .kernel
+                .emit_warning(format!("completion proposal failed: {error}"))
+                .await;
+        }
     }
 
     /// Abort the turn commit: journal the failed phase and the recovery

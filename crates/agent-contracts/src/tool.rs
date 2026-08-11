@@ -382,16 +382,35 @@ impl std::fmt::Display for EffectCommitError {
 
 impl std::error::Error for EffectCommitError {}
 
+/// A structured completion proposal the model attaches to its last tool
+/// call (`task.complete`). The runtime validates it and commits it as the
+/// active task's typed `CompletionRecord` at the turn's safe point — after
+/// the turn commits, never mid-operation — through the same CTX-10
+/// transaction the `/done` path uses. Every field is bounded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionProposal {
+    /// Bounded completion summary (becomes the CompletionRecord summary).
+    pub summary: String,
+    /// Bounded `artifact://` refs the completion produced, recorded on the
+    /// CompletionRecord so the evidence stays attached to the outcome.
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+}
+
 /// A directive a tool attaches to its output asking the runtime to change
-/// runtime-owned state (a context `gc_hint` / `tag` / `lease` / `collect`).
-/// Unlike a plain `ToolOutput` field — which any tool, including a
-/// capability, could set — a `RuntimeDirective` is a distinct
-/// `ToolOutcome` variant. The dispatcher only lets trusted tools and
-/// capabilities holding `RUNTIME_CONTEXT_CONTROL` produce it, so an
-/// arbitrary capability cannot forge context-control requests.
+/// runtime-owned state (a context `gc_hint` / `tag` / `lease` / `collect`,
+/// or a structured task completion). Unlike a plain `ToolOutput` field —
+/// which any tool, including a capability, could set — a `RuntimeDirective`
+/// is a distinct `ToolOutcome` variant. The dispatcher only lets trusted
+/// tools and capabilities holding `RUNTIME_CONTEXT_CONTROL` produce it, so
+/// an arbitrary capability cannot forge runtime-control requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeDirective {
     Context(ContextAction),
+    /// The model proposes completing the active task with a typed outcome.
+    /// Executed at the turn's safe point (after the turn commits), so the
+    /// completion never races an in-flight operation.
+    CompleteTask(CompletionProposal),
 }
 
 /// Permission a capability's manifest must declare to attach context

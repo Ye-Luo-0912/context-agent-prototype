@@ -82,6 +82,10 @@ fn representative_calls() -> Vec<(String, Value)> {
         ("shell.exec".into(), json!({"command": "echo conformance"})),
         ("context.manage".into(), json!({"op": "search"})),
         ("capability.manage".into(), json!({"op": "search"})),
+        (
+            "task.complete".into(),
+            json!({"summary": "conformance done"}),
+        ),
     ]
 }
 
