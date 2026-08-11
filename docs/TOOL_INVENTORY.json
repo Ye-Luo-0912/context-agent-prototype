@@ -314,6 +314,6 @@
     "per_tool_output_budget": "ToolSpec::output_budget (Option<usize>) declares a model-content cap per tool; the trusted output broker clamps it to MAX_TOOL_MODEL_CONTENT_CHARS and spills at the declared limit (M14).",
     "approval": "ReadOnly auto-allows; WorkspaceWrite/ProcessExecution prompt the interactive gate (or deny under --read-only); standing grants (TaskExecutionPolicy, CORE-08) can cover matching effects.",
     "workspace_confinement": "all paths resolve through the workspace confinement check (lexical + canonical walk); mutations additionally reject the state dir and use journaled transactions.",
-    "model_surface": "core + control tools are always on the surface; catalog-optional tools load on demand and cool to unloaded after idle GC; the per-round surface is packed under MAX_TOOL_SURFACE_TOKENS with mandatory tools never trimmed."
+    "model_surface": "core + control tools are always on the surface; catalog-optional tools load on demand and cool to unloaded after idle GC; capability tools share the same per-tool lifecycle (Loaded -> Warm -> Unloaded with the same thresholds and TaskAnchor roots) — loading one capability tool never surfaces its siblings; the active task's tool-demand set roots both builtin and capability tools against idle aging"
   }
 }

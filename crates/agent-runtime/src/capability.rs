@@ -72,14 +72,30 @@ struct Entry {
     /// for the same capability (that would deadlock).
     run_state: CapabilityRunState,
     run_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Which tools of this capability are on the model surface. Registration
-    /// alone keeps them `Available`; `capability.load` (or the runtime) puts
-    /// exactly the named tool on the surface — sibling tools of the same
-    /// capability stay off until they are loaded individually — and
-    /// `capability.unload` takes one tool off.
-    loaded_tools: HashSet<String>,
-    /// A tool of this capability is executing right now.
+    /// Which tools of this capability are on the model surface and how
+    /// recently each was used. This is per-tool surface state, split from
+    /// the capability's process lifecycle (`run_state`): `capability.load`
+    /// (or the runtime) puts exactly the named tool on the surface —
+    /// sibling tools of the same capability stay off until they are loaded
+    /// individually — and each loaded tool ages independently
+    /// (Loaded → Warm → Unloaded) exactly like the builtin catalog, so a
+    /// task that requires a capability tool roots it against idle GC the
+    /// same way it roots a builtin.
+    tool_states: HashMap<String, CapabilityToolState>,
+    /// A tool of this capability is executing right now (per-capability
+    /// executing marker; the catalog's `Active` row).
     active: bool,
+}
+
+/// Per-tool surface lifecycle of one capability tool: the tool's
+/// model-surface state (Loaded / Warm / Unloaded; absent means Available)
+/// and the tick of its last use, which idle GC ages against. The split is
+/// deliberate — loading one tool never exposes its siblings, and each tool
+/// cools independently of the capability's process lifecycle.
+#[derive(Debug, Clone, Copy)]
+struct CapabilityToolState {
+    lifecycle: ToolLifecycle,
+    last_used_tick: u64,
 }
 
 /// One row of the platform's capability catalog (the discovery surface).
@@ -97,7 +113,6 @@ pub struct CapabilityCatalogEntry {
 /// module host (registration) and the tool dispatcher (specs + routing).
 /// Registration is not gated on the host lifecycle: a capability can be
 /// published mid-run and its tools appear on the next model request.
-#[derive(Default)]
 pub struct CapabilityRegistry {
     /// Coordinates a unified snapshot with surface mutations without holding
     /// `inner` across the lower dispatcher's `snapshot()` callback. Writers
@@ -132,11 +147,54 @@ pub struct CapabilityRegistry {
     /// unchanged catalog answers `capability.search` without rebuilding
     /// every row from the registry lock.
     rows_cache: RwLock<Option<(u64, Arc<Vec<ToolCatalogEntry>>)>>,
+    /// Monotonic lifecycle tick: bumped at every load and every gc() safe
+    /// point, so per-tool idle aging measures rounds, like the builtin
+    /// catalog.
+    tick: AtomicU64,
+    /// Idle ticks before a loaded capability tool cools to Warm.
+    idle_to_warm_ticks: u64,
+    /// Idle ticks before a warm capability tool is unloaded from the model
+    /// surface.
+    warm_to_unload_ticks: u64,
+}
+
+impl Default for CapabilityRegistry {
+    fn default() -> Self {
+        Self {
+            surface_gate: RwLock::new(()),
+            inner: RwLock::new(HashMap::new()),
+            state: CapabilityStateAuthority::default(),
+            reserved: RwLock::new(HashSet::new()),
+            generation: AtomicU64::new(0),
+            catalog_version: AtomicU64::new(0),
+            rows_cache: RwLock::new(None),
+            tick: AtomicU64::new(0),
+            // Defaults mirror the builtin catalog's idle thresholds, so
+            // capability tools and builtin tools cool at the same rate.
+            idle_to_warm_ticks: 8,
+            warm_to_unload_ticks: 24,
+        }
+    }
 }
 
 impl CapabilityRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry with explicit idle thresholds for the per-tool surface
+    /// lifecycle (Loaded → Warm → Unloaded). The defaults mirror the
+    /// builtin catalog; tests and composition roots can tune them.
+    pub fn with_idle_thresholds(idle_to_warm_ticks: u64, warm_to_unload_ticks: u64) -> Self {
+        Self {
+            idle_to_warm_ticks,
+            warm_to_unload_ticks,
+            ..Self::default()
+        }
+    }
+
+    fn tick_now(&self) -> u64 {
+        self.tick.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// The registry's surface generation: any capability surface change
@@ -222,7 +280,7 @@ impl CapabilityRegistry {
                 tool_specs,
                 run_state: CapabilityRunState::Stopped,
                 run_lock: Arc::new(tokio::sync::Mutex::new(())),
-                loaded_tools: HashSet::new(),
+                tool_states: HashMap::new(),
                 active: false,
             },
         );
@@ -276,7 +334,7 @@ impl CapabilityRegistry {
         // A capability that cannot run must not keep its tools on the
         // model surface.
         if !activation.usable() {
-            entry.loaded_tools.clear();
+            entry.tool_states.clear();
         }
         // Activation flips the usable surface: bump the generation.
         self.generation.fetch_add(1, Ordering::Relaxed);
@@ -348,13 +406,18 @@ impl CapabilityRegistry {
                 states
                     .get(&entry.manifest.id)
                     .is_some_and(|state| state.activation.usable())
-                    && !entry.loaded_tools.is_empty()
+                    && !entry.tool_states.is_empty()
             })
             .flat_map(|entry| {
                 entry
                     .tool_specs
                     .iter()
-                    .filter(|spec| entry.loaded_tools.contains(&spec.name))
+                    .filter(|spec| {
+                        entry
+                            .tool_states
+                            .get(&spec.name)
+                            .is_some_and(|state| state.lifecycle == ToolLifecycle::Loaded)
+                    })
                     .cloned()
             })
             .collect();
@@ -417,7 +480,14 @@ impl CapabilityRegistry {
                 activation.as_str()
             )));
         }
-        entry.loaded_tools.insert(tool_name.to_string());
+        let tick = self.tick_now();
+        entry.tool_states.insert(
+            tool_name.to_string(),
+            CapabilityToolState {
+                lifecycle: ToolLifecycle::Loaded,
+                last_used_tick: tick,
+            },
+        );
         // A load puts tools on the surface: bump the generation.
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.catalog_version.fetch_add(1, Ordering::Relaxed);
@@ -425,7 +495,9 @@ impl CapabilityRegistry {
     }
 
     /// Unified `capability.unload`: take one tool of the owning capability
-    /// off the model surface. Siblings stay loaded.
+    /// off the model surface. Siblings stay loaded. Roots only protect the
+    /// idle path (like the builtin catalog): an explicit unload always
+    /// works, and round-surface planning degrades per task demand.
     pub fn unload_tool(&self, tool_name: &str) -> AgentResult<()> {
         let owner = self
             .owner_of(tool_name)
@@ -436,7 +508,7 @@ impl CapabilityRegistry {
             .expect("capability registry poisoned");
         let mut inner = self.inner.write().expect("capability registry poisoned");
         if let Some(entry) = inner.get_mut(&owner) {
-            entry.loaded_tools.remove(tool_name);
+            entry.tool_states.remove(tool_name);
         }
         // An unload takes tools off the surface: bump the generation.
         self.generation.fetch_add(1, Ordering::Relaxed);
@@ -445,11 +517,11 @@ impl CapabilityRegistry {
     }
 
     /// Lifecycle state of one capability tool: `Active` while executing,
-    /// `Loaded` when that tool itself is on the surface, `Available`
-    /// otherwise. Sibling tools of the same capability report `Available`
-    /// until they are loaded individually. A disabled/quarantined
-    /// capability reports `Available` regardless — its tools are not on
-    /// the surface.
+    /// `Loaded` when that tool itself is on the surface, `Warm`/`Unloaded`
+    /// after idle cooling, `Available` otherwise. Sibling tools of the
+    /// same capability report `Available` until they are loaded
+    /// individually. A disabled/quarantined capability reports
+    /// `Available` regardless — its tools are not on the surface.
     pub fn tool_state(&self, tool_name: &str) -> Option<ToolLifecycle> {
         // Pre-fetch the core activation record: the Loaded gate reads it
         // without nesting the authority lock inside the registry read.
@@ -466,8 +538,12 @@ impl CapabilityRegistry {
                         .is_some_and(|state| state.activation.usable());
                     if entry.active {
                         ToolLifecycle::Active
-                    } else if entry.loaded_tools.contains(tool_name) && usable {
-                        ToolLifecycle::Loaded
+                    } else if usable {
+                        entry
+                            .tool_states
+                            .get(tool_name)
+                            .map(|state| state.lifecycle)
+                            .unwrap_or(ToolLifecycle::Available)
                     } else {
                         ToolLifecycle::Available
                     }
@@ -515,8 +591,12 @@ impl CapabilityRegistry {
                 for spec in &entry.tool_specs {
                     let state = if active {
                         ToolLifecycle::Active
-                    } else if entry.loaded_tools.contains(&spec.name) && usable {
-                        ToolLifecycle::Loaded
+                    } else if usable {
+                        entry
+                            .tool_states
+                            .get(&spec.name)
+                            .map(|state| state.lifecycle)
+                            .unwrap_or(ToolLifecycle::Available)
                     } else {
                         ToolLifecycle::Available
                     };
@@ -540,7 +620,10 @@ impl CapabilityRegistry {
     }
 
     /// Mark a capability tool as executing (Active until `mark_idle`).
+    /// Executing a tool also refreshes its idle clock: a tool in active use
+    /// never ages out mid-work.
     pub fn mark_active(&self, tool_name: &str) {
+        let tick = self.tick_now();
         let owner = self.owner_of(tool_name);
         if let Some(owner) = owner
             && let Some(entry) = self
@@ -550,6 +633,9 @@ impl CapabilityRegistry {
                 .get_mut(&owner)
         {
             entry.active = true;
+            if let Some(state) = entry.tool_states.get_mut(tool_name) {
+                state.last_used_tick = tick;
+            }
         }
         // The discovery rows carry the Active state: invalidate the cache.
         self.catalog_version.fetch_add(1, Ordering::Relaxed);
@@ -571,6 +657,44 @@ impl CapabilityRegistry {
         self.catalog_version.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The per-tool lifecycle safe point, called by the merged dispatcher
+    /// once per model round (the same safe point that ages the builtin
+    /// catalog). A loaded capability tool that stays idle cools
+    /// Loaded -> Warm -> Unloaded exactly like a builtin tool; the active
+    /// task's tool-demand set (`roots`) protects required capability tools
+    /// from idle aging, so TaskAnchor-driven roots cover the whole unified
+    /// surface, not just the builtin half.
+    pub fn gc(&self, roots: &[String]) {
+        let tick = self.tick_now();
+        let mut changed = false;
+        {
+            let mut inner = self.inner.write().expect("capability registry poisoned");
+            for entry in inner.values_mut() {
+                for (name, state) in entry.tool_states.iter_mut() {
+                    if roots.iter().any(|root| root == name) {
+                        continue;
+                    }
+                    let idle = tick.saturating_sub(state.last_used_tick);
+                    match state.lifecycle {
+                        ToolLifecycle::Loaded if idle >= self.idle_to_warm_ticks => {
+                            state.lifecycle = ToolLifecycle::Warm;
+                            changed = true;
+                        }
+                        ToolLifecycle::Warm if idle >= self.warm_to_unload_ticks => {
+                            state.lifecycle = ToolLifecycle::Unloaded;
+                            changed = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if changed {
+            self.generation.fetch_add(1, Ordering::Relaxed);
+            self.catalog_version.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Snapshot of every registered capability's surface state (activation +
     /// loaded tools), for checkpoints. Registration identity itself is not
     /// part of the snapshot: capabilities are re-registered by the
@@ -583,7 +707,18 @@ impl CapabilityRegistry {
         let mut entries: Vec<_> = inner
             .iter()
             .map(|(id, entry)| {
-                let mut loaded_tools: Vec<String> = entry.loaded_tools.iter().cloned().collect();
+                // Loaded and Warm tools both survive a checkpoint: Warm is
+                // off the surface but retained in the catalog, so restore
+                // brings it back ready. Unloaded/Available are not on the
+                // surface and do not need a surface claim.
+                let mut loaded_tools: Vec<String> = entry
+                    .tool_states
+                    .iter()
+                    .filter(|(_, state)| {
+                        matches!(state.lifecycle, ToolLifecycle::Loaded | ToolLifecycle::Warm)
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect();
                 loaded_tools.sort();
                 crate::checkpoint::CapabilitySnapshot {
                     id: id.clone(),
@@ -628,7 +763,7 @@ impl CapabilityRegistry {
                 // Per-tool format: only the named tools go on the surface,
                 // and only those the capability actually declares in this
                 // run (names unknown here are dropped).
-                current.loaded_tools = entry
+                current.tool_states = entry
                     .loaded_tools
                     .iter()
                     .filter(|name| {
@@ -637,24 +772,40 @@ impl CapabilityRegistry {
                             .iter()
                             .any(|spec| spec.name.as_str() == *name)
                     })
-                    .cloned()
+                    .map(|name| {
+                        (
+                            name.clone(),
+                            CapabilityToolState {
+                                lifecycle: ToolLifecycle::Loaded,
+                                last_used_tick: 0,
+                            },
+                        )
+                    })
                     .collect();
             } else if entry.loaded {
                 // Legacy whole-capability format: everything was on the
                 // surface in the checkpoint.
-                current.loaded_tools = current
+                current.tool_states = current
                     .tool_specs
                     .iter()
-                    .map(|spec| spec.name.clone())
+                    .map(|spec| {
+                        (
+                            spec.name.clone(),
+                            CapabilityToolState {
+                                lifecycle: ToolLifecycle::Loaded,
+                                last_used_tick: 0,
+                            },
+                        )
+                    })
                     .collect();
             } else {
-                current.loaded_tools.clear();
+                current.tool_states.clear();
             }
             // A loaded flag without a usable activation is dropped —
             // activation is the gate in front of the model surface. The
             // checkpoint's activation is the value being restored.
             if !entry.activation.usable() {
-                current.loaded_tools.clear();
+                current.tool_states.clear();
             }
         }
         drop(inner);
@@ -967,6 +1118,21 @@ mod tests {
         release: Mutex<mpsc::Receiver<()>>,
     }
 
+    /// A base dispatcher with no tools of its own: the unified surface is
+    /// the capability half alone, which isolates the merged gc's effect on
+    /// capability tools.
+    struct EmptyBase;
+
+    #[async_trait::async_trait]
+    impl ToolDispatcher for EmptyBase {
+        fn specs(&self) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+        async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+            Err(AgentError::Tool("empty base".into()))
+        }
+    }
+
     #[async_trait::async_trait]
     impl ToolDispatcher for BlockingBase {
         fn specs(&self) -> Vec<ToolSpec> {
@@ -1006,6 +1172,43 @@ mod tests {
         async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
             unreachable!("this dispatcher is snapshot-only")
         }
+    }
+
+    #[test]
+    fn unified_gc_cools_capability_tools_with_builtin_root_semantics() {
+        let registry = Arc::new(CapabilityRegistry::with_idle_thresholds(2, 4));
+        registry
+            .register(Arc::new(demo_capability("demo")))
+            .expect("registration succeeds");
+        registry.load_tool("demo.one").expect("load one");
+        registry.load_tool("demo.two").expect("load two");
+
+        // The merged dispatcher's gc is the one safe point the runtime
+        // calls per round: it must age the capability registry exactly like
+        // the builtin catalog, with the same TaskAnchor roots.
+        let dispatcher = CapabilityAwareDispatcher::new(Arc::new(EmptyBase), registry.clone());
+        let roots = vec!["demo.one".to_string()];
+        for _ in 0..4 {
+            dispatcher.gc(&roots);
+        }
+        let snapshot = dispatcher.snapshot();
+        assert!(
+            snapshot.specs.iter().any(|spec| spec.name == "demo.one"),
+            "a task-rooted capability tool must survive unified idle GC"
+        );
+        assert!(
+            !snapshot.specs.iter().any(|spec| spec.name == "demo.two"),
+            "an unrooted capability tool must leave the unified surface"
+        );
+
+        // Roots dropped: the capability tool cools through the same path.
+        dispatcher.gc(&[]);
+        dispatcher.gc(&[]);
+        let snapshot = dispatcher.snapshot();
+        assert!(
+            !snapshot.specs.iter().any(|spec| spec.name == "demo.one"),
+            "without the task root the capability tool must cool too"
+        );
     }
 
     #[test]
@@ -1297,6 +1500,78 @@ mod tests {
     }
 
     #[test]
+    fn capability_tools_cool_and_unload_with_task_root_protection() {
+        let registry = CapabilityRegistry::with_idle_thresholds(2, 4);
+        registry
+            .register(Arc::new(demo_capability("demo")))
+            .expect("registration succeeds");
+        registry.load_tool("demo.one").expect("load one");
+        registry.load_tool("demo.two").expect("load two");
+        assert_eq!(registry.tool_state("demo.one"), Some(ToolLifecycle::Loaded));
+        assert_eq!(registry.tool_state("demo.two"), Some(ToolLifecycle::Loaded));
+
+        // The active task roots demo.one: idle GC must not cool it, while
+        // the unrooted demo.two ages Loaded -> Warm -> Unloaded exactly
+        // like a builtin tool.
+        let roots = vec!["demo.one".to_string()];
+        registry.gc(&roots);
+        registry.gc(&roots);
+        assert_eq!(
+            registry.tool_state("demo.one"),
+            Some(ToolLifecycle::Loaded),
+            "a task-rooted capability tool must survive idle GC"
+        );
+        assert_eq!(
+            registry.tool_state("demo.two"),
+            Some(ToolLifecycle::Warm),
+            "an unrooted capability tool must cool to Warm first"
+        );
+        assert!(
+            !registry
+                .loaded_tool_specs()
+                .iter()
+                .any(|spec| spec.name == "demo.two"),
+            "Warm is off the model surface, like the builtin catalog"
+        );
+
+        registry.gc(&roots);
+        registry.gc(&roots);
+        assert_eq!(
+            registry.tool_state("demo.two"),
+            Some(ToolLifecycle::Unloaded),
+            "a warm capability tool must unload past the second threshold"
+        );
+
+        // Roots dropped: demo.one cools too — first past the idle
+        // threshold...
+        registry.gc(&[]);
+        assert_eq!(
+            registry.tool_state("demo.one"),
+            Some(ToolLifecycle::Warm),
+            "without the task root the capability tool must cool"
+        );
+        // ...then past the unload threshold.
+        registry.gc(&[]);
+        assert_eq!(
+            registry.tool_state("demo.one"),
+            Some(ToolLifecycle::Unloaded),
+            "an unrooted warm capability tool must unload"
+        );
+
+        // Using a tool refreshes its idle clock (execution pins it): one
+        // gc pass after the execution still sees idle below the threshold.
+        registry.load_tool("demo.one").expect("reload");
+        registry.mark_active("demo.one");
+        registry.mark_idle("demo.one");
+        registry.gc(&[]);
+        assert_eq!(
+            registry.tool_state("demo.one"),
+            Some(ToolLifecycle::Loaded),
+            "a recently executed tool must not cool"
+        );
+    }
+
+    #[test]
     fn capability_snapshot_restore_keeps_per_tool_surface() {
         let registry = CapabilityRegistry::new();
         registry
@@ -1428,6 +1703,12 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
     }
 
     fn gc(&self, roots: &[String]) {
+        // One unified safe point: the builtin catalog ages (with its
+        // always-loaded core), and the capability registry ages its loaded
+        // tools with the same thresholds and the same TaskAnchor roots —
+        // external tools receive the same idle-cooling + root semantics as
+        // builtins.
+        self.capabilities.gc(roots);
         self.base.gc(roots);
     }
 

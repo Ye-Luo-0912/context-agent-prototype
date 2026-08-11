@@ -1056,9 +1056,19 @@ together with TaskAnchor and continuous context GC.
   transition, task flip, `TaskCompleted`, post-completion GC). No active
   task at the safe point drops the proposal with a warning; a committed
   turn is never undone by a completion failure.
-- [ ] **TOOLS-08A** Split capability process state from per-tool surface
+- [x] **TOOLS-08A** Split capability process state from per-tool surface
   state; loading one tool must not expose all sibling schemas, and external
-  tools must receive the same root/idle cooling semantics as builtins.
+  tools must receive the same root/idle cooling semantics as builtins. The
+  capability registry keeps per-tool surface state (`tool_states`: each
+  loaded tool's lifecycle + last-used tick) separate from the capability's
+  process lifecycle (`run_state`), so loading one tool surfaces exactly
+  that tool — siblings stay `Available` — and each loaded tool ages
+  independently. The unified `gc()` safe point now ages the capability
+  registry with the same idle thresholds as the builtin catalog
+  (Loaded → Warm → Unloaded) and honors the same TaskAnchor roots: a
+  task-required capability tool is never cooled by idle GC, and executing
+  a tool refreshes its idle clock. Explicit unload still works (roots
+  protect only the silent idle path).
 - [x] **TOOLS-08B** The first slice carries separate catalog, task-requirement
   and focus revisions, hard Must/Prefer/KeepReady degradation, atomic builtin
   capture, capability surface-gate serialization, and a composite common-cut
