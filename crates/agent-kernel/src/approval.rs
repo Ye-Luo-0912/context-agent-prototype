@@ -5,10 +5,10 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentError, AgentResult, ApprovalDecision, ApprovalGate, ToolCall, ToolRisk, ToolSpec,
+    AgentError, AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, ToolCall, ToolRisk,
+    ToolSpec,
 };
 use tokio::sync::{Mutex, broadcast, oneshot};
-use tokio::time::timeout;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -35,7 +35,12 @@ impl PolicyApprovalGate {
 
 #[async_trait::async_trait]
 impl ApprovalGate for PolicyApprovalGate {
-    async fn authorize(&self, _call: &ToolCall, spec: &ToolSpec) -> AgentResult<ApprovalDecision> {
+    async fn authorize(
+        &self,
+        _call: &ToolCall,
+        spec: &ToolSpec,
+        _cancel: &CancellationToken,
+    ) -> AgentResult<ApprovalDecision> {
         let allowed = match spec.risk {
             ToolRisk::ReadOnly => true,
             ToolRisk::WorkspaceWrite => self.allow_workspace_write,
@@ -136,7 +141,12 @@ impl InteractiveApprovalGate {
 
 #[async_trait::async_trait]
 impl ApprovalGate for InteractiveApprovalGate {
-    async fn authorize(&self, call: &ToolCall, spec: &ToolSpec) -> AgentResult<ApprovalDecision> {
+    async fn authorize(
+        &self,
+        call: &ToolCall,
+        spec: &ToolSpec,
+        cancel: &CancellationToken,
+    ) -> AgentResult<ApprovalDecision> {
         if spec.risk == ToolRisk::ReadOnly {
             return Ok(ApprovalDecision::Allow);
         }
@@ -153,20 +163,171 @@ impl ApprovalGate for InteractiveApprovalGate {
             })
             .await;
 
-        match timeout(self.answer_timeout, rx).await {
-            Ok(Ok(decision)) => Ok(decision),
-            Ok(Err(_)) => {
+        tokio::select! {
+            decision = rx => {
+                // The responder answered (and already removed the pending
+                // entries); a dropped sender without a decision surfaces as
+                // a denial — never as a silent allow.
                 self.broker.remove(&request_id).await;
-                Err(AgentError::ApprovalDenied(
-                    "approval request dropped (no responder)".into(),
-                ))
+                Ok(decision.map_err(|_| {
+                    AgentError::ApprovalDenied("approval request dropped (no responder)".into())
+                })?)
             }
-            Err(_) => {
+            _ = cancel.cancelled() => {
+                // The operation this approval belonged to was cancelled:
+                // stop waiting immediately and remove every pending entry —
+                // a cancelled turn must not leave an unanswered request in
+                // the broker or the decisions map.
+                self.decisions.lock().await.remove(&request_id);
+                self.broker.remove(&request_id).await;
+                Err(AgentError::Cancelled)
+            }
+            _ = tokio::time::sleep(self.answer_timeout) => {
+                self.decisions.lock().await.remove(&request_id);
                 self.broker.remove(&request_id).await;
                 Err(AgentError::ApprovalDenied(
                     "approval request timed out (no response)".into(),
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_contracts::{ToolRisk, ToolSpec};
+    use serde_json::json;
+
+    fn write_call() -> ToolCall {
+        ToolCall {
+            id: "c1".into(),
+            name: "fs.write".into(),
+            arguments: json!({"path": "x.txt", "content": "x"}),
+        }
+    }
+
+    fn write_spec() -> ToolSpec {
+        ToolSpec {
+            name: "fs.write".into(),
+            description: "write a file".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::WorkspaceWrite,
+        }
+    }
+
+    /// Wait until the request is visible in the broker and return its id.
+    async fn wait_for_request(broker: &ApprovalBroker) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(request) = broker.pending().await.into_iter().next() {
+                return request.request_id;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the approval request never reached the broker"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_approval_cleans_up_pending_entries() {
+        // A cancelled operation must not leave its approval request behind:
+        // both the broker entry and the decisions entry are removed, and
+        // the wait ends immediately instead of running out the answer
+        // timeout.
+        let broker = ApprovalBroker::new();
+        let gate = Arc::new(InteractiveApprovalGate::new(broker.clone()));
+        let gate_for_task = gate.clone();
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+
+        let handle = tokio::spawn(async move {
+            gate_for_task
+                .authorize(&write_call(), &write_spec(), &cancel_for_task)
+                .await
+        });
+
+        let request_id = wait_for_request(&broker).await;
+        assert!(
+            !broker.pending().await.is_empty(),
+            "a request must be pending while the UI has not answered"
+        );
+
+        cancel.cancel();
+        let result = handle.await.unwrap();
+        assert!(
+            matches!(result, Err(AgentError::Cancelled)),
+            "a cancelled approval must report cancellation: {result:?}"
+        );
+
+        assert!(
+            broker.pending().await.is_empty(),
+            "no pending request may remain after cancellation"
+        );
+        let answered = gate.respond(&request_id, ApprovalDecision::Allow).await;
+        assert!(
+            !answered,
+            "the decisions entry must be cleaned up too — a late response finds nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_approval_cleans_up_pending_entries() {
+        // A missing responder must deny after the bounded answer timeout and
+        // remove every pending entry, not leak the request.
+        let broker = ApprovalBroker::new();
+        let gate = Arc::new(
+            InteractiveApprovalGate::new(broker.clone())
+                .with_answer_timeout(Duration::from_millis(100)),
+        );
+        let gate_for_task = gate.clone();
+
+        let handle = tokio::spawn(async move {
+            gate_for_task
+                .authorize(&write_call(), &write_spec(), &CancellationToken::new())
+                .await
+        });
+
+        let request_id = wait_for_request(&broker).await;
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_err(),
+            "a timed-out approval must deny: {result:?}"
+        );
+        assert!(
+            broker.pending().await.is_empty(),
+            "no pending request may remain after a timeout"
+        );
+        let answered = gate.respond(&request_id, ApprovalDecision::Allow).await;
+        assert!(
+            !answered,
+            "the decisions entry must be cleaned up after a timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn answered_approval_resolves_and_cleans_up() {
+        // The happy path still resolves and removes the pending request.
+        let broker = ApprovalBroker::new();
+        let gate = Arc::new(InteractiveApprovalGate::new(broker.clone()));
+        let gate_for_task = gate.clone();
+
+        let handle = tokio::spawn(async move {
+            gate_for_task
+                .authorize(&write_call(), &write_spec(), &CancellationToken::new())
+                .await
+        });
+
+        let request_id = wait_for_request(&broker).await;
+        let answered = gate.respond(&request_id, ApprovalDecision::Allow).await;
+        assert!(answered, "the responder must find the pending request");
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result, ApprovalDecision::Allow);
+        assert!(
+            broker.pending().await.is_empty(),
+            "an answered request must leave the broker"
+        );
     }
 }

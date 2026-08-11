@@ -50,7 +50,12 @@ struct AllowAllGate;
 
 #[async_trait::async_trait]
 impl ApprovalGate for AllowAllGate {
-    async fn authorize(&self, _call: &ToolCall, _spec: &ToolSpec) -> AgentResult<ApprovalDecision> {
+    async fn authorize(
+        &self,
+        _call: &ToolCall,
+        _spec: &ToolSpec,
+        _cancel: &agent_contracts::CancellationToken,
+    ) -> AgentResult<ApprovalDecision> {
         Ok(ApprovalDecision::Allow)
     }
 }

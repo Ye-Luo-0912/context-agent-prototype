@@ -442,7 +442,7 @@ impl AgentKernel {
             ));
         };
 
-        match self.approval.authorize(&call, &spec).await {
+        match self.approval.authorize(&call, &spec, &cancel).await {
             Ok(ApprovalDecision::Allow) => {}
             Ok(ApprovalDecision::Deny) => {
                 return ToolOutcome::Value(tool_error_output(

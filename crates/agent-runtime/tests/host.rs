@@ -137,6 +137,7 @@ impl ApprovalGate for StubApproval {
         &self,
         _call: &agent_contracts::ToolCall,
         _spec: &ToolSpec,
+        _cancel: &agent_contracts::CancellationToken,
     ) -> AgentResult<agent_contracts::ApprovalDecision> {
         Ok(agent_contracts::ApprovalDecision::Allow)
     }
