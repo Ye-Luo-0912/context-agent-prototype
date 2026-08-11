@@ -853,8 +853,24 @@ together with TaskAnchor and continuous context GC.
   (out-of-process) capabilities still enter `Disabled` at registration and
   stay off the surface until an explicit enable, so the default remains
   safe while the M12 wire-level effect broker is finalized.
-- [ ] **MOD-03** Separate trusted composition registration from dynamic capability
+- [x] **MOD-03** Separate trusted composition registration from dynamic capability
   registration in names, docs, and authority checks.
+  **Verified 2026-08-11.** Names: `ServiceRegistry::register` (typed service,
+  "extend the trusted core plane"), `ModuleHost::add_module` (trusted module,
+  refused after the host started) and `ModuleHost::register_capability`
+  (dynamic capability, "not gated on the host lifecycle: the LLM or any
+  external actor can register new capabilities while the runtime is running")
+  are distinct entry points. Docs: the code comments name the trusted
+  composition plane versus the dynamic capability plane, and the
+  "Composition adapters are not ordinary plugins" section below records the
+  rule. Authority: a trusted module is registered before start and never
+  replaced mid-run; a dynamic capability is admitted by the registry, which
+  pins every out-of-process registration to `Experimental` + `Disabled`
+  regardless of declaration. What remains open is the *ownership* split —
+  admission/grants/activation/quarantine authority moving into a Core-owned
+  registry while the runtime keeps catalog views and load/unload scheduling
+  (`MOD-05`, part of the `MOD-04` authority slice) — not the registration
+  separation itself.
 - [ ] **MOD-04** Isolate the first real authority slice inside the existing
   kernel crate (effect, approval/policy, output/resource broker, durable
   audit) without moving `RuntimeActor` or creating a second orchestrator.
