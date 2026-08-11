@@ -4,7 +4,7 @@
   "surface": {
     "core": ["fs.list", "fs.read", "artifact.read", "search.grep", "task.complete"],
     "control": ["context.manage", "capability.manage"],
-    "catalog_optional": ["fs.write", "edit.replace", "edit.patch", "git.status", "git.diff", "shell.exec", "process.run", "process.session"]
+    "catalog_optional": ["fs.write", "edit.replace", "edit.patch", "git.status", "git.diff", "shell.exec", "process.run", "process.session", "code.symbols", "code.diagnostics"]
   },
   "global_limits": {
     "MAX_TOOL_MODEL_CONTENT_CHARS": 16000,
@@ -308,12 +308,51 @@
       "effects": ["task:complete"],
       "context_disposition": "PersistObservation",
       "platform": {}
+    },
+    "code.symbols": {
+      "risk": "ReadOnly",
+      "surface_class": "catalog_optional",
+      "schema": {
+        "path": {"type": "string", "note": "optional workspace-relative directory"},
+        "query": {"type": "string", "note": "optional case-sensitive substring filter on the symbol name"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "cursor": {"type": "string", "note": "opaque token from a previous code.symbols result; serves the next page from that call's snapshot artifact"}
+      },
+      "limits": {
+        "max_files_scanned": 5000,
+        "max_bytes_per_file": 2097152,
+        "model_symbols": 100,
+        "note": "pure local lexical scan (no language server, no index, no embeddings/vector storage); per-language declaration rules for rs/py/js/jsx/mjs/cjs/ts/tsx/go/c/h/cpp/hpp/cc/hh/cxx/hxx/java/cs/kt/kts/scala/swift/zig; comments, ignored dirs and inline comments skipped; C-like function detection is a documented heuristic; rows are file:line:col  kind name with snapshot-backed cursor paging"
+      },
+      "effects": ["read:workspace"],
+      "context_disposition": "PersistObservation",
+      "platform": {}
+    },
+    "code.diagnostics": {
+      "risk": "ReadOnly",
+      "surface_class": "catalog_optional",
+      "schema": {
+        "input": {"type": "string", "required": true, "note": "raw diagnostic text (compiler/lint output) containing file:line:col positions"},
+        "context": {"type": "integer", "minimum": 0, "maximum": 10, "default": 3, "note": "source lines around each position"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20, "note": "max positions to expand"}
+      },
+      "limits": {
+        "max_diag_model_chars": 12000,
+        "max_diag_line_chars": 200,
+        "max_diag_input_chars": 100000,
+        "max_diag_file_bytes": 2097152,
+        "max_diag_positions": 50,
+        "note": "parses file:line[:col] positions (rustc --> style included), deduplicates by file+line, resolves each as a workspace-relative confined path and shows surrounding source lines; escaping or missing paths are reported unresolved, never followed; output is hard-bounded by the char budget with skipped-remainder reporting; oversized inputs are truncated"
+      },
+      "effects": ["read:workspace"],
+      "context_disposition": "PersistObservation",
+      "platform": {}
     }
   },
   "cross_tool_notes": {
     "per_tool_output_budget": "ToolSpec::output_budget (Option<usize>) declares a model-content cap per tool; the trusted output broker clamps it to MAX_TOOL_MODEL_CONTENT_CHARS and spills at the declared limit (M14).",
     "approval": "ReadOnly auto-allows; WorkspaceWrite/ProcessExecution prompt the interactive gate (or deny under --read-only); standing grants (TaskExecutionPolicy, CORE-08) can cover matching effects.",
     "workspace_confinement": "all paths resolve through the workspace confinement check (lexical + canonical walk); mutations additionally reject the state dir and use journaled transactions.",
-    "model_surface": "core + control tools are always on the surface; catalog-optional tools load on demand and cool to unloaded after idle GC; capability tools share the same per-tool lifecycle (Loaded -> Warm -> Unloaded with the same thresholds and TaskAnchor roots) — loading one capability tool never surfaces its siblings; the active task's tool-demand set roots both builtin and capability tools against idle aging"
+    "model_surface": "core + control tools are always on the surface; catalog-optional tools load on demand and cool to unloaded after idle GC; capability tools share the same per-tool lifecycle (Loaded -> Warm -> Unloaded with the same thresholds and TaskAnchor roots) — loading one capability tool never surfaces its siblings; the active task's tool-demand set roots both builtin and capability tools against idle aging; local navigation tools (code.symbols, code.diagnostics) are catalog-optional pure-local scans with no embeddings or vector storage"
   }
 }

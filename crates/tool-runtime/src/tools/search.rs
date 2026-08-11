@@ -5,8 +5,6 @@
 //! directories (`.git`, `.focus-agent`, `target`, `node_modules`, ...) are
 //! skipped by default so build artifacts never pollute the working set.
 
-use std::path::Path;
-
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
@@ -17,23 +15,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::fs;
 
-use super::Tool;
+use super::{Tool, display_relative, walk_files};
 
 const MAX_FILES_SCANNED: usize = 5_000;
 const MAX_BYTES_PER_FILE: u64 = 2 * 1024 * 1024;
 const MODEL_HITS: usize = 100;
-
-const IGNORED_DIRS: &[&str] = &[
-    ".git",
-    ".focus-agent",
-    "target",
-    "node_modules",
-    "vendor",
-    "dist",
-    "build",
-    ".idea",
-    ".vscode",
-];
 
 pub struct SearchGrepTool {
     workspace: Workspace,
@@ -66,50 +52,6 @@ fn default_path() -> String {
 
 fn default_limit() -> usize {
     200
-}
-
-fn is_ignored_dir(name: &str) -> bool {
-    IGNORED_DIRS.contains(&name)
-}
-
-async fn walk_files(
-    root: &Path,
-    out: &mut Vec<std::path::PathBuf>,
-    budget: &mut usize,
-) -> AgentResult<()> {
-    let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        if *budget == 0 {
-            return Ok(());
-        }
-        let mut reader = fs::read_dir(&dir)
-            .await
-            .map_err(|e| AgentError::Io(format!("read dir {}: {e}", dir.display())))?;
-        while let Some(entry) = reader
-            .next_entry()
-            .await
-            .map_err(|e| AgentError::Io(format!("read dir entry: {e}")))?
-        {
-            if *budget == 0 {
-                return Ok(());
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let file_type = entry
-                .file_type()
-                .await
-                .map_err(|e| AgentError::Io(format!("file type: {e}")))?;
-            if file_type.is_dir() {
-                if is_ignored_dir(&name) {
-                    continue;
-                }
-                stack.push(entry.path());
-            } else if file_type.is_file() {
-                *budget = budget.saturating_sub(1);
-                out.push(entry.path());
-            }
-        }
-    }
-    Ok(())
 }
 
 #[async_trait]
@@ -291,19 +233,12 @@ impl SearchGrepTool {
     }
 }
 
-fn display_relative(workspace: &Workspace, path: &Path) -> String {
-    path.strip_prefix(workspace.root())
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_contracts::{CancellationToken, ToolExecutionRequest};
     use serde_json::json;
-
+    use std::path::Path;
     /// Unwrap a plain tool value (search.grep never stages an effect).
     fn value(outcome: ToolOutcome) -> ToolOutput {
         match outcome {

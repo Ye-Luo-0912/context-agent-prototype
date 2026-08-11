@@ -1085,8 +1085,35 @@ together with TaskAnchor and continuous context GC.
   rebased requirement count, whether capability state applied), emitted as a
   mandatory barrier whose append failure fences mutation as
   recovery-required (`CORE-03`).
-- [ ] **TOOLS-09** Evaluate local symbol/diagnostic navigation as optional first-party
-  tools; do not add embeddings/vector storage.
+- [x] **TOOLS-09** Evaluate local symbol/diagnostic navigation as optional
+  first-party tools; do not add embeddings/vector storage.
+  **Evaluation.** The coding loop needs two navigation primitives beyond
+  regex search: *symbol navigation* (where is a definition) and *diagnostic
+  navigation* (jump from a `file:line:col` error to its source context).
+  `search.grep` finds text occurrences but does not distinguish definitions
+  from references or know a language's declaration shapes, and a model with
+  raw compiler output must parse positions itself and guess at files. Three
+  candidate approaches were weighed: (a) vector/embedding retrieval — ruled
+  out by invariant 8 (v0 stays non-vector) and, more importantly, wrong for
+  this job, since symbol/diagnostic navigation is exact-text and structural,
+  not semantic; (b) a language-server protocol adapter — precise but
+  heavyweight: one process per language, large schema/maintenance/attack
+  surface, belongs in the Ring-3 extension plane, not the default first-party
+  set; (c) pure-local lexical scanning with per-language declaration rules,
+  bounded output, artifact spill and workspace confinement — cheap,
+  deterministic, dependency-free, and covers the common cases. (c) was
+  chosen. **Landed:** `code.symbols` (language-aware definition scan for
+  Rust/Python/TS/JS/Go/C/C++/Java/C#/Kotlin/Scala/Swift/Zig; comments,
+  ignored dirs and inline comments are skipped; C-like function detection is
+  an explicit heuristic; results are `file:line:col  kind name` rows with
+  snapshot-backed cursor paging) and `code.diagnostics` (parses diagnostic
+  text — rustc `-->` style included — deduplicates `file:line:col`
+  positions, resolves each as a workspace-relative confined path and shows
+  the surrounding source lines; escaping or missing paths are reported
+  unresolved, never followed; output is hard-bounded by a char budget). Both
+  are catalog-optional: loaded on demand through `capability.manage`, never
+  always-on, and they obey the same envelope, confinement and spill rules as
+  every tool. No embeddings, no vector storage, no index.
 
 ### Gate 4: extension packaging
 

@@ -23,9 +23,10 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::tools::{
-    ArtifactReadTool, ContextManageTool, EditPatchTool, EditReplaceTool, FsListTool, FsReadTool,
-    FsWriteTool, GitDiffTool, GitStatusTool, ProcessRunTool, ProcessSession, ProcessSessionTool,
-    SearchGrepTool, ShellExecTool, TaskCompleteTool, Tool,
+    ArtifactReadTool, CodeDiagnosticsTool, CodeSymbolsTool, ContextManageTool, EditPatchTool,
+    EditReplaceTool, FsListTool, FsReadTool, FsWriteTool, GitDiffTool, GitStatusTool,
+    ProcessRunTool, ProcessSession, ProcessSessionTool, SearchGrepTool, ShellExecTool,
+    TaskCompleteTool, Tool,
 };
 
 /// Control tools are now defined by the unified catalog contract.
@@ -114,6 +115,11 @@ impl BuiltinToolDispatcher {
             Arc::new(ShellExecTool::new(workspace.clone())),
             Arc::new(ProcessRunTool::new(workspace.clone())),
             Arc::new(ProcessSessionTool::new(workspace.clone(), sessions)),
+            // Local symbol/diagnostic navigation: catalog-optional
+            // first-party tools loaded on demand when a task needs precise
+            // navigation (pure local scans, no embeddings/vector storage).
+            Arc::new(CodeSymbolsTool::new(workspace.clone())),
+            Arc::new(CodeDiagnosticsTool::new(workspace.clone())),
             Arc::new(ContextManageTool::new()),
             Arc::new(TaskCompleteTool::new()),
         ];

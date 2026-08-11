@@ -1,4 +1,5 @@
 mod artifact;
+mod code;
 mod context;
 mod edit;
 mod fs;
@@ -12,6 +13,7 @@ mod stream;
 mod task;
 
 pub(crate) use artifact::ArtifactReadTool;
+pub(crate) use code::{CodeDiagnosticsTool, CodeSymbolsTool};
 pub(crate) use context::ContextManageTool;
 pub(crate) use edit::EditReplaceTool;
 pub(crate) use fs::{FsListTool, FsReadTool, FsWriteTool};
@@ -27,7 +29,78 @@ use agent_contracts::{AgentError, AgentResult, CancellationToken, RunId, ToolOut
 use agent_workspace::Workspace;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::path::Path;
+use tokio::fs as tokio_fs;
 use tokio::io::AsyncReadExt;
+
+/// Directories the workspace scanners skip by default, so build artifacts
+/// and runtime state never pollute the working set.
+pub(crate) const IGNORED_DIRS: &[&str] = &[
+    ".git",
+    ".focus-agent",
+    "target",
+    "node_modules",
+    "vendor",
+    "dist",
+    "build",
+    ".idea",
+    ".vscode",
+];
+
+pub(crate) fn is_ignored_dir(name: &str) -> bool {
+    IGNORED_DIRS.contains(&name)
+}
+
+/// Depth-first walk collecting regular files under `root`, honoring
+/// `IGNORED_DIRS` and stopping once `budget` files have been collected.
+pub(crate) async fn walk_files(
+    root: &Path,
+    out: &mut Vec<std::path::PathBuf>,
+    budget: &mut usize,
+) -> AgentResult<()> {
+    let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if *budget == 0 {
+            return Ok(());
+        }
+        let mut reader = tokio_fs::read_dir(&dir)
+            .await
+            .map_err(|e| AgentError::Io(format!("read dir {}: {e}", dir.display())))?;
+        while let Some(entry) = reader
+            .next_entry()
+            .await
+            .map_err(|e| AgentError::Io(format!("read dir entry: {e}")))?
+        {
+            if *budget == 0 {
+                return Ok(());
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|e| AgentError::Io(format!("file type: {e}")))?;
+            if file_type.is_dir() {
+                if is_ignored_dir(&name) {
+                    continue;
+                }
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                *budget = budget.saturating_sub(1);
+                out.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Render a path relative to the workspace with forward slashes, so tool
+/// results are stable across platforms.
+pub(crate) fn display_relative(workspace: &Workspace, path: &Path) -> String {
+    path.strip_prefix(workspace.root())
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
 
 /// The file-revision identity shared by the read and patch tools: the
 /// SHA-256 of the file's bytes as a lowercase hex string. `fs.read`
