@@ -798,10 +798,22 @@ together with TaskAnchor and continuous context GC.
   schemas, hard limits (per-tool and global broker caps), context
   dispositions (persist / transient / access-event / directive), effects and
   platform behavior; the code remains authoritative.
-- [ ] **TOOLS-02** Draft split `ModelToolSpec` / `HostToolPolicy`, concrete
+- [x] **TOOLS-02** Draft split `ModelToolSpec` / `HostToolPolicy`, concrete
   `EffectIntent`/`EffectReceipt`, and `PermissionSet`/standing-grant
   contracts without
   changing runtime behavior.
+  **Done 2026-08-11** — [`docs/ACI_CONTRACT_DRAFT.md`](ACI_CONTRACT_DRAFT.md):
+  field-level `ModelToolSpec`/`HostToolPolicy` split (model projection vs
+  host enforcement), concrete `EffectIntent` (typed kind/target/
+  reversibility/idempotency/resource estimate) and `EffectReceipt`
+  (`NotApplied | Applied | Unknown` + durability/evidence), typed
+  `PermissionSet` with a deterministic mapping from today's manifest
+  permission strings, `GrantSpec` v2 mapped from today's `StandingGrant`,
+  and the field conversions pinned to the existing compatibility order.
+  Documentation only; no runtime behavior changed. Open questions
+  (permission granularity, shell idempotency, upper-bound derivation,
+  PermissionSet placement) are tracked in the draft for `TOOLS-03` and
+  `MOD-04`/`MOD-05`.
 - [ ] **TOOLS-03** Define stable error/result envelopes and global output/artifact limits.
 - [ ] **TOOLS-04** Define the conformance harness and A/B/C/D evaluation fixtures first.
 
