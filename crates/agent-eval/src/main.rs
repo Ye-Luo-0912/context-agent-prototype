@@ -10,7 +10,9 @@
 //! retained, so the comparison measures the context policy directly.
 
 mod driver;
+mod fixture_driver;
 mod metrics;
+mod mock_model;
 mod task;
 mod workload;
 
@@ -32,7 +34,14 @@ fn usage() -> ! {
          \n\
          Aggregates the all-module cost accounting of one run's event trace\n\
          (model/schema tokens, GC and lifecycle cost, tool behavior) without\n\
-         calling a model.\n"
+         calling a model.\n\
+         \n\
+         usage: agent-eval --fixture <id>\n\
+         \n\
+         Runs one coding fixture end to end against the real builtin tool\n\
+         surface with a scripted model (no provider), scores it with the\n\
+         hidden verification and prints the cost accounting. Deterministic\n\
+         harness smoke test for M15.\n"
     );
     std::process::exit(2);
 }
@@ -47,6 +56,25 @@ async fn main() -> anyhow::Result<()> {
             "--fixtures" => {
                 workload::verify_fixture_inputs()?;
                 print!("{}", workload::render_fixtures());
+                return Ok(());
+            }
+            "--fixture" => {
+                let Some(id) = args.next() else {
+                    usage();
+                };
+                let fixture = workload::FIXTURES
+                    .iter()
+                    .find(|fixture| fixture.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown fixture: {id} (see --fixtures)"))?;
+                let dir = tempfile::tempdir()?;
+                workload::seed_fixture(fixture, dir.path());
+                let eval = fixture_driver::run_fixture(fixture, dir.path()).await?;
+                print!(
+                    "fixture {}: passed={}\n{}",
+                    eval.fixture_id,
+                    eval.passed,
+                    metrics::render_metrics(&eval.metrics)
+                );
                 return Ok(());
             }
             "--metrics" => {
