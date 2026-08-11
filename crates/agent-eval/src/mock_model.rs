@@ -12,7 +12,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_contracts::{
-    AgentResult, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, ToolCall,
+    AgentResult, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, ModelUsage,
+    ToolCall, tokens,
 };
 
 /// One scripted model. `steps` is the tool-call script, `done` the final
@@ -44,19 +45,57 @@ impl ModelTransport for ScriptedModel {
         }
     }
 
-    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+    async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
         let index = self.requests.fetch_add(1, Ordering::SeqCst);
+        // Report the input the scripted model "saw": the messages (content
+        // plus serialized tool calls) and the tool schemas of this request,
+        // priced with the same estimator the engines use. This makes the
+        // fixture path's ModelUsed accounting real, so a cross-engine
+        // comparison can measure how much context each engine feeds a
+        // request without a provider.
+        let input_tokens = request
+            .messages
+            .iter()
+            .map(|message| {
+                tokens::approx_tokens(&message.content)
+                    + message
+                        .tool_calls
+                        .iter()
+                        .map(|call| {
+                            tokens::approx_tokens(&call.name)
+                                + tokens::approx_tokens(&call.arguments.to_string())
+                        })
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+            + request
+                .tools
+                .iter()
+                .map(|spec| {
+                    tokens::approx_tokens(&spec.name)
+                        + tokens::approx_tokens(&spec.description)
+                        + tokens::approx_tokens(&spec.input_schema.to_string())
+                })
+                .sum::<usize>();
+        let usage = ModelUsage {
+            input_tokens: Some(input_tokens as u64),
+            output_tokens: Some(if index < self.steps.len() {
+                tokens::approx_tokens(&self.steps[index].arguments.to_string()) as u64
+            } else {
+                tokens::approx_tokens(&self.done) as u64
+            }),
+        };
         if let Some(call) = self.steps.get(index) {
             Ok(ModelOutput {
                 content: String::new(),
                 tool_calls: vec![call.clone()],
-                usage: Default::default(),
+                usage,
             })
         } else {
             Ok(ModelOutput {
                 content: self.done.clone(),
                 tool_calls: Vec::new(),
-                usage: Default::default(),
+                usage,
             })
         }
     }

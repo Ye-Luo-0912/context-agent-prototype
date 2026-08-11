@@ -46,7 +46,15 @@ fn usage() -> ! {
          usage: agent-eval --fixture-live <id>\n\
          \n\
          Same harness with a real model (OPENAI_API_KEY / OPENAI_BASE_URL /\n\
-         OPENAI_MODEL); the provider must accept tool calls.\n"
+         OPENAI_MODEL); the provider must accept tool calls.\n\
+         \n\
+         usage: agent-eval --compare-arm <id>\n\
+         \n\
+         Runs one coding fixture through the append-only, rolling-summary\n\
+         and dynamic engines on the same multi-turn scripted model and the\n\
+         same real tool surface, printing a cost comparison. The dynamic\n\
+         engine must pass the fixture while feeding the model fewer input\n\
+         tokens — the deterministic CI proxy of the M15 acceptance.\n"
     );
     std::process::exit(2);
 }
@@ -101,6 +109,20 @@ async fn main() -> anyhow::Result<()> {
                     eval.passed,
                     metrics::render_metrics(&eval.metrics)
                 );
+                return Ok(());
+            }
+            "--compare-arm" => {
+                let Some(id) = args.next() else {
+                    usage();
+                };
+                let fixture = workload::FIXTURES
+                    .iter()
+                    .find(|fixture| fixture.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown fixture: {id} (see --fixtures)"))?;
+                let dir = tempfile::tempdir()?;
+                workload::seed_fixture(fixture, dir.path());
+                let runs = fixture_driver::compare_engines(fixture, dir.path()).await?;
+                print!("{}", fixture_driver::render_comparison(&runs));
                 return Ok(());
             }
             "--metrics" => {

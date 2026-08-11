@@ -83,6 +83,121 @@ fn scripted_steps(fixture_id: &str) -> Vec<ToolCall> {
     }
 }
 
+/// The changed file each fixture works on, used by the multi-turn script.
+fn fixture_file(fixture_id: &str) -> &'static str {
+    match fixture_id {
+        "fix_off_by_one" => "src/util.py",
+        "implement_stub" => "src/math.py",
+        "rename_symbol" => "src/app.py",
+        "add_test" => "src/calc.py",
+        other => panic!("no fixture file for '{other}'"),
+    }
+}
+
+/// Multi-turn script for the cross-engine comparison: the fixture's edit,
+/// then a re-read of the changed file and a confirmation — the extra turns
+/// are where append-only accumulates history and the dynamic working set
+/// does not, so the token difference is measurable.
+fn multi_turn_steps(fixture_id: &str) -> Vec<ToolCall> {
+    let call = |id: &str, name: &str, arguments: serde_json::Value| ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments,
+    };
+    let mut steps = scripted_steps(fixture_id);
+    // Two more turns each re-read the changed file: every re-read append
+    // adds another observation to the append-only transcript while the
+    // dynamic working set only keeps the current view.
+    for round in 2..=3 {
+        steps.push(call(
+            &format!("c{round}"),
+            "fs.read",
+            json!({"path": fixture_file(fixture_id)}),
+        ));
+    }
+    steps
+}
+
+/// User prompts for the multi-turn comparison: the task, then two re-read
+/// requests and a summary request — five turns of accumulated history for
+/// the append-only engine to carry, and only a bounded working set for the
+/// dynamic engine.
+pub fn multi_turn_prompts(fixture: &workload::CodingFixture) -> Vec<String> {
+    vec![
+        fixture.description.to_string(),
+        "Now read the file again and confirm the change is in place.".to_string(),
+        "Read the file once more and double-check that every reference is consistent.".to_string(),
+        "Re-read the file and verify the final state against the task description.".to_string(),
+        "Summarize the change you made and the verification you performed.".to_string(),
+    ]
+}
+
+/// One engine's row in the cross-engine comparison.
+#[derive(Debug, Clone)]
+pub struct EngineRun {
+    pub engine: &'static str,
+    pub eval: FixtureEval,
+}
+
+/// Run one fixture through the append-only, rolling-summary and dynamic
+/// engines on the same multi-turn script and compare the all-module cost.
+/// Each engine gets a fresh scripted model instance (the script counter is
+/// per-instance), so the only difference between the rows is the context
+/// policy.
+pub async fn compare_engines(
+    fixture: &workload::CodingFixture,
+    workspace_root: &Path,
+) -> anyhow::Result<Vec<EngineRun>> {
+    let prompts = multi_turn_prompts(fixture);
+    let turns: Vec<&str> = prompts.iter().map(String::as_str).collect();
+    let mut runs = Vec::new();
+    for (name, engine) in [
+        (
+            "append",
+            Arc::new(context_baselines::AppendOnlyEngine::new()) as Arc<dyn ContextEngine>,
+        ),
+        (
+            "rolling",
+            Arc::new(context_baselines::RollingSummaryEngine::new()) as Arc<dyn ContextEngine>,
+        ),
+        (
+            "dynamic",
+            Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()))
+                as Arc<dyn ContextEngine>,
+        ),
+    ] {
+        let model: Arc<dyn ModelTransport> = Arc::new(ScriptedModel::new(
+            multi_turn_steps(fixture.id),
+            format!("{}: done", fixture.id),
+        ));
+        let eval = run_fixture_with_engine(fixture, workspace_root, model, engine, &turns).await?;
+        runs.push(EngineRun { engine: name, eval });
+    }
+    Ok(runs)
+}
+
+/// Human-readable comparison table for the cross-engine fixture runs.
+pub fn render_comparison(runs: &[EngineRun]) -> String {
+    let mut out = String::new();
+    out.push_str("fixture cross-engine comparison (same scripted model, same tool surface):\n");
+    for run in runs {
+        let metrics = &run.eval.metrics;
+        out.push_str(&format!(
+            "  {:8} passed={} model_in={:>7} model_out={:>5} schema_tokens={:>6} rounds={} turns={} tool_calls={} lifecycle={}\n",
+            run.engine,
+            run.eval.passed,
+            metrics.model_input_tokens,
+            metrics.model_output_tokens,
+            metrics.schema_tokens_total,
+            metrics.rounds,
+            metrics.turns,
+            metrics.tool_calls,
+            metrics.lifecycle_transitions,
+        ));
+    }
+    out
+}
+
 /// Run one fixture to completion against the real builtin tool surface with
 /// a scripted model, then score it with the fixture's hidden verification.
 pub async fn run_fixture(
@@ -107,6 +222,29 @@ pub async fn run_fixture_with_model(
 ) -> anyhow::Result<FixtureEval> {
     let context_engine: Arc<dyn ContextEngine> =
         Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
+    run_fixture_with_engine(
+        fixture,
+        workspace_root,
+        model,
+        context_engine,
+        &[fixture.description],
+    )
+    .await
+}
+
+/// The M15 comparison path: the same harness on a caller-supplied context
+/// engine (append-only / rolling / dynamic), driven through one or more
+/// user turns. Cross-engine token differences only appear across turns —
+/// inside one turn the TurnFrame carries the tool protocol, so every engine
+/// sees the same in-turn context. The fixture's hidden verification runs
+/// after the last turn.
+pub async fn run_fixture_with_engine(
+    fixture: &workload::CodingFixture,
+    workspace_root: &Path,
+    model: Arc<dyn ModelTransport>,
+    context_engine: Arc<dyn ContextEngine>,
+    turns: &[&str],
+) -> anyhow::Result<FixtureEval> {
     let approval: Arc<dyn ApprovalGate> = Arc::new(AllowAllGate);
 
     let workspace = agent_workspace::Workspace::open(workspace_root).await?;
@@ -150,13 +288,13 @@ pub async fn run_fixture_with_model(
     runtime.start().await?;
 
     let mut collected: Vec<RuntimeEventEnvelope> = Vec::new();
-    runtime
-        .handle()
-        .user_message(fixture.description.to_string())
-        .await?;
-    wait_for_turn(&mut events, &mut collected)
-        .await
-        .map_err(|reason| anyhow::anyhow!(reason))?;
+    for (index, turn) in turns.iter().enumerate() {
+        runtime.handle().user_message(turn.to_string()).await?;
+        if let Err(reason) = wait_for_turn(&mut events, &mut collected).await {
+            runtime.shutdown().await?;
+            return Err(anyhow::anyhow!("turn {} failed: {reason}", index + 1));
+        }
+    }
     let passed = workload::fixture_passes(fixture, workspace_root);
     runtime.shutdown().await?;
 
@@ -243,5 +381,59 @@ mod tests {
         assert!(eval.passed);
         let content = std::fs::read_to_string(dir.path().join("src/util.py")).unwrap_or_default();
         assert!(content.contains("items[i]"), "the edit must have landed");
+    }
+
+    /// The M15 acceptance, as a deterministic CI proxy: on the same real
+    /// tool surface and the same scripted model, the dynamic engine must
+    /// finish the multi-turn fixture with the same success while feeding
+    /// the model measurably fewer input tokens than append-only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dynamic_engine_saves_input_tokens_against_append_on_the_fixture_surface() {
+        let fixture = &FIXTURES[0];
+        let dir = tempfile::tempdir().unwrap();
+        workload::seed_fixture(fixture, dir.path());
+
+        let runs = compare_engines(fixture, dir.path()).await.unwrap();
+        assert_eq!(runs.len(), 3);
+
+        let append = runs.iter().find(|run| run.engine == "append").unwrap();
+        let rolling = runs.iter().find(|run| run.engine == "rolling").unwrap();
+        let dynamic = runs.iter().find(|run| run.engine == "dynamic").unwrap();
+
+        // Success does not regress: every engine drives the same scripted
+        // edit through the real tool surface and passes the hidden check.
+        for run in &runs {
+            assert!(
+                run.eval.passed,
+                "engine '{}' must pass the fixture",
+                run.engine
+            );
+        }
+        // The multi-turn script actually exercised the tool surface.
+        assert!(dynamic.eval.metrics.tool_calls >= 3);
+        assert!(dynamic.eval.metrics.turns >= 5);
+
+        // The dynamic working set must cost less model input than either
+        // baseline on the same workload. The gap is a real-but-bounded
+        // fraction of the total: tool schemas and the system prompt are a
+        // large per-round fixed cost (the same phenomenon the live M15
+        // measurement reported), so the assertion is directional plus a
+        // noise floor, not a large ratio.
+        for baseline in [append, rolling] {
+            assert!(
+                dynamic.eval.metrics.model_input_tokens < baseline.eval.metrics.model_input_tokens,
+                "dynamic model_in {} must be below {} {}",
+                dynamic.eval.metrics.model_input_tokens,
+                baseline.engine,
+                baseline.eval.metrics.model_input_tokens
+            );
+            assert!(
+                baseline.eval.metrics.model_input_tokens - dynamic.eval.metrics.model_input_tokens
+                    >= 300,
+                "expected a material saving over {}, got {}",
+                baseline.engine,
+                baseline.eval.metrics.model_input_tokens - dynamic.eval.metrics.model_input_tokens
+            );
+        }
     }
 }
