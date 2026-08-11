@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use agent_contracts::{AgentError, AgentResult, Effect, EffectCommitError, RunId};
+use agent_contracts::{AgentError, AgentResult, Effect, EffectDurability, EffectReceipt, RunId};
 use serde::Serialize;
 use tokio::fs;
 use uuid::Uuid;
@@ -600,13 +600,22 @@ impl MutationTransaction {
     pub async fn apply(self, content: &[u8]) -> AgentResult<()> {
         let prepared = self.prepare(content).await?;
         match prepared.commit().await {
-            Ok(()) => Ok(()),
-            // Apply collapses the structured failure: the caller only needs
+            // Apply collapses the structured receipt: the caller only needs
             // to know it failed and whether the world changed.
-            Err(EffectCommitError::NotApplied(error)) => Err(error),
-            Err(EffectCommitError::AppliedButDurabilityFailed(error)) => Err(AgentError::Internal(
-                format!("mutation applied but its journal record failed: {error}"),
-            )),
+            EffectReceipt::Applied {
+                durability: EffectDurability::Durable,
+                ..
+            } => Ok(()),
+            EffectReceipt::NotApplied { error } => Err(AgentError::Internal(error)),
+            EffectReceipt::Applied {
+                durability: EffectDurability::DurabilityFailed(error),
+                ..
+            } => Err(AgentError::Internal(format!(
+                "mutation applied but its journal record failed: {error}"
+            ))),
+            EffectReceipt::Unknown { error } => Err(AgentError::Internal(format!(
+                "mutation applied state unknown: {error}"
+            ))),
         }
     }
 }
@@ -645,9 +654,12 @@ impl PreparedMutation {
     /// The replace is relative to the pinned parent handle (`renameat` /
     /// `SetFileInformationByHandle` with `FILE_RENAME_INFO`), so a link
     /// swap cannot redirect it outside the workspace.
-    pub async fn commit(mut self) -> Result<(), EffectCommitError> {
+    pub async fn commit(mut self) -> EffectReceipt {
         let Some(temp_name) = self.temp_name.take() else {
-            return Ok(());
+            return EffectReceipt::Applied {
+                durability: EffectDurability::Durable,
+                evidence: Some(self.tx_id.clone()),
+            };
         };
         let from = self
             .temp_file
@@ -659,11 +671,9 @@ impl PreparedMutation {
         {
             let _ = self.parent.remove_file(&temp_name);
             self.record_rolled_back(format!("commit failed: {e}")).await;
-            return Err(EffectCommitError::NotApplied(confined_io_error(
-                "commit",
-                &self.target,
-                e,
-            )));
+            return EffectReceipt::NotApplied {
+                error: confined_io_error("commit", &self.target, e).to_string(),
+            };
         }
         // The target changed; from here on any failure is a durability
         // problem, not a "did not apply" one.
@@ -673,9 +683,15 @@ impl PreparedMutation {
             timestamp_ms: now_ms(),
         };
         if let Err(error) = self.workspace.record_change(record).await {
-            return Err(EffectCommitError::AppliedButDurabilityFailed(error));
+            return EffectReceipt::Applied {
+                durability: EffectDurability::DurabilityFailed(error.to_string()),
+                evidence: Some(self.tx_id.clone()),
+            };
         }
-        Ok(())
+        EffectReceipt::Applied {
+            durability: EffectDurability::Durable,
+            evidence: Some(self.tx_id.clone()),
+        }
     }
 
     /// Remove the staged file and record `MutationRolledBack` (best effort).
@@ -721,7 +737,7 @@ impl Effect for PreparedMutation {
         format!("workspace mutation {}", self.tx_id)
     }
 
-    async fn commit(self: Box<Self>) -> Result<(), EffectCommitError> {
+    async fn commit(self: Box<Self>) -> EffectReceipt {
         (*self).commit().await
     }
 
@@ -1131,10 +1147,13 @@ mod tests {
         fs::remove_file(&journal).await.unwrap();
         fs::create_dir(&journal).await.unwrap();
 
-        let err = prepared.commit().await.unwrap_err();
-        match &err {
-            EffectCommitError::AppliedButDurabilityFailed(_) => {}
-            other => panic!("expected AppliedButDurabilityFailed, got {other:?}"),
+        let receipt = prepared.commit().await;
+        match &receipt {
+            EffectReceipt::Applied {
+                durability: EffectDurability::DurabilityFailed(_),
+                ..
+            } => {}
+            other => panic!("expected Applied + DurabilityFailed, got {other:?}"),
         }
 
         // The world did change: the caller must treat this as a degraded

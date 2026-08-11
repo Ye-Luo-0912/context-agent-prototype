@@ -235,7 +235,16 @@ mod tests {
             panic!("edit.replace must prepare a committed effect");
         };
         assert!(output.ok);
-        effect.commit().await.unwrap();
+        assert!(
+            matches!(
+                effect.commit().await,
+                agent_contracts::EffectReceipt::Applied {
+                    durability: agent_contracts::EffectDurability::Durable,
+                    ..
+                }
+            ),
+            "the staged effect must commit durably"
+        );
 
         let content = tfs::read_to_string(&file).await.unwrap();
         assert!(content.contains("auth() -> bool { true }"));
@@ -296,7 +305,16 @@ mod tests {
             panic!("edit.replace must prepare a committed effect");
         };
         assert!(output.ok);
-        effect.commit().await.unwrap();
+        assert!(
+            matches!(
+                effect.commit().await,
+                agent_contracts::EffectReceipt::Applied {
+                    durability: agent_contracts::EffectDurability::Durable,
+                    ..
+                }
+            ),
+            "the staged effect must commit durably"
+        );
         assert_eq!(tfs::read_to_string(&file).await.unwrap(), "x b x\n");
     }
 }

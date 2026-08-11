@@ -355,7 +355,16 @@ mod tests {
             panic!("fs.write must prepare a committed effect");
         };
         assert!(output.ok);
-        effect.commit().await.unwrap();
+        assert!(
+            matches!(
+                effect.commit().await,
+                agent_contracts::EffectReceipt::Applied {
+                    durability: agent_contracts::EffectDurability::Durable,
+                    ..
+                }
+            ),
+            "the staged effect must commit durably"
+        );
         assert_eq!(
             fs::read_to_string(dir.path().join("notes.txt"))
                 .await
@@ -379,7 +388,16 @@ mod tests {
         let ToolOutcome::PreparedEffect { effect, .. } = outcome else {
             panic!("fs.write must prepare a committed effect");
         };
-        effect.commit().await.unwrap();
+        assert!(
+            matches!(
+                effect.commit().await,
+                agent_contracts::EffectReceipt::Applied {
+                    durability: agent_contracts::EffectDurability::Durable,
+                    ..
+                }
+            ),
+            "the staged effect must commit durably"
+        );
         let journal = fs::read_to_string(workspace.state_dir().join("changes.jsonl"))
             .await
             .unwrap();

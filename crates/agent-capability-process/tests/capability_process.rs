@@ -13,8 +13,8 @@ use agent_capability_process::ProcessCapabilityAdapter;
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, Capability, CapabilityInvocationContext,
     CapabilityKind, CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
-    CapabilityTransport, Effect, EffectCommitError, ToolCall, ToolRisk, ToolSpec, WORKSPACE_WRITE,
-    WorkspaceHandle,
+    CapabilityTransport, Effect, EffectDurability, EffectReceipt, ToolCall, ToolRisk, ToolSpec,
+    WORKSPACE_WRITE, WorkspaceHandle,
 };
 use agent_process::ProcessHostConfig;
 use serde_json::json;
@@ -107,9 +107,16 @@ impl Effect for TestWriteEffect {
         format!("test write to {}", self.path.display())
     }
 
-    async fn commit(self: Box<Self>) -> Result<(), EffectCommitError> {
-        std::fs::write(&self.path, &self.content)
-            .map_err(|e| EffectCommitError::NotApplied(AgentError::Io(e.to_string())))
+    async fn commit(self: Box<Self>) -> EffectReceipt {
+        match std::fs::write(&self.path, &self.content) {
+            Ok(()) => EffectReceipt::Applied {
+                durability: EffectDurability::Durable,
+                evidence: None,
+            },
+            Err(e) => EffectReceipt::NotApplied {
+                error: e.to_string(),
+            },
+        }
     }
 
     async fn rollback(self: Box<Self>, _reason: &str) {}
@@ -605,7 +612,17 @@ async fn staged_wire_write_returns_an_effect_request() {
         !dir.path().join("staged.txt").exists(),
         "the wire effect must be staged, never applied by the child or the adapter"
     );
-    effect.commit().await.expect("the staged effect commits");
+    let receipt = effect.commit().await;
+    assert!(
+        matches!(
+            &receipt,
+            EffectReceipt::Applied {
+                durability: EffectDurability::Durable,
+                ..
+            }
+        ),
+        "the staged effect commits durably: {receipt:?}"
+    );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("staged.txt")).unwrap(),
         "staged content",

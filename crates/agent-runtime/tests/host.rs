@@ -1669,10 +1669,17 @@ async fn undeclared_permissions_receive_no_handle() {
         .prepare_write("granted.txt", b"granted content")
         .await
         .expect("prepare_write must stage the mutation");
-    effect
-        .commit()
-        .await
-        .expect("the staged effect commits like a builtin tool's");
+    let receipt = effect.commit().await;
+    assert!(
+        matches!(
+            &receipt,
+            agent_contracts::EffectReceipt::Applied {
+                durability: agent_contracts::EffectDurability::Durable,
+                ..
+            }
+        ),
+        "the staged effect commits durably: {receipt:?}"
+    );
     assert_eq!(
         handle.read("granted.txt").await.unwrap(),
         b"granted content"

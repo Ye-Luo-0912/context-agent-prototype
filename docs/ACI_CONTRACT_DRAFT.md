@@ -460,6 +460,18 @@ only pins the field conversions each step must preserve:
    verdict row.
 5. **Migrate builtin effects + receipts** — builtin workspace effects emit
    `EffectReceipt`; journal format keeps `EffectCommitError` semantics.
+   **Landed 2026-08-11 (MOD-04 slice).** `Effect::commit` now returns the
+   serializable `EffectReceipt` (`NotApplied{error}` / `Applied{
+   durability: Durable | DurabilityFailed, evidence}` / `Unknown{error}`)
+   instead of `Result<(), EffectCommitError>`. The workspace
+   `PreparedMutation` emits `Applied` with its transaction id as evidence;
+   the composite `Vec<Box<dyn Effect>>` aggregates sub-effect evidence and
+   stops at the first non-durable receipt; the actor matches the receipt to
+   build the same model-facing messages as before (`DurabilityFailed` keeps
+   the "WAS applied but the journal failed — recovery required" path, and
+   `Unknown` is the new never-blindly-retry branch for remote effects).
+   `EffectCommitError` remains as the internal error space and converts
+   one-to-one into receipts; the journal format is unchanged.
 6. **Disable direct capability mutation, add IPC EffectRequest** — the
    `WorkspaceHandle::write` direct path is removed; process children submit
    `WireEffect` (already the shape) and receive `EffectReceipt` over IPC.

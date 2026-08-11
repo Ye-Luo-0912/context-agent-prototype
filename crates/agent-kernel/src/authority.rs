@@ -17,7 +17,7 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_contracts::{
-    AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, Effect, EffectCommitError,
+    AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, Effect, EffectReceipt,
     EventJournal, IntentShadowGate, OutputBroker, RunId, RuntimeEvent, RuntimeEventEnvelope,
     ShadowVerdict, ToolCall, ToolOutput, ToolSpec,
 };
@@ -193,18 +193,19 @@ impl ApprovalAuthority {
 }
 
 /// Effect commit/rollback. The actor decides live-vs-stale (the generation
-/// fence); this authority executes the mutation and classifies the outcome
-/// (`NotApplied` leaves the world unchanged, `AppliedButDurabilityFailed`
-/// means the effect landed but its record did not). Every staged effect of
-/// every path — builtin, capability, wire broker — commits through this one
-/// seam.
+/// fence); this authority executes the mutation and returns the ACI v2
+/// receipt (`NotApplied` leaves the world unchanged,
+/// `Applied`+`DurabilityFailed` means the effect landed but its record did
+/// not, `Unknown` means the applied state can never be learned back).
+/// Every staged effect of every path — builtin, capability, wire broker —
+/// commits through this one seam.
 pub struct EffectAuthority;
 
 impl EffectAuthority {
-    /// Commit a staged effect. The `EffectCommitError` classification is
+    /// Commit a staged effect. The `EffectReceipt` classification is
     /// preserved so the caller can tell the model the truth about what
     /// happened.
-    pub async fn commit(&self, effect: Box<dyn Effect>) -> Result<(), EffectCommitError> {
+    pub async fn commit(&self, effect: Box<dyn Effect>) -> EffectReceipt {
         effect.commit().await
     }
 
@@ -257,8 +258,8 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use agent_contracts::{
-        AgentError, AgentResult, EventJournal, RuntimeEvent, RuntimeEventEnvelope, ToolCall,
-        ToolRisk,
+        AgentError, AgentResult, EffectDurability, EffectReceipt, EventJournal, RuntimeEvent,
+        RuntimeEventEnvelope, ToolCall, ToolRisk,
     };
     use serde_json::json;
     use std::sync::{
@@ -359,14 +360,17 @@ mod tests {
         fn describe(&self) -> String {
             "recording effect".into()
         }
-        async fn commit(self: Box<Self>) -> Result<(), EffectCommitError> {
+        async fn commit(self: Box<Self>) -> EffectReceipt {
             if self.commit_fails {
-                return Err(EffectCommitError::NotApplied(AgentError::Internal(
-                    "not applied".into(),
-                )));
+                return EffectReceipt::NotApplied {
+                    error: "not applied".into(),
+                };
             }
             *self.action.lock().unwrap() = "committed";
-            Ok(())
+            EffectReceipt::Applied {
+                durability: EffectDurability::Durable,
+                evidence: Some("tx-1".into()),
+            }
         }
         async fn rollback(self: Box<Self>, reason: &str) {
             *self.action.lock().unwrap() =
@@ -504,14 +508,23 @@ mod tests {
         let authority = EffectAuthority;
 
         let action = Arc::new(std::sync::Mutex::new("pending"));
-        authority
+        let receipt = authority
             .commit(Box::new(RecordingEffect {
                 action: action.clone(),
                 commit_fails: false,
             }))
-            .await
-            .unwrap();
+            .await;
         assert_eq!(*action.lock().unwrap(), "committed");
+        assert!(
+            matches!(
+                &receipt,
+                EffectReceipt::Applied {
+                    durability: EffectDurability::Durable,
+                    evidence: Some(id),
+                } if id == "tx-1"
+            ),
+            "a live commit returns a durable receipt with its evidence: {receipt:?}"
+        );
 
         let action = Arc::new(std::sync::Mutex::new("pending"));
         authority
@@ -539,7 +552,10 @@ mod tests {
                 commit_fails: true,
             }))
             .await;
-        assert!(matches!(result, Err(EffectCommitError::NotApplied(_))));
+        assert!(
+            matches!(result, EffectReceipt::NotApplied { .. }),
+            "a refused commit returns NotApplied: {result:?}"
+        );
     }
 
     // --- OutputAuthority ---

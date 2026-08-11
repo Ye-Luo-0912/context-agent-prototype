@@ -14,11 +14,11 @@ use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
     AgentError, AgentResult, CONTEXT_CONSUMPTION_ACK_ITEM_CAP, CancellationToken,
     ContextConsumptionAck, ContextHints, ContextIngress, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect, EffectCommitError,
-    ModelInput, ModelRequest, OperationId, OperationOutcome, OperationResult, RestoreRevision,
-    RuntimeDirective, RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall, ToolOutcome, ToolOutput,
-    ToolResultDisposition, ToolSurfaceBlock, ToolSurfaceBlockReason, ToolSurfaceDemand,
-    ToolSurfaceSnapshot, TurnFrame, TurnFrameStep, TurnId,
+    ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect, EffectDurability,
+    EffectReceipt, ModelInput, ModelRequest, OperationId, OperationOutcome, OperationResult,
+    RestoreRevision, RuntimeDirective, RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall,
+    ToolOutcome, ToolOutput, ToolResultDisposition, ToolSurfaceBlock, ToolSurfaceBlockReason,
+    ToolSurfaceDemand, ToolSurfaceSnapshot, TurnFrame, TurnFrameStep, TurnId,
 };
 use agent_kernel::AgentKernel;
 use tokio::sync::mpsc;
@@ -1881,8 +1881,11 @@ impl RuntimeActor {
                 // see "edit applied" when the rename never landed.
                 let output = match completion.effect {
                     Some(effect) => match self.kernel.effect().commit(effect).await {
-                        Ok(()) => output,
-                        Err(EffectCommitError::NotApplied(error)) => ToolOutput {
+                        EffectReceipt::Applied {
+                            durability: EffectDurability::Durable,
+                            ..
+                        } => output,
+                        EffectReceipt::NotApplied { error } => ToolOutput {
                             ok: false,
                             summary: format!("effect commit failed: {error}"),
                             model_content: format!(
@@ -1890,7 +1893,10 @@ impl RuntimeActor {
                             ),
                             ..output
                         },
-                        Err(EffectCommitError::AppliedButDurabilityFailed(error)) => {
+                        EffectReceipt::Applied {
+                            durability: EffectDurability::DurabilityFailed(error),
+                            ..
+                        } => {
                             // The side effect landed but its journal record
                             // did not: the world and the journal disagree.
                             // The model must be told the truth — "applied but
@@ -1914,6 +1920,14 @@ impl RuntimeActor {
                                 ..output
                             }
                         }
+                        EffectReceipt::Unknown { error } => ToolOutput {
+                            ok: false,
+                            summary: format!("effect applied state unknown: {error}"),
+                            model_content: format!(
+                                "the change may or may not have been applied (the applied state is unknown): {error}. It is not retried blindly."
+                            ),
+                            ..output
+                        },
                     },
                     None => output,
                 };

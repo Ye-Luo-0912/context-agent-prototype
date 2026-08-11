@@ -892,8 +892,8 @@ together with TaskAnchor and continuous context GC.
   sequences, durable barrier broadcast, failed-barrier silence, verdict
   normalization, commit/rollback classification, broker pass-through).
   Still open (later steps of the v2 compatibility order, not this slice):
-  `EffectReceipt`s and commit-time resource enforcement from the
-  `EffectIntent` (`AuthorityLease` — the M14 residual). The shadow-mode
+  commit-time resource enforcement from the `EffectIntent`
+  (`AuthorityLease` — the M14 residual). The shadow-mode
   `AuthorityGate` step of the compatibility order is now landed as its own
   slice: `IntentShadowGate`/`ShadowVerdict` (agent-contracts), the
   `AgentKernelConfig.shadow_gate` injection and the bounded
@@ -901,7 +901,14 @@ together with TaskAnchor and continuous context GC.
   alike, with the standing-grant gate's shadow verdict reusing the same
   matching logic as its legacy `authorize` so the hard invariant (shadow
   `Granted` implies legacy `Allow`) holds by construction and is pinned by
-  tests. See `docs/ACI_CONTRACT_DRAFT.md` §7 step 4.
+  tests. The `EffectReceipt` step is landed too: `Effect::commit` returns
+  the serializable `EffectReceipt` (NotApplied / Applied with Durable |
+  DurabilityFailed + evidence / Unknown), the workspace mutation emits its
+  transaction id as evidence, the composite aggregates evidence and stops
+  at the first non-durable receipt, and the actor keeps the exact
+  model-facing semantics (DurabilityFailed still means "was applied but
+  the journal failed — recovery required"; Unknown is the never-blindly-
+  retry branch). See `docs/ACI_CONTRACT_DRAFT.md` §7 steps 4-5.
 - [ ] **MOD-04A** Move context/model/tool/config scheduling behind
   `agent-runtime::RuntimeServices`; only then perform the mechanical
   `agent-kernel -> agent-core` rename as a behavior-free change.

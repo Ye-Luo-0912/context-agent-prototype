@@ -168,15 +168,82 @@ pub struct ToolExecutionRequest {
 pub trait Effect: Send + Sync {
     /// Human-readable description for events and logs.
     fn describe(&self) -> String;
-    /// Apply the prepared effect (atomic rename, outbox send, ...). The
-    /// journal must reflect the outcome either way. The failure kind is
-    /// structured: `NotApplied` leaves the world unchanged, while
-    /// `AppliedButDurabilityFailed` means the effect landed but its record
-    /// could not be persisted — the runtime must treat that as a
-    /// degraded/recovery state, never as "nothing happened".
-    async fn commit(self: Box<Self>) -> Result<(), EffectCommitError>;
+    /// Apply the prepared effect (atomic rename, outbox send, ...) and
+    /// return the ACI v2 receipt: what happened to the world, how durably
+    /// it is recorded, and the evidence reference. `NotApplied` leaves the
+    /// world unchanged; `Applied` with `DurabilityFailed` means the effect
+    /// landed but its record could not be persisted — the runtime must
+    /// treat that as a degraded/recovery state, never as "nothing
+    /// happened"; `Unknown` is for remote operations whose applied state
+    /// can never be learned back.
+    async fn commit(self: Box<Self>) -> EffectReceipt;
     /// Undo the preparation: the effect must not land.
     async fn rollback(self: Box<Self>, reason: &str);
+}
+
+/// How durably an applied effect is recorded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EffectDurability {
+    /// Fully recorded; the world and the journal agree.
+    Durable,
+    /// The effect landed but its record could not be persisted; the world
+    /// and the journal disagree. Recovery is required.
+    DurabilityFailed(String),
+}
+
+/// The outcome of committing a staged effect (ACI v2, compatibility order
+/// step 5): what happened to the world, how durably it is recorded, and
+/// the evidence reference. `EffectCommitError` semantics are preserved —
+/// `NotApplied` and `AppliedButDurabilityFailed` map one-to-one — so the
+/// journal format and the model-facing messages stay the same; the receipt
+/// just carries them in one typed, serializable, evidence-bearing shape.
+/// Errors travel as message strings (receipts are result envelopes for
+/// events and logs, not error objects).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EffectReceipt {
+    /// The effect did not land; there is nothing to recover.
+    NotApplied { error: String },
+    /// The effect landed. `evidence` is a stable change id / reference for
+    /// review or recovery (e.g. the workspace mutation transaction id).
+    Applied {
+        durability: EffectDurability,
+        evidence: Option<String>,
+    },
+    /// The applied state is unknowable (a remote operation whose result
+    /// never returned). Never blindly retried without an idempotency key.
+    Unknown { error: String },
+}
+
+impl EffectReceipt {
+    /// A short human-readable summary for logs and model-facing messages.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::NotApplied { error } => format!("effect not applied: {error}"),
+            Self::Applied {
+                durability: EffectDurability::Durable,
+                ..
+            } => "effect applied".to_string(),
+            Self::Applied {
+                durability: EffectDurability::DurabilityFailed(error),
+                ..
+            } => format!("effect applied but its journal record failed: {error}"),
+            Self::Unknown { error } => format!("effect applied state unknown: {error}"),
+        }
+    }
+}
+
+impl From<EffectCommitError> for EffectReceipt {
+    fn from(error: EffectCommitError) -> Self {
+        match error {
+            EffectCommitError::NotApplied(error) => Self::NotApplied {
+                error: error.to_string(),
+            },
+            EffectCommitError::AppliedButDurabilityFailed(error) => Self::Applied {
+                durability: EffectDurability::DurabilityFailed(error.to_string()),
+                evidence: None,
+            },
+        }
+    }
 }
 
 /// Several effects committed in order as one operation. Used by the
@@ -184,19 +251,50 @@ pub trait Effect: Send + Sync {
 /// effect: each is staged through its own confined handle, and this
 /// composite commits them one after the other behind the generation fence.
 /// Each sub-effect is itself atomic; a mid-list failure stops the rest and
-/// reports `NotApplied` for the failed one — effects already committed stay
-/// committed (they are separate atomic operations, not one transaction).
+/// reports the failing receipt — effects already committed stay committed
+/// (they are separate atomic operations, not one transaction), and their
+/// evidence references are aggregated into the final receipt.
 #[async_trait::async_trait]
 impl Effect for Vec<Box<dyn Effect>> {
     fn describe(&self) -> String {
         format!("composite of {} staged effects", self.len())
     }
 
-    async fn commit(self: Box<Self>) -> Result<(), EffectCommitError> {
+    async fn commit(self: Box<Self>) -> EffectReceipt {
+        let mut evidence: Vec<String> = Vec::new();
         for effect in (*self).into_iter() {
-            effect.commit().await?;
+            match effect.commit().await {
+                EffectReceipt::Applied {
+                    durability: EffectDurability::Durable,
+                    evidence: Some(id),
+                } => {
+                    evidence.push(id);
+                }
+                EffectReceipt::Applied {
+                    durability: EffectDurability::Durable,
+                    evidence: None,
+                } => {}
+                receipt => {
+                    // The failing effect stops the list. Its own receipt
+                    // carries its error; the already-committed evidence is
+                    // attached so recovery knows what landed.
+                    return match receipt {
+                        EffectReceipt::Applied {
+                            durability,
+                            evidence: own,
+                        } => EffectReceipt::Applied {
+                            durability,
+                            evidence: Some(evidence_ids(own, &evidence)),
+                        },
+                        other => other,
+                    };
+                }
+            }
         }
-        Ok(())
+        EffectReceipt::Applied {
+            durability: EffectDurability::Durable,
+            evidence: Some(evidence.join(",")),
+        }
     }
 
     async fn rollback(self: Box<Self>, reason: &str) {
@@ -204,6 +302,16 @@ impl Effect for Vec<Box<dyn Effect>> {
             effect.rollback(reason).await;
         }
     }
+}
+
+/// Combine a sub-effect's own evidence with the already-committed evidence
+/// of earlier sub-effects.
+fn evidence_ids(own: Option<String>, committed: &[String]) -> String {
+    let mut ids: Vec<String> = committed.to_vec();
+    if let Some(id) = own {
+        ids.push(id);
+    }
+    ids.join(",")
 }
 
 /// Why an effect commit failed. The distinction is load-bearing: after a
@@ -726,12 +834,17 @@ mod tests {
         fn describe(&self) -> String {
             self.label.into()
         }
-        async fn commit(self: Box<Self>) -> Result<(), EffectCommitError> {
+        async fn commit(self: Box<Self>) -> EffectReceipt {
             self.commits.fetch_add(1, Ordering::SeqCst);
             if self.fail_commit {
-                Err(EffectCommitError::NotApplied(AgentError::Io("boom".into())))
+                EffectReceipt::NotApplied {
+                    error: "boom".into(),
+                }
             } else {
-                Ok(())
+                EffectReceipt::Applied {
+                    durability: EffectDurability::Durable,
+                    evidence: Some(self.label.into()),
+                }
             }
         }
         async fn rollback(self: Box<Self>, _reason: &str) {
@@ -767,7 +880,17 @@ mod tests {
                 fail_commit: false,
             }),
         ]);
-        effect.commit().await.expect("all sub-effects commit");
+        let receipt = effect.commit().await;
+        assert!(
+            matches!(
+                &receipt,
+                EffectReceipt::Applied {
+                    durability: EffectDurability::Durable,
+                    evidence,
+                } if evidence.as_deref() == Some("a,b,c")
+            ),
+            "all three sub-effects commit and their evidence is aggregated: {receipt:?}"
+        );
         assert_eq!(commits.load(Ordering::SeqCst), 3);
         assert_eq!(rollbacks.load(Ordering::SeqCst), 0);
     }
@@ -802,10 +925,10 @@ mod tests {
                 fail_commit: false,
             }),
         ]);
-        let error = effect.commit().await.unwrap_err();
+        let receipt = effect.commit().await;
         assert!(
-            matches!(error, EffectCommitError::NotApplied(_)),
-            "the composite must report the failed sub-effect: {error:?}"
+            matches!(receipt, EffectReceipt::NotApplied { .. }),
+            "the composite must report the failed sub-effect: {receipt:?}"
         );
         assert_eq!(ca.load(Ordering::SeqCst), 1, "'a' committed first");
         assert_eq!(cb.load(Ordering::SeqCst), 1, "'b' attempted and failed");

@@ -15,11 +15,11 @@ use agent_contracts::{
     CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
     CapabilityTransport, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemId,
     ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextQuery, ContextScope, ContextStateTransition, Effect, EffectCommitError, EventJournal,
-    MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage, ModelOutput,
-    ModelRequest, ModelRole, ModelTransport, OperationId, RuntimeEvent, RuntimeEventEnvelope,
-    ScopeId, ScopeKind, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome,
-    ToolOutput, ToolRisk, ToolSpec,
+    ContextQuery, ContextScope, ContextStateTransition, Effect, EffectDurability, EffectReceipt,
+    EventJournal, MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage,
+    ModelOutput, ModelRequest, ModelRole, ModelTransport, OperationId, RuntimeEvent,
+    RuntimeEventEnvelope, ScopeId, ScopeKind, TaskId, ToolCall, ToolDispatcher,
+    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
 use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
 use agent_runtime::{CapabilityAwareDispatcher, CapabilityRegistry, RuntimeHandle, spawn_runtime};
@@ -1421,9 +1421,12 @@ impl agent_contracts::Effect for FlagEffect {
     fn describe(&self) -> String {
         "test effect".into()
     }
-    async fn commit(self: Box<Self>) -> Result<(), agent_contracts::EffectCommitError> {
+    async fn commit(self: Box<Self>) -> agent_contracts::EffectReceipt {
         self.committed.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        agent_contracts::EffectReceipt::Applied {
+            durability: agent_contracts::EffectDurability::Durable,
+            evidence: None,
+        }
     }
     async fn rollback(self: Box<Self>, _reason: &str) {
         self.rolled_back.fetch_add(1, Ordering::SeqCst);
@@ -1773,16 +1776,15 @@ impl Effect for FailingEffect {
     fn describe(&self) -> String {
         "failing test effect".into()
     }
-    async fn commit(self: Box<Self>) -> Result<(), EffectCommitError> {
+    async fn commit(self: Box<Self>) -> EffectReceipt {
         match self.failure {
-            CommitFailure::NotApplied => Err(EffectCommitError::NotApplied(AgentError::Io(
-                "simulated disk failure".into(),
-            ))),
-            CommitFailure::AppliedButDurabilityFailed => {
-                Err(EffectCommitError::AppliedButDurabilityFailed(
-                    AgentError::Io("simulated journal failure".into()),
-                ))
-            }
+            CommitFailure::NotApplied => EffectReceipt::NotApplied {
+                error: "simulated disk failure".into(),
+            },
+            CommitFailure::AppliedButDurabilityFailed => EffectReceipt::Applied {
+                durability: EffectDurability::DurabilityFailed("simulated journal failure".into()),
+                evidence: None,
+            },
         }
     }
     async fn rollback(self: Box<Self>, _reason: &str) {
