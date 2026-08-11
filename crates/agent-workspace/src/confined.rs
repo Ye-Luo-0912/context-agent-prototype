@@ -33,7 +33,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
