@@ -876,8 +876,18 @@ self-declared), the collision pass (duplicate id, missing `requires`,
 reserved/owned tool names) against a registry-built `AdmissionContext`,
 and the `initial_status`/`initial_activation` decisions. The runtime's
 `CapabilityRegistry` delegates to it, so the same admission rules apply no
-matter which registry (or future host) asks; the registry still owns the
-mutable surface state (activation, loaded tools, run lifecycle).
+matter which registry (or future host) asks. The registry keeps only the
+mutable surface state (loaded tools, run lifecycle).
+
+The effective **state** is a core record too: `agent-core`'s
+`CapabilityStateAuthority` is the single source of truth for each
+registered capability's maturity and activation. Every read and every
+transition (enable/disable/quarantine) routes through it, and checkpoint
+snapshot/restore round-trips the state through it; the registry reacts to
+state changes with the surface effects (loaded-tool clearing, generation
+bumps). Registry readers pre-fetch the authority's state map instead of
+nesting locks, and all surface writers stay serialized by the registry's
+`surface_gate`, so the split adds no lock-order hazard.
 
 Since V1-P8 the manifest speaks `provides: Vec<CapabilityKind>`
 (tool/skill/service) and `requires` (the old `dependencies` name still

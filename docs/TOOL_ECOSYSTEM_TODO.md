@@ -955,9 +955,23 @@ together with TaskAnchor and continuous context GC.
   plus the `initial_status`/`initial_activation` decisions (external ->
   Experimental + Disabled). The runtime registry delegates to it with
   identical error messages and check order; behavior is unchanged
-  (existing capability registration/surface tests still pass). Remaining
-  slices: activation/quarantine/maturity state ownership moves into a core
-  authority seam, then catalog/lifecycle synchronization with that state.
+  (existing capability registration/surface tests still pass).
+  **Slice 2 landed 2026-08-12** — activation/quarantine/maturity state
+  ownership moved into a core authority seam:
+  `agent-core::capability_state` (`CapabilityStateAuthority` +
+  `CapabilityState`) is now the single source of truth for a registered
+  capability's effective maturity and activation. The runtime registry
+  keeps only the mutable surface mechanics (loaded tools, active marks,
+  run lifecycle) that react to the state: every read (`status`/
+  `activation`/catalog/surface gates) and every transition
+  (`set_activation`/enable/disable/quarantine) routes through the
+  authority; checkpoint `snapshot`/`restore` round-trips the state through
+  it too. Readers pre-fetch the authority's state map instead of nesting
+  locks, and all surface writers stay serialized by the registry's
+  `surface_gate`, so the split adds no lock-order hazard. 7 new core unit
+  tests pin the authority's contract; the registry's public API and error
+  messages are unchanged. Remaining: catalog/lifecycle synchronization
+  with the core state (slice 3).
 - [ ] **COMPOSE-01** Extract reusable application/bootstrap composition from
   `agent-tui` for TUI/CLI/eval while keeping it stateless and actor-free.
 - [x] **ECO-02** Make manifest identity/path/source validation and process stdout/stderr

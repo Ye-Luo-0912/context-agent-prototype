@@ -23,6 +23,7 @@ use agent_contracts::{
     ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolSpec, ToolSurfaceSnapshot,
     WORKSPACE_READ, WORKSPACE_WRITE, WorkspaceHandle,
 };
+use agent_core::{CapabilityAdmission, CapabilityState, CapabilityStateAuthority};
 use agent_workspace::{ArtifactStoreHandle, ConfinedWorkspaceHandle, Workspace};
 use async_trait::async_trait;
 use serde_json::json;
@@ -71,14 +72,6 @@ struct Entry {
     /// for the same capability (that would deadlock).
     run_state: CapabilityRunState,
     run_lock: Arc<tokio::sync::Mutex<()>>,
-    /// The effective maturity. External (out-of-process) capabilities are
-    /// pinned to Experimental regardless of their declared status, so an LLM
-    /// cannot promote its own module to Stable.
-    status: CapabilityStatus,
-    /// Whether the runtime will run this capability at all. External
-    /// capabilities enter `Disabled`; only an explicit enable (operator or
-    /// evaluator) makes them usable.
-    activation: CapabilityActivation,
     /// Which tools of this capability are on the model surface. Registration
     /// alone keeps them `Available`; `capability.load` (or the runtime) puts
     /// exactly the named tool on the surface — sibling tools of the same
@@ -113,6 +106,12 @@ pub struct CapabilityRegistry {
     /// captured at one common linearization point.
     surface_gate: RwLock<()>,
     inner: RwLock<HashMap<String, Entry>>,
+    /// The core-owned record of each registered capability's effective
+    /// maturity and activation. Every state read and every transition
+    /// (enable/disable/quarantine) routes through this authority — the
+    /// registry keeps only the mutable surface mechanics (loaded tools,
+    /// active marks, run lifecycle) that react to it.
+    state: CapabilityStateAuthority,
     /// Tool names the runtime owns (builtin core tools plus the unified
     /// control tools). A capability may never shadow them: routing would
     /// otherwise be hijackable by declaration.
@@ -175,7 +174,7 @@ impl CapabilityRegistry {
         // validates the manifest, tool schemas and authority derivation
         // lock-free, then checks collisions against this registry's live
         // state (duplicate id, missing requires, shadowed/owned tool names).
-        agent_core::CapabilityAdmission::validate_static(&manifest, &tool_specs)?;
+        CapabilityAdmission::validate_static(&manifest, &tool_specs)?;
         let tool_names: Vec<&str> = tool_specs.iter().map(|spec| spec.name.as_str()).collect();
 
         let _surface = self
@@ -197,15 +196,20 @@ impl CapabilityRegistry {
                 })
             },
         };
-        agent_core::CapabilityAdmission::validate_collisions(&manifest, &tool_names, &ctx)?;
+        CapabilityAdmission::validate_collisions(&manifest, &tool_names, &ctx)?;
         drop(reserved);
 
         // Maturity and activation are decided by the core's admission
         // authority, never declared: external capabilities always start
         // Experimental and Disabled; only the trusted in-process core keeps
         // its declared status and starts Enabled.
-        let status = agent_core::CapabilityAdmission::initial_status(&manifest);
-        let activation = agent_core::CapabilityAdmission::initial_activation(&manifest);
+        let status = CapabilityAdmission::initial_status(&manifest);
+        let activation = CapabilityAdmission::initial_activation(&manifest);
+        // Core owns the state: record maturity + activation in the
+        // authority before the entry appears in the surface maps, so no
+        // reader ever sees an entry without its state record.
+        self.state
+            .register(&manifest.id, CapabilityState { status, activation })?;
         inner.insert(
             manifest.id.clone(),
             Entry {
@@ -214,8 +218,6 @@ impl CapabilityRegistry {
                 tool_specs,
                 run_state: CapabilityRunState::Stopped,
                 run_lock: Arc::new(tokio::sync::Mutex::new(())),
-                status,
-                activation,
                 loaded_tools: HashSet::new(),
                 active: false,
             },
@@ -228,38 +230,37 @@ impl CapabilityRegistry {
     }
 
     /// The effective maturity of a registered capability (Experimental for
-    /// external capabilities regardless of declaration).
+    /// external capabilities regardless of declaration). The record lives
+    /// in the core's capability-state authority.
     pub fn status(&self, id: &str) -> Option<CapabilityStatus> {
-        self.inner
-            .read()
-            .expect("capability registry poisoned")
-            .get(id)
-            .map(|entry| entry.status)
+        self.state.status(id)
     }
 
-    /// The current activation of a registered capability.
+    /// The current activation of a registered capability. The record lives
+    /// in the core's capability-state authority.
     pub fn activation(&self, id: &str) -> Option<CapabilityActivation> {
-        self.inner
-            .read()
-            .expect("capability registry poisoned")
-            .get(id)
-            .map(|entry| entry.activation)
+        self.state.activation(id)
     }
 
     /// Set a capability's activation: `Enabled` makes it loadable and
     /// invocable, `Disabled`/`Quarantined` take its tools off the model
     /// surface and block further calls. Enabling is the operator/evaluator
-    /// action that external capabilities wait for.
+    /// action that external capabilities wait for. The transition is
+    /// decided and recorded by the core's capability-state authority; the
+    /// registry reacts to it with the surface effects (loaded tools,
+    /// generation bumps).
     pub fn set_activation(&self, id: &str, activation: CapabilityActivation) -> AgentResult<()> {
         let _surface = self
             .surface_gate
             .write()
             .expect("capability registry poisoned");
         let mut inner = self.inner.write().expect("capability registry poisoned");
+        // The entry must exist for the surface effects below; the authority
+        // record is updated right after, so the two never diverge.
         let entry = inner.get_mut(id).ok_or_else(|| {
             AgentError::InvalidRequest(format!("capability '{id}' is not registered"))
         })?;
-        entry.activation = activation;
+        self.state.set_activation(id, activation)?;
         // A capability that cannot run must not keep its tools on the
         // model surface.
         if !activation.usable() {
@@ -289,19 +290,23 @@ impl CapabilityRegistry {
 
     /// Snapshot of every registered capability, for the discovery surface.
     pub fn catalog(&self) -> Vec<CapabilityCatalogEntry> {
+        // Pre-fetch the core state record before taking `inner`, so this
+        // read never nests the authority lock inside the registry lock.
+        let states = self.state.state_map();
         let inner = self.inner.read().expect("capability registry poisoned");
         let mut entries: Vec<_> = inner
             .values()
-            .map(|entry| {
+            .filter_map(|entry| {
                 let manifest = &entry.manifest;
-                CapabilityCatalogEntry {
+                let state = states.get(&manifest.id).copied()?;
+                Some(CapabilityCatalogEntry {
                     id: manifest.id.clone(),
-                    status: entry.status,
-                    activation: entry.activation,
+                    status: state.status,
+                    activation: state.activation,
                     transport: manifest.transport.clone(),
                     tools: entry.tool_specs.iter().map(|s| s.name.clone()).collect(),
                     run_state: entry.run_state,
-                }
+                })
             })
             .collect();
         entries.sort_by(|a, b| a.id.cmp(&b.id));
@@ -321,10 +326,18 @@ impl CapabilityRegistry {
     /// bump the generation before releasing `inner`, so this single read
     /// lock pairs the two values atomically.
     fn loaded_surface(&self) -> (Vec<ToolSpec>, u64) {
+        // Pre-fetch the core activation record: the usable gate reads it,
+        // but never while `inner` is held.
+        let states = self.state.state_map();
         let inner = self.inner.read().expect("capability registry poisoned");
         let specs = inner
             .values()
-            .filter(|entry| entry.activation.usable() && !entry.loaded_tools.is_empty())
+            .filter(|entry| {
+                states
+                    .get(&entry.manifest.id)
+                    .is_some_and(|state| state.activation.usable())
+                    && !entry.loaded_tools.is_empty()
+            })
             .flat_map(|entry| {
                 entry
                     .tool_specs
@@ -372,6 +385,12 @@ impl CapabilityRegistry {
         let owner = self
             .owner_of(tool_name)
             .ok_or_else(|| AgentError::Tool(format!("unknown tool: {tool_name}")))?;
+        // Pre-fetch the core activation record before the surface gate and
+        // `inner`: the gate reads it without nesting the authority lock.
+        let activation = self
+            .state
+            .activation(&owner)
+            .unwrap_or(CapabilityActivation::Disabled);
         let _surface = self
             .surface_gate
             .write()
@@ -380,10 +399,10 @@ impl CapabilityRegistry {
         let entry = inner
             .get_mut(&owner)
             .ok_or_else(|| AgentError::Tool(format!("unknown tool: {tool_name}")))?;
-        if !entry.activation.usable() {
+        if !activation.usable() {
             return Err(AgentError::InvalidRequest(format!(
                 "capability '{owner}' is {}; enable it before loading its tools",
-                entry.activation.as_str()
+                activation.as_str()
             )));
         }
         entry.loaded_tools.insert(tool_name.to_string());
@@ -420,6 +439,9 @@ impl CapabilityRegistry {
     /// capability reports `Available` regardless — its tools are not on
     /// the surface.
     pub fn tool_state(&self, tool_name: &str) -> Option<ToolLifecycle> {
+        // Pre-fetch the core activation record: the Loaded gate reads it
+        // without nesting the authority lock inside the registry read.
+        let states = self.state.state_map();
         let inner = self.inner.read().expect("capability registry poisoned");
         inner.values().find_map(|entry| {
             entry
@@ -427,9 +449,12 @@ impl CapabilityRegistry {
                 .iter()
                 .any(|spec| spec.name == tool_name)
                 .then(|| {
+                    let usable = states
+                        .get(&entry.manifest.id)
+                        .is_some_and(|state| state.activation.usable());
                     if entry.active {
                         ToolLifecycle::Active
-                    } else if entry.loaded_tools.contains(tool_name) && entry.activation.usable() {
+                    } else if entry.loaded_tools.contains(tool_name) && usable {
                         ToolLifecycle::Loaded
                     } else {
                         ToolLifecycle::Available
@@ -463,12 +488,18 @@ impl CapabilityRegistry {
             return rows.clone();
         }
         let rows = {
+            // Pre-fetch the core activation record: the Loaded gate reads
+            // it without nesting the authority lock inside the registry
+            // read.
+            let states = self.state.state_map();
             let inner = self.inner.read().expect("capability registry poisoned");
             let mut rows = Vec::new();
             for (id, entry) in inner.iter() {
                 let owner = id.clone();
                 let active = entry.active;
-                let usable = entry.activation.usable();
+                let usable = states
+                    .get(id)
+                    .is_some_and(|state| state.activation.usable());
                 for spec in &entry.tool_specs {
                     let state = if active {
                         ToolLifecycle::Active
@@ -533,6 +564,9 @@ impl CapabilityRegistry {
     /// part of the snapshot: capabilities are re-registered by the
     /// composition root on a fresh run, then this re-applies their flags.
     pub fn snapshot(&self) -> Vec<crate::checkpoint::CapabilitySnapshot> {
+        // Pre-fetch the core state record: the activation column reads it
+        // without nesting the authority lock inside the registry read.
+        let states = self.state.state_map();
         let inner = self.inner.read().expect("capability registry poisoned");
         let mut entries: Vec<_> = inner
             .iter()
@@ -541,7 +575,12 @@ impl CapabilityRegistry {
                 loaded_tools.sort();
                 crate::checkpoint::CapabilitySnapshot {
                     id: id.clone(),
-                    activation: entry.activation,
+                    // Fail closed: an entry without a core state record
+                    // (unreachable by construction) snapshots as Disabled.
+                    activation: states
+                        .get(id)
+                        .map(|state| state.activation)
+                        .unwrap_or(CapabilityActivation::Disabled),
                     // The legacy whole-capability flag mirrors "at least one
                     // tool loaded" so older readers still see a non-empty
                     // surface; the per-tool list is authoritative.
@@ -554,11 +593,13 @@ impl CapabilityRegistry {
         entries
     }
 
-    /// Re-apply a checkpoint's capability surface state: activation first,
-    /// then the loaded tools (a loaded flag without a usable activation is
-    /// dropped — activation is the gate in front of the model surface).
-    /// Old whole-capability checkpoints (`loaded: true` with no tool list)
-    /// migrate to "every declared tool loaded".
+    /// Re-apply a checkpoint's capability surface state: the loaded-tool
+    /// surface is rebuilt from the checkpoint (a loaded flag without a
+    /// usable activation is dropped — activation is the gate in front of
+    /// the model surface), and the activation itself is re-applied to the
+    /// core's state authority. Old whole-capability checkpoints
+    /// (`loaded: true` with no tool list) migrate to "every declared tool
+    /// loaded".
     pub fn restore(&self, state: &[crate::checkpoint::CapabilitySnapshot]) {
         let _surface = self
             .surface_gate
@@ -571,7 +612,6 @@ impl CapabilityRegistry {
                 // have nothing to apply to.
                 continue;
             };
-            current.activation = entry.activation;
             if !entry.loaded_tools.is_empty() {
                 // Per-tool format: only the named tools go on the surface,
                 // and only those the capability actually declares in this
@@ -599,11 +639,29 @@ impl CapabilityRegistry {
                 current.loaded_tools.clear();
             }
             // A loaded flag without a usable activation is dropped —
-            // activation is the gate in front of the model surface.
-            if !current.activation.usable() {
+            // activation is the gate in front of the model surface. The
+            // checkpoint's activation is the value being restored.
+            if !entry.activation.usable() {
                 current.loaded_tools.clear();
             }
         }
+        drop(inner);
+        // The authority record comes last, still under the surface gate:
+        // the loaded-tool decisions above used the checkpoint's activation
+        // directly, so no authority read was needed while `inner` was held.
+        let mut states = Vec::with_capacity(state.len());
+        for entry in state {
+            if let Some(status) = self.state.status(&entry.id) {
+                states.push((
+                    entry.id.clone(),
+                    CapabilityState {
+                        status,
+                        activation: entry.activation,
+                    },
+                ));
+            }
+        }
+        self.state.restore(&states);
         // Restore changes the model-visible surface just like explicit
         // activation/load operations, so both the audit generation and the
         // derived discovery rows must advance.
@@ -615,12 +673,17 @@ impl CapabilityRegistry {
     /// Disabled/quarantined capabilities are not started — they are not
     /// usable, so there is nothing to run.
     pub async fn start_eager(&self) -> AgentResult<()> {
+        // Pre-fetch the core activation record: the usable gate reads it
+        // without nesting the authority lock inside the registry read.
+        let states = self.state.state_map();
         let ids: Vec<String> = {
             let inner = self.inner.read().expect("capability registry poisoned");
             inner
                 .iter()
                 .filter(|(_, entry)| {
-                    entry.activation.usable()
+                    states
+                        .get(&entry.manifest.id)
+                        .is_some_and(|state| state.activation.usable())
                         && entry.manifest.lifecycle == CapabilityLifecycle::Eager
                         && matches!(
                             entry.run_state,
@@ -671,6 +734,12 @@ impl CapabilityRegistry {
         // Serialize the transition: only one caller drives
         // Stopped/Failed -> Starting -> Started/Failed at a time.
         let _guard = run_lock.lock().await;
+        // Pre-fetch the core activation record before the inner read: the
+        // usable gate below reads it without nesting the authority lock.
+        let activation = self
+            .state
+            .activation(id)
+            .unwrap_or(CapabilityActivation::Disabled);
         let capability = {
             let inner = self.inner.read().expect("capability registry poisoned");
             let entry = inner.get(id).ok_or_else(|| {
@@ -688,10 +757,10 @@ impl CapabilityRegistry {
                 }
                 CapabilityRunState::Stopped | CapabilityRunState::Failed => {}
             }
-            if !entry.activation.usable() {
+            if !activation.usable() {
                 return Err(AgentError::InvalidRequest(format!(
                     "capability '{id}' is {}; enable it before use",
-                    entry.activation.as_str()
+                    activation.as_str()
                 )));
             }
             entry.capability.clone()

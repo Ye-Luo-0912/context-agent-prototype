@@ -1,6 +1,7 @@
 mod approval;
 mod authority;
 mod capability_admission;
+mod capability_state;
 mod kernel;
 
 pub use approval::{
@@ -14,4 +15,5 @@ pub use capability_admission::{
     AdmissionContext, CapabilityAdmission, MAX_TOOL_DESCRIPTION_CHARS, MAX_TOOL_NAME_CHARS,
     MAX_TOOL_SCHEMA_BYTES, MAX_TOOLS_PER_CAPABILITY,
 };
+pub use capability_state::{CapabilityState, CapabilityStateAuthority};
 pub use kernel::{CoreAuthority, CoreAuthorityConfig};
