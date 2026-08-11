@@ -9,7 +9,7 @@
 //! admission.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use agent_contracts::{AgentError, AgentResult, CapabilityActivation, CapabilityStatus};
 
@@ -27,13 +27,20 @@ pub struct CapabilityState {
 }
 
 /// Owns the authoritative activation/maturity state of every registered
-/// capability. Registration and activation transitions are surface
-/// mutations of the runtime registry too, so the registry coordinates them
-/// under its own `surface_gate`; the authority is the single source of
-/// truth for the state itself.
+/// capability, plus its effective permission grant. Registration and
+/// activation transitions are surface mutations of the runtime registry
+/// too, so the registry coordinates them under its own `surface_gate`; the
+/// authority is the single source of truth for the state itself. The grant
+/// is the admission-validated manifest permissions, captured once at
+/// registration: a capability that returns a different manifest after
+/// registration cannot escalate what it holds.
 #[derive(Default)]
 pub struct CapabilityStateAuthority {
     inner: RwLock<HashMap<String, CapabilityState>>,
+    /// The effective permission grant per capability (immutable after
+    /// registration). Kept separate from `inner` so surface views that
+    /// clone the state map do not copy permission lists too.
+    grants: RwLock<HashMap<String, Arc<Vec<String>>>>,
 }
 
 impl CapabilityStateAuthority {
@@ -41,11 +48,17 @@ impl CapabilityStateAuthority {
         Self::default()
     }
 
-    /// Record the admission-decided state of a newly registered capability.
-    /// Defense in depth: admission already rejected duplicate ids under the
-    /// registry's lock; this refuses a second record for the same id too,
-    /// so a registration and a state record can never diverge.
-    pub fn register(&self, id: &str, state: CapabilityState) -> AgentResult<()> {
+    /// Record the admission-decided state and effective permission grant of
+    /// a newly registered capability. Defense in depth: admission already
+    /// rejected duplicate ids under the registry's lock; this refuses a
+    /// second record for the same id too, so a registration and a state
+    /// record can never diverge.
+    pub fn register(
+        &self,
+        id: &str,
+        state: CapabilityState,
+        permissions: Vec<String>,
+    ) -> AgentResult<()> {
         let mut inner = self.inner.write().expect("capability state poisoned");
         if inner.contains_key(id) {
             return Err(AgentError::InvalidRequest(format!(
@@ -53,7 +66,21 @@ impl CapabilityStateAuthority {
             )));
         }
         inner.insert(id.to_string(), state);
+        self.grants
+            .write()
+            .expect("capability state poisoned")
+            .insert(id.to_string(), Arc::new(permissions));
         Ok(())
+    }
+
+    /// The effective permission grant of a registered capability: what the
+    /// runtime may hand it at invoke time, fixed at registration.
+    pub fn granted_permissions(&self, id: &str) -> Option<Arc<Vec<String>>> {
+        self.grants
+            .read()
+            .expect("capability state poisoned")
+            .get(id)
+            .cloned()
     }
 
     /// The effective maturity of a registered capability.
@@ -129,18 +156,20 @@ mod tests {
         CapabilityState { status, activation }
     }
 
+    fn register(authority: &CapabilityStateAuthority, id: &str, activation: CapabilityActivation) {
+        authority
+            .register(
+                id,
+                state(CapabilityStatus::Experimental, activation),
+                vec![format!("{id}:permission")],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn register_then_reads_reflect_the_state() {
         let authority = CapabilityStateAuthority::new();
-        authority
-            .register(
-                "demo",
-                state(
-                    CapabilityStatus::Experimental,
-                    CapabilityActivation::Enabled,
-                ),
-            )
-            .unwrap();
+        register(&authority, "demo", CapabilityActivation::Enabled);
         assert_eq!(
             authority.status("demo"),
             Some(CapabilityStatus::Experimental)
@@ -154,6 +183,29 @@ mod tests {
     }
 
     #[test]
+    fn register_records_the_effective_grant() {
+        let authority = CapabilityStateAuthority::new();
+        authority
+            .register(
+                "demo",
+                state(
+                    CapabilityStatus::Experimental,
+                    CapabilityActivation::Enabled,
+                ),
+                vec!["workspace:read".to_string(), "process:run".to_string()],
+            )
+            .unwrap();
+        let grant = authority
+            .granted_permissions("demo")
+            .expect("a registered capability must have its grant");
+        assert_eq!(
+            grant.as_slice(),
+            &["workspace:read".to_string(), "process:run".to_string()]
+        );
+        assert_eq!(authority.granted_permissions("missing"), None);
+    }
+
+    #[test]
     fn register_rejects_duplicate_ids() {
         let authority = CapabilityStateAuthority::new();
         authority
@@ -163,6 +215,7 @@ mod tests {
                     CapabilityStatus::Experimental,
                     CapabilityActivation::Enabled,
                 ),
+                Vec::new(),
             )
             .unwrap();
         let error = authority
@@ -172,6 +225,7 @@ mod tests {
                     CapabilityStatus::Experimental,
                     CapabilityActivation::Disabled,
                 ),
+                Vec::new(),
             )
             .expect_err("a duplicate state record must be rejected");
         assert!(error.to_string().contains("already registered"), "{error}");
@@ -180,15 +234,7 @@ mod tests {
     #[test]
     fn set_activation_records_every_transition() {
         let authority = CapabilityStateAuthority::new();
-        authority
-            .register(
-                "demo",
-                state(
-                    CapabilityStatus::Experimental,
-                    CapabilityActivation::Enabled,
-                ),
-            )
-            .unwrap();
+        register(&authority, "demo", CapabilityActivation::Enabled);
         authority
             .set_activation("demo", CapabilityActivation::Disabled)
             .unwrap();
@@ -231,12 +277,14 @@ mod tests {
                     CapabilityStatus::Experimental,
                     CapabilityActivation::Enabled,
                 ),
+                vec!["workspace:read".to_string()],
             )
             .unwrap();
         authority
             .register(
                 "b",
                 state(CapabilityStatus::Stable, CapabilityActivation::Disabled),
+                Vec::new(),
             )
             .unwrap();
         authority
@@ -252,6 +300,7 @@ mod tests {
                     CapabilityStatus::Experimental,
                     CapabilityActivation::Enabled,
                 ),
+                vec!["workspace:read".to_string()],
             )
             .unwrap();
         restored.restore(&snapshot);
@@ -263,20 +312,20 @@ mod tests {
         // b was never registered in the restored authority: skipped, not
         // fabricated.
         assert_eq!(restored.status("b"), None);
+        // The grant is immutable per registration: restore re-applies
+        // flags, never the permission record.
+        assert_eq!(
+            restored
+                .granted_permissions("a")
+                .map(|grant| grant.to_vec()),
+            Some(vec!["workspace:read".to_string()])
+        );
     }
 
     #[test]
     fn restore_skips_ids_not_registered_in_this_run() {
         let authority = CapabilityStateAuthority::new();
-        authority
-            .register(
-                "live",
-                state(
-                    CapabilityStatus::Experimental,
-                    CapabilityActivation::Enabled,
-                ),
-            )
-            .unwrap();
+        register(&authority, "live", CapabilityActivation::Enabled);
         authority.restore(&[(
             "ghost".to_string(),
             state(CapabilityStatus::Stable, CapabilityActivation::Disabled),
@@ -291,15 +340,7 @@ mod tests {
     #[test]
     fn state_map_reflects_the_current_state() {
         let authority = CapabilityStateAuthority::new();
-        authority
-            .register(
-                "demo",
-                state(
-                    CapabilityStatus::Experimental,
-                    CapabilityActivation::Enabled,
-                ),
-            )
-            .unwrap();
+        register(&authority, "demo", CapabilityActivation::Enabled);
         authority
             .set_activation("demo", CapabilityActivation::Quarantined)
             .unwrap();

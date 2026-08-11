@@ -943,7 +943,7 @@ together with TaskAnchor and continuous context GC.
   actor routes every scheduling trigger through `services`, keeps the
   authority facade on `kernel`. See `docs/TOOL_ECOSYSTEM_TODO.md`
   "Incremental Core migration" slices 3-4.
-- [~] **MOD-05** Split capability ownership: Core owns admission, grants,
+- [x] **MOD-05** Split capability ownership: Core owns admission, grants,
   activation/quarantine, and maturity authority; Runtime owns catalog views,
   load/unload scheduling, active state, and per-round surface snapshots.
   **Slice 1 landed 2026-08-12** — admission is now a core decision:
@@ -970,8 +970,21 @@ together with TaskAnchor and continuous context GC.
   locks, and all surface writers stay serialized by the registry's
   `surface_gate`, so the split adds no lock-order hazard. 7 new core unit
   tests pin the authority's contract; the registry's public API and error
-  messages are unchanged. Remaining: catalog/lifecycle synchronization
-  with the core state (slice 3).
+  messages are unchanged.
+  **Slice 3 landed 2026-08-12** — the effective permission **grant** is a
+  core record too: `CapabilityStateAuthority::register` captures the
+  admission-validated manifest permissions (`granted_permissions`), and the
+  unified dispatcher builds every `CapabilityInvocationContext` from that
+  registered grant — never from the live capability object. A capability
+  that returns a different manifest after registration cannot escalate what
+  it holds; the runtime-directive gate (`runtime:context-control`) also
+  checks the registered grant. A new runtime test proves the escalation is
+  refused (`invocation_uses_the_registered_grant_not_the_live_manifest`);
+  the registry's public API, error messages and honest-capability behavior
+  are unchanged. MOD-05 complete: admission, grants,
+  activation/quarantine/maturity authority all live in `agent-core`; the
+  runtime registry owns catalog views, load/unload scheduling, active
+  state and per-round surface snapshots.
 - [ ] **COMPOSE-01** Extract reusable application/bootstrap composition from
   `agent-tui` for TUI/CLI/eval while keeping it stateless and actor-free.
 - [x] **ECO-02** Make manifest identity/path/source validation and process stdout/stderr

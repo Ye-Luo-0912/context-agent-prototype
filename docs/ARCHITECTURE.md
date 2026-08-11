@@ -881,13 +881,17 @@ mutable surface state (loaded tools, run lifecycle).
 
 The effective **state** is a core record too: `agent-core`'s
 `CapabilityStateAuthority` is the single source of truth for each
-registered capability's maturity and activation. Every read and every
-transition (enable/disable/quarantine) routes through it, and checkpoint
-snapshot/restore round-trips the state through it; the registry reacts to
-state changes with the surface effects (loaded-tool clearing, generation
-bumps). Registry readers pre-fetch the authority's state map instead of
-nesting locks, and all surface writers stay serialized by the registry's
-`surface_gate`, so the split adds no lock-order hazard.
+registered capability's maturity, activation and effective permission
+grant. Every read and every transition (enable/disable/quarantine) routes
+through it, and checkpoint snapshot/restore round-trips the state through
+it; the registry reacts to state changes with the surface effects
+(loaded-tool clearing, generation bumps). Registry readers pre-fetch the
+authority's state map instead of nesting locks, and all surface writers
+stay serialized by the registry's `surface_gate`, so the split adds no
+lock-order hazard. The grant is captured at registration, and the unified
+dispatcher builds every invocation context from that registered grant —
+never from the live capability object — so a capability that returns a
+different manifest after registration cannot escalate what it holds.
 
 Since V1-P8 the manifest speaks `provides: Vec<CapabilityKind>`
 (tool/skill/service) and `requires` (the old `dependencies` name still
