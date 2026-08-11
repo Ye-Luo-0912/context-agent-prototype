@@ -1427,8 +1427,8 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
         }
     }
 
-    fn gc(&self) {
-        self.base.gc();
+    fn gc(&self, roots: &[String]) {
+        self.base.gc(roots);
     }
 
     fn catalog(&self) -> Vec<ToolCatalogEntry> {

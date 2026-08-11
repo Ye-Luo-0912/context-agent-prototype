@@ -294,8 +294,12 @@ impl RuntimeServices {
         self.tools.may_omit_from_round(name)
     }
 
-    pub fn tool_gc(&self) {
-        self.tools.gc();
+    /// Run the tool lifecycle safe point for one model round. `roots`
+    /// names the active task's tool-demand set: those tools are never aged
+    /// out by idle GC (TaskAnchor-driven tool roots), so a task that
+    /// requires a tool keeps it available across rounds.
+    pub fn tool_gc(&self, roots: &[String]) {
+        self.tools.gc(roots);
     }
 
     pub fn tool_catalog(&self) -> Vec<ToolCatalogEntry> {

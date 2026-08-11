@@ -1117,10 +1117,25 @@ impl RuntimeActor {
             }
         }
 
-        // Tool lifecycle safe point. Task demand is declarative only: reload
-        // can restore catalog/schema readiness, but cannot enable a disabled
+        // Tool lifecycle safe point. The active task's tool-demand set is
+        // the GC root set: a tool the task requires is never aged out by
+        // idle GC, so task demand cannot silently evaporate from the
+        // surface. Task demand is declarative only: reload can restore
+        // catalog/schema readiness, but cannot enable a disabled
         // capability, grant a permission or bypass approval/effect policy.
-        self.services.tool_gc();
+        let task_roots: Vec<String> = self
+            .state
+            .task_id
+            .and_then(|task_id| self.state.tasks.get(task_id))
+            .map(|task| {
+                task.tool_requirements
+                    .entries
+                    .iter()
+                    .map(|requirement| requirement.tool_name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.services.tool_gc(&task_roots);
         let active_task = self
             .state
             .task_id

@@ -1014,6 +1014,9 @@ struct RoundLocalToolDispatcher {
     generation: AtomicU64,
     load_calls: AtomicUsize,
     unload_calls: AtomicUsize,
+    /// Every gc() roots set the runtime passed (active-task tool-demand
+    /// names), for asserting the TaskAnchor-driven roots wiring.
+    roots_seen: Mutex<Vec<Vec<String>>>,
 }
 
 impl RoundLocalToolDispatcher {
@@ -1025,7 +1028,12 @@ impl RoundLocalToolDispatcher {
             generation: AtomicU64::new(17),
             load_calls: AtomicUsize::new(0),
             unload_calls: AtomicUsize::new(0),
+            roots_seen: Mutex::new(Vec::new()),
         }
+    }
+
+    fn roots_seen(&self) -> Vec<Vec<String>> {
+        self.roots_seen.lock().unwrap().clone()
     }
 
     fn evicting_on_gc() -> Self {
@@ -1094,7 +1102,8 @@ impl ToolDispatcher for RoundLocalToolDispatcher {
         name == "optional.large"
     }
 
-    fn gc(&self) {
+    fn gc(&self, roots: &[String]) {
+        self.roots_seen.lock().unwrap().push(roots.to_vec());
         if self.evict_on_gc.load(Ordering::SeqCst)
             && self.optional_loaded.swap(false, Ordering::SeqCst)
         {
@@ -1476,6 +1485,68 @@ async fn keep_ready_reloads_after_gc_without_entering_the_model_surface() {
             "KeepReady is a lifecycle root, not a prompt-visibility request"
         );
     }
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn active_task_tool_demand_reaches_gc_as_roots() {
+    let model = Arc::new(VariableWindowModel::new(16_000));
+    let tools = Arc::new(RoundLocalToolDispatcher::new());
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model.clone(),
+        tools.clone(),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut turn_events = handle.subscribe();
+    handle.start().await.unwrap();
+
+    // Before any task exists, the runtime passes no roots.
+    handle
+        .user_message("first round, no requirements yet".into())
+        .await
+        .unwrap();
+    wait_for_turn_completed(&mut turn_events).await;
+    assert!(
+        tools.roots_seen().last().unwrap().is_empty(),
+        "no active task means no tool roots"
+    );
+
+    // A task that requires a tool must hand that tool's name to gc() as a
+    // root on every later round — idle GC cannot age it off the surface.
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    handle
+        .replace_task_tool_requirements(
+            task_id,
+            0,
+            vec![ToolSurfaceRequirement {
+                tool_name: "optional.large".into(),
+                demand: ToolSurfaceDemand::MustSurface,
+                reason: "the task needs the large tool".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    handle.user_message("rooted round".into()).await.unwrap();
+    wait_for_turn_completed(&mut turn_events).await;
+    let seen = tools.roots_seen();
+    let roots = seen.last().unwrap();
+    assert!(
+        roots.iter().any(|root| root == "optional.large"),
+        "the task-demanded tool must be a gc root, got {roots:?}"
+    );
+
+    // Suspending the task drops the roots again (no active task demand).
+    handle.suspend_task().await.unwrap();
+    handle.user_message("taskless round".into()).await.unwrap();
+    wait_for_turn_completed(&mut turn_events).await;
+    assert!(
+        tools.roots_seen().last().unwrap().is_empty(),
+        "a suspended task must not keep rooting tools"
+    );
     handle.stop().await.unwrap();
 }
 

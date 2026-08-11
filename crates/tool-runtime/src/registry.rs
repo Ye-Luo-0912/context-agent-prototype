@@ -216,16 +216,21 @@ impl BuiltinToolDispatcher {
 
     /// Age transitions at an explicit runtime safe point: idle tools cool
     /// Loaded -> Warm and then Warm -> Unloaded, so the model surface
-    /// tracks recent use. Core tools never age out. Called once per model
-    /// round by the runtime — never implicitly from `specs()`, which must
-    /// stay pure so budget, prompt and tool-call validation all observe one
-    /// stable surface per round.
-    pub fn gc(&self) {
+    /// tracks recent use. Core tools (`always_loaded`) never age out, and
+    /// neither do the runtime's TaskAnchor-driven roots — the active task's
+    /// tool-demand set — because a task that requires a tool must keep it
+    /// available regardless of idle ticks. Called once per model round by
+    /// the runtime — never implicitly from `specs()`, which must stay pure
+    /// so budget, prompt and tool-call validation all observe one stable
+    /// surface per round.
+    pub fn gc(&self, roots: &[String]) {
         let tick = self.tick_now();
         let mut catalog = self.catalog.write().expect("tool catalog poisoned");
         let mut changed = false;
         for (name, entry) in catalog.iter_mut() {
-            if self.config.always_loaded.iter().any(|core| core == name) {
+            if self.config.always_loaded.iter().any(|core| core == name)
+                || roots.iter().any(|root| root == name)
+            {
                 continue;
             }
             let idle = tick.saturating_sub(entry.last_used_tick);
@@ -315,11 +320,11 @@ impl ToolDispatcher for BuiltinToolDispatcher {
         Self::surface_specs(&catalog)
     }
 
-    fn gc(&self) {
+    fn gc(&self, roots: &[String]) {
         // The explicit lifecycle safe point the runtime calls once per
         // model round; delegates to the inherent method so callers on the
         // concrete type and through the trait observe the same aging.
-        Self::gc(self);
+        Self::gc(self, roots);
     }
 
     fn snapshot(&self) -> ToolSurfaceSnapshot {
@@ -866,11 +871,50 @@ mod tests {
         );
         // Only an explicit gc() at the runtime safe point ages the catalog.
         for _ in 0..4 {
-            dispatcher.gc();
+            dispatcher.gc(&[]);
         }
         assert!(
             !surface(&dispatcher).contains(&"fs.write".to_string()),
             "an idle tool must leave the surface after the GC thresholds"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_roots_protect_required_tools_from_idle_gc() {
+        let workspace = open_workspace().await;
+        let dispatcher = BuiltinToolDispatcher::with_config(
+            workspace,
+            ToolLifecycleConfig {
+                always_loaded: vec!["fs.read".into()],
+                idle_to_warm_ticks: 2,
+                warm_to_unload_ticks: 4,
+            },
+        );
+        dispatcher.load("fs.write").unwrap();
+        dispatcher.load("git.status").unwrap();
+        assert!(surface(&dispatcher).contains(&"git.status".to_string()));
+
+        // The active task requires fs.write but not git.status. Idle GC
+        // must honor the root: fs.write stays on the surface while the
+        // unrooted git.status ages out.
+        let roots = vec!["fs.write".to_string()];
+        for _ in 0..5 {
+            dispatcher.gc(&roots);
+        }
+        assert!(
+            surface(&dispatcher).contains(&"fs.write".to_string()),
+            "a task-rooted tool must survive idle GC"
+        );
+        assert!(
+            !surface(&dispatcher).contains(&"git.status".to_string()),
+            "an unrooted idle tool must still age out"
+        );
+
+        // A root only protects the idle path: an explicit unload is still
+        // allowed (the round surface then degrades per task demand).
+        assert!(
+            dispatcher.unload("fs.write").is_ok(),
+            "roots must not block explicit unload"
         );
     }
 

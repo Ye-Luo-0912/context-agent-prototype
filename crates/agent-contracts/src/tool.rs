@@ -787,7 +787,12 @@ pub trait ToolDispatcher: Send + Sync {
     /// Explicit lifecycle maintenance safe point, called by the runtime
     /// once per model round. Dispatchers with mutable tool lifecycles
     /// (idle aging, unloading) run their GC here — never inside `specs()`.
-    fn gc(&self) {}
+    ///
+    /// `roots` names the tools the runtime must not age out: the active
+    /// task's tool-demand set (TaskAnchor-driven tool roots). A root tool
+    /// may still be unloaded explicitly; roots only protect against the
+    /// silent idle path. The default ignores roots.
+    fn gc(&self, _roots: &[String]) {}
 
     /// Unified discovery surface: every known tool (builtin and dynamic
     /// capability) with its lifecycle state and owner, for
