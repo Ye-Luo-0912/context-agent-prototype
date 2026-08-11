@@ -24,7 +24,8 @@ use serde_json::json;
 
 use crate::tools::{
     ContextManageTool, EditPatchTool, EditReplaceTool, FsListTool, FsReadTool, FsWriteTool,
-    GitDiffTool, GitStatusTool, ProcessRunTool, SearchGrepTool, ShellExecTool, Tool,
+    GitDiffTool, GitStatusTool, ProcessRunTool, ProcessSession, ProcessSessionTool, SearchGrepTool,
+    ShellExecTool, Tool,
 };
 
 /// Control tools are now defined by the unified catalog contract.
@@ -87,6 +88,11 @@ impl BuiltinToolDispatcher {
     }
 
     pub fn with_config(workspace: Workspace, config: ToolLifecycleConfig) -> Self {
+        // One session registry per dispatcher, shared by every
+        // `process.session` tool instance.
+        let sessions: std::sync::Arc<
+            tokio::sync::Mutex<std::collections::HashMap<String, ProcessSession>>,
+        > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(FsListTool::new(workspace.clone())),
             Arc::new(FsReadTool::new(workspace.clone())),
@@ -98,6 +104,7 @@ impl BuiltinToolDispatcher {
             Arc::new(GitDiffTool::new(workspace.clone())),
             Arc::new(ShellExecTool::new(workspace.clone())),
             Arc::new(ProcessRunTool::new(workspace.clone())),
+            Arc::new(ProcessSessionTool::new(workspace.clone(), sessions)),
             Arc::new(ContextManageTool::new()),
         ];
         let catalog = tools

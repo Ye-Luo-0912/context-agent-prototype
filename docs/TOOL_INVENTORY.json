@@ -4,7 +4,7 @@
   "surface": {
     "core": ["fs.list", "fs.read", "search.grep"],
     "control": ["context.manage", "capability.manage"],
-    "catalog_optional": ["fs.write", "edit.replace", "edit.patch", "git.status", "git.diff", "shell.exec"]
+    "catalog_optional": ["fs.write", "edit.replace", "edit.patch", "git.status", "git.diff", "shell.exec", "process.run", "process.session"]
   },
   "global_limits": {
     "MAX_TOOL_MODEL_CONTENT_CHARS": 16000,
@@ -168,6 +168,59 @@
       "platform": {
         "unix": "RLIMIT_CPU / RLIMIT_NPROC applied; process-group tree kill on cancel",
         "windows": "Job Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE); taskkill /T /F tree kill"
+      }
+    },
+    "process.run": {
+      "risk": "ProcessExecution",
+      "surface_class": "catalog_optional",
+      "schema": {
+        "argv": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string"}, "required": true, "note": "program and arguments, passed verbatim — no shell parsing"},
+        "cwd": {"type": "string", "note": "workspace-relative working directory; `..` escapes refused"},
+        "env": {"type": "object", "note": "explicit overrides layered on the inherited environment"},
+        "timeout_ms": {"type": "integer", "minimum": 100, "maximum": 120000, "default": 30000}
+      },
+      "limits": {
+        "max_timeout_ms": 120000,
+        "max_argv": 64,
+        "max_arg_chars": 16384,
+        "max_env_keys": 64,
+        "max_env_value_chars": 16384,
+        "model_output_chars": 12000,
+        "buffer_lines": 200,
+        "note": "full log streams to an artifact; bounded ring-buffer tail reaches the model; timeout/cancel kill the whole process tree"
+      },
+      "effects": ["process:exec"],
+      "context_disposition": "PersistObservation",
+      "platform": {
+        "unix": "process-group tree kill on cancel",
+        "windows": "taskkill /T /F tree kill"
+      }
+    },
+    "process.session": {
+      "risk": "ProcessExecution",
+      "surface_class": "catalog_optional",
+      "schema": {
+        "action": {"type": "string", "enum": ["start", "poll", "stop"], "required": true},
+        "argv": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string"}, "note": "start: program and arguments, passed verbatim"},
+        "cwd": {"type": "string", "note": "start: workspace-relative working directory"},
+        "env": {"type": "object", "note": "start: explicit environment overrides"},
+        "session_id": {"type": "string", "note": "poll/stop: the id returned by start"}
+      },
+      "limits": {
+        "max_sessions": 16,
+        "max_argv": 64,
+        "max_arg_chars": 16384,
+        "max_env_keys": 64,
+        "max_env_value_chars": 16384,
+        "model_output_chars": 12000,
+        "buffer_lines": 200,
+        "note": "long-running processes: start returns a session id, poll drains output into the tail + artifact and reports exit, stop kills the whole process tree and reaps the session"
+      },
+      "effects": ["process:exec"],
+      "context_disposition": "PersistObservation",
+      "platform": {
+        "unix": "process-group tree kill on stop",
+        "windows": "taskkill /T /F tree kill"
       }
     },
     "context.manage": {

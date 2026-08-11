@@ -163,7 +163,7 @@ The repository is already partially aligned with this architecture.
 | Permission model | [~] too coarse | `ToolSpec` has only `ReadOnly`, `WorkspaceWrite`, and `ProcessExecution`; capability permissions are strings and a capability can understate real behavior. Standing grants now narrow approval at the gate (`CORE-08`), but capability-declared permissions remain coarse strings. |
 | Output contract | [~] partial | Builtins generally bound output and spill artifacts; the kernel-level trusted output broker caps every model-facing field and spills oversized content once (`CORE-04`), `ToolSpec` declares a per-tool output budget that the broker enforces (clamped to the global hard cap), and the actor keeps a last-line guard. Process capability output/stderr still needs one enforced path. |
 | File/navigation tools | [~] useful baseline | `fs.list`, ranged `fs.read`, `search.grep`, `fs.write`, exact `edit.replace`, and multi-file `edit.patch` with file-revision preconditions (`base_revision`, SHA-256 `revision` from `fs.read`) cover basic work. Missing: glob/multi-read, binary/media metadata, symbol/diagnostic navigation, and stronger cancellation on search/read. |
-| Process tools | [~] useful baseline | `shell.exec` has timeout, bounded tail, and artifact output. It is a one-shot shell string, not a structured run/start/poll/stop process protocol; process-tree isolation remains incomplete. |
+| Process tools | [~] useful baseline | `shell.exec` has timeout, bounded tail, and artifact output. `process.run` runs an explicit argv with workspace-relative cwd, env overrides and whole-tree kill on timeout/cancel; `process.session` adds start/poll/stop for long-running processes. The raw shell string remains a controlled fallback. |
 | VCS tools | [~] minimal | `git.status` and `git.diff` are confined, bounded, and read-only. `log/show/blame` and structured change review are absent; commit/push must remain higher-risk effects. |
 | Runtime control | [~] partial | `context.manage` and `capability.manage` are merged bounded control surfaces. There is no typed TaskAnchor/open-loop control, artifact fetch surface, or task completion proposal. |
 | Completion semantics | [ ] missing | The final answer is a normal AssistantMessage and `/done` accepts unrelated free text. `CTX-10` defines the required TaskAnchor-to-CompletionRecord root transfer. |
@@ -1013,8 +1013,13 @@ together with TaskAnchor and continuous context GC.
   content, and multiple files commit as one composite effect with
   journal-backed rollback evidence. `edit.replace` remains the simpler
   single-hunk tool; no deprecation.
-- [ ] **TOOLS-06** Add structured process/session semantics and process-tree cleanup;
-  retain shell as a controlled fallback.
+- [x] **TOOLS-06** Add structured process/session semantics and process-tree cleanup;
+  retain shell as a controlled fallback. `process.run` executes an explicit
+  argv (no shell) with workspace-relative cwd, explicit env overrides,
+  bounded tail + artifact output, and whole-tree kill on timeout/cancel;
+  `process.session` adds the start/poll/stop protocol for long-running
+  processes (shared per-dispatcher session registry, drained output,
+  tree-killing stop). `shell.exec` stays as the raw-string fallback.
 - [ ] **TOOLS-07** Add artifact range fetch and consistent result paging.
 - [x] **TOOLS-08P** Validate the TaskToolRequirements/round-surface first
   slice: bounded TaskRecord CAS, Must/Prefer/KeepReady packing and degradation,

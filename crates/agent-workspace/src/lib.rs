@@ -479,6 +479,51 @@ impl Workspace {
         Ok((artifact_ref(&self.root, &path), file))
     }
 
+    /// Create an artifact and return its model-facing reference *and* its
+    /// filesystem path, so a caller that must append to the file across
+    /// tool calls (a process session's poll loop) can reopen it by path.
+    pub async fn create_artifact_path(
+        &self,
+        run_id: RunId,
+        prefix: &str,
+        extension: &str,
+    ) -> AgentResult<(String, std::path::PathBuf)> {
+        let run_dir = self.state_dir.join("artifacts").join(run_id.to_string());
+        fs::create_dir_all(&run_dir)
+            .await
+            .map_err(|e| AgentError::Io(format!("create artifact dir: {e}")))?;
+
+        let safe_prefix: String = prefix
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(48)
+            .collect();
+        let safe_ext: String = extension
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(12)
+            .collect();
+        let filename = if safe_ext.is_empty() {
+            format!("{}-{}", safe_prefix, Uuid::new_v4())
+        } else {
+            format!("{}-{}.{}", safe_prefix, Uuid::new_v4(), safe_ext)
+        };
+        let path = run_dir.join(filename);
+        tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .await
+            .map_err(|e| AgentError::Io(format!("create artifact: {e}")))?;
+        Ok((artifact_ref(&self.root, &path), path))
+    }
+
     /// Append a mutation record to the workspace change journal
     /// (`.focus-agent/changes.jsonl`). Mutating tools call this so every
     /// write is visible and reviewable.

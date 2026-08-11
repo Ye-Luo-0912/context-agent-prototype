@@ -5,6 +5,7 @@ mod git;
 mod patch;
 mod process;
 mod search;
+mod session;
 mod shell;
 mod stream;
 
@@ -15,6 +16,7 @@ pub(crate) use git::{GitDiffTool, GitStatusTool};
 pub(crate) use patch::EditPatchTool;
 pub(crate) use process::ProcessRunTool;
 pub(crate) use search::SearchGrepTool;
+pub(crate) use session::{ProcessSession, ProcessSessionTool};
 pub(crate) use shell::ShellExecTool;
 
 use agent_contracts::{AgentResult, CancellationToken, RunId, ToolOutcome, ToolSpec};
