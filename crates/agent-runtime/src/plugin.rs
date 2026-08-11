@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Duration;
 
-use agent_contracts::{AgentError, AgentResult, PluginActivation, PluginPackageManifest};
+use agent_contracts::{
+    AgentError, AgentResult, PluginActivation, PluginPackageManifest, SkillActivation, SkillSource,
+};
 use agent_core::{PluginPackageAdmission, PluginStateAuthority};
 use tokio::io::AsyncReadExt;
 
@@ -176,6 +178,63 @@ impl PluginRegistry {
             )))
         }
     }
+
+    /// The declared skills of one package, as a bounded metadata view.
+    pub fn skills(&self, package: &str) -> Option<Vec<SkillView>> {
+        let packages = self.packages.read().expect("plugin catalog poisoned");
+        packages.get(package).map(|entry| {
+            entry
+                .manifest
+                .skills
+                .iter()
+                .map(|skill| SkillView {
+                    id: skill.id.clone(),
+                    version: skill.version.clone(),
+                    summary: skill.summary.clone(),
+                    reference: skill.reference.clone(),
+                    provenance: skill.provenance,
+                    activation: skill.activation,
+                })
+                .collect()
+        })
+    }
+
+    /// Activate a declared skill. Metadata intent only (ECO-06): the
+    /// runtime never executes a skill and never turns its instructions
+    /// into System-authority content — activation only records that the
+    /// skill may be offered.
+    pub fn activate_skill(&self, package: &str, skill_id: &str) -> AgentResult<()> {
+        self.set_skill_activation(package, skill_id, SkillActivation::Active)
+    }
+
+    /// Deactivate a declared skill (metadata intent only).
+    pub fn deactivate_skill(&self, package: &str, skill_id: &str) -> AgentResult<()> {
+        self.set_skill_activation(package, skill_id, SkillActivation::Inactive)
+    }
+
+    fn set_skill_activation(
+        &self,
+        package: &str,
+        skill_id: &str,
+        next: SkillActivation,
+    ) -> AgentResult<()> {
+        let mut packages = self.packages.write().expect("plugin catalog poisoned");
+        let entry = packages.get_mut(package).ok_or_else(|| {
+            AgentError::InvalidRequest(format!("package '{package}' is not installed"))
+        })?;
+        let skill = entry
+            .manifest
+            .skills
+            .iter_mut()
+            .find(|skill| skill.id == skill_id)
+            .ok_or_else(|| {
+                AgentError::InvalidRequest(format!(
+                    "package '{package}' declares no skill '{skill_id}'"
+                ))
+            })?;
+        skill.activation = next;
+        Ok(())
+    }
 }
 
 /// A bounded, inspection-friendly view of one installed package.
@@ -193,6 +252,19 @@ pub struct PluginPackageView {
     pub adapters: usize,
     pub dependencies: usize,
     pub tests: usize,
+}
+
+/// A bounded metadata view of one declared skill (ECO-06). The reference
+/// is a package-relative location; the runtime never reads it and never
+/// injects skill instructions as System-authority content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillView {
+    pub id: String,
+    pub version: String,
+    pub summary: String,
+    pub reference: String,
+    pub provenance: SkillSource,
+    pub activation: SkillActivation,
 }
 
 fn view(entry: &PackageEntry, activation: Option<PluginActivation>) -> PluginPackageView {
@@ -260,7 +332,7 @@ async fn run_test_command(command: &[String], timeout: Duration) -> PluginTestRe
     }
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
+        use tokio::process::CommandExt;
         // Start the child in its own process group so a timeout can kill
         // the whole tree, not just the leader.
         cmd.process_group(0);
@@ -375,7 +447,7 @@ async fn kill_tree(child: &mut tokio::process::Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{TestDeclaration, ToolRisk, ToolSpec, VersionRange};
+    use agent_contracts::{SkillDeclaration, TestDeclaration, ToolRisk, ToolSpec, VersionRange};
     use serde_json::json;
 
     fn tool(name: &str) -> ToolSpec {
@@ -385,6 +457,27 @@ mod tests {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+        }
+    }
+
+    fn package_with_skill(
+        id: &str,
+        skill: SkillDeclaration,
+        tests: Vec<TestDeclaration>,
+    ) -> PluginPackageManifest {
+        PluginPackageManifest {
+            id: id.into(),
+            version: "1.0.0".into(),
+            name: id.into(),
+            summary: "test package".into(),
+            api: VersionRange("0.1".into()),
+            tools: vec![tool(&format!("{id}.run"))],
+            skills: vec![skill],
+            hooks: Vec::new(),
+            adapters: Vec::new(),
+            dependencies: Vec::new(),
+            permissions: vec!["workspace:read".into()],
+            tests,
         }
     }
 
@@ -590,6 +683,102 @@ mod tests {
         let result = &report.tests[0];
         assert!(result.timed_out, "a sleeping check must time out");
         assert!(!result.ok);
+    }
+
+    #[test]
+    fn skill_views_are_metadata_and_never_read_instructions() {
+        // ECO-06 anchor: the skill's referenced instruction file exists on
+        // disk with a marker, but no registry view ever reads it — a skill
+        // is metadata, never a source of System-authority content.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("skills")).unwrap();
+        std::fs::write(
+            dir.path().join("skills/do-thing.md"),
+            "TOP-SECRET-SKILL-INSTRUCTIONS\n",
+        )
+        .unwrap();
+
+        let registry = PluginRegistry::new();
+        registry
+            .install(package_with_skill(
+                "pack",
+                SkillDeclaration {
+                    id: "do-thing".into(),
+                    version: "1.0.0".into(),
+                    summary: "does the thing".into(),
+                    reference: "skills/do-thing.md".into(),
+                    provenance: SkillSource::Package,
+                    activation: SkillActivation::Inactive,
+                },
+                Vec::new(),
+            ))
+            .expect("install succeeds");
+
+        // Every model-facing view of the package must be free of the
+        // instruction content: the runtime never opens the reference.
+        let views = registry.skills("pack").expect("skills are viewable");
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].id, "do-thing");
+        assert_eq!(views[0].reference, "skills/do-thing.md");
+        let serialized = format!("{views:?}{:?}", registry.inspect("pack"));
+        assert!(
+            !serialized.contains("TOP-SECRET-SKILL-INSTRUCTIONS"),
+            "skill instructions must never reach a model-facing view"
+        );
+        // The package's model surface is tools only; a skill adds nothing.
+        let view = registry.inspect("pack").expect("package view");
+        assert_eq!(view.tools, 1);
+        assert_eq!(view.skills, 1);
+    }
+
+    #[test]
+    fn activate_skill_records_intent_without_runtime_effect() {
+        let registry = PluginRegistry::new();
+        registry
+            .install(package_with_skill(
+                "pack",
+                SkillDeclaration {
+                    id: "do-thing".into(),
+                    version: "1.0.0".into(),
+                    summary: "does the thing".into(),
+                    reference: "skills/do-thing.md".into(),
+                    provenance: SkillSource::Operator,
+                    activation: SkillActivation::Inactive,
+                },
+                Vec::new(),
+            ))
+            .expect("install succeeds");
+
+        registry
+            .activate_skill("pack", "do-thing")
+            .expect("activate records intent");
+        let skills = registry.skills("pack").expect("skills are viewable");
+        assert_eq!(skills[0].activation, SkillActivation::Active);
+        assert_eq!(skills[0].provenance, SkillSource::Operator);
+
+        registry
+            .deactivate_skill("pack", "do-thing")
+            .expect("deactivate records intent");
+        assert_eq!(
+            registry.skills("pack").unwrap()[0].activation,
+            SkillActivation::Inactive
+        );
+
+        // Activating a skill changes no surface and starts nothing: the
+        // package's tool count and activation are untouched.
+        let view = registry.inspect("pack").expect("package view");
+        assert_eq!(view.tools, 1);
+        assert_eq!(view.activation, PluginActivation::Installed);
+
+        // Unknown skills are refused.
+        assert!(
+            registry.activate_skill("pack", "nope").is_err(),
+            "activating an undeclared skill must fail"
+        );
+        assert!(
+            registry.activate_skill("missing", "do-thing").is_err(),
+            "activating a skill in an unknown package must fail"
+        );
     }
 
     #[tokio::test]

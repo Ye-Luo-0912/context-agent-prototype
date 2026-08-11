@@ -1208,8 +1208,21 @@ together with TaskAnchor and continuous context GC.
   tests pin the protocol and the boundary, including a real spawned mock
   MCP server (`mcp_mock_server` bin) exercising discovery + invocation +
   failure + bounded echo.
-- [ ] **ECO-06** Define Skill activation/deactivation and provenance without turning
+- [x] **ECO-06** Define Skill activation/deactivation and provenance without turning
   instructions into System-authority content.
+  **Done 2026-08-12.** `SkillDeclaration` (agent-contracts `plugin`) gains
+  `provenance: SkillSource` (Builtin/Package/Operator — attribution only,
+  never a permission source) and `activation: SkillActivation`
+  (Active/Inactive, default Inactive). `PluginRegistry` (agent-runtime
+  `plugin`) exposes a bounded `skills(package) -> Vec<SkillView>` metadata
+  view (id/version/summary/reference/provenance/activation) plus
+  `activate_skill`/`deactivate_skill`, which only record the operator's
+  intent — activation changes no tool surface, starts nothing and never
+  turns the referenced instructions into System-authority content. An
+  anchor test installs a package whose skill reference points at a real
+  file containing a marker and asserts no registry view ever serializes
+  the marker; a second test asserts activation is intent-only (surface and
+  activation untouched, unknown skill/package refused).
 - [ ] **ECO-07** Define Hook ordering, time/resource bounds, failure policy, and the rule
   that hooks cannot widen permissions or mutate protected state silently.
 

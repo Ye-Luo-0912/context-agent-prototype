@@ -381,6 +381,8 @@ mod tests {
                 version: "1.0.0".into(),
                 summary: "does the thing".into(),
                 reference: "skills/do-thing.md".into(),
+                provenance: agent_contracts::SkillSource::Package,
+                activation: agent_contracts::SkillActivation::Inactive,
             }],
             hooks: vec![agent_contracts::HookDeclaration {
                 id: "observe-model".into(),
@@ -504,6 +506,8 @@ mod tests {
                 version: "1.0.0".into(),
                 summary: "s".into(),
                 reference: "skills/s.md".into(),
+                provenance: agent_contracts::SkillSource::Package,
+                activation: agent_contracts::SkillActivation::Inactive,
             });
         }
         let error = PluginPackageAdmission::validate_static(&package).unwrap_err();

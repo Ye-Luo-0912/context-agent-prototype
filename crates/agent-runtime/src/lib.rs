@@ -39,7 +39,7 @@ pub use modules::{
 };
 pub use plugin::{
     PLUGIN_TEST_OUTPUT_TAIL_CHARS, PLUGIN_TEST_TIMEOUT, PluginPackageView, PluginRegistry,
-    PluginTestReport, PluginTestResult,
+    PluginTestReport, PluginTestResult, SkillView,
 };
 pub use prompt::PromptAssembler;
 pub use services::RuntimeServices;

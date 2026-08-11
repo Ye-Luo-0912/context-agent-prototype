@@ -70,9 +70,38 @@ impl PluginActivation {
     }
 }
 
+/// Where a skill came from. Provenance is recorded so a skill is always
+/// attributable; it never grants authority by itself (ECO-01/ECO-06).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillSource {
+    /// Ships with the runtime (first-party, operator-reviewed).
+    Builtin,
+    /// Contributed by an installed plugin package.
+    Package,
+    /// Installed directly by an operator, outside any package.
+    Operator,
+}
+
+/// Activation state of a declared skill. Metadata only: the runtime never
+/// executes a skill, so activation records the operator's intent (which
+/// skills may be offered) without turning instructions into runtime
+/// authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillActivation {
+    /// Declared but not offered.
+    #[default]
+    Inactive,
+    /// Declared and offered for use.
+    Active,
+}
+
 /// A declared skill: versioned procedural knowledge built from existing
 /// tools. Metadata only (ECO-01): never executed, never injected into
-/// context, adds no authority.
+/// context, adds no authority. The referenced instructions, when they are
+/// offered, enter context as ordinary (non-System-authority) content and
+/// only while the skill is active (ECO-06).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillDeclaration {
     /// Component id (same grammar as a capability id).
@@ -84,6 +113,12 @@ pub struct SkillDeclaration {
     /// Where the procedure lives (a package-relative path). Shape-checked
     /// at admission; the runtime does not read it in v0.
     pub reference: String,
+    /// Where the skill came from; recorded for attribution, never a
+    /// permission source.
+    pub provenance: SkillSource,
+    /// Whether the skill is offered. Metadata only (no runtime effect).
+    #[serde(default)]
+    pub activation: SkillActivation,
 }
 
 /// A declared hook: a lifecycle observation/gating point. Metadata only
