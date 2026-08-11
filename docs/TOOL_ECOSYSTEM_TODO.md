@@ -1137,9 +1137,30 @@ together with TaskAnchor and continuous context GC.
 
 ### Gate 4: extension packaging
 
-- [ ] **ECO-03** Define a versioned plugin package manifest with explicit contributed
+- [x] **ECO-03** Define a versioned plugin package manifest with explicit contributed
   tools, skills, hooks, adapters, dependencies, permissions, schemas, tests,
   and compatibility range.
+  **Done 2026-08-12.** `PluginPackageManifest` (agent-contracts `plugin`)
+  is the versioned installation unit: identity + version + name + summary,
+  an `api` compatibility range (a lexically validated `VersionRange`;
+  resolution is the installer's job, ECO-04), contributed `tools` (the
+  capability plane's `ToolSpec` — same schema shape and caps), declared
+  `skills` / `hooks` / `adapters` (metadata only per ECO-01: versioned,
+  validated, never executed, never permission-bearing), `dependencies`
+  (package id + version range), `permissions` (the known permission-word
+  table), and `tests` (bounded argv self-checks run in a sandbox at
+  install/test time, never during a turn). Admission is a core decision:
+  `PluginPackageAdmission::validate_static` (agent-core `plugin_admission`)
+  is a pure function of the manifest — id/version/range/name/summary
+  shape, per-component id and duplicate checks, skill-reference
+  confinement (package-relative, no absolute/`..`/backslash/control
+  chars), hook-event shape, adapter endpoint bounds, dependency id+range,
+  permission-word whitelist, test-command argv bounds, and per-package
+  component caps (`MAX_TOOLS_PER_PACKAGE` 32, skills 16, hooks 16,
+  adapters 8, dependencies 16, tests 16). Tool schemas reuse the capability
+  schema validator verbatim, so a package cannot smuggle in a schema the
+  capability plane would refuse. Nine admission tests pin the contract,
+  including serde round-trip.
 - [ ] **ECO-04** Add install/inspect/test/enable/disable/quarantine flows; installation
   never implies activation or permission.
 - [ ] **ECO-05** Add MCP-like adapter support behind the same capability/effect/output

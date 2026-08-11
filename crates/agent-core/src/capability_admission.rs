@@ -135,10 +135,12 @@ pub struct AdmissionContext<'a> {
     pub owner_of_tool: &'a dyn Fn(&str) -> Option<String>,
 }
 
-/// Validate the tool schemas a capability declares at registration: name
-/// shape/length, description length, per-schema byte size, duplicate names
-/// within the capability, and the per-capability tool count.
-fn validate_tool_specs(manifest_id: &str, specs: &[ToolSpec]) -> AgentResult<()> {
+/// Validate the tool schemas a capability (or plugin package) declares at
+/// admission: name shape/length, description length, per-schema byte size,
+/// duplicate names within the owner, and the per-owner tool count. Shared
+/// by capability and plugin admission so a package cannot smuggle in a
+/// schema the capability plane would refuse.
+pub(crate) fn validate_tool_specs(manifest_id: &str, specs: &[ToolSpec]) -> AgentResult<()> {
     if specs.len() > MAX_TOOLS_PER_CAPABILITY {
         return Err(AgentError::InvalidRequest(format!(
             "capability '{manifest_id}' declares {} tools, above the {MAX_TOOLS_PER_CAPABILITY} per-capability cap",
