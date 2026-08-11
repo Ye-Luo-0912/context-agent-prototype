@@ -39,6 +39,45 @@ fn main() {
 /// file with an incrementing counter every 50 ms — the *only* observable
 /// liveness signal from outside the process, so a cancellation test can
 /// prove the child tree was actually terminated (the counter stops).
+/// One mid-invoke system request the mock issues, plus the `model_content`
+/// prefixes the parent-side test asserts on the broker's answer. The ok and
+/// refused prefixes differ per op family (`FS_READ`/`FS_REFUSED` for
+/// `fs.read`, `NET_FETCH`/`NET_REFUSED` for `net.fetch`), so a test can
+/// tell a refused read from a refused network request.
+enum SystemProbe {
+    FsRead { path: String },
+    NetFetch,
+    Unknown,
+}
+
+impl SystemProbe {
+    fn frame(&self) -> Value {
+        match self {
+            SystemProbe::FsRead { path } => json!({ "system": "fs.read", "path": path }),
+            SystemProbe::NetFetch => json!({ "system": "net.fetch", "url": "http://127.0.0.1/" }),
+            SystemProbe::Unknown => json!({ "system": "no.such.op" }),
+        }
+    }
+
+    fn ok_prefix(&self) -> &'static str {
+        match self {
+            SystemProbe::FsRead { .. } => "FS_READ",
+            // Never observed today: network is deny-by-default, so the
+            // broker always refuses; kept for symmetry with `fs.read`.
+            SystemProbe::NetFetch => "NET_FETCH",
+            SystemProbe::Unknown => "FS_READ",
+        }
+    }
+
+    fn refused_prefix(&self) -> &'static str {
+        match self {
+            SystemProbe::FsRead { .. } => "FS_REFUSED",
+            SystemProbe::NetFetch => "NET_REFUSED",
+            SystemProbe::Unknown => "FS_REFUSED",
+        }
+    }
+}
+
 async fn server_loop() {
     // Bounded-stderr test hook: when the parent injects
     // `MOCK_STDERR_FLOOD_BYTES`, the mock writes that many bytes to stderr
@@ -155,24 +194,41 @@ async fn server_loop() {
                     .get("permissions")
                     .cloned()
                     .unwrap_or(Value::Array(Vec::new()));
-                // Brokered-fs test hooks: `ask_fs_read: "<path>"` makes the
-                // mock issue a mid-invoke `{"system": "fs.read", ...}`
-                // frame and wait for the host's answer; `ask_unknown_system:
-                // true` issues an unknown system op. The outcome replaces
-                // the canned model content so the parent-side test sees
-                // exactly what the broker allowed or refused.
+                // Brokered-system test hooks: `ask_fs_read: "<path>"` makes
+                // the mock issue a mid-invoke `{"system": "fs.read", ...}`
+                // frame and wait for the host's answer; `ask_net_fetch:
+                // true` issues a `{"system": "net.fetch", ...}` frame;
+                // `ask_unknown_system: true` issues an undeclared op. The
+                // outcome replaces the canned model content so the
+                // parent-side test sees exactly what the broker allowed or
+                // refused.
                 let ask_fs_read = request
                     .get("call")
                     .and_then(|call| call.get("arguments"))
                     .and_then(|args| args.get("ask_fs_read"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                let ask_net_fetch = request
+                    .get("call")
+                    .and_then(|call| call.get("arguments"))
+                    .and_then(|args| args.get("ask_net_fetch"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let ask_unknown_system = request
                     .get("call")
                     .and_then(|call| call.get("arguments"))
                     .and_then(|args| args.get("ask_unknown_system"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                let probe = if let Some(path) = ask_fs_read {
+                    Some(SystemProbe::FsRead { path })
+                } else if ask_net_fetch {
+                    Some(SystemProbe::NetFetch)
+                } else if ask_unknown_system {
+                    Some(SystemProbe::Unknown)
+                } else {
+                    None
+                };
                 let model_content = match echo_env {
                     Some(name) => std::env::var(name).unwrap_or_default(),
                     None if echo_permissions => permissions.to_string(),
@@ -190,12 +246,8 @@ async fn server_loop() {
                 .expect("ToolOutput serializes");
                 // When a broker hook is set, run one system round trip now
                 // and overwrite the model content with its outcome.
-                let output = if ask_fs_read.is_some() || ask_unknown_system {
-                    let system = match ask_fs_read {
-                        Some(path) => json!({ "system": "fs.read", "path": path }),
-                        None => json!({ "system": "no.such.op" }),
-                    };
-                    let answer = system_round_trip(&mut writer, &mut lines, system).await;
+                let output = if let Some(probe) = probe {
+                    let answer = system_round_trip(&mut writer, &mut lines, probe.frame()).await;
                     let model_content = match (
                         answer.get("system_ok").and_then(Value::as_bool),
                         answer.get("value"),
@@ -211,10 +263,10 @@ async fn server_loop() {
                                 content,
                             )
                             .unwrap_or_default();
-                            format!("FS_READ:{}", String::from_utf8_lossy(&bytes))
+                            format!("{}:{}", probe.ok_prefix(), String::from_utf8_lossy(&bytes))
                         }
-                        (_, _, Some(error)) => format!("FS_REFUSED:{error}"),
-                        _ => "FS_REFUSED:malformed system answer".into(),
+                        (_, _, Some(error)) => format!("{}:{error}", probe.refused_prefix()),
+                        _ => format!("{}:malformed system answer", probe.refused_prefix()),
                     };
                     let mut output = output;
                     output["model_content"] = json!(model_content);

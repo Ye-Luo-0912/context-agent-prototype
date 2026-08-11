@@ -887,3 +887,72 @@ async fn unknown_system_ops_are_refused() {
     );
     capability.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn brokered_network_requests_are_refused_by_default() {
+    // The permission vocabulary has no network word at all, so a network
+    // system request is denied by default — with an explicit, nameable
+    // refusal instead of a silent fall-through.
+    let capability = started_readonly_capability().await;
+    let output = capability
+        .invoke(
+            ToolCall {
+                id: "c12".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({ "ask_net_fetch": true }),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec!["workspace:read".into()],
+                workspace: None,
+                artifacts: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let model_content = match output {
+        CapabilityOutcome::Value(output) => output.model_content,
+        other => panic!("the wire only carries plain values, got: {other:?}"),
+    };
+    assert!(
+        model_content.contains("NET_REFUSED:")
+            && model_content.contains("net.fetch")
+            && model_content.contains("deny-by-default"),
+        "a network op must be refused with the explicit policy: {model_content}"
+    );
+    capability.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn network_requests_are_refused_even_with_a_networkish_grant() {
+    // No network permission exists, so even a grant string that *looks*
+    // like one (from a misdeclared manifest, or a future over-eager
+    // registry) must not unlock the network: the broker never consults a
+    // grant for these ops — there is nothing to grant.
+    let capability = started_readonly_capability().await;
+    let output = capability
+        .invoke(
+            ToolCall {
+                id: "c13".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({ "ask_net_fetch": true }),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec!["net:fetch".into(), "workspace:read".into()],
+                workspace: None,
+                artifacts: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let model_content = match output {
+        CapabilityOutcome::Value(output) => output.model_content,
+        other => panic!("the wire only carries plain values, got: {other:?}"),
+    };
+    assert!(
+        model_content.contains("NET_REFUSED:") && model_content.contains("net.fetch"),
+        "a networkish grant must not unlock the network: {model_content}"
+    );
+    capability.stop().await.unwrap();
+}

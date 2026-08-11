@@ -253,10 +253,25 @@ impl ProcessCapabilityAdapter {
 /// granted to it": the path is confined by construction (relative, no `..`,
 /// never absolute) and the read goes through the workspace handle, never an
 /// absolute filesystem path.
+///
+/// Network access is *deny-by-default by design*: no network permission word
+/// exists anywhere in the permission vocabulary, so there is nothing to
+/// grant. Recognized network ops are refused with an explicit message
+/// instead of falling through to the generic unknown-op refusal, so the
+/// policy is nameable and testable; everything else stays refused too.
 struct InvokeFsBroker<'a> {
     id: &'a str,
     grant: &'a [String],
     workspace: Option<&'a Arc<dyn WorkspaceHandle>>,
+}
+
+/// The known network system ops. Recognized so the refusal names the policy;
+/// the broker never consults a grant for these — none exists.
+fn is_network_system_op(op: &str) -> bool {
+    matches!(
+        op,
+        "net.fetch" | "net.connect" | "http.get" | "http.request"
+    )
 }
 
 #[async_trait]
@@ -264,6 +279,10 @@ impl SystemBroker for InvokeFsBroker<'_> {
     async fn handle(&self, request: Value) -> AgentResult<Value> {
         match request.get("system").and_then(Value::as_str) {
             Some("fs.read") => self.handle_fs_read(&request).await,
+            Some(op) if is_network_system_op(op) => Err(AgentError::InvalidRequest(format!(
+                "capability '{}' requested network op '{op}': network access is deny-by-default, no network permission exists",
+                self.id
+            ))),
             Some(other) => Err(AgentError::InvalidRequest(format!(
                 "capability '{}' requested unknown system op '{other}'",
                 self.id
