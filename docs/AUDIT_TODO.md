@@ -197,17 +197,24 @@ GC moves `body_location`; it does not move or duplicate authority metadata.
 Property tests must run supersession, recurrence, verification, completion
 and quota sequences with the target initially in every residency.
 
-Residual correctness follow-up — the aging half is **closed 2026-08-11**:
+Residual correctness follow-up — **closed 2026-08-11**:
 minor TTL/tombstone aging no longer iterates Resident items only. The
 maintenance pass now tombstones warm-buffer items on the same windows
 residency uses (ephemeral TTL, then `ttl x 4` staleness), with pinned and
 keep-alive/lease items exempt exactly like the resident root set; a
 tombstoned warm item is never reactivated by hot entities. Regressions:
 `warm_ephemeral_item_is_tombstoned_by_ttl_not_only_resident`,
-`warm_working_item_is_tombstoned_by_staleness`. Stored (`ExternalizedContext`)
-metadata still cannot represent every keep/lease directive field, and the
-authority/body split (`ContextCatalog`) remains the structural target — make
-the remaining protection semantics catalog-owned before closing it.
+`warm_working_item_is_tombstoned_by_staleness`. Stored metadata now
+represents every protection field too: `ExternalizedContext` carries
+`keep_alive`/`lease_until_turn` (captured at externalize time, cleared by
+task completion in every body location), so a protection survives a
+buffer-overflow externalize and a completed task cannot keep rooting its
+records through a stored reference. Regressions:
+`external_entries_carry_the_model_protection_fields`,
+`completed_task_clears_protections_in_external_entries`. The authority/body
+split (`ContextCatalog`, one `item_id -> ContextRecord` where GC moves
+`body_location` without duplicating authority metadata) remains the
+structural target.
 
 ### CTX-03 — Fetch/Search/Inspect persist as new observations
 

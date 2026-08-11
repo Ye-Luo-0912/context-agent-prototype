@@ -1203,7 +1203,10 @@ letting the LLM grow capabilities autonomously.
    final-output digest (`CTX-10`); the System-role split (`CORE-05`); the
    episode-local turn counter (rotation resets it, and GC ages ordinary
    dialogue out of the open episode, so a long episode stays bounded without
-   rotating every message). The canonical catalog remains.
+   rotating every message); catalog-owned aging/protection semantics across
+   body locations (warm-buffer TTL/staleness clock, protection fields on
+   stored entries). The authority/body split (`ContextCatalog`, one
+   `item_id -> ContextRecord`) remains.
 3. **Close trusted execution (M12/M13).** Extend process IPC with typed
    prepared effects, broker or confine direct shell/process mutation, and add
    real filesystem/network/resource isolation with adversarial cancel/escape
