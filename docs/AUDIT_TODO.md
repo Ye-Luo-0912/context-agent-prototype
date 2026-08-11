@@ -953,28 +953,47 @@ lower-authority role/structured field. Add malicious file/tool/store evals.
 
 - Git now kills the direct child, not guaranteed descendants;
 - process-capability cancellation kills a Unix process group or invokes
-  Windows `taskkill /T`, and `shell.exec` now does the same through the
-  shared `agent_process::kill_process_tree` — a cancelled shell no longer
-  leaves `&` background jobs or `start`-spawned descendants running (the
-  M12 stale-mutation boundary); Git descendants and Windows Job-Object
-  quota enforcement remain incomplete; every process path still needs
+  Windows `taskkill /T`, and `shell.exec` / the git tools do the same
+  through the shared `agent_process::kill_process_tree` — a cancelled
+  shell no longer leaves `&` background jobs or `start`-spawned
+  descendants running, and a timed-out git cannot leave hook/alias-spawned
+  subprocesses alive (the M12 stale-mutation boundary); Windows Job-Object
+  quota enforcement remains incomplete; every process path still needs
   bounded artifact/line/decoded-total quotas;
-- approval timeout/cancel needs pending cleanup and bounded previews; UI
-  defaults must not turn ambiguity/truncation into allow;
-- provider streams need total response/error/SSE byte caps and explicit
-  cancellation at EOF/backoff boundaries.
+- approval timeout/cancel now cleans up every pending entry (broker and
+  decisions map) and the wait ends the moment the operation is cancelled;
+  the UI preview is bounded (220 chars) and only explicit y/n/Enter/Esc
+  resolve a prompt — ambiguity or truncation never becomes allow;
+- provider streams now carry a total byte cap; EOF/backoff boundaries
+  already cancel explicitly.
 
-**2026-08-11: `shell.exec` process-tree termination landed.** The tree-kill
-used by the process-capability host is now one shared public primitive
-(`agent_process::kill_process_tree`): Unix process-group SIGKILL (the child
-spawns as a group leader) and Windows `taskkill /T`. `shell.exec` spawns
-its shell as a group leader and calls it on cancel/timeout instead of
-killing only the direct child. Regression test
-`shell_cancellation_kills_descendants` proves a cancelled shell's
-descendant heartbeat freezes. The test command carries no nested quotes —
-Rust's Windows argument escaping would mangle `\"` for cmd.exe. Remaining:
-Git descendants, Windows Job-Object quotas, approval cleanup/bounded
-previews, and provider stream byte caps.
+**2026-08-11: process-tree termination + approval + stream caps landed.**
+
+1. **Shared tree-kill** — `agent_process::kill_process_tree` (Unix
+   process-group SIGKILL, Windows `taskkill /T`) is now the one primitive
+   behind the process-capability host, `shell.exec` (group leader on
+   Unix; kills the tree on cancel/timeout) and the git tools (explicit
+   spawn + wait; tree kill on cancel/timeout). Regression tests:
+   `shell_cancellation_kills_descendants` (a descendant heartbeat freezes
+   after cancel) and the existing git/process tests. The Windows test
+   command carries no nested quotes — Rust's argument escaping would
+   mangle `\"` for cmd.exe.
+2. **Approval pending cleanup** — `ApprovalGate::authorize` now takes the
+   operation's cancel token: a cancelled operation stops waiting
+   immediately (no 5-minute stall) and every exit path removes both the
+   broker entry and the decisions entry (the old cancel/timeout branches
+   leaked the oneshot sender). Tests: `cancelled_approval_cleans_up_
+   pending_entries`, `timed_out_approval_cleans_up_pending_entries`,
+   `answered_approval_resolves_and_cleans_up`.
+3. **Provider stream cap** — `OpenAiConfig::max_stream_bytes`
+   (`DEFAULT_MAX_STREAM_BYTES = 16 MiB`) counts every decoded SSE line and
+   fails the transport instead of growing the accumulator forever.
+   `stream_over_cap_fails_bounded` drives a local mock SSE server that
+   streams forever and asserts the tiny cap refuses.
+
+Remaining: Windows Job-Object quota enforcement (M13), bounded
+artifact/line/decoded-total quotas per process path, and the standing-grant
+`TaskExecutionPolicy` (CORE-08).
 
 ### CORE-07 — Workspace operations remain TOCTOU-sensitive
 
