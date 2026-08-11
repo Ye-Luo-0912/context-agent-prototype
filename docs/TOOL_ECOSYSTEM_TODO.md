@@ -787,8 +787,28 @@ together with TaskAnchor and continuous context GC.
 - [ ] **MOD-02** Reserve "composition module/adapter" for operator-trusted services;
   reserve "capability" for runtime-loadable actions/services; define Skill,
   Hook, and Plugin Package separately.
-- [ ] **ECO-01** Decide whether Skills and Hooks are first-class contracts now or remain
-  package metadata until the base ACI is measured.
+- [x] **ECO-01** Decide whether Skills and Hooks are first-class contracts now or remain
+    package metadata until the base ACI is measured.
+    **Decision 2026-08-12: Skills and Hooks remain *declared package
+    metadata* — they are not first-class runtime contracts yet.** A
+    manifest may declare a Skill (`provides: Vec<CapabilityKind>` already
+    carries `tool`/`skill`/`service`) and may carry a Hook section, but the
+    runtime does not interpret either: a declared Skill never injects
+    instructions into context, never starts a process, and adds no
+    authority; a declared Hook never fires on lifecycle events. First-class
+    status is gated on the evidence gate (Gate 5 / M15): the base ACI was
+    only just completed (Gate 3, TOOLS-05..09), so there is no real-load
+    measurement yet, and the two open risks that would justify first-class
+    mechanics — Skill provenance without turning instructions into
+    System-authority content (ECO-06) and Hook ordering/time/resource bounds
+    and failure policy (ECO-07) — cannot be validated against workloads
+    that do not exist yet. Until then the package manifest (ECO-03) treats
+    Skills and Hooks as versioned, validated, source-attributed metadata:
+    shape-checked at install, never executed, never permission-bearing. Two
+    hard rules already stated in this document stay binding: loading a
+    Skill must not implicitly start a process capability, and installing an
+    MCP adapter must not implicitly inject its schema catalog into every
+    model request.
 
 ### Gate 1: specify the base ACI before adding tools
 

@@ -1105,7 +1105,8 @@ impl CapabilityAwareDispatcher {
 mod tests {
     use super::*;
     use agent_contracts::{
-        CancellationToken, ContextAction, RunId, RuntimeDirective, ToolCall, ToolRisk,
+        CancellationToken, CapabilityKind, ContextAction, RunId, RuntimeDirective, ToolCall,
+        ToolRisk,
     };
     use std::{
         sync::{Mutex, mpsc},
@@ -1311,6 +1312,82 @@ mod tests {
                 transport: CapabilityTransport::Builtin,
             },
         }
+    }
+
+    /// ECO-01 anchor: a manifest whose `provides` declares a Skill. The
+    /// declaration must be accepted and validated as metadata, but the
+    /// runtime must not interpret it: no tool schema reaches the model
+    /// surface, the skill is not loadable as a tool, and nothing is
+    /// implicitly activated or started.
+    struct SkillOnlyCapability {
+        manifest: CapabilityManifest,
+    }
+
+    #[async_trait::async_trait]
+    impl Capability for SkillOnlyCapability {
+        fn manifest(&self) -> &CapabilityManifest {
+            &self.manifest
+        }
+
+        async fn invoke(
+            &self,
+            _call: agent_contracts::ToolCall,
+            _ctx: CapabilityInvocationContext,
+        ) -> AgentResult<CapabilityOutcome> {
+            unreachable!("a skill-only capability is never invoked as a tool")
+        }
+    }
+
+    fn skill_only_capability(id: &str) -> SkillOnlyCapability {
+        SkillOnlyCapability {
+            manifest: CapabilityManifest {
+                id: id.into(),
+                version: "0.1.0".into(),
+                name: id.into(),
+                summary: "a multi-step skill".into(),
+                status: CapabilityStatus::Experimental,
+                provides: vec![CapabilityKind::Skill],
+                permissions: Vec::new(),
+                requires: Vec::new(),
+                tools: Vec::new(),
+                lifecycle: CapabilityLifecycle::Lazy,
+                // Out-of-process transport: admission pins external
+                // capabilities to Experimental + Disabled, so the test
+                // proves a Skill declaration never implicitly activates.
+                transport: CapabilityTransport::Process {
+                    program: "skill-runner".into(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn skill_declarations_are_metadata_not_runtime_contracts() {
+        let registry = CapabilityRegistry::default();
+        registry
+            .register(Arc::new(skill_only_capability("skill-demo")))
+            .expect("a Skill declaration registers as validated metadata");
+
+        // No model-facing tools: a Skill adds no schema to the surface.
+        assert!(
+            registry.loaded_tool_specs().is_empty(),
+            "a declared Skill must not surface any tool schema"
+        );
+        // A Skill is not a tool and cannot be loaded as one.
+        assert!(
+            registry.load_tool("skill-demo.step").is_err(),
+            "a declared Skill must not be loadable as a tool"
+        );
+        // No implicit activation: admission defaults hold (Experimental +
+        // Disabled), so a declaration never enables or starts anything.
+        assert_eq!(
+            registry.status("skill-demo"),
+            Some(CapabilityStatus::Experimental)
+        );
+        assert_eq!(
+            registry.activation("skill-demo"),
+            Some(CapabilityActivation::Disabled)
+        );
     }
 
     /// A capability that returns a benign manifest at registration and an
