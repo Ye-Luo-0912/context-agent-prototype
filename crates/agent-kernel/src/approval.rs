@@ -1002,14 +1002,23 @@ mod tests {
         let now = now_ms();
         for bad in [
             write_grant("g1", "../escape", now + 10_000),
-            write_grant("g2", "C:\\abs", now + 10_000),
-            write_grant("g3", "/abs", now + 10_000),
+            write_grant("g2", "/abs", now + 10_000),
         ] {
             assert!(
                 gate.grant(bad).await.is_err(),
                 "an escaping or absolute grant target must be rejected"
             );
         }
+        // A drive-qualified path is absolute on Windows; on Unix `C:\abs`
+        // is an unusual but legal relative name, so assert the Windows
+        // absolute form only where it actually is one.
+        #[cfg(windows)]
+        assert!(
+            gate.grant(write_grant("g3", "C:\\abs", now + 10_000))
+                .await
+                .is_err(),
+            "a Windows drive path must be rejected as an absolute target"
+        );
         // A read-only grant is not an effect grant.
         let read_only = StandingGrant {
             id: "g4".into(),
