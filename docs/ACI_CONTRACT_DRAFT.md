@@ -50,6 +50,20 @@ Rules that constrain every shape below:
   optional documentation;
 - every mutation returns durable evidence sufficient to review and recover.
 
+## 0. What has landed since this draft
+
+**2026-08-11 (M14 slice):** the `EffectIntent` type is implemented in
+`agent-contracts` (`ReadOnly | WorkspaceWrite { path, content_bytes } |
+ProcessRun { command }`, with `risk()` bridging to the legacy `ToolRisk`),
+and `TaskApprovalGate` now derives the concrete intent from the validated
+arguments (`derive_effect_intent`) and matches standing grants against that
+intent — approval is effect-derived, never tool-name-derived. The
+`AuthorityGate` shadow-mode migration (`MOD-04`) can now reuse the derived
+intent directly. Still open from this draft: commit-time resource
+enforcement from the intent (the `AuthorityLease` step), the
+`ModelToolSpec`/`HostToolPolicy` split, and typed `PermissionSet`/
+`GrantSpec` — all remain specification until a later migration item.
+
 ## 2. ModelToolSpec / HostToolPolicy split
 
 ### 2.1 Why split

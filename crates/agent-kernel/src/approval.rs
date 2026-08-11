@@ -6,8 +6,8 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentError, AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, StandingGrant,
-    ToolCall, ToolRisk, ToolSpec,
+    AgentError, AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, EffectIntent,
+    StandingGrant, ToolCall, ToolRisk, ToolSpec,
 };
 use tokio::sync::{Mutex, broadcast, oneshot};
 use uuid::Uuid;
@@ -330,18 +330,21 @@ impl TaskApprovalGate {
         self.audit.lock().await.iter().cloned().collect()
     }
 
-    /// Whether `call` falls inside the grant's declared target scope.
-    fn grant_matches(grant: &StandingGrant, call: &ToolCall, spec: &ToolSpec) -> bool {
-        if grant.risk != spec.risk {
+    /// Whether the derived intent of `call` falls inside the grant's
+    /// declared target scope. Matching is effect-derived: the grant is
+    /// compared against the concrete intent (path, content size, command
+    /// prefix), never against the tool name alone.
+    fn grant_matches(grant: &StandingGrant, intent: &EffectIntent) -> bool {
+        if grant.risk != intent.risk() {
             return false;
         }
-        match spec.risk {
-            ToolRisk::ReadOnly => false,
-            ToolRisk::WorkspaceWrite => {
+        match intent {
+            EffectIntent::ReadOnly => false,
+            EffectIntent::WorkspaceWrite {
+                path,
+                content_bytes,
+            } => {
                 let Some(prefix) = &grant.target.workspace_path_prefix else {
-                    return false;
-                };
-                let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) else {
                     return false;
                 };
                 if !path_within_prefix(path, prefix) {
@@ -349,27 +352,56 @@ impl TaskApprovalGate {
                 }
                 // The write's content is part of the effect scope: a grant
                 // with a content cap does not cover oversized writes.
-                if let Some(max) = grant.constraint.max_content_bytes {
-                    let content = call
-                        .arguments
-                        .get("content")
-                        .or_else(|| call.arguments.get("new"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if content.len() as u64 > max {
-                        return false;
-                    }
+                if let Some(max) = grant.constraint.max_content_bytes
+                    && *content_bytes > max
+                {
+                    return false;
                 }
                 true
             }
-            ToolRisk::ProcessExecution => {
+            EffectIntent::ProcessRun { command } => {
                 let Some(prefix) = &grant.target.process_command_prefix else {
                     return false;
                 };
-                let Some(command) = call.arguments.get("command").and_then(|v| v.as_str()) else {
-                    return false;
-                };
                 command_with_prefix(command, prefix)
+            }
+        }
+    }
+
+    /// Derive the concrete effect intent of one call from its validated
+    /// arguments. Missing or malformed arguments produce the empty intent
+    /// of that class (an empty path/command can never match a grant), which
+    /// is the same fail-closed behavior as the legacy argument parsing.
+    fn derive_effect_intent(call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
+        match spec.risk {
+            ToolRisk::ReadOnly => EffectIntent::ReadOnly,
+            ToolRisk::WorkspaceWrite => {
+                let path = call
+                    .arguments
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let content_bytes = call
+                    .arguments
+                    .get("content")
+                    .or_else(|| call.arguments.get("new"))
+                    .and_then(|value| value.as_str())
+                    .map(|content| content.len() as u64)
+                    .unwrap_or(0);
+                EffectIntent::WorkspaceWrite {
+                    path,
+                    content_bytes,
+                }
+            }
+            ToolRisk::ProcessExecution => {
+                let command = call
+                    .arguments
+                    .get("command")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                EffectIntent::ProcessRun { command }
             }
         }
     }
@@ -405,9 +437,13 @@ impl ApprovalGate for TaskApprovalGate {
         // `active_grants` stays accurate.
         book.retain(|_, entry| entry.grant.expires_at_ms > now);
 
+        // Approval is effect-derived: derive the concrete intent from the
+        // validated arguments and match grants against it.
+        let intent = Self::derive_effect_intent(call, spec);
+
         let mut matched_id: Option<String> = None;
         for (id, entry) in book.iter_mut() {
-            if !Self::grant_matches(&entry.grant, call, spec) {
+            if !Self::grant_matches(&entry.grant, &intent) {
                 continue;
             }
             if let Some(max) = entry.grant.constraint.max_runs
@@ -416,7 +452,7 @@ impl ApprovalGate for TaskApprovalGate {
                 continue;
             }
             matched_id = Some(id.clone());
-            if spec.risk == ToolRisk::ProcessExecution {
+            if matches!(intent, EffectIntent::ProcessRun { .. }) {
                 entry.runs_used += 1;
             }
             break;
@@ -488,7 +524,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{GrantTarget, ToolRisk, ToolSpec};
+    use agent_contracts::{EffectIntent, GrantTarget, ToolRisk, ToolSpec};
     use serde_json::json;
 
     fn write_call() -> ToolCall {
@@ -1100,5 +1136,118 @@ mod tests {
             Err(AgentError::ApprovalDenied(_)) => {}
             other => panic!("no responder must deny, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn derive_effect_intent_extracts_the_concrete_effect_from_arguments() {
+        let write = ToolCall {
+            id: "c".into(),
+            name: "fs.write".into(),
+            arguments: json!({"path": "src/main.rs", "content": "fn main() {}"}),
+        };
+        let write_spec = ToolSpec {
+            name: "fs.write".into(),
+            description: "w".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::WorkspaceWrite,
+            output_budget: None,
+        };
+        assert_eq!(
+            TaskApprovalGate::derive_effect_intent(&write, &write_spec),
+            EffectIntent::WorkspaceWrite {
+                path: "src/main.rs".into(),
+                content_bytes: "fn main() {}".len() as u64,
+            }
+        );
+
+        // `edit.replace` declares content under `new`; the intent must use it.
+        let edit = ToolCall {
+            id: "c".into(),
+            name: "edit.replace".into(),
+            arguments: json!({"path": "src/main.rs", "old": "a", "new": "b"}),
+        };
+        assert_eq!(
+            TaskApprovalGate::derive_effect_intent(&edit, &write_spec),
+            EffectIntent::WorkspaceWrite {
+                path: "src/main.rs".into(),
+                content_bytes: 1,
+            }
+        );
+
+        let process = ToolCall {
+            id: "c".into(),
+            name: "shell.exec".into(),
+            arguments: json!({"command": "cargo test -- --nocapture"}),
+        };
+        let process_spec = ToolSpec {
+            name: "shell.exec".into(),
+            description: "p".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ProcessExecution,
+            output_budget: None,
+        };
+        assert_eq!(
+            TaskApprovalGate::derive_effect_intent(&process, &process_spec),
+            EffectIntent::ProcessRun {
+                command: "cargo test -- --nocapture".into()
+            }
+        );
+
+        let read = ToolCall {
+            id: "c".into(),
+            name: "fs.read".into(),
+            arguments: json!({"path": "src/main.rs"}),
+        };
+        let read_spec = ToolSpec {
+            name: "fs.read".into(),
+            description: "r".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+        };
+        assert_eq!(
+            TaskApprovalGate::derive_effect_intent(&read, &read_spec),
+            EffectIntent::ReadOnly
+        );
+    }
+
+    #[test]
+    fn derive_effect_intent_is_fail_closed_on_missing_arguments() {
+        // A write without a path yields an empty-path intent, which can
+        // never match a grant — the legacy parser behaved identically
+        // (missing path => no match).
+        let missing = ToolCall {
+            id: "c".into(),
+            name: "fs.write".into(),
+            arguments: json!({"content": "x"}),
+        };
+        let write_spec = ToolSpec {
+            name: "fs.write".into(),
+            description: "w".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::WorkspaceWrite,
+            output_budget: None,
+        };
+        assert_eq!(
+            TaskApprovalGate::derive_effect_intent(&missing, &write_spec),
+            EffectIntent::WorkspaceWrite {
+                path: String::new(),
+                content_bytes: 1,
+            }
+        );
+
+        // An empty-path intent never matches any path prefix.
+        let grant = StandingGrant {
+            id: "g".into(),
+            risk: ToolRisk::WorkspaceWrite,
+            target: GrantTarget {
+                workspace_path_prefix: Some("src".into()),
+                process_command_prefix: None,
+            },
+            constraint: Default::default(),
+            expires_at_ms: u64::MAX,
+        };
+        let intent = TaskApprovalGate::derive_effect_intent(&missing, &write_spec);
+        assert!(!TaskApprovalGate::grant_matches(&grant, &intent));
     }
 }

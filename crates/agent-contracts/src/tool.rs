@@ -53,6 +53,35 @@ pub enum ToolRisk {
     ProcessExecution,
 }
 
+/// The normalized side effect one tool call intends to perform, derived from
+/// the validated arguments — never from the tool's self-declared risk
+/// alone. Approval/policy matches this concrete intent, and the executor
+/// proves the actual effect fits it before commit. It is a conservative
+/// upper bound by design: a workspace write carries its target path and a
+/// byte estimate of the content, a process run its lexical command prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EffectIntent {
+    /// A read-only call; nothing to authorize.
+    ReadOnly,
+    /// A workspace write: the workspace-relative target path and a
+    /// conservative byte estimate of the content being written.
+    WorkspaceWrite { path: String, content_bytes: u64 },
+    /// A process run: the lexical command (whitespace-separated tokens).
+    ProcessRun { command: String },
+}
+
+impl EffectIntent {
+    /// The effect class the intent belongs to — the bridge to the legacy
+    /// `ToolRisk` grant vocabulary until grants move to typed permissions.
+    pub fn risk(&self) -> ToolRisk {
+        match self {
+            Self::ReadOnly => ToolRisk::ReadOnly,
+            Self::WorkspaceWrite { .. } => ToolRisk::WorkspaceWrite,
+            Self::ProcessRun { .. } => ToolRisk::ProcessExecution,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
@@ -648,6 +677,40 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn effect_intent_round_trips_and_maps_to_risk() {
+        for intent in [
+            EffectIntent::ReadOnly,
+            EffectIntent::WorkspaceWrite {
+                path: "src/main.rs".into(),
+                content_bytes: 42,
+            },
+            EffectIntent::ProcessRun {
+                command: "cargo test".into(),
+            },
+        ] {
+            let value = serde_json::to_value(&intent).unwrap();
+            let back: EffectIntent = serde_json::from_value(value).unwrap();
+            assert_eq!(back, intent);
+        }
+        assert_eq!(EffectIntent::ReadOnly.risk(), ToolRisk::ReadOnly);
+        assert_eq!(
+            EffectIntent::WorkspaceWrite {
+                path: "x".into(),
+                content_bytes: 1
+            }
+            .risk(),
+            ToolRisk::WorkspaceWrite
+        );
+        assert_eq!(
+            EffectIntent::ProcessRun {
+                command: "x".into()
+            }
+            .risk(),
+            ToolRisk::ProcessExecution
+        );
+    }
 
     /// Records whether it was committed or rolled back, optionally failing
     /// its own commit — the observable trace for the composite semantics.
