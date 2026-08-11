@@ -2226,7 +2226,7 @@ async fn output_broker_spills_oversized_tool_output_end_to_end() {
         }],
         ..ToolSurfaceSnapshot::default()
     };
-    let outcome = kernel
+    let (outcome, lease) = kernel
         .execute_tool(
             ToolCall {
                 id: "c1".into(),
@@ -2235,8 +2235,13 @@ async fn output_broker_spills_oversized_tool_output_end_to_end() {
             },
             CancellationToken::new(),
             &surface,
+            0,
         )
         .await;
+    assert!(
+        lease.is_none(),
+        "a read-only call carries no commit-time lease"
+    );
     let ToolOutcome::Value(output) = outcome else {
         panic!("expected a plain value outcome");
     };

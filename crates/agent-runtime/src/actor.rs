@@ -12,7 +12,7 @@ use std::{
 
 use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
-    AgentError, AgentResult, CONTEXT_CONSUMPTION_ACK_ITEM_CAP, CancellationToken,
+    AgentError, AgentResult, AuthorityLease, CONTEXT_CONSUMPTION_ACK_ITEM_CAP, CancellationToken,
     ContextConsumptionAck, ContextHints, ContextIngress, ContextMaintenanceReport,
     ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect, EffectDurability,
     EffectReceipt, ModelInput, ModelRequest, OperationId, OperationOutcome, OperationResult,
@@ -142,6 +142,12 @@ pub(crate) struct OperationCompletion {
     /// must roll it back so the effect never lands (tool computation is
     /// separate from side-effect commit).
     effect: Option<Box<dyn Effect>>,
+    /// The short-lived authority lease minted for this operation's side
+    /// effect (ACI v2 §6). The actor validates it again at commit time —
+    /// operation generation must match and the lease must not have expired
+    /// — before any staged effect lands; a refused lease rolls the effect
+    /// back and reports a failed tool result.
+    lease: Option<AuthorityLease>,
     /// A runtime directive (context control) the tool attached to its
     /// output. Executed at commit time, right after the effect — so a
     /// "manual collect now" is actually now, not at turn end.
@@ -1627,6 +1633,7 @@ impl RuntimeActor {
                     },
                     kind: OpKind::Model,
                     effect: None,
+                    lease: None,
                     directive: None,
                     disposition: ToolResultDisposition::PersistObservation,
                     context_ack: Some(context_ack),
@@ -1690,7 +1697,9 @@ impl RuntimeActor {
         let run_id = kernel.run_id();
         let task_id = self.state.task_id;
         tokio::spawn(async move {
-            let outcome = kernel.execute_tool(call, cancel, &surface).await;
+            let (outcome, lease) = kernel
+                .execute_tool(call, cancel, &surface, generation)
+                .await;
             let (operation, effect, directive, disposition) = match outcome {
                 ToolOutcome::Value(output) => (
                     OperationResult {
@@ -1780,6 +1789,7 @@ impl RuntimeActor {
                     operation,
                     kind: OpKind::Tool,
                     effect,
+                    lease,
                     directive,
                     disposition,
                     context_ack: None,
@@ -1875,10 +1885,69 @@ impl RuntimeActor {
                 }
             }
             OperationOutcome::ToolOutput(output) => {
-                // The generation fence passed: commit the staged effect
-                // before the result enters the turn frame. A commit failure
-                // is surfaced as a failed tool result — the model must not
-                // see "edit applied" when the rename never landed.
+                // The generation fence passed; the commit-time authority
+                // lease (ACI v2 §6), when one was minted, must still be
+                // current before any staged effect lands. A refused lease —
+                // stale operation generation or an expired authorization
+                // window — rolls the effect back and reports a failed tool
+                // result: the world must not change after the authorization
+                // ran out.
+                let lease_ok = completion
+                    .lease
+                    .as_ref()
+                    .is_none_or(|lease| lease.valid_at(now_ms(), completion.operation.generation));
+                if !lease_ok {
+                    if let Some(effect) = completion.effect {
+                        self.kernel
+                            .effect()
+                            .rollback(
+                                effect,
+                                &format!(
+                                    "authority lease expired or stale (generation {})",
+                                    completion.operation.generation
+                                ),
+                            )
+                            .await;
+                    }
+                    let _ = self
+                        .kernel
+                        .emit_warning(format!(
+                            "authority lease expired before commit (generation {}) — staged effect rolled back",
+                            completion.operation.generation
+                        ))
+                        .await;
+                    let output = ToolOutput {
+                        ok: false,
+                        summary: "authority lease expired before commit".to_string(),
+                        model_content: "the change was not applied: the authorization lease for this operation expired before it could be committed."
+                            .to_string(),
+                        ..output
+                    };
+                    // The failed result enters the turn frame exactly like a
+                    // commit failure would: the model must see that the
+                    // change did not land, not a silence that looks like
+                    // success.
+                    let output = bound_tool_output(output);
+                    if let Some(turn) = self.state.turn.as_mut() {
+                        turn.turn_frame.push_tool_result_with(
+                            output.clone(),
+                            op_scope_id,
+                            completion.disposition,
+                        );
+                    }
+                    let _ = self
+                        .kernel
+                        .emit_event(RuntimeEvent::ToolFinished { output })
+                        .await;
+                    self.advance_turn(op_tx).await;
+                    return;
+                }
+
+                // The generation fence passed and the lease is current:
+                // commit the staged effect before the result enters the
+                // turn frame. A commit failure is surfaced as a failed tool
+                // result — the model must not see "edit applied" when the
+                // rename never landed.
                 let output = match completion.effect {
                     Some(effect) => match self.kernel.effect().commit(effect).await {
                         EffectReceipt::Applied {

@@ -2180,4 +2180,188 @@ async fn hint_quota_refuses_excess_meta_tool_requests() {
         "the refusal must name the quota and its cap, got: {refused}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Commit-time authority lease (ACI v2 §6): a side-effecting call that
+// overruns its lease window is rolled back at commit time and reported as
+// a failed tool result — the world must not change after the
+// authorization expired, even though the tool computation finished.
+// ---------------------------------------------------------------------------
+
+/// A staged write that records whether it was committed or rolled back.
+#[derive(Debug, Default)]
+struct TracingWriteEffect {
+    committed: Arc<AtomicUsize>,
+    rolled_back: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Effect for TracingWriteEffect {
+    fn describe(&self) -> String {
+        "tracing write".into()
+    }
+    async fn commit(self: Box<Self>) -> EffectReceipt {
+        self.committed.fetch_add(1, Ordering::SeqCst);
+        EffectReceipt::Applied {
+            durability: EffectDurability::Durable,
+            evidence: Some("tx-1".into()),
+        }
+    }
+    async fn rollback(self: Box<Self>, _reason: &str) {
+        self.rolled_back.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// One `fs.write` on the first round, a plain reply on the second; records
+/// every message list it received.
+#[derive(Debug, Default)]
+struct LeaseToolModel {
+    rounds: AtomicUsize,
+    requests: Mutex<Vec<Vec<ModelMessage>>>,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for LeaseToolModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        self.requests.lock().await.push(request.messages.clone());
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        if round == 0 {
+            Ok(ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "fs.write".into(),
+                    arguments: json!({"path": "src/main.rs", "content": "fn main() {}"}),
+                }],
+                usage: Default::default(),
+            })
+        } else {
+            Ok(ModelOutput {
+                content: "done".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            })
+        }
+    }
+}
+
+/// Serves `fs.write` by sleeping far past the lease window, then staging
+/// its write effect — the commit arrives after the authorization expired.
+#[derive(Debug)]
+struct SlowWriteDispatcher {
+    committed: Arc<AtomicUsize>,
+    rolled_back: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ToolDispatcher for SlowWriteDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "fs.write".into(),
+            description: "write a file".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::WorkspaceWrite,
+            output_budget: None,
+        }]
+    }
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        // Overrun the 1ms lease window, then stage the effect.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        Ok(ToolOutcome::PreparedEffect {
+            output: ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "staged".into(),
+                model_content: "staged write".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            effect: Box::new(TracingWriteEffect {
+                committed: self.committed.clone(),
+                rolled_back: self.rolled_back.clone(),
+            }),
+        })
+    }
+}
+
+#[tokio::test]
+async fn expired_authority_lease_rolls_back_the_staged_effect() {
+    let model = Arc::new(LeaseToolModel::default());
+    let committed = Arc::new(AtomicUsize::new(0));
+    let rolled_back = Arc::new(AtomicUsize::new(0));
+    let tools = Arc::new(SlowWriteDispatcher {
+        committed: committed.clone(),
+        rolled_back: rolled_back.clone(),
+    });
+    let kernel = Arc::new(AgentKernel::new(
+        AgentKernelConfig {
+            // 1ms window: any real dispatch overruns it deterministically.
+            lease_ttl_ms: Some(1),
+            ..AgentKernelConfig::default()
+        },
+        Arc::new(TestContextEngine),
+        model.clone(),
+        tools.clone(),
+        Arc::new(PolicyApprovalGate::permissive()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle.user_message("write it".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut refused_output = None;
+    let mut completed = false;
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::ToolFinished { output } => {
+                    if output.tool_name == "fs.write" {
+                        refused_output = Some(output);
+                    }
+                }
+                RuntimeEvent::TurnCompleted => completed = true,
+                _ => {}
+            }
+        }
+        if completed && refused_output.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(completed, "the turn must complete");
+    let output = refused_output.expect("the write tool result must be published");
+    assert!(
+        !output.ok && output.model_content.contains("not applied"),
+        "the overrun write must surface as a failed tool result: {output:?}"
+    );
+    assert_eq!(
+        committed.load(Ordering::SeqCst),
+        0,
+        "the overrun effect must never commit"
+    );
+    assert_eq!(
+        rolled_back.load(Ordering::SeqCst),
+        1,
+        "the overrun effect must be rolled back"
+    );
+
+    // The second model round must see the failure, not a success.
+    let requests = model.requests.lock().await;
+    assert!(
+        requests.len() >= 2,
+        "the turn must have a second model round"
+    );
+    let serialized = serde_json::to_string(requests.last().unwrap()).unwrap();
+    assert!(
+        serialized.contains("not applied"),
+        "the failed write must reach the model: {serialized}"
+    );
+}
 // ---------------------------------------------------------------------------

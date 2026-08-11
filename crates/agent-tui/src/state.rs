@@ -546,6 +546,24 @@ impl AppState {
                     if legacy_allowed { "allow" } else { "deny" }
                 ));
             }
+            RuntimeEvent::LeaseIssued {
+                lease_id,
+                call_name,
+                grant_id,
+                expires_at_ms,
+            } => {
+                // ACI v2 §6 audit row: a side-effecting call got a bounded
+                // commit-time authorization. The expiry makes the window
+                // visible; a grant name (when the v2 gate granted the
+                // intent) explains the coverage.
+                let covered = match &grant_id {
+                    Some(grant_id) => format!(" via grant '{grant_id}'"),
+                    None => String::new(),
+                };
+                self.push_system(format!(
+                    "authority lease {lease_id} for {call_name}{covered} expires at {expires_at_ms}ms"
+                ));
+            }
             RuntimeEvent::RunCompleted => {
                 self.busy = false;
                 self.status = "stopped".into();

@@ -82,6 +82,46 @@ impl EffectIntent {
     }
 }
 
+/// Derive the conservative `EffectIntent` upper bound from validated tool
+/// arguments. This is the shared normalization both the legacy
+/// standing-grant gate and the v2 lease/`AuthorityGate` path use:
+/// approval matches the concrete intent, never the tool name. Fail-closed:
+/// a missing argument yields the empty/zero bound, which can never match a
+/// grant (an empty path has no prefix, an empty command has no tokens).
+pub fn derive_effect_intent(call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
+    match spec.risk {
+        ToolRisk::ReadOnly => EffectIntent::ReadOnly,
+        ToolRisk::WorkspaceWrite => {
+            let path = call
+                .arguments
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let content_bytes = call
+                .arguments
+                .get("content")
+                .or_else(|| call.arguments.get("new"))
+                .and_then(|value| value.as_str())
+                .map(|content| content.len() as u64)
+                .unwrap_or(0);
+            EffectIntent::WorkspaceWrite {
+                path,
+                content_bytes,
+            }
+        }
+        ToolRisk::ProcessExecution => {
+            let command = call
+                .arguments
+                .get("command")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            EffectIntent::ProcessRun { command }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,

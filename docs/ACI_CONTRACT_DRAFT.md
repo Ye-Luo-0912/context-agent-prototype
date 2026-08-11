@@ -52,17 +52,29 @@ Rules that constrain every shape below:
 
 ## 0. What has landed since this draft
 
+**2026-08-12 (M14 slice):** the `AuthorityLease` step is implemented
+(§6 below): `execute_tool` mints a short-lived lease for every
+side-effecting call after approval — operation generation, derived
+`EffectIntent`, the covering grant (when the shadow gate granted it) and a
+bounded TTL (`AgentKernelConfig.lease_ttl_ms`, default 120 s) — the lease
+travels with the operation, and the actor validates it again at commit
+time (`AuthorityLease::valid_at`: generation match + not expired). A
+refused lease rolls the staged effect back and surfaces a failed tool
+result, so an operation that overran its authorization window cannot
+mutate the world. `derive_effect_intent` moved to `agent-contracts` so
+grant matching and lease minting share one normalization; the bounded
+`RuntimeEvent::LeaseIssued` audit row records lease/grant/expiry. Still
+open from this draft: the `ModelToolSpec`/`HostToolPolicy` split and typed
+`PermissionSet`/`GrantSpec` — both remain specification until a later
+migration item.
+
 **2026-08-11 (M14 slice):** the `EffectIntent` type is implemented in
 `agent-contracts` (`ReadOnly | WorkspaceWrite { path, content_bytes } |
 ProcessRun { command }`, with `risk()` bridging to the legacy `ToolRisk`),
 and `TaskApprovalGate` now derives the concrete intent from the validated
-arguments (`derive_effect_intent`) and matches standing grants against that
-intent — approval is effect-derived, never tool-name-derived. The
-`AuthorityGate` shadow-mode migration (`MOD-04`) can now reuse the derived
-intent directly. Still open from this draft: commit-time resource
-enforcement from the intent (the `AuthorityLease` step), the
-`ModelToolSpec`/`HostToolPolicy` split, and typed `PermissionSet`/
-`GrantSpec` — all remain specification until a later migration item.
+arguments and matches standing grants against that intent — approval is
+effect-derived, never tool-name-derived. The `AuthorityGate` shadow-mode
+migration (`MOD-04`) can now reuse the derived intent directly.
 
 ## 2. ModelToolSpec / HostToolPolicy split
 
@@ -402,6 +414,27 @@ what today's `TaskApprovalGate` accepts; nothing about the runtime behavior
 changes until `MOD-04`/`MOD-05` wire the new matcher in shadow mode.
 
 ## 6. AuthorityLease
+
+**Landed 2026-08-12 (MOD-04 slice).** The type below is implemented in
+`agent-contracts/src/approval.rs` with `AuthorityLease::valid_at(now_ms,
+generation)` as the commit-time gate. `execute_tool` mints one lease for
+every side-effecting call (`spec.risk != ReadOnly`) after approval,
+before dispatch: it carries the operation generation, the derived intent,
+the covering grant id (when the configured shadow gate granted the
+intent) and a bounded TTL (`AgentKernelConfig.lease_ttl_ms`, default
+`DEFAULT_LEASE_TTL_MS` = 120 s). The lease travels with the operation
+(`OperationCompletion.lease`); the actor validates it again at commit
+time — stale generation or expiry rolls the staged effect back and
+surfaces a failed tool result ("the change was not applied: the
+authorization lease for this operation expired") instead of committing.
+Read-only calls mint no lease (there is no commit to enforce). The bounded
+`RuntimeEvent::LeaseIssued { lease_id, call_name, grant_id,
+expires_at_ms }` audit row is published at minting; `derive_effect_intent`
+lives in `agent-contracts` so the standing-grant matcher and the lease
+mint share one normalization. Enforcement note: the generation/expiry
+check is live today; the *policy* behind a minted lease is still the
+legacy `ApprovalGate` in shadow mode — a future `AuthorityGate` reuses the
+same shape and moves the decision into the intent matcher.
 
 One operation/generation, short-lived, Core-issued:
 

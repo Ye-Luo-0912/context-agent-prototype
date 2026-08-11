@@ -369,41 +369,13 @@ impl TaskApprovalGate {
     }
 
     /// Derive the concrete effect intent of one call from its validated
-    /// arguments. Missing or malformed arguments produce the empty intent
-    /// of that class (an empty path/command can never match a grant), which
+    /// arguments. Shared with the v2 lease path through the contracts-level
+    /// `derive_effect_intent` so approval and lease minting can never
+    /// drift; missing or malformed arguments produce the empty intent of
+    /// that class (an empty path/command can never match a grant), which
     /// is the same fail-closed behavior as the legacy argument parsing.
     fn derive_effect_intent(call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
-        match spec.risk {
-            ToolRisk::ReadOnly => EffectIntent::ReadOnly,
-            ToolRisk::WorkspaceWrite => {
-                let path = call
-                    .arguments
-                    .get("path")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let content_bytes = call
-                    .arguments
-                    .get("content")
-                    .or_else(|| call.arguments.get("new"))
-                    .and_then(|value| value.as_str())
-                    .map(|content| content.len() as u64)
-                    .unwrap_or(0);
-                EffectIntent::WorkspaceWrite {
-                    path,
-                    content_bytes,
-                }
-            }
-            ToolRisk::ProcessExecution => {
-                let command = call
-                    .arguments
-                    .get("command")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                EffectIntent::ProcessRun { command }
-            }
-        }
+        agent_contracts::derive_effect_intent(call, spec)
     }
 
     async fn record(&self, call_name: &str, risk: ToolRisk, grant_id: Option<String>) {

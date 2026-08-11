@@ -1,18 +1,25 @@
 use std::sync::Arc;
 
 use agent_contracts::{
-    AgentError, AgentResult, CONTEXT_SEARCH_MAX_LIMIT, CancellationToken, ContextConsumptionAck,
-    ContextEngine, ContextGcReport, ContextIngress, ContextItemSummary, ContextKind,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery,
-    ContextStateTransition, EngineQuery, FocusState, MaterializedContext, ModelCapabilities,
-    ModelEventSink, ModelOutput, ModelRequest, ModelTransport, OutputBroker, RunId, RuntimeEvent,
-    ScopeId, ScopeKind, TaskId, ToolCall, ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest,
-    ToolOutcome, ToolOutput, ToolSpec, ToolSurfaceSnapshot,
+    AgentError, AgentResult, AuthorityLease, CONTEXT_SEARCH_MAX_LIMIT, CancellationToken,
+    ContextConsumptionAck, ContextEngine, ContextGcReport, ContextIngress, ContextItemSummary,
+    ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
+    ContextSearchQuery, ContextStateTransition, EngineQuery, FocusState, MaterializedContext,
+    ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest, ModelTransport, OutputBroker,
+    RunId, RuntimeEvent, ScopeId, ScopeKind, TaskId, ToolCall, ToolCatalogEntry, ToolDispatcher,
+    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec, ToolSurfaceSnapshot,
+    derive_effect_intent,
 };
 
 use crate::authority::{
     ApprovalAuthority, ApprovalVerdict, EffectAuthority, EventAuthority, OutputAuthority,
 };
+
+/// Default commit-time lease window for one side-effecting tool call (ACI
+/// v2 §6): how long after approval a staged effect may still be committed.
+/// Short by design — a tool computation that overruns this window is
+/// rolled back at commit time instead of mutating the world.
+pub const DEFAULT_LEASE_TTL_MS: u64 = 120_000;
 
 #[derive(Clone)]
 pub struct AgentKernelConfig {
@@ -29,6 +36,11 @@ pub struct AgentKernelConfig {
     /// and published as a `ShadowDecision` event, never enforced. `None`
     /// keeps the legacy approval path exactly as before.
     pub shadow_gate: Option<Arc<dyn agent_contracts::IntentShadowGate>>,
+    /// Commit-time lease window in milliseconds (ACI v2 §6). `None` uses
+    /// `DEFAULT_LEASE_TTL_MS`. A side-effecting call's lease expires this
+    /// long after approval; the actor refuses to commit a staged effect
+    /// whose lease has expired and rolls it back instead.
+    pub lease_ttl_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for AgentKernelConfig {
@@ -39,6 +51,7 @@ impl std::fmt::Debug for AgentKernelConfig {
             .field("max_tool_rounds", &self.max_tool_rounds)
             .field("output_broker", &"<output broker>")
             .field("shadow_gate", &"<shadow gate>")
+            .field("lease_ttl_ms", &self.lease_ttl_ms)
             .finish()
     }
 }
@@ -56,6 +69,7 @@ impl Default for AgentKernelConfig {
             max_tool_rounds: 16,
             output_broker: None,
             shadow_gate: None,
+            lease_ttl_ms: None,
         }
     }
 }
@@ -481,45 +495,52 @@ impl AgentKernel {
 
     /// Execute one tool call: validate it against the round's tool surface
     /// snapshot (the same surface the model saw and the budget used), run
-    /// approval, dispatch. Emits nothing — ToolStarted/ToolFinished are
-    /// committed by the actor. Returns the tool outcome: either a plain
-    /// value or a staged effect the actor commits/rolls back after the
-    /// generation fence.
+    /// approval, mint the commit-time authority lease for side-effecting
+    /// calls, dispatch. Emits nothing — ToolStarted/ToolFinished are
+    /// committed by the actor. Returns the tool outcome (a plain value or
+    /// a staged effect the actor commits/rolls back after the generation
+    /// fence) plus the lease, when one was minted.
     pub async fn execute_tool(
         &self,
         call: ToolCall,
         cancel: CancellationToken,
         surface: &ToolSurfaceSnapshot,
-    ) -> ToolOutcome {
+        generation: u64,
+    ) -> (ToolOutcome, Option<AuthorityLease>) {
         let spec = surface
             .specs
             .iter()
             .find(|spec| spec.name == call.name)
             .cloned();
         let Some(spec) = spec else {
-            return ToolOutcome::Value(tool_error_output(
-                &call,
-                tool_not_on_surface_message(&call, surface),
-            ));
+            return (
+                ToolOutcome::Value(tool_error_output(
+                    &call,
+                    tool_not_on_surface_message(&call, surface),
+                )),
+                None,
+            );
         };
 
         let verdict = self.approval.authorize(&call, &spec, &cancel).await;
         let legacy_allowed = matches!(verdict, ApprovalVerdict::Allowed);
 
-        // Shadow mode (ACI v2 step 4): record what the v2 intent-derived
-        // gate would decide beside the legacy decision — for allowed and
-        // denied calls alike, so the invariant trace (granted/denied/
-        // reason) can be compared against the legacy path. Best-effort
-        // observability: a failed journal append must not turn a granted
-        // call into an error.
-        if self.approval.has_shadow()
-            && let Some(shadow) = self.approval.shadow_verdict(&call, &spec).await
-        {
+        // Shadow mode (ACI v2 step 4): the v2 intent-derived verdict is
+        // computed once and reused for the audit event and the lease's
+        // covering grant, so the comparison and the lease can never drift.
+        // Best-effort observability: a failed journal append must not turn
+        // a granted call into an error.
+        let shadow = if self.approval.has_shadow() {
+            self.approval.shadow_verdict(&call, &spec).await
+        } else {
+            None
+        };
+        if let Some(shadow) = &shadow {
             let _ = self
                 .emit_event(RuntimeEvent::ShadowDecision {
                     call_name: call.name.clone(),
                     legacy_allowed,
-                    shadow,
+                    shadow: shadow.clone(),
                 })
                 .await;
         }
@@ -527,9 +548,48 @@ impl AgentKernel {
         match verdict {
             ApprovalVerdict::Allowed => {}
             ApprovalVerdict::Denied(message) | ApprovalVerdict::Failed(message) => {
-                return ToolOutcome::Value(tool_error_output(&call, message));
+                return (ToolOutcome::Value(tool_error_output(&call, message)), None);
             }
         }
+
+        // Mint the short-lived authority lease (ACI v2 §6) for
+        // side-effecting calls before dispatch: the approved concrete
+        // intent, the covering grant (when the v2 shadow gate granted it),
+        // and a bounded TTL. The lease travels with the operation; the
+        // actor validates it again at commit time — stale generation or
+        // expiry means rollback, never commit — so an operation that
+        // overran its authorization window cannot mutate the world.
+        // Read-only calls carry no lease: there is no commit to enforce.
+        let lease = if spec.risk != ToolRisk::ReadOnly {
+            let grant_id = match &shadow {
+                Some(agent_contracts::ShadowVerdict::Granted { grant_id, .. }) => {
+                    Some(grant_id.clone())
+                }
+                _ => None,
+            };
+            let issued_at_ms = now_ms();
+            let ttl = self.config.lease_ttl_ms.unwrap_or(DEFAULT_LEASE_TTL_MS);
+            let lease = AuthorityLease {
+                lease_id: format!("lease-{}", RunId::new()),
+                operation_generation: generation,
+                intent: derive_effect_intent(&call, &spec),
+                grant_id,
+                decision: agent_contracts::ApprovalDecision::Allow,
+                issued_at_ms,
+                expires_at_ms: issued_at_ms.saturating_add(ttl),
+            };
+            let _ = self
+                .emit_event(RuntimeEvent::LeaseIssued {
+                    lease_id: lease.lease_id.clone(),
+                    call_name: call.name.clone(),
+                    grant_id: lease.grant_id.clone(),
+                    expires_at_ms: lease.expires_at_ms,
+                })
+                .await;
+            Some(lease)
+        } else {
+            None
+        };
 
         let outcome = match self
             .tools
@@ -552,7 +612,7 @@ impl AgentKernel {
         // tool's own budget (`ToolSpec::output_budget`) is enforced here — a
         // verbose tool spills sooner, a quiet tool never exceeds its cap.
         let budget = spec.output_budget;
-        match outcome {
+        let outcome = match outcome {
             ToolOutcome::Value(output) => {
                 ToolOutcome::Value(self.output.bound(self.run_id, budget, output).await)
             }
@@ -568,7 +628,8 @@ impl AgentKernel {
                 output: self.output.bound(self.run_id, budget, output).await,
                 query,
             },
-        }
+        };
+        (outcome, lease)
     }
 
     /// Switch the runtime's focus to a task's goal. The task id comes from
@@ -779,6 +840,13 @@ fn tool_not_on_surface_message(call: &ToolCall, surface: &ToolSurfaceSnapshot) -
     }
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,6 +942,22 @@ mod tests {
         }
         async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
             assert_eq!(request.call.name, "big.tool");
+            Ok(ToolOutcome::Value(self.output.clone()))
+        }
+    }
+
+    /// Returns a fixed output for any call — for tests that exercise the
+    /// approval/lease path without caring about the dispatched value.
+    struct EchoDispatcher {
+        output: ToolOutput,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolDispatcher for EchoDispatcher {
+        fn specs(&self) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+        async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
             Ok(ToolOutcome::Value(self.output.clone()))
         }
     }
@@ -1047,13 +1131,18 @@ mod tests {
             dispatcher,
             Some(broker.clone()),
         );
-        let outcome = kernel
+        let (outcome, lease) = kernel
             .execute_tool(
                 call("big.tool"),
                 CancellationToken::new(),
                 &surface_with("big.tool"),
+                0,
             )
             .await;
+        assert!(
+            lease.is_none(),
+            "a read-only call carries no commit-time lease"
+        );
         assert_eq!(*broker.calls.lock().unwrap(), 1, "broker must run once");
         let ToolOutcome::Value(output) = outcome else {
             panic!("expected a plain value");
@@ -1089,13 +1178,18 @@ mod tests {
             dispatcher,
             None,
         );
-        let outcome = kernel
+        let (outcome, lease) = kernel
             .execute_tool(
                 call("big.tool"),
                 CancellationToken::new(),
                 &surface_with("big.tool"),
+                0,
             )
             .await;
+        assert!(
+            lease.is_none(),
+            "a read-only call carries no commit-time lease"
+        );
         let ToolOutcome::Value(output) = outcome else {
             panic!("expected a plain value");
         };
@@ -1303,13 +1397,18 @@ mod tests {
         ));
         let mut events = kernel.subscribe();
 
-        let outcome = kernel
+        let (outcome, lease) = kernel
             .execute_tool(
                 call("big.tool"),
                 CancellationToken::new(),
                 &surface_with("big.tool"),
+                0,
             )
             .await;
+        assert!(
+            lease.is_none(),
+            "a read-only call carries no commit-time lease"
+        );
         assert!(
             matches!(outcome, ToolOutcome::Value(_)),
             "the legacy gate still runs and the call executes"
@@ -1333,6 +1432,187 @@ mod tests {
         assert!(
             matches!(shadow, agent_contracts::ShadowVerdict::Denied { .. }),
             "the shadow gate recorded its v2 refusal"
+        );
+    }
+
+    /// Read the next `LeaseIssued` audit row, skipping any events published
+    /// before it (the shadow comparison lands first).
+    async fn next_lease_issued(
+        events: &mut tokio::sync::broadcast::Receiver<agent_contracts::RuntimeEventEnvelope>,
+    ) -> agent_contracts::RuntimeEvent {
+        for _ in 0..4 {
+            let envelope = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .expect("a lease audit event must be published")
+                .expect("stream open");
+            if let agent_contracts::RuntimeEvent::LeaseIssued { .. } = envelope.event {
+                return envelope.event;
+            }
+        }
+        panic!("no LeaseIssued event published");
+    }
+
+    #[tokio::test]
+    async fn execute_tool_mints_a_commit_time_lease_for_side_effecting_calls() {
+        let shadow = Arc::new(FixedShadowGate(agent_contracts::ShadowVerdict::Granted {
+            grant_id: "g-1".into(),
+            reason: "workspace write inside grant g-1".into(),
+        }));
+        let kernel = Arc::new(AgentKernel::new(
+            AgentKernelConfig {
+                shadow_gate: Some(shadow),
+                lease_ttl_ms: Some(5_000),
+                ..AgentKernelConfig::default()
+            },
+            Arc::new(RecordingEngine {
+                searched_limits: Default::default(),
+                fetched: Default::default(),
+            }),
+            Arc::new(UnusedModel),
+            Arc::new(EchoDispatcher {
+                output: ToolOutput {
+                    call_id: "c1".into(),
+                    tool_name: "fs.write".into(),
+                    ok: true,
+                    summary: "done".into(),
+                    model_content: "ok".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                },
+            }),
+            Arc::new(AllowAllApproval),
+            None,
+        ));
+        let mut events = kernel.subscribe();
+
+        let surface = ToolSurfaceSnapshot {
+            specs: vec![ToolSpec {
+                name: "fs.write".into(),
+                description: "write".into(),
+                input_schema: serde_json::json!({}),
+                risk: ToolRisk::WorkspaceWrite,
+                output_budget: None,
+            }],
+            ..ToolSurfaceSnapshot::default()
+        };
+        let write_call = ToolCall {
+            id: "c1".into(),
+            name: "fs.write".into(),
+            arguments: serde_json::json!({"path": "src/main.rs", "content": "fn main() {}"}),
+        };
+        let (outcome, lease) = kernel
+            .execute_tool(write_call, CancellationToken::new(), &surface, 5)
+            .await;
+        assert!(matches!(outcome, ToolOutcome::Value(_)));
+        let lease = lease.expect("a side-effecting call must mint a lease");
+        assert_eq!(
+            lease.operation_generation, 5,
+            "the lease is bound to the operation generation"
+        );
+        assert_eq!(
+            lease.grant_id.as_deref(),
+            Some("g-1"),
+            "the covering grant from the v2 shadow verdict is recorded"
+        );
+        assert_eq!(
+            lease.intent,
+            agent_contracts::EffectIntent::WorkspaceWrite {
+                path: "src/main.rs".into(),
+                content_bytes: "fn main() {}".len() as u64,
+            }
+        );
+        let now = now_ms();
+        assert!(
+            lease.issued_at_ms <= now && now <= lease.expires_at_ms,
+            "the lease window contains the present instant"
+        );
+        assert_eq!(
+            lease.expires_at_ms - lease.issued_at_ms,
+            5_000,
+            "the configured TTL bounds the lease window"
+        );
+
+        // The bounded audit row is published beside the shadow comparison.
+        let RuntimeEvent::LeaseIssued {
+            lease_id,
+            call_name,
+            grant_id,
+            expires_at_ms,
+        } = next_lease_issued(&mut events).await
+        else {
+            panic!("expected LeaseIssued");
+        };
+        assert_eq!(lease_id, lease.lease_id);
+        assert_eq!(call_name, "fs.write");
+        assert_eq!(grant_id.as_deref(), Some("g-1"));
+        assert_eq!(expires_at_ms, lease.expires_at_ms);
+    }
+
+    #[tokio::test]
+    async fn lease_is_minted_even_when_the_shadow_gate_denies() {
+        // Shadow is observational: the legacy gate allowed the call, so it
+        // executes and mints a lease. The lease records that no v2 grant
+        // covered the intent — the audit truth, not an enforcement stop.
+        let shadow = Arc::new(FixedShadowGate(agent_contracts::ShadowVerdict::Denied {
+            reason: "no live standing grant matches the derived intent".into(),
+        }));
+        let kernel = Arc::new(AgentKernel::new(
+            AgentKernelConfig {
+                shadow_gate: Some(shadow),
+                ..AgentKernelConfig::default()
+            },
+            Arc::new(RecordingEngine {
+                searched_limits: Default::default(),
+                fetched: Default::default(),
+            }),
+            Arc::new(UnusedModel),
+            Arc::new(EchoDispatcher {
+                output: ToolOutput {
+                    call_id: "c1".into(),
+                    tool_name: "shell.exec".into(),
+                    ok: true,
+                    summary: "done".into(),
+                    model_content: "ok".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                },
+            }),
+            Arc::new(AllowAllApproval),
+            None,
+        ));
+
+        let surface = ToolSurfaceSnapshot {
+            specs: vec![ToolSpec {
+                name: "shell.exec".into(),
+                description: "run".into(),
+                input_schema: serde_json::json!({}),
+                risk: ToolRisk::ProcessExecution,
+                output_budget: None,
+            }],
+            ..ToolSurfaceSnapshot::default()
+        };
+        let (_, lease) = kernel
+            .execute_tool(
+                ToolCall {
+                    id: "c1".into(),
+                    name: "shell.exec".into(),
+                    arguments: serde_json::json!({"command": "cargo test"}),
+                },
+                CancellationToken::new(),
+                &surface,
+                1,
+            )
+            .await;
+        let lease = lease.expect("a side-effecting call mints a lease");
+        assert_eq!(
+            lease.grant_id, None,
+            "a shadow-denied call records that no v2 grant covered it"
+        );
+        assert_eq!(
+            lease.intent,
+            agent_contracts::EffectIntent::ProcessRun {
+                command: "cargo test".into()
+            }
         );
     }
 }

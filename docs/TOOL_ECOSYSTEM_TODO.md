@@ -891,24 +891,37 @@ together with TaskAnchor and continuous context GC.
   workspace tests stay green, plus six new authority unit tests (monotonic
   sequences, durable barrier broadcast, failed-barrier silence, verdict
   normalization, commit/rollback classification, broker pass-through).
-  Still open (later steps of the v2 compatibility order, not this slice):
-  commit-time resource enforcement from the `EffectIntent`
-  (`AuthorityLease` — the M14 residual). The shadow-mode
-  `AuthorityGate` step of the compatibility order is now landed as its own
-  slice: `IntentShadowGate`/`ShadowVerdict` (agent-contracts), the
-  `AgentKernelConfig.shadow_gate` injection and the bounded
-  `RuntimeEvent::ShadowDecision` published for allowed and denied calls
-  alike, with the standing-grant gate's shadow verdict reusing the same
-  matching logic as its legacy `authorize` so the hard invariant (shadow
-  `Granted` implies legacy `Allow`) holds by construction and is pinned by
-  tests. The `EffectReceipt` step is landed too: `Effect::commit` returns
-  the serializable `EffectReceipt` (NotApplied / Applied with Durable |
-  DurabilityFailed + evidence / Unknown), the workspace mutation emits its
-  transaction id as evidence, the composite aggregates evidence and stops
-  at the first non-durable receipt, and the actor keeps the exact
+  The shadow-mode `AuthorityGate` step of the compatibility order is
+  landed as its own slice: `IntentShadowGate`/`ShadowVerdict`
+  (agent-contracts), the `AgentKernelConfig.shadow_gate` injection and the
+  bounded `RuntimeEvent::ShadowDecision` published for allowed and denied
+  calls alike, with the standing-grant gate's shadow verdict reusing the
+  same matching logic as its legacy `authorize` so the hard invariant
+  (shadow `Granted` implies legacy `Allow`) holds by construction and is
+  pinned by tests. The `EffectReceipt` step is landed too: `Effect::commit`
+  returns the serializable `EffectReceipt` (NotApplied / Applied with
+  Durable | DurabilityFailed + evidence / Unknown), the workspace mutation
+  emits its transaction id as evidence, the composite aggregates evidence
+  and stops at the first non-durable receipt, and the actor keeps the exact
   model-facing semantics (DurabilityFailed still means "was applied but
   the journal failed — recovery required"; Unknown is the never-blindly-
-  retry branch). See `docs/ACI_CONTRACT_DRAFT.md` §7 steps 4-5.
+  retry branch). The `AuthorityLease` step (commit-time resource
+  enforcement from the `EffectIntent` — the M14 residual) is landed too:
+  `AuthorityLease` (agent-contracts §6 of the draft) is minted by
+  `execute_tool` for every side-effecting call after approval — carrying
+  the operation generation, the derived intent, the covering grant (when
+  the shadow gate granted it) and a bounded TTL (`AgentKernelConfig::lease_ttl_ms`, default 120 s) — travels with the operation, and is
+  validated again at commit time (`valid_at`: generation match + not
+  expired). A refused lease rolls the staged effect back and surfaces a
+  failed tool result ("the change was not applied: the authorization lease
+  expired"), so an operation that overran its authorization window cannot
+  mutate the world. `derive_effect_intent` moved to agent-contracts so
+  grant matching and lease minting share one normalization; the bounded
+  `RuntimeEvent::LeaseIssued` audit row records lease/grant/expiry. What
+  remains of this item: `MOD-04A` (move scheduling behind
+  `RuntimeServices`, then the mechanical kernel rename) and compatibility
+  order step 7 (sandboxed shell/process — an M13-scoped, OS-level change).
+  See `docs/ACI_CONTRACT_DRAFT.md` §6 and §7 steps 4-5.
 - [ ] **MOD-04A** Move context/model/tool/config scheduling behind
   `agent-runtime::RuntimeServices`; only then perform the mechanical
   `agent-kernel -> agent-core` rename as a behavior-free change.

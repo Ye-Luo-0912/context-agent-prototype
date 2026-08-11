@@ -212,6 +212,20 @@ pub enum RuntimeEvent {
         legacy_allowed: bool,
         shadow: crate::approval::ShadowVerdict,
     },
+    /// A short-lived authority lease was minted for one side-effecting
+    /// tool call (ACI v2 §6): the legacy path allowed the call, and the
+    /// runtime now holds a bounded commit-time authorization for its
+    /// operation generation. The audit row carries the lease identity,
+    /// the call, the covering grant (when the v2 shadow gate granted the
+    /// intent) and the expiry; the full lease (intent, issued instant)
+    /// travels with the operation, not the event.
+    LeaseIssued {
+        lease_id: String,
+        call_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_id: Option<String>,
+        expires_at_ms: u64,
+    },
     RunCompleted,
 }
 
