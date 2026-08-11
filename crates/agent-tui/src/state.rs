@@ -619,6 +619,7 @@ mod tests {
             .map(|index| ToolSurfaceSelection {
                 tool_name: format!("{long_name}{index}"),
                 demand: ToolSurfaceDemand::PreferSurface,
+                origin: agent_contracts::ToolSurfaceOrigin::CatalogLoadedOptional,
                 approx_tokens: 10,
             })
             .collect();
@@ -626,6 +627,7 @@ mod tests {
             .map(|index| ToolSurfaceOmission {
                 tool_name: format!("{long_name}{index}"),
                 demand: ToolSurfaceDemand::PreferSurface,
+                origin: agent_contracts::ToolSurfaceOrigin::CatalogLoadedOptional,
                 reason: ToolSurfaceOmissionReason::SchemaBudget,
                 approx_tokens: 10,
             })

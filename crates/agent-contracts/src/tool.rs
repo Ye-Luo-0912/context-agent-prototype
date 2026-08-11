@@ -311,6 +311,10 @@ pub const MAX_TOOL_SURFACE_REPORT_OMITTED: usize = 32;
 pub const MAX_TOOL_SURFACE_REPORT_BLOCKED: usize = 32;
 /// UTF-8 byte cap for every tool name copied into a round-plan event row.
 pub const MAX_TOOL_SURFACE_REPORT_NAME_BYTES: usize = 64;
+/// Hard wire cap for one serialized round-surface report event. Covers the
+/// worst-case fixed overhead of every row at all row/name maxima, including
+/// the per-row `origin` provenance field.
+pub const MAX_TOOL_SURFACE_REPORT_WIRE_BYTES: usize = 18 * 1024;
 
 /// A task's demand for one exact tool id. This is orthogonal to catalog
 /// lifecycle and authority: it neither enables a capability nor grants an
@@ -373,10 +377,32 @@ pub enum ToolSurfaceBlockReason {
     ProviderInputBudget,
 }
 
+/// Which authority put one tool into the round surface. Rows with the same
+/// `demand` can now answer whether they entered because of Task intent, a
+/// fail-closed dispatcher/core policy, or an ordinary catalog load. `Unknown`
+/// marks rows predating per-row provenance (old journal events), so no
+/// legacy row ever pretends to know its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSurfaceOrigin {
+    /// Legacy row without provenance information.
+    #[default]
+    Unknown,
+    /// Task-owned requirement (task requirement revision / reason ref).
+    TaskRequirement,
+    /// Fail-closed dispatcher/core policy (`may_omit` returned false).
+    DispatcherRequired,
+    /// Loaded optional from the catalog (e.g. `capability.load`).
+    CatalogLoadedOptional,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSurfaceSelection {
     pub tool_name: String,
     pub demand: ToolSurfaceDemand,
+    /// Which authority put this tool into consideration.
+    #[serde(default)]
+    pub origin: ToolSurfaceOrigin,
     pub approx_tokens: usize,
 }
 
@@ -384,6 +410,9 @@ pub struct ToolSurfaceSelection {
 pub struct ToolSurfaceOmission {
     pub tool_name: String,
     pub demand: ToolSurfaceDemand,
+    /// Which authority put this tool into consideration.
+    #[serde(default)]
+    pub origin: ToolSurfaceOrigin,
     pub reason: ToolSurfaceOmissionReason,
     pub approx_tokens: usize,
 }

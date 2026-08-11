@@ -783,6 +783,7 @@ mod tests {
             omissions: vec![ToolSurfaceOmission {
                 tool_name: "optional.large".into(),
                 demand: ToolSurfaceDemand::PreferSurface,
+                origin: agent_contracts::ToolSurfaceOrigin::CatalogLoadedOptional,
                 reason: ToolSurfaceOmissionReason::ProviderInputBudget,
                 approx_tokens: 2_500,
             }],

@@ -10,9 +10,9 @@ use agent_contracts::{
     MAX_TOOL_REQUIREMENT_NAME_CHARS, MAX_TOOL_SURFACE_REPORT_BLOCKED,
     MAX_TOOL_SURFACE_REPORT_NAME_BYTES, MAX_TOOL_SURFACE_REPORT_OMITTED,
     MAX_TOOL_SURFACE_REPORT_SELECTED, ToolSpec, ToolSurfaceBlock, ToolSurfaceBlockReason,
-    ToolSurfaceDemand, ToolSurfaceOmission, ToolSurfaceOmissionReason, ToolSurfacePlanReport,
-    ToolSurfacePlanStatus, ToolSurfaceRequirement, ToolSurfaceSelection, ToolSurfaceSnapshot,
-    ToolSurfaceSourceRevisions, TurnId,
+    ToolSurfaceDemand, ToolSurfaceOmission, ToolSurfaceOmissionReason, ToolSurfaceOrigin,
+    ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceRequirement, ToolSurfaceSelection,
+    ToolSurfaceSnapshot, ToolSurfaceSourceRevisions, TurnId,
 };
 
 use crate::budget::{MAX_TOOL_SURFACE_TOKENS, approx_layer_tokens};
@@ -24,6 +24,9 @@ const MAX_SNAPSHOT_OMISSIONS: usize = 128;
 pub(crate) struct RoundSurfacePlan {
     specs: Vec<ToolSpec>,
     demands: BTreeMap<String, ToolSurfaceDemand>,
+    /// Per-tool authority source, so report rows can answer why the tool
+    /// entered consideration (task intent vs dispatcher vs catalog load).
+    origins: BTreeMap<String, ToolSurfaceOrigin>,
     omissions: Vec<ToolSurfaceOmission>,
     omitted_total: usize,
     mandatory: HashSet<String>,
@@ -65,6 +68,7 @@ impl RoundSurfacePlan {
         let mut mandatory_specs = Vec::new();
         let mut optional_specs = Vec::new();
         let mut demands = BTreeMap::new();
+        let mut origins = BTreeMap::new();
         let mut mandatory = HashSet::new();
         let mut task_preferred = HashSet::new();
         let mut omissions = candidates.omissions;
@@ -85,6 +89,17 @@ impl RoundSurfacePlan {
                 requested_demand.unwrap_or(ToolSurfaceDemand::PreferSurface)
             };
             demands.insert(spec.name.clone(), demand);
+            // Provenance: which authority put this tool into consideration.
+            // A fail-closed dispatcher entry wins over task intent, and task
+            // intent wins over a plain catalog load.
+            let origin = if dispatcher_mandatory {
+                ToolSurfaceOrigin::DispatcherRequired
+            } else if requested_demand.is_some() {
+                ToolSurfaceOrigin::TaskRequirement
+            } else {
+                ToolSurfaceOrigin::CatalogLoadedOptional
+            };
+            origins.insert(spec.name.clone(), origin);
 
             if demand == ToolSurfaceDemand::KeepReady {
                 let approx_tokens = approx_layer_tokens(&spec);
@@ -94,6 +109,7 @@ impl RoundSurfacePlan {
                     ToolSurfaceOmission {
                         tool_name: spec.name,
                         demand,
+                        origin,
                         reason: ToolSurfaceOmissionReason::KeepReady,
                         approx_tokens,
                     },
@@ -135,24 +151,34 @@ impl RoundSurfacePlan {
                 // with a smaller schema.
                 saturated_group = Some(explicitly_preferred);
                 let spec = specs.pop().expect("the just-pushed schema exists");
+                let origin = origins
+                    .get(&spec.name)
+                    .copied()
+                    .unwrap_or(ToolSurfaceOrigin::Unknown);
                 push_omission(
                     &mut omissions,
                     &mut omitted_total,
                     ToolSurfaceOmission {
                         tool_name: spec.name,
                         demand: ToolSurfaceDemand::PreferSurface,
+                        origin,
                         reason: ToolSurfaceOmissionReason::SchemaBudget,
                         approx_tokens: cost,
                     },
                 );
                 continue;
             }
+            let origin = origins
+                .get(&spec.name)
+                .copied()
+                .unwrap_or(ToolSurfaceOrigin::Unknown);
             push_omission(
                 &mut omissions,
                 &mut omitted_total,
                 ToolSurfaceOmission {
                     tool_name: spec.name,
                     demand: ToolSurfaceDemand::PreferSurface,
+                    origin,
                     reason: ToolSurfaceOmissionReason::SchemaBudget,
                     approx_tokens: cost,
                 },
@@ -170,6 +196,7 @@ impl RoundSurfacePlan {
         Self {
             specs,
             demands,
+            origins,
             omissions,
             omitted_total,
             mandatory,
@@ -194,6 +221,7 @@ impl RoundSurfacePlan {
             ToolSurfaceOmission {
                 tool_name: requirement.tool_name.clone(),
                 demand: requirement.demand,
+                origin: ToolSurfaceOrigin::TaskRequirement,
                 reason: ToolSurfaceOmissionReason::Unavailable,
                 approx_tokens: 0,
             },
@@ -224,12 +252,18 @@ impl RoundSurfacePlan {
             .get(&spec.name)
             .copied()
             .unwrap_or(ToolSurfaceDemand::PreferSurface);
+        let origin = self
+            .origins
+            .get(&spec.name)
+            .copied()
+            .unwrap_or(ToolSurfaceOrigin::Unknown);
         push_omission(
             &mut self.omissions,
             &mut self.omitted_total,
             ToolSurfaceOmission {
                 tool_name: spec.name.clone(),
                 demand,
+                origin,
                 reason: ToolSurfaceOmissionReason::ProviderInputBudget,
                 approx_tokens: approx_layer_tokens(&spec),
             },
@@ -294,6 +328,11 @@ impl RoundSurfacePlan {
                     .get(&spec.name)
                     .copied()
                     .unwrap_or(ToolSurfaceDemand::PreferSurface),
+                origin: self
+                    .origins
+                    .get(&spec.name)
+                    .copied()
+                    .unwrap_or(ToolSurfaceOrigin::Unknown),
                 approx_tokens: approx_layer_tokens(spec),
             })
             .collect();
@@ -395,7 +434,9 @@ fn bounded_utf8(name: &str, max_bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use agent_contracts::{ToolRisk, ToolSurfaceSourceRevisions};
+    use agent_contracts::{
+        MAX_TOOL_SURFACE_REPORT_WIRE_BYTES, ToolRisk, ToolSurfaceSourceRevisions,
+    };
     use serde_json::json;
 
     use super::*;
@@ -526,7 +567,7 @@ mod tests {
         assert!(report.selected.len() <= MAX_TOOL_SURFACE_REPORT_SELECTED);
         assert!(report.omitted.len() <= MAX_TOOL_SURFACE_REPORT_OMITTED);
         assert_eq!(report.selected_total + report.omitted_total, 200);
-        assert!(serde_json::to_vec(&report).unwrap().len() < 16 * 1024);
+        assert!(serde_json::to_vec(&report).unwrap().len() < MAX_TOOL_SURFACE_REPORT_WIRE_BYTES);
     }
 
     #[test]
@@ -536,6 +577,7 @@ mod tests {
                 .map(|index| ToolSurfaceOmission {
                     tool_name: format!("{}-{index}", "x".repeat(1_000)),
                     demand: ToolSurfaceDemand::PreferSurface,
+                    origin: ToolSurfaceOrigin::DispatcherRequired,
                     reason: ToolSurfaceOmissionReason::SchemaBudget,
                     approx_tokens: usize::MAX,
                 })
@@ -614,6 +656,7 @@ mod tests {
                 .map(|index| ToolSurfaceOmission {
                     tool_name: format!("{long_name}{index}"),
                     demand: ToolSurfaceDemand::PreferSurface,
+                    origin: ToolSurfaceOrigin::CatalogLoadedOptional,
                     reason: ToolSurfaceOmissionReason::ProviderInputBudget,
                     approx_tokens: usize::MAX,
                 })
@@ -643,9 +686,125 @@ mod tests {
         assert_eq!(report.selected.len(), MAX_TOOL_SURFACE_REPORT_SELECTED);
         assert_eq!(report.omitted.len(), MAX_TOOL_SURFACE_REPORT_OMITTED);
         assert_eq!(report.blocked.len(), MAX_TOOL_SURFACE_REPORT_BLOCKED);
+        let wire_len = serde_json::to_vec(&report).unwrap().len();
         assert!(
-            serde_json::to_vec(&report).unwrap().len() <= 16 * 1024,
-            "the documented event wire bound must hold at all row/name maxima"
+            wire_len <= MAX_TOOL_SURFACE_REPORT_WIRE_BYTES,
+            "the documented event wire bound must hold at all row/name maxima \
+             (wire_len={wire_len}, bound={MAX_TOOL_SURFACE_REPORT_WIRE_BYTES})"
         );
+    }
+
+    #[test]
+    fn selected_rows_distinguish_task_intent_from_catalog_loads() {
+        // Two candidates with the same surface demand: one task-preferred,
+        // one a legacy catalog-loaded optional. The report must say which
+        // authority put each into consideration.
+        let candidates = ToolSurfaceSnapshot {
+            specs: vec![
+                spec("task.pick", 100),
+                spec("catalog.pick", 100),
+                spec("core.mandatory", 100),
+            ],
+            ..Default::default()
+        };
+        let requirements = vec![requirement("task.pick", ToolSurfaceDemand::PreferSurface)];
+        let plan =
+            RoundSurfacePlan::build(candidates, &requirements, |name| name != "core.mandatory");
+        let report = plan.ready_report(SurfaceReportContext {
+            turn_id: TurnId::new(),
+            model_round: 1,
+            surface_revision: 1,
+            estimated_input_tokens: 0,
+            input_budget_tokens: 0,
+        });
+        let by_name = |name: &str| {
+            report
+                .selected
+                .iter()
+                .find(|row| row.tool_name == name)
+                .unwrap_or_else(|| panic!("{name} must be selected"))
+        };
+        let task_row = by_name("task.pick");
+        let catalog_row = by_name("catalog.pick");
+        let core_row = by_name("core.mandatory");
+        assert_eq!(task_row.demand, ToolSurfaceDemand::PreferSurface);
+        assert_eq!(task_row.origin, ToolSurfaceOrigin::TaskRequirement);
+        assert_eq!(catalog_row.demand, ToolSurfaceDemand::PreferSurface);
+        assert_eq!(catalog_row.origin, ToolSurfaceOrigin::CatalogLoadedOptional);
+        assert_eq!(core_row.demand, ToolSurfaceDemand::MustSurface);
+        assert_eq!(core_row.origin, ToolSurfaceOrigin::DispatcherRequired);
+    }
+
+    #[test]
+    fn omitted_rows_carry_their_authority_origin() {
+        // Budget omission must keep provenance too: a task-preferred
+        // candidate and a catalog-loaded candidate omitted for the same
+        // schema-budget reason remain distinguishable.
+        let candidates = ToolSurfaceSnapshot {
+            specs: vec![spec("task.big", 40_000), spec("catalog.big", 40_000)],
+            ..Default::default()
+        };
+        let requirements = vec![requirement("task.big", ToolSurfaceDemand::PreferSurface)];
+        let plan = RoundSurfacePlan::build(candidates, &requirements, |_| true);
+        let report = plan.ready_report(SurfaceReportContext {
+            turn_id: TurnId::new(),
+            model_round: 1,
+            surface_revision: 1,
+            estimated_input_tokens: 0,
+            input_budget_tokens: 0,
+        });
+        let by_name = |name: &str| {
+            report
+                .omitted
+                .iter()
+                .find(|row| row.tool_name == name)
+                .unwrap_or_else(|| panic!("{name} must be omitted"))
+        };
+        let task_row = by_name("task.big");
+        let catalog_row = by_name("catalog.big");
+        assert_eq!(task_row.demand, ToolSurfaceDemand::PreferSurface);
+        assert_eq!(task_row.origin, ToolSurfaceOrigin::TaskRequirement);
+        assert_eq!(task_row.reason, ToolSurfaceOmissionReason::SchemaBudget);
+        assert_eq!(catalog_row.demand, ToolSurfaceDemand::PreferSurface);
+        assert_eq!(catalog_row.origin, ToolSurfaceOrigin::CatalogLoadedOptional);
+        assert_eq!(catalog_row.reason, ToolSurfaceOmissionReason::SchemaBudget);
+    }
+
+    #[test]
+    fn keep_ready_omissions_name_their_authority() {
+        let candidates = ToolSurfaceSnapshot {
+            specs: vec![spec("ready.only", 10)],
+            ..Default::default()
+        };
+        let requirements = vec![requirement("ready.only", ToolSurfaceDemand::KeepReady)];
+        let plan = RoundSurfacePlan::build(candidates, &requirements, |_| true);
+        let report = plan.ready_report(SurfaceReportContext {
+            turn_id: TurnId::new(),
+            model_round: 1,
+            surface_revision: 1,
+            estimated_input_tokens: 0,
+            input_budget_tokens: 0,
+        });
+        let row = report
+            .omitted
+            .iter()
+            .find(|row| row.tool_name == "ready.only")
+            .expect("keep-ready must be omitted");
+        assert_eq!(row.reason, ToolSurfaceOmissionReason::KeepReady);
+        assert_eq!(row.origin, ToolSurfaceOrigin::TaskRequirement);
+    }
+
+    #[test]
+    fn legacy_omission_rows_default_to_unknown_origin() {
+        // Old journal events lack provenance; deserializing them must yield
+        // `Unknown`, never a fabricated authority claim.
+        let json = serde_json::json!({
+            "tool_name": "legacy.tool",
+            "demand": "prefer_surface",
+            "reason": "schema_budget",
+            "approx_tokens": 100
+        });
+        let row: ToolSurfaceOmission = serde_json::from_value(json).unwrap();
+        assert_eq!(row.origin, ToolSurfaceOrigin::Unknown);
     }
 }
