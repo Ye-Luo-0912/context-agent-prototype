@@ -866,8 +866,21 @@ together with TaskAnchor and continuous context GC.
   load/unload scheduling, active state, and per-round surface snapshots.
 - [ ] **COMPOSE-01** Extract reusable application/bootstrap composition from
   `agent-tui` for TUI/CLI/eval while keeping it stateless and actor-free.
-- [ ] **ECO-02** Make manifest identity/path/source validation and process stdout/stderr
+- [x] **ECO-02** Make manifest identity/path/source validation and process stdout/stderr
   accounting non-bypassable.
+  **Verified 2026-08-11.** Identity: `validate_capability_id` runs at registration and
+  again in `ProcessCapabilityAdapter::from_manifest` (a manifest the registry never saw
+  is refused too — `from_manifest_rejects_ids_that_could_escape_a_path`). Path: the
+  capability working directory is `temp_dir()/context-agent-capability-<id>-<uuid>`,
+  unpredictable and path-safe. Source: source is the transport, not a self-declared
+  field — `CapabilityTransport::Builtin` (host-registered, pre-start, keeps its declared
+  maturity and enters `Enabled`) versus any out-of-process transport (pinned to
+  `Experimental`, enters `Disabled`, explicit enable only;
+  `external_capabilities_start_experimental_regardless_of_declared_status`). Process
+  stdout/stderr accounting: the child's stderr is piped into a bounded 64 KiB tail
+  (`stderr_capture_bytes`), stdout crosses the wire through the frame bound and the
+  kernel-level output broker caps `model_content` at 16 K chars with artifact spill —
+  there is no path from a capability's output to the model that bypasses the broker.
 
 ### Gate 3: complete and test the minimal ACI
 

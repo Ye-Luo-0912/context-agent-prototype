@@ -389,51 +389,63 @@ mod tests {
     /// the model measurably fewer input tokens than append-only.
     #[tokio::test(flavor = "multi_thread")]
     async fn dynamic_engine_saves_input_tokens_against_append_on_the_fixture_surface() {
-        let fixture = &FIXTURES[0];
-        let dir = tempfile::tempdir().unwrap();
-        workload::seed_fixture(fixture, dir.path());
+        for fixture in &FIXTURES {
+            let dir = tempfile::tempdir().unwrap();
+            workload::seed_fixture(fixture, dir.path());
 
-        let runs = compare_engines(fixture, dir.path()).await.unwrap();
-        assert_eq!(runs.len(), 3);
+            let runs = compare_engines(fixture, dir.path()).await.unwrap();
+            assert_eq!(runs.len(), 3, "fixture '{}'", fixture.id);
 
-        let append = runs.iter().find(|run| run.engine == "append").unwrap();
-        let rolling = runs.iter().find(|run| run.engine == "rolling").unwrap();
-        let dynamic = runs.iter().find(|run| run.engine == "dynamic").unwrap();
+            let append = runs.iter().find(|run| run.engine == "append").unwrap();
+            let rolling = runs.iter().find(|run| run.engine == "rolling").unwrap();
+            let dynamic = runs.iter().find(|run| run.engine == "dynamic").unwrap();
 
-        // Success does not regress: every engine drives the same scripted
-        // edit through the real tool surface and passes the hidden check.
-        for run in &runs {
+            // Success does not regress: every engine drives the same
+            // scripted edit through the real tool surface and passes the
+            // hidden check.
+            for run in &runs {
+                assert!(
+                    run.eval.passed,
+                    "engine '{}' must pass fixture '{}'",
+                    run.engine, fixture.id
+                );
+            }
+            // The multi-turn script actually exercised the tool surface.
             assert!(
-                run.eval.passed,
-                "engine '{}' must pass the fixture",
-                run.engine
+                dynamic.eval.metrics.tool_calls >= 3,
+                "fixture '{}'",
+                fixture.id
             );
-        }
-        // The multi-turn script actually exercised the tool surface.
-        assert!(dynamic.eval.metrics.tool_calls >= 3);
-        assert!(dynamic.eval.metrics.turns >= 5);
+            assert!(dynamic.eval.metrics.turns >= 5, "fixture '{}'", fixture.id);
 
-        // The dynamic working set must cost less model input than either
-        // baseline on the same workload. The gap is a real-but-bounded
-        // fraction of the total: tool schemas and the system prompt are a
-        // large per-round fixed cost (the same phenomenon the live M15
-        // measurement reported), so the assertion is directional plus a
-        // noise floor, not a large ratio.
-        for baseline in [append, rolling] {
-            assert!(
-                dynamic.eval.metrics.model_input_tokens < baseline.eval.metrics.model_input_tokens,
-                "dynamic model_in {} must be below {} {}",
-                dynamic.eval.metrics.model_input_tokens,
-                baseline.engine,
-                baseline.eval.metrics.model_input_tokens
-            );
-            assert!(
-                baseline.eval.metrics.model_input_tokens - dynamic.eval.metrics.model_input_tokens
-                    >= 300,
-                "expected a material saving over {}, got {}",
-                baseline.engine,
-                baseline.eval.metrics.model_input_tokens - dynamic.eval.metrics.model_input_tokens
-            );
+            // The dynamic working set must cost less model input than
+            // either baseline on the same workload. The gap is a
+            // real-but-bounded fraction of the total: tool schemas and the
+            // system prompt are a large per-round fixed cost (the same
+            // phenomenon the live M15 measurement reported), so the
+            // assertion is directional plus a noise floor, not a large
+            // ratio.
+            for baseline in [append, rolling] {
+                assert!(
+                    dynamic.eval.metrics.model_input_tokens
+                        < baseline.eval.metrics.model_input_tokens,
+                    "fixture '{}': dynamic model_in {} must be below {} {}",
+                    fixture.id,
+                    dynamic.eval.metrics.model_input_tokens,
+                    baseline.engine,
+                    baseline.eval.metrics.model_input_tokens
+                );
+                assert!(
+                    baseline.eval.metrics.model_input_tokens
+                        - dynamic.eval.metrics.model_input_tokens
+                        >= 300,
+                    "fixture '{}': expected a material saving over {}, got {}",
+                    fixture.id,
+                    baseline.engine,
+                    baseline.eval.metrics.model_input_tokens
+                        - dynamic.eval.metrics.model_input_tokens
+                );
+            }
         }
     }
 }
