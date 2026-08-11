@@ -1120,7 +1120,7 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 | M11 Context Recall | ✅ narrow retrieval baseline | Search/inspect/fetch, transient results, bounded external view and service parity work. Canonical catalog ownership and complete cross-residency semantics remain context-runtime work rather than reasons to call recall itself absent. TaskAnchor/Completion roots are now implemented (`CTX-10`). |
 | M12 Effect Runtime | ✅ | In-process prepared effects and process-capability wire effects commit behind the generation fence (`CORE-01`), a cancelled operation kills its whole process tree (`CORE-06`: shell/git/capability share one tree-kill) and cleans up every pending approval entry, provider streams are byte-capped, and Windows Job-Object quotas are kernel-enforced. The standing-grant `TaskExecutionPolicy` (CORE-08) is M14 approval-policy work, not an M12 gap. |
 | M13 Extension Sandbox | 🟡 partial | Env scrub, private cwd, bounded stderr, process-tree cancellation, Windows Job-Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE), Unix rlimits (CPU/process) and directory-handle-relative workspace opens with reparse substitution rejected at open time (`CORE-07`) are enforced. Mid-invoke filesystem access is now brokered: a child's `fs.read` system request is answered only under the invocation's `workspace:read` grant, only through a confined workspace handle, and only for relative non-escaping paths (absolute/rooted and `..` paths refused before the handle is consulted); network is explicitly deny-by-default (no network permission word exists; recognized network ops get a named refusal). OS-level filesystem/network filtering — a hostile child opening arbitrary absolute paths or sockets at the OS layer — remains the residual gap (`CORE-01` open). |
-| M14 Resource Policy | 🟡 partial | Schema/context quotas, risk/permission validation and final output guards exist; the narrow standing `TaskExecutionPolicy` is landed (`CORE-08`: effect + target + constraint + expiry grants, revocable, zero-responder deny/skip); the kernel-level trusted output broker is landed (`CORE-04`: capped fields, one-time artifact spill, execution-enforced query limits); a declared per-tool output budget on `ToolSpec` is enforced by the broker (clamped to the global hard cap); approval is now effect-derived: `EffectIntent` (contract type) is derived from the validated arguments and standing grants match the concrete intent (path, content bytes, command prefix) instead of re-parsing raw arguments; and commit-time resource enforcement is landed (`AuthorityLease`: every side-effecting call mints a short-lived lease at approval, and the actor refuses to commit a staged effect whose lease expired or whose operation generation moved — rollback, never commit). |
+| M14 Resource Policy | 🟡 partial | Schema/context quotas, risk/permission validation and final output guards exist; the narrow standing `TaskExecutionPolicy` is landed (`CORE-08`: effect + target + constraint + expiry grants, revocable, zero-responder deny/skip); the kernel-level trusted output broker is landed (`CORE-04`: capped fields, one-time artifact spill, execution-enforced query limits); a declared per-tool output budget on `ToolSpec` is enforced by the broker (clamped to the global hard cap); approval is now effect-derived: `EffectIntent` (contract type) is derived from the validated arguments and standing grants match the concrete intent (path, content bytes, command prefix) instead of re-parsing raw arguments; commit-time resource enforcement is landed (`AuthorityLease`: every side-effecting call mints a short-lived lease at approval, and the actor refuses to commit a staged effect whose lease expired or whose operation generation moved — rollback, never commit); and diagnostics/catalog are bounded by logical history size, not by it (O(1) Cold/External counts, `inspect` memory-bounded by its limit). |
 | M15 Real Evaluation | 🧪 instrumentation/smoke only | Replay is a policy proxy and the live run is a no-tool constraint-retention task. The A/B/C/D evaluation inputs (four tool-surface arms + four coding fixtures with hidden verification, `agent-eval --fixtures`), the all-module cost-accounting aggregation (`agent-eval --metrics`), a deterministic fixture runner (`agent-eval --fixture <id>`, scripted model driving the real builtin tool surface end to end), a live fixture path (`agent-eval --fixture-live <id>`, real provider when `OPENAI_API_KEY` is set), and a cross-engine fixture comparison (`agent-eval --compare-arm <id>`, append-only / rolling-summary / dynamic on the same five-turn scripted model and the same real tool surface: every engine passes the hidden verification and dynamic feeds the model measurably fewer input tokens) are landed; there is still no paired real coding workload run with a real model, or a non-inferiority result. |
 | V2 Self-Iteration | 🔒 blocked | Registry maturity and sandboxed self-checks are foundations only. Autonomous generation/promotion stays disabled until M10 and M12-M15 acceptance gates close. |
 
@@ -1238,11 +1238,13 @@ letting the LLM grow capabilities autonomously.
 4. **Complete bounded policy (M14).** Put every producer behind one output
    broker. The narrow, revocable `TaskExecutionPolicy` is landed (`CORE-08`):
    unattended builds/tests inside a granted scope no longer prompt per call
-   while broader effects remain denied; effect-derived resource policy
-   remains.
+   while broader effects remain denied; effect-derived resource policy is
+   landed (`EffectIntent` + `AuthorityLease`).
 5. **Optimize measured context work.** Give external refs a token budget,
-   pack by fit before top-K exclusion, avoid O(total-history) external/session
-   candidate scans, and make diagnostics count the logical catalog. Record
+   pack by fit before top-K exclusion, and avoid O(total-history)
+   external/session candidate scans. Diagnostics already counts the logical
+   catalog in O(1) and `inspect` is memory-bounded by its limit (not by
+   history size). Record
    Resident bytes, candidate count and materialization p95 before changing
    scoring weights.
 6. **Run the real gate (M15).** Compare append-only, actual compaction and
@@ -1388,9 +1390,20 @@ Several model-facing dimensions are bounded and tested:
   `Unknown` for legacy rows), and the surface report records catalog /
   task-requirement / anchor / focus / execution-policy source revisions.
 
-The milestone acceptance is still open. Context diagnostics/catalog scans
-are not all bounded by logical history size, and effect-derived resource
-policy is not landed. The kernel-level trusted output broker is landed
+The milestone acceptance is still open. Context diagnostics and the
+catalog are now bounded by logical history size, not by it: diagnostics
+answers in O(1) (the external map maintains its Cold/External counts
+instead of scanning a store that grows with history) and `inspect` keeps
+only the requested number of smallest-tick summaries while streaming
+(`bounded_catalog`, memory O(limit) regardless of store size), so a
+model-driven meta-tool cannot cost proportional to history. Effect-derived
+resource policy is landed: approval derives `EffectIntent` from the
+validated arguments, standing grants match the concrete intent (path,
+content bytes, command prefix) instead of re-parsing raw arguments, and
+commit-time enforcement mints a short-lived `AuthorityLease` per
+side-effecting call — the actor refuses to commit a staged effect whose
+lease expired or whose operation generation moved (rollback, never commit).
+The kernel-level trusted output broker is landed
 (`CORE-04`): every model-facing tool field is capped, oversized content
 spills to an artifact once (no more lost truncated middle), and
 context-fetch/provider-error text is bounded. A *declared* per-tool output
@@ -1401,9 +1414,10 @@ tool's spec budget at every outcome variant. The narrow, revocable
 standing `TaskExecutionPolicy` (`CORE-08`) is now implemented:
 effect + target + constraint + expiry grants established by the composition
 root, consumed per call, revoked or expired by shrinking, with a
-zero-responder deny/skip fallback that never expands privileges. Permission
-declarations also cannot contain a hostile child until M13 brokers the
-underlying resources. See
+zero-responder deny/skip fallback that never expands privileges. The
+M13 system broker has landed, so a capability's declared permissions
+cannot smuggle a hostile child through: brokered filesystem reads and
+network requests are permission-gated at the adapter. See
 `CORE-04`, `CORE-08`, `CTX-07` and `CTX-09`.
 
 ## V1-M15 Real Evaluation 🧪 (replay, fixture harness and live smoke)

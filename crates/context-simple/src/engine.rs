@@ -913,11 +913,23 @@ impl ContextEngine for SimpleContextEngine {
         // reversible warm buffer and the external store entries are all
         // known items. External entries project from their lightweight
         // descriptor (externalized_at_tick as their created_tick).
-        let mut summaries = crate::heap::to_summaries(&state.items);
-        summaries.extend(crate::heap::to_summaries(&state.eviction_buffer));
-        summaries.extend(state.external.iter().map(external_summary));
-        summaries.sort_by_key(|summary| summary.created_tick);
-        summaries.truncate(limit);
+        //
+        // Bounded by construction: `bounded_catalog` keeps only the
+        // `limit` smallest created_tick summaries while streaming, so the
+        // call's memory stays O(limit) no matter how large the external
+        // store grows — a model-driven catalog call must not cost
+        // proportional to logical history size (M14 resource policy). The
+        // stream order (heap slot, buffer order, externalization order)
+        // makes equal ticks deterministic, exactly like the previous
+        // stable sort + truncate.
+        let summaries = crate::heap::to_summaries(&state.items);
+        let summaries = crate::heap::bounded_catalog(
+            limit,
+            summaries
+                .into_iter()
+                .chain(crate::heap::to_summaries(&state.eviction_buffer))
+                .chain(state.external.iter().map(external_summary)),
+        );
         Ok(summaries)
     }
 

@@ -2483,6 +2483,71 @@ async fn terminal_external_entries_are_hidden_from_every_retrieval_surface() {
 }
 
 #[tokio::test]
+async fn inspect_is_bounded_across_the_logical_catalog() {
+    // The catalog spans the heap and the external store. With a limit, the
+    // call must return only the `limit` smallest created ticks — and keep
+    // that cost bounded no matter how large the store's history grows.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+
+    // Resident items with controlled created ticks.
+    for (offset, tick) in [30u64, 10, 50].into_iter().enumerate() {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            format!("resident {offset}"),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.5,
+            None,
+        );
+        item.created_tick = tick;
+        state.items.push(item);
+    }
+    // External store entries with interleaved ticks.
+    for (offset, tick) in [20u64, 5, 40].into_iter().enumerate() {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            format!("external {offset}"),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.5,
+            None,
+        );
+        item.entities = crate::index::entity::extract_entities(&item.content);
+        let reference = crate::store::externalize(dir.path(), &item).unwrap();
+        let entry = crate::store::to_external_entry(&item, reference, tick, 1, None);
+        state.external.push(entry);
+    }
+
+    let kept = engine.inspect(3).await.unwrap();
+    assert_eq!(kept.len(), 3, "the limit caps the returned rows");
+    let ticks: Vec<u64> = kept.iter().map(|summary| summary.created_tick).collect();
+    assert_eq!(
+        ticks,
+        vec![5, 10, 20],
+        "the three smallest ticks across the heap and the store, ascending"
+    );
+
+    let all = engine.inspect(usize::MAX).await.unwrap();
+    assert_eq!(all.len(), 6, "no limit keeps the whole logical catalog");
+    let all_ticks: Vec<u64> = all.iter().map(|summary| summary.created_tick).collect();
+    assert_eq!(
+        all_ticks,
+        vec![5, 10, 20, 30, 40, 50],
+        "the full catalog is ascending by created tick"
+    );
+}
+
+#[tokio::test]
 async fn consumption_ack_stamps_an_external_descriptor_without_reactivating_it() {
     let dir = tempfile::tempdir().unwrap();
     let engine = SimpleContextEngine::new(SimpleContextConfig {

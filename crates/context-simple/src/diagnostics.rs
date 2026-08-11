@@ -25,16 +25,10 @@ pub(crate) fn compute(state: &State) -> ContextDiagnostics {
         tool_round: state.tool_round,
         resident_items: state.items.len(),
         warm_items: state.eviction_buffer.len(),
-        cold_items: state
-            .external
-            .iter()
-            .filter(|entry| entry.residency == agent_contracts::ContextResidency::Cold)
-            .count(),
-        external_items: state
-            .external
-            .iter()
-            .filter(|entry| entry.residency == agent_contracts::ContextResidency::External)
-            .count(),
+        // O(1): the external map maintains its Cold/External counts, so
+        // diagnostics never scans a store that grows with logical history.
+        cold_items: state.external.cold_entries(),
+        external_items: state.external.external_entries(),
         gc_evicted_total: state.gc_evicted_total,
         gc_reactivated_total: state.gc_reactivated_total,
         gc_externalized_total: state.gc_externalized_total,

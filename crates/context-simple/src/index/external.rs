@@ -24,7 +24,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use agent_contracts::{ContextItemId, ExternalizedContext};
+use agent_contracts::{ContextItemId, ContextResidency, ExternalizedContext};
 
 #[derive(Debug, Default)]
 pub(crate) struct ExternalMap {
@@ -36,6 +36,11 @@ pub(crate) struct ExternalMap {
     /// Expected `self.entries.len()`; a mismatch means the map changed
     /// without the index and a rebuild is required before use.
     map_len: usize,
+    /// Cold-entry count, so `diagnostics` answers in O(1) instead of
+    /// scanning a store that grows with logical history size.
+    cold_entries: usize,
+    /// External-entry count (the reference-only tail of the store).
+    external_entries: usize,
 }
 
 impl ExternalMap {
@@ -54,8 +59,67 @@ impl ExternalMap {
                 .or_default()
                 .push(entry.item_id);
         }
+        let (cold, external) = Self::residency_delta(&entry);
+        self.cold_entries = self.cold_entries.saturating_add(cold);
+        self.external_entries = self.external_entries.saturating_add(external);
         self.entries.push(entry);
         self.map_len = self.entries.len();
+    }
+
+    /// Age `Cold` entries toward `External` after the configured number of
+    /// full GC *generations* without access, maintaining the residency
+    /// counts. The unit is `gc_epoch`, which only a full GC pass
+    /// increments — comparing against the tick counter would let unrelated
+    /// runtime activity (ingest, maintain, materialize) age entries out
+    /// without a single GC pass having run. Entries restored from
+    /// pre-epoch checkpoints (`last_access_gc_epoch == None`) start fresh
+    /// at the current epoch instead of aging out instantly.
+    pub(crate) fn age_entries(&mut self, ttl_generations: u64, gc_epoch: u64) -> usize {
+        let mut aged = 0usize;
+        for entry in &mut self.entries {
+            if entry.residency != ContextResidency::Cold {
+                continue;
+            }
+            let Some(last) = entry.last_access_gc_epoch else {
+                // A pre-epoch checkpoint has no generation anchor. Establish
+                // one on its first full GC so subsequent passes can age it
+                // normally; merely substituting `gc_epoch` here would leave
+                // the field `None` forever and make the entry immortal.
+                entry.last_access_gc_epoch = Some(gc_epoch);
+                continue;
+            };
+            let idle = gc_epoch.saturating_sub(last);
+            if idle >= ttl_generations {
+                entry.residency = ContextResidency::External;
+                self.cold_entries = self.cold_entries.saturating_sub(1);
+                self.external_entries += 1;
+                aged += 1;
+            }
+        }
+        aged
+    }
+
+    /// O(1) count of `Cold` entries (diagnostics; the store can grow with
+    /// logical history, so scanning it per diagnostics call would let a
+    /// model-driven meta-tool cost grow with history).
+    pub(crate) fn cold_entries(&self) -> usize {
+        self.cold_entries
+    }
+
+    /// O(1) count of `External` (reference-only) entries.
+    pub(crate) fn external_entries(&self) -> usize {
+        self.external_entries
+    }
+
+    /// How this entry contributes to the Cold/External counts. A free
+    /// function so callers can update the counters field-by-field without
+    /// a whole-`self` borrow (the counts and the entry vec are disjoint).
+    fn residency_delta(entry: &ExternalizedContext) -> (usize, usize) {
+        match entry.residency {
+            ContextResidency::Cold => (1, 0),
+            ContextResidency::External => (0, 1),
+            ContextResidency::Resident | ContextResidency::Warm => (0, 0),
+        }
     }
 
     /// Filter the map in place (GC commit: recalled entries leave the map)
@@ -135,6 +199,8 @@ impl ExternalMap {
     fn rebuild_indexes(&mut self) {
         self.id_index.clear();
         self.entity_index.clear();
+        self.cold_entries = 0;
+        self.external_entries = 0;
         for (slot, entry) in self.entries.iter().enumerate() {
             self.id_index.insert(entry.item_id, slot);
             for entity in &entry.entities {
@@ -143,6 +209,9 @@ impl ExternalMap {
                     .or_default()
                     .push(entry.item_id);
             }
+            let (cold, external) = Self::residency_delta(entry);
+            self.cold_entries = self.cold_entries.saturating_add(cold);
+            self.external_entries = self.external_entries.saturating_add(external);
         }
         self.map_len = self.entries.len();
     }
@@ -316,5 +385,37 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert_eq!(restored.get(a).unwrap().item_id, a);
         assert_eq!(restored.ids_for_entity("AuthService.rs"), &[a]);
+    }
+
+    #[test]
+    fn residency_counts_track_push_aging_and_retain() {
+        let mut map = ExternalMap::new();
+        let a = ContextItemId::new();
+        let b = ContextItemId::new();
+        let c = ContextItemId::new();
+        map.push(entry(a, &["a.rs"]));
+        map.push(entry(b, &["b.rs"]));
+        let mut external = entry(c, &["c.rs"]);
+        external.residency = ContextResidency::External;
+        map.push(external);
+        assert_eq!(map.cold_entries(), 2, "two Cold entries counted");
+        assert_eq!(map.external_entries(), 1, "one External entry counted");
+
+        // Aging: the test entries carry `last_access_gc_epoch = Some(0)`,
+        // so below the TTL nothing ages and past it the Cold entries move
+        // to External with the counts following.
+        assert_eq!(map.age_entries(5, 1), 0, "below the TTL nothing ages");
+        assert_eq!(map.cold_entries(), 2);
+        assert_eq!(map.external_entries(), 1);
+        assert_eq!(map.age_entries(1, 1), 2, "idle Cold entries age");
+        assert_eq!(map.cold_entries(), 0);
+        assert_eq!(map.external_entries(), 3);
+
+        // retain rebuilds and recounts the survivors.
+        let removed: HashSet<ContextItemId> = [b].into();
+        map.retain(|e| !removed.contains(&e.item_id));
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.cold_entries(), 0);
+        assert_eq!(map.external_entries(), 2, "a and c survived as External");
     }
 }

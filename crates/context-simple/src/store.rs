@@ -506,26 +506,9 @@ pub(crate) fn age_external_entries(
     config: &SimpleContextConfig,
     gc_epoch: u64,
 ) -> usize {
-    let mut aged = 0usize;
-    for entry in &mut state.external {
-        if entry.residency != ContextResidency::Cold {
-            continue;
-        }
-        let Some(last) = entry.last_access_gc_epoch else {
-            // A pre-epoch checkpoint has no generation anchor. Establish
-            // one on its first full GC so subsequent passes can age it
-            // normally; merely substituting `gc_epoch` here would leave
-            // the field `None` forever and make the entry immortal.
-            entry.last_access_gc_epoch = Some(gc_epoch);
-            continue;
-        };
-        let idle = gc_epoch.saturating_sub(last);
-        if idle >= config.gc_external_ttl_generations as u64 {
-            entry.residency = ContextResidency::External;
-            aged += 1;
-        }
-    }
-    aged
+    state
+        .external
+        .age_entries(config.gc_external_ttl_generations as u64, gc_epoch)
 }
 
 /// Whether the store can provide a read path (used by recall).
