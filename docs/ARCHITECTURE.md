@@ -583,6 +583,13 @@ Turn Frame       - the current turn's execution stack (runtime-owned)
 Active Tool Schemas - tool definitions for this request
 ```
 
+Role authority follows the same split. Only the system policy and the
+focus frame render with the `System` role; the context frame (retrieved
+history and external refs) renders as delimited, low-authority `user`
+messages and tool results stay `Tool`-role messages, so content retrieved
+from files, tools or the store can never gain system precedence over the
+operator's instructions (prompt injection defense, `CORE-05`).
+
 The split is deliberate. The context engine owns the long-term working set
 and knows nothing about the execution protocol; the runtime owns the turn
 stack and never scores or evicts it while the turn is open. Since V1-P0-2

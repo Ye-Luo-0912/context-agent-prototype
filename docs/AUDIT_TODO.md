@@ -977,13 +977,33 @@ end` (agent-runtime actor); plus the provider-error cap tests
 (agent-runtime `output.rs`).
 
 ### CORE-05 — Untrusted historical content is promoted to System role
-
 `PromptAssembler` renders selected historical user/tool/file content and
 external summaries inside `ModelMessage::system`, giving retrieved prompt
 injection system precedence.
 
-Keep policy/instructions in System; render observations in a delimited
-lower-authority role/structured field. Add malicious file/tool/store evals.
+**2026-08-11: closed.** `PromptAssembler` renders every observation as a
+low-authority `user` message, never as `system`:
+
+1. **System holds policy only.** `system_policy` (and the focus frame, the
+   runtime's authoritative task state) is the only content rendered with
+   the `System` role; it never contains retrieved history.
+2. **Observations are delimited, low-authority user messages.** The
+   selected working set and external refs render as `ModelMessage::user`
+   under their existing explicit headers (`SELECTED WORKING CONTEXT` /
+   `EXTERNAL CONTEXT (refs only)`), so instructions injected inside a
+   retrieved file, tool result or store item cannot gain system precedence
+   over the operator's instructions. File/tool content already arrived as
+   `Tool`-role messages in the turn frame, and nothing in the turn frame is
+   `System`.
+3. **Malicious-content evals.** `retrieved_history_never_renders_as_system`
+   and `injected_instructions_cannot_gain_system_precedence` seed the
+   working set with "ignore previous instructions ..." text and assert it
+   appears only inside a `user` observation; `external_refs_render_as_low_
+   authority_observations` covers the external map; `malicious_file_and_
+   tool_content_stays_in_the_tool_role` covers hostile `fs.read` output
+   (prompt.rs, agent-runtime). `model_input_flattens_five_layers_in_order`
+   (agent-contracts) now pins the user-role context frame in the flattened
+   message order.
 
 ### CORE-06 — Cancellation/approval/process cleanup
 

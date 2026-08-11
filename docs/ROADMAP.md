@@ -1196,10 +1196,12 @@ letting the LLM grow capabilities autonomously.
    introduce the runtime-owned TaskAnchor and immutable CompletionRecord;
    retain the exact final output/evidence through a completion root transfer;
    then move lifecycle metadata into one canonical catalog. Historical
-   content must also leave System role (`CORE-05`). **Done:** TaskAnchor,
+   content has left the System role (`CORE-05`): observations render as
+   low-authority `user` messages, so retrieved history cannot gain system
+   precedence. **Done:** TaskAnchor,
    `CompletionRecord`, atomic completion root transfer and verifiable
-   final-output digest (`CTX-10`); the episode-local turn counter, canonical
-   catalog and `CORE-05` remain.
+   final-output digest (`CTX-10`); the System-role split (`CORE-05`). The
+   episode-local turn counter and canonical catalog remain.
 3. **Close trusted execution (M12/M13).** Extend process IPC with typed
    prepared effects, broker or confine direct shell/process mutation, and add
    real filesystem/network/resource isolation with adversarial cancel/escape
