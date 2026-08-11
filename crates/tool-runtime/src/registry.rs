@@ -23,8 +23,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::tools::{
-    ContextManageTool, EditReplaceTool, FsListTool, FsReadTool, FsWriteTool, GitDiffTool,
-    GitStatusTool, SearchGrepTool, ShellExecTool, Tool,
+    ContextManageTool, EditPatchTool, EditReplaceTool, FsListTool, FsReadTool, FsWriteTool,
+    GitDiffTool, GitStatusTool, SearchGrepTool, ShellExecTool, Tool,
 };
 
 /// Control tools are now defined by the unified catalog contract.
@@ -93,6 +93,7 @@ impl BuiltinToolDispatcher {
             Arc::new(FsWriteTool::new(workspace.clone())),
             Arc::new(SearchGrepTool::new(workspace.clone())),
             Arc::new(EditReplaceTool::new(workspace.clone())),
+            Arc::new(EditPatchTool::new(workspace.clone())),
             Arc::new(GitStatusTool::new(workspace.clone())),
             Arc::new(GitDiffTool::new(workspace.clone())),
             Arc::new(ShellExecTool::new(workspace.clone())),
