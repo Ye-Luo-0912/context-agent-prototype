@@ -10,6 +10,7 @@
 //! retained, so the comparison measures the context policy directly.
 
 mod driver;
+mod metrics;
 mod task;
 mod workload;
 
@@ -25,6 +26,12 @@ fn usage() -> ! {
          \n\
          Lists the M15 evaluation inputs — the A/B/C/D tool-surface arms and\n\
          the coding workload fixtures (seed + hidden verification) — without\n\
+         calling a model.\n\
+         \n\
+         usage: agent-eval --metrics <trace.jsonl>\n\
+         \n\
+         Aggregates the all-module cost accounting of one run's event trace\n\
+         (model/schema tokens, GC and lifecycle cost, tool behavior) without\n\
          calling a model.\n"
     );
     std::process::exit(2);
@@ -40,6 +47,15 @@ async fn main() -> anyhow::Result<()> {
             "--fixtures" => {
                 workload::verify_fixture_inputs()?;
                 print!("{}", workload::render_fixtures());
+                return Ok(());
+            }
+            "--metrics" => {
+                let Some(path) = args.next() else {
+                    usage();
+                };
+                let events = read_trace(&path)?;
+                let metrics = metrics::aggregate_metrics(&events);
+                print!("{}", metrics::render_metrics(&metrics));
                 return Ok(());
             }
             "--all" => engines = vec!["append", "rolling", "dynamic"],
@@ -78,4 +94,26 @@ async fn main() -> anyhow::Result<()> {
 
     print!("{}", driver::render_comparison(&results));
     Ok(())
+}
+
+/// Read a JSONL event trace and keep the first run's envelopes.
+fn read_trace(path: &str) -> anyhow::Result<Vec<agent_contracts::RuntimeEventEnvelope>> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("read trace {path}: {error}"))?;
+    let mut envelopes = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let envelope: agent_contracts::RuntimeEventEnvelope = serde_json::from_str(line)
+            .map_err(|error| anyhow::anyhow!("parse trace line {}: {error}", index + 1))?;
+        envelopes.push(envelope);
+    }
+    let Some(first) = envelopes.first() else {
+        anyhow::bail!("trace {path} contains no events");
+    };
+    let run_id = first.run_id;
+    envelopes.retain(|envelope| envelope.run_id == run_id);
+    Ok(envelopes)
 }
