@@ -197,12 +197,17 @@ GC moves `body_location`; it does not move or duplicate authority metadata.
 Property tests must run supersession, recurrence, verification, completion
 and quota sequences with the target initially in every residency.
 
-Residual correctness follow-up: terminal semantic mutations now span body
-locations, but minor TTL/tombstone aging still iterates Resident items and
-Stored metadata cannot represent every keep/lease directive field. A live
-item that moves to Warm/Cold/External can therefore escape the same lifecycle
-clock. Make aging/protection semantics catalog-owned before closing the
-structural target.
+Residual correctness follow-up — the aging half is **closed 2026-08-11**:
+minor TTL/tombstone aging no longer iterates Resident items only. The
+maintenance pass now tombstones warm-buffer items on the same windows
+residency uses (ephemeral TTL, then `ttl x 4` staleness), with pinned and
+keep-alive/lease items exempt exactly like the resident root set; a
+tombstoned warm item is never reactivated by hot entities. Regressions:
+`warm_ephemeral_item_is_tombstoned_by_ttl_not_only_resident`,
+`warm_working_item_is_tombstoned_by_staleness`. Stored (`ExternalizedContext`)
+metadata still cannot represent every keep/lease directive field, and the
+authority/body split (`ContextCatalog`) remains the structural target — make
+the remaining protection semantics catalog-owned before closing it.
 
 ### CTX-03 — Fetch/Search/Inspect persist as new observations
 

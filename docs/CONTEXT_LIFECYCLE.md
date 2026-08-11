@@ -714,6 +714,15 @@ Resident -> Warm -> Cold -> External   (context GC)
 External -> Storage GC -> Delete       (a future, separate pass)
 ```
 
+The warm buffer shares the resident lifecycle clock, not just the ladder:
+a live item that GC moved to the reversible buffer is still tombstoned by
+the same windows residency uses — the ephemeral TTL, then the `ttl x 4`
+staleness — on every maintenance pass, with pinned and keep-alive/lease
+items exempt exactly like the resident root set. A tombstoned warm item is
+never reactivated by hot entities, so a warm body cannot escape aging
+forever (a consumed ephemeral observation used to sit in the buffer
+reactivatable until overflow externalized it).
+
 `ContextEngine` gains a `store` surface (`ContextStore`): when the buffer is
 full, the oldest eviction is written to the store as an `ExternalizedContext`
 (a `ContextRef` like `context://run/task/item-id`, plus `artifact://` /
