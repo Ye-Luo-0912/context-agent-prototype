@@ -1,0 +1,207 @@
+# Tool Result Envelope and Global Limits — Specification (TOOLS-03)
+
+Status: **specification of the current runtime contract**, 2026-08-11.
+
+This document is the Gate 1 item **TOOLS-03** of
+`docs/TOOL_ECOSYSTEM_TODO.md`: it pins the stable error/result envelope and
+the global output/artifact limits that every tool, capability and process
+adapter must honor. It changes no runtime behavior — it is the normative
+description of what the code already enforces, so the conformance harness
+(TOOLS-04) and the evaluation fixtures (M15) can assert against one
+authoritative list instead of re-reading constants.
+
+Code remains authoritative. When a constant or enforcement point moves, this
+document and [`docs/TOOL_INVENTORY.json`](TOOL_INVENTORY.json) (TOOLS-01,
+the per-tool matrix) must move with it.
+
+## 1. Result envelope: `ToolOutput`
+
+Every tool execution produces exactly one `ToolOutput`
+(`agent-contracts/src/tool.rs`). Its fields are the stable result envelope:
+
+| Field | Meaning | Hard cap (enforced) | Enforcement point |
+| --- | --- | --- | --- |
+| `call_id` | The `ToolCall.id` this result answers; pairing with the assistant's tool call. | — | producer; validated by the turn frame |
+| `tool_name` | The tool/capability that produced the result. | `MAX_TOOL_SURFACE_REPORT_NAME_BYTES` (64) in surface reports | actor round plan |
+| `ok` | Success flag; the model-facing contract for "did the operation land". `false` results are errors, not outputs. | — | producer |
+| `summary` | Short human/UI summary, also the first thing a model sees when content is spilled. | `MAX_TOOL_SUMMARY_CHARS` = 2 000 chars | broker (`OutputBroker::bound`) |
+| `model_content` | The bounded model-facing body. | declared tool budget clamped to `MAX_TOOL_MODEL_CONTENT_CHARS` = 16 000 chars; `MAX_TOOL_OUTPUT_TOTAL_CHARS` = 24 000 decoded total | broker + actor last-line guard (`bound_tool_output`) |
+| `artifact_ref` | Optional `artifact://` reference when the full body lives in an artifact instead of the prompt. Producer-set refs are preserved, never overwritten by the broker. | reference itself is capped by the spill path (256 chars in the truncation marker); artifact bytes bounded by the run artifact store | producer; broker validates ownership |
+| `metadata` | Structured side data (file list rows, limits, per-row detail) that must not be prompt text. | serialized `MAX_TOOL_METADATA_BYTES` = 8 000 bytes | broker (`bound_metadata`) |
+
+The decoded total is the honest model-facing cost: `summary` +
+`model_content` + serialized `metadata` must stay under
+`MAX_TOOL_OUTPUT_TOTAL_CHARS` = 24 000 chars. The broker trims
+`model_content` first, then `summary`; metadata overflow is replaced by a
+bounded marker object (see §6).
+
+## 2. Error envelope
+
+Errors are structured; there is no free-text error channel into model
+context.
+
+### 2.1 `AgentError` categories (contract level)
+
+`AgentError` (`agent-contracts/src/error.rs`) is the typed error for every
+crossing: tool, capability, approval, storage, model, transport. Categories:
+
+| Variant | Meaning |
+| --- | --- |
+| `InvalidRequest` | Bad arguments/schema, rejected path, quota refusal. |
+| `Context` | Context-engine/adapter failure. |
+| `Model` | Provider/model failure. |
+| `Transport { retryable }` | Wire failure; `retryable` decides backoff. |
+| `Cancelled` | Operation cancelled; never a failure of the tool itself. |
+| `Tool` | Tool execution failed. |
+| `ApprovalDenied` | The approval gate denied the call. |
+| `Storage` | Journal/artifact/store failure. |
+| `Io` | Filesystem error. |
+| `Internal` | Unexpected invariant break. |
+| `RecoveryRequired` | A mutation may have partially landed and rollback failed; stop ordinary mutation and restore from a known-good checkpoint. |
+
+### 2.2 Tool errors → `ToolOutput`
+
+A tool that fails during execution returns `AgentError::Tool(...)`; the
+dispatcher converts it to `ToolOutput { ok: false, summary: <bounded
+reason>, model_content: <bounded reason>, .. }`. The model sees `ok: false`
+plus a summary naming the failure; it never sees a stack trace or unbounded
+diagnostics. Error text passes through the same broker caps as success text.
+
+A `PreparedEffect` whose commit fails returns `EffectCommitError`
+(`agent-contracts/src/tool.rs`):
+
+- `NotApplied(error)` — the world is unchanged; "nothing happened" is the
+  truthful model story;
+- `AppliedButDurabilityFailed(error)` — the effect landed but its journal
+  record failed; the runtime must surface a degraded/recovery state, never
+  "nothing happened" (this is the `EffectReceipt::Unknown`-adjacent case in
+  the v2 draft).
+
+### 2.3 Provider/model errors
+
+Provider and model error text is capped before it enters the event stream:
+`MAX_PROVIDER_ERROR_CHARS` = 4 000 chars (`agent-runtime/src/output.rs`,
+`bound_error_message`), with a visible `runtime truncated error text`
+marker. This keeps a hostile or buggy provider from flooding the journal
+with one message.
+
+### 2.4 Runtime operation outcomes
+
+At the actor boundary, a failed operation is `OperationOutcome::Failed {
+message }` (message already `bound_error_message`-capped) or
+`OperationOutcome::Cancelled`; a completed model round is `Completed`. The
+turn-commit failure path is the typed `TurnCommitFailed { phase, message }`
+event plus `RecoveryRequired` — see the crash-recovery replay
+(`agent-replay --recover`) for how a recovery reads that boundary back from
+the trace.
+
+## 3. Global output limits — authoritative list
+
+All caps are enforced by the kernel-level trusted `OutputBroker`
+(`agent-workspace/src/broker.rs` `WorkspaceOutputBroker`) before any
+`ToolOutcome` reaches the actor, and again by the actor's last-line guard
+for dynamic/process capabilities. A producer may declare a *smaller* local
+limit; no producer may make the model-facing result larger.
+
+| Constant | Value | Field/scope | Enforced where |
+| --- | --- | --- | --- |
+| `MAX_TOOL_MODEL_CONTENT_CHARS` | 16 000 | `model_content` chars | broker; actor `bound_tool_output` |
+| `MAX_TOOL_SUMMARY_CHARS` | 2 000 | `summary` chars | broker |
+| `MAX_TOOL_METADATA_BYTES` | 8 000 | serialized `metadata` bytes | broker `bound_metadata` |
+| `MAX_TOOL_OUTPUT_TOTAL_CHARS` | 24 000 | `summary + model_content + metadata` decoded chars | broker |
+| `MAX_PROVIDER_ERROR_CHARS` | 4 000 | provider/model error text | runtime `bound_error_message` |
+| `CONTEXT_SEARCH_MAX_LIMIT` | 50 | `context.search` limit (execution clamp) | kernel `resolve_engine_query` |
+| `MAX_TOOL_SURFACE_TOKENS` | 4 096 | per-round tool schema tokens | runtime round packing |
+| `MAX_TOOL_SURFACE_REPORT_WIRE_BYTES` | 18 432 | one round-surface report event | event construction |
+| `MAX_TOOL_SURFACE_REPORT_{SELECTED,OMITTED,BLOCKED}` | 32 | rows per report section | event construction |
+| `MAX_TOOL_SURFACE_REPORT_NAME_BYTES` | 64 | tool name per row | event construction |
+
+Contract-level bound constants that guard the same envelope family:
+`MAX_TOOL_SURFACE_TOKENS` (surface), `MAX_TASK_TOOL_REQUIREMENTS` (32),
+`MAX_TOOL_REQUIREMENT_NAME_CHARS` (96), `MAX_TOOL_REQUIREMENT_REASON_CHARS`
+(160), `MAX_TASK_ANCHOR_*` (2 000 / 32 / 200 / 32 / 8),
+`MAX_COMPLETION_SUMMARY_CHARS` (2 000), `MAX_COMPLETION_REF_CHARS` (256),
+`MAX_COMPLETION_ARTIFACTS` (32).
+
+## 4. Tool-level limits — authoritative list
+
+Per-tool local limits (all smaller than or equal to the global caps; the
+broker clamps a declaration to the global hard cap). The full per-tool
+matrix with schemas lives in [`docs/TOOL_INVENTORY.json`](TOOL_INVENTORY.json).
+
+| Tool | Limit | Value |
+| --- | --- | --- |
+| `shell.exec` | `MAX_TIMEOUT_MS` | 120 000 ms |
+| | `MODEL_OUTPUT_CHARS` (tail) | 12 000 chars |
+| | `MAX_LINE_CHARS` | 4 000 chars per line |
+| | ring-buffer tail lines | 200 |
+| `git.status` / `git.diff` | `MODEL_OUTPUT_CHARS` (tail) | 12 000 chars (overflow → artifact) |
+| `search.grep` | `MAX_FILES_SCANNED` | 5 000 |
+| | `MAX_BYTES_PER_FILE` | 2 MiB |
+| | `MODEL_HITS` | 100 (overflow → artifact) |
+| `fs.read` | `MAX_READ_BYTES` | 2 MiB |
+| | `MAX_READ_LINES` | 400 |
+| `fs.list` | `MAX_LIST_ENTRIES` | 2 000 |
+| `edit.replace` / `fs.write` | `MAX_FILE_BYTES` | 4 MiB (reject, not truncate) |
+| | change-journal old-content capture | 256 KiB (`CHANGE_CAPTURE_LIMIT`) |
+
+## 5. Artifact contract
+
+- **Location.** Every artifact — tool spills, run logs, recovery output —
+  lives under `.focus-agent/artifacts/<run>/...` in the workspace
+  (`.gitignore`d), sharing one lifetime and cleanup rule with the rest of
+  the artifact store. The workspace state directory is a hard-confined
+  path: no tool can write into `.focus-agent/` through the mutation path.
+- **Reference format.** Artifacts are referenced as `artifact://` URIs in
+  `ToolOutput.artifact_ref` (and in truncation markers). A producer's own
+  reference is preserved by the broker, never overwritten.
+- **Spill-once rule.** When `model_content` exceeds its cap and the
+  producer did not return an artifact, the broker stores the full content
+  once under the run's artifact directory and returns a bounded
+  head/marker/tail preview with the reference — a producer without an
+  artifact never loses the truncated middle, and nothing is cloned through
+  TurnFrame/context/events.
+- **Boundedness.** Artifact bytes are bounded by the run artifact store;
+  `context.fetch` of a stored item passes through the same broker so large
+  stored content spills on recall instead of entering the prompt.
+- **Ownership/GC.** Artifacts are files, not DB rows; a recall deletes a
+  blob only after its commit lands, and the startup reconcile re-owns
+  orphans (store-integrity rules, `CTX-04`). A `ToolOutput.artifact_ref`
+  is a *reference* — its validity is the artifact store's lifetime, not the
+  tool result's.
+
+## 6. Truncation marker contract
+
+Truncation is always visible and always names the original size, so a
+bounded result can never be mistaken for the full output.
+
+- **Broker marker** (`WorkspaceOutputBroker`):
+  `\n...[output broker truncated <field> from <N> chars to the <cap>-char
+  cap.<reference>]...\n`, head and tail preserved around the marker.
+- **Actor guard marker** (`bound_tool_output`):
+  `\n...[runtime truncated model-facing tool output from <N> chars to the
+  16000-char hard limit.<location>]...\n`, head and tail preserved.
+- **Metadata marker**: an over-cap metadata JSON is replaced by
+  `{"truncated": true, "field": "metadata", "original_bytes": <N>,
+  "cap_bytes": 8000}` so the decoded total stays honest.
+- **Error marker**: provider/model error text over 4 000 chars keeps its
+  head plus a `runtime truncated error text` marker.
+
+## 7. Relationship to the v2 contract draft
+
+`docs/ACI_CONTRACT_DRAFT.md` (TOOLS-02) projects this envelope into the
+`ModelContract` half of `HostToolPolicy` (`output_budget`,
+`summary_budget`, `spill_policy`). This document is the *current* contract
+the migration starts from; the compatibility order's step 3 ("broker
+existing outputs") therefore requires no envelope change, only feeding the
+declared budgets from `HostToolPolicy` instead of `ToolSpec.output_budget`.
+
+## 8. Open questions (for TOOLS-04 / M15)
+
+- Whether `ToolOutput` needs a structured `error_code`/category field on
+  `ok: false` (today the model reads `summary`), or the `AgentError`
+  category should ride in `metadata` only.
+- Whether the conformance harness should assert exact marker text (brittle)
+  or marker semantics (contains `truncated`, names field + original size).
+- Whether artifact references need a TTL/GC beyond the run lifetime for
+  long multi-run sessions.

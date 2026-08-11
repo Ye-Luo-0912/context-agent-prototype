@@ -814,7 +814,18 @@ together with TaskAnchor and continuous context GC.
   (permission granularity, shell idempotency, upper-bound derivation,
   PermissionSet placement) are tracked in the draft for `TOOLS-03` and
   `MOD-04`/`MOD-05`.
-- [ ] **TOOLS-03** Define stable error/result envelopes and global output/artifact limits.
+- [x] **TOOLS-03** Define stable error/result envelopes and global output/artifact limits.
+  **Done 2026-08-11** — [`docs/TOOL_RESULT_ENVELOPE.md`](TOOL_RESULT_ENVELOPE.md):
+  the authoritative specification of the current `ToolOutput` result
+  envelope (field semantics and hard caps), the `AgentError`/
+  `EffectCommitError`/`OperationOutcome` error envelope, the complete global
+  output-limit list (broker/actor/provider caps with enforcement points),
+  the per-tool limit matrix (matching `TOOL_INVENTORY.json`), the artifact
+  contract (location, `artifact://` refs, spill-once, boundedness,
+  ownership), and the two truncation-marker formats. Documentation only; no
+  runtime behavior changed. Open questions (structured error codes on
+  `ok:false`, marker-assertion granularity for the harness, artifact TTL)
+  are tracked for `TOOLS-04`/`M15`.
 - [ ] **TOOLS-04** Define the conformance harness and A/B/C/D evaluation fixtures first.
 
 ### Gate 2: close correctness/security blockers
