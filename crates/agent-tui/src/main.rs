@@ -9,9 +9,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use agent_contracts::{ApprovalDecision, ContextEngine, ModelTransport};
+use agent_contracts::{ApprovalDecision, ContextEngine, ModelTransport, StandingGrant};
 use agent_kernel::{
     AgentKernel, AgentKernelConfig, ApprovalBroker, InteractiveApprovalGate, PolicyApprovalGate,
+    TaskApprovalGate,
 };
 use agent_runtime::{
     ApprovalModule, ArtifactModule, CapabilityAwareDispatcher, ContextModule, EventModule,
@@ -35,10 +36,13 @@ use state::AppState;
 use tool_runtime::BuiltinToolDispatcher;
 
 /// UI-side handles for interactive approval: the broker carries requests from
-/// the kernel to the UI, the gate carries the user's decision back.
+/// the kernel to the UI, the gate carries the user's decision back, and the
+/// task gate holds the standing grants (established from `--grant` on the
+/// command line, revocable from the UI).
 struct InteractiveHandle {
     broker: Arc<ApprovalBroker>,
     gate: Arc<InteractiveApprovalGate>,
+    task_grants: Arc<TaskApprovalGate>,
 }
 
 #[tokio::main]
@@ -46,11 +50,14 @@ async fn main() -> anyhow::Result<()> {
     let mut read_only = false;
     let mut context_policy = "dynamic".to_string();
     let mut root_arg: Option<PathBuf> = None;
+    let mut grant_args: Vec<String> = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--read-only" {
             read_only = true;
         } else if let Some(value) = arg.strip_prefix("--context=") {
             context_policy = value.to_string();
+        } else if let Some(value) = arg.strip_prefix("--grant=") {
+            grant_args.push(value.to_string());
         } else if root_arg.is_none() {
             root_arg = Some(PathBuf::from(arg));
         }
@@ -88,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
         ),
     };
     let model: Arc<dyn ModelTransport> = build_model();
+    if read_only && !grant_args.is_empty() {
+        anyhow::bail!("--grant cannot be combined with --read-only");
+    }
     let (approval, interactive) = if read_only {
         (
             Arc::new(PolicyApprovalGate::read_only()) as Arc<dyn agent_contracts::ApprovalGate>,
@@ -96,9 +106,19 @@ async fn main() -> anyhow::Result<()> {
     } else {
         let broker = ApprovalBroker::new();
         let gate = Arc::new(InteractiveApprovalGate::new(broker.clone()));
+        let task_gate = Arc::new(TaskApprovalGate::new(gate.clone()));
+        for json in &grant_args {
+            let grant: StandingGrant = serde_json::from_str(json)
+                .with_context(|| format!("invalid --grant JSON: {json}"))?;
+            task_gate.grant(grant).await?;
+        }
         (
-            gate.clone() as Arc<dyn agent_contracts::ApprovalGate>,
-            Some(InteractiveHandle { broker, gate }),
+            task_gate.clone() as Arc<dyn agent_contracts::ApprovalGate>,
+            Some(InteractiveHandle {
+                broker,
+                gate,
+                task_grants: task_gate,
+            }),
         )
     };
     let journal = Arc::new(journal);
@@ -309,6 +329,32 @@ async fn run_ui(
                                     }
                                 }
                                 Err(error) => tracing::error!(%error, "list tasks failed"),
+                            }
+                        });
+                        continue;
+                    }
+                    if trimmed == "/grants" {
+                        let Some(handle) = &interactive else {
+                            continue;
+                        };
+                        let task_grants = handle.task_grants.clone();
+                        tokio::spawn(async move {
+                            let grants = task_grants.active_grants().await;
+                            if grants.is_empty() {
+                                println!("no active standing grants");
+                            }
+                            for grant in grants {
+                                println!(
+                                    "grant {} risk={:?} workspace={:?} command={:?} \
+                                     max_runs={:?} max_bytes={:?} expires_at_ms={}",
+                                    grant.id,
+                                    grant.risk,
+                                    grant.target.workspace_path_prefix,
+                                    grant.target.process_command_prefix,
+                                    grant.constraint.max_runs,
+                                    grant.constraint.max_content_bytes,
+                                    grant.expires_at_ms,
+                                );
                             }
                         });
                         continue;

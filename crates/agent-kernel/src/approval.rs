@@ -1,12 +1,13 @@
 use std::{
     collections::{HashMap, VecDeque},
+    path::{Component, Path},
     sync::Arc,
     time::Duration,
 };
 
 use agent_contracts::{
-    AgentError, AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, ToolCall, ToolRisk,
-    ToolSpec,
+    AgentError, AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, StandingGrant,
+    ToolCall, ToolRisk, ToolSpec,
 };
 use tokio::sync::{Mutex, broadcast, oneshot};
 use uuid::Uuid;
@@ -193,10 +194,301 @@ impl ApprovalGate for InteractiveApprovalGate {
     }
 }
 
+/// How many decision entries the bounded audit keeps (observability, not a
+/// policy surface).
+const GRANT_AUDIT_CAP: usize = 64;
+
+/// A granted decision record for observability: which call was decided by a
+/// standing grant (and its id) versus delegated to the underlying gate.
+#[derive(Debug, Clone)]
+pub struct GrantAuditEntry {
+    pub call_name: String,
+    pub risk: ToolRisk,
+    /// The grant id when a standing grant decided the call; `None` when the
+    /// call was delegated to the underlying gate.
+    pub grant_id: Option<String>,
+}
+
+/// Composes a trusted standing-grant layer over any underlying
+/// `ApprovalGate` (interactive prompts or policy booleans).
+///
+/// A call that matches an active standing grant is allowed immediately —
+/// no per-call prompt — which is what lets a long coding task edit its
+/// granted workspace and run bounded local tests unattended. A call that
+/// matches nothing falls through to the underlying gate (which denies on a
+/// missing responder), so zero user responses can never expand privileges
+/// beyond the granted envelope and never stall a turn for the underlying
+/// answer timeout when a grant covers the operation.
+///
+/// The model can use a matching grant but cannot widen it: grants are only
+/// established through `grant` (composition root / UI), only shrink
+/// (revocation, run consumption, expiry) and never grant beyond their
+/// declared target. The final effect of a granted workspace write is still
+/// bounded by the confined workspace (CORE-07) and the runtime's generation
+/// fence — the grant is an approval decision, not a sandbox bypass.
+pub struct TaskApprovalGate {
+    inner: Arc<dyn ApprovalGate>,
+    grants: Mutex<HashMap<String, GrantEntry>>,
+    audit: Mutex<VecDeque<GrantAuditEntry>>,
+    now: Box<dyn Fn() -> u64 + Send + Sync>,
+}
+
+struct GrantEntry {
+    grant: StandingGrant,
+    runs_used: u32,
+}
+
+impl TaskApprovalGate {
+    pub fn new(inner: Arc<dyn ApprovalGate>) -> Self {
+        Self::with_clock(inner, Box::new(now_ms))
+    }
+
+    /// Test seam: an injectable clock so expiry behavior is deterministic.
+    pub fn with_clock(
+        inner: Arc<dyn ApprovalGate>,
+        now: Box<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
+        Self {
+            inner,
+            grants: Mutex::new(HashMap::new()),
+            audit: Mutex::new(VecDeque::new()),
+            now,
+        }
+    }
+
+    /// Establish a standing grant. The grant is validated (target scope is
+    /// clean and inside the workspace, risk is a real effect class, not
+    /// already expired) before it can match anything.
+    pub async fn grant(&self, grant: StandingGrant) -> AgentResult<()> {
+        if grant.id.is_empty() {
+            return Err(AgentError::InvalidRequest(
+                "grant id must not be empty".into(),
+            ));
+        }
+        match grant.risk {
+            ToolRisk::ReadOnly => {
+                return Err(AgentError::InvalidRequest(
+                    "standing grants cover write/process effects, not read-only calls".into(),
+                ));
+            }
+            ToolRisk::WorkspaceWrite => {
+                let Some(prefix) = &grant.target.workspace_path_prefix else {
+                    return Err(AgentError::InvalidRequest(
+                        "a workspace-write grant needs a workspace_path_prefix target".into(),
+                    ));
+                };
+                if relative_components(prefix).is_none_or(|parts| parts.is_empty()) {
+                    return Err(AgentError::InvalidRequest(format!(
+                        "grant target must be a clean non-root workspace-relative path: {prefix}"
+                    )));
+                }
+            }
+            ToolRisk::ProcessExecution => {
+                let Some(prefix) = &grant.target.process_command_prefix else {
+                    return Err(AgentError::InvalidRequest(
+                        "a process grant needs a process_command_prefix target".into(),
+                    ));
+                };
+                if prefix.split_whitespace().next().is_none() {
+                    return Err(AgentError::InvalidRequest(
+                        "process command prefix must not be empty".into(),
+                    ));
+                }
+            }
+        }
+        if grant.expires_at_ms <= (self.now)() {
+            return Err(AgentError::InvalidRequest(
+                "grant is already expired".into(),
+            ));
+        }
+        self.grants.lock().await.insert(
+            grant.id.clone(),
+            GrantEntry {
+                grant,
+                runs_used: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Revoke a grant by id; returns whether one was live.
+    pub async fn revoke(&self, id: &str) -> bool {
+        self.grants.lock().await.remove(id).is_some()
+    }
+
+    /// The live grants (expired entries are pruned first).
+    pub async fn active_grants(&self) -> Vec<StandingGrant> {
+        let now = (self.now)();
+        let mut book = self.grants.lock().await;
+        book.retain(|_, entry| entry.grant.expires_at_ms > now);
+        book.values().map(|entry| entry.grant.clone()).collect()
+    }
+
+    /// Bounded audit of recent decisions: granted (with the grant id) or
+    /// delegated to the underlying gate.
+    pub async fn recent_decisions(&self) -> Vec<GrantAuditEntry> {
+        self.audit.lock().await.iter().cloned().collect()
+    }
+
+    /// Whether `call` falls inside the grant's declared target scope.
+    fn grant_matches(grant: &StandingGrant, call: &ToolCall, spec: &ToolSpec) -> bool {
+        if grant.risk != spec.risk {
+            return false;
+        }
+        match spec.risk {
+            ToolRisk::ReadOnly => false,
+            ToolRisk::WorkspaceWrite => {
+                let Some(prefix) = &grant.target.workspace_path_prefix else {
+                    return false;
+                };
+                let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) else {
+                    return false;
+                };
+                if !path_within_prefix(path, prefix) {
+                    return false;
+                }
+                // The write's content is part of the effect scope: a grant
+                // with a content cap does not cover oversized writes.
+                if let Some(max) = grant.constraint.max_content_bytes {
+                    let content = call
+                        .arguments
+                        .get("content")
+                        .or_else(|| call.arguments.get("new"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if content.len() as u64 > max {
+                        return false;
+                    }
+                }
+                true
+            }
+            ToolRisk::ProcessExecution => {
+                let Some(prefix) = &grant.target.process_command_prefix else {
+                    return false;
+                };
+                let Some(command) = call.arguments.get("command").and_then(|v| v.as_str()) else {
+                    return false;
+                };
+                command_with_prefix(command, prefix)
+            }
+        }
+    }
+
+    async fn record(&self, call_name: &str, risk: ToolRisk, grant_id: Option<String>) {
+        let mut audit = self.audit.lock().await;
+        if audit.len() >= GRANT_AUDIT_CAP {
+            audit.pop_front();
+        }
+        audit.push_back(GrantAuditEntry {
+            call_name: call_name.to_string(),
+            risk,
+            grant_id,
+        });
+    }
+}
+
+#[async_trait::async_trait]
+impl ApprovalGate for TaskApprovalGate {
+    async fn authorize(
+        &self,
+        call: &ToolCall,
+        spec: &ToolSpec,
+        cancel: &CancellationToken,
+    ) -> AgentResult<ApprovalDecision> {
+        if spec.risk == ToolRisk::ReadOnly {
+            return Ok(ApprovalDecision::Allow);
+        }
+
+        let now = (self.now)();
+        let mut book = self.grants.lock().await;
+        // Prune expired grants first, so an expired grant never matches and
+        // `active_grants` stays accurate.
+        book.retain(|_, entry| entry.grant.expires_at_ms > now);
+
+        let mut matched_id: Option<String> = None;
+        for (id, entry) in book.iter_mut() {
+            if !Self::grant_matches(&entry.grant, call, spec) {
+                continue;
+            }
+            if let Some(max) = entry.grant.constraint.max_runs
+                && entry.runs_used >= max
+            {
+                continue;
+            }
+            matched_id = Some(id.clone());
+            if spec.risk == ToolRisk::ProcessExecution {
+                entry.runs_used += 1;
+            }
+            break;
+        }
+        drop(book);
+
+        if let Some(id) = matched_id {
+            self.record(&call.name, spec.risk, Some(id)).await;
+            return Ok(ApprovalDecision::Allow);
+        }
+
+        self.record(&call.name, spec.risk, None).await;
+        self.inner.authorize(call, spec, cancel).await
+    }
+}
+
+/// Split a workspace-relative path into clean components. Returns `None`
+/// for absolute paths, parent escapes and root/drive prefixes — such a path
+/// can never match a grant.
+fn relative_components(path: &str) -> Option<Vec<String>> {
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for component in candidate.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(parts)
+}
+
+/// Component-aware prefix match: `path` is inside `prefix` when the clean
+/// path components start with the clean prefix components. `src/` covers
+/// `src/main.rs` but neither `src-other/x` nor a bare `src` file write.
+fn path_within_prefix(path: &str, prefix: &str) -> bool {
+    let (Some(path_parts), Some(prefix_parts)) =
+        (relative_components(path), relative_components(prefix))
+    else {
+        return false;
+    };
+    if path_parts.len() < prefix_parts.len() {
+        return false;
+    }
+    path_parts[..prefix_parts.len()] == prefix_parts[..]
+}
+
+/// Lexical command-prefix match on whitespace-separated tokens: `cargo
+/// test` covers `cargo test -- --nocapture` but not `cargo testx`.
+fn command_with_prefix(command: &str, prefix: &str) -> bool {
+    let command_tokens: Vec<&str> = command.split_whitespace().collect();
+    let prefix_tokens: Vec<&str> = prefix.split_whitespace().collect();
+    if command_tokens.len() < prefix_tokens.len() {
+        return false;
+    }
+    command_tokens[..prefix_tokens.len()] == prefix_tokens[..]
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{ToolRisk, ToolSpec};
+    use agent_contracts::{GrantTarget, ToolRisk, ToolSpec};
     use serde_json::json;
 
     fn write_call() -> ToolCall {
@@ -329,5 +621,473 @@ mod tests {
             broker.pending().await.is_empty(),
             "an answered request must leave the broker"
         );
+    }
+
+    /// Records every delegated call so tests can prove the standing layer
+    /// did (or did not) fall through to the underlying gate.
+    struct RecordingGate {
+        calls: Mutex<Vec<(String, ToolRisk)>>,
+        decision: ApprovalDecision,
+    }
+
+    impl RecordingGate {
+        fn denying() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                decision: ApprovalDecision::Deny,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ApprovalGate for RecordingGate {
+        async fn authorize(
+            &self,
+            call: &ToolCall,
+            spec: &ToolSpec,
+            _cancel: &CancellationToken,
+        ) -> AgentResult<ApprovalDecision> {
+            self.calls.lock().await.push((call.name.clone(), spec.risk));
+            Ok(self.decision)
+        }
+    }
+
+    fn write_call_at(path: &str, content: &str) -> ToolCall {
+        ToolCall {
+            id: "c1".into(),
+            name: "fs.write".into(),
+            arguments: json!({"path": path, "content": content}),
+        }
+    }
+
+    fn process_call(command: &str) -> ToolCall {
+        ToolCall {
+            id: "c2".into(),
+            name: "shell.exec".into(),
+            arguments: json!({"command": command}),
+        }
+    }
+
+    fn process_spec() -> ToolSpec {
+        ToolSpec {
+            name: "shell.exec".into(),
+            description: "run a command".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ProcessExecution,
+        }
+    }
+
+    fn write_grant(id: &str, prefix: &str, expires_at_ms: u64) -> StandingGrant {
+        StandingGrant {
+            id: id.into(),
+            risk: ToolRisk::WorkspaceWrite,
+            target: GrantTarget {
+                workspace_path_prefix: Some(prefix.into()),
+                process_command_prefix: None,
+            },
+            constraint: Default::default(),
+            expires_at_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn standing_grant_allows_matching_write_without_prompt() {
+        let inner = RecordingGate::denying();
+        let gate = TaskApprovalGate::new(inner.clone());
+        gate.grant(write_grant("g-src", "src/", u64::MAX))
+            .await
+            .unwrap();
+
+        let decision = gate
+            .authorize(
+                &write_call_at("src/main.rs", "fn main() {}"),
+                &write_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            ApprovalDecision::Allow,
+            "a write inside the grant must be allowed without prompting"
+        );
+        assert!(
+            inner.calls.lock().await.is_empty(),
+            "the underlying gate must not be consulted for a granted call"
+        );
+        let audit = gate.recent_decisions().await;
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].grant_id.as_deref(), Some("g-src"));
+    }
+
+    #[tokio::test]
+    async fn write_outside_grant_delegates_to_inner() {
+        let inner = RecordingGate::denying();
+        let gate = TaskApprovalGate::new(inner.clone());
+        gate.grant(write_grant("g-src", "src/", u64::MAX))
+            .await
+            .unwrap();
+
+        let decision = gate
+            .authorize(
+                &write_call_at("lib/other.rs", "x"),
+                &write_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            ApprovalDecision::Deny,
+            "an ungranted write must fall through to the underlying gate"
+        );
+        assert_eq!(
+            inner.calls.lock().await.len(),
+            1,
+            "the underlying gate decides ungranted calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_prefix_is_component_aware() {
+        let inner = RecordingGate::denying();
+        let gate = TaskApprovalGate::new(inner.clone());
+        gate.grant(write_grant("g-src", "src", u64::MAX))
+            .await
+            .unwrap();
+
+        // `src/main.rs` is inside `src`; `src-other/x` is a different
+        // component and must not match. (A file literally named `src` is
+        // the prefix itself, which is covered — component equality.)
+        assert_eq!(
+            gate.authorize(
+                &write_call_at("src/main.rs", "x"),
+                &write_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+            ApprovalDecision::Allow
+        );
+        let decision = gate
+            .authorize(
+                &write_call_at("src-other/x", "x"),
+                &write_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            ApprovalDecision::Deny,
+            "prefix matching must be component-aware"
+        );
+        assert_eq!(inner.calls.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn parent_and_absolute_writes_never_match_a_grant() {
+        let inner = RecordingGate::denying();
+        let gate = TaskApprovalGate::new(inner.clone());
+        gate.grant(write_grant("g", "src/", u64::MAX))
+            .await
+            .unwrap();
+
+        for hostile in [
+            "src/../outside/x",
+            "../src/x",
+            "C:\\outside\\x",
+            "/etc/passwd",
+        ] {
+            let decision = gate
+                .authorize(
+                    &write_call_at(hostile, "x"),
+                    &write_spec(),
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                decision,
+                ApprovalDecision::Deny,
+                "an escaping write must never be granted: {hostile}"
+            );
+        }
+        assert_eq!(
+            inner.calls.lock().await.len(),
+            4,
+            "every escaping write must be delegated (and denied by the inner gate)"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_grant_stops_matching() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let inner = RecordingGate::denying();
+        let clock = Arc::new(AtomicU64::new(0));
+        let clock_for_gate = clock.clone();
+        let gate = TaskApprovalGate::with_clock(
+            inner.clone(),
+            Box::new(move || clock_for_gate.load(Ordering::Relaxed)),
+        );
+        gate.grant(write_grant("g-exp", "src/", 1_000))
+            .await
+            .unwrap();
+
+        // While the clock is before the expiry the grant covers the write...
+        let decision = gate
+            .authorize(
+                &write_call_at("src/main.rs", "x"),
+                &write_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decision, ApprovalDecision::Allow);
+
+        // ...past the expiry it stops matching and the call falls through.
+        clock.store(2_000, Ordering::Relaxed);
+        let decision = gate
+            .authorize(
+                &write_call_at("src/main.rs", "x"),
+                &write_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decision, ApprovalDecision::Deny);
+        assert_eq!(inner.calls.lock().await.len(), 1);
+        assert!(
+            gate.active_grants().await.is_empty(),
+            "expired grants must not be reported as active"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_grant_stops_matching() {
+        let inner = RecordingGate::denying();
+        let gate = TaskApprovalGate::new(inner.clone());
+        gate.grant(write_grant("g-r", "src/", u64::MAX))
+            .await
+            .unwrap();
+        assert!(gate.revoke("g-r").await, "the grant must be live");
+        assert!(!gate.revoke("g-r").await, "a second revoke finds nothing");
+
+        let decision = gate
+            .authorize(
+                &write_call_at("src/main.rs", "x"),
+                &write_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            ApprovalDecision::Deny,
+            "a revoked grant must not cover writes anymore"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_grant_limits_runs_and_prefix_is_lexical() {
+        let inner = RecordingGate::denying();
+        let gate = TaskApprovalGate::new(inner.clone());
+        gate.grant(StandingGrant {
+            id: "g-test".into(),
+            risk: ToolRisk::ProcessExecution,
+            target: GrantTarget {
+                workspace_path_prefix: None,
+                process_command_prefix: Some("cargo test".into()),
+            },
+            constraint: agent_contracts::GrantConstraint {
+                max_content_bytes: None,
+                max_runs: Some(2),
+            },
+            expires_at_ms: u64::MAX,
+        })
+        .await
+        .unwrap();
+
+        // Two runs inside the envelope.
+        for command in ["cargo test", "cargo test -- --nocapture"] {
+            let decision = gate
+                .authorize(
+                    &process_call(command),
+                    &process_spec(),
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                decision,
+                ApprovalDecision::Allow,
+                "a bounded local test inside the grant must run without prompting: {command}"
+            );
+        }
+        // The third run exceeds the cap and falls through.
+        let decision = gate
+            .authorize(
+                &process_call("cargo test"),
+                &process_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decision, ApprovalDecision::Deny, "the run cap must bite");
+
+        // A lexical neighbour is not covered even with runs left.
+        let decision = gate
+            .authorize(
+                &process_call("cargo testx -- --ignored"),
+                &process_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            ApprovalDecision::Deny,
+            "command matching must be token-aware, not substring-aware"
+        );
+        assert_eq!(inner.calls.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn content_cap_rejects_oversized_write() {
+        let inner = RecordingGate::denying();
+        let gate = TaskApprovalGate::new(inner.clone());
+        gate.grant(StandingGrant {
+            id: "g-small".into(),
+            risk: ToolRisk::WorkspaceWrite,
+            target: GrantTarget {
+                workspace_path_prefix: Some("src/".into()),
+                process_command_prefix: None,
+            },
+            constraint: agent_contracts::GrantConstraint {
+                max_content_bytes: Some(10),
+                max_runs: None,
+            },
+            expires_at_ms: u64::MAX,
+        })
+        .await
+        .unwrap();
+
+        let decision = gate
+            .authorize(
+                &write_call_at("src/small.rs", "tiny"),
+                &write_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decision, ApprovalDecision::Allow);
+        let decision = gate
+            .authorize(
+                &write_call_at("src/big.rs", "this content is far too large"),
+                &write_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            ApprovalDecision::Deny,
+            "the content cap is part of the effect scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_rejects_invalid_targets_and_shapes() {
+        let gate = TaskApprovalGate::new(RecordingGate::denying());
+        let now = now_ms();
+        for bad in [
+            write_grant("g1", "../escape", now + 10_000),
+            write_grant("g2", "C:\\abs", now + 10_000),
+            write_grant("g3", "/abs", now + 10_000),
+        ] {
+            assert!(
+                gate.grant(bad).await.is_err(),
+                "an escaping or absolute grant target must be rejected"
+            );
+        }
+        // A read-only grant is not an effect grant.
+        let read_only = StandingGrant {
+            id: "g4".into(),
+            risk: ToolRisk::ReadOnly,
+            target: GrantTarget {
+                workspace_path_prefix: Some("src/".into()),
+                process_command_prefix: None,
+            },
+            constraint: Default::default(),
+            expires_at_ms: u64::MAX,
+        };
+        assert!(gate.grant(read_only).await.is_err());
+        // A process grant without a command scope matches nothing.
+        let no_scope = StandingGrant {
+            id: "g5".into(),
+            risk: ToolRisk::ProcessExecution,
+            target: GrantTarget::default(),
+            constraint: Default::default(),
+            expires_at_ms: u64::MAX,
+        };
+        assert!(gate.grant(no_scope).await.is_err());
+        // An already-expired grant cannot be established.
+        assert!(
+            gate.grant(write_grant("g6", "src/", now - 1))
+                .await
+                .is_err()
+        );
+        assert!(
+            gate.active_grants().await.is_empty(),
+            "no invalid grant may be live"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_responder_without_grant_denies_without_expansion() {
+        // The acceptance criterion: with no user responses, an ungranted
+        // call is denied (quickly, by a short interactive timeout) — never
+        // implicitly allowed, and a granted call never waits at all.
+        let broker = ApprovalBroker::new();
+        let interactive = Arc::new(
+            InteractiveApprovalGate::new(broker.clone())
+                .with_answer_timeout(Duration::from_millis(50)),
+        );
+        let gate = TaskApprovalGate::new(interactive.clone());
+        gate.grant(write_grant("g-src", "src/", u64::MAX))
+            .await
+            .unwrap();
+
+        // Granted: no prompt, no wait.
+        let start = tokio::time::Instant::now();
+        let decision = gate
+            .authorize(
+                &write_call_at("src/main.rs", "x"),
+                &write_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decision, ApprovalDecision::Allow);
+        assert!(
+            start.elapsed() < Duration::from_millis(40),
+            "a granted call must not wait for a responder"
+        );
+
+        // Ungranted: denied when no responder appears — no privilege
+        // expansion, no five-minute stall. The interactive inner reports a
+        // timeout as `Err(ApprovalDenied)` (a deny, never an allow).
+        let result = gate
+            .authorize(
+                &write_call_at("elsewhere/secret.rs", "x"),
+                &write_spec(),
+                &CancellationToken::new(),
+            )
+            .await;
+        match result {
+            Ok(ApprovalDecision::Deny) => {}
+            Err(AgentError::ApprovalDenied(_)) => {}
+            other => panic!("no responder must deny, got {other:?}"),
+        }
     }
 }
