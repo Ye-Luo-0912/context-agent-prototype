@@ -1120,7 +1120,7 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 | M11 Context Recall | ✅ narrow retrieval baseline | Search/inspect/fetch, transient results, bounded external view and service parity work. Canonical catalog ownership and complete cross-residency semantics remain context-runtime work rather than reasons to call recall itself absent. TaskAnchor/Completion roots are now implemented (`CTX-10`). |
 | M12 Effect Runtime | ✅ | In-process prepared effects and process-capability wire effects commit behind the generation fence (`CORE-01`), a cancelled operation kills its whole process tree (`CORE-06`: shell/git/capability share one tree-kill) and cleans up every pending approval entry, provider streams are byte-capped, and Windows Job-Object quotas are kernel-enforced. The standing-grant `TaskExecutionPolicy` (CORE-08) is M14 approval-policy work, not an M12 gap. |
 | M13 Extension Sandbox | 🟡 partial | Env scrub, private cwd, bounded stderr, process-tree cancellation and Windows Job-Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE) are enforced; Unix rlimits cover CPU/process count; workspace filesystem access is confined to directory-handle-relative opens with reparse substitution rejected at open time (`CORE-07`). A cwd is still not a filesystem boundary: absolute filesystem/network access is not brokered, which keeps M13 open. |
-| M14 Resource Policy | 🟡 partial | Schema/context quotas, risk/permission validation and final output guards exist; the narrow standing `TaskExecutionPolicy` is landed (`CORE-08`: effect + target + constraint + expiry grants, revocable, zero-responder deny/skip); and the kernel-level trusted output broker is landed (`CORE-04`: capped fields, one-time artifact spill, execution-enforced query limits). A declared per-tool output budget/spill policy on `ToolSpec` and effect-derived approval/resource enforcement remain open. |
+| M14 Resource Policy | 🟡 partial | Schema/context quotas, risk/permission validation and final output guards exist; the narrow standing `TaskExecutionPolicy` is landed (`CORE-08`: effect + target + constraint + expiry grants, revocable, zero-responder deny/skip); the kernel-level trusted output broker is landed (`CORE-04`: capped fields, one-time artifact spill, execution-enforced query limits); and a declared per-tool output budget on `ToolSpec` is enforced by the broker (clamped to the global hard cap, so a declaration can never enlarge the model-facing result). Effect-derived approval/resource enforcement remains open. |
 | M15 Real Evaluation | 🧪 instrumentation/smoke only | Replay is a policy proxy and the live run is a no-tool constraint-retention task. There is no paired real coding workload, hidden outcome verification, all-module cost accounting or non-inferiority result. |
 | V2 Self-Iteration | 🔒 blocked | Registry maturity and sandboxed self-checks are foundations only. Autonomous generation/promotion stays disabled until M10 and M12-M15 acceptance gates close. |
 
@@ -1168,10 +1168,11 @@ the required gate order; the numbered list and table above are authoritative.
    bound landed in Performance P1), context hint quota,
    RiskClass, PermissionSet. Acceptance: the LLM cannot exhaust runtime
    resources through meta-tools. 🟡 Model-facing bounds exist, the narrow
-   standing `TaskExecutionPolicy` (`CORE-08`) is landed, and the
-   kernel-level trusted output broker is landed (`CORE-04`); a declared
-   per-tool output budget/spill policy and effect-derived resource policy
-   remain open.
+   standing `TaskExecutionPolicy` (`CORE-08`) is landed, the kernel-level
+   trusted output broker is landed (`CORE-04`), and a declared per-tool
+   output budget/spill policy on `ToolSpec` is enforced by the broker
+   (clamped to the global hard cap, spill at the declared limit);
+   effect-derived resource policy remains open.
 6. **V1-M15 Real Evaluation** — coding workload A/B/C + lifecycle metrics.
    Acceptance: the dynamic runtime saves tokens without lowering task
    success rate. 🧪 Replay and one no-tool live smoke exist; real coding
@@ -1334,14 +1335,17 @@ Several model-facing dimensions are bounded and tested:
   `Unknown` for legacy rows), and the surface report records catalog /
   task-requirement / anchor / focus / execution-policy source revisions.
 
-The milestone acceptance is still open. `ToolSpec` has no trusted per-output
-budget/spill policy; context diagnostics/catalog scans are not all
-bounded by logical history size. The kernel-level trusted output broker is
-landed (`CORE-04`): every model-facing tool field is capped, oversized
-content spills to an artifact once (no more lost truncated middle), and
-context-fetch/provider-error text is bounded — but a *declared* per-tool
-output budget/spill policy on `ToolSpec` itself remains. The narrow,
-revocable standing `TaskExecutionPolicy` (`CORE-08`) is now implemented:
+The milestone acceptance is still open. Context diagnostics/catalog scans
+are not all bounded by logical history size, and effect-derived resource
+policy is not landed. The kernel-level trusted output broker is landed
+(`CORE-04`): every model-facing tool field is capped, oversized content
+spills to an artifact once (no more lost truncated middle), and
+context-fetch/provider-error text is bounded. A *declared* per-tool output
+budget is landed too: `ToolSpec::output_budget` bounds a tool's
+`model_content` (clamped to the global hard cap) and the broker spills and
+truncates at the declared limit, with the kernel passing the executed
+tool's spec budget at every outcome variant. The narrow, revocable
+standing `TaskExecutionPolicy` (`CORE-08`) is now implemented:
 effect + target + constraint + expiry grants established by the composition
 root, consumed per call, revoked or expired by shrinking, with a
 zero-responder deny/skip fallback that never expands privileges. Permission
