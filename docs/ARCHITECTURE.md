@@ -288,12 +288,29 @@ and since V1-P0-5 it is a confinement boundary, not a path joiner:
   lexically so new-file writes still work. (Windows verbatim `\\?\`
   prefixes from `canonicalize` are normalized away so returned paths
   stay display-friendly.)
+- Since CORE-07 the *authoritative* reads and mutations do not use that
+  path string at all: validation and open are fused into one
+  directory-handle-relative descent (`confined_open_read`,
+  `confined_parent`, staging and replace), so a link swap between a
+  validation pass and the open cannot redirect the operation. Each
+  component is opened relative to the already-open parent handle with
+  link-following disabled — `openat` with `O_NOFOLLOW`/`O_DIRECTORY` on
+  Unix; `NtCreateFile` with a `RootDirectory` handle and
+  `FILE_OPEN_REPARSE_POINT`, plus an explicit reparse-tag check after
+  every open (any nonzero tag — symlink, junction, mount point, cloud
+  placeholder — is rejected), on Windows. `resolve_relative` remains for
+  display-only resolution (`fs.list`, `search.grep`, `git.diff` pathspec
+  validation).
 - `Workspace::resolve_mutation` adds a hard rejection of the runtime
   state directory (`.focus-agent/` — traces, checkpoints, artifacts,
   change journal); mutating tools (`fs.write`, `edit.replace`) resolve
   through it, so ordinary coding tools cannot overwrite runtime state.
+  `confined_parent` mirrors the same rejection while descending through
+  the pinned handle chain.
 - Read tools (`fs.list`/`fs.read`/`search.grep`) use `resolve_relative`
-  and can still read artifacts.
+  and can still read artifacts; `fs.read`/`edit.replace` read through the
+  pinned handle, so their size checks and content reads describe the same
+  object.
 
 ### Mutation transactions
 
@@ -301,9 +318,16 @@ Since V1-P0-6 every file mutation is a `MutationTransaction` produced by
 `Workspace::begin_mutation`:
 
 ```text
-resolve_mutation → capture old content (bounded) → stage temp file in
-target dir → record change journal → atomic rename (swap)
+resolve_mutation → confined parent handle → capture old content (bounded)
+→ stage temp file under the pinned handle → record change journal →
+handle-relative atomic replace
 ```
+
+Since CORE-07 the staging and the swap are relative to the pinned parent
+directory handle — `renameat` on Unix,
+`NtSetInformationFile(FileRenameInformation)` with the parent as
+`RootDirectory` on Windows — so neither the staged file nor the final
+replace can be redirected by a path swap.
 
 The journal entry lands *before* the swap, so a journal failure never
 leaves the target half-mutated (a retrying agent cannot double-apply an

@@ -1013,6 +1013,42 @@ open/create can race a link swap. Trusted Core should use directory-handle-
 relative/openat-style operations (and Windows equivalent), reject reparse
 substitution at operation time, and test concurrent swaps.
 
+**2026-08-11: closed.** The workspace fuses validation and open into one
+directory-handle-relative descent (`crates/agent-workspace/src/confined.rs`
+— `ConfinedDir`/`ConfinedFile`):
+
+1. **Directory-handle-relative opens** — reads (`Workspace::confined_open_
+   read`) and mutation parents (`confined_parent`) descend through pinned
+   directory handles: `openat` with `O_NOFOLLOW`/`O_DIRECTORY` on Unix,
+   `NtCreateFile` with a `RootDirectory` handle on Windows. A handle pins
+   the directory object, so renaming the path after the handle is held
+   cannot redirect the next step.
+2. **Reparse substitution rejected at operation time** — every Windows open
+   uses `FILE_OPEN_REPARSE_POINT` and then rejects any nonzero reparse tag
+   (symlink, junction, mount point, cloud placeholder), so a swap into a
+   link fails the open instead of following it.
+3. **Handle-relative atomic replace** — the staged temp file is created
+   exclusively under the pinned parent and committed with `renameat` /
+   `NtSetInformationFile(FileRenameInformation)` relative to it, so the
+   final mutation cannot be redirected either. (The
+   `SetFileInformationByHandle` wrapper rejects a nonzero `RootDirectory`
+   on this Windows generation; the native call is used.) The old
+   path-based `atomic_replace` is gone.
+4. **Consumers read through the handle** — `WorkspaceHandle::read`,
+   `fs.read` and `edit.replace` take metadata and content from the pinned
+   handle, so size checks and reads describe the same object. Path-string
+   `resolve_relative` remains for display-only resolution (`fs.list`,
+   `search.grep`, `git.diff` pathspec validation).
+
+Regression coverage (the audit's "test concurrent swaps"): a real
+directory and an outside-pointing junction/symlink are swapped in and out
+of the target path by a real OS thread while the victim reads (`concurrent_
+dir_swap_never_reads_outside`) and mutates (`concurrent_dir_swap_never_
+writes_outside`) — outside content never surfaces and no mutation lands
+outside. Also: `confined_read_rejects_preplanted_reparse_link`,
+`confined_mutation_creates_missing_parents`,
+`confined_replace_file_overwrites_and_creates`.
+
 ### CORE-08 — Per-call approval cannot support unattended long tasks
 
 The current policy has two extremes:
