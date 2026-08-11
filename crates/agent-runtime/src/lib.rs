@@ -38,8 +38,8 @@ pub use modules::{
     ApprovalModule, ArtifactModule, ContextModule, EventModule, ModelModule, ToolModule,
 };
 pub use plugin::{
-    PLUGIN_TEST_OUTPUT_TAIL_CHARS, PLUGIN_TEST_TIMEOUT, PluginPackageView, PluginRegistry,
-    PluginTestReport, PluginTestResult, SkillView,
+    HookRef, HookView, PLUGIN_TEST_OUTPUT_TAIL_CHARS, PLUGIN_TEST_TIMEOUT, PluginPackageView,
+    PluginRegistry, PluginTestReport, PluginTestResult, SkillView,
 };
 pub use prompt::PromptAssembler;
 pub use services::RuntimeServices;

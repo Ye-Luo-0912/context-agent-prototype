@@ -33,12 +33,80 @@ impl VersionRange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookMode {
-    /// Observes the lifecycle event without blocking it.
+    /// Observes the lifecycle event without blocking it. Failure policy is
+    /// always `HookFailurePolicy::RecordAndContinue` (ECO-07).
     Observe,
-    /// May gate (allow/deny) the lifecycle event. The gate contract itself
-    /// (ordering, bounds, failure policy) is ECO-07 work; v0 only records
-    /// the declaration.
+    /// May gate (allow/deny) the lifecycle event. Failure policy is always
+    /// `HookFailurePolicy::DenyOnFailure` — a gate fails closed (ECO-07).
     Gate,
+}
+
+/// What the runtime does when a hook firing itself fails (errors, exceeds
+/// its timeout or output bound). Pinned at admission so a gate can never
+/// silently fail open (ECO-07): `RecordAndContinue` is only valid for
+/// observers, `DenyOnFailure` only for gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookFailurePolicy {
+    /// Record the failure (diagnostics) and let the lifecycle event
+    /// proceed. Only valid with `HookMode::Observe`.
+    #[default]
+    RecordAndContinue,
+    /// Fail closed: deny/block the lifecycle event. Only valid with
+    /// `HookMode::Gate`.
+    DenyOnFailure,
+}
+
+/// The known lifecycle-event vocabulary a hook may target (ECO-07). This
+/// mirrors the runtime maintenance triggers; admission refuses any event
+/// outside it, so a misspelled or invented event cannot silently register
+/// a hook that never fires.
+pub const KNOWN_HOOK_EVENTS: &[&str] = &[
+    "user_input",
+    "before_model",
+    "after_model",
+    "after_tool",
+    "focus_changed",
+    "task_completed",
+    "checkpoint",
+];
+
+/// A declared hook: a lifecycle observation/gating point. Metadata only
+/// (ECO-01): never fired in v0. ECO-07 pins the firing contract in the
+/// declaration itself — deterministic ordering, bounded time/output,
+/// explicit fail-closed failure policy and permissions that can never
+/// widen the package's set — so a future first-class hook runtime has the
+/// shape validated at install and needs no new authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookDeclaration {
+    pub id: String,
+    /// The lifecycle event this hook targets, from `KNOWN_HOOK_EVENTS`
+    /// (validated at admission).
+    pub event: String,
+    pub mode: HookMode,
+    /// Explicit priority among hooks on the same event: ascending `order`
+    /// runs first; ties break by declaration order within a package, then
+    /// by package install order (deterministic, ECO-07).
+    #[serde(default)]
+    pub order: u32,
+    /// Wall-clock budget for one firing, capped by
+    /// `MAX_HOOK_TIMEOUT_MS` at admission. `None` = runtime default.
+    /// Metadata in v0; enforced when hooks become first-class (Gate 5).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Bounded model-facing output for one firing, capped by
+    /// `MAX_HOOK_OUTPUT_CHARS` at admission. `None` = runtime default.
+    #[serde(default)]
+    pub output_budget_chars: Option<usize>,
+    /// Failure policy, validated against `mode` at admission: observers
+    /// record-and-continue, gates fail closed.
+    #[serde(default)]
+    pub failure: HookFailurePolicy,
+    /// Permissions this hook may exercise. Must be a subset of the
+    /// package's declared permissions (validated at admission): a hook
+    /// can never widen the package's permission set (ECO-07).
+    #[serde(default)]
+    pub permissions: Vec<String>,
 }
 
 /// Activation state of an installed plugin package. Installation never
@@ -119,18 +187,6 @@ pub struct SkillDeclaration {
     /// Whether the skill is offered. Metadata only (no runtime effect).
     #[serde(default)]
     pub activation: SkillActivation,
-}
-
-/// A declared hook: a lifecycle observation/gating point. Metadata only
-/// (ECO-01): never fired in v0.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HookDeclaration {
-    pub id: String,
-    /// The lifecycle event this hook targets (e.g. `before_model`,
-    /// `after_tool`). Validated for shape and length; the known-event
-    /// vocabulary and firing order are ECO-07 work.
-    pub event: String,
-    pub mode: HookMode,
 }
 
 /// A declared adapter (e.g. an MCP endpoint). Metadata only until the

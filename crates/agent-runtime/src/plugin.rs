@@ -15,7 +15,8 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use agent_contracts::{
-    AgentError, AgentResult, PluginActivation, PluginPackageManifest, SkillActivation, SkillSource,
+    AgentError, AgentResult, HookFailurePolicy, HookMode, PluginActivation, PluginPackageManifest,
+    SkillActivation, SkillSource,
 };
 use agent_core::{PluginPackageAdmission, PluginStateAuthority};
 use tokio::io::AsyncReadExt;
@@ -33,6 +34,9 @@ const PLUGIN_TEST_ENV_KEYS: &[&str] = &["PATH", "SystemRoot", "TEMP", "TMP", "CO
 #[derive(Debug, Clone)]
 struct PackageEntry {
     manifest: PluginPackageManifest,
+    /// Monotonic install sequence, so cross-package hook ordering has a
+    /// deterministic tie-break (ECO-07).
+    installed_at: u64,
 }
 
 /// The runtime's plugin package catalog and lifecycle flows.
@@ -40,6 +44,8 @@ struct PackageEntry {
 pub struct PluginRegistry {
     packages: RwLock<HashMap<String, PackageEntry>>,
     state: PluginStateAuthority,
+    /// Next `installed_at` sequence number (see `PackageEntry`).
+    next_install: std::sync::atomic::AtomicU64,
 }
 
 impl PluginRegistry {
@@ -60,7 +66,16 @@ impl PluginRegistry {
                 "package '{id}' is already installed"
             )));
         }
-        packages.insert(id.clone(), PackageEntry { manifest });
+        let installed_at = self
+            .next_install
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        packages.insert(
+            id.clone(),
+            PackageEntry {
+                manifest,
+                installed_at,
+            },
+        );
         self.state.install(&id);
         Ok(())
     }
@@ -199,6 +214,61 @@ impl PluginRegistry {
         })
     }
 
+    /// The declared hooks of one package, as a bounded metadata view, in
+    /// declaration order (ECO-07). Metadata only — nothing fires in v0.
+    pub fn hooks(&self, package: &str) -> Option<Vec<HookView>> {
+        let packages = self.packages.read().expect("plugin catalog poisoned");
+        packages.get(package).map(|entry| {
+            entry
+                .manifest
+                .hooks
+                .iter()
+                .map(|hook| HookView {
+                    id: hook.id.clone(),
+                    event: hook.event.clone(),
+                    mode: hook.mode,
+                    order: hook.order,
+                    timeout_ms: hook.timeout_ms,
+                    output_budget_chars: hook.output_budget_chars,
+                    failure: hook.failure,
+                    permissions: hook.permissions.clone(),
+                })
+                .collect()
+        })
+    }
+
+    /// The deterministic firing order for one lifecycle event across every
+    /// active package (ECO-07): ascending `order`, then package install
+    /// order, then declaration order within the package. Packages that are
+    /// not `Active` contribute no hooks; an event outside the known
+    /// vocabulary yields an empty order. Metadata only — nothing fires in
+    /// v0.
+    pub fn hook_order(&self, event: &str) -> Vec<HookRef> {
+        let packages = self.packages.read().expect("plugin catalog poisoned");
+        let mut order: Vec<(u32, u64, usize, String, String)> = Vec::new();
+        for (id, entry) in packages.iter() {
+            if self.state.activation(id) != Some(PluginActivation::Active) {
+                continue;
+            }
+            for (index, hook) in entry.manifest.hooks.iter().enumerate() {
+                if hook.event == event {
+                    order.push((
+                        hook.order,
+                        entry.installed_at,
+                        index,
+                        id.clone(),
+                        hook.id.clone(),
+                    ));
+                }
+            }
+        }
+        order.sort_by_key(|(order, installed_at, index, _, _)| (*order, *installed_at, *index));
+        order
+            .into_iter()
+            .map(|(_, _, _, package, id)| HookRef { package, id })
+            .collect()
+    }
+
     /// Activate a declared skill. Metadata intent only (ECO-06): the
     /// runtime never executes a skill and never turns its instructions
     /// into System-authority content — activation only records that the
@@ -265,6 +335,30 @@ pub struct SkillView {
     pub reference: String,
     pub provenance: SkillSource,
     pub activation: SkillActivation,
+}
+
+/// A bounded metadata view of one declared hook (ECO-07). The firing
+/// contract is pinned here — ordering, time/output bounds, fail-closed
+/// failure policy and a permission set that can never widen the package's
+/// own — while the runtime still never fires a hook in v0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookView {
+    pub id: String,
+    pub event: String,
+    pub mode: HookMode,
+    pub order: u32,
+    pub timeout_ms: Option<u64>,
+    pub output_budget_chars: Option<usize>,
+    pub failure: HookFailurePolicy,
+    pub permissions: Vec<String>,
+}
+
+/// One hook in the deterministic firing order for an event (ECO-07):
+/// package + hook id; details come from `PluginRegistry::hooks(package)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookRef {
+    pub package: String,
+    pub id: String,
 }
 
 fn view(entry: &PackageEntry, activation: Option<PluginActivation>) -> PluginPackageView {
@@ -447,7 +541,9 @@ async fn kill_tree(child: &mut tokio::process::Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{SkillDeclaration, TestDeclaration, ToolRisk, ToolSpec, VersionRange};
+    use agent_contracts::{
+        HookDeclaration, SkillDeclaration, TestDeclaration, ToolRisk, ToolSpec, VersionRange,
+    };
     use serde_json::json;
 
     fn tool(name: &str) -> ToolSpec {
@@ -495,6 +591,36 @@ mod tests {
             dependencies: Vec::new(),
             permissions: vec!["workspace:read".into()],
             tests,
+        }
+    }
+
+    fn package_with_hooks(id: &str, hooks: Vec<HookDeclaration>) -> PluginPackageManifest {
+        PluginPackageManifest {
+            id: id.into(),
+            version: "1.0.0".into(),
+            name: id.into(),
+            summary: "test package".into(),
+            api: VersionRange("0.1".into()),
+            tools: vec![tool(&format!("{id}.run"))],
+            skills: Vec::new(),
+            hooks,
+            adapters: Vec::new(),
+            dependencies: Vec::new(),
+            permissions: vec!["workspace:read".into()],
+            tests: Vec::new(),
+        }
+    }
+
+    fn observe_hook(id: &str, event: &str, order: u32) -> HookDeclaration {
+        HookDeclaration {
+            id: id.into(),
+            event: event.into(),
+            mode: HookMode::Observe,
+            order,
+            timeout_ms: Some(500),
+            output_budget_chars: Some(1_000),
+            failure: HookFailurePolicy::RecordAndContinue,
+            permissions: vec!["workspace:read".into()],
         }
     }
 
@@ -779,6 +905,136 @@ mod tests {
             registry.activate_skill("missing", "do-thing").is_err(),
             "activating a skill in an unknown package must fail"
         );
+    }
+
+    #[test]
+    fn hook_views_expose_the_bounded_firing_contract() {
+        // ECO-07 anchor: the view carries the firing contract — order,
+        // time/output bounds, fail-closed policy, subset permissions —
+        // while nothing fires in v0.
+        let registry = PluginRegistry::new();
+        registry
+            .install(package_with_hooks(
+                "pack",
+                vec![
+                    observe_hook("a", "before_model", 10),
+                    HookDeclaration {
+                        id: "gate-b".into(),
+                        event: "before_model".into(),
+                        mode: HookMode::Gate,
+                        order: 5,
+                        timeout_ms: None,
+                        output_budget_chars: None,
+                        failure: HookFailurePolicy::DenyOnFailure,
+                        permissions: Vec::new(),
+                    },
+                ],
+            ))
+            .expect("install succeeds");
+
+        let views = registry.hooks("pack").expect("hooks are viewable");
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].id, "a");
+        assert_eq!(views[0].event, "before_model");
+        assert_eq!(views[0].mode, HookMode::Observe);
+        assert_eq!(views[0].order, 10);
+        assert_eq!(views[0].timeout_ms, Some(500));
+        assert_eq!(views[0].output_budget_chars, Some(1_000));
+        assert_eq!(views[0].failure, HookFailurePolicy::RecordAndContinue);
+        assert_eq!(views[0].permissions, vec!["workspace:read".to_string()]);
+        assert_eq!(views[1].id, "gate-b");
+        assert_eq!(views[1].failure, HookFailurePolicy::DenyOnFailure);
+
+        // Unknown package: no view.
+        assert!(registry.hooks("missing").is_none());
+    }
+
+    #[test]
+    fn hook_order_is_deterministic_across_active_packages() {
+        // ECO-07 ordering: ascending `order` first; ties break by package
+        // install order, then declaration order within the package. Only
+        // Active packages contribute.
+        let registry = PluginRegistry::new();
+        registry
+            .install(package_with_hooks(
+                "pack-a",
+                vec![observe_hook("late", "before_model", 50)],
+            ))
+            .expect("install a");
+        registry
+            .install(package_with_hooks(
+                "pack-b",
+                vec![
+                    observe_hook("early", "before_model", 1),
+                    observe_hook("mid", "before_model", 50),
+                ],
+            ))
+            .expect("install b");
+        registry
+            .install(package_with_hooks(
+                "pack-c",
+                vec![observe_hook("z", "after_tool", 0)],
+            ))
+            .expect("install c");
+        // Only active packages contribute hooks (ECO-07).
+        registry.enable("pack-a").expect("enable a");
+        registry.enable("pack-b").expect("enable b");
+        // pack-c stays Installed (inert): its hooks must not appear.
+
+        let order = registry.hook_order("before_model");
+        let refs: Vec<(String, String)> = order
+            .iter()
+            .map(|hook| (hook.package.clone(), hook.id.clone()))
+            .collect();
+        assert_eq!(
+            refs,
+            vec![
+                // pack-b.early has order 1 -> first.
+                ("pack-b".to_string(), "early".to_string()),
+                // order 50 ties: pack-a installed before pack-b, so
+                // pack-a.late runs before pack-b.mid (install order).
+                ("pack-a".to_string(), "late".to_string()),
+                ("pack-b".to_string(), "mid".to_string()),
+            ]
+        );
+
+        // An event with no hooks anywhere, or outside the vocabulary,
+        // yields an empty order.
+        assert!(registry.hook_order("after_tool").is_empty());
+        assert!(registry.hook_order("not_an_event").is_empty());
+    }
+
+    #[test]
+    fn hook_order_skips_disabled_and_quarantined_packages() {
+        // A package that is not Active contributes no hooks: disabled and
+        // quarantined packages must not gate or observe lifecycle events.
+        let registry = PluginRegistry::new();
+        registry
+            .install(package_with_hooks(
+                "on",
+                vec![observe_hook("h", "checkpoint", 0)],
+            ))
+            .expect("install on");
+        registry
+            .install(package_with_hooks(
+                "off",
+                vec![observe_hook("h", "checkpoint", 0)],
+            ))
+            .expect("install off");
+        registry.enable("on").expect("enable on");
+        registry.enable("off").expect("enable off");
+        assert_eq!(registry.hook_order("checkpoint").len(), 2);
+
+        registry.disable("off").expect("disable off");
+        let order = registry.hook_order("checkpoint");
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0].package, "on");
+
+        registry.enable("off").expect("re-enable off");
+        registry.quarantine("off").expect("quarantine off");
+        let order = registry.hook_order("checkpoint");
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0].package, "on");
     }
 
     #[tokio::test]

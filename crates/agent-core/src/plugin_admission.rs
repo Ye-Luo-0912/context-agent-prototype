@@ -13,8 +13,8 @@
 //! schema the capability plane would refuse.
 
 use agent_contracts::{
-    AgentError, AgentResult, PluginPackageManifest, VersionRange, is_known_permission,
-    validate_capability_id,
+    AgentError, AgentResult, HookFailurePolicy, HookMode, PluginPackageManifest, VersionRange,
+    is_known_permission, validate_capability_id,
 };
 
 /// Per-package component caps: a package must not be able to grow the model
@@ -25,6 +25,13 @@ pub const MAX_HOOKS_PER_PACKAGE: usize = 16;
 pub const MAX_ADAPTERS_PER_PACKAGE: usize = 8;
 pub const MAX_DEPENDENCIES_PER_PACKAGE: usize = 16;
 pub const MAX_TESTS_PER_PACKAGE: usize = 16;
+
+/// Per-hook firing bounds (ECO-07): a hook declares its budget explicitly
+/// and admission refuses anything above the hard cap, so a future hook
+/// runtime can never be pushed past the model-facing or wall-clock limits
+/// by the manifest alone.
+pub const MAX_HOOK_TIMEOUT_MS: u64 = 30_000;
+pub const MAX_HOOK_OUTPUT_CHARS: usize = 16_000;
 
 /// Field bounds for package identity and component declarations.
 pub const MAX_PACKAGE_NAME_CHARS: usize = 100;
@@ -141,6 +148,8 @@ fn validate_hooks(package: &PluginPackageManifest) -> AgentResult<()> {
             package.hooks.len()
         )));
     }
+    let package_permissions: std::collections::HashSet<&str> =
+        package.permissions.iter().map(String::as_str).collect();
     let mut seen = std::collections::HashSet::new();
     for hook in &package.hooks {
         validate_component_id("hook", &package.id, &hook.id)?;
@@ -158,18 +167,82 @@ fn validate_hooks(package: &PluginPackageManifest) -> AgentResult<()> {
                 hook.event.len()
             )));
         }
-        let well_formed = hook
-            .event
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-'));
-        if !well_formed {
+        // The event must be part of the known lifecycle vocabulary, so a
+        // misspelled or invented event cannot register a hook that never
+        // fires (ECO-07).
+        if !agent_contracts::KNOWN_HOOK_EVENTS.contains(&hook.event.as_str()) {
             return Err(AgentError::InvalidRequest(format!(
-                "package '{}' hook '{}' event '{}' may only contain lowercase [a-z0-9_.-]",
-                package.id, hook.id, hook.event
+                "package '{}' hook '{}' targets unknown event '{}' (known: {})",
+                package.id,
+                hook.id,
+                hook.event,
+                agent_contracts::KNOWN_HOOK_EVENTS.join(", ")
             )));
         }
-        // Mode is an enum, so observe/gate are the only possibilities.
-        let _ = hook.mode;
+        // Time and output bounds are explicit and hard-capped (ECO-07): a
+        // zero budget can never complete, an over-cap budget could push a
+        // future hook runtime past its limits.
+        if hook.timeout_ms == Some(0) || hook.timeout_ms.is_some_and(|ms| ms > MAX_HOOK_TIMEOUT_MS)
+        {
+            return Err(AgentError::InvalidRequest(format!(
+                "package '{}' hook '{}' timeout must be 1..={MAX_HOOK_TIMEOUT_MS} ms (got {:?})",
+                package.id, hook.id, hook.timeout_ms
+            )));
+        }
+        if hook.output_budget_chars == Some(0)
+            || hook
+                .output_budget_chars
+                .is_some_and(|chars| chars > MAX_HOOK_OUTPUT_CHARS)
+        {
+            return Err(AgentError::InvalidRequest(format!(
+                "package '{}' hook '{}' output budget must be 1..={MAX_HOOK_OUTPUT_CHARS} chars (got {:?})",
+                package.id, hook.id, hook.output_budget_chars
+            )));
+        }
+        // Failure policy must match the mode (ECO-07): observers
+        // record-and-continue, gates fail closed. A gate that records and
+        // continues is a silent fail-open and is refused outright.
+        let policy_ok = match hook.mode {
+            HookMode::Observe => hook.failure == HookFailurePolicy::RecordAndContinue,
+            HookMode::Gate => hook.failure == HookFailurePolicy::DenyOnFailure,
+        };
+        if !policy_ok {
+            return Err(AgentError::InvalidRequest(format!(
+                "package '{}' hook '{}' ({:?}) must use failure policy {:?}, got {:?}",
+                package.id,
+                hook.id,
+                hook.mode,
+                match hook.mode {
+                    HookMode::Observe => HookFailurePolicy::RecordAndContinue,
+                    HookMode::Gate => HookFailurePolicy::DenyOnFailure,
+                },
+                hook.failure
+            )));
+        }
+        // A hook can never widen the package's permission set (ECO-07):
+        // every declared hook permission must be known and a subset of the
+        // package's own permissions.
+        let mut seen_permission = std::collections::HashSet::new();
+        for permission in &hook.permissions {
+            if !is_known_permission(permission) {
+                return Err(AgentError::InvalidRequest(format!(
+                    "package '{}' hook '{}' declares unknown permission '{permission}'",
+                    package.id, hook.id
+                )));
+            }
+            if !seen_permission.insert(permission.as_str()) {
+                return Err(AgentError::InvalidRequest(format!(
+                    "package '{}' hook '{}' declares permission '{permission}' twice",
+                    package.id, hook.id
+                )));
+            }
+            if !package_permissions.contains(permission.as_str()) {
+                return Err(AgentError::InvalidRequest(format!(
+                    "package '{}' hook '{}' permission '{permission}' is not a subset of the package permissions",
+                    package.id, hook.id
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -388,6 +461,11 @@ mod tests {
                 id: "observe-model".into(),
                 event: "before_model".into(),
                 mode: HookMode::Observe,
+                order: 10,
+                timeout_ms: Some(1_000),
+                output_budget_chars: Some(4_000),
+                failure: HookFailurePolicy::RecordAndContinue,
+                permissions: vec!["workspace:read".into()],
             }],
             adapters: vec![agent_contracts::AdapterDeclaration {
                 id: "mcp-main".into(),
@@ -422,12 +500,17 @@ mod tests {
 
     #[test]
     fn rejects_unknown_or_duplicate_permissions() {
+        // Hook validation runs before package permission validation, so the
+        // hook's permission scope is cleared to isolate the package-level
+        // checks here (the hook-subset rules are tested separately).
         let mut package = valid_package();
+        package.hooks[0].permissions = Vec::new();
         package.permissions = vec!["network:all".into()];
         let error = PluginPackageAdmission::validate_static(&package).unwrap_err();
         assert!(error.to_string().contains("unknown permission"), "{error}");
 
         let mut package = valid_package();
+        package.hooks[0].permissions = Vec::new();
         package.permissions = vec!["workspace:read".into(), "workspace:read".into()];
         let error = PluginPackageAdmission::validate_static(&package).unwrap_err();
         assert!(error.to_string().contains("twice"), "{error}");
@@ -448,14 +531,89 @@ mod tests {
     #[test]
     fn rejects_bad_hook_event_and_duplicate_components() {
         let mut package = valid_package();
-        package.hooks[0].event = "Before Model".into();
+        package.hooks[0].event = "before_model_typo".into();
         let error = PluginPackageAdmission::validate_static(&package).unwrap_err();
-        assert!(error.to_string().contains("lowercase"), "{error}");
+        assert!(error.to_string().contains("unknown event"), "{error}");
 
         let mut package = valid_package();
         package.skills.push(package.skills[0].clone());
         let error = PluginPackageAdmission::validate_static(&package).unwrap_err();
         assert!(error.to_string().contains("twice"), "{error}");
+    }
+
+    #[test]
+    fn rejects_hook_bounds_outside_the_hard_caps() {
+        // A zero budget can never complete; an over-cap budget could push
+        // a future hook runtime past its limits (ECO-07).
+        for timeout in [Some(0u64), Some(MAX_HOOK_TIMEOUT_MS + 1)] {
+            let mut package = valid_package();
+            package.hooks[0].timeout_ms = timeout;
+            let error = PluginPackageAdmission::validate_static(&package).unwrap_err();
+            assert!(error.to_string().contains("timeout"), "{error}");
+        }
+        for budget in [Some(0usize), Some(MAX_HOOK_OUTPUT_CHARS + 1)] {
+            let mut package = valid_package();
+            package.hooks[0].output_budget_chars = budget;
+            let error = PluginPackageAdmission::validate_static(&package).unwrap_err();
+            assert!(error.to_string().contains("output"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_inconsistent_hook_failure_policy() {
+        // A gate that records-and-continues is a silent fail-open and is
+        // refused outright; an observer that denies would block the event
+        // it is only supposed to watch (ECO-07).
+        let mut package = valid_package();
+        package.hooks[0].mode = HookMode::Gate;
+        package.hooks[0].failure = HookFailurePolicy::RecordAndContinue;
+        let error = PluginPackageAdmission::validate_static(&package).unwrap_err();
+        assert!(error.to_string().contains("failure policy"), "{error}");
+
+        let mut package = valid_package();
+        package.hooks[0].failure = HookFailurePolicy::DenyOnFailure;
+        let error = PluginPackageAdmission::validate_static(&package).unwrap_err();
+        assert!(error.to_string().contains("failure policy"), "{error}");
+    }
+
+    #[test]
+    fn rejects_hook_permissions_outside_the_package_set() {
+        // A hook can never widen the package's permission set (ECO-07).
+        // `workspace:write` is a known word but outside this package's
+        // {workspace:read} set, so the subset rule refuses it.
+        let mut package = valid_package();
+        package.hooks[0].permissions = vec!["workspace:write".into()];
+        let error = PluginPackageAdmission::validate_static(&package).unwrap_err();
+        assert!(error.to_string().contains("not a subset"), "{error}");
+
+        let mut package = valid_package();
+        package.hooks[0].permissions = vec!["totally:madeup".into()];
+        let error = PluginPackageAdmission::validate_static(&package).unwrap_err();
+        assert!(error.to_string().contains("unknown permission"), "{error}");
+
+        let mut package = valid_package();
+        package.hooks[0].permissions = vec!["workspace:read".into(), "workspace:read".into()];
+        let error = PluginPackageAdmission::validate_static(&package).unwrap_err();
+        assert!(error.to_string().contains("twice"), "{error}");
+    }
+
+    #[test]
+    fn valid_package_with_gate_hook_passes() {
+        // A gate hook with an explicit fail-closed policy and a subset
+        // permission set is a valid declaration.
+        let mut package = valid_package();
+        package.hooks.push(agent_contracts::HookDeclaration {
+            id: "gate-model".into(),
+            event: "after_tool".into(),
+            mode: HookMode::Gate,
+            order: 0,
+            timeout_ms: None,
+            output_budget_chars: None,
+            failure: HookFailurePolicy::DenyOnFailure,
+            permissions: Vec::new(),
+        });
+        PluginPackageAdmission::validate_static(&package)
+            .expect("a gate hook with fail-closed policy passes");
     }
 
     #[test]

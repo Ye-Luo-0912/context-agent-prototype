@@ -1223,8 +1223,29 @@ together with TaskAnchor and continuous context GC.
   file containing a marker and asserts no registry view ever serializes
   the marker; a second test asserts activation is intent-only (surface and
   activation untouched, unknown skill/package refused).
-- [ ] **ECO-07** Define Hook ordering, time/resource bounds, failure policy, and the rule
+- [x] **ECO-07** Define Hook ordering, time/resource bounds, failure policy, and the rule
   that hooks cannot widen permissions or mutate protected state silently.
+  **Done 2026-08-12.** Hooks stay declared metadata (ECO-01) but the
+  firing contract is now pinned in the declaration and validated at
+  admission. `HookDeclaration` (agent-contracts `plugin`) gains `order`
+  (explicit priority), `timeout_ms` / `output_budget_chars` (bounded
+  budgets, hard-capped at admission by `MAX_HOOK_TIMEOUT_MS` /
+  `MAX_HOOK_OUTPUT_CHARS`), `failure: HookFailurePolicy`
+  (RecordAndContinue / DenyOnFailure) and a per-hook `permissions` set.
+  Admission (`PluginPackageAdmission`) refuses any event outside the
+  `KNOWN_HOOK_EVENTS` vocabulary, any budget above the cap or zero, a
+  failure policy inconsistent with the mode (a gate that records-and-
+  continues is a silent fail-open and is refused outright; observers
+  record-and-continue, gates fail closed), and any hook permission that is
+  unknown or not a subset of the package's own permissions — a hook can
+  never widen the package's set. `PluginRegistry` exposes bounded
+  `hooks(package)` views and `hook_order(event)`, the deterministic firing
+  order across every *active* package (ascending `order`, then package
+  install order, then declaration order), so a future first-class hook
+  runtime has the shape validated at install and needs no new authority.
+  Seven tests pin the contract: unknown events, zero/over-cap budgets,
+  mode/policy mismatch, out-of-set permissions, a valid gate hook, and the
+  ordering rules including disabled/quarantined exclusion.
 
 ### Gate 5: evidence gate
 
