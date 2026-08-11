@@ -870,6 +870,16 @@ pub struct ExternalizedContext {
     /// instead of checking only single incoming edges from the heap.
     #[serde(default)]
     pub dependencies: Vec<DependencyEdge>,
+    /// Model/operator-directed protection captured at externalize time.
+    /// A protected item is normally a GC root and never leaves the heap, so
+    /// these are almost always the default; they exist so stored metadata
+    /// can *represent* every directive field (a protection survives a
+    /// buffer-overflow externalize of a hint that arrived just before the
+    /// pass, and a completed task clears them in every body location).
+    #[serde(default)]
+    pub keep_alive: bool,
+    #[serde(default)]
+    pub lease_until_turn: Option<u64>,
     /// The `State::gc_epoch` at which this entry was last accessed. Aging
     /// Cold -> External compares *generations* (only full GC increments the
     /// epoch), never ticks — ingest/maintain/materialize also advance the
@@ -1232,6 +1242,8 @@ mod tests {
             entities: Vec::new(),
             tags: Vec::new(),
             dependencies: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
             last_access_gc_epoch: Some(0),
             blob_checksum: None,
         }

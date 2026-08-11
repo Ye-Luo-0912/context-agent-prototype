@@ -636,6 +636,18 @@ impl ContextEngine for SimpleContextEngine {
                             item.lease_until_turn = None;
                         }
                     }
+                    // External entries carry the same protection fields
+                    // (captured at externalize time); a completed task
+                    // clears them there too, so no body location can keep
+                    // rooting the finished task's records.
+                    let mut external = state.external.take_all();
+                    for entry in &mut external {
+                        if entry.task_id == Some(completed_task) {
+                            entry.keep_alive = false;
+                            entry.lease_until_turn = None;
+                        }
+                    }
+                    state.external.replace_all(external);
                     scope::queue_task_scope_close(&mut state, completed_task);
                 }
                 let mut item = item::make_item(

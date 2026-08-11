@@ -171,6 +171,8 @@ mod tests {
             entities: Vec::new(),
             tags: Vec::new(),
             dependencies: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
             last_access_gc_epoch: Some(0),
             blob_checksum: None,
         }

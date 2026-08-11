@@ -3829,6 +3829,81 @@ async fn completed_task_clears_protections_in_every_residency() {
     );
 }
 
+/// A completed task clears model protections in the external map too: the
+/// entry captures keep_alive/lease at externalize time, and the task close
+/// must drop them in every body location so a finished task cannot keep
+/// rooting its records through a stored reference.
+#[tokio::test]
+async fn completed_task_clears_protections_in_external_entries() {
+    let store = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(store.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let task_id = open_focus(&engine, "maintain the auth service").await;
+
+    // An external entry for the focused task carrying model protections.
+    let protected_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "AuthService.rs decision: keep the token cache".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Durable,
+            0.5,
+            None,
+        );
+        item.id = ContextItemId::new();
+        item.task_id = Some(task_id);
+        item.keep_alive = true;
+        item.lease_until_turn = Some(99);
+        item.entities = crate::index::entity::extract_entities(&item.content);
+        let reference = crate::store::externalize(store.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item, reference, 1, 1, None,
+        ));
+        item.id
+    };
+    {
+        let state = engine.state.lock().await;
+        let entry = state
+            .external
+            .get(protected_id)
+            .expect("one external entry");
+        assert!(
+            entry.keep_alive && entry.lease_until_turn == Some(99),
+            "the entry captures the protections at externalize time"
+        );
+    }
+
+    // Completing the task clears the protections in the external map.
+    engine
+        .ingest(ContextIngress::TaskCompleted {
+            task_id: Some(task_id),
+            summary: "auth service maintained".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::TaskCompleted)
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    let entry = state
+        .external
+        .get(protected_id)
+        .expect("the entry stays in the map");
+    assert!(
+        !entry.keep_alive && entry.lease_until_turn.is_none(),
+        "completed task must clear protections in the external map, got keep_alive={} lease={:?}",
+        entry.keep_alive,
+        entry.lease_until_turn
+    );
+}
+
 /// Automatic hot-entity recall of a completed task's records is forbidden
 /// without an explicit reason. The hot set alone must not bring finished
 /// work back as current truth.

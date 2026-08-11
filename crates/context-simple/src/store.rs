@@ -235,6 +235,8 @@ pub(crate) fn to_external_entry(
         entities: item.entities.clone(),
         tags: item.tags.clone(),
         dependencies: item.dependencies.clone(),
+        keep_alive: item.keep_alive,
+        lease_until_turn: item.lease_until_turn,
         last_access_gc_epoch: Some(gc_epoch),
         blob_checksum,
     }
@@ -922,6 +924,28 @@ mod tests {
         assert_eq!(entry.dependencies, item.dependencies);
         assert_eq!(entry.last_access_gc_epoch, Some(3));
         assert!(entry.entities.iter().any(|e| e == "AuthService.rs"));
+    }
+
+    #[test]
+    fn external_entries_carry_the_model_protection_fields() {
+        let mut item = test_item(ContextItemId::new(), "fix AuthService.rs");
+        item.keep_alive = true;
+        item.lease_until_turn = Some(42);
+        let reference = ContextRef {
+            uri: "context://run/x".into(),
+            item_id: item.id,
+            kind: item.kind,
+            scope: item.scope,
+            summary: "fix AuthService.rs".into(),
+            created_tick: 1,
+        };
+        let entry = to_external_entry(&item, reference, 7, 3, None);
+        assert!(entry.keep_alive, "keep_alive survives externalization");
+        assert_eq!(
+            entry.lease_until_turn,
+            Some(42),
+            "a lease survives externalization"
+        );
     }
 
     #[test]
