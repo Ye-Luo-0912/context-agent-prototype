@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::fs;
 
-use super::Tool;
+use super::{Tool, content_digest};
 
 const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_READ_LINES: usize = 400;
@@ -243,7 +243,14 @@ impl Tool for FsReadTool {
             ),
             model_content: selected,
             artifact_ref: None,
-            metadata: json!({"line_count": lines.len(), "bytes": metadata.len()}),
+            metadata: json!({
+                "line_count": lines.len(),
+                "bytes": metadata.len(),
+                // The content revision (SHA-256 hex): stable for the same
+                // bytes, changes with any edit — the patch tool's
+                // `base_revision` precondition is checked against this.
+                "revision": content_digest(text.as_bytes()),
+            }),
         }))
     }
 }
@@ -425,5 +432,65 @@ mod tests {
             .execute(run_id, "c", request.call.arguments, request.cancel)
             .await;
         assert!(result.is_err(), "state dir writes must be rejected");
+    }
+
+    #[tokio::test]
+    async fn fs_read_reports_a_stable_content_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "hello revision\n").unwrap();
+        let tool = FsReadTool::new(workspace.clone());
+        let run_id = RunId::new();
+
+        let read = |path: &str| {
+            let tool = &tool;
+            let call = agent_contracts::ToolCall {
+                id: "c".into(),
+                name: "fs.read".into(),
+                arguments: json!({"path": path}),
+            };
+            async move {
+                tool.execute(run_id, "c", call.arguments, CancellationToken::new())
+                    .await
+            }
+        };
+
+        let first = read("notes.txt").await.unwrap();
+        let ToolOutcome::Value(output) = first else {
+            panic!("fs.read returns a plain value");
+        };
+        let revision_a = output.metadata["revision"].as_str().unwrap().to_string();
+        assert_eq!(revision_a.len(), 64, "a full SHA-256 hex revision");
+
+        // Same bytes, same revision.
+        let second = read("notes.txt").await.unwrap();
+        let ToolOutcome::Value(output) = second else {
+            panic!("fs.read returns a plain value");
+        };
+        assert_eq!(
+            output.metadata["revision"].as_str().unwrap(),
+            revision_a,
+            "reading the same content must not change the revision"
+        );
+
+        // Any edit changes the revision.
+        std::fs::write(dir.path().join("notes.txt"), "hello revision!\n").unwrap();
+        let third = read("notes.txt").await.unwrap();
+        let ToolOutcome::Value(output) = third else {
+            panic!("fs.read returns a plain value");
+        };
+        assert_ne!(
+            output.metadata["revision"].as_str().unwrap(),
+            revision_a,
+            "an edited file must report a different revision"
+        );
+
+        // The revision is exactly the digest helper the patch tool will
+        // use for its `base_revision` precondition.
+        let bytes = std::fs::read(dir.path().join("notes.txt")).unwrap();
+        assert_eq!(
+            output.metadata["revision"].as_str().unwrap(),
+            content_digest(&bytes)
+        );
     }
 }
