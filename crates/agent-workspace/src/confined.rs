@@ -195,6 +195,7 @@ impl ConfinedDir {
     /// The returned handle pins the object, so metadata and reads taken
     /// through it cannot be redirected by a later path swap.
     pub(crate) fn open_existing(&self, name: &OsStr) -> io::Result<std::fs::File> {
+        #[cfg(windows)]
         let child_display = self.display.join(name);
         #[cfg(unix)]
         {
@@ -246,7 +247,7 @@ impl ConfinedDir {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            std::fs::File::open(&child_display)
+            std::fs::File::open(self.display.join(name))
         }
     }
 
@@ -308,6 +309,9 @@ impl ConfinedDir {
     ) -> io::Result<()> {
         #[cfg(unix)]
         {
+            // Unix renames by name under the pinned directory; the handle
+            // is only needed for the Windows FileRenameInformation path.
+            let _ = from_file;
             let from_c = to_cstring(from_name)?;
             let to_c = to_cstring(to_name)?;
             // SAFETY: both names are NUL-terminated; renameat resolves them
