@@ -1200,8 +1200,10 @@ letting the LLM grow capabilities autonomously.
    low-authority `user` messages, so retrieved history cannot gain system
    precedence. **Done:** TaskAnchor,
    `CompletionRecord`, atomic completion root transfer and verifiable
-   final-output digest (`CTX-10`); the System-role split (`CORE-05`). The
-   episode-local turn counter and canonical catalog remain.
+   final-output digest (`CTX-10`); the System-role split (`CORE-05`); the
+   episode-local turn counter (rotation resets it, and GC ages ordinary
+   dialogue out of the open episode, so a long episode stays bounded without
+   rotating every message). The canonical catalog remains.
 3. **Close trusted execution (M12/M13).** Extend process IPC with typed
    prepared effects, broker or confine direct shell/process mutation, and add
    real filesystem/network/resource isolation with adversarial cancel/escape

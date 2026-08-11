@@ -262,6 +262,26 @@ the residency floor. The `long_task_10k_turns` property test keeps the
 resident heap flat (~10 items) over 10,000 task turns while a durable
 decision stays recallable and stale dialogue leaves Resident.
 
+The episode turn budget is **episode-local**: rotation zeroes
+`FocusState.generation`, so `episode_max_user_turns` measures the current
+episode only. Without the reset, one overlong episode permanently exhausted
+every later episode's budget (the guard fired on the very next user message
+and rotated a fresh single-turn episode). `focus_generation` diagnostics
+read the episode-local count.
+
+The open episode is bounded too, not just the closed one. Related messages
+share tokens, so the score floor keeps them Active forever and the
+focus-scope root would otherwise accumulate every turn of a long episode
+(a 500-turn episode held ~500 messages once the exhausted-budget rotation
+stopped firing every message). GC ages **ordinary dialogue** out of the
+heap — Working retention, no promotable outcome (the same
+`is_promotable` set), not hot, not model-directed, older than the staleness
+window residency uses (`ttl x 4`) — into the reversible buffer, and the
+reactivate phase refuses to bounce it back on its own score. Only a hot
+entity right now (a fresh causal reason) exempts it. So the resident
+working set tracks the current episode's *active* activity plus unresolved
+semantic state, not the whole episode transcript.
+
 ## 8. Completing a task
 
 `/done <summary>` performs the intended lifecycle transition. Since V1-M2

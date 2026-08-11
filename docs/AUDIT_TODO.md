@@ -79,12 +79,28 @@ the closed-scope GC rule, same-template messages kept a focus-match floor
 above `active_threshold`, were rated Active every maintain pass, and were
 never evictable.
 
-Residual correctness follow-up (does not invalidate the bounded-residency
-acceptance): episode rotation closes the Focus scope but does not reset the
-shared `FocusState.generation`. Once the 500-turn guard first fires, every
-later user message can satisfy the same guard and rotate again. Reset or
-replace the episode-local counter and add a cadence regression proving one
-overlong episode does not permanently exhaust every later episode's budget.
+Residual correctness follow-up — **closed 2026-08-11**: episode rotation now
+resets the episode-local turn counter (`close_focus_episode` zeroes
+`FocusState.generation`), so the `episode_max_user_turns` guard measures the
+current episode only; one overlong episode no longer permanently exhausts
+every later episode's budget. The cadence regression
+`one_overlong_episode_does_not_exhaust_later_episode_budgets` proves the
+guard fires at the budget boundary and that the next episode's related
+messages do not rotate again.
+
+Companion bound for the same 10K-turn acceptance: inside a long *open*
+episode, related messages share tokens, so the score floor keeps them
+Active forever and the focus-scope root accumulates every turn (a 500-turn
+episode held ~500 messages once the exhausted-budget rotation stopped
+firing every message). GC now ages ordinary dialogue — Working retention,
+no promotable outcome (decision/finding/constraint/open-loop/artifact/
+evidence), not hot, not model-directed, older than the staleness window
+residency uses (`ttl x 4`) — out of the heap into the reversible buffer,
+and the reactivate phase refuses to bounce it back on its own score.
+`focus_generation` diagnostics now read as episode-local. Regressions:
+`open_focus_ordinary_dialogue_ages_out_without_rotation`; the
+`long_task_10k_turns` peak stays below 200 without relying on the
+exhausted-budget rotation to keep it small.
 
 Confirmed behavior (as audited):
 
