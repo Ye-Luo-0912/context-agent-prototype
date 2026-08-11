@@ -1121,7 +1121,7 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 | M12 Effect Runtime | ✅ | In-process prepared effects and process-capability wire effects commit behind the generation fence (`CORE-01`), a cancelled operation kills its whole process tree (`CORE-06`: shell/git/capability share one tree-kill) and cleans up every pending approval entry, provider streams are byte-capped, and Windows Job-Object quotas are kernel-enforced. The standing-grant `TaskExecutionPolicy` (CORE-08) is M14 approval-policy work, not an M12 gap. |
 | M13 Extension Sandbox | 🟡 partial | Env scrub, private cwd, bounded stderr, process-tree cancellation and Windows Job-Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE) are enforced; Unix rlimits cover CPU/process count; workspace filesystem access is confined to directory-handle-relative opens with reparse substitution rejected at open time (`CORE-07`). A cwd is still not a filesystem boundary: absolute filesystem/network access is not brokered, which keeps M13 open. |
 | M14 Resource Policy | 🟡 partial | Schema/context quotas, risk/permission validation and final output guards exist; the narrow standing `TaskExecutionPolicy` is landed (`CORE-08`: effect + target + constraint + expiry grants, revocable, zero-responder deny/skip); the kernel-level trusted output broker is landed (`CORE-04`: capped fields, one-time artifact spill, execution-enforced query limits); a declared per-tool output budget on `ToolSpec` is enforced by the broker (clamped to the global hard cap); and approval is now effect-derived: `EffectIntent` (contract type) is derived from the validated arguments and standing grants match the concrete intent (path, content bytes, command prefix) instead of re-parsing raw arguments. Commit-time resource enforcement from the intent remains open (the `AuthorityLease` step of the v2 migration). |
-| M15 Real Evaluation | 🧪 instrumentation/smoke only | Replay is a policy proxy and the live run is a no-tool constraint-retention task. The A/B/C/D evaluation inputs (four tool-surface arms + four coding fixtures with hidden verification, `agent-eval --fixtures`), the all-module cost-accounting aggregation (`agent-eval --metrics`), and a deterministic fixture runner (`agent-eval --fixture <id>`, scripted model driving the real builtin tool surface end to end) are landed; there is still no paired real coding workload run with a real model, or a non-inferiority result. |
+| M15 Real Evaluation | 🧪 instrumentation/smoke only | Replay is a policy proxy and the live run is a no-tool constraint-retention task. The A/B/C/D evaluation inputs (four tool-surface arms + four coding fixtures with hidden verification, `agent-eval --fixtures`), the all-module cost-accounting aggregation (`agent-eval --metrics`), a deterministic fixture runner (`agent-eval --fixture <id>`, scripted model driving the real builtin tool surface end to end), a live fixture path (`agent-eval --fixture-live <id>`, real provider when `OPENAI_API_KEY` is set), and a cross-engine fixture comparison (`agent-eval --compare-arm <id>`, append-only / rolling-summary / dynamic on the same five-turn scripted model and the same real tool surface: every engine passes the hidden verification and dynamic feeds the model measurably fewer input tokens) are landed; there is still no paired real coding workload run with a real model, or a non-inferiority result. |
 | V2 Self-Iteration | 🔒 blocked | Registry maturity and sandboxed self-checks are foundations only. Autonomous generation/promotion stays disabled until M10 and M12-M15 acceptance gates close. |
 
 The intended order remains M10 → M11 → M12 → M13 → M14 → M15 → V2.
@@ -1178,8 +1178,16 @@ the required gate order; the numbered list and table above are authoritative.
    effect-derived resource policy remains open.
 6. **V1-M15 Real Evaluation** — coding workload A/B/C + lifecycle metrics.
    Acceptance: the dynamic runtime saves tokens without lowering task
-   success rate. 🧪 Replay and one no-tool live smoke exist; real coding
-   non-inferiority remains unmeasured.
+   success rate. 🧪 The deterministic fixture harness and the
+   cross-engine comparison are landed (`agent-eval --fixture <id>` /
+   `--fixture-live <id>` / `--compare-arm <id>`): on the same real
+   builtin tool surface and the same five-turn scripted model, every
+   engine passes the fixture's hidden verification while dynamic feeds
+   the model measurably fewer input tokens than append-only and
+   rolling-summary (measured on `fix_off_by_one`: append 12 849, rolling
+   12 913, dynamic 11 862 model input tokens; dynamic is the only engine
+   that performs lifecycle maintenance). A real coding non-inferiority
+   result with a tool-capable provider remains unmeasured.
 7. **V2 Self-Iteration** — generate → sandbox → test → replay → evaluate →
    canary → stable. The LLM grows capabilities, but cannot modify the
    evaluation or permission Core. 🔒 Blocked; only prerequisite scaffolding
@@ -1356,10 +1364,11 @@ declarations also cannot contain a hostile child until M13 brokers the
 underlying resources. See
 `CORE-04`, `CORE-08`, `CTX-07` and `CTX-09`.
 
-## V1-M15 Real Evaluation 🧪 (replay and live smoke only)
+## V1-M15 Real Evaluation 🧪 (replay, fixture harness and live smoke)
 
-The evaluation infrastructure has useful deterministic policy comparisons,
-but the named real-coding acceptance is not complete.
+The evaluation infrastructure has useful deterministic policy comparisons
+and a real-tool-surface fixture harness, but the named real-coding
+acceptance (a paired run with a real tool-capable model) is not complete.
 
 - **Harness.** `agent-replay` replays each scripted workload through the
   three engines (A append-only / B rolling-summary / C dynamic) under a
@@ -1368,6 +1377,28 @@ but the named real-coding acceptance is not complete.
   It exercises the production context engines, but its token number is a
   policy proxy: it does not price the complete provider request, TurnFrame,
   tool schemas, compactor/recall/store work or wall time.
+- **Real-tool-surface fixture harness (`agent-eval`).** Four coding
+  fixtures (`fix_off_by_one`, `implement_stub`, `rename_symbol`,
+  `add_test`) with seed workspaces and hidden file-content verification
+  run end to end through the real runtime: the real builtin tool surface,
+  prepared-effect commit behind the generation fence, the all-module cost
+  accounting, and the hidden check. `--fixture <id>` drives the surface
+  with a scripted model that reports usage priced from the request it saw
+  (so the fixture path's `ModelUsed` accounting is real); `--fixture-live
+  <id>` swaps in a real provider (`OPENAI_API_KEY`) for the same harness.
+- **Cross-engine comparison (`--compare-arm <id>`).** The M15 acceptance
+  — dynamic saves tokens without lowering task success — is exercised
+  deterministically on the real tool surface: one fixture runs through
+  append-only, rolling-summary and dynamic on the same five-turn scripted
+  model. Every engine passes the hidden verification; dynamic feeds the
+  model measurably fewer input tokens than either baseline (measured on
+  `fix_off_by_one`: append 12 849, rolling 12 913, dynamic 11 862 model
+  input tokens over eight model rounds), and it is the only engine that
+  performs lifecycle maintenance. The gap is a bounded fraction of the
+  total because tool schemas and the system prompt dominate the per-round
+  fixed cost — the same phenomenon the live measurement reports. Asserted
+  directionally with a noise floor in
+  `dynamic_engine_saves_input_tokens_against_append_on_the_fixture_surface`.
 - **Token saving is measured, not asserted.** On the heavy scenarios the
   dynamic engine costs a small fraction of append-only (budget 12 K):
   `long_refactor` 622,560 → 64,014 input tokens total (peak 17,425 →

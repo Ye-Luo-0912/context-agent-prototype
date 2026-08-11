@@ -161,7 +161,7 @@ The repository is already partially aligned with this architecture.
 | External effect enforcement | [~] confirmed blocker | Process capabilities currently execute inside the child and return a value, so side effects can bypass the effect fence. Keep the `CORE-01` defect in `AUDIT_TODO.md` authoritative. |
 | Extension sandbox | [~] confirmed blocker | The process host has framing/deadlines and limited environment/rlimits, but no complete brokered filesystem/network boundary and no reliable process-tree kill on every platform (`CORE-06`/`CORE-07`). |
 | Permission model | [~] too coarse | `ToolSpec` has only `ReadOnly`, `WorkspaceWrite`, and `ProcessExecution`; capability permissions are strings and a capability can understate real behavior. Standing grants now narrow approval at the gate (`CORE-08`), but capability-declared permissions remain coarse strings. |
-| Output contract | [~] partial | Builtins generally bound output and spill artifacts; the kernel-level trusted output broker caps every model-facing field and spills oversized content once (`CORE-04`), and the actor keeps a last-line guard. `ToolSpec` still cannot declare an output budget/spill policy, and process capability output/stderr needs one enforced path. |
+| Output contract | [~] partial | Builtins generally bound output and spill artifacts; the kernel-level trusted output broker caps every model-facing field and spills oversized content once (`CORE-04`), `ToolSpec` declares a per-tool output budget that the broker enforces (clamped to the global hard cap), and the actor keeps a last-line guard. Process capability output/stderr still needs one enforced path. |
 | File/navigation tools | [~] useful baseline | `fs.list`, ranged `fs.read`, `search.grep`, `fs.write`, and exact `edit.replace` cover basic work. Missing: patch-set preconditions, glob/multi-read, binary/media metadata, symbol/diagnostic navigation, and stronger cancellation on search/read. |
 | Process tools | [~] useful baseline | `shell.exec` has timeout, bounded tail, and artifact output. It is a one-shot shell string, not a structured run/start/poll/stop process protocol; process-tree isolation remains incomplete. |
 | VCS tools | [~] minimal | `git.status` and `git.diff` are confined, bounded, and read-only. `log/show/blame` and structured change review are absent; commit/push must remain higher-risk effects. |
@@ -891,10 +891,17 @@ together with TaskAnchor and continuous context GC.
   capture, capability surface-gate serialization, and a composite common-cut
   protocol verified under concurrent mutation. Complete TaskAnchor,
   Episode/Focus and execution-policy sources remain owned by `TOOLS-08`.
-- [~] **TOOLS-08C** Bounded round-surface diagnostics, monotonic revisions and
-  `ModelStarted` ordering are verified. Add per-row demand provenance so Task
-  Prefer and catalog-loaded optional candidates are distinguishable, plus the
-  bounded live-restore rebase audit event owned by `CORE-03`.
+- [x] **TOOLS-08C** Bounded round-surface diagnostics, monotonic revisions and
+  `ModelStarted` ordering are verified; per-row demand provenance and the
+  live-restore rebase audit event are landed. The per-row demand provenance
+  is `ToolSurfaceOrigin` (`DispatcherRequired` / `TaskRequirement` /
+  `CatalogLoadedOptional`, legacy rows deserialize as `Unknown`), carried on
+  selected and omitted rows alike and preserved by budget omission. The
+  bounded live-restore rebase audit is `RuntimeEvent::RuntimeRestored`
+  (checkpoint version, restored/current run ids, focus/surface revisions,
+  rebased requirement count, whether capability state applied), emitted as a
+  mandatory barrier whose append failure fences mutation as
+  recovery-required (`CORE-03`).
 - [ ] **TOOLS-09** Evaluate local symbol/diagnostic navigation as optional first-party
   tools; do not add embeddings/vector storage.
 
