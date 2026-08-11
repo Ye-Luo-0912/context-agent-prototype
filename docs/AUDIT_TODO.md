@@ -930,15 +930,51 @@ the restore is never retried as if nothing changed. Regressions:
 **CORE-03 closed.**
 
 ### CORE-04 — Output broker/resource policy is incomplete
-
 The actor hard limit protects model context, but a producer without an
 artifact loses the truncated middle. Process responses may allocate to the
 frame limit, metadata/summary can be large, and inherited stderr bypasses it.
 
-Add a trusted output broker before `ToolOutcome` reaches the actor: store
-once, return bounded preview/reference, cap every field and decoded total,
-and apply it to context fetch/provider errors. Enforce query limits in
-execution, not only JSON schema.
+**2026-08-11: closed.** A trusted output broker runs inside the kernel
+before any `ToolOutcome` reaches the actor:
+
+1. **Every field is capped.** `summary` (2 000 chars), `model_content`
+   (16 000 chars) and serialized `metadata` (8 000 bytes) each have a hard
+   cap, plus a decoded-total cap on the combined model-facing view (24 000
+   chars). Oversized fields carry a visible truncation marker naming the
+   field, the original size and the artifact reference.
+2. **Oversized content spills once, never truncates away.** When
+   `model_content` exceeds the cap and the producer did not return an
+   artifact, the broker stores the full content under
+   `.focus-agent/artifacts/<run>/` and returns a bounded head/marker/tail
+   preview with the `artifact://` reference — a producer without an
+   artifact no longer loses the truncated middle. A producer's own
+   reference is preserved, not overwritten.
+3. **Applied to context fetch and provider errors.** `context.fetch` items
+   pass through the same broker after the engine answers (large stored
+   content spills), and provider/model error text is capped before it
+   enters the event stream (`bound_error_message`, 4 000 chars). Inherited
+   process stderr stays bounded at the process layer (bounded stderr,
+   artifact tail), not by this broker.
+4. **Query limits are enforced in execution.** `context.search`'s limit is
+   clamped to `CONTEXT_SEARCH_MAX_LIMIT` (50) inside
+   `resolve_engine_query`, so a hostile or stale limit cannot ask the
+   engine for an unbounded hit set even if it never touches the JSON
+   schema; `0` still means the engine default.
+
+Wiring: `agent-contracts` owns the `OutputBroker` contract and the caps;
+`agent-workspace` provides `WorkspaceOutputBroker` (composition-root
+implementation); `agent-kernel` applies it in `execute_tool` and
+`resolve_engine_query` when the config carries one; `agent-tui` injects it.
+
+Regression coverage: `oversized_content_spills_to_an_artifact_and_keeps_
+both_ends`, `existing_reference_is_preserved_not_overwritten`, `summary_and_
+metadata_are_capped_independently`, `decoded_total_cap_trims_content_when_
+fields_combine_over` (agent-workspace); `output_broker_bounds_tool_results_
+before_the_actor`, `context_fetch_results_are_bounded_after_resolve`,
+`search_limit_is_clamped_in_execution`, `search_limit_zero_keeps_the_engine_
+default` (agent-kernel); `output_broker_spills_oversized_tool_output_end_to_
+end` (agent-runtime actor); plus the provider-error cap tests
+(agent-runtime `output.rs`).
 
 ### CORE-05 — Untrusted historical content is promoted to System role
 

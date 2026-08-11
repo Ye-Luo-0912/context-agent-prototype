@@ -437,7 +437,26 @@ InteractiveApprovalGate ── broadcast ──► ApprovalBroker ──► TUI 
    └────────────────────────◄──────────────────────────────────┘
    ▼
 ToolDispatcher.execute(ToolExecutionRequest { cancel, .. })
+   ▼
+OutputBroker.bound(run, output)   ── cap fields / spill oversized to artifact
 ```
+
+### Output broker
+
+A trusted `OutputBroker` (`agent-contracts`) runs inside the kernel before
+any `ToolOutcome` reaches the actor. Every model-facing field has a hard
+cap (`summary` 2 000 chars, `model_content` 16 000 chars, serialized
+`metadata` 8 000 bytes, decoded total 24 000 chars); oversized
+`model_content` spills to the run's artifact directory once
+(`agent-workspace::WorkspaceOutputBroker`, composition-root injected by
+`agent-tui`) and the preview keeps both ends plus an `artifact://`
+reference, so a producer that did not spill no longer loses the truncated
+middle. The same broker bounds `context.fetch` results after the engine
+answers, provider/model error text is capped before it enters the event
+stream, and `context.search` limits are clamped in execution
+(`CONTEXT_SEARCH_MAX_LIMIT`), not only in the JSON schema. The actor's
+last-line guard (`agent-runtime::output`) stays as a second, cheaper
+defense for producers that bypass the broker.
 
 ### EventJournal
 
