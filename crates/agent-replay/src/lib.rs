@@ -18,6 +18,7 @@
 //! measure input-token cost, over-budget turns and context churn.
 
 mod facts;
+mod recovery;
 mod scenarios;
 
 use std::{
@@ -36,6 +37,11 @@ use context_simple::{SimpleContextConfig, SimpleContextEngine};
 
 pub use facts::{
     FactCoverage, FactOutcome, KeyFact, compare_facts, render_fact_comparison, scenario_key_facts,
+};
+pub use recovery::{
+    RecoveryBarrier, RecoveryFailure, RecoveryReport, RestoreConsistencyReport, analyze_barrier,
+    first_seq_gap, rebuild_engine_state, recovery_replay, recovery_replay_file,
+    render_recovery_report, verify_restore_consistency,
 };
 pub use scenarios::{
     Scenario, all_scenarios, compare_config, compare_scenario, engine_variants, render_comparison,

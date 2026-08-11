@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use agent_replay::{ReplayConfig, compare_config, render_comparison, render_report, replay_file};
+use agent_replay::{
+    ReplayConfig, compare_config, recovery_replay_file, render_comparison, render_recovery_report,
+    render_report, replay_file,
+};
 
 fn usage() -> ! {
     eprintln!(
@@ -25,7 +28,15 @@ fn usage() -> ! {
          Same comparison plus key-fact coverage: which required facts stayed\n\
          in the model-visible working set when they mattered, and which\n\
          forbidden (stale) facts leaked. The completion-quality proxy that\n\
-         needs no model.\n"
+         needs no model.\n\
+         \n\
+         usage: agent-replay --recover <trace.jsonl>\n\
+         \n\
+         Crash-recovery replay (CORE-02): re-read the trace to locate the\n\
+         durability barrier (last committed TurnCompleted, any\n\
+         TurnCommitFailed/RecoveryRequired), check the envelope sequence is\n\
+         contiguous, and rebuild the context-engine state from the events —\n\
+         the state a recovery can trust after a failed turn commit.\n"
     );
     std::process::exit(2);
 }
@@ -56,6 +67,39 @@ async fn main() -> anyhow::Result<()> {
             let results = agent_replay::compare_scenario(scenario, &config).await?;
             print!("{}", render_comparison(scenario, &results));
         }
+        return Ok(());
+    }
+
+    if first == "--recover" {
+        let Some(path) = args.next() else {
+            usage();
+        };
+        let mut config = ReplayConfig::default();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--system-prompt" => {
+                    let Some(value) = args.next() else {
+                        usage();
+                    };
+                    config.system_prompt = value;
+                }
+                "--budget" => {
+                    let Some(value) = args.next() else {
+                        usage();
+                    };
+                    let Ok(tokens) = value.parse::<usize>() else {
+                        usage();
+                    };
+                    config.budget_tokens = tokens;
+                }
+                other => {
+                    eprintln!("unknown argument: {other}");
+                    usage();
+                }
+            }
+        }
+        let report = recovery_replay_file(Path::new(&path), &config).await?;
+        print!("{}", render_recovery_report(&report));
         return Ok(());
     }
 
