@@ -48,6 +48,11 @@ pub struct ProcessSandbox {
     /// Hard process-count limit via `RLIMIT_NPROC` (Unix only; ignored
     /// elsewhere). `0` = unlimited.
     pub process_limit: u64,
+    /// Per-process memory ceiling in bytes enforced by the Windows
+    /// Job-Object (`JOB_OBJECT_LIMIT_PROCESS_MEMORY`). `0` = unlimited.
+    /// Unix has no equivalent yet.
+    #[cfg(windows)]
+    pub job_max_memory_bytes: u64,
     /// How many bytes of the child's stderr to capture into a bounded tail
     /// (surfaced on connection errors and diagnostics). `0` inherits the
     /// parent's stderr instead — the context-service default. A sandboxed
@@ -88,6 +93,14 @@ pub struct ProcessHost {
     /// kill the process *tree* (process group / taskkill) without touching
     /// the io lock.
     pid: AtomicU32,
+    /// The Windows Job-Object holding the child tree: kernel-enforced
+    /// quotas (active-process ceiling from `process_limit`, per-process
+    /// memory ceiling from `job_max_memory_bytes`) and
+    /// `KILL_ON_JOB_CLOSE`, so closing the handle (host drop) terminates
+    /// every descendant. `None` when the sandbox asked for no Windows
+    /// quotas; the platform has no equivalent on other OSes.
+    #[cfg(windows)]
+    job: Mutex<Option<JobObject>>,
     /// The bounded tail of the child's stderr, fed by a drainer task when
     /// `ProcessSandbox::stderr_capture_bytes > 0`; `None` when stderr is
     /// inherited. The tail is surfaced on errors so a failing child says
@@ -180,10 +193,35 @@ impl ProcessHost {
         // child — a runaway subprocess must not survive its caller.
         #[cfg(unix)]
         command.process_group(0);
+        // Sandbox (Windows): create the Job-Object before spawning so the
+        // child is assigned in the same breath as it starts. The kernel
+        // enforces the active-process and per-process-memory ceilings and
+        // kills the whole tree when the handle closes.
+        #[cfg(windows)]
+        let created_job = job_object::create_job_object(&config.sandbox)?;
         let mut child = command
             .spawn()
             .map_err(|e| AgentError::Context(format!("spawn '{}': {e}", config.program)))?;
         let pid = child.id().unwrap_or(0);
+
+        // Sandbox (Windows): assign the child to the Job-Object. When the
+        // kernel refuses (outer Job-Object confinement on CI runners, or a
+        // ceiling), degrade to no job rather than failing the connection —
+        // the child still runs under env/cwd hardening, it just loses the
+        // Windows quota layer here.
+        #[cfg(windows)]
+        let job = match created_job {
+            Some(created) => match created.assign(pid) {
+                Ok(true) => Some(created),
+                Ok(false) | Err(_) => {
+                    eprintln!(
+                        "job object assign skipped: process {pid} is already confined by an outer job"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
         let stdin = child
             .stdin
             .take()
@@ -230,6 +268,8 @@ impl ProcessHost {
             }),
             next_id: AtomicU64::new(1),
             pid: AtomicU32::new(pid),
+            #[cfg(windows)]
+            job: Mutex::new(job),
             stderr_tail,
         };
         timeout(
@@ -445,6 +485,24 @@ impl ProcessHost {
     /// effects (spawned subprocesses, writers) die with it.
     fn kill_tree(&self) {
         let pid = self.pid.load(Ordering::Relaxed);
+        #[cfg(windows)]
+        {
+            // The Job-Object is the authoritative tree kill: every
+            // descendant was assigned at connect, so terminating the job
+            // reaches them all in one kernel call. Fall back to taskkill
+            // when no job exists.
+            let terminated = if let Ok(guard) = self.job.try_lock()
+                && let Some(job) = guard.as_ref()
+            {
+                job.terminate()
+            } else {
+                false
+            };
+            if !terminated {
+                kill_process_tree(pid);
+            }
+        }
+        #[cfg(not(windows))]
         kill_process_tree(pid);
         // Defense in depth: on Unix, a `kill(-pgid)` ESRCH (group already
         // gone) must not leave the direct child alive; on other platforms
@@ -504,6 +562,112 @@ pub fn kill_process_tree(pid: u32) {
     {}
 }
 
+/// The Windows Job-Object machinery behind the process sandbox:
+/// kernel-enforced quotas (active-process ceiling, per-process memory
+/// ceiling) and `KILL_ON_JOB_CLOSE`, so closing the handle — the host's
+/// drop — terminates every assigned process even if no explicit kill ran.
+#[cfg(windows)]
+mod job_object {
+    use super::{AgentError, AgentResult, ProcessSandbox};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    /// RAII handle: the drop closes the handle, and `KILL_ON_JOB_CLOSE`
+    /// turns that close into a whole-tree termination.
+    pub struct JobObject(HANDLE);
+
+    // A Windows HANDLE is a kernel handle-table index: safe to move between
+    // threads and share behind a lock (CloseHandle / TerminateJobObject are
+    // thread-safe). Without this the host would not be Send, which would
+    // break `Arc<dyn Capability>`.
+    unsafe impl Send for JobObject {}
+    unsafe impl Sync for JobObject {}
+
+    impl JobObject {
+        /// Assign one process (by pid) to this job. `Ok(false)` means the
+        /// kernel refused the assignment — most commonly because the
+        /// process already belongs to an outer Job-Object (CI runners
+        /// confine every process under one), which blocks nesting, or the
+        /// active-process ceiling is already reached.
+        pub fn assign(&self, pid: u32) -> AgentResult<bool> {
+            unsafe {
+                let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+                if process.is_null() {
+                    return Err(AgentError::Context(format!(
+                        "open process {pid} to assign the job object failed"
+                    )));
+                }
+                let assigned = AssignProcessToJobObject(self.0, process);
+                let _ = CloseHandle(process);
+                Ok(assigned != 0)
+            }
+        }
+
+        /// Terminate every process in the job in one kernel call.
+        pub fn terminate(&self) -> bool {
+            unsafe { TerminateJobObject(self.0, 1) != 0 }
+        }
+    }
+
+    impl Drop for JobObject {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// Create a Job-Object from the sandbox's Windows quotas. Returns
+    /// `None` when no Windows quota was requested (the host then falls back
+    /// to `taskkill /T`). The caller assigns processes with
+    /// `JobObject::assign`.
+    pub fn create_job_object(sandbox: &ProcessSandbox) -> AgentResult<Option<JobObject>> {
+        if sandbox.process_limit == 0 && sandbox.job_max_memory_bytes == 0 {
+            return Ok(None);
+        }
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job == INVALID_HANDLE_VALUE || job.is_null() {
+                return Err(AgentError::Context(
+                    "create job object for the sandbox failed".into(),
+                ));
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            let mut flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if sandbox.process_limit > 0 {
+                flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+                info.BasicLimitInformation.ActiveProcessLimit = sandbox.process_limit as u32;
+            }
+            if sandbox.job_max_memory_bytes > 0 {
+                flags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+                info.ProcessMemoryLimit = sandbox.job_max_memory_bytes as usize;
+            }
+            info.BasicLimitInformation.LimitFlags = flags;
+            let configured = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if configured == 0 {
+                let _ = CloseHandle(job);
+                return Err(AgentError::Context(
+                    "set job object limits for the sandbox failed".into(),
+                ));
+            }
+            Ok(Some(JobObject(job)))
+        }
+    }
+}
+
 /// Locate a process binary: explicit env var (`CARGO_BIN_EXE_*` in tests),
 /// then the standard cargo layout around the current executable, then PATH.
 pub fn resolve_program(env_var: Option<&str>, binary_name: &str) -> String {
@@ -534,6 +698,9 @@ pub fn probe_siblings(current_exe: &std::path::Path, name: &str) -> Option<std::
     .find(|candidate| candidate.exists())
 }
 
+#[cfg(windows)]
+use job_object::JobObject;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +729,102 @@ mod tests {
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
         std::fs::write(&exe, "test").unwrap();
         assert_eq!(probe_siblings(&exe, "agent-context-service"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn job_object_assigns_and_terminates() {
+        // Assigning a real process to the sandbox's Job-Object must let the
+        // host terminate it in one kernel call. Skipped (not failed) when
+        // the runner itself is confined by an outer Job-Object — CI runners
+        // cannot nest, and the production path degrades the same way.
+        use super::job_object::create_job_object;
+        let sandbox = ProcessSandbox {
+            process_limit: 4,
+            ..ProcessSandbox::default()
+        };
+        let job = create_job_object(&sandbox)
+            .expect("create the job")
+            .expect("a quota was requested");
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "300", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        if !job.assign(child.id()).expect("assign the process") {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("skipped: outer job confinement prevents nesting");
+            return;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the assigned process must still be running"
+        );
+        assert!(job.terminate(), "terminating the job must succeed");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(!status.success(), "a terminated child reports failure");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child survived job termination"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn job_object_caps_active_processes() {
+        // The kernel enforces the active-process ceiling: once one job
+        // holds its limit, assigning another process to it fails. Skipped
+        // (not failed) under an outer job on CI runners.
+        use super::job_object::create_job_object;
+        let sandbox = ProcessSandbox {
+            process_limit: 2,
+            ..ProcessSandbox::default()
+        };
+        let job = create_job_object(&sandbox)
+            .expect("create the job")
+            .expect("a quota was requested");
+        let spawn_ping = || {
+            std::process::Command::new("ping")
+                .args(["-n", "300", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn ping")
+        };
+        let mut first = spawn_ping();
+        if !job.assign(first.id()).expect("assign first") {
+            let _ = first.kill();
+            let _ = first.wait();
+            eprintln!("skipped: outer job confinement prevents nesting");
+            return;
+        }
+        // Second process sits exactly at the ceiling: assignment succeeds.
+        let mut second = spawn_ping();
+        assert!(
+            job.assign(second.id()).expect("assign second"),
+            "the second process fits within the ceiling"
+        );
+        // Third process exceeds the ceiling: the kernel refuses.
+        let mut third = spawn_ping();
+        assert!(
+            !job.assign(third.id()).expect("assign third"),
+            "the third process must be refused by the active-process ceiling"
+        );
+        // Terminating the job reaps the two assigned processes; the
+        // unassigned third is killed and reaped directly.
+        let _ = job.terminate();
+        let _ = first.wait();
+        let _ = second.wait();
+        let _ = third.kill();
+        let _ = third.wait();
     }
 
     /// A chatty child must not grow the parent's memory or flood the

@@ -60,7 +60,7 @@ impl ProcessCapabilityAdapter {
                 )));
             }
         };
-        let config = ProcessHostConfig {
+        let mut config = ProcessHostConfig {
             program,
             args: Vec::new(),
             env: Vec::new(),
@@ -85,14 +85,23 @@ impl ProcessCapabilityAdapter {
                 // reusing an id) never share a predictable temp path and a
                 // hostile pre-created directory cannot be a symlink trap.
                 cwd: Some(private_capability_dir(&manifest.id)),
-                // Hard ceilings enforced by the kernel on Unix.
+                // Hard ceilings enforced by the kernel on Unix (rlimits)
+                // and Windows (Job-Object: the active-process ceiling uses
+                // `process_limit`, plus a per-process memory ceiling below).
                 cpu_time_limit_secs: 60,
                 process_limit: 16,
                 // The child's stderr is piped and drained into a bounded
                 // tail, never inherited unbounded into the parent console.
                 stderr_capture_bytes: 64 * 1024,
+                ..ProcessSandbox::default()
             },
         };
+        #[cfg(windows)]
+        {
+            // A per-process memory ceiling enforced by the Job-Object, so a
+            // runaway capability child cannot exhaust the machine.
+            config.sandbox.job_max_memory_bytes = 512 * 1024 * 1024;
+        }
         Ok(Self::with_config(manifest, config))
     }
 
