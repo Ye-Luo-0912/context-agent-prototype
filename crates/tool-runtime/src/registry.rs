@@ -23,9 +23,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::tools::{
-    ContextManageTool, EditPatchTool, EditReplaceTool, FsListTool, FsReadTool, FsWriteTool,
-    GitDiffTool, GitStatusTool, ProcessRunTool, ProcessSession, ProcessSessionTool, SearchGrepTool,
-    ShellExecTool, Tool,
+    ArtifactReadTool, ContextManageTool, EditPatchTool, EditReplaceTool, FsListTool, FsReadTool,
+    FsWriteTool, GitDiffTool, GitStatusTool, ProcessRunTool, ProcessSession, ProcessSessionTool,
+    SearchGrepTool, ShellExecTool, Tool,
 };
 
 /// Control tools are now defined by the unified catalog contract.
@@ -49,6 +49,11 @@ impl Default for ToolLifecycleConfig {
                 "fs.list".into(),
                 "fs.read".into(),
                 "search.grep".into(),
+                // Every tool that spills large output returns an
+                // `artifact://` reference; artifact.read is the bounded
+                // read side of that contract, so it must always be on the
+                // surface.
+                "artifact.read".into(),
                 // The merged control surface: one `context.manage` (gc hints,
                 // tags, leases, manual collect, and the on-demand retrieval
                 // loop over externalized refs) and one `capability.manage`
@@ -96,6 +101,7 @@ impl BuiltinToolDispatcher {
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(FsListTool::new(workspace.clone())),
             Arc::new(FsReadTool::new(workspace.clone())),
+            Arc::new(ArtifactReadTool::new(workspace.clone())),
             Arc::new(FsWriteTool::new(workspace.clone())),
             Arc::new(SearchGrepTool::new(workspace.clone())),
             Arc::new(EditReplaceTool::new(workspace.clone())),

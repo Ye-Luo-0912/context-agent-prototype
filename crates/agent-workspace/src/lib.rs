@@ -192,6 +192,34 @@ impl Workspace {
         Ok(path)
     }
 
+    /// Validate an `artifact://` reference and return the cleaned
+    /// workspace-relative path, confined to the run artifact store
+    /// (`.focus-agent/artifacts/`). Non-artifact schemes, query/fragment
+    /// components, `..` traversal and any target outside the artifact store
+    /// are refused. The caller opens the returned path through
+    /// `confined_open_read`, so the final read is still pinned against link
+    /// swaps — this check only decides *which* files may be reached.
+    pub fn artifact_relative_path(&self, reference: &str) -> AgentResult<PathBuf> {
+        let relative = reference.strip_prefix("artifact://").ok_or_else(|| {
+            AgentError::InvalidRequest(format!(
+                "artifact references must start with artifact://: {reference:?}"
+            ))
+        })?;
+        if relative.contains('#') || relative.contains('?') {
+            return Err(AgentError::InvalidRequest(format!(
+                "artifact references cannot carry query/fragment components: {reference:?}"
+            )));
+        }
+        let clean = clean_relative(Path::new(relative))?;
+        let artifacts_root = self.state_dir.join("artifacts");
+        if !self.root.join(&clean).starts_with(&artifacts_root) {
+            return Err(AgentError::InvalidRequest(format!(
+                "artifact reference outside the run artifact store: {reference:?}"
+            )));
+        }
+        Ok(clean)
+    }
+
     async fn confine(&self, clean: PathBuf) -> AgentResult<PathBuf> {
         let mut base = self.root.clone();
         let mut tail: Vec<std::ffi::OsString> = Vec::new();
@@ -1475,5 +1503,47 @@ mod tests {
                 || dir.path().join("hold/new.txt").exists();
             assert!(landed, "applied mutations must land inside the workspace");
         }
+    }
+
+    #[tokio::test]
+    async fn artifact_relative_path_resolves_only_run_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+
+        let valid = workspace
+            .artifact_relative_path(&format!(
+                "artifact://.focus-agent/artifacts/{run_id}/fs-list-abc.txt"
+            ))
+            .expect("a genuine artifact reference must resolve");
+        assert_eq!(
+            valid,
+            std::path::PathBuf::from(format!(".focus-agent/artifacts/{run_id}/fs-list-abc.txt"))
+        );
+
+        // Non-artifact schemes, query/fragment components and traversal are
+        // all refused before any file is touched.
+        for bad in [
+            "https://example.com/x",
+            "artifact://.focus-agent/artifacts/x/y.txt?page=2",
+            "artifact://.focus-agent/artifacts/x/y.txt#L10",
+            "artifact://.focus-agent/artifacts/../secret.txt",
+            "artifact://C:/Windows/system32/notepad.exe",
+            "artifact:///etc/passwd",
+        ] {
+            assert!(
+                workspace.artifact_relative_path(bad).is_err(),
+                "must refuse {bad:?}"
+            );
+        }
+
+        // A reference outside the artifact store (even though it is a valid
+        // workspace file) is not an artifact.
+        assert!(
+            workspace
+                .artifact_relative_path("artifact://src/main.rs")
+                .is_err(),
+            "workspace files are not artifacts"
+        );
     }
 }

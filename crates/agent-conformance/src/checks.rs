@@ -16,7 +16,7 @@ use crate::report::{ConformanceReport, ConformanceViolation};
 pub const MAX_CONFORMANCE_SCHEMA_BYTES: usize = 16 * 1024;
 
 /// The core read/discovery tools every surface must always offer.
-pub const CONFORMANCE_CORE_TOOLS: &[&str] = &["fs.list", "fs.read", "search.grep"];
+pub const CONFORMANCE_CORE_TOOLS: &[&str] = &["fs.list", "fs.read", "artifact.read", "search.grep"];
 
 /// Check one `ToolSpec`: well-formed identity, a `type: object` input
 /// schema, and a bounded schema size.

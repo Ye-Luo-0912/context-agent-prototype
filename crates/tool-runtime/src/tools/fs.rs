@@ -32,6 +32,12 @@ struct ListArgs {
     path: String,
     #[serde(default = "default_list_limit")]
     limit: usize,
+    /// Opaque paging token returned by a previous `fs.list` call. When
+    /// present, the next page is served from that call's snapshot artifact
+    /// instead of a fresh directory scan, so paging stays consistent even
+    /// if the directory changes between pages.
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 fn default_list_limit() -> usize {
@@ -48,7 +54,8 @@ impl Tool for FsListTool {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Workspace-relative path"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000},
+                    "cursor": {"type": "string", "description": "Opaque token from a previous fs.list result; serves the next page from that call's snapshot"}
                 }
             }),
             risk: ToolRisk::ReadOnly,
@@ -65,6 +72,12 @@ impl Tool for FsListTool {
     ) -> AgentResult<ToolOutcome> {
         let args: ListArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("fs.list args: {e}")))?;
+        let limit = args.limit.clamp(1, MAX_LIST_ENTRIES);
+        if let Some(cursor) = args.cursor.as_deref() {
+            return self
+                .page_from_snapshot(run_id, call_id, cursor, limit)
+                .await;
+        }
         let path = self.workspace.resolve_relative(&args.path).await?;
         let mut reader = fs::read_dir(&path)
             .await
@@ -96,7 +109,6 @@ impl Tool for FsListTool {
         }
         entries.sort();
 
-        let limit = args.limit.clamp(1, MAX_LIST_ENTRIES);
         let visible = entries.iter().take(limit).cloned().collect::<Vec<_>>();
         let full = entries.join("\n");
         let artifact_ref = if entries.len() > limit {
@@ -107,6 +119,10 @@ impl Tool for FsListTool {
             )
         } else {
             None
+        };
+        let (cursor, has_more) = match &artifact_ref {
+            Some(reference) => (Some(format!("{reference}#{limit}")), true),
+            None => (None, false),
         };
         let truncated_note = artifact_ref
             .as_ref()
@@ -129,7 +145,70 @@ impl Tool for FsListTool {
             ),
             model_content: format!("{}{}", visible.join("\n"), truncated_note),
             artifact_ref,
-            metadata: json!({"entry_count": entries.len()}),
+            metadata: json!({
+                "entry_count": entries.len(),
+                "returned": visible.len(),
+                "has_more": has_more,
+                "cursor": cursor,
+            }),
+        }))
+    }
+}
+
+impl FsListTool {
+    /// Serve one page from a previous call's snapshot artifact (cursor is
+    /// `<artifact_ref>#<offset>`). Pages come from the immutable snapshot,
+    /// so later changes to the directory cannot cause duplicates or gaps
+    /// between pages.
+    async fn page_from_snapshot(
+        &self,
+        _run_id: RunId,
+        call_id: &str,
+        cursor: &str,
+        limit: usize,
+    ) -> AgentResult<ToolOutcome> {
+        use super::{parse_cursor, read_snapshot_lines};
+
+        let (reference, offset) = parse_cursor(cursor)?;
+        let lines = read_snapshot_lines(&self.workspace, reference).await?;
+        if offset > lines.len() {
+            return Err(AgentError::InvalidRequest(format!(
+                "cursor is past the end of the snapshot ({offset} > {} lines)",
+                lines.len()
+            )));
+        }
+        let page: Vec<&str> = lines
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(String::as_str)
+            .collect();
+        let next_offset = offset + page.len();
+        let has_more = next_offset < lines.len();
+        let next_cursor = has_more.then(|| format!("{reference}#{next_offset}"));
+
+        Ok(ToolOutcome::Value(ToolOutput {
+            call_id: call_id.into(),
+            tool_name: "fs.list".into(),
+            ok: true,
+            summary: format!(
+                "listed entries {}-{} of {} (snapshot)",
+                offset + 1,
+                next_offset,
+                lines.len()
+            ),
+            model_content: if page.is_empty() {
+                "no more entries".to_string()
+            } else {
+                page.join("\n")
+            },
+            artifact_ref: Some(reference.to_string()),
+            metadata: json!({
+                "entry_count": lines.len(),
+                "returned": page.len(),
+                "has_more": has_more,
+                "cursor": next_cursor,
+            }),
         }))
     }
 }
@@ -492,5 +571,90 @@ mod tests {
             output.metadata["revision"].as_str().unwrap(),
             content_digest(&bytes)
         );
+    }
+
+    #[tokio::test]
+    async fn fs_list_pages_a_consistent_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        // List a subdirectory so the runtime state dir (.focus-agent) does
+        // not enter the count.
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.path().join("d").join(format!("file-{i:02}.txt")), "x").unwrap();
+        }
+        let tool = FsListTool::new(workspace.clone());
+        let run_id = RunId::new();
+
+        let list = |args: Value| {
+            let tool = &tool;
+            let call = agent_contracts::ToolCall {
+                id: "c".into(),
+                name: "fs.list".into(),
+                arguments: args,
+            };
+            async move {
+                tool.execute(run_id, "c", call.arguments, CancellationToken::new())
+                    .await
+            }
+        };
+
+        // Page 1: limit 4 of 10 entries → spills a snapshot + cursor.
+        let first = list(json!({"path": "d", "limit": 4})).await.unwrap();
+        let ToolOutcome::Value(output) = first else {
+            panic!("fs.list returns a plain value");
+        };
+        assert_eq!(output.metadata["entry_count"], 10);
+        assert_eq!(output.metadata["returned"], 4);
+        assert_eq!(output.metadata["has_more"], true);
+        assert!(
+            output.artifact_ref.is_some(),
+            "an overflowing listing must spill a snapshot"
+        );
+        let cursor = output.metadata["cursor"].as_str().unwrap().to_string();
+        let first_content = output.model_content.clone();
+
+        // The directory changes between pages — paging must not notice.
+        std::fs::write(dir.path().join("d").join("zz-new.txt"), "x").unwrap();
+        std::fs::remove_file(dir.path().join("d").join("file-00.txt")).unwrap();
+
+        // Page 2 from the snapshot: exactly the next 4 snapshot entries,
+        // no duplicates from page 1, no gaps, no new file leaking in.
+        let second = list(json!({"path": "d", "limit": 4, "cursor": cursor}))
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = second else {
+            panic!("fs.list returns a plain value");
+        };
+        let second_lines: Vec<&str> = output.model_content.lines().collect();
+        assert_eq!(second_lines.len(), 4);
+        assert_eq!(output.metadata["returned"], 4);
+        assert_eq!(output.metadata["has_more"], true);
+        let first_lines: Vec<&str> = first_content.lines().collect();
+        assert!(
+            second_lines.iter().all(|line| !first_lines.contains(line)),
+            "pages must not overlap: {first_lines:?} vs {second_lines:?}"
+        );
+        assert!(
+            !second_lines.iter().any(|line| line.contains("zz-new")),
+            "the snapshot must not see later directory changes"
+        );
+        let cursor2 = output.metadata["cursor"].as_str().unwrap().to_string();
+
+        // Page 3 drains the remaining 2 entries.
+        let third = list(json!({"path": "d", "limit": 4, "cursor": cursor2}))
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = third else {
+            panic!("fs.list returns a plain value");
+        };
+        assert_eq!(output.metadata["returned"], 2);
+        assert_eq!(output.metadata["has_more"], false);
+        assert!(output.metadata["cursor"].is_null());
+
+        // A corrupted cursor (offset beyond the snapshot) is a clean error.
+        let bad = format!("{}#9999", output.artifact_ref.as_deref().unwrap());
+        let result = list(json!({"path": "d", "limit": 4, "cursor": bad})).await;
+        assert!(result.is_err(), "a cursor past the snapshot must error");
     }
 }

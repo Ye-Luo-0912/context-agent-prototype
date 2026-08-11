@@ -219,3 +219,53 @@ async fn control_tools_execute_and_stay_within_the_envelope() {
         assert!(violations.is_empty(), "{op}: {violations:?}");
     }
 }
+
+#[tokio::test]
+async fn artifact_read_is_bounded_confined_and_references_real_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::open(dir.path()).await.unwrap();
+    let dispatcher = BuiltinToolDispatcher::new(workspace.clone());
+    let broker = WorkspaceOutputBroker::new(Arc::new(workspace.clone()));
+
+    // A genuine artifact reference reads back through the trusted broker
+    // with a clean envelope and paging metadata.
+    let run_id = RunId::new();
+    let reference = workspace
+        .write_artifact(run_id, "grep", "txt", b"one\ntwo\nthree\n")
+        .await
+        .unwrap();
+    let outcome = dispatcher
+        .execute(request(
+            "artifact.read",
+            json!({"reference": reference, "start_line": 2, "end_line": 2}),
+        ))
+        .await
+        .expect("artifact.read must execute");
+    let output = bound_value(outcome, &broker, run_id).await;
+    let violations = check_output_envelope(&output);
+    assert!(violations.is_empty(), "{violations:?}");
+    assert!(output.ok);
+    assert!(output.model_content.contains("two"));
+    assert!(output.metadata["has_more"].as_bool().unwrap());
+    assert_eq!(output.metadata["total_lines"], 3);
+
+    // Traversal and foreign references must be refused, never read.
+    for reference in [
+        "artifact://.focus-agent/artifacts/../changes.jsonl",
+        "artifact://src/main.rs",
+        "https://example.com/x",
+    ] {
+        let outcome = dispatcher
+            .execute(request("artifact.read", json!({"reference": reference})))
+            .await;
+        // A structured error is also correct; only a succeeding read (or a
+        // failing-but-ok output) is a violation.
+        if let Ok(outcome) = outcome {
+            let output = bound_value(outcome, &broker, RunId::new()).await;
+            assert!(
+                !output.ok,
+                "artifact.read must not succeed on {reference:?}"
+            );
+        }
+    }
+}

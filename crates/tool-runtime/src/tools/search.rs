@@ -52,6 +52,12 @@ struct GrepArgs {
     path: String,
     #[serde(default = "default_limit")]
     limit: usize,
+    /// Opaque paging token returned by a previous `search.grep` call. When
+    /// present, the next page is served from that call's snapshot artifact
+    /// instead of a fresh scan, so paging stays consistent even if files
+    /// change between pages.
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 fn default_path() -> String {
@@ -118,7 +124,8 @@ impl Tool for SearchGrepTool {
                 "properties": {
                     "pattern": {"type": "string", "description": "Regular expression"},
                     "path": {"type": "string", "description": "Optional workspace-relative directory"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+                    "cursor": {"type": "string", "description": "Opaque token from a previous search.grep result; serves the next page from that call's snapshot"}
                 }
             }),
             risk: ToolRisk::ReadOnly,
@@ -135,6 +142,9 @@ impl Tool for SearchGrepTool {
     ) -> AgentResult<ToolOutcome> {
         let args: GrepArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("search.grep args: {e}")))?;
+        if let Some(cursor) = args.cursor.as_deref() {
+            return self.page_from_snapshot(run_id, call_id, cursor).await;
+        }
         let regex = Regex::new(&args.pattern)
             .map_err(|e| AgentError::InvalidRequest(format!("invalid regex: {e}")))?;
         let root = self.workspace.resolve_relative(&args.path).await?;
@@ -182,6 +192,10 @@ impl Tool for SearchGrepTool {
         } else {
             None
         };
+        let (cursor, has_more) = match &artifact_ref {
+            Some(reference) => (Some(format!("{reference}#{MODEL_HITS}")), true),
+            None => (None, false),
+        };
         let truncated_note = artifact_ref
             .as_ref()
             .map(|r| {
@@ -208,7 +222,71 @@ impl Tool for SearchGrepTool {
                 format!("{}{}", model_hits.join("\n"), truncated_note)
             },
             artifact_ref,
-            metadata: json!({"hits": hits.len(), "files_scanned": scanned_files}),
+            metadata: json!({
+                "hits": hits.len(),
+                "files_scanned": scanned_files,
+                "returned": model_hits.len(),
+                "has_more": has_more,
+                "cursor": cursor,
+            }),
+        }))
+    }
+}
+
+impl SearchGrepTool {
+    /// Serve one page from a previous call's snapshot artifact (cursor is
+    /// `<artifact_ref>#<offset>`); pages are capped at `MODEL_HITS` lines
+    /// like the first page. Every page comes from the same immutable
+    /// snapshot, so file changes between pages cannot cause duplicates or
+    /// gaps.
+    async fn page_from_snapshot(
+        &self,
+        _run_id: RunId,
+        call_id: &str,
+        cursor: &str,
+    ) -> AgentResult<ToolOutcome> {
+        use super::{parse_cursor, read_snapshot_lines};
+
+        let (reference, offset) = parse_cursor(cursor)?;
+        let lines = read_snapshot_lines(&self.workspace, reference).await?;
+        if offset > lines.len() {
+            return Err(AgentError::InvalidRequest(format!(
+                "cursor is past the end of the snapshot ({offset} > {} lines)",
+                lines.len()
+            )));
+        }
+        let page: Vec<&str> = lines
+            .iter()
+            .skip(offset)
+            .take(MODEL_HITS)
+            .map(String::as_str)
+            .collect();
+        let next_offset = offset + page.len();
+        let has_more = next_offset < lines.len();
+        let next_cursor = has_more.then(|| format!("{reference}#{next_offset}"));
+
+        Ok(ToolOutcome::Value(ToolOutput {
+            call_id: call_id.into(),
+            tool_name: "search.grep".into(),
+            ok: true,
+            summary: format!(
+                "hit page {}-{} of {} (snapshot)",
+                offset + 1,
+                next_offset,
+                lines.len()
+            ),
+            model_content: if page.is_empty() {
+                "no more hits".to_string()
+            } else {
+                page.join("\n")
+            },
+            artifact_ref: Some(reference.to_string()),
+            metadata: json!({
+                "hits": lines.len(),
+                "returned": page.len(),
+                "has_more": has_more,
+                "cursor": next_cursor,
+            }),
         }))
     }
 }
@@ -320,5 +398,81 @@ mod tests {
             output.model_content.matches("match_").count() <= MODEL_HITS,
             "model content exceeded the hit cap"
         );
+    }
+
+    #[tokio::test]
+    async fn grep_pages_a_consistent_snapshot() {
+        let (workspace, _dir) = temp_workspace().await;
+        let root = workspace.root().to_path_buf();
+        let mut body = String::new();
+        for i in 0..250 {
+            body.push_str(&format!("match_{i:03}: something\n"));
+        }
+        write(&root, "big.txt", &body).await;
+
+        let tool = SearchGrepTool::new(workspace.clone());
+        let run_id = RunId::new();
+
+        let grep = |args: Value| {
+            let tool = &tool;
+            let call = agent_contracts::ToolCall {
+                id: "c".into(),
+                name: "search.grep".into(),
+                arguments: args,
+            };
+            async move {
+                tool.execute(run_id, "c", call.arguments, CancellationToken::new())
+                    .await
+            }
+        };
+
+        // Page 1: 250 hits, 100 shown, cursor + snapshot spill.
+        let first = grep(json!({"pattern": "match_", "limit": 300}))
+            .await
+            .unwrap();
+        let first = value(first);
+        assert_eq!(first.metadata["hits"], 250);
+        assert_eq!(first.metadata["has_more"], true);
+        let cursor = first.metadata["cursor"].as_str().unwrap().to_string();
+        assert!(first.artifact_ref.is_some());
+
+        // The source file changes between pages; paging must not notice.
+        std::fs::write(root.join("big.txt"), "match_000: changed\n").unwrap();
+
+        // Page 2 serves the next 100 snapshot hits.
+        let second = grep(json!({"pattern": "match_", "limit": 300, "cursor": cursor}))
+            .await
+            .unwrap();
+        let second = value(second);
+        assert_eq!(
+            second.metadata["hits"], 250,
+            "total comes from the snapshot"
+        );
+        assert_eq!(second.metadata["returned"], 100);
+        assert!(second.metadata["has_more"].as_bool().unwrap());
+        let first_lines: Vec<&str> = first.model_content.lines().collect();
+        let second_lines: Vec<&str> = second.model_content.lines().collect();
+        assert!(
+            second_lines.iter().all(|line| !first_lines.contains(line)),
+            "pages must not overlap"
+        );
+        assert!(
+            !second_lines.iter().any(|line| line.contains("changed")),
+            "the snapshot must not see later file edits"
+        );
+
+        // Drain the last 50.
+        let cursor2 = second.metadata["cursor"].as_str().unwrap().to_string();
+        let third = grep(json!({"pattern": "match_", "limit": 300, "cursor": cursor2}))
+            .await
+            .unwrap();
+        let third = value(third);
+        assert_eq!(third.metadata["returned"], 50);
+        assert_eq!(third.metadata["has_more"], false);
+        assert!(third.metadata["cursor"].is_null());
+
+        // A malformed cursor is a clean error.
+        let bad = grep(json!({"pattern": "match_", "limit": 300, "cursor": "not-a-cursor"})).await;
+        assert!(bad.is_err(), "malformed cursors must error");
     }
 }

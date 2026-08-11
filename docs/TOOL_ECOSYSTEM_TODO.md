@@ -1020,7 +1020,21 @@ together with TaskAnchor and continuous context GC.
   `process.session` adds the start/poll/stop protocol for long-running
   processes (shared per-dispatcher session registry, drained output,
   tree-killing stop). `shell.exec` stays as the raw-string fallback.
-- [ ] **TOOLS-07** Add artifact range fetch and consistent result paging.
+- [x] **TOOLS-07** Add artifact range fetch and consistent result paging.
+  `artifact.read` is the read side of the `artifact://` contract: it
+  resolves a reference (confined to `.focus-agent/artifacts/`, refusing
+  foreign schemes, query/fragment components and traversal), returns a
+  bounded numbered line range with `has_more`/`next_start_line` paging
+  metadata, and reads with a hard byte cap (append-only artifacts cannot
+  grow past the bound between a size probe and the read). `fs.list` and
+  `search.grep` gain snapshot-backed cursor paging: an overflowing result
+  spills its full sorted listing to an artifact (as before) and the result
+  now carries an opaque `cursor` (`<artifact_ref>#<offset>`); a later call
+  with that cursor serves the next page from the *same immutable snapshot*
+  instead of a fresh scan, so directory/file changes between pages cannot
+  cause duplicates or gaps. Cursors past the snapshot end and malformed
+  cursors are clean errors, and `artifact.read` can still page through any
+  spill directly.
 - [x] **TOOLS-08P** Validate the TaskToolRequirements/round-surface first
   slice: bounded TaskRecord CAS, Must/Prefer/KeepReady packing and degradation,
   lifecycle refresh, bounded decision events, one final snapshot, runtime

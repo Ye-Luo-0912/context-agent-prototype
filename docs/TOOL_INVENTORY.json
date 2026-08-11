@@ -2,7 +2,7 @@
   "generated": "2026-08-11",
   "purpose": "TOOLS-01 machine-readable matrix: inventory of the current tool schemas, limits, context dispositions, effects and platform behavior as of this commit. The code remains authoritative; this file is the ACI specification input for TOOLS-02/03/04.",
   "surface": {
-    "core": ["fs.list", "fs.read", "search.grep"],
+    "core": ["fs.list", "fs.read", "artifact.read", "search.grep"],
     "control": ["context.manage", "capability.manage"],
     "catalog_optional": ["fs.write", "edit.replace", "edit.patch", "git.status", "git.diff", "shell.exec", "process.run", "process.session"]
   },
@@ -26,9 +26,13 @@
       "surface_class": "core",
       "schema": {
         "path": {"type": "string", "note": "workspace-relative; resolved through the confinement check"},
-        "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 200}
+        "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 200},
+        "cursor": {"type": "string", "note": "opaque token from a previous fs.list result; serves the next page from that call's snapshot artifact"}
       },
-      "limits": {"max_list_entries": 2000},
+      "limits": {
+        "max_list_entries": 2000,
+        "note": "when the listing overflows the page it spills the full sorted snapshot to an artifact and returns a cursor; later pages are served from the immutable snapshot, so directory changes between pages cannot cause duplicates or gaps"
+      },
       "effects": ["read:workspace"],
       "context_disposition": "PersistObservation",
       "platform": {}
@@ -53,19 +57,40 @@
       "context_disposition": "PersistObservation",
       "platform": {"note": "directory-handle-relative confined open; reparse/link swap rejected at open time (CORE-07)"}
     },
+    "artifact.read": {
+      "risk": "ReadOnly",
+      "surface_class": "core",
+      "schema": {
+        "reference": {"type": "string", "required": true, "note": "artifact:// reference returned by another tool (spilled listings, grep hit sets, process logs)"},
+        "start_line": {"type": "integer", "minimum": 1, "default": 1},
+        "end_line": {"type": "integer", "minimum": 1, "default": 200}
+      },
+      "limits": {
+        "max_read_bytes": 2097152,
+        "max_read_lines": 400,
+        "note": "reference confined to .focus-agent/artifacts; foreign schemes, query/fragment components and traversal refused; the read itself is byte-capped (append-only artifacts cannot grow past the bound between a size probe and the read); non-UTF-8 content shown lossily"
+      },
+      "output": {
+        "paging": "metadata has_more / next_start_line let the model walk a spilled snapshot one page at a time without guessing filesystem paths"
+      },
+      "effects": ["read:workspace"],
+      "context_disposition": "PersistObservation",
+      "platform": {"note": "open goes through the pinned directory-handle descent (CORE-07)"}
+    },
     "search.grep": {
       "risk": "ReadOnly",
       "surface_class": "core",
       "schema": {
         "pattern": {"type": "string", "required": true, "note": "rg-style regex"},
         "path": {"type": "string", "note": "optional workspace-relative directory"},
-        "limit": {"type": "integer", "minimum": 1, "maximum": 1000}
+        "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "cursor": {"type": "string", "note": "opaque token from a previous search.grep result; serves the next page from that call's snapshot artifact"}
       },
       "limits": {
         "max_files_scanned": 5000,
         "max_bytes_per_file": 2097152,
         "model_hits": 100,
-        "note": "hit sets above model_hits spill to an artifact; ignored dirs: .git, .focus-agent, target, node_modules, vendor, dist, build"
+        "note": "hit sets above model_hits spill to an artifact and return a cursor; later pages are served from the immutable snapshot, so file changes between pages cannot cause duplicates or gaps; ignored dirs: .git, .focus-agent, target, node_modules, vendor, dist, build"
       },
       "effects": ["read:workspace"],
       "context_disposition": "PersistObservation",
