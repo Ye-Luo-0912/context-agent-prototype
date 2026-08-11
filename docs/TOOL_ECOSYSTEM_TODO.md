@@ -1184,8 +1184,30 @@ together with TaskAnchor and continuous context GC.
   turn. 8 registry tests + 5 authority tests pin the flows, including
   duplicate-install refusal, unknown-package refusal, ordered transitions,
   pass/fail/timeout self-checks and the env scrub.
-- [ ] **ECO-05** Add MCP-like adapter support behind the same capability/effect/output
+- [x] **ECO-05** Add MCP-like adapter support behind the same capability/effect/output
   boundary; lazily expose schemas through the existing catalog.
+  **Done 2026-08-12.** `McpCapabilityAdapter` (agent-capability-process
+  `mcp`) turns an MCP server over stdio (JSON-RPC 2.0, one document per
+  line) into a `Capability` behind the exact same boundary as any other
+  capability. `McpClient` is a minimal generic JSON-RPC client (id-matched
+  responses, server notifications skipped, per-request timeout, frame-size
+  bound, clean errors for closed/oversized/malformed frames) unit-tested
+  against in-memory duplex streams; `connect_stdio` spawns the server with
+  a scrubbed environment (PATH + platform essentials only, no
+  secrets/HOME), a private temp cwd and discarded stderr, then runs the
+  `initialize` handshake with protocol-version check. `connect()` performs
+  one discovery pass (`tools/list`) and builds a static manifest whose
+  schemas enter the existing catalog — loaded on demand through
+  `capability.manage`, never injected wholesale into a request; `risk` is
+  the caller's classification (derived from declared permissions, never
+  self-declared by the server). Every invocation is forwarded as
+  `tools/call`; the concatenated text content is clipped to
+  `MAX_MCP_TOOL_TEXT_CHARS` before it reaches the model, and a server
+  `isError` surfaces as `ok:false`, not a transport error. The server
+  child is restarted lazily if the connection dropped between calls. Nine
+  tests pin the protocol and the boundary, including a real spawned mock
+  MCP server (`mcp_mock_server` bin) exercising discovery + invocation +
+  failure + bounded echo.
 - [ ] **ECO-06** Define Skill activation/deactivation and provenance without turning
   instructions into System-authority content.
 - [ ] **ECO-07** Define Hook ordering, time/resource bounds, failure policy, and the rule
