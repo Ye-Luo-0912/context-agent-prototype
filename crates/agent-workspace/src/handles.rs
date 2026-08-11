@@ -45,10 +45,17 @@ impl WorkspaceHandle for ConfinedWorkspaceHandle {
     }
 
     async fn read(&self, relative: &str) -> AgentResult<Vec<u8>> {
-        let path = self.workspace.resolve_relative(relative).await?;
-        tokio::fs::read(&path)
+        // Validation and open are fused into one directory-handle-relative
+        // descent, so a link swap cannot redirect the read outside the
+        // workspace; the read goes through the pinned handle.
+        let confined = self.workspace.confined_open_read(relative).await?;
+        use tokio::io::AsyncReadExt;
+        let mut file = confined.into_tokio();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
             .await
-            .map_err(|e| AgentError::Io(format!("read {}: {e}", path.display())))
+            .map_err(|e| AgentError::Io(format!("read {relative}: {e}")))?;
+        Ok(bytes)
     }
 
     async fn write(&self, relative: &str, content: &[u8]) -> AgentResult<()> {

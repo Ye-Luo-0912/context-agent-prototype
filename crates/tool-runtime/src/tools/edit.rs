@@ -13,7 +13,6 @@ use agent_workspace::Workspace;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::fs;
 
 use super::Tool;
 
@@ -89,9 +88,15 @@ impl Tool for EditReplaceTool {
             ));
         }
 
+        // Reject state-dir targets up front (reads may legitimately reach
+        // into artifacts; editing them is a mutation policy decision).
         let path = self.workspace.resolve_mutation(&args.path).await?;
-        let metadata = fs::metadata(&path)
-            .await
+        // Validation and open are fused into a directory-handle-relative
+        // descent; the size check and the content read both go through the
+        // pinned handle, so a link swap cannot redirect them.
+        let confined = self.workspace.confined_open_read(&args.path).await?;
+        let metadata = confined
+            .metadata()
             .map_err(|e| AgentError::Io(format!("metadata {}: {e}", path.display())))?;
         if metadata.len() > MAX_FILE_BYTES {
             return Err(AgentError::InvalidRequest(format!(
@@ -101,7 +106,10 @@ impl Tool for EditReplaceTool {
             )));
         }
 
-        let original = fs::read_to_string(&path)
+        use tokio::io::AsyncReadExt;
+        let mut file = confined.into_tokio();
+        let mut original = String::new();
+        file.read_to_string(&mut original)
             .await
             .map_err(|e| AgentError::Io(format!("read {}: {e}", path.display())))?;
         let occurrences: Vec<_> = original.match_indices(&args.old).collect();

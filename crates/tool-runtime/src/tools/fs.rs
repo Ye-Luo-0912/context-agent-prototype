@@ -197,10 +197,13 @@ impl Tool for FsReadTool {
             )));
         }
 
-        let path = self.workspace.resolve_relative(&args.path).await?;
-        let metadata = fs::metadata(&path)
-            .await
-            .map_err(|e| AgentError::Io(format!("metadata {}: {e}", path.display())))?;
+        // Validation and open are fused into a directory-handle-relative
+        // descent; the size check and the content read both go through the
+        // pinned handle, so a link swap cannot redirect the read.
+        let confined = self.workspace.confined_open_read(&args.path).await?;
+        let metadata = confined.metadata().map_err(|e| {
+            AgentError::Io(format!("metadata {}: {e}", confined.display().display()))
+        })?;
         if metadata.len() > MAX_READ_BYTES {
             return Err(AgentError::InvalidRequest(format!(
                 "file is {} bytes; use a narrower/specialized tool for files above {} bytes",
@@ -209,9 +212,13 @@ impl Tool for FsReadTool {
             )));
         }
 
-        let text = fs::read_to_string(&path)
+        use tokio::io::AsyncReadExt;
+        let display_path = confined.display().to_path_buf();
+        let mut file = confined.into_tokio();
+        let mut text = String::new();
+        file.read_to_string(&mut text)
             .await
-            .map_err(|e| AgentError::Io(format!("read {}: {e}", path.display())))?;
+            .map_err(|e| AgentError::Io(format!("read {}: {e}", display_path.display())))?;
         let lines: Vec<&str> = text.lines().collect();
         let start = args.start_line.saturating_sub(1).min(lines.len());
         let end = args.end_line.min(lines.len());
@@ -230,7 +237,7 @@ impl Tool for FsReadTool {
                 "read lines {}-{} of {}",
                 start + 1,
                 end,
-                display_relative(&self.workspace, &path)
+                display_relative(&self.workspace, &display_path)
             ),
             model_content: selected,
             artifact_ref: None,

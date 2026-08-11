@@ -1,3 +1,4 @@
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use agent_contracts::{AgentError, AgentResult, Effect, EffectCommitError, RunId};
@@ -5,11 +6,11 @@ use serde::Serialize;
 use tokio::fs;
 use uuid::Uuid;
 
+mod confined;
 mod handles;
-mod replace;
 
+pub use confined::{ConfinedDir, ConfinedFile};
 pub use handles::{ArtifactStoreHandle, ConfinedWorkspaceHandle};
-pub use replace::atomic_replace;
 
 /// One record in the workspace change journal (`.focus-agent/changes.jsonl`).
 ///
@@ -160,25 +161,17 @@ impl Workspace {
     /// target verified to stay under the root, so a link anywhere along the
     /// path cannot smuggle the final result outside. Missing tail components
     /// are appended lexically afterwards, which keeps new-file writes working.
+    ///
+    /// Resolution returns a path *string*; for reads and mutations the
+    /// caller should prefer `confined_open_read` / `begin_mutation`, which
+    /// fuse validation and open into a directory-handle-relative descent so
+    /// a link swap between validation and use cannot redirect the operation.
     pub async fn resolve_relative(&self, relative: impl AsRef<Path>) -> AgentResult<PathBuf> {
         let relative = relative.as_ref();
         if relative.as_os_str().is_empty() {
             return Ok(self.root.clone());
         }
-
-        let mut clean = PathBuf::new();
-        for component in relative.components() {
-            match component {
-                Component::Normal(part) => clean.push(part),
-                Component::CurDir => {}
-                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                    return Err(AgentError::InvalidRequest(format!(
-                        "path must stay inside workspace: {}",
-                        relative.display()
-                    )));
-                }
-            }
-        }
+        let clean = clean_relative(relative)?;
         self.confine(clean).await
     }
 
@@ -242,9 +235,101 @@ impl Workspace {
         Ok(base)
     }
 
+    /// Open a workspace file for reading with validation and open fused
+    /// into one directory-handle-relative descent (`openat` style): each
+    /// component is opened relative to the already-open parent handle with
+    /// link-following disabled, so a link swap between a validation pass
+    /// and the open can never redirect the read outside the workspace.
+    /// Metadata and content taken through the returned handle refer to the
+    /// opened object even if its path is swapped afterwards.
+    pub async fn confined_open_read(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> AgentResult<ConfinedFile> {
+        let relative = relative.as_ref();
+        if relative.as_os_str().is_empty() {
+            return Err(AgentError::InvalidRequest(
+                "cannot open the workspace root as a file".into(),
+            ));
+        }
+        let clean = clean_relative(relative)?;
+        let parts: Vec<std::ffi::OsString> = clean
+            .components()
+            .map(|c| c.as_os_str().to_owned())
+            .collect();
+        let (last, parents) = parts.split_last().ok_or_else(|| {
+            AgentError::InvalidRequest("cannot open the workspace root as a file".into())
+        })?;
+        let mut dir = ConfinedDir::open_root(&self.root)
+            .map_err(|e| AgentError::Io(format!("open workspace root handle: {e}")))?;
+        for part in parents {
+            let next_display = dir.display().join(part);
+            dir = dir
+                .open_child_dir(part)
+                .map_err(|e| confined_io_error("open dir", &next_display, e))?;
+        }
+        let file_display = dir.display().join(last);
+        let file = dir
+            .open_existing(last)
+            .map_err(|e| confined_io_error("open", &file_display, e))?;
+        Ok(ConfinedFile::new(file, self.root.join(clean)))
+    }
+
+    /// Confine a mutation's parent directory with validation and open fused
+    /// into one directory-handle-relative descent. Missing components are
+    /// created through the pinned handle chain (never by following a path
+    /// string), and the runtime state directory is rejected, mirroring
+    /// `resolve_mutation`.
+    pub(crate) async fn confined_parent(&self, relative: &Path) -> AgentResult<ConfinedDir> {
+        let clean = clean_relative(relative)?;
+        let mut dir = ConfinedDir::open_root(&self.root)
+            .map_err(|e| AgentError::Io(format!("open workspace root handle: {e}")))?;
+        let mut display = self.root.clone();
+        for part in clean.components() {
+            display.push(part.as_os_str());
+            // The state directory is a trusted-core-owned region: no
+            // mutation may descend into it (mirrors resolve_mutation).
+            if display == self.state_dir || display.starts_with(&self.state_dir) {
+                return Err(AgentError::InvalidRequest(format!(
+                    "mutations inside the runtime state directory are not allowed: {}",
+                    display_relative(&self.root, &display)
+                )));
+            }
+            match dir.open_child_dir(part.as_os_str()) {
+                Ok(child) => dir = child,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    // Create the missing component under the pinned parent,
+                    // then reopen it; a concurrent creator only means the
+                    // reopen succeeds.
+                    match dir.create_child_dir(part.as_os_str()) {
+                        Ok(()) => {}
+                        Err(ce) if ce.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(ce) => {
+                            return Err(AgentError::Io(format!(
+                                "create dir {}: {ce}",
+                                display.display()
+                            )));
+                        }
+                    }
+                    dir = dir
+                        .open_child_dir(part.as_os_str())
+                        .map_err(|e| confined_io_error("open created dir", &display, e))?;
+                }
+                Err(e) => return Err(confined_io_error("open dir", &display, e)),
+            }
+        }
+        Ok(dir)
+    }
+
     /// Begin a journaled, atomic mutation. The target is confined like
     /// `resolve_mutation` and its old content is captured (bounded) as the
     /// journal backup before anything is written.
+    ///
+    /// The parent directory is confined with validation and open fused into
+    /// a directory-handle-relative descent: the staged temp file and the
+    /// final atomic replace both happen relative to the pinned handle, so a
+    /// link swap after validation cannot redirect the write outside the
+    /// workspace. The old content is read through that same pinned handle.
     pub async fn begin_mutation(
         &self,
         tool: &str,
@@ -252,19 +337,35 @@ impl Workspace {
         relative: impl AsRef<Path>,
     ) -> AgentResult<MutationTransaction> {
         let target = self.resolve_mutation(relative).await?;
+        let target_name = target.file_name().ok_or_else(|| {
+            AgentError::InvalidRequest(format!("no file name for {}", target.display()))
+        })?;
+        let parent_rel = target
+            .parent()
+            .and_then(|p| p.strip_prefix(&self.root).ok())
+            .unwrap_or_else(|| Path::new(""));
+        let parent = self.confined_parent(parent_rel).await?;
+
         let mut bytes_before = 0u64;
         let mut before_hash = content_hash(&[]);
         let mut old_content = None;
-        match fs::metadata(&target).await {
-            Ok(meta) => {
+        match parent.open_existing(target_name) {
+            Ok(file) => {
+                let meta = file
+                    .metadata()
+                    .map_err(|e| AgentError::Io(format!("metadata {}: {e}", target.display())))?;
                 bytes_before = meta.len();
                 if meta.is_file() {
                     // The hash must always reflect the real content — a
                     // recovery pass relies on it to tell "prepared but
                     // never committed" from "committed". Only the *backup*
                     // is bounded: big files get a hash but no journal copy.
-                    let bytes = fs::read(&target)
-                        .await
+                    // The read goes through the pinned handle, so a swap
+                    // cannot change which object is hashed.
+                    use std::io::Read;
+                    let mut file = file;
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes)
                         .map_err(|e| AgentError::Io(format!("read {}: {e}", target.display())))?;
                     before_hash = content_hash(&bytes);
                     if bytes.len() as u64 <= CHANGE_CAPTURE_LIMIT as u64 {
@@ -272,15 +373,16 @@ impl Workspace {
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(AgentError::Io(format!("inspect {}: {e}", target.display())));
-            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(confined_io_error("inspect", &target, e)),
         }
+        let relative = display_relative(&self.root, &target);
         Ok(MutationTransaction {
             workspace: self.clone(),
-            relative: display_relative(&self.root, &target),
+            parent,
+            target_name: target_name.to_os_string(),
             target,
+            relative,
             tool: tool.to_string(),
             action: action.to_string(),
             bytes_before,
@@ -417,6 +519,10 @@ impl Workspace {
 /// operation's prepared effect would otherwise leak.
 pub struct MutationTransaction {
     workspace: Workspace,
+    /// Pinned parent directory handle: staging and the atomic replace both
+    /// happen relative to this handle, never through a swappable path.
+    parent: ConfinedDir,
+    target_name: std::ffi::OsString,
     target: PathBuf,
     relative: String,
     tool: String,
@@ -435,35 +541,27 @@ impl MutationTransaction {
     /// `MutationPrepared`. The target is not touched. Returns the prepared
     /// mutation the runtime commits or rolls back.
     pub async fn prepare(mut self, content: &[u8]) -> AgentResult<PreparedMutation> {
-        let parent = self.target.parent().ok_or_else(|| {
-            AgentError::InvalidRequest(format!("no parent for {}", self.target.display()))
-        })?;
-        fs::create_dir_all(parent)
-            .await
-            .map_err(|e| AgentError::Io(format!("create parent dir: {e}")))?;
-        let file_name = self
-            .target
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "file".into());
-        let temp = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+        // The parent is already confined (with missing components created
+        // through the pinned handle chain); the staged file is created
+        // exclusively under that handle, so a link swap cannot redirect it.
+        // Staging is a short synchronous write through the exclusive handle
+        // (the same style as the atomic replace below).
+        let file_name = self.target_name.to_string_lossy().to_string();
+        let temp_name = std::ffi::OsString::from(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+        let mut file = self
+            .parent
+            .create_new_file(&temp_name)
+            .map_err(|e| confined_io_error("create temp", &self.target, e))?;
 
-        let mut options = tokio::fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        let mut file = options
-            .open(&temp)
-            .await
-            .map_err(|e| AgentError::Io(format!("create temp file: {e}")))?;
-        use tokio::io::AsyncWriteExt;
-        if let Err(e) = file.write_all(content).await {
-            let _ = fs::remove_file(&temp).await;
+        use std::io::Write;
+        if let Err(e) = file.write_all(content) {
+            let _ = self.parent.remove_file(&temp_name);
             return Err(AgentError::Io(format!("write temp file: {e}")));
         }
-        if let Err(e) = file.flush().await {
-            let _ = fs::remove_file(&temp).await;
+        if let Err(e) = file.flush() {
+            let _ = self.parent.remove_file(&temp_name);
             return Err(AgentError::Io(format!("flush temp file: {e}")));
         }
-        drop(file);
 
         let record = ChangeRecord::MutationPrepared {
             tx_id: self.tx_id.clone(),
@@ -478,15 +576,18 @@ impl MutationTransaction {
             old_content: self.old_content.take(),
         };
         if let Err(e) = self.workspace.record_change(record).await {
-            let _ = fs::remove_file(&temp).await;
+            let _ = self.parent.remove_file(&temp_name);
             return Err(e);
         }
 
         Ok(PreparedMutation {
             workspace: self.workspace,
+            parent: self.parent,
             target: self.target,
+            target_name: self.target_name,
             tx_id: self.tx_id,
-            temp: Some(temp),
+            temp_name: Some(temp_name),
+            temp_file: Some(file),
             finished: false,
         })
     }
@@ -512,9 +613,16 @@ impl MutationTransaction {
 /// generation fence passes, roll back when the operation turned stale.
 pub struct PreparedMutation {
     workspace: Workspace,
+    /// Pinned parent directory handle the staged file lives under.
+    parent: ConfinedDir,
     target: PathBuf,
+    target_name: std::ffi::OsString,
     tx_id: String,
-    temp: Option<PathBuf>,
+    temp_name: Option<std::ffi::OsString>,
+    /// The staged file handle, kept for the Windows atomic replace (which
+    /// renames through the handle); Unix renames by name under the pinned
+    /// directory.
+    temp_file: Option<std::fs::File>,
     finished: bool,
 }
 
@@ -531,17 +639,29 @@ impl PreparedMutation {
     /// `AppliedButDurabilityFailed` when the replace landed but the
     /// `MutationCommitted` record could not be appended — the caller must
     /// treat that as a degraded state, never as "nothing happened".
+    ///
+    /// The replace is relative to the pinned parent handle (`renameat` /
+    /// `SetFileInformationByHandle` with `FILE_RENAME_INFO`), so a link
+    /// swap cannot redirect it outside the workspace.
     pub async fn commit(mut self) -> Result<(), EffectCommitError> {
-        let Some(temp) = self.temp.take() else {
+        let Some(temp_name) = self.temp_name.take() else {
             return Ok(());
         };
-        if let Err(e) = atomic_replace(&temp, &self.target).await {
-            let _ = fs::remove_file(&temp).await;
+        let from = self
+            .temp_file
+            .as_ref()
+            .expect("prepare created the staged file");
+        if let Err(e) = self
+            .parent
+            .replace_file(from, &temp_name, &self.target_name)
+        {
+            let _ = self.parent.remove_file(&temp_name);
             self.record_rolled_back(format!("commit failed: {e}")).await;
-            return Err(EffectCommitError::NotApplied(AgentError::Io(format!(
-                "commit {}: {e}",
-                self.target.display()
-            ))));
+            return Err(EffectCommitError::NotApplied(confined_io_error(
+                "commit",
+                &self.target,
+                e,
+            )));
         }
         // The target changed; from here on any failure is a durability
         // problem, not a "did not apply" one.
@@ -562,8 +682,8 @@ impl PreparedMutation {
     /// `Drop` impl — a stale or cancelled mutation must never leak temp
     /// files.
     pub async fn rollback(mut self, reason: &str) {
-        if let Some(temp) = self.temp.take() {
-            let _ = fs::remove_file(&temp).await;
+        if let Some(temp_name) = self.temp_name.take() {
+            let _ = self.parent.remove_file(&temp_name);
         }
         self.finished = true;
         self.record_rolled_back(reason.to_string()).await;
@@ -582,9 +702,9 @@ impl PreparedMutation {
 impl Drop for PreparedMutation {
     fn drop(&mut self) {
         if !self.finished
-            && let Some(temp) = &self.temp
+            && let Some(temp_name) = &self.temp_name
         {
-            let _ = std::fs::remove_file(temp);
+            let _ = self.parent.remove_file(temp_name);
         }
     }
 }
@@ -613,6 +733,37 @@ fn display_relative(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// Lexically clean a user-provided workspace-relative path: no absolute
+/// prefixes, no `..`, no `.` segments. Shared by the path-string resolver
+/// and the directory-handle-relative confined operations.
+fn clean_relative(relative: &Path) -> AgentResult<PathBuf> {
+    let mut clean = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => clean.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(AgentError::InvalidRequest(format!(
+                    "path must stay inside workspace: {}",
+                    relative.display()
+                )));
+            }
+        }
+    }
+    Ok(clean)
+}
+
+/// Map a confined-filesystem error onto the agent error space: a reparse
+/// rejection is a policy violation (`InvalidRequest`), anything else is an
+/// IO failure.
+fn confined_io_error(operation: &str, path: &Path, e: io::Error) -> AgentError {
+    if e.kind() == io::ErrorKind::InvalidData {
+        AgentError::InvalidRequest(format!("{operation} {}: {e}", path.display()))
+    } else {
+        AgentError::Io(format!("{operation} {}: {e}", path.display()))
+    }
 }
 
 fn now_ms() -> u64 {
@@ -1025,5 +1176,238 @@ mod tests {
             record["old_content"].is_null(),
             "the bounded backup copy must not capture a 256KB+ file"
         );
+    }
+
+    /// Rename with retry: transient sharing violations from the victim's
+    /// open handles are expected on Windows and retried briefly.
+    fn retry_rename(from: &Path, to: &Path) -> bool {
+        for _ in 0..50 {
+            if std::fs::rename(from, to).is_ok() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        false
+    }
+
+    /// Swap `d` between a real directory (`real`, holding the inside file)
+    /// and a link (`link`, pointing outside the workspace), both parked
+    /// under `root`. Every step is a plain rename — no subprocess — so the
+    /// swap genuinely races the victim. Returns whether the link ever
+    /// occupied `d` (a real competition window existed); a later step can
+    /// lose to the victim recreating `d`, which is exactly the workspace-
+    /// confined behavior under test.
+    fn swap_d_between_real_and_link(root: &Path) -> bool {
+        let d = root.join("d");
+        let real = root.join("real");
+        let link = root.join("link");
+        let hold = root.join("hold");
+        // Initial state (established by the test): `d` is the real
+        // directory and `link` is the pre-planted junction/symlink.
+        let mut saw_link_at_d = false;
+        for _ in 0..3 {
+            // Move the current `d` (the real dir) away, put the link at
+            // `d`, then park the real dir at `real` again.
+            if !(retry_rename(&d, &hold) && retry_rename(&link, &d) && retry_rename(&hold, &real)) {
+                return saw_link_at_d;
+            }
+            // Hold the link in place so a racing open can hit it.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            saw_link_at_d = true;
+            // Swap back: link out, real dir back at `d`. The victim may
+            // have recreated `d` (confined_parent creates missing parents),
+            // which makes the restore fail — the write still landed inside
+            // the workspace, which is what the test asserts.
+            if !(retry_rename(&d, &hold) && retry_rename(&real, &d) && retry_rename(&hold, &link)) {
+                return saw_link_at_d;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        true
+    }
+
+    #[tokio::test]
+    async fn confined_read_rejects_preplanted_reparse_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let link = dir.path().join("link");
+        if !try_make_link(&link, outside.path()) {
+            return; // platform cannot create links; nothing to assert
+        }
+        fs::write(outside.path().join("secret.txt"), "secret")
+            .await
+            .unwrap();
+        let result = workspace.confined_open_read("link/secret.txt").await;
+        assert!(
+            result.is_err(),
+            "a pre-planted link must be rejected at open time, not followed"
+        );
+    }
+
+    #[tokio::test]
+    async fn confined_mutation_creates_missing_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        workspace
+            .begin_mutation("fs.write", "write", "a/b/c.txt")
+            .await
+            .unwrap()
+            .apply(b"deep")
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a/b/c.txt"))
+                .await
+                .unwrap(),
+            "deep"
+        );
+    }
+
+    #[tokio::test]
+    async fn confined_replace_file_overwrites_and_creates() {
+        use std::ffi::OsStr;
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let cdir = ConfinedDir::open_root(dir.path()).unwrap();
+
+        // Pre-plant the destination, then replace it through the handle.
+        std::fs::write(dir.path().join("target.txt"), b"old").unwrap();
+        let mut src = cdir.create_new_file(OsStr::new("stage.tmp")).unwrap();
+        src.write_all(b"new content").unwrap();
+        src.flush().unwrap();
+        cdir.replace_file(&src, OsStr::new("stage.tmp"), OsStr::new("target.txt"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("target.txt")).unwrap(),
+            b"new content"
+        );
+        assert!(
+            !dir.path().join("stage.tmp").exists(),
+            "the staged file is consumed by the replace"
+        );
+
+        // A missing destination is created by the same operation.
+        let mut src2 = cdir.create_new_file(OsStr::new("stage2.tmp")).unwrap();
+        src2.write_all(b"fresh").unwrap();
+        src2.flush().unwrap();
+        cdir.replace_file(&src2, OsStr::new("stage2.tmp"), OsStr::new("fresh.txt"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("fresh.txt")).unwrap(),
+            b"fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_dir_swap_never_reads_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+
+        // Park a real directory (holding the inside file) and a pre-planted
+        // link pointing outside; the attacker swaps them in and out of `d`.
+        let root = dir.path();
+        fs::create_dir(root.join("real")).await.unwrap();
+        fs::write(root.join("real/file.txt"), "inside")
+            .await
+            .unwrap();
+        fs::write(outside.path().join("file.txt"), "outside")
+            .await
+            .unwrap();
+        if !try_make_link(&root.join("link"), outside.path()) {
+            return; // platform cannot create links; nothing to assert
+        }
+        assert!(
+            std::fs::rename(root.join("real"), root.join("d")).is_ok(),
+            "initial d must be the real directory"
+        );
+
+        let root = root.to_path_buf();
+        let attacker = std::thread::spawn(move || swap_d_between_real_and_link(&root));
+
+        let mut reads = 0usize;
+        for _ in 0..600 {
+            if let Ok(confined) = workspace.confined_open_read("d/file.txt").await {
+                use std::io::Read;
+                let mut content = String::new();
+                let mut file = confined.into_std();
+                if file.read_to_string(&mut content).is_ok() {
+                    reads += 1;
+                    assert_eq!(
+                        content, "inside",
+                        "a confined read must never surface content from outside the workspace"
+                    );
+                }
+            }
+        }
+        let supported = attacker.join().unwrap();
+        assert!(
+            !supported || reads > 0,
+            "the swap loop must race with real reads to be a meaningful test"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_dir_swap_never_writes_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+
+        let root = dir.path();
+        fs::create_dir(root.join("real")).await.unwrap();
+        fs::write(root.join("real/file.txt"), "inside")
+            .await
+            .unwrap();
+        fs::write(outside.path().join("file.txt"), "outside")
+            .await
+            .unwrap();
+        if !try_make_link(&root.join("link"), outside.path()) {
+            return; // platform cannot create links; nothing to assert
+        }
+        assert!(
+            std::fs::rename(root.join("real"), root.join("d")).is_ok(),
+            "initial d must be the real directory"
+        );
+
+        let root = root.to_path_buf();
+        let attacker = std::thread::spawn(move || swap_d_between_real_and_link(&root));
+
+        let mut applied = 0usize;
+        for _ in 0..150 {
+            if let Ok(tx) = workspace
+                .begin_mutation("fs.write", "write", "d/new.txt")
+                .await
+                && tx.apply(b"payload").await.is_ok()
+            {
+                applied += 1;
+            }
+        }
+        let supported = attacker.join().unwrap();
+        assert!(
+            !supported || applied > 0,
+            "the swap loop must race with real mutations to be a meaningful test"
+        );
+
+        // The write must never have landed outside the workspace: the
+        // outside directory only ever holds its pre-planted file.
+        let mut entries = fs::read_dir(outside.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert_ne!(
+                entry.file_name().to_string_lossy(),
+                "new.txt",
+                "a mutation escaped the workspace through the directory swap"
+            );
+        }
+        // Every applied mutation must be visible inside the workspace (the
+        // pinned handle keeps writing into the real directory even while
+        // the path is being swapped). The real directory parks at `real`
+        // or `d` depending on where the swap stopped.
+        if applied > 0 {
+            let landed = dir.path().join("real/new.txt").exists()
+                || dir.path().join("d/new.txt").exists()
+                || dir.path().join("hold/new.txt").exists();
+            assert!(landed, "applied mutations must land inside the workspace");
+        }
     }
 }

@@ -154,6 +154,7 @@ version = "0.1.0"
 dependencies = [
  "agent-contracts",
  "async-trait",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

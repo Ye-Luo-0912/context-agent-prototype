@@ -40,6 +40,7 @@ provider-openai = { path = "crates/provider-openai" }
 
 async-trait = "0.1"
 base64 = "0.22"
+libc = "0.2"
 futures-util = "0.3"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
