@@ -1145,6 +1145,16 @@ authority, sandbox authority, runtime integrity — are the seed of an
 task manager, scope scheduling, prompt assembly, materialization, adaptive
 policy) stays in `agent-runtime`. Runtime evolves, Core stays trusted.
 
+Since the MOD-04 first slice (2026-08-11) the four authority seams have
+one named home behind the `AgentKernel` facade (`agent-kernel/src/
+authority.rs`): `EventAuthority` (envelope identity + journal +
+durability barrier), `ApprovalAuthority` (`ApprovalVerdict` normalization),
+`EffectAuthority` (the single commit/rollback seam every staged effect
+passes), and `OutputAuthority` (the only path from producer output to a
+model-facing `ToolOutput`). This centralizes calls only — it is not yet
+proof that opaque effects are safe — but it is the growing seam a future
+Core implementation replaces without rewriting the facade or the actor.
+
 ## 9e. Performance P0: store confinement, lock-free IO, bounded external view
 
 The next hot paths are store I/O, external recall and the tool surface —

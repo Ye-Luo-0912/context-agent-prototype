@@ -1813,7 +1813,7 @@ impl RuntimeActor {
                     completion.operation.turn_id,
                     completion.operation.generation
                 );
-                effect.rollback(&reason).await;
+                self.kernel.effect().rollback(effect, &reason).await;
             }
             let message = format!(
                 "stale {} result dropped (turn {}, generation {})",
@@ -1880,7 +1880,7 @@ impl RuntimeActor {
                 // is surfaced as a failed tool result — the model must not
                 // see "edit applied" when the rename never landed.
                 let output = match completion.effect {
-                    Some(effect) => match effect.commit().await {
+                    Some(effect) => match self.kernel.effect().commit(effect).await {
                         Ok(()) => output,
                         Err(EffectCommitError::NotApplied(error)) => ToolOutput {
                             ok: false,

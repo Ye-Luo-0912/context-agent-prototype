@@ -871,9 +871,30 @@ together with TaskAnchor and continuous context GC.
   registry while the runtime keeps catalog views and load/unload scheduling
   (`MOD-05`, part of the `MOD-04` authority slice) — not the registration
   separation itself.
-- [ ] **MOD-04** Isolate the first real authority slice inside the existing
+- [~] **MOD-04** Isolate the first real authority slice inside the existing
   kernel crate (effect, approval/policy, output/resource broker, durable
   audit) without moving `RuntimeActor` or creating a second orchestrator.
+  **First slice landed 2026-08-11** — `agent-kernel/src/authority.rs` puts
+  each authority behind one named seam of the `AgentKernel` facade:
+  `EventAuthority` (envelope identity/sequence/timestamp, journal append,
+  the `emit_durable` durability barrier that broadcasts nothing on a failed
+  flush), `ApprovalAuthority` (normalizes the gate's outcome to
+  `ApprovalVerdict::{Allowed, Denied, Failed}`, so callers match a verdict
+  instead of re-interpreting `AgentResult` + a boolean),
+  `EffectAuthority` (every staged effect of every path — builtin,
+  capability, wire broker — commits or rolls back through this one seam;
+  the actor still decides live-vs-stale behind the generation fence) and
+  `OutputAuthority` (the only path from producer output to a model-facing
+  `ToolOutput`; absent a broker it passes through and the runtime last-line
+  guard remains the backstop). The actor's two effect call sites route
+  through `kernel.effect()`. Behavior-preserving: kernel + runtime + full
+  workspace tests stay green, plus six new authority unit tests (monotonic
+  sequences, durable barrier broadcast, failed-barrier silence, verdict
+  normalization, commit/rollback classification, broker pass-through).
+  Still open (later steps of the v2 compatibility order, not this slice):
+  the shadow-mode `AuthorityGate` beside the legacy gate, `EffectReceipt`s,
+  and commit-time resource enforcement from the `EffectIntent`
+  (`AuthorityLease` — the M14 residual).
 - [ ] **MOD-04A** Move context/model/tool/config scheduling behind
   `agent-runtime::RuntimeServices`; only then perform the mechanical
   `agent-kernel -> agent-core` rename as a behavior-free change.

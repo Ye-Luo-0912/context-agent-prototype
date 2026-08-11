@@ -1,22 +1,18 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::Arc;
 
 use agent_contracts::{
-    AgentError, AgentResult, ApprovalDecision, ApprovalGate, CONTEXT_SEARCH_MAX_LIMIT,
-    CancellationToken, ContextConsumptionAck, ContextEngine, ContextGcReport, ContextIngress,
-    ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextQuery, ContextSearchQuery, ContextStateTransition, EngineQuery, EventJournal,
-    FocusState, MaterializedContext, ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest,
-    ModelTransport, OutputBroker, RunId, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind,
-    TaskId, ToolCall, ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolOutcome,
-    ToolOutput, ToolSpec, ToolSurfaceSnapshot,
+    AgentError, AgentResult, CONTEXT_SEARCH_MAX_LIMIT, CancellationToken, ContextConsumptionAck,
+    ContextEngine, ContextGcReport, ContextIngress, ContextItemSummary, ContextKind,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery,
+    ContextStateTransition, EngineQuery, FocusState, MaterializedContext, ModelCapabilities,
+    ModelEventSink, ModelOutput, ModelRequest, ModelTransport, OutputBroker, RunId, RuntimeEvent,
+    ScopeId, ScopeKind, TaskId, ToolCall, ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest,
+    ToolOutcome, ToolOutput, ToolSpec, ToolSurfaceSnapshot,
 };
-use tokio::sync::broadcast;
+
+use crate::authority::{
+    ApprovalAuthority, ApprovalVerdict, EffectAuthority, EventAuthority, OutputAuthority,
+};
 
 #[derive(Clone)]
 pub struct AgentKernelConfig {
@@ -58,19 +54,24 @@ impl Default for AgentKernelConfig {
 }
 
 /// The runtime's executor: stateless primitives over the engine contracts
-/// (context, model, tools, approval, journal) plus the event plumbing. The
-/// execution *state machine* (turn frame, generation, what to commit) lives
-/// in the runtime actor — this type owns no turn state and no locks for it.
+/// (context, model, tools) plus the four authority seams (events, approval,
+/// effects, output) and the event plumbing. The execution *state machine*
+/// (turn frame, generation, what to commit) lives in the runtime actor —
+/// this type owns no turn state and no locks for it. The authorities are
+/// the MOD-04 seam: every event, approval verdict, effect commit/rollback
+/// and bounded producer output passes through one named home, so a future
+/// Trusted Core can replace the seam without rewriting the facade or the
+/// actor.
 pub struct AgentKernel {
     run_id: RunId,
     config: AgentKernelConfig,
     context: Arc<dyn ContextEngine>,
     model: Arc<dyn ModelTransport>,
     tools: Arc<dyn ToolDispatcher>,
-    approval: Arc<dyn ApprovalGate>,
-    journal: Option<Arc<dyn EventJournal>>,
-    event_tx: broadcast::Sender<RuntimeEventEnvelope>,
-    seq: Arc<AtomicU64>,
+    event: EventAuthority,
+    approval: ApprovalAuthority,
+    effect: EffectAuthority,
+    output: OutputAuthority,
 }
 
 impl AgentKernel {
@@ -79,20 +80,22 @@ impl AgentKernel {
         context: Arc<dyn ContextEngine>,
         model: Arc<dyn ModelTransport>,
         tools: Arc<dyn ToolDispatcher>,
-        approval: Arc<dyn ApprovalGate>,
-        journal: Option<Arc<dyn EventJournal>>,
+        approval: Arc<dyn agent_contracts::ApprovalGate>,
+        journal: Option<Arc<dyn agent_contracts::EventJournal>>,
     ) -> Self {
-        let (event_tx, _) = broadcast::channel(1_024);
+        let (event_tx, _) = tokio::sync::broadcast::channel(1_024);
+        let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let output_broker = config.output_broker.clone();
         Self {
             run_id: RunId::new(),
             config,
             context,
             model,
             tools,
-            approval,
-            journal,
-            event_tx,
-            seq: Arc::new(AtomicU64::new(0)),
+            event: EventAuthority::new(journal, event_tx, seq),
+            approval: ApprovalAuthority::new(approval),
+            effect: EffectAuthority,
+            output: OutputAuthority::new(output_broker),
         }
     }
 
@@ -100,19 +103,43 @@ impl AgentKernel {
         self.run_id
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<RuntimeEventEnvelope> {
-        self.event_tx.subscribe()
+    /// The event authority seam: identity, journaling, barriers.
+    pub fn event(&self) -> &EventAuthority {
+        &self.event
+    }
+
+    /// The approval authority seam: policy verdicts.
+    pub fn approval(&self) -> &ApprovalAuthority {
+        &self.approval
+    }
+
+    /// The effect authority seam: commit/rollback of staged effects.
+    pub fn effect(&self) -> &EffectAuthority {
+        &self.effect
+    }
+
+    /// The output authority seam: the broker path from producer to model.
+    pub fn output(&self) -> &OutputAuthority {
+        &self.output
+    }
+
+    pub fn subscribe(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<agent_contracts::RuntimeEventEnvelope> {
+        self.event.subscribe()
     }
 
     /// The broadcast sender behind `subscribe`, for live event sinks.
-    pub fn event_sender(&self) -> broadcast::Sender<RuntimeEventEnvelope> {
-        self.event_tx.clone()
+    pub fn event_sender(
+        &self,
+    ) -> tokio::sync::broadcast::Sender<agent_contracts::RuntimeEventEnvelope> {
+        self.event.sender()
     }
 
     /// The shared sequence counter, so live deltas and journaled events keep
     /// one consistent envelope order.
-    pub fn seq(&self) -> Arc<AtomicU64> {
-        self.seq.clone()
+    pub fn seq(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.event.seq()
     }
 
     /// Configuration accessors the actor drives the turn loop with.
@@ -180,20 +207,19 @@ impl AgentKernel {
     }
 
     pub async fn start(&self) -> AgentResult<()> {
-        self.emit(RuntimeEvent::RunStarted).await
+        self.event.emit(self.run_id, RuntimeEvent::RunStarted).await
     }
 
     pub async fn stop(&self) -> AgentResult<()> {
-        self.emit(RuntimeEvent::RunCompleted).await?;
-        if let Some(journal) = &self.journal {
-            journal.flush().await?;
-        }
-        Ok(())
+        self.event
+            .emit(self.run_id, RuntimeEvent::RunCompleted)
+            .await?;
+        self.event.flush().await
     }
 
     /// Journal + broadcast one runtime event (the single write path).
     pub async fn emit_event(&self, event: RuntimeEvent) -> AgentResult<()> {
-        self.emit(event).await
+        self.event.emit(self.run_id, event).await
     }
 
     /// Journal + broadcast one runtime event *after a durability barrier*:
@@ -205,18 +231,12 @@ impl AgentKernel {
     /// broadcasts nothing — the caller fences the turn instead of claiming
     /// a commit that never landed.
     pub async fn emit_event_durable(&self, event: RuntimeEvent) -> AgentResult<()> {
-        let envelope = self.make_envelope(event);
-        if let Some(journal) = &self.journal {
-            journal.append(&envelope).await?;
-            journal.flush().await?;
-        }
-        let _ = self.event_tx.send(envelope);
-        Ok(())
+        self.event.emit_durable(self.run_id, event).await
     }
 
     /// Surface a runtime-level warning through the normal event stream.
     pub async fn emit_warning(&self, message: String) -> AgentResult<()> {
-        self.emit(RuntimeEvent::Warning { message }).await
+        self.event.warning(self.run_id, message).await
     }
 
     /// Context primitives: the actor decides when they run.
@@ -259,7 +279,7 @@ impl AgentKernel {
         let checkpoint = self.context.checkpoint().await?;
         let result = async {
             self.context.acknowledge_consumption(ack.clone()).await?;
-            self.emit(RuntimeEvent::ContextConsumed { ack }).await
+            self.emit_event(RuntimeEvent::ContextConsumed { ack }).await
         }
         .await;
         self.finish_context_transaction("acknowledge context consumption", checkpoint, result)
@@ -426,15 +446,12 @@ impl AgentKernel {
                 }
             }
         }
-        // Context fetches can return large stored content; the output broker
-        // bounds it and spills the full item to an artifact before the model
-        // ever sees a truncated middle. No tool spec applies here (the
-        // result comes from the engine query path), so the global cap rules.
-        if let Some(broker) = &self.config.output_broker {
-            broker.bound(self.run_id, None, output).await
-        } else {
-            output
-        }
+        // Context fetches can return large stored content; the output
+        // authority bounds it and spills the full item to an artifact before
+        // the model ever sees a truncated middle. No tool spec applies here
+        // (the result comes from the engine query path), so the global cap
+        // rules.
+        self.output.bound(self.run_id, None, output).await
     }
 
     /// One model round: stream the request to the provider. The result is a
@@ -473,18 +490,9 @@ impl AgentKernel {
         };
 
         match self.approval.authorize(&call, &spec, &cancel).await {
-            Ok(ApprovalDecision::Allow) => {}
-            Ok(ApprovalDecision::Deny) => {
-                return ToolOutcome::Value(tool_error_output(
-                    &call,
-                    format!("tool denied by approval policy: {}", call.name),
-                ));
-            }
-            Err(error) => {
-                return ToolOutcome::Value(tool_error_output(
-                    &call,
-                    format!("approval check failed: {error}"),
-                ));
+            ApprovalVerdict::Allowed => {}
+            ApprovalVerdict::Denied(message) | ApprovalVerdict::Failed(message) => {
+                return ToolOutcome::Value(tool_error_output(&call, message));
             }
         }
 
@@ -501,31 +509,28 @@ impl AgentKernel {
             Err(error) => ToolOutcome::Value(tool_error_output(&call, error.to_string())),
         };
 
-        // Trusted output broker: bound every model-facing field and spill
+        // Trusted output authority: bound every model-facing field and spill
         // oversized content before the outcome reaches the actor. Engine
         // queries carry a placeholder output here (their real content is
         // produced by `resolve_engine_query`, which bounds it there), so the
-        // broker runs on all four variants uniformly. The declaring tool's
-        // own budget (`ToolSpec::output_budget`) is enforced here — a
+        // authority runs on all four variants uniformly. The declaring
+        // tool's own budget (`ToolSpec::output_budget`) is enforced here — a
         // verbose tool spills sooner, a quiet tool never exceeds its cap.
-        let Some(broker) = &self.config.output_broker else {
-            return outcome;
-        };
         let budget = spec.output_budget;
         match outcome {
             ToolOutcome::Value(output) => {
-                ToolOutcome::Value(broker.bound(self.run_id, budget, output).await)
+                ToolOutcome::Value(self.output.bound(self.run_id, budget, output).await)
             }
             ToolOutcome::PreparedEffect { output, effect } => ToolOutcome::PreparedEffect {
-                output: broker.bound(self.run_id, budget, output).await,
+                output: self.output.bound(self.run_id, budget, output).await,
                 effect,
             },
             ToolOutcome::RuntimeDirective { output, directive } => ToolOutcome::RuntimeDirective {
-                output: broker.bound(self.run_id, budget, output).await,
+                output: self.output.bound(self.run_id, budget, output).await,
                 directive,
             },
             ToolOutcome::EngineQuery { output, query } => ToolOutcome::EngineQuery {
-                output: broker.bound(self.run_id, budget, output).await,
+                output: self.output.bound(self.run_id, budget, output).await,
                 query,
             },
         }
@@ -635,7 +640,8 @@ impl AgentKernel {
 
     pub async fn emit_diagnostics(&self) -> AgentResult<()> {
         let diagnostics = self.context.diagnostics().await?;
-        self.emit(RuntimeEvent::Diagnostics { diagnostics }).await
+        self.emit_event(RuntimeEvent::Diagnostics { diagnostics })
+            .await
     }
 
     pub async fn inspect_context(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
@@ -647,7 +653,7 @@ impl AgentKernel {
             .context
             .maintain(ContextMaintenanceTrigger::Checkpoint)
             .await?;
-        self.emit(RuntimeEvent::ContextMaintained {
+        self.emit_event(RuntimeEvent::ContextMaintained {
             trigger: ContextMaintenanceTrigger::Checkpoint,
             report,
         })
@@ -697,24 +703,6 @@ impl AgentKernel {
         self.finish_context_transaction("restore context", checkpoint, restored)
             .await
     }
-
-    fn make_envelope(&self, event: RuntimeEvent) -> RuntimeEventEnvelope {
-        RuntimeEventEnvelope {
-            run_id: self.run_id,
-            seq: self.seq.fetch_add(1, Ordering::Relaxed) + 1,
-            timestamp_ms: now_ms(),
-            event,
-        }
-    }
-
-    async fn emit(&self, event: RuntimeEvent) -> AgentResult<()> {
-        let envelope = self.make_envelope(event);
-        if let Some(journal) = &self.journal {
-            journal.append(&envelope).await?;
-        }
-        let _ = self.event_tx.send(envelope);
-        Ok(())
-    }
 }
 
 fn tool_error_output(call: &ToolCall, message: String) -> ToolOutput {
@@ -756,20 +744,13 @@ fn tool_not_on_surface_message(call: &ToolCall, surface: &ToolSurfaceSnapshot) -
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_contracts::{
-        AttentionState, ContextDiagnostics, ContextItem, ContextItemId, ContextResidency,
-        ContextRetention, ContextScope, ExternalizedContext, SemanticState, ToolRisk,
-        ToolSurfaceDemand, ToolSurfaceOmission, ToolSurfaceOmissionReason,
+        ApprovalDecision, ApprovalGate, AttentionState, ContextDiagnostics, ContextItem,
+        ContextItemId, ContextResidency, ContextRetention, ContextScope, ExternalizedContext,
+        SemanticState, ToolRisk, ToolSurfaceDemand, ToolSurfaceOmission, ToolSurfaceOmissionReason,
     };
 
     fn call(name: &str) -> ToolCall {
