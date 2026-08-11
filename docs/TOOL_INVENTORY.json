@@ -4,7 +4,7 @@
   "surface": {
     "core": ["fs.list", "fs.read", "search.grep"],
     "control": ["context.manage", "capability.manage"],
-    "catalog_optional": ["fs.write", "edit.replace", "git.status", "git.diff", "shell.exec"]
+    "catalog_optional": ["fs.write", "edit.replace", "edit.patch", "git.status", "git.diff", "shell.exec"]
   },
   "global_limits": {
     "MAX_TOOL_MODEL_CONTENT_CHARS": 16000,
@@ -46,6 +46,9 @@
         "max_read_lines": 400,
         "note": "file larger than max_read_bytes is rejected outright (use a narrower tool)"
       },
+      "output": {
+        "revision": "SHA-256 hex of the file bytes; stable for identical content, changes with any edit — the edit.patch base_revision precondition is checked against it"
+      },
       "effects": ["read:workspace"],
       "context_disposition": "PersistObservation",
       "platform": {"note": "directory-handle-relative confined open; reparse/link swap rejected at open time (CORE-07)"}
@@ -76,6 +79,25 @@
         "content": {"type": "string", "required": true}
       },
       "limits": {"note": "state dir (.focus-agent) rejected via resolve_mutation; journaled transaction"},
+      "effects": ["write:workspace", "journal:changes.jsonl"],
+      "context_disposition": "PersistObservation",
+      "platform": {}
+    },
+    "edit.patch": {
+      "risk": "WorkspaceWrite",
+      "surface_class": "catalog_optional",
+      "schema": {
+        "files": {"type": "array", "note": "multi-file form: [{path, base_revision?, hunks:[{old, new, occurrence?}]}]; max 16 files, max 64 hunks per call"},
+        "path": {"type": "string", "note": "single-file shortcut, mutually exclusive with files"},
+        "base_revision": {"type": "string", "note": "single-file shortcut revision from fs.read"},
+        "hunks": {"type": "array", "note": "single-file shortcut hunks"}
+      },
+      "limits": {
+        "max_file_bytes": 4194304,
+        "max_files": 16,
+        "max_hunks": 64,
+        "note": "base_revision mismatch refuses the edit (file changed since it was read); hunks apply in order and each old must match exactly once unless occurrence is given; all files commit as one composite effect, a failure rolls back the already-applied files; old content captured to the change journal"
+      },
       "effects": ["write:workspace", "journal:changes.jsonl"],
       "context_disposition": "PersistObservation",
       "platform": {}

@@ -162,7 +162,7 @@ The repository is already partially aligned with this architecture.
 | Extension sandbox | [~] confirmed blocker | The process host has framing/deadlines and limited environment/rlimits, but no complete brokered filesystem/network boundary and no reliable process-tree kill on every platform (`CORE-06`/`CORE-07`). |
 | Permission model | [~] too coarse | `ToolSpec` has only `ReadOnly`, `WorkspaceWrite`, and `ProcessExecution`; capability permissions are strings and a capability can understate real behavior. Standing grants now narrow approval at the gate (`CORE-08`), but capability-declared permissions remain coarse strings. |
 | Output contract | [~] partial | Builtins generally bound output and spill artifacts; the kernel-level trusted output broker caps every model-facing field and spills oversized content once (`CORE-04`), `ToolSpec` declares a per-tool output budget that the broker enforces (clamped to the global hard cap), and the actor keeps a last-line guard. Process capability output/stderr still needs one enforced path. |
-| File/navigation tools | [~] useful baseline | `fs.list`, ranged `fs.read`, `search.grep`, `fs.write`, and exact `edit.replace` cover basic work. Missing: patch-set preconditions, glob/multi-read, binary/media metadata, symbol/diagnostic navigation, and stronger cancellation on search/read. |
+| File/navigation tools | [~] useful baseline | `fs.list`, ranged `fs.read`, `search.grep`, `fs.write`, exact `edit.replace`, and multi-file `edit.patch` with file-revision preconditions (`base_revision`, SHA-256 `revision` from `fs.read`) cover basic work. Missing: glob/multi-read, binary/media metadata, symbol/diagnostic navigation, and stronger cancellation on search/read. |
 | Process tools | [~] useful baseline | `shell.exec` has timeout, bounded tail, and artifact output. It is a one-shot shell string, not a structured run/start/poll/stop process protocol; process-tree isolation remains incomplete. |
 | VCS tools | [~] minimal | `git.status` and `git.diff` are confined, bounded, and read-only. `log/show/blame` and structured change review are absent; commit/push must remain higher-risk effects. |
 | Runtime control | [~] partial | `context.manage` and `capability.manage` are merged bounded control surfaces. There is no typed TaskAnchor/open-loop control, artifact fetch surface, or task completion proposal. |
@@ -1005,8 +1005,14 @@ together with TaskAnchor and continuous context GC.
 
 ### Gate 3: complete and test the minimal ACI
 
-- [ ] **TOOLS-05** Add patch-set/file-revision semantics; evaluate against `edit.replace`
-  before deprecating anything.
+- [x] **TOOLS-05** Add patch-set/file-revision semantics; evaluate against `edit.replace`
+  before deprecating anything. `edit.patch` lands the file-revision
+  semantics: `fs.read` reports the content revision (SHA-256 hex), hunks
+  are exact-match and occurrence-aware like `edit.replace` (nothing is
+  deprecated), an optional `base_revision` refuses an edit based on stale
+  content, and multiple files commit as one composite effect with
+  journal-backed rollback evidence. `edit.replace` remains the simpler
+  single-hunk tool; no deprecation.
 - [ ] **TOOLS-06** Add structured process/session semantics and process-tree cleanup;
   retain shell as a controlled fallback.
 - [ ] **TOOLS-07** Add artifact range fetch and consistent result paging.
