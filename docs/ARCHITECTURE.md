@@ -21,7 +21,7 @@ The first version therefore prioritizes runtime/context boundaries over model fe
                               │ User command / RuntimeEvent
 ┌─────────────────────────────v───────────────────────────────┐
 │ Runtime                                                     │
-│ agent-kernel                                                │
+│ agent-core                                                │
 │ Agent loop / budgets / approval / event publication        │
 └──────────────┬───────────────────┬──────────────────────────┘
                │                   │
@@ -54,7 +54,7 @@ agent-contracts
       ├──────── tool-runtime
       ├──────── agent-storage
       ├──────── agent-process          (framed IPC / child lifecycle / sandbox)
-      └──────── agent-kernel
+      └──────── agent-core
                     ^                  ├── agent-capability-process -> agent-process
                     │                  └── context-contextcore      -> agent-process
                  agent-tui
@@ -62,7 +62,7 @@ agent-contracts
 
 Important consequences:
 
-- `agent-kernel` does not import `context-simple`.
+- `agent-core` does not import `context-simple`.
 - `tool-runtime` does not import `context-simple` or any memory implementation.
 - `agent-tui` is the composition root and chooses concrete implementations.
 - `context-contextcore` implements `ContextEngine` over a process without
@@ -403,7 +403,7 @@ silently change promotion or GC behavior.
 
 ### Approval flow
 
-`agent-kernel` owns the `ApprovalGate` contract. Three implementations
+`agent-core` owns the `ApprovalGate` contract. Three implementations
 exist:
 
 - `PolicyApprovalGate` — automatic policy (`read_only()`, `permissive()`, or a
@@ -800,7 +800,7 @@ RuntimeHandle ── mpsc<RuntimeCommand> ──▶ RuntimeActor (owns mutable s
   (temp file removed, `MutationRolledBack` journaled) instead of
   committed, so an external side effect cannot slip through the fence
   that protects model state;
-- `AgentKernel` is now a stateless executor/helper: context/model/tool
+- `CoreAuthority` is now a stateless executor/helper: context/model/tool
   primitives plus event plumbing (journal, sequence, broadcast). Its
   turn loop, turn locks and `TurnFrame` ownership are gone;
 - since V1-M9, a tool result can carry a context directive: the actor
@@ -1146,7 +1146,7 @@ task manager, scope scheduling, prompt assembly, materialization, adaptive
 policy) stays in `agent-runtime`. Runtime evolves, Core stays trusted.
 
 Since the MOD-04 first slice (2026-08-11) the four authority seams have
-one named home behind the `AgentKernel` facade (`agent-kernel/src/
+one named home behind the `CoreAuthority` facade (`agent-core/src/
 authority.rs`): `EventAuthority` (envelope identity + journal +
 durability barrier), `ApprovalAuthority` (`ApprovalVerdict` normalization),
 `EffectAuthority` (the single commit/rollback seam every staged effect

@@ -115,7 +115,7 @@ Run real coding tasks without coupling the kernel to one vendor.
 
 - provider can be replaced without changing kernel/context/tools: satisfied —
   the kernel sees only the `ModelTransport` contract (see the P1 kernel tests
-  in `crates/agent-kernel/tests/streaming.rs`);
+  in `crates/agent-core/tests/streaming.rs`);
 - cancel stops model/tool continuation cleanly: satisfied;
 - context diagnostics remain correct during streaming: satisfied — the kernel
   loop and maintenance triggers are unchanged; deltas bypass the journal.
@@ -394,7 +394,7 @@ The ContextCore integration shape is implemented as a real process boundary:
 A composition-root change selects ContextCore. No tool, TUI, provider, or
 core agent-loop code needs architectural rewrites: satisfied — the P5 test
 `adapter_plugs_into_a_real_kernel_without_rewrites` runs a real
-`AgentKernel` with the adapter as its context engine; the TUI selects it
+`CoreAuthority` with the adapter as its context engine; the TUI selects it
 with one CLI flag. A future real ContextCore runtime only has to speak the
 wire protocol; nothing on the agent side changes.
 
@@ -456,7 +456,7 @@ Acceptance:
 - during a turn, the model sees tool results as protocol-paired messages
   (`tool_call_id` matches the assistant call), and the context engine sees no
   observation until the turn ends — covered by
-  `agent-kernel/tests/turn_frame.rs` and the contract/provider tests;
+  `agent-core/tests/turn_frame.rs` and the contract/provider tests;
 - replay and the A/B/C comparison are unaffected (they drive the engines
   directly, not the kernel);
 - `ContextEngine` contract unchanged: all four implementations, the process
@@ -552,7 +552,7 @@ being folded into `ContextState`:
   out of the reactivation scan);
 - `ContextEngine::gc()` — a full mark/sweep/reactivate pass with a default
   no-op implementation, so baselines and the wire adapter keep working
-  unchanged; `AgentKernel::context_gc()` forwards it and the `RuntimeActor`
+  unchanged; `CoreAuthority::context_gc()` forwards it and the `RuntimeActor`
   runs it at turn boundaries, emitting `RuntimeEvent::ContextGc`;
 - mark phase: roots = pins, active task/focus scope members, durable
   session memory, hot-entity matches, bounded dependency reachability;
@@ -585,7 +585,7 @@ verification; they are being implemented in order.
 
 ### V1-P0-1: the actor is the runtime ✅ (implemented)
 
-`AgentKernel` no longer runs turns. The turn execution state machine lives
+`CoreAuthority` no longer runs turns. The turn execution state machine lives
 in the `RuntimeActor`:
 
 ```text
@@ -615,7 +615,7 @@ Consequences:
   dropped before it can touch the context, the turn frame or the event
   stream; the previously unavoidable side effects of "the whole kernel
   turn already finished" are gone;
-- `AgentKernel` is a stateless executor/helper (context/model/tool
+- `CoreAuthority` is a stateless executor/helper (context/model/tool
   primitives + event plumbing + journal); its `turn_lock`/`turn_cancel`
   and the `TurnFrame` ownership are gone — execution ownership is no
   longer duplicated;
@@ -1324,7 +1324,7 @@ Several model-facing dimensions are bounded and tested:
   request (engine prices the working set, the runtime's final guard
   refuses an unshrinkable over-budget request), and the external view is
   bounded by `ContextMapView` (cap 32).
-- **Standing task execution policy.** `TaskApprovalGate` (agent-kernel)
+- **Standing task execution policy.** `TaskApprovalGate` (agent-core)
   wraps any inner gate with narrow, revocable standing grants: one
   `ToolRisk` effect bound to a `GrantTarget` (workspace path prefix,
   process command prefix) with a `GrantConstraint` (`max_content_bytes`,

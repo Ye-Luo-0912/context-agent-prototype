@@ -2,7 +2,7 @@
 //! slice).
 //!
 //! The four authority seams — events, approval, effects, output — each get
-//! one named home behind the existing `AgentKernel` facade. This slice only
+//! one named home behind the existing `CoreAuthority` facade. This slice only
 //! *centralizes calls*; it is not yet proof that opaque effects are safe.
 //! The point is the seam: every event gets its identity and durability
 //! barrier here, every approval decision is a verdict here, every staged

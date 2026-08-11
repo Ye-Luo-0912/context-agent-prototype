@@ -15,7 +15,7 @@ use agent_contracts::{
     ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolRisk,
     ToolSpec,
 };
-use agent_kernel::{AgentKernelConfig, PolicyApprovalGate};
+use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{
     CapabilityId, ContextRootClaim, Module, ModuleHost, RootClaimRole, RootClaimStrength,
     RuntimeInstance, RuntimeServices, ServiceRegistry, TaskAnchor,
@@ -28,7 +28,7 @@ async fn simple_instance() -> (RuntimeInstance, Arc<context_simple::SimpleContex
         context_simple::SimpleContextConfig::default(),
     ));
     let services = RuntimeServices::new(
-        AgentKernelConfig::default(),
+        CoreAuthorityConfig::default(),
         context.clone(),
         Arc::new(QuietModel),
         Arc::new(EmptyTools),
@@ -244,7 +244,7 @@ impl ModelTransport for QuietModel {
 
 fn services() -> RuntimeServices {
     RuntimeServices::new(
-        AgentKernelConfig::default(),
+        CoreAuthorityConfig::default(),
         Arc::new(TestContextEngine),
         Arc::new(QuietModel),
         Arc::new(EmptyTools),
@@ -736,7 +736,7 @@ async fn restore_audit_failure_demands_recovery_and_fences_mutation() {
     let failing = RuntimeInstance::spawn(
         ModuleHost::new(),
         RuntimeServices::new(
-            AgentKernelConfig::default(),
+            CoreAuthorityConfig::default(),
             // The real reference engine: restore must pass the
             // context/task focus agreement check and reach the journal
             // barrier before the audit failure can surface.
@@ -1026,7 +1026,7 @@ async fn completion_failure_never_leaves_a_half_closed_task() {
     let instance = RuntimeInstance::spawn(
         ModuleHost::new(),
         RuntimeServices::new(
-            AgentKernelConfig::default(),
+            CoreAuthorityConfig::default(),
             Arc::new(FailingCompleteEngine),
             Arc::new(QuietModel),
             Arc::new(EmptyTools),
@@ -1076,7 +1076,7 @@ async fn completion_audit_gap_marks_recovery_but_keeps_the_commit() {
     let instance = RuntimeInstance::spawn(
         ModuleHost::new(),
         RuntimeServices::new(
-            AgentKernelConfig::default(),
+            CoreAuthorityConfig::default(),
             Arc::new(context_simple::SimpleContextEngine::new(
                 context_simple::SimpleContextConfig::default(),
             )),

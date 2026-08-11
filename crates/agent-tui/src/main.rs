@@ -10,8 +10,8 @@ use std::{
 };
 
 use agent_contracts::{ApprovalDecision, ContextEngine, ModelTransport, StandingGrant};
-use agent_kernel::{
-    AgentKernelConfig, ApprovalBroker, InteractiveApprovalGate, PolicyApprovalGate,
+use agent_core::{
+    ApprovalBroker, CoreAuthorityConfig, InteractiveApprovalGate, PolicyApprovalGate,
     TaskApprovalGate,
 };
 use agent_runtime::{
@@ -147,14 +147,14 @@ async fn main() -> anyhow::Result<()> {
     host.add_module(Arc::new(ArtifactModule::new(Arc::new(workspace.clone()))))?;
     host.start().await?;
 
-    let kernel_config = AgentKernelConfig {
+    let kernel_config = CoreAuthorityConfig {
         // The composition-root output broker: bounds every model-facing
         // tool field and spills oversized content under the run's
         // artifact directory before it reaches the actor.
         output_broker: Some(Arc::new(WorkspaceOutputBroker::new(
             workspace.clone().into(),
         ))),
-        ..AgentKernelConfig::default()
+        ..CoreAuthorityConfig::default()
     };
     // The composition seam: every service the run needs is resolved from
     // the module host's typed registry and handed to the runtime as one

@@ -152,7 +152,7 @@ The repository is already partially aligned with this architecture.
 | Area | Status | Code-grounded assessment |
 | --- | --- | --- |
 | Contract-first dependencies | [x] | `agent-contracts` defines `ContextEngine`, `ToolDispatcher`, capability, effect, model, and event contracts. Concrete context/tool implementations are composed outside `agent-runtime`. |
-| Single orchestrator | [x] | `RuntimeActor` owns turn state; `agent-kernel` remains a stateless facade. Preserve this boundary. |
+| Single orchestrator | [x] | `RuntimeActor` owns turn state; `agent-core` remains a stateless facade. Preserve this boundary. |
 | Typed composition modules | [x] / needs naming | `agent-runtime/src/host.rs` publishes context/model/tool/approval/event/artifact services through a typed registry. This is a trusted composition plane, not the boundary for arbitrary model-authored plugins. |
 | Dynamic capability catalog | [x] / lifecycle gap | `CapabilityRegistry` validates/caches declared tool schemas, prevents name shadowing, tracks activation/maturity, and merges them through one dispatcher. Lifecycle is per tool: loading one tool never surfaces its siblings (process start/stop stays owner-level). Dynamic capabilities still do not participate in builtin idle cooling/GC. |
 | Bounded active tool surface | [x] | Bounded task-owned exact-tool requirements, `MustSurface`/`PreferSurface`/`KeepReady`, the runtime-owned `RoundSurfacePlan`, bounded selection/omission/block reports with per-row provenance, source revisions, and a monotonic round `surface_revision` are implemented and verified. A typed-root policy derives family roots from the TaskAnchor/focus/active-call state at BeforeModel. RuntimeCheckpoint v2 persists requirements, anchors and counters rather than a derived snapshot. |
@@ -171,7 +171,7 @@ The repository is already partially aligned with this architecture.
 
 ## Incremental Core migration
 
-Do not create a second long-lived `agent-core` beside `agent-kernel`, and do
+Do not create a second long-lived `agent-core` beside `agent-core`, and do
 not move the actor merely to make the dependency graph look cleaner. Evolve
 the existing kernel crate in place, then perform one mechanical rename after
 its contents match the name.
@@ -180,7 +180,7 @@ Recommended independently compilable slices:
 
 1. Lock current event-order, approval, live/stale effect, capability
    lifecycle, and checkpoint traces with regression tests.
-2. Inside `agent-kernel`, isolate `EventAuthority`, `ApprovalAuthority`,
+2. Inside `agent-core`, isolate `EventAuthority`, `ApprovalAuthority`,
    `EffectAuthority`, and `OutputAuthority` behind the existing facade. This
    first centralizes calls; it is not yet proof that opaque effects are safe.
 3. Add `agent-runtime::RuntimeServices` and move system prompt/config,
@@ -188,8 +188,11 @@ Recommended independently compilable slices:
    ToolDispatcher lifecycle/surface scheduling out of the kernel. The actor
    still decides every trigger and order.
 4. Once the remaining crate is actual authority, atomically rename
-   `agent-kernel -> agent-core` and `AgentKernel -> CoreHandle/CoreAuthority`
-   in a behavior-free change.
+   `agent-kernel -> agent-core` and `AgentKernel -> CoreAuthority`
+   in a behavior-free change. **Landed 2026-08-12** (the crate is
+   `agent-core`; `CoreAuthority`/`CoreAuthorityConfig` are the facade and
+   its configuration; the runtime derives the facade from
+   `RuntimeServices`).
 5. Replace opaque/self-declared effects with inspectable `EffectIntent`,
    Core-issued leases, brokered commit, `EffectReceipt`, and output/resource
    enforcement. Process capabilities remain disabled until this is real.
@@ -874,8 +877,8 @@ together with TaskAnchor and continuous context GC.
 - [~] **MOD-04** Isolate the first real authority slice inside the existing
   kernel crate (effect, approval/policy, output/resource broker, durable
   audit) without moving `RuntimeActor` or creating a second orchestrator.
-  **First slice landed 2026-08-11** — `agent-kernel/src/authority.rs` puts
-  each authority behind one named seam of the `AgentKernel` facade:
+  **First slice landed 2026-08-11** — `agent-core/src/authority.rs` puts
+  each authority behind one named seam of the `CoreAuthority` facade:
   `EventAuthority` (envelope identity/sequence/timestamp, journal append,
   the `emit_durable` durability barrier that broadcasts nothing on a failed
   flush), `ApprovalAuthority` (normalizes the gate's outcome to
@@ -893,7 +896,7 @@ together with TaskAnchor and continuous context GC.
   normalization, commit/rollback classification, broker pass-through).
   The shadow-mode `AuthorityGate` step of the compatibility order is
   landed as its own slice: `IntentShadowGate`/`ShadowVerdict`
-  (agent-contracts), the `AgentKernelConfig.shadow_gate` injection and the
+  (agent-contracts), the `CoreAuthorityConfig.shadow_gate` injection and the
   bounded `RuntimeEvent::ShadowDecision` published for allowed and denied
   calls alike, with the standing-grant gate's shadow verdict reusing the
   same matching logic as its legacy `authorize` so the hard invariant
@@ -910,7 +913,7 @@ together with TaskAnchor and continuous context GC.
   `AuthorityLease` (agent-contracts §6 of the draft) is minted by
   `execute_tool` for every side-effecting call after approval — carrying
   the operation generation, the derived intent, the covering grant (when
-  the shadow gate granted it) and a bounded TTL (`AgentKernelConfig::lease_ttl_ms`, default 120 s) — travels with the operation, and is
+  the shadow gate granted it) and a bounded TTL (`CoreAuthorityConfig::lease_ttl_ms`, default 120 s) — travels with the operation, and is
   validated again at commit time (`valid_at`: generation match + not
   expired). A refused lease rolls the staged effect back and surfaces a
   failed tool result ("the change was not applied: the authorization lease
@@ -922,9 +925,24 @@ together with TaskAnchor and continuous context GC.
   `RuntimeServices`, then the mechanical kernel rename) and compatibility
   order step 7 (sandboxed shell/process — an M13-scoped, OS-level change).
   See `docs/ACI_CONTRACT_DRAFT.md` §6 and §7 steps 4-5.
-- [ ] **MOD-04A** Move context/model/tool/config scheduling behind
-  `agent-runtime::RuntimeServices`; only then perform the mechanical
-  `agent-kernel -> agent-core` rename as a behavior-free change.
+- [x] **MOD-04A** Move context/model/tool/config scheduling behind
+  `agent-runtime::RuntimeServices`, then perform the mechanical
+  `agent-core` rename as a behavior-free change.
+  **Done 2026-08-12** — `agent-runtime::RuntimeServices` is the composition
+  seam: `from_registry` resolves the context engine, model transport, tool
+  dispatcher, approval gate and event journal from the module host, the
+  kernel (`CoreAuthority`) is derived inside the seam (one Arc per run,
+  shared with the spawn handle), and all scheduling — configuration,
+  model calls, context maintenance/focus transactions, tool lifecycle and
+  surface scheduling — moved out of the kernel onto the services. The
+  kernel keeps only authority (events, approval, effects, output,
+  start/stop) plus the tool-execution wiring (`execute_tool`), query
+  rendering with output-authority bounds (`resolve_engine_query`) and the
+  authority transactions (acknowledge/restore). The crate is renamed
+  `agent-core` with `CoreAuthority`/`CoreAuthorityConfig` types; runtime
+  actor routes every scheduling trigger through `services`, keeps the
+  authority facade on `kernel`. See `docs/TOOL_ECOSYSTEM_TODO.md`
+  "Incremental Core migration" slices 3-4.
 - [ ] **MOD-05** Split capability ownership: Core owns admission, grants,
   activation/quarantine, and maturity authority; Runtime owns catalog views,
   load/unload scheduling, active state, and per-round surface snapshots.

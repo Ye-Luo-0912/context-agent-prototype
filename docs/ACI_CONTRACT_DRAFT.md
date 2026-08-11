@@ -10,7 +10,7 @@ This document drafts the Tool contract v2 shapes promised by Gate 1 item
 3. `PermissionSet` and the standing-grant contract.
 
 It deliberately changes no runtime behavior. Every type below is proposed;
-the code (`agent-contracts`, `agent-kernel`, `tool-runtime`,
+the code (`agent-contracts`, `agent-core`, `tool-runtime`,
 `agent-workspace`) remains authoritative until a later migration item
 (`TOOLS-03`, `MOD-04`, `MOD-05`) makes a code change under the
 compatibility order in `docs/TOOL_ECOSYSTEM_TODO.md` ("Compatibility order",
@@ -56,7 +56,7 @@ Rules that constrain every shape below:
 (§6 below): `execute_tool` mints a short-lived lease for every
 side-effecting call after approval — operation generation, derived
 `EffectIntent`, the covering grant (when the shadow gate granted it) and a
-bounded TTL (`AgentKernelConfig.lease_ttl_ms`, default 120 s) — the lease
+bounded TTL (`CoreAuthorityConfig.lease_ttl_ms`, default 120 s) — the lease
 travels with the operation, and the actor validates it again at commit
 time (`AuthorityLease::valid_at`: generation match + not expired). A
 refused lease rolls the staged effect back and surfaces a failed tool
@@ -421,7 +421,7 @@ generation)` as the commit-time gate. `execute_tool` mints one lease for
 every side-effecting call (`spec.risk != ReadOnly`) after approval,
 before dispatch: it carries the operation generation, the derived intent,
 the covering grant id (when the configured shadow gate granted the
-intent) and a bounded TTL (`AgentKernelConfig.lease_ttl_ms`, default
+intent) and a bounded TTL (`CoreAuthorityConfig.lease_ttl_ms`, default
 `DEFAULT_LEASE_TTL_MS` = 120 s). The lease travels with the operation
 (`OperationCompletion.lease`); the actor validates it again at commit
 time — stale generation or expiry rolls the staged effect back and
@@ -477,7 +477,7 @@ only pins the field conversions each step must preserve:
    legacy `ApprovalGate`; decisions logged, not enforced, until the
    invariant trace (granted/denied/reason) matches the legacy path.
    **Landed 2026-08-11 (MOD-04 slice).** `IntentShadowGate` + `ShadowVerdict`
-   (agent-contracts), the `AgentKernelConfig.shadow_gate` injection, and a
+   (agent-contracts), the `CoreAuthorityConfig.shadow_gate` injection, and a
    `RuntimeEvent::ShadowDecision { call_name, legacy_allowed, shadow }`
    published by `execute_tool` for allowed and denied calls alike. The
    standing-grant gate implements the shadow verdict with the *same*
@@ -529,7 +529,7 @@ schema, no learned tool selection.
   must stay the command prefix (today's `grant_matches` logic). A finer
   bound needs the structured process protocol, not a smarter parser.
 - **Where `PermissionSet` lives**: `agent-contracts` (shared) vs
-  `agent-kernel` authority module; draft assumes contracts so both the
+  `agent-core` authority module; draft assumes contracts so both the
   manifest and the Core matcher share one shape.
 
 ## 9. Definition of done for this draft

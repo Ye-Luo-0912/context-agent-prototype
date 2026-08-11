@@ -11,7 +11,7 @@ members = [
     "crates/tool-runtime",
     "crates/agent-conformance",
     "crates/agent-storage",
-    "crates/agent-kernel",
+    "crates/agent-core",
     "crates/agent-runtime",
     "crates/agent-replay",
     "crates/agent-eval",
@@ -35,7 +35,7 @@ agent-capability-process = { path = "crates/agent-capability-process" }
 agent-workspace = { path = "crates/agent-workspace" }
 tool-runtime = { path = "crates/tool-runtime" }
 agent-storage = { path = "crates/agent-storage" }
-agent-kernel = { path = "crates/agent-kernel" }
+agent-core = { path = "crates/agent-core" }
 agent-runtime = { path = "crates/agent-runtime" }
 provider-openai = { path = "crates/provider-openai" }
 

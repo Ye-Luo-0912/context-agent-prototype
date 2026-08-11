@@ -20,7 +20,7 @@ use agent_contracts::{
     ToolOutcome, ToolOutput, ToolResultDisposition, ToolSurfaceBlock, ToolSurfaceBlockReason,
     ToolSurfaceDemand, ToolSurfaceSnapshot, TurnFrame, TurnFrameStep, TurnId,
 };
-use agent_kernel::AgentKernel;
+use agent_core::CoreAuthority;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -205,7 +205,7 @@ pub struct RuntimeActor {
     /// The authority facade: events, approval, effects, output, and the
     /// tool-execution wiring (execute_tool). Scheduling — context
     /// maintenance, model calls, tool lifecycle — lives on `services`.
-    kernel: Arc<AgentKernel>,
+    kernel: Arc<CoreAuthority>,
     /// The scheduling seam: context/model/tool/config operations the actor
     /// triggers. The actor decides every trigger and order; the services
     /// execute the call.
@@ -217,7 +217,7 @@ pub struct RuntimeActor {
 }
 
 impl RuntimeActor {
-    pub fn new(kernel: Arc<AgentKernel>, services: Arc<RuntimeServices>) -> Self {
+    pub fn new(kernel: Arc<CoreAuthority>, services: Arc<RuntimeServices>) -> Self {
         Self {
             assembler: PromptAssembler::new(services.system_prompt()),
             kernel,
@@ -1672,7 +1672,11 @@ impl RuntimeActor {
 
         // The tool scope opens when the tool starts — it is an execution
         // frame, not a batch artifact of turn-end persistence.
-        let tool_scope = match self.services.context_open_scope(ScopeKind::Tool, None).await {
+        let tool_scope = match self
+            .services
+            .context_open_scope(ScopeKind::Tool, None)
+            .await
+        {
             Ok(scope) => Some(scope),
             Err(error) => {
                 let _ = self

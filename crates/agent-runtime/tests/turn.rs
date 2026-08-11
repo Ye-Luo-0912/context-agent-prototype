@@ -22,7 +22,7 @@ use agent_contracts::{
     ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
 
-use agent_kernel::{AgentKernelConfig, PolicyApprovalGate};
+use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{
     CapabilityAwareDispatcher, CapabilityRegistry, RuntimeHandle, RuntimeServices, spawn_runtime,
 };
@@ -286,7 +286,7 @@ async fn spawn_with(
     tools: Arc<dyn ToolDispatcher>,
 ) -> RuntimeHandle {
     let kernel = Arc::new(RuntimeServices::new(
-        AgentKernelConfig::default(),
+        CoreAuthorityConfig::default(),
         context,
         model,
         tools,
@@ -1239,7 +1239,7 @@ async fn before_model_audit_failure_fences_the_turn() {
     });
     let rounds_ref = model.clone();
     let kernel = Arc::new(RuntimeServices::new(
-        AgentKernelConfig::default(),
+        CoreAuthorityConfig::default(),
         Arc::new(RecordingContextEngine::default()),
         model,
         Arc::new(DirectiveToolDispatcher),
@@ -1285,7 +1285,7 @@ async fn collect_audit_failure_is_not_silent() {
     // must surface the failure as an Error event instead of dropping it.
     let context = Arc::new(RecordingContextEngine::default());
     let kernel = Arc::new(RuntimeServices::new(
-        AgentKernelConfig::default(),
+        CoreAuthorityConfig::default(),
         context.clone(),
         Arc::new(DirectiveModel {
             tool_name: "context.collect",
@@ -2301,10 +2301,10 @@ async fn expired_authority_lease_rolls_back_the_staged_effect() {
         rolled_back: rolled_back.clone(),
     });
     let kernel = Arc::new(RuntimeServices::new(
-        AgentKernelConfig {
+        CoreAuthorityConfig {
             // 1ms window: any real dispatch overruns it deterministically.
             lease_ttl_ms: Some(1),
-            ..AgentKernelConfig::default()
+            ..CoreAuthorityConfig::default()
         },
         Arc::new(TestContextEngine),
         model.clone(),

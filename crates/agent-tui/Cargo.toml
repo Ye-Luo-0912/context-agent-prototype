@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 agent-contracts.workspace = true
-agent-kernel.workspace = true
+agent-core.workspace = true
 agent-runtime.workspace = true
 agent-storage.workspace = true
 agent-workspace.workspace = true

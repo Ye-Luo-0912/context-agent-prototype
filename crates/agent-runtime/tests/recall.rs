@@ -21,7 +21,7 @@ use agent_contracts::{
     ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
 
-use agent_kernel::{AgentKernelConfig, PolicyApprovalGate};
+use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{RuntimeServices, spawn_runtime};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 use serde_json::{Value, json};
@@ -399,7 +399,7 @@ async fn recall_turn_pulls_external_content_back_without_polluting_the_prompt() 
         calls: AtomicUsize::new(0),
     });
     let kernel = Arc::new(RuntimeServices::new(
-        AgentKernelConfig::default(),
+        CoreAuthorityConfig::default(),
         engine.clone(),
         model.clone(),
         Arc::new(EngineQueryTools),
@@ -585,7 +585,7 @@ async fn admit_and_derive_through_the_runtime_never_duplicate_observations() {
         calls: AtomicUsize::new(0),
     });
     let kernel = Arc::new(RuntimeServices::new(
-        AgentKernelConfig::default(),
+        CoreAuthorityConfig::default(),
         engine.clone(),
         model.clone(),
         Arc::new(EngineQueryTools),

@@ -11,7 +11,7 @@ use agent_contracts::{
     RuntimeEvent, RuntimeEventEnvelope, ToolCall, ToolDispatcher, ToolExecutionRequest,
     ToolOutcome, ToolSpec,
 };
-use agent_kernel::AgentKernelConfig;
+use agent_core::CoreAuthorityConfig;
 use agent_runtime::{
     ApprovalModule, ContextModule, ModelModule, ModuleHost, RuntimeInstance, RuntimeServices,
 };
@@ -135,7 +135,7 @@ pub async fn run_eval(
     host.add_module(Arc::new(ApprovalModule::new(approval)))?;
     host.start().await?;
 
-    let services = RuntimeServices::from_registry(host.registry(), AgentKernelConfig::default())?;
+    let services = RuntimeServices::from_registry(host.registry(), CoreAuthorityConfig::default())?;
     let runtime = RuntimeInstance::spawn(host, services);
     // Subscribe before start so no event is missed (the broadcast channel
     // only delivers what is sent after subscription).

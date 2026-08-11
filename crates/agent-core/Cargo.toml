@@ -1,5 +1,5 @@
 [package]
-name = "agent-kernel"
+name = "agent-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

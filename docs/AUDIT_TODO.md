@@ -1023,7 +1023,7 @@ before any `ToolOutcome` reaches the actor:
 
 Wiring: `agent-contracts` owns the `OutputBroker` contract and the caps;
 `agent-workspace` provides `WorkspaceOutputBroker` (composition-root
-implementation); `agent-kernel` applies it in `execute_tool` and
+implementation); `agent-core` applies it in `execute_tool` and
 `resolve_engine_query` when the config carries one; `agent-tui` injects it.
 
 Regression coverage: `oversized_content_spills_to_an_artifact_and_keeps_
@@ -1032,7 +1032,7 @@ metadata_are_capped_independently`, `decoded_total_cap_trims_content_when_
 fields_combine_over` (agent-workspace); `output_broker_bounds_tool_results_
 before_the_actor`, `context_fetch_results_are_bounded_after_resolve`,
 `search_limit_is_clamped_in_execution`, `search_limit_zero_keeps_the_engine_
-default` (agent-kernel); `output_broker_spills_oversized_tool_output_end_to_
+default` (agent-core); `output_broker_spills_oversized_tool_output_end_to_
 end` (agent-runtime actor); plus the provider-error cap tests
 (agent-runtime `output.rs`).
 
@@ -1175,7 +1175,7 @@ The current policy has two extremes:
   five minutes, then denies on timeout.
 
 **2026-08-11: closed.** `TaskApprovalGate`
-(`crates/agent-kernel/src/approval.rs`) wraps any inner `ApprovalGate` with
+(`crates/agent-core/src/approval.rs`) wraps any inner `ApprovalGate` with
 task-scoped standing grants established by the composition root
 (`agent-tui` parses `--grant=<json>`), revocable via `revoke` and visible
 via `/grants`:
@@ -1213,7 +1213,7 @@ component_aware`, `parent_and_absolute_writes_never_match_a_grant`,
 `expired_grant_stops_matching`, `revoked_grant_stops_matching`,
 `process_grant_limits_runs_and_prefix_is_lexical`, `content_cap_rejects_
 oversized_write`, `grant_rejects_invalid_targets_and_shapes`,
-`zero_responder_without_grant_denies_without_expansion` (agent-kernel).
+`zero_responder_without_grant_denies_without_expansion` (agent-core).
 
 ### CORE-09 — Tool schema budget mutates lifecycle and can forget required capability
 Status: **Closed 2026-08-11 - typed tool-root derivation, per-tool

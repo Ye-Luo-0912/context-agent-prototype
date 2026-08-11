@@ -3,7 +3,7 @@
 //! Cargo sets `CARGO_BIN_EXE_agent-context-service` for integration tests, so
 //! these tests spawn the real service process and drive the full
 //! `ContextEngine` contract across the process boundary — including plugging
-//! the adapter into a real `AgentKernel` (the acceptance criterion: a
+//! the adapter into a real `CoreAuthority` (the acceptance criterion: a
 //! composition-root change, nothing else).
 
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use agent_contracts::{
     ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, OperationId, RuntimeEvent,
     ToolOutcome, ToolOutput, TurnId,
 };
-use agent_kernel::{AgentKernelConfig, PolicyApprovalGate};
+use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use context_contextcore::{ContextServiceAdapter, ContextServiceConfig, ServiceEngine};
 use serde_json::json;
 
@@ -158,7 +158,7 @@ async fn adapter_plugs_into_a_real_kernel_without_rewrites() {
     let engine = connect().await;
 
     let services = Arc::new(agent_runtime::RuntimeServices::new(
-        AgentKernelConfig::default(),
+        CoreAuthorityConfig::default(),
         engine,
         Arc::new(PlainModel),
         Arc::new(ToolDispatcherStub),

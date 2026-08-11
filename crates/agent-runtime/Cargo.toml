@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 agent-contracts = { workspace = true }
-agent-kernel = { workspace = true }
+agent-core = { workspace = true }
 agent-workspace = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

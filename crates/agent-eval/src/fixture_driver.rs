@@ -16,7 +16,7 @@ use agent_contracts::{
     AgentResult, ApprovalDecision, ApprovalGate, ContextEngine, ModelTransport, RuntimeEvent,
     RuntimeEventEnvelope, ToolCall, ToolDispatcher, ToolSpec,
 };
-use agent_kernel::AgentKernelConfig;
+use agent_core::CoreAuthorityConfig;
 use agent_runtime::{
     ApprovalModule, ContextModule, ModelModule, ModuleHost, RuntimeInstance, RuntimeServices,
 };
@@ -277,7 +277,7 @@ pub async fn run_fixture_with_engine(
     host.add_module(Arc::new(ApprovalModule::new(approval)))?;
     host.start().await?;
 
-    let services = RuntimeServices::from_registry(host.registry(), AgentKernelConfig::default())?;
+    let services = RuntimeServices::from_registry(host.registry(), CoreAuthorityConfig::default())?;
     let runtime = RuntimeInstance::spawn(host, services);
     let mut events = runtime.handle().subscribe();
     runtime.start().await?;

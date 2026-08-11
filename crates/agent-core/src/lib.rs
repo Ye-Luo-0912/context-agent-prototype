@@ -9,4 +9,4 @@ pub use approval::{
 pub use authority::{
     ApprovalAuthority, ApprovalVerdict, EffectAuthority, EventAuthority, OutputAuthority,
 };
-pub use kernel::{AgentKernel, AgentKernelConfig};
+pub use kernel::{CoreAuthority, CoreAuthorityConfig};

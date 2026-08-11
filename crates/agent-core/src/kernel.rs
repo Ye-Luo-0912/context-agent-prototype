@@ -19,7 +19,7 @@ use crate::authority::{
 pub const DEFAULT_LEASE_TTL_MS: u64 = 120_000;
 
 #[derive(Clone)]
-pub struct AgentKernelConfig {
+pub struct CoreAuthorityConfig {
     pub system_prompt: String,
     pub context_budget_tokens: usize,
     pub max_tool_rounds: usize,
@@ -40,9 +40,9 @@ pub struct AgentKernelConfig {
     pub lease_ttl_ms: Option<u64>,
 }
 
-impl std::fmt::Debug for AgentKernelConfig {
+impl std::fmt::Debug for CoreAuthorityConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentKernelConfig")
+        f.debug_struct("CoreAuthorityConfig")
             .field("system_prompt", &self.system_prompt)
             .field("context_budget_tokens", &self.context_budget_tokens)
             .field("max_tool_rounds", &self.max_tool_rounds)
@@ -53,7 +53,7 @@ impl std::fmt::Debug for AgentKernelConfig {
     }
 }
 
-impl Default for AgentKernelConfig {
+impl Default for CoreAuthorityConfig {
     fn default() -> Self {
         Self {
             system_prompt: concat!(
@@ -80,9 +80,9 @@ impl Default for AgentKernelConfig {
 /// and bounded producer output passes through one named home, so a future
 /// Trusted Core can replace the seam without rewriting the facade or the
 /// actor.
-pub struct AgentKernel {
+pub struct CoreAuthority {
     run_id: RunId,
-    config: AgentKernelConfig,
+    config: CoreAuthorityConfig,
     context: Arc<dyn ContextEngine>,
     tools: Arc<dyn ToolDispatcher>,
     event: EventAuthority,
@@ -91,9 +91,9 @@ pub struct AgentKernel {
     output: OutputAuthority,
 }
 
-impl AgentKernel {
+impl CoreAuthority {
     pub fn new(
-        config: AgentKernelConfig,
+        config: CoreAuthorityConfig,
         context: Arc<dyn ContextEngine>,
         tools: Arc<dyn ToolDispatcher>,
         approval: Arc<dyn agent_contracts::ApprovalGate>,
@@ -865,11 +865,11 @@ mod tests {
         engine: Arc<dyn ContextEngine>,
         dispatcher: Arc<dyn ToolDispatcher>,
         broker: Option<Arc<dyn OutputBroker>>,
-    ) -> Arc<AgentKernel> {
-        Arc::new(AgentKernel::new(
-            AgentKernelConfig {
+    ) -> Arc<CoreAuthority> {
+        Arc::new(CoreAuthority::new(
+            CoreAuthorityConfig {
                 output_broker: broker,
-                ..AgentKernelConfig::default()
+                ..CoreAuthorityConfig::default()
             },
             engine,
             dispatcher,
@@ -1153,10 +1153,10 @@ mod tests {
             reason: "no live standing grant matches the derived intent (workspace write to 'x')"
                 .into(),
         }));
-        let kernel = Arc::new(AgentKernel::new(
-            AgentKernelConfig {
+        let kernel = Arc::new(CoreAuthority::new(
+            CoreAuthorityConfig {
                 shadow_gate: Some(shadow),
-                ..AgentKernelConfig::default()
+                ..CoreAuthorityConfig::default()
             },
             Arc::new(RecordingEngine {
                 searched_limits: Default::default(),
@@ -1239,11 +1239,11 @@ mod tests {
             grant_id: "g-1".into(),
             reason: "workspace write inside grant g-1".into(),
         }));
-        let kernel = Arc::new(AgentKernel::new(
-            AgentKernelConfig {
+        let kernel = Arc::new(CoreAuthority::new(
+            CoreAuthorityConfig {
                 shadow_gate: Some(shadow),
                 lease_ttl_ms: Some(5_000),
-                ..AgentKernelConfig::default()
+                ..CoreAuthorityConfig::default()
             },
             Arc::new(RecordingEngine {
                 searched_limits: Default::default(),
@@ -1336,10 +1336,10 @@ mod tests {
         let shadow = Arc::new(FixedShadowGate(agent_contracts::ShadowVerdict::Denied {
             reason: "no live standing grant matches the derived intent".into(),
         }));
-        let kernel = Arc::new(AgentKernel::new(
-            AgentKernelConfig {
+        let kernel = Arc::new(CoreAuthority::new(
+            CoreAuthorityConfig {
                 shadow_gate: Some(shadow),
-                ..AgentKernelConfig::default()
+                ..CoreAuthorityConfig::default()
             },
             Arc::new(RecordingEngine {
                 searched_limits: Default::default(),

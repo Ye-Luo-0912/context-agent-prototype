@@ -7,7 +7,7 @@ description = "Headless live evaluation: run a real coding task through the A/B/
 
 [dependencies]
 agent-contracts.workspace = true
-agent-kernel.workspace = true
+agent-core.workspace = true
 agent-runtime.workspace = true
 agent-storage.workspace = true
 agent-workspace.workspace = true

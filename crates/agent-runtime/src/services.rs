@@ -13,13 +13,13 @@
 use std::sync::Arc;
 
 use agent_contracts::{
-    AgentError, AgentResult, ApprovalGate, ContextEngine, ContextGcReport,
-    ContextIngress, ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextQuery, ContextStateTransition, EventJournal, FocusState, MaterializedContext,
-    ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest, ModelTransport, ScopeId,
-    ScopeKind, TaskId, ToolCatalogEntry, ToolDispatcher, ToolSpec, ToolSurfaceSnapshot,
+    AgentError, AgentResult, ApprovalGate, ContextEngine, ContextGcReport, ContextIngress,
+    ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
+    ContextStateTransition, EventJournal, FocusState, MaterializedContext, ModelCapabilities,
+    ModelEventSink, ModelOutput, ModelRequest, ModelTransport, ScopeId, ScopeKind, TaskId,
+    ToolCatalogEntry, ToolDispatcher, ToolSpec, ToolSurfaceSnapshot,
 };
-use agent_kernel::{AgentKernel, AgentKernelConfig};
+use agent_core::{CoreAuthority, CoreAuthorityConfig};
 
 use crate::host::ServiceRegistry;
 
@@ -29,8 +29,8 @@ use crate::host::ServiceRegistry;
 /// (`services.kernel()`) the actor consults for events, approval, effects,
 /// output and tool-execution wiring.
 pub struct RuntimeServices {
-    kernel: Arc<AgentKernel>,
-    pub kernel_config: AgentKernelConfig,
+    kernel: Arc<CoreAuthority>,
+    pub kernel_config: CoreAuthorityConfig,
     pub context: Arc<dyn ContextEngine>,
     pub model: Arc<dyn ModelTransport>,
     pub tools: Arc<dyn ToolDispatcher>,
@@ -46,14 +46,14 @@ impl RuntimeServices {
     /// kernel (authority facade) does not call the provider, so it is not
     /// part of the kernel's inputs.
     pub fn new(
-        kernel_config: AgentKernelConfig,
+        kernel_config: CoreAuthorityConfig,
         context: Arc<dyn ContextEngine>,
         model: Arc<dyn ModelTransport>,
         tools: Arc<dyn ToolDispatcher>,
         approval: Arc<dyn ApprovalGate>,
         journal: Option<Arc<dyn EventJournal>>,
     ) -> Self {
-        let kernel = Arc::new(AgentKernel::new(
+        let kernel = Arc::new(CoreAuthority::new(
             kernel_config.clone(),
             context.clone(),
             tools.clone(),
@@ -77,7 +77,7 @@ impl RuntimeServices {
     /// services).
     pub fn from_registry(
         registry: &ServiceRegistry,
-        kernel_config: AgentKernelConfig,
+        kernel_config: CoreAuthorityConfig,
     ) -> AgentResult<Self> {
         Ok(Self::new(
             kernel_config,
@@ -92,7 +92,7 @@ impl RuntimeServices {
     /// The kernel this run uses: the authority facade (events, approval,
     /// effects, output) plus the tool-execution wiring. Shared by the actor
     /// and the spawn seam — one instance per run.
-    pub fn kernel(&self) -> Arc<AgentKernel> {
+    pub fn kernel(&self) -> Arc<CoreAuthority> {
         self.kernel.clone()
     }
 
@@ -317,7 +317,7 @@ mod tests {
     use agent_contracts::{
         ContextDiagnostics, ModelCapabilities, ToolExecutionRequest, ToolOutcome,
     };
-    use agent_kernel::PolicyApprovalGate;
+    use agent_core::PolicyApprovalGate;
 
     #[derive(Debug)]
     struct StubContext;
@@ -351,7 +351,10 @@ mod tests {
         ) -> AgentResult<ScopeId> {
             Ok(ScopeId::new())
         }
-        async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        async fn close_scope(
+            &self,
+            _scope_id: ScopeId,
+        ) -> AgentResult<Vec<ContextStateTransition>> {
             Ok(Vec::new())
         }
         async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
@@ -404,7 +407,7 @@ mod tests {
     #[test]
     fn services_share_one_kernel_and_round_trip_the_registry() {
         let services = RuntimeServices::new(
-            AgentKernelConfig::default(),
+            CoreAuthorityConfig::default(),
             Arc::new(StubContext),
             Arc::new(StubModel),
             Arc::new(StubTools),
@@ -416,7 +419,10 @@ mod tests {
         // the other's events.
         let kernel = services.kernel();
         assert_eq!(kernel.run_id(), services.kernel().run_id());
-        assert_eq!(services.system_prompt(), services.kernel_config.system_prompt);
+        assert_eq!(
+            services.system_prompt(),
+            services.kernel_config.system_prompt
+        );
         assert_eq!(
             services.context_budget_tokens(),
             services.kernel_config.context_budget_tokens
@@ -444,7 +450,7 @@ mod tests {
                 services.approval.clone(),
             )
             .unwrap();
-        let resolved = RuntimeServices::from_registry(&registry, AgentKernelConfig::default())
+        let resolved = RuntimeServices::from_registry(&registry, CoreAuthorityConfig::default())
             .expect("every required service is present");
         assert_eq!(
             resolved.system_prompt(),

@@ -3,7 +3,7 @@ use agent_contracts::{
     RuntimeEventEnvelope, ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfacePlanReport,
     ToolSurfacePlanStatus, TurnId,
 };
-use agent_kernel::ApprovalRequest;
+use agent_core::ApprovalRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiRole {

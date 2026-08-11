@@ -23,7 +23,7 @@ changing architecture.
 1. **The transcript is not the source of model context.** Rebuild model input
    through `ContextEngine::materialize(ContextQuery) -> MaterializedContext`,
    then render it with the runtime-owned `PromptAssembler`. Never add an
-   authoritative global `messages: Vec<_>` to `AgentKernel`.
+   authoritative global `messages: Vec<_>` to `CoreAuthority`.
 2. **Token pressure does not trigger forgetting.** Maintenance is driven by
    `UserInput`, `BeforeModel`, `AfterModel`, `AfterTool`, `FocusChanged`,
    `TaskCompleted`, and `Checkpoint`; budgeting is final packing only.
@@ -32,7 +32,7 @@ changing architecture.
    `tool-runtime` may depend only on contracts and workspace facilities.
 4. **Raw tool output is not prompt history.** Store large output once under
    `.focus-agent/artifacts/...`; keep `ToolOutput::model_content` bounded.
-5. **Context implementations are replaceable.** `agent-kernel` depends only
+5. **Context implementations are replaceable.** `agent-core` depends only
    on `ContextEngine`; ContextCore must arrive as an adapter/implementation,
    never a kernel rewrite or a `context-simple` import.
 6. **UI is event-driven.** UI code consumes runtime events, not mutable
@@ -55,35 +55,35 @@ agent-contracts
   +-- tool-runtime (also -> agent-workspace)
   +-- agent-storage
   +-- agent-process (framed IPC, child lifecycle, sandbox hooks)
-  +-- agent-kernel
+  +-- agent-core
 
 agent-capability-process -> agent-process (+ agent-contracts)
 context-contextcore      -> agent-process (+ agent-contracts)
-agent-runtime            -> agent-kernel + agent-workspace
+agent-runtime            -> agent-core + agent-workspace
 agent-tui                -> composition of implementations
 ```
 
-- `agent-kernel` is the **stateless Core facade**: contracts, budgets,
+- `agent-core` is the **stateless Core facade**: contracts, budgets,
   approval, events/audit/durability, and model/tool/context wiring through
   traits. It owns no turn state.
 - `agent-runtime` is the **only orchestrator**. It owns `RuntimeActor`, task
   and scope lifecycle, prompt assembly, capability registry, module host, and
-  adaptive policy. Never put turn state back in the kernel or add a second
+  adaptive policy. Never put turn state back in the core or add a second
   orchestrator.
 - Concrete context engines (`context-simple`, `context-baselines`) and tool
   dispatchers (`tool-runtime`) are wired only by the composition root
   (`agent-tui`); runtime remains implementation-agnostic.
-- Long term, kernel primitives grow into an agent-modification-resistant
-  `agent-core`: permissions/approval, effect brokering, audit/durability,
-  budgets, capability/sandbox authority, and runtime integrity. Evolvable
-  orchestration stays in `agent-runtime`; the fold is into `agent-core`, never
-  the orchestrator or a parallel orchestrator. **Runtime evolves; Core stays
-  trusted.**
+- The core's stateless primitives (permissions/approval, effect brokering,
+  events/audit/durability, budgets, capability/sandbox authority, runtime
+  integrity) are the trust boundary of an agent-modification-resistant
+  `agent-core`. Evolvable orchestration stays in `agent-runtime`; the fold
+  is into `agent-core`, never the orchestrator or a parallel orchestrator.
+  **Runtime evolves; Core stays trusted.**
 
 Forbidden dependencies:
 
 ```text
-agent-kernel  -> context-simple | agent-tui
+agent-core  -> context-simple | agent-tui
 agent-runtime -> context-simple | tool-runtime
 tool-runtime  -> context-simple | ContextEngine
 context-simple -> tool-runtime
