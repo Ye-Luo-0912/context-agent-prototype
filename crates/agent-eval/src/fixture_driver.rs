@@ -16,8 +16,10 @@ use agent_contracts::{
     AgentResult, ApprovalDecision, ApprovalGate, ContextEngine, ModelTransport, RuntimeEvent,
     RuntimeEventEnvelope, ToolCall, ToolDispatcher, ToolSpec,
 };
-use agent_kernel::{AgentKernel, AgentKernelConfig};
-use agent_runtime::{ApprovalModule, ContextModule, ModelModule, ModuleHost, RuntimeInstance};
+use agent_kernel::AgentKernelConfig;
+use agent_runtime::{
+    ApprovalModule, ContextModule, ModelModule, ModuleHost, RuntimeInstance, RuntimeServices,
+};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -275,15 +277,8 @@ pub async fn run_fixture_with_engine(
     host.add_module(Arc::new(ApprovalModule::new(approval)))?;
     host.start().await?;
 
-    let kernel = Arc::new(AgentKernel::new(
-        AgentKernelConfig::default(),
-        host.registry().context_service()?,
-        host.registry().model_provider()?,
-        host.registry().tool_provider()?,
-        host.registry().approval_policy()?,
-        host.registry().event_store()?,
-    ));
-    let runtime = RuntimeInstance::spawn(host, kernel);
+    let services = RuntimeServices::from_registry(host.registry(), AgentKernelConfig::default())?;
+    let runtime = RuntimeInstance::spawn(host, services);
     let mut events = runtime.handle().subscribe();
     runtime.start().await?;
 

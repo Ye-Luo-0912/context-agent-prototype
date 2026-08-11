@@ -13,6 +13,7 @@ pub mod modules;
 mod output;
 mod policy;
 mod prompt;
+mod services;
 mod sink;
 mod surface;
 pub mod task;
@@ -36,6 +37,7 @@ pub use modules::{
     ApprovalModule, ArtifactModule, ContextModule, EventModule, ModelModule, ToolModule,
 };
 pub use prompt::PromptAssembler;
+pub use services::RuntimeServices;
 pub use task::{
     ContextRootClaim, RootClaimRole, RootClaimStrength, TaskAnchor, TaskInfo, TaskManager,
     TaskRecord, TaskStatus, TaskToolRequirementSet,

@@ -6,12 +6,12 @@
 use std::sync::Arc;
 
 use agent_contracts::{AgentError, AgentResult};
-use agent_kernel::AgentKernel;
 use tokio::task::JoinHandle;
 
 use crate::checkpoint::RuntimeCheckpoint;
 use crate::command::RuntimeHandle;
 use crate::host::ModuleHost;
+use crate::services::RuntimeServices;
 
 /// Owns the module host, the actor handle and the actor task. `shutdown` is
 /// the only way a run should end:
@@ -30,9 +30,13 @@ pub struct RuntimeInstance {
 }
 
 impl RuntimeInstance {
-    /// Spawn the actor over a composed kernel. The host must already be
-    /// started and its services consumed by the kernel.
-    pub fn spawn(host: ModuleHost, kernel: Arc<AgentKernel>) -> Self {
+    /// Spawn the actor over the resolved services. The host must already be
+    /// started; the services may come from its registry
+    /// (`RuntimeServices::from_registry`) or be built directly. The kernel
+    /// is derived from the services inside this seam — a composition root
+    /// never constructs the authority facade itself.
+    pub fn spawn(host: ModuleHost, services: RuntimeServices) -> Self {
+        let kernel = Arc::new(services.kernel());
         let (handle, task) = crate::actor::spawn_runtime(kernel);
         Self { host, handle, task }
     }

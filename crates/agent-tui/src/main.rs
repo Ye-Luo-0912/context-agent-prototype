@@ -11,12 +11,12 @@ use std::{
 
 use agent_contracts::{ApprovalDecision, ContextEngine, ModelTransport, StandingGrant};
 use agent_kernel::{
-    AgentKernel, AgentKernelConfig, ApprovalBroker, InteractiveApprovalGate, PolicyApprovalGate,
+    AgentKernelConfig, ApprovalBroker, InteractiveApprovalGate, PolicyApprovalGate,
     TaskApprovalGate,
 };
 use agent_runtime::{
     ApprovalModule, ArtifactModule, CapabilityAwareDispatcher, ContextModule, EventModule,
-    ModelModule, ModuleHost, RuntimeHandle, RuntimeInstance, ToolModule,
+    ModelModule, ModuleHost, RuntimeHandle, RuntimeInstance, RuntimeServices, ToolModule,
 };
 use agent_storage::FileEventJournal;
 use agent_workspace::{Workspace, WorkspaceOutputBroker};
@@ -147,28 +147,25 @@ async fn main() -> anyhow::Result<()> {
     host.add_module(Arc::new(ArtifactModule::new(Arc::new(workspace.clone()))))?;
     host.start().await?;
 
-    let kernel = Arc::new(AgentKernel::new(
-        AgentKernelConfig {
-            // The composition-root output broker: bounds every model-facing
-            // tool field and spills oversized content under the run's
-            // artifact directory before it reaches the actor.
-            output_broker: Some(Arc::new(WorkspaceOutputBroker::new(
-                workspace.clone().into(),
-            ))),
-            ..AgentKernelConfig::default()
-        },
-        host.registry().context_service()?,
-        host.registry().model_provider()?,
-        host.registry().tool_provider()?,
-        host.registry().approval_policy()?,
-        host.registry().event_store()?,
-    ));
+    let kernel_config = AgentKernelConfig {
+        // The composition-root output broker: bounds every model-facing
+        // tool field and spills oversized content under the run's
+        // artifact directory before it reaches the actor.
+        output_broker: Some(Arc::new(WorkspaceOutputBroker::new(
+            workspace.clone().into(),
+        ))),
+        ..AgentKernelConfig::default()
+    };
+    // The composition seam: every service the run needs is resolved from
+    // the module host's typed registry and handed to the runtime as one
+    // `RuntimeServices`; the kernel is derived inside the runtime.
+    let services = RuntimeServices::from_registry(host.registry(), kernel_config)?;
     // The runtime actor owns all subsequent mutation: commands are serialized
     // and long-running turns report back as operations, so focus/pin/task
     // commands can no longer race an in-flight turn. The instance owns the
     // host, the handle and the actor task, so shutdown runs in one ordered
     // step and surfaces every error.
-    let runtime = RuntimeInstance::spawn(host, kernel);
+    let runtime = RuntimeInstance::spawn(host, services);
     let mut runtime_events = runtime.handle().subscribe();
     runtime.start().await?;
 

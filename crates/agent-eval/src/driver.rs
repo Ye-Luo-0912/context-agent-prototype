@@ -11,8 +11,10 @@ use agent_contracts::{
     RuntimeEvent, RuntimeEventEnvelope, ToolCall, ToolDispatcher, ToolExecutionRequest,
     ToolOutcome, ToolSpec,
 };
-use agent_kernel::{AgentKernel, AgentKernelConfig};
-use agent_runtime::{ApprovalModule, ContextModule, ModelModule, ModuleHost, RuntimeInstance};
+use agent_kernel::AgentKernelConfig;
+use agent_runtime::{
+    ApprovalModule, ContextModule, ModelModule, ModuleHost, RuntimeInstance, RuntimeServices,
+};
 use anyhow::Context as _;
 use context_baselines::{AppendOnlyEngine, RollingConfig, RollingSummaryEngine};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
@@ -133,15 +135,8 @@ pub async fn run_eval(
     host.add_module(Arc::new(ApprovalModule::new(approval)))?;
     host.start().await?;
 
-    let kernel = Arc::new(AgentKernel::new(
-        AgentKernelConfig::default(),
-        host.registry().context_service()?,
-        host.registry().model_provider()?,
-        host.registry().tool_provider()?,
-        host.registry().approval_policy()?,
-        host.registry().event_store()?,
-    ));
-    let runtime = RuntimeInstance::spawn(host, kernel);
+    let services = RuntimeServices::from_registry(host.registry(), AgentKernelConfig::default())?;
+    let runtime = RuntimeInstance::spawn(host, services);
     // Subscribe before start so no event is missed (the broadcast channel
     // only delivers what is sent after subscription).
     let mut events = runtime.handle().subscribe();

@@ -15,10 +15,10 @@ use agent_contracts::{
     ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolRisk,
     ToolSpec,
 };
-use agent_kernel::{AgentKernel, AgentKernelConfig, PolicyApprovalGate};
+use agent_kernel::{AgentKernelConfig, PolicyApprovalGate};
 use agent_runtime::{
     CapabilityId, ContextRootClaim, Module, ModuleHost, RootClaimRole, RootClaimStrength,
-    RuntimeInstance, ServiceRegistry, TaskAnchor,
+    RuntimeInstance, RuntimeServices, ServiceRegistry, TaskAnchor,
 };
 
 /// Build an instance over the real reference engine, so the checkpoint test
@@ -27,15 +27,15 @@ async fn simple_instance() -> (RuntimeInstance, Arc<context_simple::SimpleContex
     let context = Arc::new(context_simple::SimpleContextEngine::new(
         context_simple::SimpleContextConfig::default(),
     ));
-    let kernel = Arc::new(AgentKernel::new(
+    let services = RuntimeServices::new(
         AgentKernelConfig::default(),
         context.clone(),
         Arc::new(QuietModel),
         Arc::new(EmptyTools),
         Arc::new(PolicyApprovalGate::read_only()),
         None,
-    ));
-    let instance = RuntimeInstance::spawn(ModuleHost::new(), kernel);
+    );
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
     instance.start().await.unwrap();
     (instance, context)
 }
@@ -242,15 +242,15 @@ impl ModelTransport for QuietModel {
     }
 }
 
-fn kernel() -> Arc<AgentKernel> {
-    Arc::new(AgentKernel::new(
+fn services() -> RuntimeServices {
+    RuntimeServices::new(
         AgentKernelConfig::default(),
         Arc::new(TestContextEngine),
         Arc::new(QuietModel),
         Arc::new(EmptyTools),
         Arc::new(PolicyApprovalGate::read_only()),
         None,
-    ))
+    )
 }
 
 /// Records every lifecycle call so the test can assert the bracket order.
@@ -298,9 +298,11 @@ async fn shutdown_stops_modules_and_joins_the_actor() {
     .unwrap();
     host.start().await.unwrap();
 
-    let kernel = kernel();
-    let mut events = kernel.subscribe();
-    let instance = RuntimeInstance::spawn(host, kernel);
+    let services = services();
+    let instance = RuntimeInstance::spawn(host, services);
+    // Subscribe through the handle: the actor's kernel is derived inside
+    // the spawn seam, so the handle is the one live event source.
+    let mut events = instance.handle().subscribe();
     instance.start().await.unwrap();
     instance.shutdown().await.unwrap();
 
@@ -335,7 +337,7 @@ async fn shutdown_aggregates_module_stop_errors() {
     .unwrap();
     host.start().await.unwrap();
 
-    let instance = RuntimeInstance::spawn(host, kernel());
+    let instance = RuntimeInstance::spawn(host, services());
     instance.start().await.unwrap();
     let error = instance.shutdown().await.unwrap_err();
 
@@ -358,7 +360,7 @@ async fn shutdown_with_no_turn_is_a_clean_noop_path() {
     }))
     .unwrap();
     host.start().await.unwrap();
-    let instance = RuntimeInstance::spawn(host, kernel());
+    let instance = RuntimeInstance::spawn(host, services());
     // Never started the actor; shutdown must still complete within a bounded
     // time (cancel is a no-op, stop is a no-op, host stops, task joins).
     let result = tokio::time::timeout(Duration::from_secs(2), instance.shutdown())
@@ -570,7 +572,7 @@ async fn rejected_actor_restore_does_not_change_capability_flags() {
     registry.enable("checkpoint-capability").unwrap();
     registry.load_tool("checkpoint.tool").unwrap();
 
-    let instance = RuntimeInstance::spawn(host, kernel());
+    let instance = RuntimeInstance::spawn(host, services());
     instance.start().await.unwrap();
     let mut invalid = instance.checkpoint().await.unwrap();
     invalid.version += 1;
@@ -733,7 +735,7 @@ async fn restore_audit_failure_demands_recovery_and_fences_mutation() {
     // The actor with a journal that refuses the restore-commit record.
     let failing = RuntimeInstance::spawn(
         ModuleHost::new(),
-        Arc::new(AgentKernel::new(
+        RuntimeServices::new(
             AgentKernelConfig::default(),
             // The real reference engine: restore must pass the
             // context/task focus agreement check and reach the journal
@@ -745,7 +747,7 @@ async fn restore_audit_failure_demands_recovery_and_fences_mutation() {
             Arc::new(EmptyTools),
             Arc::new(PolicyApprovalGate::read_only()),
             Some(Arc::new(FailRestoreEventJournal)),
-        )),
+        ),
     );
     failing.start().await.unwrap();
     let mut events = failing.handle().subscribe();
@@ -1023,14 +1025,14 @@ async fn completion_failure_never_leaves_a_half_closed_task() {
     // Active, the active slot stays, and no outcome record exists.
     let instance = RuntimeInstance::spawn(
         ModuleHost::new(),
-        Arc::new(AgentKernel::new(
+        RuntimeServices::new(
             AgentKernelConfig::default(),
             Arc::new(FailingCompleteEngine),
             Arc::new(QuietModel),
             Arc::new(EmptyTools),
             Arc::new(PolicyApprovalGate::read_only()),
             None,
-        )),
+        ),
     );
     instance.start().await.unwrap();
     instance
@@ -1073,7 +1075,7 @@ async fn completion_audit_gap_marks_recovery_but_keeps_the_commit() {
     // standard recovery signal — never report an un-audited success.
     let instance = RuntimeInstance::spawn(
         ModuleHost::new(),
-        Arc::new(AgentKernel::new(
+        RuntimeServices::new(
             AgentKernelConfig::default(),
             Arc::new(context_simple::SimpleContextEngine::new(
                 context_simple::SimpleContextConfig::default(),
@@ -1082,7 +1084,7 @@ async fn completion_audit_gap_marks_recovery_but_keeps_the_commit() {
             Arc::new(EmptyTools),
             Arc::new(PolicyApprovalGate::read_only()),
             Some(Arc::new(FailCompletionEventJournal)),
-        )),
+        ),
     );
     instance.start().await.unwrap();
     let mut events = instance.handle().subscribe();
