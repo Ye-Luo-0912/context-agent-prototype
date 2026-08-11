@@ -41,7 +41,12 @@ fn usage() -> ! {
          Runs one coding fixture end to end against the real builtin tool\n\
          surface with a scripted model (no provider), scores it with the\n\
          hidden verification and prints the cost accounting. Deterministic\n\
-         harness smoke test for M15.\n"
+         harness smoke test for M15.\n\
+         \n\
+         usage: agent-eval --fixture-live <id>\n\
+         \n\
+         Same harness with a real model (OPENAI_API_KEY / OPENAI_BASE_URL /\n\
+         OPENAI_MODEL); the provider must accept tool calls.\n"
     );
     std::process::exit(2);
 }
@@ -71,6 +76,27 @@ async fn main() -> anyhow::Result<()> {
                 let eval = fixture_driver::run_fixture(fixture, dir.path()).await?;
                 print!(
                     "fixture {}: passed={}\n{}",
+                    eval.fixture_id,
+                    eval.passed,
+                    metrics::render_metrics(&eval.metrics)
+                );
+                return Ok(());
+            }
+            "--fixture-live" => {
+                let Some(id) = args.next() else {
+                    usage();
+                };
+                let fixture = workload::FIXTURES
+                    .iter()
+                    .find(|fixture| fixture.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown fixture: {id} (see --fixtures)"))?;
+                let model = driver::build_model()?;
+                let dir = tempfile::tempdir()?;
+                workload::seed_fixture(fixture, dir.path());
+                let eval =
+                    fixture_driver::run_fixture_with_model(fixture, dir.path(), model).await?;
+                print!(
+                    "fixture {} (live): passed={}\n{}",
                     eval.fixture_id,
                     eval.passed,
                     metrics::render_metrics(&eval.metrics)

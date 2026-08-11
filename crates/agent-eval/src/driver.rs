@@ -80,7 +80,7 @@ impl ToolDispatcher for NoToolDispatcher {
 
 /// Build the model transport from `OPENAI_API_KEY` / `OPENAI_BASE_URL` /
 /// `OPENAI_MODEL` (same contract the TUI composition root uses).
-fn build_model() -> anyhow::Result<Arc<dyn ModelTransport>> {
+pub(crate) fn build_model() -> anyhow::Result<Arc<dyn ModelTransport>> {
     let api_key = std::env::var("OPENAI_API_KEY")
         .context("OPENAI_API_KEY is not set — the live eval needs a real model")?;
     if api_key.trim().is_empty() {

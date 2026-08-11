@@ -89,12 +89,24 @@ pub async fn run_fixture(
     fixture: &workload::CodingFixture,
     workspace_root: &Path,
 ) -> anyhow::Result<FixtureEval> {
-    let context_engine: Arc<dyn ContextEngine> =
-        Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
     let model: Arc<dyn ModelTransport> = Arc::new(ScriptedModel::new(
         scripted_steps(fixture.id),
         format!("{}: done", fixture.id),
     ));
+    run_fixture_with_model(fixture, workspace_root, model).await
+}
+
+/// The M15 live path: the same harness with a real model transport. The
+/// model under test sees the fixture description and the real tool surface;
+/// the workspace, verification and accounting are identical to the
+/// deterministic run. Requires a provider that accepts tool calls.
+pub async fn run_fixture_with_model(
+    fixture: &workload::CodingFixture,
+    workspace_root: &Path,
+    model: Arc<dyn ModelTransport>,
+) -> anyhow::Result<FixtureEval> {
+    let context_engine: Arc<dyn ContextEngine> =
+        Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
     let approval: Arc<dyn ApprovalGate> = Arc::new(AllowAllGate);
 
     let workspace = agent_workspace::Workspace::open(workspace_root).await?;
