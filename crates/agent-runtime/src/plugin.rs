@@ -426,9 +426,9 @@ async fn run_test_command(command: &[String], timeout: Duration) -> PluginTestRe
     }
     #[cfg(unix)]
     {
-        use tokio::process::CommandExt;
-        // Start the child in its own process group so a timeout can kill
-        // the whole tree, not just the leader.
+        // `process_group` is an inherent method on tokio::process::Command
+        // (no trait import needed); start the child in its own process
+        // group so a timeout can kill the whole tree, not just the leader.
         cmd.process_group(0);
     }
 
