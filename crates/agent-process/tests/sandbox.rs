@@ -223,3 +223,33 @@ async fn sandboxed_self_check_artifacts_stay_contained() {
 
     host.shutdown().await;
 }
+
+/// A child that answers a request with a system frame instead of the
+/// normal response must be refused and killed when no broker is installed:
+/// there is no sanctioned way to answer it, so the connection poisons and
+/// the child tree is terminated (fail-closed — an undeclared access
+/// request can never be silently satisfied).
+#[tokio::test]
+async fn system_frames_without_a_broker_poison_and_kill_the_connection() {
+    let host = connect_with(ProcessSandbox::default()).await;
+    let error = host
+        .call(serde_json::json!({ "op": "system_abuse" }))
+        .await
+        .expect_err("a system frame with no broker must be refused");
+    assert!(
+        error.to_string().contains("no broker"),
+        "the refusal must name the missing broker: {error}"
+    );
+
+    // The connection is poisoned and the child was killed: any further
+    // call fails fast, and shutdown reaps the dead child immediately.
+    let poisoned = host
+        .call(serde_json::json!({ "op": "ping" }))
+        .await
+        .expect_err("the poisoned connection must refuse further calls");
+    assert!(
+        poisoned.to_string().contains("poisoned"),
+        "the failure must name the poisoned connection: {poisoned}"
+    );
+    host.shutdown().await;
+}

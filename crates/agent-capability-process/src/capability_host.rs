@@ -14,11 +14,11 @@ use std::time::Duration;
 use agent_contracts::{
     AgentError, AgentResult, Capability, CapabilityInvocationContext, CapabilityManifest,
     CapabilityOutcome, CapabilityTransport, ProcessInvokeResponse, ToolCall, ToolOutput, ToolRisk,
-    WORKSPACE_WRITE, WireEffect, validate_capability_id,
+    WORKSPACE_READ, WORKSPACE_WRITE, WireEffect, WorkspaceHandle, validate_capability_id,
 };
-use agent_process::{ProcessHost, ProcessHostConfig, ProcessSandbox};
+use agent_process::{ProcessHost, ProcessHostConfig, ProcessSandbox, SystemBroker};
 use async_trait::async_trait;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 /// A `Capability` whose service is a separate process. The manifest's
@@ -160,14 +160,24 @@ impl Capability for ProcessCapabilityAdapter {
         // against the granted permissions and stages it through the
         // confined workspace handle, so a process mutation crosses the same
         // generation-fence effect commit as a builtin tool's `PreparedEffect`.
+        // Mid-invoke, the child may also send *system requests* (a brokered
+        // filesystem read): the broker answers them from the confined
+        // workspace handle, so the child's filesystem access is brokered
+        // and permission-gated, never a direct absolute-path read.
+        let broker = InvokeFsBroker {
+            id: &self.manifest.id,
+            grant: &ctx.granted_permissions,
+            workspace: ctx.workspace.as_ref(),
+        };
         let value = host
-            .call_with_cancel(
+            .call_with_cancel_and_broker(
                 json!({
                     "op": "invoke",
                     "call": call,
-                    "permissions": ctx.granted_permissions,
+                    "permissions": &ctx.granted_permissions,
                 }),
                 &ctx.cancel,
+                &broker,
             )
             .await?;
         match serde_json::from_value::<ProcessInvokeResponse>(value.clone()) {
@@ -232,6 +242,99 @@ impl ProcessCapabilityAdapter {
             }
         }
         Ok(staged)
+    }
+}
+
+/// A broker for the child's mid-invoke system requests. Slice 1 brokers
+/// filesystem reads: `{"system": "fs.read", "path": <relative>}` is
+/// answered from the confined workspace handle when the invocation holds
+/// `workspace:read`; every other op is refused. The broker is the
+/// enforcement point for "experimental code cannot exceed the permissions
+/// granted to it": the path is confined by construction (relative, no `..`,
+/// never absolute) and the read goes through the workspace handle, never an
+/// absolute filesystem path.
+struct InvokeFsBroker<'a> {
+    id: &'a str,
+    grant: &'a [String],
+    workspace: Option<&'a Arc<dyn WorkspaceHandle>>,
+}
+
+#[async_trait]
+impl SystemBroker for InvokeFsBroker<'_> {
+    async fn handle(&self, request: Value) -> AgentResult<Value> {
+        match request.get("system").and_then(Value::as_str) {
+            Some("fs.read") => self.handle_fs_read(&request).await,
+            Some(other) => Err(AgentError::InvalidRequest(format!(
+                "capability '{}' requested unknown system op '{other}'",
+                self.id
+            ))),
+            None => Err(AgentError::InvalidRequest(format!(
+                "capability '{}' sent a malformed system request",
+                self.id
+            ))),
+        }
+    }
+}
+
+impl InvokeFsBroker<'_> {
+    async fn handle_fs_read(&self, request: &Value) -> AgentResult<Value> {
+        if !self
+            .grant
+            .iter()
+            .any(|permission| permission == WORKSPACE_READ)
+        {
+            return Err(AgentError::InvalidRequest(format!(
+                "capability '{}' requested a brokered read without '{WORKSPACE_READ}' permission",
+                self.id
+            )));
+        }
+        let path = request
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AgentError::InvalidRequest("fs.read requires a string 'path'".into()))?;
+        // Confined by construction: the broker never hands an absolute,
+        // rooted or `..`-escaping path to the workspace handle — the
+        // handle confines too, but the broker must not depend on the
+        // handle's implementation for the security boundary. A rooted path
+        // like `/etc/passwd` (or `\foo`) is refused even where the OS
+        // does not consider it "absolute" (Windows).
+        let relative = std::path::Path::new(path);
+        if path.is_empty()
+            || relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::RootDir | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(AgentError::InvalidRequest(format!(
+                "capability '{}' requested an absolute or empty path '{path}'",
+                self.id
+            )));
+        }
+        if relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(AgentError::InvalidRequest(format!(
+                "capability '{}' requested an escaping path '{path}'",
+                self.id
+            )));
+        }
+        let workspace = self.workspace.ok_or_else(|| {
+            AgentError::InvalidRequest(format!(
+                "capability '{}' has no workspace handle: '{WORKSPACE_READ}' was not granted",
+                self.id
+            ))
+        })?;
+        let content = workspace.read(path).await?;
+        Ok(json!({
+            "content_b64": base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &content,
+            ),
+        }))
     }
 }
 

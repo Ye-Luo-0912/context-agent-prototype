@@ -155,6 +155,24 @@ async fn server_loop() {
                     .get("permissions")
                     .cloned()
                     .unwrap_or(Value::Array(Vec::new()));
+                // Brokered-fs test hooks: `ask_fs_read: "<path>"` makes the
+                // mock issue a mid-invoke `{"system": "fs.read", ...}`
+                // frame and wait for the host's answer; `ask_unknown_system:
+                // true` issues an unknown system op. The outcome replaces
+                // the canned model content so the parent-side test sees
+                // exactly what the broker allowed or refused.
+                let ask_fs_read = request
+                    .get("call")
+                    .and_then(|call| call.get("arguments"))
+                    .and_then(|args| args.get("ask_fs_read"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let ask_unknown_system = request
+                    .get("call")
+                    .and_then(|call| call.get("arguments"))
+                    .and_then(|args| args.get("ask_unknown_system"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let model_content = match echo_env {
                     Some(name) => std::env::var(name).unwrap_or_default(),
                     None if echo_permissions => permissions.to_string(),
@@ -170,6 +188,40 @@ async fn server_loop() {
                     metadata: json!({}),
                 })
                 .expect("ToolOutput serializes");
+                // When a broker hook is set, run one system round trip now
+                // and overwrite the model content with its outcome.
+                let output = if ask_fs_read.is_some() || ask_unknown_system {
+                    let system = match ask_fs_read {
+                        Some(path) => json!({ "system": "fs.read", "path": path }),
+                        None => json!({ "system": "no.such.op" }),
+                    };
+                    let answer = system_round_trip(&mut writer, &mut lines, system).await;
+                    let model_content = match (
+                        answer.get("system_ok").and_then(Value::as_bool),
+                        answer.get("value"),
+                        answer.get("error").and_then(Value::as_str),
+                    ) {
+                        (Some(true), Some(value), _) => {
+                            let content = value
+                                .get("content_b64")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let bytes = base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD,
+                                content,
+                            )
+                            .unwrap_or_default();
+                            format!("FS_READ:{}", String::from_utf8_lossy(&bytes))
+                        }
+                        (_, _, Some(error)) => format!("FS_REFUSED:{error}"),
+                        _ => "FS_REFUSED:malformed system answer".into(),
+                    };
+                    let mut output = output;
+                    output["model_content"] = json!(model_content);
+                    output
+                } else {
+                    output
+                };
                 // `stage_write: {"path": ..., "content": ...}` — the mock
                 // declares a workspace-write *wire effect* instead of
                 // mutating anything itself: the wire effect broker test
@@ -226,12 +278,41 @@ async fn server_loop() {
                 // request's answer).
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
+            "system_abuse" => {
+                // Answer a request with a system frame instead of the normal
+                // `{id, version, ok, value}` response: a host call without
+                // a broker must refuse and poison (fail-closed), never
+                // misparse the frame as a response.
+                let _ = writer
+                    .write_all(b"{\"system\":\"fs.read\",\"path\":\"x\"}\n")
+                    .await;
+                let _ = writer.flush().await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
             "shutdown" => {
                 reply(&mut writer, id, Value::Null).await;
                 return;
             }
             _ => {}
         }
+    }
+}
+
+/// One mid-invoke system round trip: write the child's `{"system": ...}`
+/// frame, read the host's answer line, return it. The host answers each
+/// system frame with a single line before the exchange continues.
+async fn system_round_trip(
+    writer: &mut BufWriter<tokio::io::Stdout>,
+    lines: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>,
+    request: Value,
+) -> Value {
+    let line = serde_json::to_string(&request).unwrap_or_default();
+    let _ = writer.write_all(line.as_bytes()).await;
+    let _ = writer.write_all(b"\n").await;
+    let _ = writer.flush().await;
+    match lines.next_line().await {
+        Ok(Some(line)) => serde_json::from_str(&line).unwrap_or_default(),
+        _ => json!({ "system_ok": false, "error": "host closed the connection" }),
     }
 }
 

@@ -90,6 +90,7 @@ name = "agent-process"
 version = "0.1.0"
 dependencies = [
  "agent-contracts",
+ "async-trait",
  "base64",
  "libc",
  "serde_json",

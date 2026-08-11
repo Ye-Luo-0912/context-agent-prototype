@@ -13,6 +13,6 @@
 mod host;
 
 pub use host::{
-    PROTOCOL_VERSION, ProcessHost, ProcessHostConfig, ProcessSandbox, kill_process_tree,
-    probe_siblings, resolve_program,
+    MAX_SYSTEM_REQUESTS_PER_CALL, PROTOCOL_VERSION, ProcessHost, ProcessHostConfig, ProcessSandbox,
+    SystemBroker, kill_process_tree, probe_siblings, resolve_program,
 };

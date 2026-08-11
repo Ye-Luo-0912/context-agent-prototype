@@ -725,3 +725,165 @@ async fn wire_write_without_a_workspace_handle_is_refused() {
     );
     capability.stop().await.unwrap();
 }
+
+/// A started read-only process capability on the mock host, ready for
+/// invoke. The sandbox dimensions are covered by the dedicated sandbox
+/// tests; these tests exercise the mid-invoke broker.
+async fn started_readonly_capability() -> Arc<dyn Capability> {
+    let program = common::locate_mock_host().expect("mock_host built");
+    let capability: Arc<dyn Capability> = Arc::new(ProcessCapabilityAdapter::with_config(
+        manifest_with_program(&program.to_string_lossy()),
+        ProcessHostConfig {
+            program: program.to_string_lossy().into_owned(),
+            args: vec!["--serve".into()],
+            env: vec![("MOCK_MARKER".into(), "1".into())],
+            startup_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+            max_frame_bytes: 1024 * 1024,
+            sandbox: Default::default(),
+        },
+    ));
+    capability.start().await.unwrap();
+    capability
+}
+
+/// One brokered `fs.read` invoke against the mock: the child issues a
+/// mid-invoke `{"system": "fs.read", "path": ...}` frame, the adapter's
+/// broker answers it, and the mock reports the outcome in `model_content`
+/// as `FS_READ:<content>` or `FS_REFUSED:<error>`.
+async fn invoke_broker_read(
+    capability: &Arc<dyn Capability>,
+    workspace: &Arc<dyn WorkspaceHandle>,
+    path: &str,
+) -> String {
+    let output = capability
+        .invoke(
+            ToolCall {
+                id: "c9".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({ "ask_fs_read": path }),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec!["workspace:read".into()],
+                workspace: Some(workspace.clone()),
+                artifacts: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap();
+    match output {
+        CapabilityOutcome::Value(output) => output.model_content,
+        other => panic!("the wire only carries plain values, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn brokered_fs_read_serves_files_inside_the_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "hello broker").unwrap();
+    let workspace: Arc<dyn WorkspaceHandle> = Arc::new(TestWorkspace {
+        root: dir.path().to_path_buf(),
+    });
+
+    let capability = started_readonly_capability().await;
+    let model_content = invoke_broker_read(&capability, &workspace, "notes.txt").await;
+    assert!(
+        model_content.contains("FS_READ:hello broker"),
+        "the brokered read must return the workspace file's content: {model_content}"
+    );
+    capability.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn brokered_fs_read_refuses_absolute_and_escaping_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace: Arc<dyn WorkspaceHandle> = Arc::new(TestWorkspace {
+        root: dir.path().to_path_buf(),
+    });
+
+    let capability = started_readonly_capability().await;
+    // An absolute/rooted path is refused before the workspace handle ever
+    // sees it — even on platforms where `/etc/passwd` is not "absolute".
+    let model_content = invoke_broker_read(&capability, &workspace, "/etc/passwd").await;
+    assert!(
+        model_content.contains("FS_REFUSED:") && model_content.contains("absolute"),
+        "an absolute path must be refused: {model_content}"
+    );
+    // A `..` escape is refused the same way.
+    let model_content = invoke_broker_read(&capability, &workspace, "../secret.txt").await;
+    assert!(
+        model_content.contains("FS_REFUSED:") && model_content.contains("escaping"),
+        "a `..` escape must be refused: {model_content}"
+    );
+    capability.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn brokered_fs_read_without_the_grant_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("secret.txt"), "top secret").unwrap();
+    let workspace: Arc<dyn WorkspaceHandle> = Arc::new(TestWorkspace {
+        root: dir.path().to_path_buf(),
+    });
+
+    let capability = started_readonly_capability().await;
+    // This invocation was not granted `workspace:read`: even though the
+    // file is inside the workspace, the broker must refuse before the
+    // handle could be touched.
+    let output = capability
+        .invoke(
+            ToolCall {
+                id: "c10".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({ "ask_fs_read": "secret.txt" }),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: Vec::new(),
+                workspace: Some(workspace),
+                artifacts: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let model_content = match output {
+        CapabilityOutcome::Value(output) => output.model_content,
+        other => panic!("the wire only carries plain values, got: {other:?}"),
+    };
+    assert!(
+        model_content.contains("FS_REFUSED:") && model_content.contains("workspace:read"),
+        "the refusal must name the missing permission: {model_content}"
+    );
+    capability.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn unknown_system_ops_are_refused() {
+    let capability = started_readonly_capability().await;
+    let output = capability
+        .invoke(
+            ToolCall {
+                id: "c11".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({ "ask_unknown_system": true }),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec!["workspace:read".into()],
+                workspace: None,
+                artifacts: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let model_content = match output {
+        CapabilityOutcome::Value(output) => output.model_content,
+        other => panic!("the wire only carries plain values, got: {other:?}"),
+    };
+    assert!(
+        model_content.contains("FS_REFUSED:") && model_content.contains("unknown system op"),
+        "an undeclared system op must be refused: {model_content}"
+    );
+    capability.stop().await.unwrap();
+}
