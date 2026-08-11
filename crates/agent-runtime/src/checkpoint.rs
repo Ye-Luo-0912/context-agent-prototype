@@ -14,7 +14,7 @@
 //!   ├─ current TaskId (the actor's belief, kept in sync with the engine)
 //!   ├─ focus and last-issued surface revisions
 //!   ├─ context checkpoint (the engine's own JSON state)
-//!   └─ capability surface state (activation + loaded per capability)
+//!   └─ capability surface state (activation + loaded tools per capability)
 //! ```
 //!
 //! Tool lifecycle and context-store generation are deliberately optional
@@ -96,14 +96,23 @@ pub struct TaskRecordSnapshot {
     pub anchor: TaskAnchor,
 }
 
-/// One dynamic capability's surface state: its activation and whether its
+/// One dynamic capability's surface state: its activation and which of its
 /// tools are on the model surface. Restoring re-applies the flags so a
 /// restarted run offers exactly the tools the checkpoint left loaded.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilitySnapshot {
     pub id: String,
     pub activation: agent_contracts::CapabilityActivation,
+    /// Legacy whole-capability loaded flag, kept so old checkpoints round
+    /// trip. New checkpoints write it as "at least one tool loaded" so
+    /// older readers still see a non-empty surface; a non-empty `loaded_tools`
+    /// list is the authoritative form.
+    #[serde(default)]
     pub loaded: bool,
+    /// Per-tool surface state (authoritative since the per-tool lifecycle).
+    /// Empty means no tool of this capability is on the surface.
+    #[serde(default)]
+    pub loaded_tools: Vec<String>,
 }
 
 impl RuntimeCheckpoint {

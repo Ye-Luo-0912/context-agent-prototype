@@ -80,10 +80,12 @@ struct Entry {
     /// capabilities enter `Disabled`; only an explicit enable (operator or
     /// evaluator) makes them usable.
     activation: CapabilityActivation,
-    /// Whether the capability's tools are on the model surface. Registration
+    /// Which tools of this capability are on the model surface. Registration
     /// alone keeps them `Available`; `capability.load` (or the runtime) puts
-    /// them on the surface, `capability.unload` takes them off.
-    loaded: bool,
+    /// exactly the named tool on the surface — sibling tools of the same
+    /// capability stay off until they are loaded individually — and
+    /// `capability.unload` takes one tool off.
+    loaded_tools: HashSet<String>,
     /// A tool of this capability is executing right now.
     active: bool,
 }
@@ -383,7 +385,7 @@ impl CapabilityRegistry {
                 run_lock: Arc::new(tokio::sync::Mutex::new(())),
                 status,
                 activation,
-                loaded: false,
+                loaded_tools: HashSet::new(),
                 active: false,
             },
         );
@@ -430,7 +432,7 @@ impl CapabilityRegistry {
         // A capability that cannot run must not keep its tools on the
         // model surface.
         if !activation.usable() {
-            entry.loaded = false;
+            entry.loaded_tools.clear();
         }
         // Activation flips the usable surface: bump the generation.
         self.generation.fetch_add(1, Ordering::Relaxed);
@@ -475,10 +477,11 @@ impl CapabilityRegistry {
         entries
     }
 
-    /// The tool schemas of *loaded and usable* capabilities only — the
+    /// The tool schemas of *loaded and usable* capability tools only — the
     /// model surface. Unloaded or disabled capabilities stay registered but
     /// invisible, so the prompt does not grow with every registered
-    /// capability and a suspended one cannot linger on the surface.
+    /// capability and a suspended one cannot linger on the surface. Loading
+    /// one tool of a capability never surfaces its siblings.
     pub fn loaded_tool_specs(&self) -> Vec<ToolSpec> {
         self.loaded_surface().0
     }
@@ -490,8 +493,14 @@ impl CapabilityRegistry {
         let inner = self.inner.read().expect("capability registry poisoned");
         let specs = inner
             .values()
-            .filter(|entry| entry.loaded && entry.activation.usable())
-            .flat_map(|entry| entry.tool_specs.iter().cloned())
+            .filter(|entry| entry.activation.usable() && !entry.loaded_tools.is_empty())
+            .flat_map(|entry| {
+                entry
+                    .tool_specs
+                    .iter()
+                    .filter(|spec| entry.loaded_tools.contains(&spec.name))
+                    .cloned()
+            })
             .collect();
         let generation = self.generation.load(Ordering::Relaxed);
         (specs, generation)
@@ -521,10 +530,13 @@ impl CapabilityRegistry {
         })
     }
 
-    /// Unified `capability.load`: put every tool of the owning capability on
-    /// the model surface. Unknown tool names are rejected like the builtin
-    /// catalog does, and a disabled/quarantined capability cannot load —
-    /// activation is the gate in front of the surface.
+    /// Unified `capability.load`: put exactly one tool of the owning
+    /// capability on the model surface. Sibling tools of the same
+    /// capability stay off until they are loaded individually — a single
+    /// tool load never surfaces the whole capability. Unknown tool names
+    /// are rejected like the builtin catalog does, and a
+    /// disabled/quarantined capability cannot load — activation is the
+    /// gate in front of the surface.
     pub fn load_tool(&self, tool_name: &str) -> AgentResult<()> {
         let owner = self
             .owner_of(tool_name)
@@ -543,15 +555,15 @@ impl CapabilityRegistry {
                 entry.activation.as_str()
             )));
         }
-        entry.loaded = true;
+        entry.loaded_tools.insert(tool_name.to_string());
         // A load puts tools on the surface: bump the generation.
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.catalog_version.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Unified `capability.unload`: take the owning capability's tools off
-    /// the model surface.
+    /// Unified `capability.unload`: take one tool of the owning capability
+    /// off the model surface. Siblings stay loaded.
     pub fn unload_tool(&self, tool_name: &str) -> AgentResult<()> {
         let owner = self
             .owner_of(tool_name)
@@ -562,7 +574,7 @@ impl CapabilityRegistry {
             .expect("capability registry poisoned");
         let mut inner = self.inner.write().expect("capability registry poisoned");
         if let Some(entry) = inner.get_mut(&owner) {
-            entry.loaded = false;
+            entry.loaded_tools.remove(tool_name);
         }
         // An unload takes tools off the surface: bump the generation.
         self.generation.fetch_add(1, Ordering::Relaxed);
@@ -571,9 +583,11 @@ impl CapabilityRegistry {
     }
 
     /// Lifecycle state of one capability tool: `Active` while executing,
-    /// `Loaded` when its capability is loaded, `Available` otherwise. A
-    /// disabled/quarantined capability reports `Available` regardless —
-    /// its tools are not on the surface.
+    /// `Loaded` when that tool itself is on the surface, `Available`
+    /// otherwise. Sibling tools of the same capability report `Available`
+    /// until they are loaded individually. A disabled/quarantined
+    /// capability reports `Available` regardless — its tools are not on
+    /// the surface.
     pub fn tool_state(&self, tool_name: &str) -> Option<ToolLifecycle> {
         let inner = self.inner.read().expect("capability registry poisoned");
         inner.values().find_map(|entry| {
@@ -584,7 +598,7 @@ impl CapabilityRegistry {
                 .then(|| {
                     if entry.active {
                         ToolLifecycle::Active
-                    } else if entry.loaded && entry.activation.usable() {
+                    } else if entry.loaded_tools.contains(tool_name) && entry.activation.usable() {
                         ToolLifecycle::Loaded
                     } else {
                         ToolLifecycle::Available
@@ -623,11 +637,11 @@ impl CapabilityRegistry {
             for (id, entry) in inner.iter() {
                 let owner = id.clone();
                 let active = entry.active;
-                let usable = entry.loaded && entry.activation.usable();
+                let usable = entry.activation.usable();
                 for spec in &entry.tool_specs {
                     let state = if active {
                         ToolLifecycle::Active
-                    } else if usable {
+                    } else if entry.loaded_tools.contains(&spec.name) && usable {
                         ToolLifecycle::Loaded
                     } else {
                         ToolLifecycle::Available
@@ -684,17 +698,25 @@ impl CapabilityRegistry {
     }
 
     /// Snapshot of every registered capability's surface state (activation +
-    /// loaded), for checkpoints. Registration identity itself is not part of
-    /// the snapshot: capabilities are re-registered by the composition root
-    /// on a fresh run, then this re-applies their flags.
+    /// loaded tools), for checkpoints. Registration identity itself is not
+    /// part of the snapshot: capabilities are re-registered by the
+    /// composition root on a fresh run, then this re-applies their flags.
     pub fn snapshot(&self) -> Vec<crate::checkpoint::CapabilitySnapshot> {
         let inner = self.inner.read().expect("capability registry poisoned");
         let mut entries: Vec<_> = inner
             .iter()
-            .map(|(id, entry)| crate::checkpoint::CapabilitySnapshot {
-                id: id.clone(),
-                activation: entry.activation,
-                loaded: entry.loaded,
+            .map(|(id, entry)| {
+                let mut loaded_tools: Vec<String> = entry.loaded_tools.iter().cloned().collect();
+                loaded_tools.sort();
+                crate::checkpoint::CapabilitySnapshot {
+                    id: id.clone(),
+                    activation: entry.activation,
+                    // The legacy whole-capability flag mirrors "at least one
+                    // tool loaded" so older readers still see a non-empty
+                    // surface; the per-tool list is authoritative.
+                    loaded: !loaded_tools.is_empty(),
+                    loaded_tools,
+                }
             })
             .collect();
         entries.sort_by(|a, b| a.id.cmp(&b.id));
@@ -702,8 +724,10 @@ impl CapabilityRegistry {
     }
 
     /// Re-apply a checkpoint's capability surface state: activation first,
-    /// then the loaded flag (a loaded flag without a usable activation is
+    /// then the loaded tools (a loaded flag without a usable activation is
     /// dropped — activation is the gate in front of the model surface).
+    /// Old whole-capability checkpoints (`loaded: true` with no tool list)
+    /// migrate to "every declared tool loaded".
     pub fn restore(&self, state: &[crate::checkpoint::CapabilitySnapshot]) {
         let _surface = self
             .surface_gate
@@ -717,7 +741,37 @@ impl CapabilityRegistry {
                 continue;
             };
             current.activation = entry.activation;
-            current.loaded = entry.loaded && entry.activation.usable();
+            if !entry.loaded_tools.is_empty() {
+                // Per-tool format: only the named tools go on the surface,
+                // and only those the capability actually declares in this
+                // run (names unknown here are dropped).
+                current.loaded_tools = entry
+                    .loaded_tools
+                    .iter()
+                    .filter(|name| {
+                        current
+                            .tool_specs
+                            .iter()
+                            .any(|spec| spec.name.as_str() == *name)
+                    })
+                    .cloned()
+                    .collect();
+            } else if entry.loaded {
+                // Legacy whole-capability format: everything was on the
+                // surface in the checkpoint.
+                current.loaded_tools = current
+                    .tool_specs
+                    .iter()
+                    .map(|spec| spec.name.clone())
+                    .collect();
+            } else {
+                current.loaded_tools.clear();
+            }
+            // A loaded flag without a usable activation is dropped —
+            // activation is the gate in front of the model surface.
+            if !current.activation.usable() {
+                current.loaded_tools.clear();
+            }
         }
         // Restore changes the model-visible surface just like explicit
         // activation/load operations, so both the audit generation and the
@@ -957,7 +1011,7 @@ impl CapabilityAwareDispatcher {
         vec![
             ToolSpec {
                 name: CAPABILITY_MANAGE.into(),
-                description: "Manage the tool catalog in one call (builtin tools and dynamic capabilities). ops: search (list known tools with lifecycle state and owner), inspect (one tool's schema, risk, owner and state), load (put a tool — or the capability owning it — on the model surface), unload (take it off; core builtin tools cannot be unloaded).".into(),
+                description: "Manage the tool catalog in one call (builtin tools and dynamic capabilities). ops: search (list known tools with lifecycle state and owner), inspect (one tool's schema, risk, owner and state), load (put one tool on the model surface; its capability's sibling tools stay off until loaded individually), unload (take it off; core builtin tools cannot be unloaded).".into(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["op"],
@@ -1087,6 +1141,182 @@ mod tests {
         assert_eq!(snapshot.source_revisions.capability_catalog_generation, 0);
         assert_eq!(snapshot.generation, 41);
         assert_eq!(registry.generation(), 1);
+    }
+
+    /// A small in-process capability with three tools, so a single-tool
+    /// load can prove siblings stay off the surface.
+    struct DemoCapability {
+        manifest: CapabilityManifest,
+    }
+
+    #[async_trait::async_trait]
+    impl Capability for DemoCapability {
+        fn manifest(&self) -> &CapabilityManifest {
+            &self.manifest
+        }
+
+        async fn invoke(
+            &self,
+            _call: agent_contracts::ToolCall,
+            _ctx: CapabilityInvocationContext,
+        ) -> AgentResult<CapabilityOutcome> {
+            unreachable!("surface tests never invoke")
+        }
+    }
+
+    fn demo_capability(id: &str) -> DemoCapability {
+        let tool = |name: &str| ToolSpec {
+            name: name.into(),
+            description: "demo tool".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+        };
+        DemoCapability {
+            manifest: CapabilityManifest {
+                id: id.into(),
+                version: "0.1.0".into(),
+                name: id.into(),
+                summary: "demo".into(),
+                status: CapabilityStatus::Experimental,
+                provides: Vec::new(),
+                permissions: Vec::new(),
+                requires: Vec::new(),
+                tools: vec![
+                    tool(&format!("{id}.one")),
+                    tool(&format!("{id}.two")),
+                    tool(&format!("{id}.three")),
+                ],
+                lifecycle: CapabilityLifecycle::Lazy,
+                transport: CapabilityTransport::Builtin,
+            },
+        }
+    }
+
+    #[test]
+    fn loading_one_capability_tool_never_surfaces_siblings() {
+        let registry = CapabilityRegistry::new();
+        registry
+            .register(Arc::new(demo_capability("demo")))
+            .expect("registration succeeds");
+
+        // Registration alone leaves everything off the surface.
+        assert!(registry.loaded_tool_specs().is_empty());
+
+        registry.load_tool("demo.one").expect("load one tool");
+        let surfaced: Vec<String> = registry
+            .loaded_tool_specs()
+            .iter()
+            .map(|spec| spec.name.clone())
+            .collect();
+        assert_eq!(surfaced, vec!["demo.one"]);
+
+        // The sibling stays Available; the loaded tool is Loaded.
+        assert_eq!(registry.tool_state("demo.one"), Some(ToolLifecycle::Loaded));
+        assert_eq!(
+            registry.tool_state("demo.two"),
+            Some(ToolLifecycle::Available)
+        );
+        assert_eq!(
+            registry.tool_state("demo.three"),
+            Some(ToolLifecycle::Available)
+        );
+
+        // Discovery rows agree with the per-tool surface.
+        let rows = registry.catalog_rows();
+        let by_name = |name: &str| {
+            rows.iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("{name} must be listed"))
+        };
+        assert_eq!(by_name("demo.one").state, ToolLifecycle::Loaded);
+        assert_eq!(by_name("demo.two").state, ToolLifecycle::Available);
+        assert_eq!(by_name("demo.three").state, ToolLifecycle::Available);
+    }
+
+    #[test]
+    fn unloading_one_capability_tool_keeps_siblings_loaded() {
+        let registry = CapabilityRegistry::new();
+        registry
+            .register(Arc::new(demo_capability("demo")))
+            .expect("registration succeeds");
+        registry.load_tool("demo.one").expect("load one");
+        registry.load_tool("demo.two").expect("load two");
+
+        registry.unload_tool("demo.one").expect("unload one");
+        let surfaced: Vec<String> = registry
+            .loaded_tool_specs()
+            .iter()
+            .map(|spec| spec.name.clone())
+            .collect();
+        assert_eq!(surfaced, vec!["demo.two"]);
+        assert_eq!(
+            registry.tool_state("demo.one"),
+            Some(ToolLifecycle::Available)
+        );
+        assert_eq!(registry.tool_state("demo.two"), Some(ToolLifecycle::Loaded));
+    }
+
+    #[test]
+    fn capability_snapshot_restore_keeps_per_tool_surface() {
+        let registry = CapabilityRegistry::new();
+        registry
+            .register(Arc::new(demo_capability("demo")))
+            .expect("registration succeeds");
+        registry.load_tool("demo.two").expect("load two");
+
+        let snapshot = registry.snapshot();
+        let restored = CapabilityRegistry::new();
+        restored
+            .register(Arc::new(demo_capability("demo")))
+            .expect("registration succeeds");
+        restored.restore(&snapshot);
+
+        let surfaced: Vec<String> = restored
+            .loaded_tool_specs()
+            .iter()
+            .map(|spec| spec.name.clone())
+            .collect();
+        assert_eq!(surfaced, vec!["demo.two"]);
+        // The snapshot wrote the authoritative per-tool list.
+        assert_eq!(snapshot[0].loaded_tools, vec!["demo.two".to_string()]);
+        assert!(snapshot[0].loaded);
+    }
+
+    #[test]
+    fn legacy_whole_capability_checkpoint_migrates_to_all_tools() {
+        let registry = CapabilityRegistry::new();
+        registry
+            .register(Arc::new(demo_capability("demo")))
+            .expect("registration succeeds");
+        // Old checkpoints carry `loaded: true` and no per-tool list; restore
+        // must migrate them to "every declared tool loaded".
+        registry.restore(&[crate::checkpoint::CapabilitySnapshot {
+            id: "demo".into(),
+            activation: CapabilityActivation::Enabled,
+            loaded: true,
+            loaded_tools: Vec::new(),
+        }]);
+        let mut surfaced: Vec<String> = registry
+            .loaded_tool_specs()
+            .iter()
+            .map(|spec| spec.name.clone())
+            .collect();
+        surfaced.sort();
+        assert_eq!(surfaced, vec!["demo.one", "demo.three", "demo.two"]);
+    }
+
+    #[test]
+    fn legacy_capability_snapshot_json_without_tool_list_deserializes() {
+        // Old journal/checkpoint JSON has no loaded_tools field; it must
+        // deserialize without fabricating a per-tool claim.
+        let json = serde_json::json!({
+            "id": "demo",
+            "activation": "enabled",
+            "loaded": true
+        });
+        let snapshot: crate::checkpoint::CapabilitySnapshot = serde_json::from_value(json).unwrap();
+        assert!(snapshot.loaded);
+        assert!(snapshot.loaded_tools.is_empty());
     }
 }
 
