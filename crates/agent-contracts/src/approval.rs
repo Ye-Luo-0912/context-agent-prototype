@@ -67,3 +67,32 @@ pub trait ApprovalGate: Send + Sync {
         cancel: &CancellationToken,
     ) -> AgentResult<ApprovalDecision>;
 }
+
+/// The v2 perspective on one approval decision, computed *beside* the
+/// legacy gate (shadow mode): what an intent-based `AuthorityGate` would
+/// decide. The v2 policy is deny-by-default — only a live standing grant
+/// whose target scope contains the derived effect intent allows the call —
+/// so `Denied` is the normal answer for an ungranted write/process call,
+/// and read-only calls need no grant at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShadowVerdict {
+    /// The derived intent falls inside a live standing grant (or is
+    /// read-only and needs no grant).
+    Granted { grant_id: String, reason: String },
+    /// The derived intent matches no live grant; a v2 gate would refuse.
+    Denied { reason: String },
+}
+
+/// The shadow authority seam (ACI v2 compatibility order step 4): an
+/// intent-derived decision recorded beside the legacy `ApprovalGate`
+/// without being enforced. The kernel runs both paths when a shadow gate is
+/// configured and publishes the comparison, so the invariant trace —
+/// granted/denied/reason — can be checked against the legacy path before
+/// the v2 gate is ever enforced. The one hard invariant is that the shadow
+/// gate never *grants* beyond the legacy gate: `Granted` in shadow must
+/// imply `Allow` on the legacy path, otherwise the v2 policy has a
+/// privilege-expansion bug.
+#[async_trait]
+pub trait IntentShadowGate: Send + Sync {
+    async fn shadow_verdict(&self, call: &ToolCall, spec: &ToolSpec) -> ShadowVerdict;
+}

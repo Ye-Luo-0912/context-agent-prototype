@@ -18,8 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_contracts::{
     AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, Effect, EffectCommitError,
-    EventJournal, OutputBroker, RunId, RuntimeEvent, RuntimeEventEnvelope, ToolCall, ToolOutput,
-    ToolSpec,
+    EventJournal, IntentShadowGate, OutputBroker, RunId, RuntimeEvent, RuntimeEventEnvelope,
+    ShadowVerdict, ToolCall, ToolOutput, ToolSpec,
 };
 use tokio::sync::broadcast;
 
@@ -123,9 +123,12 @@ impl EventAuthority {
 /// normalizes the three outcomes (allowed / denied / machinery failed) so
 /// callers match a verdict instead of re-interpreting `AgentResult` + a
 /// boolean, and so a future Core can substitute its own policy evaluation
-/// behind the same shape.
+/// behind the same shape. When a shadow gate is configured, the v2
+/// intent-derived verdict is computed beside the legacy decision (never
+/// enforced) so the invariant trace can be audited.
 pub struct ApprovalAuthority {
     approval: Arc<dyn ApprovalGate>,
+    shadow: Option<Arc<dyn IntentShadowGate>>,
 }
 
 /// The normalized outcome of one approval check.
@@ -141,7 +144,18 @@ pub enum ApprovalVerdict {
 
 impl ApprovalAuthority {
     pub fn new(approval: Arc<dyn ApprovalGate>) -> Self {
-        Self { approval }
+        Self {
+            approval,
+            shadow: None,
+        }
+    }
+
+    /// Attach the v2 shadow gate (ACI v2 compatibility order step 4). The
+    /// shadow verdict is recorded beside the legacy decision, never
+    /// enforced.
+    pub fn with_shadow(mut self, shadow: Arc<dyn IntentShadowGate>) -> Self {
+        self.shadow = Some(shadow);
+        self
     }
 
     /// Ask the gate and normalize its answer. Deny and error both produce a
@@ -159,6 +173,21 @@ impl ApprovalAuthority {
                 ApprovalVerdict::Denied(format!("tool denied by approval policy: {}", call.name))
             }
             Err(error) => ApprovalVerdict::Failed(format!("approval check failed: {error}")),
+        }
+    }
+
+    /// Whether a shadow gate is attached (so the caller only publishes
+    /// `ShadowDecision` events when there is a comparison to record).
+    pub fn has_shadow(&self) -> bool {
+        self.shadow.is_some()
+    }
+
+    /// The v2 shadow verdict for one call, when a shadow gate is attached.
+    pub async fn shadow_verdict(&self, call: &ToolCall, spec: &ToolSpec) -> Option<ShadowVerdict> {
+        if let Some(shadow) = &self.shadow {
+            Some(shadow.shadow_verdict(call, spec).await)
+        } else {
+            None
         }
     }
 }

@@ -24,6 +24,11 @@ pub struct AgentKernelConfig {
     /// `ToolOutcome` reaches the actor. `None` keeps the runtime's last-line
     /// truncation (bounded but no artifact spill).
     pub output_broker: Option<Arc<dyn OutputBroker>>,
+    /// Optional v2 shadow gate (ACI v2 compatibility order step 4): the
+    /// intent-derived verdict is computed beside the legacy approval gate
+    /// and published as a `ShadowDecision` event, never enforced. `None`
+    /// keeps the legacy approval path exactly as before.
+    pub shadow_gate: Option<Arc<dyn agent_contracts::IntentShadowGate>>,
 }
 
 impl std::fmt::Debug for AgentKernelConfig {
@@ -33,6 +38,7 @@ impl std::fmt::Debug for AgentKernelConfig {
             .field("context_budget_tokens", &self.context_budget_tokens)
             .field("max_tool_rounds", &self.max_tool_rounds)
             .field("output_broker", &"<output broker>")
+            .field("shadow_gate", &"<shadow gate>")
             .finish()
     }
 }
@@ -49,6 +55,7 @@ impl Default for AgentKernelConfig {
             context_budget_tokens: 24_000,
             max_tool_rounds: 16,
             output_broker: None,
+            shadow_gate: None,
         }
     }
 }
@@ -86,6 +93,13 @@ impl AgentKernel {
         let (event_tx, _) = tokio::sync::broadcast::channel(1_024);
         let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let output_broker = config.output_broker.clone();
+        let shadow_gate = config.shadow_gate.clone();
+        let approval = ApprovalAuthority::new(approval);
+        let approval = if let Some(shadow) = shadow_gate {
+            approval.with_shadow(shadow)
+        } else {
+            approval
+        };
         Self {
             run_id: RunId::new(),
             config,
@@ -93,7 +107,7 @@ impl AgentKernel {
             model,
             tools,
             event: EventAuthority::new(journal, event_tx, seq),
-            approval: ApprovalAuthority::new(approval),
+            approval,
             effect: EffectAuthority,
             output: OutputAuthority::new(output_broker),
         }
@@ -489,7 +503,28 @@ impl AgentKernel {
             ));
         };
 
-        match self.approval.authorize(&call, &spec, &cancel).await {
+        let verdict = self.approval.authorize(&call, &spec, &cancel).await;
+        let legacy_allowed = matches!(verdict, ApprovalVerdict::Allowed);
+
+        // Shadow mode (ACI v2 step 4): record what the v2 intent-derived
+        // gate would decide beside the legacy decision — for allowed and
+        // denied calls alike, so the invariant trace (granted/denied/
+        // reason) can be compared against the legacy path. Best-effort
+        // observability: a failed journal append must not turn a granted
+        // call into an error.
+        if self.approval.has_shadow()
+            && let Some(shadow) = self.approval.shadow_verdict(&call, &spec).await
+        {
+            let _ = self
+                .emit_event(RuntimeEvent::ShadowDecision {
+                    call_name: call.name.clone(),
+                    legacy_allowed,
+                    shadow,
+                })
+                .await;
+        }
+
+        match verdict {
             ApprovalVerdict::Allowed => {}
             ApprovalVerdict::Denied(message) | ApprovalVerdict::Failed(message) => {
                 return ToolOutcome::Value(tool_error_output(&call, message));
@@ -1217,6 +1252,87 @@ mod tests {
             limits.as_slice(),
             &[0],
             "0 must stay 0 so the engine default applies"
+        );
+    }
+
+    // --- ACI v2 shadow mode (IntentShadowGate) ---
+
+    /// A deterministic shadow gate for the kernel integration test.
+    struct FixedShadowGate(agent_contracts::ShadowVerdict);
+
+    #[async_trait::async_trait]
+    impl agent_contracts::IntentShadowGate for FixedShadowGate {
+        async fn shadow_verdict(
+            &self,
+            _call: &ToolCall,
+            _spec: &ToolSpec,
+        ) -> agent_contracts::ShadowVerdict {
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_tool_publishes_the_shadow_decision_event() {
+        let shadow = Arc::new(FixedShadowGate(agent_contracts::ShadowVerdict::Denied {
+            reason: "no live standing grant matches the derived intent (workspace write to 'x')"
+                .into(),
+        }));
+        let kernel = Arc::new(AgentKernel::new(
+            AgentKernelConfig {
+                shadow_gate: Some(shadow),
+                ..AgentKernelConfig::default()
+            },
+            Arc::new(RecordingEngine {
+                searched_limits: Default::default(),
+                fetched: Default::default(),
+            }),
+            Arc::new(UnusedModel),
+            Arc::new(BigOutputDispatcher {
+                output: ToolOutput {
+                    call_id: "c1".into(),
+                    tool_name: "big.tool".into(),
+                    ok: true,
+                    summary: "done".into(),
+                    model_content: "ok".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                },
+            }),
+            Arc::new(AllowAllApproval),
+            None,
+        ));
+        let mut events = kernel.subscribe();
+
+        let outcome = kernel
+            .execute_tool(
+                call("big.tool"),
+                CancellationToken::new(),
+                &surface_with("big.tool"),
+            )
+            .await;
+        assert!(
+            matches!(outcome, ToolOutcome::Value(_)),
+            "the legacy gate still runs and the call executes"
+        );
+
+        // The shadow comparison is published for the allowed call.
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("a ShadowDecision event must be published")
+            .expect("stream open");
+        let RuntimeEvent::ShadowDecision {
+            call_name,
+            legacy_allowed,
+            shadow,
+        } = envelope.event
+        else {
+            panic!("expected ShadowDecision, got {:?}", envelope.event);
+        };
+        assert_eq!(call_name, "big.tool");
+        assert!(legacy_allowed, "the legacy AllowAll gate allowed the call");
+        assert!(
+            matches!(shadow, agent_contracts::ShadowVerdict::Denied { .. }),
+            "the shadow gate recorded its v2 refusal"
         );
     }
 }

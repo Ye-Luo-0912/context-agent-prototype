@@ -201,6 +201,17 @@ pub enum RuntimeEvent {
         input_tokens: u64,
         output_tokens: u64,
     },
+    /// A shadow-mode approval decision (ACI v2 compatibility order step 4):
+    /// the v2 intent-derived verdict recorded beside the legacy gate. Only
+    /// emitted when a shadow gate is configured; the legacy gate's decision
+    /// is the one that runs. `legacy_allowed` records whether the legacy
+    /// path allowed the call, so the invariant trace can prove the shadow
+    /// gate never grants beyond the legacy gate.
+    ShadowDecision {
+        call_name: String,
+        legacy_allowed: bool,
+        shadow: crate::approval::ShadowVerdict,
+    },
     RunCompleted,
 }
 

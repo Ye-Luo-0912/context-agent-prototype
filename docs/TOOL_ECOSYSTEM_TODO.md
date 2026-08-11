@@ -892,9 +892,16 @@ together with TaskAnchor and continuous context GC.
   sequences, durable barrier broadcast, failed-barrier silence, verdict
   normalization, commit/rollback classification, broker pass-through).
   Still open (later steps of the v2 compatibility order, not this slice):
-  the shadow-mode `AuthorityGate` beside the legacy gate, `EffectReceipt`s,
-  and commit-time resource enforcement from the `EffectIntent`
-  (`AuthorityLease` — the M14 residual).
+  `EffectReceipt`s and commit-time resource enforcement from the
+  `EffectIntent` (`AuthorityLease` — the M14 residual). The shadow-mode
+  `AuthorityGate` step of the compatibility order is now landed as its own
+  slice: `IntentShadowGate`/`ShadowVerdict` (agent-contracts), the
+  `AgentKernelConfig.shadow_gate` injection and the bounded
+  `RuntimeEvent::ShadowDecision` published for allowed and denied calls
+  alike, with the standing-grant gate's shadow verdict reusing the same
+  matching logic as its legacy `authorize` so the hard invariant (shadow
+  `Granted` implies legacy `Allow`) holds by construction and is pinned by
+  tests. See `docs/ACI_CONTRACT_DRAFT.md` §7 step 4.
 - [ ] **MOD-04A** Move context/model/tool/config scheduling behind
   `agent-runtime::RuntimeServices`; only then perform the mechanical
   `agent-kernel -> agent-core` rename as a behavior-free change.

@@ -527,6 +527,25 @@ impl AppState {
                     self.input_tokens, self.output_tokens
                 ));
             }
+            RuntimeEvent::ShadowDecision {
+                call_name,
+                legacy_allowed,
+                shadow,
+            } => {
+                // ACI v2 shadow-mode audit row: what the intent-derived gate
+                // would decide beside the legacy decision that ran. Bounded
+                // to the verdict, never the arguments.
+                let shadow_label = match &shadow {
+                    agent_contracts::ShadowVerdict::Granted { grant_id, .. } => {
+                        format!("v2 grant '{grant_id}'")
+                    }
+                    agent_contracts::ShadowVerdict::Denied { .. } => "v2 deny".to_string(),
+                };
+                self.push_system(format!(
+                    "shadow approval: {call_name} legacy={} -> {shadow_label}",
+                    if legacy_allowed { "allow" } else { "deny" }
+                ));
+            }
             RuntimeEvent::RunCompleted => {
                 self.busy = false;
                 self.status = "stopped".into();

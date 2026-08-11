@@ -443,6 +443,21 @@ only pins the field conversions each step must preserve:
 4. **AuthorityGate in shadow mode** — new intent matcher runs beside the
    legacy `ApprovalGate`; decisions logged, not enforced, until the
    invariant trace (granted/denied/reason) matches the legacy path.
+   **Landed 2026-08-11 (MOD-04 slice).** `IntentShadowGate` + `ShadowVerdict`
+   (agent-contracts), the `AgentKernelConfig.shadow_gate` injection, and a
+   `RuntimeEvent::ShadowDecision { call_name, legacy_allowed, shadow }`
+   published by `execute_tool` for allowed and denied calls alike. The
+   standing-grant gate implements the shadow verdict with the *same*
+   matching logic as its legacy `authorize` (derived `EffectIntent` against
+   live grants, including the run cap) without consuming any state, so the
+   hard invariant — shadow `Granted` implies legacy `Allow` — holds by
+   construction and is pinned by tests
+   (`shadow_verdict_never_grants_beyond_the_legacy_path`,
+   `execute_tool_publishes_the_shadow_decision_event`). An ungranted
+   write/process call is shadow-`Denied` even when the legacy inner gate
+   would allow it — shadow being stricter than legacy is the point; the
+   reverse would be a privilege-expansion bug. The TUI renders the bounded
+   verdict row.
 5. **Migrate builtin effects + receipts** — builtin workspace effects emit
    `EffectReceipt`; journal format keeps `EffectCommitError` semantics.
 6. **Disable direct capability mutation, add IPC EffectRequest** — the

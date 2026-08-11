@@ -7,7 +7,7 @@ use std::{
 
 use agent_contracts::{
     AgentError, AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, EffectIntent,
-    StandingGrant, ToolCall, ToolRisk, ToolSpec,
+    IntentShadowGate, ShadowVerdict, StandingGrant, ToolCall, ToolRisk, ToolSpec,
 };
 use tokio::sync::{Mutex, broadcast, oneshot};
 use uuid::Uuid;
@@ -419,6 +419,69 @@ impl TaskApprovalGate {
     }
 }
 
+/// A human-readable label of a derived intent, for shadow verdict reasons.
+fn intent_label(intent: &EffectIntent) -> String {
+    match intent {
+        EffectIntent::ReadOnly => "read-only".to_string(),
+        EffectIntent::WorkspaceWrite { path, .. } => {
+            format!("workspace write to '{path}'")
+        }
+        EffectIntent::ProcessRun { command } => format!("process run '{command}'"),
+    }
+}
+
+/// The shadow mode of the standing-grant gate: the v2 deny-by-default
+/// perspective, recorded beside the legacy path and never enforced. The
+/// verdict reuses the *same* matching logic as `authorize` (derived intent
+/// against live grants, including the run cap), but does not consume any
+/// state — so the invariant "shadow `Granted` implies legacy `Allow`" holds
+/// by construction, and an ungranted write/process call is `Denied` here
+/// even when the legacy inner gate (permissive policy, interactive prompt)
+/// would allow it. That asymmetry — shadow stricter than legacy — is the
+/// point of shadow mode; the reverse would be a privilege-expansion bug.
+#[async_trait::async_trait]
+impl IntentShadowGate for TaskApprovalGate {
+    async fn shadow_verdict(&self, call: &ToolCall, spec: &ToolSpec) -> ShadowVerdict {
+        if spec.risk == ToolRisk::ReadOnly {
+            return ShadowVerdict::Granted {
+                grant_id: "read-only".into(),
+                reason: "read-only calls need no standing grant".into(),
+            };
+        }
+        let intent = Self::derive_effect_intent(call, spec);
+        let now = (self.now)();
+        let mut book = self.grants.lock().await;
+        book.retain(|_, entry| entry.grant.expires_at_ms > now);
+        for (id, entry) in book.iter() {
+            if !Self::grant_matches(&entry.grant, &intent) {
+                continue;
+            }
+            // An exhausted grant must not grant in shadow either: the
+            // legacy path refuses it, so granting here would make the
+            // shadow gate look *wider* than the legacy gate.
+            if let Some(max) = entry.grant.constraint.max_runs
+                && entry.runs_used >= max
+            {
+                continue;
+            }
+            return ShadowVerdict::Granted {
+                grant_id: id.clone(),
+                reason: format!(
+                    "derived intent ({}) matches standing grant '{}'",
+                    intent_label(&intent),
+                    id
+                ),
+            };
+        }
+        ShadowVerdict::Denied {
+            reason: format!(
+                "no live standing grant matches the derived intent ({})",
+                intent_label(&intent)
+            ),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ApprovalGate for TaskApprovalGate {
     async fn authorize(
@@ -672,6 +735,13 @@ mod tests {
             Arc::new(Self {
                 calls: Mutex::new(Vec::new()),
                 decision: ApprovalDecision::Deny,
+            })
+        }
+
+        fn allowing() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                decision: ApprovalDecision::Allow,
             })
         }
     }
@@ -1249,5 +1319,166 @@ mod tests {
         };
         let intent = TaskApprovalGate::derive_effect_intent(&missing, &write_spec);
         assert!(!TaskApprovalGate::grant_matches(&grant, &intent));
+    }
+
+    // --- IntentShadowGate (ACI v2 shadow mode) ---
+
+    #[tokio::test]
+    async fn shadow_verdict_grants_read_only_without_a_grant() {
+        let gate = TaskApprovalGate::new(RecordingGate::denying());
+        let read_only = ToolSpec {
+            name: "fs.read".into(),
+            description: "read".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+        };
+        let verdict = gate
+            .shadow_verdict(
+                &ToolCall {
+                    id: "c".into(),
+                    name: "fs.read".into(),
+                    arguments: json!({"path": "src/main.rs"}),
+                },
+                &read_only,
+            )
+            .await;
+        assert!(
+            matches!(verdict, ShadowVerdict::Granted { ref grant_id, .. } if grant_id == "read-only"),
+            "read-only needs no grant: {verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_verdict_grants_when_a_grant_matches_and_denies_otherwise() {
+        let gate = TaskApprovalGate::new(RecordingGate::denying());
+        gate.grant(write_grant("g-src", "src/", u64::MAX))
+            .await
+            .unwrap();
+
+        let granted = gate
+            .shadow_verdict(&write_call_at("src/main.rs", "x"), &write_spec())
+            .await;
+        assert!(
+            matches!(granted, ShadowVerdict::Granted { ref grant_id, .. } if grant_id == "g-src"),
+            "a matching grant must grant in shadow: {granted:?}"
+        );
+
+        let denied = gate
+            .shadow_verdict(&write_call_at("elsewhere/x.rs", "x"), &write_spec())
+            .await;
+        assert!(
+            matches!(denied, ShadowVerdict::Denied { ref reason } if reason.contains("no live standing grant")),
+            "an ungranted write must be denied by the v2 policy: {denied:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_verdict_respects_expiry_and_run_caps_like_the_legacy_path() {
+        // Expired grant: the legacy path would delegate (and a missing
+        // responder denies); shadow must not grant either. `grant()` refuses
+        // an already-expired grant, so the expiry is produced by moving the
+        // injected clock past the grant's deadline.
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let now_for_gate = now.clone();
+        let expired = TaskApprovalGate::with_clock(
+            RecordingGate::denying(),
+            Box::new(move || now_for_gate.load(std::sync::atomic::Ordering::SeqCst)),
+        );
+        expired
+            .grant(write_grant("g-old", "src/", 2_000))
+            .await
+            .unwrap();
+        now.store(3_000, std::sync::atomic::Ordering::SeqCst);
+        let verdict = expired
+            .shadow_verdict(&write_call_at("src/main.rs", "x"), &write_spec())
+            .await;
+        assert!(
+            matches!(verdict, ShadowVerdict::Denied { .. }),
+            "an expired grant must not grant: {verdict:?}"
+        );
+
+        // Run-capped process grant: after the cap is consumed on the legacy
+        // path, shadow must not grant — otherwise shadow would look wider
+        // than the legacy gate.
+        let process = TaskApprovalGate::new(RecordingGate::denying());
+        process
+            .grant(StandingGrant {
+                id: "g-run".into(),
+                risk: ToolRisk::ProcessExecution,
+                target: GrantTarget {
+                    workspace_path_prefix: None,
+                    process_command_prefix: Some("cargo test".into()),
+                },
+                constraint: agent_contracts::GrantConstraint {
+                    max_runs: Some(2),
+                    ..Default::default()
+                },
+                expires_at_ms: u64::MAX,
+            })
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let decision = process
+                .authorize(
+                    &process_call("cargo test"),
+                    &process_spec(),
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(decision, ApprovalDecision::Allow);
+        }
+        let verdict = process
+            .shadow_verdict(&process_call("cargo test"), &process_spec())
+            .await;
+        assert!(
+            matches!(verdict, ShadowVerdict::Denied { .. }),
+            "an exhausted run cap must not grant in shadow: {verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_verdict_never_grants_beyond_the_legacy_path() {
+        // The hard invariant of shadow mode: whenever shadow says Granted,
+        // the legacy path must say Allow. Exercise a mix of granted and
+        // ungranted writes/process calls against a permissive inner gate.
+        let inner = RecordingGate::allowing();
+        let gate = TaskApprovalGate::new(inner.clone());
+        gate.grant(write_grant("g-src", "src/", u64::MAX))
+            .await
+            .unwrap();
+        gate.grant(StandingGrant {
+            id: "g-run".into(),
+            risk: ToolRisk::ProcessExecution,
+            target: GrantTarget {
+                workspace_path_prefix: None,
+                process_command_prefix: Some("cargo".into()),
+            },
+            constraint: Default::default(),
+            expires_at_ms: u64::MAX,
+        })
+        .await
+        .unwrap();
+
+        let cancel = CancellationToken::new();
+        let cases: Vec<(ToolCall, ToolSpec)> = vec![
+            (write_call_at("src/main.rs", "x"), write_spec()),
+            (write_call_at("elsewhere/x.rs", "x"), write_spec()),
+            (process_call("cargo test"), process_spec()),
+            (process_call("npm install"), process_spec()),
+        ];
+        for (call, spec) in cases {
+            let shadow = gate.shadow_verdict(&call, &spec).await;
+            let legacy = gate.authorize(&call, &spec, &cancel).await.unwrap();
+            if matches!(shadow, ShadowVerdict::Granted { .. }) {
+                assert_eq!(
+                    legacy,
+                    ApprovalDecision::Allow,
+                    "shadow Granted for '{}' must imply legacy Allow",
+                    call.name
+                );
+            }
+        }
     }
 }
