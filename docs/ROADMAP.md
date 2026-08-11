@@ -1118,8 +1118,8 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 | --- | --- | --- |
 | M10 Runtime Consistency | 🟡 transaction baseline | Cross-plane checkpoint capture and live-restore audit/recovery are closed (`CORE-03`), the GC/storage/checkpoint/restore operation protocol is closed (`CTX-06`), and the task authority/completion contract is closed (`CTX-10`: TaskAnchor, CompletionRecord, atomic root transfer, storage-root outcomes). M10's named acceptance (runtime and context never drift into a task/state split-brain) is exercised by the invariant suite; the remaining gap is a single standing recovery-replay path (`CORE-02` residual) rather than a missing transaction primitive. |
 | M11 Context Recall | ✅ narrow retrieval baseline | Search/inspect/fetch, transient results, bounded external view and service parity work. Canonical catalog ownership and complete cross-residency semantics remain context-runtime work rather than reasons to call recall itself absent. TaskAnchor/Completion roots are now implemented (`CTX-10`). |
-| M12 Effect Runtime | 🟡 partial | In-process prepared effects use the generation fence, process capabilities stage structured wire effects the core commits behind the fence (`CORE-01` wire broker), `shell.exec` and git kill their whole process tree on cancel/timeout, approval waits stop the moment the operation is cancelled and clean up every pending entry, and provider streams are byte-capped (`CORE-06`). Windows Job-Object quotas (an M13 boundary) keep the milestone open. |
-| M13 Extension Sandbox | ⛔ trust blocker | Env scrub, private cwd, bounded stderr and process-tree cancellation are useful host hardening. A cwd is not a filesystem boundary; absolute filesystem/network access and cross-platform resource isolation are not brokered. |
+| M12 Effect Runtime | ✅ | In-process prepared effects and process-capability wire effects commit behind the generation fence (`CORE-01`), a cancelled operation kills its whole process tree (`CORE-06`: shell/git/capability share one tree-kill) and cleans up every pending approval entry, provider streams are byte-capped, and Windows Job-Object quotas are kernel-enforced. The standing-grant `TaskExecutionPolicy` (CORE-08) is M14 approval-policy work, not an M12 gap. |
+| M13 Extension Sandbox | 🟡 partial | Env scrub, private cwd, bounded stderr, process-tree cancellation and Windows Job-Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE) are enforced; Unix rlimits cover CPU/process count. A cwd is still not a filesystem boundary: absolute filesystem/network access is not brokered, which keeps M13 open. |
 | M14 Resource Policy | 🟡 partial | Schema/context quotas, risk/permission validation and final output guards exist. A unified output broker, standing task execution policy and effect-derived approval/resource enforcement remain open. |
 | M15 Real Evaluation | 🧪 instrumentation/smoke only | Replay is a policy proxy and the live run is a no-tool constraint-retention task. There is no paired real coding workload, hidden outcome verification, all-module cost accounting or non-inferiority result. |
 | V2 Self-Iteration | 🔒 blocked | Registry maturity and sandboxed self-checks are foundations only. Autonomous generation/promotion stays disabled until M10 and M12-M15 acceptance gates close. |
@@ -1152,14 +1152,16 @@ the required gate order; the numbered list and table above are authoritative.
    stays in the context queue.
 3. **V1-M12 Effect Runtime** — every capability routes side effects through
    one unified EffectRequest/Effect commit. Acceptance: a cancelled
-   operation produces no avoidable stale mutation. 🟡 The process-wire path
+   operation produces no avoidable stale mutation. ✅ The process-wire path
    (`CORE-01` wire broker), the direct-shell escape path and approval
-   timeout/cancel cleanup (`CORE-06`) are closed; Windows Job-Object quotas
-   keep the gate open.
+   timeout/cancel cleanup (`CORE-06`) are closed, and Windows Job-Object
+   quotas are kernel-enforced; the standing-grant `TaskExecutionPolicy`
+   stays with M14 (`CORE-08`).
 4. **V1-M13 Extension Sandbox** — process sandbox, env scrub, brokered
    FS/network, cancel. Acceptance: experimental code cannot exceed the
-   permissions granted to it. ⛔ Host hardening exists, but brokered OS
-   filesystem/network and cross-platform resource enforcement do not.
+   permissions granted to it. 🟡 Host hardening plus Windows Job-Object
+   quotas and Unix rlimits exist; brokered OS filesystem/network access
+   is still not implemented.
 5. **V1-M14 Resource Policy** — tool schema budget (the per-round surface
    bound landed in Performance P1), context hint quota,
    RiskClass, PermissionSet. Acceptance: the LLM cannot exhaust runtime

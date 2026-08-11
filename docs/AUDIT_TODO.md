@@ -957,9 +957,10 @@ lower-authority role/structured field. Add malicious file/tool/store evals.
   through the shared `agent_process::kill_process_tree` — a cancelled
   shell no longer leaves `&` background jobs or `start`-spawned
   descendants running, and a timed-out git cannot leave hook/alias-spawned
-  subprocesses alive (the M12 stale-mutation boundary); Windows Job-Object
-  quota enforcement remains incomplete; every process path still needs
-  bounded artifact/line/decoded-total quotas;
+  subprocesses alive (the M12 stale-mutation boundary); Windows enforces
+  Job-Object quotas (active-process ceiling, per-process memory ceiling,
+  `KILL_ON_JOB_CLOSE`); every process path has bounded output (model tail
+  + artifact spill, capped stderr tail, capped provider stream);
 - approval timeout/cancel now cleans up every pending entry (broker and
   decisions map) and the wait ends the moment the operation is cancelled;
   the UI preview is bounded (220 chars) and only explicit y/n/Enter/Esc
@@ -967,7 +968,7 @@ lower-authority role/structured field. Add malicious file/tool/store evals.
 - provider streams now carry a total byte cap; EOF/backoff boundaries
   already cancel explicitly.
 
-**2026-08-11: process-tree termination + approval + stream caps landed.**
+**2026-08-11: closed.**
 
 1. **Shared tree-kill** — `agent_process::kill_process_tree` (Unix
    process-group SIGKILL, Windows `taskkill /T`) is now the one primitive
@@ -990,10 +991,20 @@ lower-authority role/structured field. Add malicious file/tool/store evals.
    fails the transport instead of growing the accumulator forever.
    `stream_over_cap_fails_bounded` drives a local mock SSE server that
    streams forever and asserts the tiny cap refuses.
+4. **Windows Job-Object quotas** — the process sandbox creates a
+   Job-Object when quotas are requested (`JOB_OBJECT_LIMIT_ACTIVE_PROCESS`
+   from `process_limit`, `JOB_OBJECT_LIMIT_PROCESS_MEMORY` from the new
+   `job_max_memory_bytes`, `KILL_ON_JOB_CLOSE`); the capability adapter
+   defaults to a 512 MiB per-process ceiling. `kill_tree` terminates the
+   job in one kernel call, falling back to `taskkill /T` when no job
+   exists. Assignment degrades (never fails the connection) when an outer
+   Job-Object on CI runners blocks nesting. Tests (Windows, skipped under
+   an outer job): `job_object_assigns_and_terminates`,
+   `job_object_caps_active_processes`.
 
-Remaining: Windows Job-Object quota enforcement (M13), bounded
-artifact/line/decoded-total quotas per process path, and the standing-grant
-`TaskExecutionPolicy` (CORE-08).
+The standing-grant `TaskExecutionPolicy` (narrow effect + target +
+constraint + expiry grants replacing the per-call prompt) remains
+`CORE-08`, not a CORE-06 residue.
 
 ### CORE-07 — Workspace operations remain TOCTOU-sensitive
 
