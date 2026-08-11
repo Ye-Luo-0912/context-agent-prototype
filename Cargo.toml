@@ -9,6 +9,7 @@ members = [
     "crates/agent-context-service",
     "crates/agent-workspace",
     "crates/tool-runtime",
+    "crates/agent-conformance",
     "crates/agent-storage",
     "crates/agent-kernel",
     "crates/agent-runtime",
