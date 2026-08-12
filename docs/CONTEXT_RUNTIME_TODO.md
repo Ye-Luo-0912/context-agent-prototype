@@ -827,9 +827,14 @@ stable; it should not introduce a second orchestrator.
 - [x] Replay fact comparison now uses independent fresh engines for cost and
   coverage, with a regression matching the comparison result to a standalone
   fresh coverage run.
-- [ ] Rename/split Resident-only diagnostics from real logical catalog totals
+- [x] Rename/split Resident-only diagnostics from real logical catalog totals
   before using `total_items`, `inspect`, or replay `final_total` as retention
-  evidence.
+  evidence. **Landed via `CTX-09` (catalog DONE):** `total_items`/`inspect()`
+  are the logical catalog (resident heap + warm buffer + external store
+  entries; each id has exactly one owner, so the sum is exact) and replay
+  `final_total` is a real catalog total — `context-simple/src/diagnostics.rs`
+  computes the split and the external map maintains Cold/External counts in
+  O(1).
 - [~] Record baseline Resident/Warm/Cold/External counts, candidate count,
   selected count/tokens, maintenance work, GC work, store I/O, materialize
   p50/p95, recall count, and task success.
@@ -881,9 +886,15 @@ stable; it should not introduce a second orchestrator.
   half-closed task and an audit gap after commit fences recovery. Explicit
   `CompletionPrepared -> CompletionCommitted` phase *events* are not emitted
   as separate named stages; the ordering and atomicity are tested directly.
-- [ ] Reset/replace episode-local generation when Focus scope rotates; add a
+- [x] Reset/replace episode-local generation when Focus scope rotates; add a
   test that an overlong episode rotates once and the next episode receives a
-  fresh turn budget.
+  fresh turn budget. **Landed 2026-08-12:** `scope::close_focus_episode`
+  resets `FocusState.generation` to 0 at rotation (a rotated episode starts
+  with a fresh budget), and
+  `one_overlong_episode_does_not_exhaust_later_episode_budgets` drives an
+  episode past `episode_max_user_turns`, asserts the guard fires at the
+  budget boundary (not immediately), then verifies five related messages in
+  the next episode do not rotate and stay resident.
 - [ ] Apply TTL/terminal aging coherently across every body location and keep
   full GC progressing in external-only state.
 - [ ] Make dependency roots and scope-close transitions location-independent;
@@ -903,8 +914,15 @@ stable; it should not introduce a second orchestrator.
   non-deletable record (`CTX-05`).
 - [ ] Serialize or revision-check GC/storage-GC/checkpoint/restore plans and
   validate all residency layers (`CTX-06`).
-- [ ] Propagate failures from `BeforeModel` maintenance audit and explicit
+- [x] Propagate failures from `BeforeModel` maintenance audit and explicit
   `context.collect`; a context mutation cannot silently outrun its journal.
+  **Landed via `CTX-09` (audit propagation DONE):** a failed
+  `ContextMaintained` (BeforeModel) publication fences the turn (Error
+  event, model never called, no `TurnCompleted`); an explicit `collect`
+  propagates both a refused GC pass and a failed `ContextGc` publication
+  as `Error` events. Regressions:
+  `before_model_audit_failure_fences_the_turn`,
+  `collect_audit_failure_is_not_silent`.
 - [x] Split materialization preview from model consumption (`CTX-07`). After
   PromptAssembler and final provider packing, a successful non-stale model
   operation acknowledges the exact selected item/external-ref ids and
@@ -912,8 +930,15 @@ stable; it should not introduce a second orchestrator.
   rounds receive no reinforcement; reinforcement + the bounded audit event
   roll back together on failure. Remaining CTX-07 packing/hot-path work stays
   open below.
-- [ ] Render untrusted historical/retrieved content in a lower-authority,
-  delimited prompt channel (`CORE-05`).
+- [x] Render untrusted historical/retrieved content in a lower-authority,
+  delimited prompt channel (`CORE-05`). **Closed 2026-08-11:** the
+  `PromptAssembler` renders every observation as a low-authority `user`
+  message (never `system`); system holds policy only, and retrieved
+  file/tool/store content cannot gain system precedence. Regressions:
+  `retrieved_history_never_renders_as_system`,
+  `injected_instructions_cannot_gain_system_precedence`,
+  `external_refs_render_as_low_authority_observations`,
+  `malicious_file_and_tool_content_stays_in_the_tool_role`.
 - [ ] Coordinate with Effect Runtime/Resource Policy on task-scoped standing
   grants, `DenyAndContinue`, batched boundary requests and interruption caps;
   do not solve approval fatigue by silently broadening permissions.
@@ -935,8 +960,17 @@ stable; it should not introduce a second orchestrator.
   transition before roots are released.
 - [ ] Keep lexical overlap and turn cap as fallback guards; add explicit
   runtime/subgoal/verification boundary signals and measure false rotations.
-- [ ] Separate `event_seq`, `user_turn`, `gc_epoch`, and
+- [x] Separate `event_seq`, `user_turn`, `gc_epoch`, and
   `last_selected_turn`; every TTL/rule names one clock (`CTX-09`).
+  **Landed:** `event_seq` (monotonic, never advanced by `materialize`),
+  `turn` (user-turn clock), `gc_epoch` (full-GC generation) and
+  `last_selected_turn` (stamped on consumption acknowledgement) are
+  separate and every rule names its clock; the consumed-ephemeral check
+  uses event distance, ephemeral TTL ages in user turns, recency reads
+  `last_selected_turn`. Regressions:
+  `materialize_preview_is_a_read_that_advances_no_clock`,
+  `selection_stamp_is_written_only_by_consumption_ack`,
+  `ephemeral_ttl_counts_user_turns_not_events`.
 - [ ] Replace whole-heap minor scans with dirty ids + bounded aging work.
 - [ ] Add GC work/item/I/O budgets, backlog metrics, revision fencing, and a
   full reconciliation mode.
