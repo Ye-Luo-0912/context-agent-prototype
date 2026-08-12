@@ -16,6 +16,7 @@ members = [
     "crates/agent-replay",
     "crates/agent-eval",
     "crates/provider-openai",
+    "crates/agent-compose",
     "crates/agent-tui",
 ]
 resolver = "3"
@@ -38,6 +39,7 @@ agent-storage = { path = "crates/agent-storage" }
 agent-core = { path = "crates/agent-core" }
 agent-runtime = { path = "crates/agent-runtime" }
 provider-openai = { path = "crates/provider-openai" }
+agent-compose = { path = "crates/agent-compose" }
 
 async-trait = "0.1"
 base64 = "0.22"

@@ -1,21 +1,21 @@
 [package]
-name = "agent-tui"
+name = "agent-compose"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 agent-contracts.workspace = true
-agent-compose.workspace = true
 agent-core.workspace = true
 agent-runtime.workspace = true
-agent-storage.workspace = true
 agent-workspace.workspace = true
+agent-storage.workspace = true
+context-simple.workspace = true
+context-baselines.workspace = true
+context-contextcore.workspace = true
 tool-runtime.workspace = true
+provider-openai.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
-crossterm.workspace = true
-ratatui.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tracing.workspace = true

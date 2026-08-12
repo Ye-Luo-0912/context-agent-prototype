@@ -1032,8 +1032,27 @@ together with TaskAnchor and continuous context GC.
   activation/quarantine/maturity authority all live in `agent-core`; the
   runtime registry owns catalog views, load/unload scheduling, active
   state and per-round surface snapshots.
-- [ ] **COMPOSE-01** Extract reusable application/bootstrap composition from
+- [x] **COMPOSE-01** Extract reusable application/bootstrap composition from
   `agent-tui` for TUI/CLI/eval while keeping it stateless and actor-free.
+  **Done 2026-08-12.** New composition-root crate `agent-compose`: one
+  stateless, actor-free `compose(ComposeConfig)` async function wires the
+  module host (context/model/tool/approval + optional event/artifact
+  modules), the `CapabilityAwareDispatcher` (when `capability_aware`),
+  the kernel services from the typed registry, and spawns the
+  `RuntimeInstance` — without starting it, so the caller can subscribe to
+  events first (preserving `RunStarted` visibility). The config carries
+  the workspace, engine, model, approval gate, base tool dispatcher,
+  capability-aware flag, journal, artifact store and output broker; the
+  crate also owns the shared `ContextPolicy` parsing +
+  `build_context_engine` (append/rolling/dynamic/service, store always
+  under the run's state dir) and the env-driven `model_from_env`
+  (OpenAI-compatible provider or the moved `MockModelTransport`).
+  `agent-tui` and `agent-eval` now both call it: the TUI passes the full
+  interactive wiring (capability-aware dispatcher, journal, artifacts,
+  output broker), the eval harness passes its scripted engine/model/
+  allow-all approval with a plain dispatcher and no journal. Behavior
+  preserved — agent-eval's fixture tests (real tool surface end to end)
+  and the full workspace suite stay green.
 - [x] **ECO-02** Make manifest identity/path/source validation and process stdout/stderr
   accounting non-bypassable.
   **Verified 2026-08-11.** Identity: `validate_capability_id` runs at registration and

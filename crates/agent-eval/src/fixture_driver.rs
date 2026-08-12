@@ -16,10 +16,6 @@ use agent_contracts::{
     AgentResult, ApprovalDecision, ApprovalGate, ContextEngine, ModelTransport, RuntimeEvent,
     RuntimeEventEnvelope, ToolCall, ToolDispatcher, ToolSpec,
 };
-use agent_core::CoreAuthorityConfig;
-use agent_runtime::{
-    ApprovalModule, ContextModule, ModelModule, ModuleHost, RuntimeInstance, RuntimeServices,
-};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -252,7 +248,7 @@ pub async fn run_fixture_with_engine(
     let workspace = agent_workspace::Workspace::open(workspace_root).await?;
     let tools: Arc<dyn ToolDispatcher> =
         Arc::new(tool_runtime::BuiltinToolDispatcher::with_config(
-            workspace,
+            workspace.clone(),
             tool_runtime::ToolLifecycleConfig {
                 always_loaded: vec![
                     "fs.list".into(),
@@ -270,28 +266,35 @@ pub async fn run_fixture_with_engine(
             },
         ));
 
-    let mut host = ModuleHost::new();
-    host.add_module(Arc::new(ContextModule::new(context_engine)))?;
-    host.add_module(Arc::new(ModelModule::new(model)))?;
-    host.add_module(Arc::new(agent_runtime::ToolModule::new(tools)))?;
-    host.add_module(Arc::new(ApprovalModule::new(approval)))?;
-    host.start().await?;
-
-    let services = RuntimeServices::from_registry(host.registry(), CoreAuthorityConfig::default())?;
-    let runtime = RuntimeInstance::spawn(host, services);
-    let mut events = runtime.handle().subscribe();
-    runtime.start().await?;
+    // One shared composition (agent-compose): the host wiring, kernel
+    // services and actor spawn are identical to the TUI/CLI roots; the
+    // harness only differs in the pieces it hands in (engine, model,
+    // approval, plain dispatcher, no journal/artifacts/output broker).
+    let composed = agent_compose::compose(agent_compose::ComposeConfig {
+        workspace,
+        context_engine,
+        model,
+        approval,
+        base_tools: tools,
+        capability_aware: false,
+        journal: None,
+        artifact_store: None,
+        output_broker: None,
+    })
+    .await?;
+    let mut events = composed.subscribe();
+    composed.instance.start().await?;
 
     let mut collected: Vec<RuntimeEventEnvelope> = Vec::new();
     for (index, turn) in turns.iter().enumerate() {
-        runtime.handle().user_message(turn.to_string()).await?;
+        composed.handle().user_message(turn.to_string()).await?;
         if let Err(reason) = wait_for_turn(&mut events, &mut collected).await {
-            runtime.shutdown().await?;
+            composed.shutdown().await?;
             return Err(anyhow::anyhow!("turn {} failed: {reason}", index + 1));
         }
     }
     let passed = workload::fixture_passes(fixture, workspace_root);
-    runtime.shutdown().await?;
+    composed.shutdown().await?;
 
     Ok(FixtureEval {
         fixture_id: fixture.id,

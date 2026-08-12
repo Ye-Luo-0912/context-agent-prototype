@@ -1,0 +1,255 @@
+//! Reusable application/bootstrap composition (COMPOSE-01): one stateless,
+//! actor-free function turns a `ComposeConfig` into a `RuntimeInstance`
+//! wired over the module host. The TUI, any future CLI and the evaluation
+//! harness share the same host wiring — context/model/tool/approval
+//! modules, the optional event/artifact modules, the
+//! `CapabilityAwareDispatcher` and `RuntimeServices` derivation — so a
+//! composition change is exercised everywhere it is used.
+//!
+//! This crate owns no state and runs no loop: `compose` is a pure async
+//! function of its inputs (stateless), and it never drives the actor
+//! (actor-free — the caller subscribes, starts and drives the returned
+//! instance). Like `agent-tui` it is a composition root: it may import
+//! every concrete implementation, and nothing below `agent-runtime` may
+//! import it.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use agent_contracts::{
+    AgentResult, ApprovalGate, ContextEngine, ModelTransport, RuntimeEventEnvelope, ToolDispatcher,
+};
+use agent_core::CoreAuthorityConfig;
+use agent_runtime::{
+    ApprovalModule, ArtifactModule, CapabilityAwareDispatcher, ContextModule, EventModule,
+    ModelModule, ModuleHost, RuntimeHandle, RuntimeInstance, RuntimeServices, ToolModule,
+};
+use agent_storage::FileEventJournal;
+use agent_workspace::Workspace;
+use context_baselines::{AppendOnlyEngine, RollingConfig, RollingSummaryEngine};
+use context_contextcore::{ContextServiceConfig, ServiceEngine, connect_engine};
+use context_simple::{SimpleContextConfig, SimpleContextEngine};
+use provider_openai::{OpenAiConfig, OpenAiProvider, RetryingTransport};
+use tokio::sync::broadcast;
+
+mod mock_model;
+
+pub use mock_model::MockModelTransport;
+
+/// The context-engine policy, a composition-root choice shared by every
+/// entry point (TUI / CLI / eval). `append`, `rolling` and `dynamic` are
+/// in-process engines; `service` runs the process-boundary adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextPolicy {
+    Append,
+    Rolling,
+    Dynamic,
+    Service,
+}
+
+impl ContextPolicy {
+    /// Parse a `--context=` CLI value; the error names the valid set.
+    pub fn from_str_checked(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "append" => Ok(Self::Append),
+            "rolling" => Ok(Self::Rolling),
+            "dynamic" => Ok(Self::Dynamic),
+            "service" => Ok(Self::Service),
+            other => anyhow::bail!(
+                "unknown --context policy: {other} (expected append | rolling | dynamic | service)"
+            ),
+        }
+    }
+
+    /// The canonical CLI spelling of this policy.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Append => "append",
+            Self::Rolling => "rolling",
+            Self::Dynamic => "dynamic",
+            Self::Service => "service",
+        }
+    }
+}
+
+/// Build the context engine for a policy. The external context store always
+/// lives under the run's state directory — never guessed from the CWD, so a
+/// run started from a crate directory does not scatter `.focus-agent`
+/// folders around the tree.
+pub async fn build_context_engine(
+    policy: ContextPolicy,
+    state_dir: &Path,
+) -> anyhow::Result<Arc<dyn ContextEngine>> {
+    match policy {
+        ContextPolicy::Append => Ok(Arc::new(AppendOnlyEngine::new())),
+        ContextPolicy::Rolling => Ok(Arc::new(RollingSummaryEngine::with_config(
+            RollingConfig::default(),
+        ))),
+        ContextPolicy::Dynamic => Ok(Arc::new(SimpleContextEngine::new(SimpleContextConfig {
+            context_store_dir: Some(state_dir.join("context-store")),
+            ..SimpleContextConfig::default()
+        }))),
+        ContextPolicy::Service => connect_engine(&ContextServiceConfig {
+            engine: ServiceEngine::Dynamic,
+            // The service's context store must live under the workspace
+            // state dir too — the child never guesses a CWD-relative path.
+            store_dir: Some(state_dir.join("context-store")),
+            ..ContextServiceConfig::default()
+        })
+        .await
+        .map_err(anyhow::Error::from),
+    }
+}
+
+/// Composition-root model selection: a real OpenAI-compatible provider when
+/// `OPENAI_API_KEY` is set, otherwise the mock transport.
+///
+/// Optional overrides:
+/// - `OPENAI_BASE_URL` (default `https://api.openai.com/v1`) — point at
+///   DeepSeek (`https://api.deepseek.com/v1`), Qwen, Moonshot, GLM, ...
+/// - `OPENAI_MODEL` (default `gpt-4o-mini`)
+pub fn model_from_env() -> Arc<dyn ModelTransport> {
+    let Ok(api_key) = std::env::var("OPENAI_API_KEY") else {
+        return Arc::new(MockModelTransport);
+    };
+    if api_key.trim().is_empty() {
+        return Arc::new(MockModelTransport);
+    }
+
+    let base_url = std::env::var("OPENAI_BASE_URL")
+        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+    let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let provider = OpenAiProvider::new(OpenAiConfig {
+        api_key,
+        base_url,
+        model,
+        max_output_tokens: 4096,
+        timeout: std::time::Duration::from_secs(120),
+        send_stream_options: true,
+        send_max_tokens: true,
+        max_stream_bytes: provider_openai::DEFAULT_MAX_STREAM_BYTES,
+    });
+    Arc::new(RetryingTransport::new(
+        provider,
+        3,
+        std::time::Duration::from_millis(500),
+    ))
+}
+
+/// Everything a composed run differs on. The composition root (TUI/CLI/
+/// eval) selects the concrete pieces — engine, model, approval, tools —
+/// and `compose` wires them into a runtime.
+pub struct ComposeConfig {
+    /// Opened workspace (owns the state dir and artifact confinement).
+    pub workspace: Workspace,
+    /// The context engine, already selected by the caller.
+    pub context_engine: Arc<dyn ContextEngine>,
+    /// The model transport, already selected by the caller.
+    pub model: Arc<dyn ModelTransport>,
+    /// The approval gate, already selected by the caller.
+    pub approval: Arc<dyn ApprovalGate>,
+    /// The base tool dispatcher (the builtin surface).
+    pub base_tools: Arc<dyn ToolDispatcher>,
+    /// Wrap `base_tools` in a `CapabilityAwareDispatcher` over the host's
+    /// capability registry (interactive mode). `false` uses `base_tools`
+    /// as-is (harness mode).
+    pub capability_aware: bool,
+    /// Optional durable event journal -> `EventModule`.
+    pub journal: Option<Arc<FileEventJournal>>,
+    /// Optional artifact store -> `ArtifactModule`.
+    pub artifact_store: Option<Arc<Workspace>>,
+    /// Optional output broker (bounds every model-facing tool field and
+    /// spills oversized content under the run's artifact directory).
+    pub output_broker: Option<Arc<dyn agent_contracts::OutputBroker>>,
+}
+
+/// A composed runtime. Owns the workspace and the spawned `RuntimeInstance`
+/// (not yet started — subscribe first, then `start`, so `RunStarted` is
+/// observable, exactly like the hand-wired entry points). The caller drives
+/// the actor through the handle; `shutdown` runs the full ordered teardown.
+pub struct ComposedRuntime {
+    pub workspace: Workspace,
+    pub instance: RuntimeInstance,
+}
+
+impl ComposedRuntime {
+    /// The actor handle (user messages, focus, task commands, checkpoint).
+    pub fn handle(&self) -> &RuntimeHandle {
+        self.instance.handle()
+    }
+
+    /// Subscribe to runtime events. Call before `start` to see `RunStarted`.
+    pub fn subscribe(&self) -> broadcast::Receiver<RuntimeEventEnvelope> {
+        self.instance.handle().subscribe()
+    }
+
+    /// Full ordered shutdown (actor -> host -> join), aggregating errors.
+    pub async fn shutdown(self) -> AgentResult<()> {
+        self.instance.shutdown().await
+    }
+}
+
+/// Wire the module host (context/model/tool/approval + optional event/
+/// artifact modules), derive the kernel services from the typed registry,
+/// and spawn the runtime actor over them. Stateless: a pure function of
+/// `config`; the actor is spawned but not started, so the caller can
+/// subscribe to events before `start`.
+pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
+    let ComposeConfig {
+        workspace,
+        context_engine,
+        model,
+        approval,
+        base_tools,
+        capability_aware,
+        journal,
+        artifact_store,
+        output_broker,
+    } = config;
+
+    let mut host = ModuleHost::new();
+    host.add_module(Arc::new(ContextModule::new(context_engine)))?;
+    host.add_module(Arc::new(ModelModule::new(model)))?;
+    // The capability registry is the host's: capabilities registered against
+    // it (even mid-run) are picked up by the tool provider on the next
+    // model request. The dispatcher must see it before the ToolModule is
+    // added.
+    let capability_registry = host.capability_registry();
+    let tools: Arc<dyn ToolDispatcher> = if capability_aware {
+        Arc::new(CapabilityAwareDispatcher::with_workspace(
+            base_tools,
+            capability_registry,
+            // Capabilities that declare workspace/artifact permissions
+            // receive confined handles into the same workspace the builtin
+            // tools use.
+            Some(Arc::new(workspace.clone())),
+        ))
+    } else {
+        base_tools
+    };
+    host.add_module(Arc::new(ToolModule::new(tools)))?;
+    host.add_module(Arc::new(ApprovalModule::new(approval)))?;
+    if let Some(journal) = journal {
+        host.add_module(Arc::new(EventModule::new(journal)))?;
+    }
+    if let Some(artifact_store) = artifact_store {
+        host.add_module(Arc::new(ArtifactModule::new(artifact_store)))?;
+    }
+    host.start().await?;
+
+    // The composition seam: every service the run needs is resolved from
+    // the host's typed registry and handed to the runtime as one
+    // `RuntimeServices`; the kernel is derived inside the runtime.
+    let services = RuntimeServices::from_registry(
+        host.registry(),
+        CoreAuthorityConfig {
+            output_broker,
+            ..CoreAuthorityConfig::default()
+        },
+    )?;
+    let instance = RuntimeInstance::spawn(host, services);
+    Ok(ComposedRuntime {
+        workspace,
+        instance,
+    })
+}

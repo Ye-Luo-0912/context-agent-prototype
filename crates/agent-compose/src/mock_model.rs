@@ -1,3 +1,8 @@
+//! A trivial model transport used by the interactive composition root when
+//! no provider key is configured: echoes the latest user request and
+//! exercises one canned `fs.list` tool call for the "demo: list files"
+//! prompt. Replace with a real provider adapter to evaluate model quality.
+
 use agent_contracts::{
     AgentResult, ModelCapabilities, ModelOutput, ModelRequest, ModelRole, ModelTransport, ToolCall,
 };
