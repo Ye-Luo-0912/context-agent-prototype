@@ -296,6 +296,30 @@ impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
                 command.env(key, value);
             }
         }
+        // OS-level write confinement (Linux): the MCP server may create,
+        // modify or destroy filesystem state only inside its private cwd.
+        // Reads stay unhandled (the loader must be readable; the model sees
+        // only what the adapter returns). A kernel without landlock
+        // degrades to a warning; a server that cannot be confined does not
+        // start.
+        #[cfg(target_os = "linux")]
+        {
+            let roots = vec![private.path().to_path_buf()];
+            if !agent_process::landlock::available() {
+                eprintln!(
+                    "landlock sandbox skipped: kernel support unavailable \
+                     (OS-level write confinement off for MCP server '{}')",
+                    decl.program
+                );
+            } else {
+                let rules = agent_process::landlock::ChildRules::open(&roots).map_err(|e| {
+                    AgentError::Tool(format!("landlock sandbox setup for MCP server: {e}"))
+                })?;
+                unsafe {
+                    command.pre_exec(move || agent_process::landlock::apply_in_child(&rules));
+                }
+            }
+        }
         let mut child = command
             .spawn()
             .map_err(|e| AgentError::Tool(format!("spawn MCP server '{}': {e}", decl.program)))?;

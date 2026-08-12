@@ -1119,7 +1119,7 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 | M10 Runtime Consistency | ✅ | Cross-plane checkpoint capture and live-restore audit/recovery are closed (`CORE-03`), the GC/storage/checkpoint/restore operation protocol is closed (`CTX-06`), the task authority/completion contract is closed (`CTX-10`: TaskAnchor, CompletionRecord, atomic root transfer, storage-root outcomes), and the standing recovery-replay path is closed (`CORE-02` residual: `agent-replay --recover` locates the durability barrier and failure phase, checks envelope-sequence integrity, rebuilds the context-engine state from the trace, and proves checkpoint restore + tail replay equals the full rebuild). M10's named acceptance (runtime and context never drift into a task/state split-brain) is exercised by the invariant suite plus the engine-level restore-consistency proof. |
 | M11 Context Recall | ✅ narrow retrieval baseline | Search/inspect/fetch, transient results, bounded external view and service parity work. Canonical catalog ownership and complete cross-residency semantics remain context-runtime work rather than reasons to call recall itself absent. TaskAnchor/Completion roots are now implemented (`CTX-10`). |
 | M12 Effect Runtime | ✅ | In-process prepared effects and process-capability wire effects commit behind the generation fence (`CORE-01`), a cancelled operation kills its whole process tree (`CORE-06`: shell/git/capability share one tree-kill) and cleans up every pending approval entry, provider streams are byte-capped, and Windows Job-Object quotas are kernel-enforced. The standing-grant `TaskExecutionPolicy` (CORE-08) is M14 approval-policy work, not an M12 gap. |
-| M13 Extension Sandbox | 🟡 partial | Env scrub, private cwd, bounded stderr, process-tree cancellation, Windows Job-Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE), Unix rlimits (CPU/process) and directory-handle-relative workspace opens with reparse substitution rejected at open time (`CORE-07`) are enforced. Mid-invoke filesystem access is now brokered: a child's `fs.read` system request is answered only under the invocation's `workspace:read` grant, only through a confined workspace handle, and only for relative non-escaping paths (absolute/rooted and `..` paths refused before the handle is consulted); network is explicitly deny-by-default (no network permission word exists; recognized network ops get a named refusal). OS-level filesystem/network filtering — a hostile child opening arbitrary absolute paths or sockets at the OS layer — remains the residual gap (`CORE-01` open). |
+| M13 Extension Sandbox | 🟡 partial | Env scrub, private cwd, bounded stderr, process-tree cancellation, Windows Job-Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE), Unix rlimits (CPU/process) and directory-handle-relative workspace opens with reparse substitution rejected at open time (`CORE-07`) are enforced. Mid-invoke filesystem access is now brokered: a child's `fs.read` system request is answered only under the invocation's `workspace:read` grant, only through a confined workspace handle, and only for relative non-escaping paths (absolute/rooted and `..` paths refused before the handle is consulted); network is explicitly deny-by-default (no network permission word exists; recognized network ops get a named refusal). OS-level *write* filtering is now kernel-enforced on Linux (landlock, `MOD-06`): a confined child may create/modify/destroy filesystem state only under its configured write roots, irrevocably and inherited by every descendant, verified on a real kernel. OS-level *network* filtering (sockets) remains the residual gap (`CORE-01` open). |
 | M14 Resource Policy | ✅ | Schema/context quotas, risk/permission validation and final output guards exist; the narrow standing `TaskExecutionPolicy` is landed (`CORE-08`: effect + target + constraint + expiry grants, revocable, zero-responder deny/skip); the kernel-level trusted output broker is landed (`CORE-04`: capped fields, one-time artifact spill, execution-enforced query limits); a declared per-tool output budget on `ToolSpec` is enforced by the broker (clamped to the global hard cap); approval is now effect-derived: `EffectIntent` (contract type) is derived from the validated arguments and standing grants match the concrete intent (path, content bytes, command prefix) instead of re-parsing raw arguments; commit-time resource enforcement is landed (`AuthorityLease`: every side-effecting call mints a short-lived lease at approval, and the actor refuses to commit a staged effect whose lease expired or whose operation generation moved — rollback, never commit); and every meta-tool surface is bounded by logical history size, not by it: diagnostics answers in O(1) (Cold/External counts), `inspect` and `search` keep only their limit of rows while streaming (memory O(limit)), and the ledger is capped. The acceptance — the LLM cannot exhaust runtime resources through meta-tools — is met. |
 | M15 Real Evaluation | 🧪 instrumentation/smoke only | Replay is a policy proxy and the live run is a no-tool constraint-retention task. The A/B/C/D evaluation inputs (four tool-surface arms + four coding fixtures with hidden verification, `agent-eval --fixtures`), the all-module cost-accounting aggregation (`agent-eval --metrics`), a deterministic fixture runner (`agent-eval --fixture <id>`, scripted model driving the real builtin tool surface end to end), a live fixture path (`agent-eval --fixture-live <id>`, real provider when `OPENAI_API_KEY` is set), and a cross-engine fixture comparison (`agent-eval --compare-arm <id>`, append-only / rolling-summary / dynamic on the same five-turn scripted model and the same real tool surface: every engine passes the hidden verification and dynamic feeds the model measurably fewer input tokens) are landed; there is still no paired real coding workload run with a real model, or a non-inferiority result. |
 | V2 Self-Iteration | 🔒 blocked | Registry maturity and sandboxed self-checks are foundations only. Autonomous generation/promotion stays disabled until M10 and M12-M15 acceptance gates close. |
@@ -1170,9 +1170,10 @@ the required gate order; the numbered list and table above are authoritative.
    system requests answered only with a `workspace:read` grant through a
    confined handle, path-shape preflight before the handle) and network is
    explicitly deny-by-default (no network permission word; recognized
-   network ops refused by name; undeclared ops refused). OS-level
-   filesystem/network filtering (seccomp/AppContainer-style) remains the
-   residual gap.
+   network ops refused by name; undeclared ops refused). OS-level *write*
+   filtering is now kernel-enforced on Linux (landlock, `MOD-06`); OS-level
+   *network* filtering (seccomp/AppContainer-style) remains the residual
+   gap.
 5. **V1-M14 Resource Policy** — tool schema budget (the per-round surface
    bound landed in Performance P1), context hint quota,
    RiskClass, PermissionSet. Acceptance: the LLM cannot exhaust runtime
@@ -1317,15 +1318,30 @@ A process capability runs with a hardened process-host profile
   (`a_system_request_flood_poisons_and_kills_the_connection`); a refused
   system request is an answer, not a connection failure
   (`a_refused_system_request_does_not_poison_the_connection`).
+- **OS-level write fence (Linux, `MOD-06`).** Since the residual below was
+  written, `agent-process::landlock` closes the *write* half of the
+  direct-OS gap on Linux: the child sets no_new_privs, creates a ruleset
+  (handled-access tried newest-first across ABIs) with one path-beneath
+  rule per configured write root, and restricts itself right before
+  `exec` — so a hostile child is refused by the kernel when it creates,
+  modifies or destroys state outside its roots (including `rm -rf` on the
+  parent's tree or a write to `/etc/passwd`). Reads stay unhandled (the
+  executable and loader must stay readable) and are gated by the app-level
+  broker; the fence is verified on a real kernel by `tests/landlock.rs`
+  and is inherited by every descendant. Wired for process capabilities and
+  stdio MCP servers.
 - **Residual.** The brokered surface is confined; the child's *direct* OS
-  access is not. A hostile child can still open arbitrary absolute paths or
-  sockets itself at the OS layer — seccomp-bpf / AppContainer-style
-  filtering is out of v0 scope and stays gated with V2. Cross-platform
-  memory/I/O/disk quotas also remain (Windows Job-Object memory ceilings
-  and Unix rlimits cover part of it). These keep M13 from closing.
+  access is not fully. On Linux, writes/destroys are kernel-fenced
+  (landlock) but a hostile child can still *read* arbitrary absolute paths
+  or open sockets itself at the OS layer; on Windows there is no OS-level
+  file fence at all — seccomp-bpf / AppContainer-style filtering is out of
+  v0 scope and stays gated with V2. Cross-platform memory/I/O/disk quotas
+  also remain (Windows Job-Object memory ceilings and Unix rlimits cover
+  part of it). These keep M13 from closing.
 
 Therefore `ProcessSandbox` covers host hardening plus a brokered
-filesystem/network surface; it is not an OS-level sandbox. External process
+filesystem/network surface and, on Linux, an OS-level write fence; it is
+not a full OS-level sandbox. External process
 capabilities remain disabled by default until the isolation boundary is
 complete.
 

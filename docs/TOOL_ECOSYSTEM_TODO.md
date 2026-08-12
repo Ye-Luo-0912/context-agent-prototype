@@ -967,10 +967,11 @@ together with TaskAnchor and continuous context GC.
   expired"), so an operation that overran its authorization window cannot
   mutate the world. `derive_effect_intent` moved to agent-contracts so
   grant matching and lease minting share one normalization; the bounded
-  `RuntimeEvent::LeaseIssued` audit row records lease/grant/expiry. What
-  remains of this item: `MOD-04A` (move scheduling behind
-  `RuntimeServices`, then the mechanical kernel rename) and compatibility
-  order step 7 (sandboxed shell/process — an M13-scoped, OS-level change).
+  `RuntimeEvent::LeaseIssued` audit row records lease/grant/expiry.
+  `MOD-04A` is closed separately below; the only remaining piece of this
+  item is compatibility order step 7 (sandboxed shell/process — an
+  M13-scoped, OS-level change), whose OS-level *write* filtering slice is
+  landed as `MOD-06`; OS-level network filtering remains open.
   See `docs/ACI_CONTRACT_DRAFT.md` §6 and §7 steps 4-5.
 - [x] **MOD-04A** Move context/model/tool/config scheduling behind
   `agent-runtime::RuntimeServices`, then perform the mechanical
@@ -1032,6 +1033,34 @@ together with TaskAnchor and continuous context GC.
   activation/quarantine/maturity authority all live in `agent-core`; the
   runtime registry owns catalog views, load/unload scheduling, active
   state and per-round surface snapshots.
+- [x] **MOD-06** Land the OS-level write-confine slice of compatibility
+  order step 7 (sandboxed shell/process): Linux landlock write fencing in
+  `agent-process`, wired for process capabilities and stdio MCP servers.
+  **Done 2026-08-12.** `agent-process::landlock` applies a kernel-enforced
+  fence in the child right before `exec` (via `pre_exec`): the handled
+  access set is tried newest-first across landlock ABIs (v3/v2/v1, using
+  the smallest legal struct sizes), each configured write root is opened
+  as an `O_PATH` fd in the parent (raw fds — the child's `pre_exec`
+  closure only makes syscalls, no allocation), and
+  `landlock_restrict_self` — which demands the no_new_privs bit or
+  CAP_SYS_ADMIN — runs after `prctl(PR_SET_NO_NEW_PRIVS)`, so the fence is
+  irrevocable, inherited by every descendant, and also stops setuid/
+  setgid escalation at exec. Reads are deliberately unhandled (the
+  executable and loader must stay readable; reads remain gated by the
+  app-level broker), so landlock closes the write/destroy/exfil-by-write
+  half of the direct-OS gap; network-level filtering stays open. Wiring:
+  `ProcessSandbox.landlock_write_roots` (Linux only); `ProcessHost::
+  connect` opens the roots and attaches the closure, degrading to a
+  warning on kernels without landlock and failing the spawn (never running
+  unconfined) when a configured root cannot be opened or the child cannot
+  be confined; `ProcessCapabilityAdapter::from_manifest` confines the
+  capability child to its private dir; `McpClient::connect_stdio` confines
+  stdio MCP server children to their private temp cwd. Verified on a real
+  Linux kernel (WSL2, 6.6): `crates/agent-process/tests/landlock.rs`
+  drives the `sandbox_probe` bin under confinement and asserts the probe
+  writes inside its root, is refused outside at the OS layer, and still
+  reads system files, plus a `ProcessHost` handshake test under the same
+  fence. Unit tests cover `O_PATH` root opening and fd-close-on-drop.
 - [x] **COMPOSE-01** Extract reusable application/bootstrap composition from
   `agent-tui` for TUI/CLI/eval while keeping it stateless and actor-free.
   **Done 2026-08-12.** New composition-root crate `agent-compose`: one

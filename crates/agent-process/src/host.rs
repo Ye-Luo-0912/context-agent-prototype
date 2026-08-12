@@ -71,6 +71,17 @@ pub struct ProcessSandbox {
     /// Hard process-count limit via `RLIMIT_NPROC` (Unix only; ignored
     /// elsewhere). `0` = unlimited.
     pub process_limit: u64,
+    /// Linux landlock write confinement (kernel 5.13+): the child may
+    /// create, modify or destroy filesystem state only under these roots —
+    /// enforced by the kernel in the child before `exec`, inherited by
+    /// every descendant. Reads are deliberately unhandled (the executable
+    /// and loader must stay readable; reads are gated by the app-level
+    /// broker), so this is the OS-level write/destroy/exfil-by-write
+    /// fence. Empty = no landlock. Unsupported kernels degrade to a
+    /// warning (the app-level broker remains); a configured root that
+    /// cannot be opened fails the spawn.
+    #[cfg(target_os = "linux")]
+    pub landlock_write_roots: Vec<std::path::PathBuf>,
     /// Per-process memory ceiling in bytes enforced by the Windows
     /// Job-Object (`JOB_OBJECT_LIMIT_PROCESS_MEMORY`). `0` = unlimited.
     /// Unix has no equivalent yet.
@@ -208,6 +219,37 @@ impl ProcessHost {
                         Ok(())
                     });
                 }
+            }
+        }
+
+        // Sandbox (Linux): landlock write confinement — the child may
+        // create/modify/destroy filesystem state only under its write
+        // roots. The roots are opened as O_PATH fds in the parent (raw
+        // fds, no allocation) and the restriction is applied in the child
+        // right before exec, so it is irrevocable and inherited by every
+        // descendant. A kernel without landlock degrades to a warning (the
+        // app-level broker still gates reads); once wired, a child that
+        // cannot be confined fails the spawn (never runs unconfined).
+        #[cfg(target_os = "linux")]
+        let landlock_rules = if config.sandbox.landlock_write_roots.is_empty() {
+            None
+        } else if !crate::landlock::available() {
+            eprintln!(
+                "landlock sandbox skipped: kernel support unavailable \
+                 (OS-level write confinement off for '{}')",
+                config.program
+            );
+            None
+        } else {
+            Some(
+                crate::landlock::ChildRules::open(&config.sandbox.landlock_write_roots)
+                    .map_err(|e| AgentError::Context(format!("landlock sandbox setup: {e}")))?,
+            )
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(rules) = landlock_rules {
+            unsafe {
+                command.pre_exec(move || crate::landlock::apply_in_child(&rules));
             }
         }
 

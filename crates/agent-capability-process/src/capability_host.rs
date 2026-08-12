@@ -60,6 +60,7 @@ impl ProcessCapabilityAdapter {
                 )));
             }
         };
+        let private_dir = private_capability_dir(&manifest.id);
         let config = ProcessHostConfig {
             program,
             args: Vec::new(),
@@ -84,7 +85,7 @@ impl ProcessCapabilityAdapter {
                 // an unpredictable nonce, so two runs (or two capabilities
                 // reusing an id) never share a predictable temp path and a
                 // hostile pre-created directory cannot be a symlink trap.
-                cwd: Some(private_capability_dir(&manifest.id)),
+                cwd: Some(private_dir.clone()),
                 // Hard ceilings enforced by the kernel on Unix (rlimits)
                 // and Windows (Job-Object: the active-process ceiling uses
                 // `process_limit`, plus a per-process memory ceiling below).
@@ -98,6 +99,12 @@ impl ProcessCapabilityAdapter {
                 // Unix relies on rlimits only.
                 #[cfg(windows)]
                 job_max_memory_bytes: 512 * 1024 * 1024,
+                // OS-level write confinement (Linux): the child may create,
+                // modify or destroy filesystem state only inside its own
+                // private dir. Reads are gated by the app-level broker; this
+                // is the kernel fence no application logic can bypass.
+                #[cfg(target_os = "linux")]
+                landlock_write_roots: vec![private_dir.clone()],
             },
         };
         Ok(Self::with_config(manifest, config))

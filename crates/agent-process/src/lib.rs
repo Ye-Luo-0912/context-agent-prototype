@@ -12,6 +12,9 @@
 
 mod host;
 
+#[cfg(target_os = "linux")]
+pub mod landlock;
+
 pub use host::{
     MAX_SYSTEM_REQUESTS_PER_CALL, PROTOCOL_VERSION, ProcessHost, ProcessHostConfig, ProcessSandbox,
     SystemBroker, kill_process_tree, probe_siblings, resolve_program,
