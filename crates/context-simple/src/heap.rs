@@ -53,7 +53,9 @@ pub(crate) fn external_summary(entry: &ExternalizedContext) -> ContextItemSummar
         dependencies: entry.dependencies.iter().map(|edge| edge.target).collect(),
         keep_alive: false,
         lease_until_turn: None,
-        source: Some("externalized".to_string()),
+        // 来源权威随条目外部化保留，inspect 如实显示原始来源，而不是
+        // 一个固定的 "externalized" 占位——否则外部化会抹掉来源信息。
+        source: entry.source.clone(),
     }
 }
 

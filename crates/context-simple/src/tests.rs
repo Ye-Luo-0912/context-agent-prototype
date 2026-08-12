@@ -2287,7 +2287,7 @@ async fn external_retrieval_searches_inspects_and_fetches() {
             ContextScope::Task,
             ContextRetention::Durable,
             0.5,
-            None,
+            Some("tool-capture".into()),
         );
         item_a.id = ContextItemId::new();
         item_a.task_id = Some(task_a);
@@ -2395,8 +2395,8 @@ async fn external_retrieval_searches_inspects_and_fetches() {
         .expect("the fetched item stays part of the logical catalog");
     assert_eq!(
         entry.source.as_deref(),
-        Some("externalized"),
-        "fetch must not re-enter the working set"
+        Some("tool-capture"),
+        "fetch must not re-enter the working set, and the source authority survives externalization"
     );
 }
 
@@ -2564,7 +2564,7 @@ async fn consumption_ack_stamps_an_external_descriptor_without_reactivating_it()
             ContextScope::Task,
             ContextRetention::Working,
             0.6,
-            None,
+            Some("tool-session".into()),
         );
         item.entities = crate::index::entity::extract_entities(&item.content);
         let reference = crate::store::externalize(dir.path(), &item).unwrap();
@@ -2608,8 +2608,8 @@ async fn consumption_ack_stamps_an_external_descriptor_without_reactivating_it()
         .expect("the acknowledged descriptor stays part of the logical catalog");
     assert_eq!(
         entry.source.as_deref(),
-        Some("externalized"),
-        "acknowledging a descriptor must not page its body back into memory"
+        Some("tool-session"),
+        "acknowledging a descriptor must not page its body back into memory, and the source authority survives"
     );
 }
 
@@ -4794,6 +4794,80 @@ async fn admit_of_a_durable_item_keeps_its_retention() {
     assert_eq!(resident.residency, ContextResidency::Resident);
     assert!(
         state.external.get(item.id).is_none(),
+        "the entry must leave the external map"
+    );
+}
+
+/// 来源权威跨外部化保留：外部化时 `source` 随条目进入 external map，
+/// inspect 的 catalog 投影显示原始来源（而不是固定的 "externalized"
+/// 占位），admit 把条目带回工作集后来源依然保持。这是 fetch/admit 时
+/// 权威校验的前提——来源信息若在外部化时丢失，就无从校验。
+#[tokio::test]
+async fn externalized_source_survives_inspect_and_admit() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let item_id = {
+        let mut state = crate::engine::State::default();
+        let config = SimpleContextConfig::default();
+        let mut item = crate::item::make_item(
+            &state,
+            &config,
+            "tool-captured finding: the cache layer is the hot path".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.6,
+            Some("tool-capture".to_string()),
+        );
+        item.id = ContextItemId::new();
+        let reference = crate::store::externalize(dir.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item, reference, 1, 1, None,
+        ));
+        let value = crate::checkpoint::serialize(&state).unwrap();
+        engine.restore(value).await.unwrap();
+        item.id
+    };
+
+    // inspect 的 catalog 投影必须显示原始来源，而不是 "externalized" 占位。
+    let catalog = engine.inspect(usize::MAX).await.unwrap();
+    let entry = catalog
+        .iter()
+        .find(|item| item.id == item_id)
+        .expect("the externalized entry is part of the logical catalog");
+    assert_eq!(
+        entry.source.as_deref(),
+        Some("tool-capture"),
+        "the source authority must survive externalization"
+    );
+
+    // admit 把条目带回工作集：来源保持，外部 map 移除。
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Admit {
+                item_id,
+                reason: "the finding is relevant again".into(),
+            },
+        })
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    let resident = state
+        .items
+        .iter()
+        .find(|i| i.id == item_id)
+        .expect("the item is resident after admit");
+    assert_eq!(
+        resident.source.as_deref(),
+        Some("tool-capture"),
+        "the source authority must survive the external -> resident move"
+    );
+    assert!(
+        state.external.get(item_id).is_none(),
         "the entry must leave the external map"
     );
 }

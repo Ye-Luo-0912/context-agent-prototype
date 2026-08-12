@@ -805,7 +805,15 @@ Requirements:
   `context.fetch` full bodies pass through the trusted output broker, which
   caps every model-facing field and spills oversized content to one
   artifact before the model sees a truncated middle.
-- [ ] Record access without promoting evidence into a trusted prompt role.
+- [x] Record access without promoting evidence into a trusted prompt role.
+  **Satisfied 2026-08-12.** Retrieved history, external refs, files and
+  tool results render only as low-authority `user`/`tool` observations,
+  never as `system` (prompt.rs keeps policy in the system layer; the
+  injected-instruction and external-refs tests pin this). `fetch` is a
+  transient read that never re-enters the working set, `admit` is an
+  explicit promotion that still renders as ordinary context, and access
+  recording only reinforces recency — it never changes the item's prompt
+  role.
 - [x] Distinguish “evidence does not exist” from “not found by this search.”
   **Done 2026-08-12.** An empty search result now distinguishes the two
   cases in the model-facing message: with no kind/scope/task filter it
@@ -813,7 +821,15 @@ Requirements:
   matches within the requested filter and evidence may exist under a
   different filter — so the model can decide to give up or retry under
   another filter instead of misreading a filter miss as absent evidence.
-- [ ] Require source authority/taint checks again at fetch/admit time.
+- [~] Require source authority/taint checks again at fetch/admit time.
+  **Precondition landed 2026-08-12.** `ExternalizedContext` now carries
+  the item's `source` authority captured at externalize time, and the
+  `inspect` catalog projection reports the real source instead of a fixed
+  "externalized" placeholder — so the source of an externalized item is
+  visible without a store read and survives the external -> resident move
+  on admit (blob reads already carried it). The actual authority/taint
+  check policy at fetch/admit time (what a given source may or may not do
+  on re-entry) remains open.
 - [ ] Keep vector retrieval deferred as an optional candidate provider; it
   may suggest ids but cannot own lifecycle truth or bypass admission.
 

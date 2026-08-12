@@ -907,6 +907,14 @@ pub struct ExternalizedContext {
     /// them by parsing + id match).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_checksum: Option<String>,
+    /// Source authority captured at externalize time: which producer
+    /// (user/tool/model/artifact) the item originally came from. Kept on
+    /// the entry so `inspect` and the future fetch/admit authority checks
+    /// can see where an externalized item came from without reading the
+    /// store file. `None` for entries externalized before the field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Cap on the external refs surfaced in one materialized context. The
@@ -1258,6 +1266,7 @@ mod tests {
             lease_until_turn: None,
             last_access_gc_epoch: Some(0),
             blob_checksum: None,
+            source: None,
         }
     }
 

@@ -291,6 +291,9 @@ pub(crate) fn to_external_entry(
         lease_until_turn: item.lease_until_turn,
         last_access_gc_epoch: Some(gc_epoch),
         blob_checksum,
+        // 来源权威随条目一起外部化：检索/审查能看到条目来自哪里，
+        // 无需读 store 文件；admit/fetch 的权威校验以此为前提。
+        source: item.source.clone(),
     }
 }
 
