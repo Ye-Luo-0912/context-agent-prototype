@@ -2615,3 +2615,127 @@ fn collect_txt_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+/// Round 0 proposes `task.complete`; round 1 answers with one very long
+/// plain-text response — so the raw-evidence artifact of the *final*
+/// response is written, and the CompletionRecord must attach its ref even
+/// though the model declared no artifacts.
+#[derive(Debug)]
+struct CompletingLongModel {
+    rounds: AtomicUsize,
+    content_len: usize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for CompletingLongModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        if round == 0 {
+            Ok(ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "task.complete".into(),
+                    arguments: json!({"summary": "the task is done", "artifacts": []}),
+                }],
+                usage: Default::default(),
+            })
+        } else {
+            Ok(ModelOutput {
+                content: "x".repeat(self.content_len),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            })
+        }
+    }
+}
+
+/// The CompletionRecord carries the raw-evidence artifact of the final
+/// assistant response, independent of the model's self-declared artifact
+/// list — the raw output stays reachable after the bounded ContextItem
+/// truncated it.
+#[tokio::test]
+async fn completion_record_attaches_the_raw_final_response_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    let content_len = 40_000;
+    let mut services = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(CompletingLongModel {
+            rounds: AtomicUsize::new(0),
+            content_len,
+        }),
+        Arc::new(CompletionToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    Arc::get_mut(&mut services).unwrap().artifact_workspace = Some(workspace.clone());
+    let (handle, _task) = spawn_runtime(services);
+    handle.start().await.unwrap();
+    handle.user_message("finish the work".into()).await.unwrap();
+
+    let mut task_id = None;
+    let mut events = handle.subscribe();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::TaskCompleted {
+                task_id: completed_task,
+                ..
+            } = envelope.event
+            {
+                task_id = Some(completed_task);
+            }
+        }
+        if task_id.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let task_id = task_id.expect("the completion proposal must commit");
+
+    // The CompletionRecord carries exactly one raw-evidence ref, naming the
+    // assistant-response artifact.
+    let checkpoint = handle.checkpoint().await.unwrap();
+    let record = checkpoint
+        .tasks
+        .completed
+        .iter()
+        .find(|record| record.task_id == task_id)
+        .expect("a completed task owns exactly one CompletionRecord");
+    let raw_refs: Vec<&String> = record
+        .artifacts
+        .iter()
+        .filter(|reference| reference.contains("assistant-response"))
+        .collect();
+    assert_eq!(
+        raw_refs.len(),
+        1,
+        "the CompletionRecord must attach the raw final-response artifact: {:?}",
+        record.artifacts
+    );
+
+    // The artifact exists and carries the complete untruncated response.
+    let artifacts_dir = workspace.state_dir().join("artifacts");
+    let files = collect_txt_files(&artifacts_dir);
+    assert_eq!(files.len(), 1, "one artifact per final response");
+    let content = std::fs::read_to_string(&files[0]).unwrap();
+    assert_eq!(
+        content.len(),
+        content_len,
+        "the raw response must be intact"
+    );
+    assert!(
+        files[0]
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with("assistant-response")
+            || raw_refs[0].contains("assistant-response"),
+        "the attached ref must name the assistant-response artifact"
+    );
+    handle.stop().await.unwrap();
+}

@@ -868,21 +868,24 @@ stable; it should not introduce a second orchestrator.
   ref/digest, and bounded artifact refs (`CTX-10`). Acceptance results,
   verification and unresolved state remain anchor fields the runtime has not
   yet sourced autonomously.
-- [~] Persist the exact final response before ContextItem truncation; stop
+- [x] Persist the exact final response before ContextItem truncation; stop
   treating task-less Session Durable summaries as the authoritative result.
   The completion summary is now a typed task-owned record with a verifiable
   digest, but the raw final assistant response is still truncated before
   ContextItem — raw-evidence retention stays open.
-  **Persistence slice landed 2026-08-12** — the actor writes the *full*
-  final assistant response to an artifact
-  (`state_dir/artifacts/<run>/assistant-response-<uuid>.txt`) before the
-  bounded ContextItem is built, when the composition root wired an artifact
-  workspace (`RuntimeServices.artifact_workspace`); a persistence failure
-  aborts the turn commit (`TurnCommitPhase::AssistantMessageArtifact`).
-  Pinned by `final_assistant_response_is_persisted_in_full_before_
-  contextitem_truncation` (a 40k-char response survives intact). The
-  CompletionRecord *reference* to that artifact (so the model's
-  self-declared artifact list is not the only path) is still open.
+  **Done 2026-08-12.** The actor writes the *full* final assistant response
+  to an artifact (`state_dir/artifacts/<run>/assistant-response-<uuid>.txt`)
+  before the bounded ContextItem is built, when the composition root wired
+  an artifact workspace (`RuntimeServices.artifact_workspace`); a
+  persistence failure aborts the turn commit
+  (`TurnCommitPhase::AssistantMessageArtifact`). `commit_completion`
+  attaches that ref to the task's `CompletionRecord` (deduplicated against
+  the model's self-declared list), so the complete raw output is reachable
+  from the typed record even when the model named no artifacts. Pinned by
+  `final_assistant_response_is_persisted_in_full_before_
+  contextitem_truncation` (a 40k-char response survives intact) and
+  `completion_record_attaches_the_raw_final_response_artifact` (the
+  CompletionRecord carries the ref end to end).
 - [x] Extend the now-checkpointed tool-demand subset into the bounded complete
   TaskAnchor as the only task-authority owner; add typed CAS patches for goal,
   constraints, criteria, progress, open loops and evidence plus completion

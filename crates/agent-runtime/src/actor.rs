@@ -207,6 +207,12 @@ struct ActorState {
     /// a tool's result still offers the tool.
     active_tool: Option<String>,
     turn: Option<ActiveTurn>,
+    /// Ref of the most recent assistant-response artifact (raw-evidence
+    /// retention): `finalize_turn` records it after persisting the full
+    /// final response, and `commit_completion` attaches it to the task's
+    /// CompletionRecord so the complete raw output is reachable even when
+    /// the model's self-declared artifact list omits it.
+    last_assistant_artifact: Option<String>,
 }
 
 pub struct RuntimeActor {
@@ -2152,9 +2158,17 @@ impl RuntimeActor {
     async fn commit_completion(
         &mut self,
         summary: String,
-        artifacts: Vec<String>,
+        mut artifacts: Vec<String>,
         next_focus_revision: u64,
     ) -> AgentResult<()> {
+        // Attach the raw-evidence artifact of the final assistant response
+        // (if any) so the CompletionRecord always carries the complete
+        // output, independent of the model's self-declared artifact list.
+        if let Some(raw_ref) = self.state.last_assistant_artifact.take()
+            && !artifacts.iter().any(|reference| reference == &raw_ref)
+        {
+            artifacts.push(raw_ref);
+        }
         // The exact final-output body is the completion summary itself in
         // this prototype: retain its digest so the outcome stays
         // byte-for-byte verifiable, with a deterministic ref naming the
@@ -2291,7 +2305,7 @@ impl RuntimeActor {
         // each other. A failure here aborts the commit exactly like any
         // other mandatory state write.
         if let Some(workspace) = &self.services.artifact_workspace {
-            let (_, artifact_path) = match workspace
+            let (artifact_ref, artifact_path) = match workspace
                 .create_artifact_path(self.kernel.run_id(), "assistant-response", "txt")
                 .await
             {
@@ -2313,6 +2327,10 @@ impl RuntimeActor {
                     )
                     .await;
             }
+            // The task's CompletionRecord attaches this ref (see
+            // `commit_completion`), so the raw output is reachable without
+            // the model naming it.
+            self.state.last_assistant_artifact = Some(artifact_ref);
         }
         if let Err(error) = self
             .services
