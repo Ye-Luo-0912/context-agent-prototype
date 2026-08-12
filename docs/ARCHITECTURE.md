@@ -1079,6 +1079,18 @@ explicit `ProcessSandbox` (shared `ProcessHost`, since the crate split in
 - **Process/job limits and CPU quota** — Unix `pre_exec` rlimits
   (`RLIMIT_CPU`, `RLIMIT_NPROC`) applied right after fork; the adapter
   sets 60 s CPU and 16 processes.
+- **OS-level write fence (Linux)** — `landlock_write_roots:
+  Vec<PathBuf>` (V1-M13/MOD-06): when non-empty, the child applies a
+  landlock confinement in `pre_exec` — no_new_privs via `prctl`, a
+  ruleset whose handled access is tried newest-first across ABIs, one
+  path-beneath rule per root (opened as `O_PATH` fds in the parent), then
+  an irrevocable `landlock_restrict_self`. The kernel then refuses any
+  create/modify/destroy outside the roots, inherited by every descendant;
+  a kernel without landlock degrades to a warning, and a child that cannot
+  be confined fails the spawn (never runs unconfined). The capability
+  adapter confines children to their private dir; stdio MCP servers are
+  confined to their private temp cwd. Reads stay unhandled (loader must
+  remain readable) and are gated by the app-level broker.
 - **Kill tree on cancel** — `call_with_cancel(op, cancel)` selects the
   framed request against the invocation's `CancellationToken`: on cancel
   (user `/cancel`, superseded operation) it poisons the connection and
@@ -1116,9 +1128,11 @@ grammar (`validate_capability_id`, lowercase/digit start, `[a-z0-9._-]`,
 the working directory is private and unpredictable
 (`context-agent-capability-<id>-<uuid>`) so no two runs share a path and
 a hostile pre-created directory cannot be predicted. The broker confines
-the *brokered* surface; OS-level filesystem/network filtering (a hostile
-child opening arbitrary absolute paths or sockets directly at the OS
-layer), plus cross-platform memory/I/O/disk quotas, remain open M13
+the *brokered* surface; since MOD-06 the OS-level *write* half of the
+direct-OS gap is closed on Linux (landlock fence above — a hostile child
+is refused by the kernel when it creates, modifies or destroys state
+outside its roots), while OS-level *network* filtering (sockets) and
+cross-platform memory/I/O/disk quotas remain open M13
 acceptance requirements; until then **V2 autonomous
 capability generation stays gated** — a generated capability only runs
 after explicit `enable`, and only inside the sandbox above.
