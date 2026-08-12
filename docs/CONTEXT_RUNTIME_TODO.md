@@ -827,9 +827,12 @@ Requirements:
   `inspect` catalog projection reports the real source instead of a fixed
   "externalized" placeholder — so the source of an externalized item is
   visible without a store read and survives the external -> resident move
-  on admit (blob reads already carried it). The actual authority/taint
-  check policy at fetch/admit time (what a given source may or may not do
-  on re-entry) remains open.
+  on admit (blob reads already carried it). The kernel's retrieval output
+  now renders the authority end to end: `context.search` hits, `inspect`
+  metadata and the `fetch` header all show `source=...` (`-` when absent),
+  so the model and audit can see where every retrieved item came from.
+  The actual authority/taint check policy at fetch/admit time (what a
+  given source may or may not do on re-entry) remains open.
 - [ ] Keep vector retrieval deferred as an optional candidate provider; it
   may suggest ids but cannot own lifecycle truth or bypass admission.
 

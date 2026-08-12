@@ -267,11 +267,14 @@ impl CoreAuthority {
                     Ok(hits) => {
                         output.ok = true;
                         output.summary = format!("{} external ref(s) match", hits.len());
+                        // 每行命中都带上来源权威（source）：检索结果让模型
+                        // 直接看到条目来自哪里（工具/用户/派生等），None 显示
+                        // "-" 与 task 占位风格一致；这是权威校验的可观察基础。
                         output.model_content = hits
                             .iter()
                             .map(|entry| {
                                 format!(
-                                    "{} | kind={:?} scope={:?} task={} | {}\n  tags: {}\n  entities: {}",
+                                    "{} | kind={:?} scope={:?} task={} source={} | {}\n  tags: {}\n  entities: {}",
                                     entry.context_ref.uri,
                                     entry.kind,
                                     entry.scope,
@@ -279,6 +282,10 @@ impl CoreAuthority {
                                         .task_id
                                         .map(|t| t.to_string())
                                         .unwrap_or_else(|| "-".into()),
+                                    entry
+                                        .source
+                                        .as_deref()
+                                        .unwrap_or("-"),
                                     entry.context_ref.summary,
                                     if entry.tags.is_empty() {
                                         "-".to_string()
@@ -308,8 +315,10 @@ impl CoreAuthority {
                     Ok(Some(entry)) => {
                         output.ok = true;
                         output.summary = "external ref metadata".into();
+                        // inspect 是元数据视图：来源权威（source）与
+                        // residency/semantic 并列展示，None 显示 "-"。
                         output.model_content = format!(
-                            "{} | kind={:?} scope={:?} task={} residency={:?} semantic={:?}\nsummary: {}\ntags: {}\nentities: {}",
+                            "{} | kind={:?} scope={:?} task={} source={} residency={:?} semantic={:?}\nsummary: {}\ntags: {}\nentities: {}",
                             entry.context_ref.uri,
                             entry.kind,
                             entry.scope,
@@ -317,6 +326,7 @@ impl CoreAuthority {
                                 .task_id
                                 .map(|t| t.to_string())
                                 .unwrap_or_else(|| "-".into()),
+                            entry.source.as_deref().unwrap_or("-"),
                             entry.residency,
                             entry.semantic,
                             entry.context_ref.summary,
@@ -351,9 +361,15 @@ impl CoreAuthority {
                     Ok(Some(item)) => {
                         output.ok = true;
                         output.summary = "external item fetched".into();
+                        // fetch 返回完整条目：来源权威（source）进头部行，
+                        // None 显示 "-"；正文仍经 output.bound 截断 + spill。
                         output.model_content = format!(
-                            "[{:?} | {:?} | id={}]\n{}",
-                            item.kind, item.scope, item.id, item.content
+                            "[{:?} | {:?} | id={} | source={}]\n{}",
+                            item.kind,
+                            item.scope,
+                            item.id,
+                            item.source.as_deref().unwrap_or("-"),
+                            item.content
                         );
                     }
                     Ok(None) => {
@@ -655,7 +671,7 @@ mod tests {
     use agent_contracts::{
         ApprovalDecision, ApprovalGate, AttentionState, ContextDiagnostics, ContextIngress,
         ContextItem, ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
-        ContextResidency, ContextRetention, ContextScope, ContextStateTransition,
+        ContextRef, ContextResidency, ContextRetention, ContextScope, ContextStateTransition,
         ExternalizedContext, MaterializedContext, ScopeId, ScopeKind, SemanticState, ToolRisk,
         ToolSpec, ToolSurfaceDemand, ToolSurfaceOmission, ToolSurfaceOmissionReason,
     };
@@ -783,6 +799,8 @@ mod tests {
     struct RecordingEngine {
         searched_limits: std::sync::Mutex<Vec<usize>>,
         searched_queries: std::sync::Mutex<Vec<String>>,
+        search_hits: std::sync::Mutex<Vec<ExternalizedContext>>,
+        inspect_external_entry: std::sync::Mutex<Option<ExternalizedContext>>,
         fetched: std::sync::Mutex<Option<ContextItem>>,
     }
 
@@ -828,7 +846,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(query.query.clone());
-            Ok(Vec::new())
+            Ok(self.search_hits.lock().unwrap().clone())
+        }
+        async fn inspect_external(
+            &self,
+            _item_id: ContextItemId,
+        ) -> AgentResult<Option<ExternalizedContext>> {
+            Ok(self.inspect_external_entry.lock().unwrap().clone())
         }
         async fn fetch_external(
             &self,
@@ -892,6 +916,40 @@ mod tests {
         ))
     }
 
+    /// 构造一个带指定来源权威（source）的外部化条目，用于检索输出渲染测试。
+    fn external_entry(source: Option<&str>) -> ExternalizedContext {
+        let item_id = ContextItemId::new();
+        ExternalizedContext {
+            item_id,
+            task_id: None,
+            scope_id: None,
+            kind: ContextKind::Note,
+            scope: ContextScope::Task,
+            retention: ContextRetention::Working,
+            attention: AttentionState::Archived,
+            semantic: SemanticState::Live,
+            context_ref: ContextRef {
+                uri: format!("context://run/{item_id}"),
+                item_id,
+                kind: ContextKind::Note,
+                scope: ContextScope::Task,
+                summary: "a past tool capture".into(),
+                created_tick: 0,
+            },
+            externalized_at_tick: 0,
+            last_access_tick: 0,
+            residency: ContextResidency::Cold,
+            entities: Vec::new(),
+            tags: Vec::new(),
+            dependencies: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
+            last_access_gc_epoch: Some(0),
+            blob_checksum: None,
+            source: source.map(|s| s.to_string()),
+        }
+    }
+
     fn surface_with(name: &str) -> ToolSurfaceSnapshot {
         ToolSurfaceSnapshot {
             specs: vec![ToolSpec {
@@ -923,6 +981,8 @@ mod tests {
             Arc::new(RecordingEngine {
                 searched_limits: Default::default(),
                 searched_queries: Default::default(),
+                search_hits: Default::default(),
+                inspect_external_entry: Default::default(),
                 fetched: Default::default(),
             }),
             dispatcher,
@@ -971,6 +1031,8 @@ mod tests {
             Arc::new(RecordingEngine {
                 searched_limits: Default::default(),
                 searched_queries: Default::default(),
+                search_hits: Default::default(),
+                inspect_external_entry: Default::default(),
                 fetched: Default::default(),
             }),
             dispatcher,
@@ -1000,6 +1062,8 @@ mod tests {
         let engine = Arc::new(RecordingEngine {
             searched_limits: Default::default(),
             searched_queries: Default::default(),
+            search_hits: Default::default(),
+            inspect_external_entry: Default::default(),
             fetched: std::sync::Mutex::new(Some(test_item("big".repeat(200_000)))),
         });
         let kernel = test_kernel(
@@ -1057,6 +1121,8 @@ mod tests {
         let engine = Arc::new(RecordingEngine {
             searched_limits: Default::default(),
             searched_queries: Default::default(),
+            search_hits: Default::default(),
+            inspect_external_entry: Default::default(),
             fetched: Default::default(),
         });
         let kernel = test_kernel(
@@ -1104,6 +1170,8 @@ mod tests {
         let engine = Arc::new(RecordingEngine {
             searched_limits: Default::default(),
             searched_queries: Default::default(),
+            search_hits: Default::default(),
+            inspect_external_entry: Default::default(),
             fetched: Default::default(),
         });
         let kernel = test_kernel(
@@ -1157,6 +1225,8 @@ mod tests {
         let engine = Arc::new(RecordingEngine {
             searched_limits: Default::default(),
             searched_queries: Default::default(),
+            search_hits: Default::default(),
+            inspect_external_entry: Default::default(),
             fetched: Default::default(),
         });
         let kernel = test_kernel(
@@ -1211,6 +1281,8 @@ mod tests {
         let engine = Arc::new(RecordingEngine {
             searched_limits: Default::default(),
             searched_queries: Default::default(),
+            search_hits: Default::default(),
+            inspect_external_entry: Default::default(),
             fetched: Default::default(),
         });
         let kernel = test_kernel(
@@ -1273,6 +1345,167 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn search_hits_render_the_source_authority() {
+        // 检索命中行携带来源权威：带 source 的条目显示真实来源，
+        // 无来源的条目显示 "-"，与 task 占位风格一致。
+        let engine = Arc::new(RecordingEngine {
+            searched_limits: Default::default(),
+            searched_queries: Default::default(),
+            search_hits: std::sync::Mutex::new(vec![
+                external_entry(Some("tool-capture")),
+                external_entry(None),
+            ]),
+            inspect_external_entry: Default::default(),
+            fetched: Default::default(),
+        });
+        let kernel = test_kernel(
+            engine.clone(),
+            Arc::new(BigOutputDispatcher {
+                output: ToolOutput {
+                    call_id: "c1".into(),
+                    tool_name: "context.manage".into(),
+                    ok: true,
+                    summary: "placeholder".into(),
+                    model_content: "placeholder".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                },
+            }),
+            None,
+        );
+        let output = kernel
+            .resolve_engine_query(
+                ToolOutput {
+                    call_id: "c1".into(),
+                    tool_name: "context.manage".into(),
+                    ok: true,
+                    summary: "placeholder".into(),
+                    model_content: "placeholder".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                },
+                EngineQuery::SearchExternal {
+                    query: "x".into(),
+                    kind: None,
+                    scope: None,
+                    task_id: None,
+                    limit: 10,
+                },
+            )
+            .await;
+        assert!(
+            output.model_content.contains("source=tool-capture"),
+            "a hit with a known source must render it: {}",
+            output.model_content
+        );
+        assert!(
+            output.model_content.contains("source=-"),
+            "a hit without a source must render the dash placeholder"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_renders_the_source_authority() {
+        // inspect 元数据视图与 residency/semantic 并列展示来源权威。
+        let engine = Arc::new(RecordingEngine {
+            searched_limits: Default::default(),
+            searched_queries: Default::default(),
+            search_hits: Default::default(),
+            inspect_external_entry: std::sync::Mutex::new(Some(external_entry(Some(
+                "tool-session",
+            )))),
+            fetched: Default::default(),
+        });
+        let kernel = test_kernel(
+            engine.clone(),
+            Arc::new(BigOutputDispatcher {
+                output: ToolOutput {
+                    call_id: "c1".into(),
+                    tool_name: "context.manage".into(),
+                    ok: true,
+                    summary: "placeholder".into(),
+                    model_content: "placeholder".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                },
+            }),
+            None,
+        );
+        let output = kernel
+            .resolve_engine_query(
+                ToolOutput {
+                    call_id: "c1".into(),
+                    tool_name: "context.manage".into(),
+                    ok: true,
+                    summary: "placeholder".into(),
+                    model_content: "placeholder".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                },
+                EngineQuery::InspectExternal {
+                    item_id: ContextItemId::new(),
+                },
+            )
+            .await;
+        assert!(
+            output.model_content.contains("source=tool-session"),
+            "inspect must render the source authority: {}",
+            output.model_content
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_renders_the_source_authority() {
+        // fetch 的头部行携带来源权威，正文仍走有界输出。
+        let mut item = test_item("stored body".into());
+        item.source = Some("tool-capture".into());
+        let engine = Arc::new(RecordingEngine {
+            searched_limits: Default::default(),
+            searched_queries: Default::default(),
+            search_hits: Default::default(),
+            inspect_external_entry: Default::default(),
+            fetched: std::sync::Mutex::new(Some(item)),
+        });
+        let kernel = test_kernel(
+            engine.clone(),
+            Arc::new(BigOutputDispatcher {
+                output: ToolOutput {
+                    call_id: "c1".into(),
+                    tool_name: "context.manage".into(),
+                    ok: true,
+                    summary: "placeholder".into(),
+                    model_content: "placeholder".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                },
+            }),
+            None,
+        );
+        let output = kernel
+            .resolve_engine_query(
+                ToolOutput {
+                    call_id: "c1".into(),
+                    tool_name: "context.manage".into(),
+                    ok: true,
+                    summary: "placeholder".into(),
+                    model_content: "placeholder".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                },
+                EngineQuery::FetchExternal {
+                    item_id: ContextItemId::new(),
+                },
+            )
+            .await;
+        assert!(
+            output.model_content.contains("source=tool-capture"),
+            "fetch must render the source authority in the header: {}",
+            output.model_content
+        );
+        assert!(output.model_content.contains("stored body"));
+    }
+
     // --- ACI v2 shadow mode (IntentShadowGate) ---
 
     /// A deterministic shadow gate for the kernel integration test.
@@ -1303,6 +1536,8 @@ mod tests {
             Arc::new(RecordingEngine {
                 searched_limits: Default::default(),
                 searched_queries: Default::default(),
+                search_hits: Default::default(),
+                inspect_external_entry: Default::default(),
                 fetched: Default::default(),
             }),
             Arc::new(BigOutputDispatcher {
@@ -1391,6 +1626,8 @@ mod tests {
             Arc::new(RecordingEngine {
                 searched_limits: Default::default(),
                 searched_queries: Default::default(),
+                search_hits: Default::default(),
+                inspect_external_entry: Default::default(),
                 fetched: Default::default(),
             }),
             Arc::new(EchoDispatcher {
@@ -1488,6 +1725,8 @@ mod tests {
             Arc::new(RecordingEngine {
                 searched_limits: Default::default(),
                 searched_queries: Default::default(),
+                search_hits: Default::default(),
+                inspect_external_entry: Default::default(),
                 fetched: Default::default(),
             }),
             Arc::new(EchoDispatcher {
