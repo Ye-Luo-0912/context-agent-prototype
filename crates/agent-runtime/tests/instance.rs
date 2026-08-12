@@ -8,10 +8,11 @@ use std::time::Duration;
 use agent_contracts::{
     AgentResult, Capability, CapabilityActivation, CapabilityInvocationContext,
     CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
-    CapabilityTransport, ContextDiagnostics, ContextEngine, ContextIngress, ContextItemSummary,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
-    EventJournal, MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput,
-    ModelRequest, ModelTransport, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, ToolCall,
+    CapabilityTransport, ContextAction, ContextDiagnostics, ContextEngine, ContextIngress,
+    ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
+    ContextSearchQuery, ContextStateTransition, EventJournal, FocusState, MaterializedContext,
+    ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput, ModelRequest, ModelTransport,
+    RuntimeDirective, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, TaskId, ToolCall,
     ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolRisk,
     ToolSpec,
 };
@@ -207,6 +208,100 @@ impl ToolDispatcher for EmptyTools {
         Err(agent_contracts::AgentError::Tool(
             "no tools configured".into(),
         ))
+    }
+}
+
+/// A dispatcher that answers one `context.manage` admit call with the
+/// typed runtime directive, so the full tool -> runtime -> engine admit
+/// route is exercised without the real builtin surface.
+#[derive(Debug)]
+struct AdmitDirectiveDispatcher;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for AdmitDirectiveDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: agent_contracts::CONTEXT_MANAGE.into(),
+            description: "admit a ref back into the working set".into(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+        }]
+    }
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        let item_id = request
+            .call
+            .arguments
+            .get("item_id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| agent_contracts::AgentError::Tool("missing item_id".into()))?
+            .to_string();
+        let output = ToolOutput {
+            call_id: request.call.id.clone(),
+            tool_name: request.call.name.clone(),
+            ok: true,
+            summary: "admitted".into(),
+            model_content: format!("admitted {item_id}"),
+            artifact_ref: None,
+            metadata: serde_json::json!({}),
+        };
+        Ok(ToolOutcome::RuntimeDirective {
+            output,
+            directive: RuntimeDirective::Context(ContextAction::Admit {
+                item_id: item_id
+                    .parse()
+                    .expect("valid item id from the model script"),
+                reason: "the model needs the externalized step again".into(),
+            }),
+        })
+    }
+}
+
+/// A model that first asks for the admit (one `context.manage` call), then
+/// completes — enough to drive the directive through one real turn.
+#[derive(Debug)]
+struct AdmitScriptedModel {
+    target: agent_contracts::ContextItemId,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl AdmitScriptedModel {
+    fn new(target: agent_contracts::ContextItemId) -> Self {
+        Self {
+            target,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for AdmitScriptedModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if index == 0 {
+            Ok(ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "admit-1".into(),
+                    name: agent_contracts::CONTEXT_MANAGE.into(),
+                    arguments: serde_json::json!({
+                        "op": "admit",
+                        "item_id": self.target.to_string(),
+                        "reason": "the model needs this step again",
+                    }),
+                }],
+                usage: Default::default(),
+            })
+        } else {
+            Ok(ModelOutput {
+                content: "done".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            })
+        }
     }
 }
 
@@ -1042,6 +1137,120 @@ async fn boundary_anchor_patch_denied_leaves_the_anchor_untouched() {
         instance.handle().list_tasks().await.unwrap()[0].anchor_revision,
         0,
         "a denied patch must not bump the anchor revision"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+/// Full-suite acceptance for `context.admit`: a model tool call travels the
+/// whole route — scripted model emits `context.manage`, the dispatcher
+/// returns the typed runtime directive, the actor executes it at
+/// operation-commit time, and the engine re-enters the externalized item
+/// under its original id. The result is the admission event itself, not a
+/// duplicated observation.
+#[tokio::test]
+async fn context_manage_admit_routes_end_to_end() {
+    // 种入一个被外部化的条目（buffer 溢出触发 full GC 写入 store）。
+    let dir = tempfile::tempdir().unwrap();
+    let context = Arc::new(context_simple::SimpleContextEngine::new(
+        context_simple::SimpleContextConfig {
+            gc_buffer_capacity: 1,
+            gc_reactivate_per_pass: 8,
+            context_store_dir: Some(dir.path().to_path_buf()),
+            ..context_simple::SimpleContextConfig::default()
+        },
+    ));
+    context
+        .ingest(ContextIngress::FocusChanged {
+            focus: FocusState::for_task(TaskId::new(), "service layer"),
+        })
+        .await
+        .unwrap();
+    context
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    for (index, ch) in ["x", "y"].iter().enumerate() {
+        context
+            .ingest(ContextIngress::ToolObservation {
+                output: ToolOutput {
+                    call_id: format!("step-{index}"),
+                    tool_name: "shell.exec".into(),
+                    ok: true,
+                    summary: "ok".into(),
+                    model_content: format!("step {index}: fix AuthService.rs {}", ch.repeat(160)),
+                    artifact_ref: None,
+                    metadata: serde_json::json!({}),
+                },
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    context
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let gc_report = context.gc().await.unwrap();
+    assert!(gc_report.externalized >= 1, "the seed must externalize");
+
+    let refs = context
+        .search_external(ContextSearchQuery {
+            query: "AuthService".into(),
+            kind: None,
+            scope: None,
+            task_id: None,
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let target = refs[0].item_id;
+    let resident_before = context.diagnostics().await.unwrap().resident_items;
+
+    // 构造实例：真实 context 引擎 + 返回 admit 指令的 dispatcher +
+    // 先发工具调用后完成的 scripted model。
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        context.clone(),
+        Arc::new(AdmitScriptedModel::new(target)),
+        Arc::new(AdmitDirectiveDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    instance.start().await.unwrap();
+    let mut events = instance.handle().subscribe();
+    instance
+        .handle()
+        .set_focus("service layer".into())
+        .await
+        .unwrap();
+    instance
+        .handle()
+        .user_message("admit the step I need".into())
+        .await
+        .unwrap();
+
+    // 等待 turn 完成（admit 指令在操作提交时执行）。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let completed = events
+            .try_recv()
+            .is_ok_and(|envelope| matches!(envelope.event, RuntimeEvent::TurnCompleted));
+        if completed || tokio::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        context.diagnostics().await.unwrap().resident_items > resident_before,
+        "the admitted item must be resident after the turn"
+    );
+    let inspected = context.inspect(100).await.unwrap();
+    assert!(
+        inspected.iter().any(|item| item.id == target),
+        "the admitted item is inspectable under its original id"
     );
     instance.shutdown().await.unwrap();
 }

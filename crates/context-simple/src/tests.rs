@@ -4629,6 +4629,175 @@ async fn derive_creates_a_new_item_with_a_derived_from_edge() {
     );
 }
 
+/// admit 的 store 读取是一次回滚边界：当 blob 在 plan 与 IO 之间消失
+/// （崩溃、手动删除），admit 必须是静默 no-op —— 条目留在外部映射、
+/// 不产生任何新项、也没有挂起的转换。半截 admit 永远不允许存在。
+#[tokio::test]
+async fn admit_of_a_disappeared_store_blob_is_a_silent_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        gc_reactivate_per_pass: 8,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    open_focus(&engine, "service layer").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "work on AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    let content = format!("step 0: fix AuthService.rs {}", "x".repeat(160));
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: observation_output("step-0", true, &content),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    let content = format!("step 1: fix AuthService.rs {}", "y".repeat(160));
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: observation_output("step-1", true, &content),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let gc_report = engine.gc().await.unwrap();
+    assert!(
+        gc_report.externalized >= 1,
+        "buffer overflow must externalize"
+    );
+
+    let refs = engine
+        .search_external(ContextSearchQuery {
+            query: "AuthService".into(),
+            kind: None,
+            scope: None,
+            task_id: None,
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let target = refs[0].item_id;
+    assert!(
+        engine.fetch_external(target).await.unwrap().is_some(),
+        "the blob must be readable before removal"
+    );
+
+    // 删除 blob 文件：plan_admit 只看映射（仍判定可检索），锁外读返回
+    // None —— 必须静默 no-op，不留下任何半截状态。
+    let store = crate::store::store_dir(&SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    std::fs::remove_file(store.join(format!("{target}.json"))).unwrap();
+
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Admit {
+                item_id: target,
+                reason: "need it again".into(),
+            },
+        })
+        .await
+        .unwrap();
+
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            state.external.get(target).is_some(),
+            "the entry must stay in the external map"
+        );
+        assert!(
+            !state.items.iter().any(|item| item.id == target),
+            "no half-admitted resident may exist"
+        );
+        assert!(
+            state
+                .pending_ingest_transitions
+                .iter()
+                .all(|t| t.item_id != target),
+            "no pending admit transition may exist"
+        );
+    }
+    // materialize 也不应选中它（内容仍在外部层）。
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "next".into(),
+            budget_tokens: 4096,
+            hints: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert!(!materialized.items.iter().any(|item| item.item_id == target));
+}
+
+/// 持久保留内容经 admit 后保持其保留类别：指令只移动 body 位置
+/// （external -> resident），绝不改变生命周期权威（retention 保持
+/// Durable）。
+#[tokio::test]
+async fn admit_of_a_durable_item_keeps_its_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    // 直接构造一个 Durable 的外部条目（持久根不会被 GC 驱逐，因此通过
+    // restore 种入）。
+    let mut state = crate::engine::State::default();
+    let config = SimpleContextConfig::default();
+    let mut item = crate::item::make_item(
+        &state,
+        &config,
+        "durable decision: keep the module split".into(),
+        ContextKind::Note,
+        ContextScope::Task,
+        ContextRetention::Durable,
+        0.6,
+        Some("seeded".to_string()),
+    );
+    item.id = ContextItemId::new();
+    let reference = crate::store::externalize(dir.path(), &item).unwrap();
+    state.external.push(crate::store::to_external_entry(
+        &item, reference, 1, 1, None,
+    ));
+    let value = crate::checkpoint::serialize(&state).unwrap();
+    engine.restore(value).await.unwrap();
+
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Admit {
+                item_id: item.id,
+                reason: "the decision is relevant again".into(),
+            },
+        })
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    let resident = state
+        .items
+        .iter()
+        .find(|i| i.id == item.id)
+        .expect("the durable item is resident after admit");
+    assert_eq!(
+        resident.retention,
+        ContextRetention::Durable,
+        "retention must not change when the body moves"
+    );
+    assert_eq!(resident.residency, ContextResidency::Resident);
+    assert!(
+        state.external.get(item.id).is_none(),
+        "the entry must leave the external map"
+    );
+}
+
 /// The startup reconcile, driven through the public engine API, converges a
 /// crash-injected store: an uncommitted orphan blob is rebuilt into an
 /// entry, a stale duplicate of resident content is reclaimed, a damaged

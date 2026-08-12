@@ -784,9 +784,18 @@ Requirements:
 - [x] `search`/`inspect`/`fetch` are transient and do not create a second
   `ToolObservation`; runtime E2E and context-service process parity are
   verified, including real externalization and full-body fetch.
-- [~] `admit` and `derive` are now present in the working tree with per-turn
+- [x] `admit` and `derive` are now present in the working tree with per-turn
   quotas and a `DerivedFrom` edge; identity, terminal-state, cross-residency,
   storage-root, rollback, and full-suite acceptance remain to be validated.
+  **All validated 2026-08-12.** Identity and single-transition admits are
+  covered for the external and warm paths, terminal states never resurrect,
+  and per-turn quotas bound both directives; new coverage closes the rest —
+  rollback (a store blob that vanished between plan and IO makes the admit a
+  silent no-op: entry stays external, nothing minted, no pending transition),
+  retention authority (a durable item keeps `Durable` when its body moves
+  external -> resident), and full-suite acceptance (a scripted
+  `context.manage` admit call routes end to end through the runtime directive
+  path and the item re-enters the working set under its original id).
 - [ ] Bound every query, descriptor, fetched excerpt, full-body result, and
   model-facing output; spill large bodies to one artifact.
 - [ ] Record access without promoting evidence into a trusted prompt role.
