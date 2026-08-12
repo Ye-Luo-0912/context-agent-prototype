@@ -2518,3 +2518,100 @@ async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
     handle.stop().await.unwrap();
 }
 // ---------------------------------------------------------------------------
+
+/// A model that answers with one very long plain-text message — far beyond
+/// the engine's bounded ContextItem cap — so the raw-evidence artifact is
+/// the only place the *complete* final response survives.
+#[derive(Debug)]
+struct LongResponseModel(usize);
+
+#[async_trait::async_trait]
+impl ModelTransport for LongResponseModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        Ok(ModelOutput {
+            content: "x".repeat(self.0),
+            tool_calls: Vec::new(),
+            usage: Default::default(),
+        })
+    }
+    async fn complete_stream(
+        &self,
+        request: ModelRequest,
+        sink: &dyn ModelEventSink,
+    ) -> AgentResult<ModelOutput> {
+        sink.on_chunk(ModelChunk::Done).await?;
+        self.complete(request).await
+    }
+}
+
+/// Raw-evidence retention (CONTEXT_RUNTIME_TODO "Persist the exact final
+/// response before ContextItem truncation"): with an artifact workspace
+/// wired, the actor writes the *full* final assistant response to an
+/// artifact before the bounded ContextItem is built, so an oversized
+/// response survives intact even though the engine's copy would truncate
+/// it.
+#[tokio::test]
+async fn final_assistant_response_is_persisted_in_full_before_contextitem_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    // Far beyond the default ContextItem cap (16,000 chars): only an
+    // untruncated artifact preserves the raw output.
+    let content_len = 40_000;
+    let mut services = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(LongResponseModel(content_len)),
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    Arc::get_mut(&mut services).unwrap().artifact_workspace = Some(workspace.clone());
+    let (handle, _task) = spawn_runtime(services);
+    handle.start().await.unwrap();
+    handle
+        .user_message("write the report".into())
+        .await
+        .unwrap();
+
+    // Wait until the assistant-response artifact appears (one per final
+    // response) and read it back.
+    let artifacts_dir = workspace.state_dir().join("artifacts");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut artifacts: Vec<std::path::PathBuf> = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        artifacts = collect_txt_files(&artifacts_dir);
+        if !artifacts.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        artifacts.len(),
+        1,
+        "exactly one assistant-response artifact per final response, got {artifacts:?}"
+    );
+    let content = std::fs::read_to_string(&artifacts[0]).unwrap();
+    assert_eq!(
+        content.len(),
+        content_len,
+        "the artifact must carry the complete untruncated response"
+    );
+}
+
+fn collect_txt_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(collect_txt_files(&path));
+            } else if path.extension().is_some_and(|ext| ext == "txt") {
+                out.push(path);
+            }
+        }
+    }
+    out
+}

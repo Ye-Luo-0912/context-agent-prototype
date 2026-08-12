@@ -20,6 +20,7 @@ use agent_contracts::{
     ToolCatalogEntry, ToolDispatcher, ToolSpec, ToolSurfaceSnapshot,
 };
 use agent_core::{CoreAuthority, CoreAuthorityConfig};
+use agent_workspace::Workspace;
 
 use crate::host::ServiceRegistry;
 
@@ -36,6 +37,12 @@ pub struct RuntimeServices {
     pub tools: Arc<dyn ToolDispatcher>,
     pub approval: Arc<dyn ApprovalGate>,
     pub journal: Option<Arc<dyn EventJournal>>,
+    /// Optional artifact destination (the run's workspace). When set, the
+    /// actor persists each final assistant response in full before the
+    /// bounded ContextItem is built, so the raw output survives ContextItem
+    /// truncation (raw-evidence retention). `None` skips the persistence
+    /// (tests and bare compositions).
+    pub artifact_workspace: Option<Arc<Workspace>>,
 }
 
 impl RuntimeServices {
@@ -68,6 +75,7 @@ impl RuntimeServices {
             tools,
             approval,
             journal,
+            artifact_workspace: None,
         }
     }
 
@@ -79,14 +87,18 @@ impl RuntimeServices {
         registry: &ServiceRegistry,
         kernel_config: CoreAuthorityConfig,
     ) -> AgentResult<Self> {
-        Ok(Self::new(
+        let mut services = Self::new(
             kernel_config,
             registry.context_service()?,
             registry.model_provider()?,
             registry.tool_provider()?,
             registry.approval_policy()?,
             registry.event_store()?,
-        ))
+        );
+        // Raw-evidence retention destination: the run's artifact store,
+        // when the composition root wired one.
+        services.artifact_workspace = registry.artifact_store()?;
+        Ok(services)
     }
 
     /// The kernel this run uses: the authority facade (events, approval,

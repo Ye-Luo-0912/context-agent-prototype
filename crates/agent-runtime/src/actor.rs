@@ -114,6 +114,7 @@ enum TurnCommitPhase {
     ToolObservationIngest,
     AfterToolMaintain,
     AfterToolMaintainedEvent,
+    AssistantMessageArtifact,
     AssistantMessageIngest,
     AssistantMessageEvent,
     AfterModelMaintain,
@@ -129,6 +130,7 @@ impl TurnCommitPhase {
             TurnCommitPhase::ToolObservationIngest => "tool_observation_ingest",
             TurnCommitPhase::AfterToolMaintain => "after_tool_maintain",
             TurnCommitPhase::AfterToolMaintainedEvent => "after_tool_maintained_event",
+            TurnCommitPhase::AssistantMessageArtifact => "assistant_message_artifact",
             TurnCommitPhase::AssistantMessageIngest => "assistant_message_ingest",
             TurnCommitPhase::AssistantMessageEvent => "assistant_message_event",
             TurnCommitPhase::AfterModelMaintain => "after_model_maintain",
@@ -2278,6 +2280,37 @@ impl RuntimeActor {
             {
                 return self
                     .commit_failed(TurnCommitPhase::AfterToolMaintainedEvent, error)
+                    .await;
+            }
+        }
+        // Raw-evidence retention: the exact final assistant response is
+        // persisted in full *before* the bounded ContextItem is built, so
+        // the raw output survives ContextItem truncation and stays
+        // recoverable even when the engine's copy was capped. The artifact
+        // name embeds a fresh uuid, so sibling responses never overwrite
+        // each other. A failure here aborts the commit exactly like any
+        // other mandatory state write.
+        if let Some(workspace) = &self.services.artifact_workspace {
+            let (_, artifact_path) = match workspace
+                .create_artifact_path(self.kernel.run_id(), "assistant-response", "txt")
+                .await
+            {
+                Ok(pair) => pair,
+                Err(error) => {
+                    return self
+                        .commit_failed(TurnCommitPhase::AssistantMessageArtifact, error)
+                        .await;
+                }
+            };
+            if let Err(error) = tokio::fs::write(&artifact_path, content.as_bytes()).await {
+                return self
+                    .commit_failed(
+                        TurnCommitPhase::AssistantMessageArtifact,
+                        AgentError::Io(format!(
+                            "write assistant-response artifact '{}': {error}",
+                            artifact_path.display()
+                        )),
+                    )
                     .await;
             }
         }
