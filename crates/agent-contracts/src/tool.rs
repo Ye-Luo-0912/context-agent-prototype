@@ -25,9 +25,13 @@ pub const MAX_TOOL_METADATA_BYTES: usize = 8_000;
 /// field individually fits. The broker trims `model_content` first.
 pub const MAX_TOOL_OUTPUT_TOTAL_CHARS: usize = 24_000;
 
-/// Cap on `context.search` limit enforced in execution (the JSON schema
-/// advertises the same maximum; execution is authoritative).
+/// `context.search` 的 limit 上限，在执行期强制（JSON schema 只负责声明
+/// 同一个最大值；执行期才是权威）。
 pub const CONTEXT_SEARCH_MAX_LIMIT: usize = 50;
+
+/// `context.search` 自由文本查询的长度上限，在执行期强制：超长查询在
+/// 到达引擎前按字符截断，模型永远无法用巨型查询字符串冲刷检索路径。
+pub const CONTEXT_SEARCH_MAX_QUERY_CHARS: usize = 256;
 
 /// A trusted output broker: bounds every model-facing field of a tool
 /// output and spills oversized content to an artifact once, returning a

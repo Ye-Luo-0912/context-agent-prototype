@@ -796,10 +796,23 @@ Requirements:
   external -> resident), and full-suite acceptance (a scripted
   `context.manage` admit call routes end to end through the runtime directive
   path and the item re-enters the working set under its original id).
-- [ ] Bound every query, descriptor, fetched excerpt, full-body result, and
+- [x] Bound every query, descriptor, fetched excerpt, full-body result, and
   model-facing output; spill large bodies to one artifact.
+  **Bounded 2026-08-12.** `context.search` limits are clamped to
+  `CONTEXT_SEARCH_MAX_LIMIT` in execution (0 keeps the engine default) and
+  the free-text query is truncated to `CONTEXT_SEARCH_MAX_QUERY_CHARS` chars
+  before it reaches the engine; search hits render bounded summaries, and
+  `context.fetch` full bodies pass through the trusted output broker, which
+  caps every model-facing field and spills oversized content to one
+  artifact before the model sees a truncated middle.
 - [ ] Record access without promoting evidence into a trusted prompt role.
-- [ ] Distinguish “evidence does not exist” from “not found by this search.”
+- [x] Distinguish “evidence does not exist” from “not found by this search.”
+  **Done 2026-08-12.** An empty search result now distinguishes the two
+  cases in the model-facing message: with no kind/scope/task filter it
+  reports that no externalized items match, with a filter it says nothing
+  matches within the requested filter and evidence may exist under a
+  different filter — so the model can decide to give up or retry under
+  another filter instead of misreading a filter miss as absent evidence.
 - [ ] Require source authority/taint checks again at fetch/admit time.
 - [ ] Keep vector retrieval deferred as an optional candidate provider; it
   may suggest ids but cannot own lifecycle truth or bypass admission.

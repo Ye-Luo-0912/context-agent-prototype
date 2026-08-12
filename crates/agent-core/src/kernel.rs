@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use agent_contracts::{
-    AgentError, AgentResult, AuthorityLease, CONTEXT_SEARCH_MAX_LIMIT, CancellationToken,
-    ContextConsumptionAck, ContextEngine, ContextMaintenanceTrigger, ContextQuery,
-    ContextSearchQuery, EngineQuery, OutputBroker, RunId, RuntimeEvent, TaskId, ToolCall,
-    ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSurfaceSnapshot,
-    derive_effect_intent,
+    AgentError, AgentResult, AuthorityLease, CONTEXT_SEARCH_MAX_LIMIT,
+    CONTEXT_SEARCH_MAX_QUERY_CHARS, CancellationToken, ContextConsumptionAck, ContextEngine,
+    ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery, EngineQuery, OutputBroker, RunId,
+    RuntimeEvent, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput,
+    ToolRisk, ToolSurfaceSnapshot, derive_effect_intent,
 };
 
 use crate::authority::{
@@ -236,11 +236,17 @@ impl CoreAuthority {
                 task_id,
                 limit,
             } => {
-                // Query limits are enforced in execution, not only by the
-                // JSON schema: a hostile or stale limit is clamped before it
-                // reaches the engine, so the model can never ask for an
-                // unbounded hit set. 0 keeps the engine default.
+                // 查询上限在执行期强制，而不只依赖 JSON schema：恶意或过期的
+                // limit 在到达引擎前就被钳制，模型永远无法要求无界命中集。
+                // 0 表示保持引擎默认值。
                 let limit = limit.min(CONTEXT_SEARCH_MAX_LIMIT);
+                // 自由文本查询同样有硬上限：超长查询在到达引擎前按字符截断，
+                // 避免模型用巨型查询字符串冲刷检索路径。
+                let query: String = query.chars().take(CONTEXT_SEARCH_MAX_QUERY_CHARS).collect();
+                // 空结果需要区分"确实没有外部化证据"（无过滤）与"当前过滤条件下
+                // 未命中"（带过滤）：前者提示模型放弃检索，后者提示证据可能
+                // 存在于别的过滤条件下，值得换个条件重试。
+                let has_filter = kind.is_some() || scope.is_some() || task_id.is_some();
                 let search = ContextSearchQuery {
                     query,
                     kind,
@@ -252,8 +258,11 @@ impl CoreAuthority {
                     Ok(hits) if hits.is_empty() => {
                         output.ok = true;
                         output.summary = "no external refs match".into();
-                        output.model_content =
-                            "context.search: no externalized items match the query.".into();
+                        output.model_content = if has_filter {
+                            "context.search: nothing matches within the requested filter — evidence may exist under a different filter.".into()
+                        } else {
+                            "context.search: no externalized items match the query.".into()
+                        };
                     }
                     Ok(hits) => {
                         output.ok = true;
@@ -773,6 +782,7 @@ mod tests {
 
     struct RecordingEngine {
         searched_limits: std::sync::Mutex<Vec<usize>>,
+        searched_queries: std::sync::Mutex<Vec<String>>,
         fetched: std::sync::Mutex<Option<ContextItem>>,
     }
 
@@ -814,6 +824,10 @@ mod tests {
             query: ContextSearchQuery,
         ) -> AgentResult<Vec<ExternalizedContext>> {
             self.searched_limits.lock().unwrap().push(query.limit);
+            self.searched_queries
+                .lock()
+                .unwrap()
+                .push(query.query.clone());
             Ok(Vec::new())
         }
         async fn fetch_external(
@@ -908,6 +922,7 @@ mod tests {
         let kernel = test_kernel(
             Arc::new(RecordingEngine {
                 searched_limits: Default::default(),
+                searched_queries: Default::default(),
                 fetched: Default::default(),
             }),
             dispatcher,
@@ -955,6 +970,7 @@ mod tests {
         let kernel = test_kernel(
             Arc::new(RecordingEngine {
                 searched_limits: Default::default(),
+                searched_queries: Default::default(),
                 fetched: Default::default(),
             }),
             dispatcher,
@@ -983,6 +999,7 @@ mod tests {
         let broker = Arc::new(RecordingBroker::default());
         let engine = Arc::new(RecordingEngine {
             searched_limits: Default::default(),
+            searched_queries: Default::default(),
             fetched: std::sync::Mutex::new(Some(test_item("big".repeat(200_000)))),
         });
         let kernel = test_kernel(
@@ -1039,6 +1056,7 @@ mod tests {
     async fn search_limit_is_clamped_in_execution() {
         let engine = Arc::new(RecordingEngine {
             searched_limits: Default::default(),
+            searched_queries: Default::default(),
             fetched: Default::default(),
         });
         let kernel = test_kernel(
@@ -1085,6 +1103,7 @@ mod tests {
     async fn search_limit_zero_keeps_the_engine_default() {
         let engine = Arc::new(RecordingEngine {
             searched_limits: Default::default(),
+            searched_queries: Default::default(),
             fetched: Default::default(),
         });
         let kernel = test_kernel(
@@ -1131,6 +1150,129 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn search_query_length_is_bounded_in_execution() {
+        // 超长查询在执行期被截断到 CONTEXT_SEARCH_MAX_QUERY_CHARS：
+        // 引擎只收到有界长度的查询字符串，模型无法用巨型查询冲刷检索路径。
+        let engine = Arc::new(RecordingEngine {
+            searched_limits: Default::default(),
+            searched_queries: Default::default(),
+            fetched: Default::default(),
+        });
+        let kernel = test_kernel(
+            engine.clone(),
+            Arc::new(BigOutputDispatcher {
+                output: ToolOutput {
+                    call_id: "c1".into(),
+                    tool_name: "context.manage".into(),
+                    ok: true,
+                    summary: "placeholder".into(),
+                    model_content: "placeholder".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                },
+            }),
+            None,
+        );
+        let placeholder = ToolOutput {
+            call_id: "c1".into(),
+            tool_name: "context.manage".into(),
+            ok: true,
+            summary: "placeholder".into(),
+            model_content: "placeholder".into(),
+            artifact_ref: None,
+            metadata: serde_json::Value::Null,
+        };
+        let _ = kernel
+            .resolve_engine_query(
+                placeholder,
+                EngineQuery::SearchExternal {
+                    query: "x".repeat(CONTEXT_SEARCH_MAX_QUERY_CHARS * 4),
+                    kind: None,
+                    scope: None,
+                    task_id: None,
+                    limit: 10,
+                },
+            )
+            .await;
+        let queries = engine.searched_queries.lock().unwrap();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(
+            queries[0].chars().count(),
+            CONTEXT_SEARCH_MAX_QUERY_CHARS,
+            "the engine must receive a query truncated to the execution cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_search_distinguishes_no_evidence_from_filter_miss() {
+        // 无过滤的空结果说明确实没有外部化证据；带过滤的空结果提示
+        // 证据可能存在于别的过滤条件下——模型据此决定放弃还是换过滤重试。
+        let engine = Arc::new(RecordingEngine {
+            searched_limits: Default::default(),
+            searched_queries: Default::default(),
+            fetched: Default::default(),
+        });
+        let kernel = test_kernel(
+            engine.clone(),
+            Arc::new(BigOutputDispatcher {
+                output: ToolOutput {
+                    call_id: "c1".into(),
+                    tool_name: "context.manage".into(),
+                    ok: true,
+                    summary: "placeholder".into(),
+                    model_content: "placeholder".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                },
+            }),
+            None,
+        );
+        let placeholder = ToolOutput {
+            call_id: "c1".into(),
+            tool_name: "context.manage".into(),
+            ok: true,
+            summary: "placeholder".into(),
+            model_content: "placeholder".into(),
+            artifact_ref: None,
+            metadata: serde_json::Value::Null,
+        };
+        let no_filter = kernel
+            .resolve_engine_query(
+                placeholder.clone(),
+                EngineQuery::SearchExternal {
+                    query: "x".into(),
+                    kind: None,
+                    scope: None,
+                    task_id: None,
+                    limit: 10,
+                },
+            )
+            .await;
+        assert!(
+            no_filter
+                .model_content
+                .contains("no externalized items match"),
+            "no filter must report that there is genuinely no externalized evidence"
+        );
+        let filtered = kernel
+            .resolve_engine_query(
+                placeholder,
+                EngineQuery::SearchExternal {
+                    query: "x".into(),
+                    kind: Some(ContextKind::Note),
+                    scope: None,
+                    task_id: None,
+                    limit: 10,
+                },
+            )
+            .await;
+        assert!(
+            filtered.model_content.contains("different filter"),
+            "a filter miss must hint that evidence may exist under another filter"
+        );
+    }
+
     // --- ACI v2 shadow mode (IntentShadowGate) ---
 
     /// A deterministic shadow gate for the kernel integration test.
@@ -1160,6 +1302,7 @@ mod tests {
             },
             Arc::new(RecordingEngine {
                 searched_limits: Default::default(),
+                searched_queries: Default::default(),
                 fetched: Default::default(),
             }),
             Arc::new(BigOutputDispatcher {
@@ -1247,6 +1390,7 @@ mod tests {
             },
             Arc::new(RecordingEngine {
                 searched_limits: Default::default(),
+                searched_queries: Default::default(),
                 fetched: Default::default(),
             }),
             Arc::new(EchoDispatcher {
@@ -1343,6 +1487,7 @@ mod tests {
             },
             Arc::new(RecordingEngine {
                 searched_limits: Default::default(),
+                searched_queries: Default::default(),
                 fetched: Default::default(),
             }),
             Arc::new(EchoDispatcher {
