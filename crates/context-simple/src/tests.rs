@@ -2509,7 +2509,9 @@ async fn inspect_is_bounded_across_the_logical_catalog() {
         item.created_tick = tick;
         state.items.push(item);
     }
-    // External store entries with interleaved ticks.
+    // External store entries with interleaved ticks: the entry now carries
+    // the item's real creation clock, so the fixture sets it explicitly
+    // (the externalized_at_tick argument stays for the store metadata).
     for (offset, tick) in [20u64, 5, 40].into_iter().enumerate() {
         let mut state = engine.state.lock().await;
         let mut item = crate::item::make_item(
@@ -2522,6 +2524,7 @@ async fn inspect_is_bounded_across_the_logical_catalog() {
             0.5,
             None,
         );
+        item.created_tick = tick;
         item.entities = crate::index::entity::extract_entities(&item.content);
         let reference = crate::store::externalize(dir.path(), &item).unwrap();
         let entry = crate::store::to_external_entry(&item, reference, tick, 1, None);
@@ -4872,9 +4875,131 @@ async fn externalized_source_survives_inspect_and_admit() {
     );
 }
 
-/// The startup reconcile, driven through the public engine API, converges a
-/// crash-injected store: an uncommitted orphan blob is rebuilt into an
-/// entry, a stale duplicate of resident content is reclaimed, a damaged
+/// 权威元数据（打分权重/时钟/访问计数/GC 世代）跨外部化同构：外部化只搬运
+/// body 到 store，权威元数据随条目保留——inspect 的 external 投影如实显示
+/// 真实 importance/created_tick（而不是硬编码 0.0 或用 externalized_at_tick
+/// 近似），admit 带回工作集后字段保持。这是 ContextCatalog 统一权威的前提。
+#[tokio::test]
+async fn externalized_authority_metadata_survives_externalization() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let item_id = {
+        let mut state = crate::engine::State::default();
+        let config = SimpleContextConfig::default();
+        let mut item = crate::item::make_item(
+            &state,
+            &config,
+            "metadata-preserving tool finding".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.7,
+            Some("tool-capture".to_string()),
+        );
+        // 覆盖完整权威元数据：外部化后这些值必须原样可见。
+        item.id = ContextItemId::new();
+        item.relevance = 0.3;
+        item.created_tick = 42;
+        item.created_turn = 3;
+        item.last_access_turn = 5;
+        item.last_selected_turn = 4;
+        item.access_count = 7;
+        item.gc_generation = 2;
+        item.evicted_at_tick = Some(10);
+        let reference = crate::store::externalize(dir.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item, reference, 99, 1, None,
+        ));
+        let value = crate::checkpoint::serialize(&state).unwrap();
+        engine.restore(value).await.unwrap();
+        item.id
+    };
+
+    // inspect 的 external 投影必须如实反映权威元数据（非 0.0、非
+    // externalized_at_tick 近似、非 turn 0）。
+    let catalog = engine.inspect(usize::MAX).await.unwrap();
+    let entry = catalog
+        .iter()
+        .find(|item| item.id == item_id)
+        .expect("the externalized entry is part of the logical catalog");
+    assert_eq!(
+        entry.importance, 0.7,
+        "importance must survive externalization"
+    );
+    assert_eq!(
+        entry.relevance, 0.3,
+        "relevance must survive externalization"
+    );
+    assert_eq!(
+        entry.created_tick, 42,
+        "the real creation tick must be kept"
+    );
+    assert_eq!(entry.created_turn, 3, "the creation turn must be kept");
+    assert_eq!(entry.last_access_turn, 5, "the access turn must be kept");
+    assert_eq!(
+        entry.last_selected_turn, 4,
+        "the selection turn must be kept"
+    );
+    assert_eq!(entry.access_count, 7, "the access count must be kept");
+
+    // admit 带回工作集：权威元数据经 blob 读回后原样保持。
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::Admit {
+                item_id,
+                reason: "the finding is relevant again".into(),
+            },
+        })
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    let resident = state
+        .items
+        .iter()
+        .find(|i| i.id == item_id)
+        .expect("the item is resident after admit");
+    // 权威元数据在 body 移动（external -> resident）后原样保持：创建时钟、
+    // 打分权重、入选时钟都是历史事实，admit 只改位置与访问时钟。
+    assert_eq!(
+        resident.importance, 0.7,
+        "importance is authority and must survive"
+    );
+    assert_eq!(
+        resident.created_tick, 42,
+        "the creation tick is authority and must not be rewritten"
+    );
+    assert_eq!(
+        resident.created_turn, 3,
+        "the creation turn is authority and must survive"
+    );
+    assert_eq!(
+        resident.last_selected_turn, 4,
+        "the selection turn is authority and must survive"
+    );
+    // admit 的入场语义更新（与 GC reactivate 一致的既有行为）：相关性抬升、
+    // 访问时钟刷新、计数递增、世代从新窗口开始、清除 eviction 标记。
+    assert_eq!(
+        resident.relevance, 0.5,
+        "re-entry floors the relevance at 0.5"
+    );
+    assert_eq!(
+        resident.last_access_turn, state.turn,
+        "re-entry refreshes the access clock"
+    );
+    assert_eq!(resident.access_count, 8, "re-entry counts one more access");
+    assert_eq!(
+        resident.gc_generation, 0,
+        "re-entry restarts the GC generation window"
+    );
+    assert_eq!(
+        resident.evicted_at_tick, None,
+        "the eviction marker is cleared on re-entry"
+    );
+}
 /// blob is quarantined (evidence preserved), and an abandoned temp file is
 /// removed — with every action surfaced in the `StoreReconcileReport`.
 #[tokio::test]

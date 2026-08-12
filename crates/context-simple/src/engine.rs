@@ -911,8 +911,9 @@ impl ContextEngine for SimpleContextEngine {
         let state = self.state.lock().await;
         // The logical catalog, not just the resident share: the heap, the
         // reversible warm buffer and the external store entries are all
-        // known items. External entries project from their lightweight
-        // descriptor (externalized_at_tick as their created_tick).
+        // known items. External entries project from their descriptor,
+        // which carries the authoritative creation clock captured at
+        // externalize time.
         //
         // Bounded by construction: `bounded_catalog` keeps only the
         // `limit` smallest created_tick summaries while streaming, so the

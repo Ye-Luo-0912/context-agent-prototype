@@ -915,6 +915,31 @@ pub struct ExternalizedContext {
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// 外部化时的打分权重（importance/relevance），随条目保留：inspect
+    /// 能如实反映外部条目的候选价值，而不是固定 0.0。这是 ContextCatalog
+    /// 统一权威元数据的前置——外部化不得把权威降级。
+    #[serde(default)]
+    pub importance: f32,
+    #[serde(default)]
+    pub relevance: f32,
+    /// 真实创建时钟，随条目保留。inspect 排序据此用真实创建时间，
+    /// 不再以 `externalized_at_tick` 近似。
+    #[serde(default)]
+    pub created_tick: u64,
+    #[serde(default)]
+    pub created_turn: u64,
+    #[serde(default)]
+    pub last_access_turn: u64,
+    #[serde(default)]
+    pub last_selected_turn: u64,
+    #[serde(default)]
+    pub access_count: u32,
+    /// 外部化时的 GC 世代，随条目保留（recall 后从原世代继续，而非清零）。
+    #[serde(default)]
+    pub gc_generation: u32,
+    /// 进入 warm 缓冲的 tick，随条目保留。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evicted_at_tick: Option<u64>,
 }
 
 /// Cap on the external refs surfaced in one materialized context. The
@@ -1267,7 +1292,60 @@ mod tests {
             last_access_gc_epoch: Some(0),
             blob_checksum: None,
             source: None,
+            importance: 0.0,
+            relevance: 0.0,
+            created_tick: 0,
+            created_turn: 0,
+            last_access_turn: 0,
+            last_selected_turn: 0,
+            access_count: 0,
+            gc_generation: 0,
+            evicted_at_tick: None,
         }
+    }
+
+    #[test]
+    fn externalized_entry_without_the_new_authority_fields_still_loads() {
+        // 权威元数据字段全部带 serde(default)：旧 checkpoint / 旧 wire
+        // 数据（没有 importance/created_tick/... ）必须能反序列化为默认值，
+        // 而不是拒绝加载。
+        let legacy = serde_json::json!({
+            "item_id": ContextItemId::new(),
+            "kind": "Note",
+            "scope": "Task",
+            "retention": "Working",
+            "attention": "Archived",
+            "semantic": "Live",
+            "context_ref": {
+                "uri": "context://run/x",
+                "item_id": ContextItemId::new(),
+                "kind": "Note",
+                "scope": "Task",
+                "summary": "legacy",
+                "created_tick": 0
+            },
+            "externalized_at_tick": 0,
+            "last_access_tick": 0,
+            "residency": "Cold",
+            "entities": [],
+            "tags": [],
+            "dependencies": [],
+            "keep_alive": false,
+            "lease_until_turn": null,
+            "last_access_gc_epoch": 0,
+            "blob_checksum": null
+        });
+        let entry: ExternalizedContext = serde_json::from_value(legacy).unwrap();
+        assert_eq!(entry.importance, 0.0);
+        assert_eq!(entry.relevance, 0.0);
+        assert_eq!(entry.created_tick, 0);
+        assert_eq!(entry.created_turn, 0);
+        assert_eq!(entry.last_access_turn, 0);
+        assert_eq!(entry.last_selected_turn, 0);
+        assert_eq!(entry.access_count, 0);
+        assert_eq!(entry.gc_generation, 0);
+        assert_eq!(entry.evicted_at_tick, None);
+        assert_eq!(entry.source, None);
     }
 
     #[test]

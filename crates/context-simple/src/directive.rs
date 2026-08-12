@@ -229,8 +229,9 @@ fn reenter_working_set(item: &mut ContextItem, now_tick: u64, state: &State) {
     item.residency = ContextResidency::Resident;
     item.gc_generation = 0;
     item.evicted_at_tick = None;
-    item.created_tick = now_tick;
-    item.created_turn = state.turn;
+    // 创建时钟是权威元数据：body 移动（external/warm -> resident）只改
+    // 位置与访问时钟，绝不改写 created_tick/created_turn——否则条目看
+    // 起来永远年轻，TTL/recency 老化失真。与 GC reactivate 行为一致。
     item.last_access_tick = now_tick;
     item.last_access_turn = state.turn;
     item.access_count = item.access_count.saturating_add(1);

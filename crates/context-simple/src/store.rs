@@ -294,6 +294,17 @@ pub(crate) fn to_external_entry(
         // 来源权威随条目一起外部化：检索/审查能看到条目来自哪里，
         // 无需读 store 文件；admit/fetch 的权威校验以此为前提。
         source: item.source.clone(),
+        // 完整保留打分/时钟/世代权威元数据：外部化只搬运 body 到 store，
+        // 权威元数据不得降级（inspect 如实投影，recall 后从原值继续）。
+        importance: item.importance,
+        relevance: item.relevance,
+        created_tick: item.created_tick,
+        created_turn: item.created_turn,
+        last_access_turn: item.last_access_turn,
+        last_selected_turn: item.last_selected_turn,
+        access_count: item.access_count,
+        gc_generation: item.gc_generation,
+        evicted_at_tick: item.evicted_at_tick,
     }
 }
 

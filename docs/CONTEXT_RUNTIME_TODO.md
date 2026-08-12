@@ -1117,8 +1117,18 @@ second authority or another transcript-based context system.
   and single ownership; derive creates a new item with `DerivedFrom`; both
   have per-turn quotas and runtime E2E tests. Canonical catalog and
   provenance/authority admission remain separate work.
-- [ ] Introduce canonical `ContextCatalog` ownership; body movement changes
+- [~] Introduce canonical `ContextCatalog` ownership; body movement changes
   location only, never lifecycle authority (`CTX-02` structural target).
+  **Authority-isomorphism step landed 2026-08-12.** `ExternalizedContext`
+  now carries the item's full authoritative lifecycle metadata (importance/
+  relevance, real `created_tick`/turn clocks, access count, GC generation,
+  eviction tick) captured at externalize time — externalization no longer
+  degrades authority, and `inspect` projects the real values instead of
+  zeros or the externalization tick. Body movement no longer rewrites
+  authority: `reenter_working_set` stopped clobbering `created_tick`/
+  `created_turn` on admit, matching the GC reactivate path. The single
+  `item_id -> ContextRecord` storage directory (merging heap / warm buffer
+  / external map) remains the open structural step.
 - [x] Make externalization/recall crash-safe and restart-reconcilable, with
   one owner per blob, checksum/revision, atomic writes, and bounded I/O
   (`CTX-04`).

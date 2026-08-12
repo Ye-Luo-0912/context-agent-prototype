@@ -176,6 +176,15 @@ mod tests {
             last_access_gc_epoch: Some(0),
             blob_checksum: None,
             source: None,
+            importance: 0.0,
+            relevance: 0.0,
+            created_tick: 0,
+            created_turn: 0,
+            last_access_turn: 0,
+            last_selected_turn: 0,
+            access_count: 0,
+            gc_generation: 0,
+            evicted_at_tick: None,
         }
     }
 

@@ -32,9 +32,11 @@ pub(crate) fn to_summaries(items: &[ContextItem]) -> Vec<ContextItemSummary> {
 
 /// Project an external store entry into a summary so `inspect` covers the
 /// whole logical catalog, not just the resident share. The lightweight
-/// descriptor has no per-item lifecycle stamps (content lives in the store);
-/// `externalized_at_tick` stands in for `created_tick` so ordering stays
-/// meaningful.
+/// descriptor carries the authoritative lifecycle stamps captured at
+/// externalize time, so the projection reports the item's real
+/// importance/relevance and creation clock instead of zeros or the
+/// externalization tick (the body lives in the store, but the authority
+/// does not degrade).
 pub(crate) fn external_summary(entry: &ExternalizedContext) -> ContextItemSummary {
     ContextItemSummary {
         id: entry.item_id,
@@ -43,13 +45,13 @@ pub(crate) fn external_summary(entry: &ExternalizedContext) -> ContextItemSummar
         scope_id: entry.scope_id,
         attention: entry.attention,
         semantic: entry.semantic,
-        importance: 0.0,
-        relevance: 0.0,
-        created_tick: entry.externalized_at_tick,
-        created_turn: 0,
-        last_access_turn: 0,
-        last_selected_turn: 0,
-        access_count: 0,
+        importance: entry.importance,
+        relevance: entry.relevance,
+        created_tick: entry.created_tick,
+        created_turn: entry.created_turn,
+        last_access_turn: entry.last_access_turn,
+        last_selected_turn: entry.last_selected_turn,
+        access_count: entry.access_count,
         dependencies: entry.dependencies.iter().map(|edge| edge.target).collect(),
         keep_alive: false,
         lease_until_turn: None,
