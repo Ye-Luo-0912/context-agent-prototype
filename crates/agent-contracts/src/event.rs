@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AgentResult, ContextConsumptionAck, ContextDiagnostics, ContextGcReport,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextSelection, ContextStateTransition,
-    OperationId, RunId, ScopeId, TaskId, ToolCall, ToolOutput, ToolSurfacePlanReport,
-    ToolSurfaceRequirement, TurnId,
+    OperationId, RunId, ScopeId, StorageGcReport, TaskId, ToolCall, ToolOutput,
+    ToolSurfacePlanReport, ToolSurfaceRequirement, TurnId,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +97,14 @@ pub enum RuntimeEvent {
     /// eviction and reactivation.
     ContextGc {
         report: ContextGcReport,
+    },
+    /// A conservative Storage GC pass ran at a runtime boundary (task
+    /// completion): semantically dead, retention-expired store entries with
+    /// no live dependency were permanently deleted. Storage GC is the only
+    /// place information is deleted, it never runs on the per-model hot
+    /// path, and the report names every deletion reason.
+    StorageGc {
+        report: StorageGcReport,
     },
     /// One bounded, schema-free account of the final round surface decision.
     /// A Ready report is emitted before ModelStarted; an Unsatisfiable report

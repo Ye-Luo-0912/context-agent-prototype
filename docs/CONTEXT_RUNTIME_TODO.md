@@ -1207,10 +1207,19 @@ second authority or another transcript-based context system.
 - [ ] Replace whole-heap minor scans with dirty ids + bounded aging work.
 - [ ] Add GC work/item/I/O budgets, backlog metrics, revision fencing, and a
   full reconciliation mode.
-- [ ] With the `CTX-04`/`CTX-05` safety baseline now closed, schedule bounded
+- [x] With the `CTX-04`/`CTX-05` safety baseline now closed, schedule bounded
   Storage GC at an
   explicit retention/checkpoint/task boundary and emit its report; never put
   destructive storage deletion on the per-model hot path.
+  **Landed 2026-08-12.** Task completion is the explicit boundary: right
+  after the post-completion full GC, the actor runs one conservative
+  `ContextEngine::storage_gc` pass (`RuntimeServices::context_storage_gc`)
+  and publishes the report as a `RuntimeEvent::StorageGc` event — the only
+  permanent-deletion surface, never on the per-model hot path, and a
+  failure is surfaced as an `Error` event without undoing the completed
+  task. The TUI surfaces the report (scanned/deleted/io-errors) when
+  anything was deleted. E2E:
+  `task_completion_schedules_storage_gc_and_publishes_the_report`.
 - [ ] Emit a bounded metadata-only `WorkingSetSignal` at tool commit so the
   next model round sees newly hot files/symbols (`CTX-08`).
 - [ ] Bound materialization candidates and external preview tokens; fix

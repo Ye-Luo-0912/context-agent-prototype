@@ -356,6 +356,17 @@ impl AppState {
                     ));
                 }
             }
+            RuntimeEvent::StorageGc { report } => {
+                // Storage GC is the only place information is permanently
+                // deleted; surface the conservative report so every
+                // deletion is observable.
+                if report.deleted > 0 || report.io_errors > 0 {
+                    self.push_system(format!(
+                        "storage gc: scanned {}, permanently deleted {} (io errors {})",
+                        report.scanned, report.deleted, report.io_errors,
+                    ));
+                }
+            }
             RuntimeEvent::ToolSurfacePlanned { report } => {
                 let ready = matches!(report.status, ToolSurfacePlanStatus::Ready);
                 let message = bounded_tool_surface_message(&report);

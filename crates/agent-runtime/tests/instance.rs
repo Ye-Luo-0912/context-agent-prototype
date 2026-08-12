@@ -1418,6 +1418,47 @@ async fn restore_rejects_completed_task_without_a_completion_record() {
 }
 
 #[tokio::test]
+async fn task_completion_schedules_storage_gc_and_publishes_the_report() {
+    // Task completion is the explicit runtime boundary for Storage GC: the
+    // completed task's records stop being storage roots at this point, so
+    // one conservative Storage GC pass runs right after the completion GC —
+    // never on the per-model hot path — and its report is published as a
+    // `StorageGc` event, the only permanent-deletion surface.
+    let (instance, _context) = simple_instance().await;
+    let mut events = instance.handle().subscribe();
+    instance
+        .handle()
+        .set_focus("refactor auth".into())
+        .await
+        .unwrap();
+    instance
+        .handle()
+        .complete_current_task("shipped".into())
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw = None;
+    while tokio::time::Instant::now() < deadline && saw.is_none() {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::StorageGc { report } = envelope.event {
+                saw = Some(report);
+                break;
+            }
+        }
+        if saw.is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    let report = saw.expect("task completion must schedule one storage GC pass");
+    // The empty engine has nothing to delete, but the pass still ran and
+    // reported; io_errors stay 0 — an IO failure is never mistaken for
+    // "the file is already gone".
+    assert_eq!(report.io_errors, 0);
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn completion_failure_never_leaves_a_half_closed_task() {
     // The context side refuses the completion ingest: the transaction must
     // fail before the task authority plane commits, so the task stays

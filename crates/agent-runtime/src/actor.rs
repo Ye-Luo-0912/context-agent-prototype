@@ -932,6 +932,40 @@ impl RuntimeActor {
         }
     }
 
+    /// Task completion is an explicit runtime boundary for Storage GC: the
+    /// completed task's records are storage roots until this point, after
+    /// which the only live references are the completion outcome and its
+    /// evidence. Run one conservative Storage GC pass here — never on the
+    /// per-model hot path — and publish the report so every permanent
+    /// deletion is observable and auditable. A failure is surfaced as an
+    /// Error event, never allowed to undo the completed task.
+    async fn run_storage_gc_at_boundary(&mut self) {
+        match self.services.context_storage_gc().await {
+            Ok(report) => {
+                if let Err(error) = self
+                    .kernel
+                    .emit_event(RuntimeEvent::StorageGc { report })
+                    .await
+                {
+                    let _ = self
+                        .kernel
+                        .emit_event(RuntimeEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                }
+            }
+            Err(error) => {
+                let _ = self
+                    .kernel
+                    .emit_event(RuntimeEvent::Error {
+                        message: format!("storage GC at task completion failed: {error}"),
+                    })
+                    .await;
+            }
+        }
+    }
+
     /// Commit the turn start: user message into the long-term context, then
     /// spawn the first model operation.
     async fn start_turn(
@@ -2315,6 +2349,7 @@ impl RuntimeActor {
             .await;
         if transition.is_ok() {
             self.compact_after_completion().await;
+            self.run_storage_gc_at_boundary().await;
         }
         transition
     }

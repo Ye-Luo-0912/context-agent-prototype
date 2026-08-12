@@ -16,8 +16,8 @@ use agent_contracts::{
     AgentError, AgentResult, ApprovalGate, ContextEngine, ContextGcReport, ContextIngress,
     ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
     ContextStateTransition, EventJournal, FocusState, MaterializedContext, ModelCapabilities,
-    ModelEventSink, ModelOutput, ModelRequest, ModelTransport, ScopeId, ScopeKind, TaskId,
-    ToolCatalogEntry, ToolDispatcher, ToolSpec, ToolSurfaceSnapshot,
+    ModelEventSink, ModelOutput, ModelRequest, ModelTransport, ScopeId, ScopeKind, StorageGcReport,
+    TaskId, ToolCatalogEntry, ToolDispatcher, ToolSpec, ToolSurfaceSnapshot,
 };
 use agent_core::{CoreAuthority, CoreAuthorityConfig};
 use agent_workspace::Workspace;
@@ -158,6 +158,14 @@ impl RuntimeServices {
     /// empty report.
     pub async fn context_gc(&self) -> AgentResult<ContextGcReport> {
         self.context.gc().await
+    }
+
+    /// Run one conservative Storage GC pass (the only place information is
+    /// permanently deleted). The runtime schedules it only at explicit
+    /// boundaries — task completion, checkpoint — never on the per-model
+    /// hot path.
+    pub async fn context_storage_gc(&self) -> AgentResult<StorageGcReport> {
+        self.context.storage_gc().await
     }
 
     /// Materialize the working set for one model request. The result is
