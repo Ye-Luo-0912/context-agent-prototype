@@ -1083,8 +1083,19 @@ second authority or another transcript-based context system.
   (`CTX-04`).
 - [x] Add strong edge kinds and make Storage GC root/traverse every
   non-deletable record (`CTX-05`).
-- [ ] Serialize or revision-check GC/storage-GC/checkpoint/restore plans and
+- [x] Serialize or revision-check GC/storage-GC/checkpoint/restore plans and
   validate all residency layers (`CTX-06`).
+  **Done 2026-08-12.** The `op_gate` serializes the multi-phase/whole-state
+  operations — GC, storage GC, store reconcile, checkpoint and restore —
+  so a plan always commits against the state it was planned against
+  (`multi_phase_operations_are_serialized_by_the_operation_gate` holds the
+  gate and proves every sibling blocks until release), and
+  `checkpoint::validate` runs before a restore becomes live: cross-location
+  ownership across the heap / eviction buffer / external map, scope
+  ancestry and item scope references, with
+  `restore_rejects_checkpoints_that_violate_structural_invariants` covering
+  every layer including the external map (heap↔external, buffer↔external,
+  and duplicate ids inside the map).
 - [x] Propagate failures from `BeforeModel` maintenance audit and explicit
   `context.collect`; a context mutation cannot silently outrun its journal.
   **Landed via `CTX-09` (audit propagation DONE):** a failed

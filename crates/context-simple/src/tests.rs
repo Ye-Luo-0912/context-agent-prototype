@@ -4857,6 +4857,46 @@ async fn restore_rejects_checkpoints_that_violate_structural_invariants() {
     cross.eviction_buffer.push(item);
     expect_restore_rejected(&cross, "owned by both").await;
 
+    // 同一 id 同时被堆和外部映射持有（跨驻留层所有权冲突）。
+    let mut heap_external = crate::engine::State::default();
+    let id = ContextItemId::new();
+    let item = make_item(&heap_external, id, "heap + external body");
+    heap_external.items.replace_all(vec![item.clone()]);
+    heap_external.external.push(crate::store::to_external_entry(
+        &item,
+        crate::store::make_context_ref(&item),
+        1,
+        1,
+        None,
+    ));
+    expect_restore_rejected(&heap_external, "owned by both").await;
+
+    // 同一 id 同时被可逆缓冲区和外部映射持有。
+    let mut buffer_external = crate::engine::State::default();
+    let id = ContextItemId::new();
+    let item = make_item(&buffer_external, id, "buffer + external body");
+    buffer_external.eviction_buffer.push(item.clone());
+    buffer_external
+        .external
+        .push(crate::store::to_external_entry(
+            &item,
+            crate::store::make_context_ref(&item),
+            1,
+            1,
+            None,
+        ));
+    expect_restore_rejected(&buffer_external, "owned by both").await;
+
+    // 外部映射内部出现重复 id（映射查找会掩盖它，只有原始扫描能发现）。
+    let mut dup_external = crate::engine::State::default();
+    let id = ContextItemId::new();
+    let item = make_item(&dup_external, id, "duplicated external body");
+    let entry =
+        crate::store::to_external_entry(&item, crate::store::make_context_ref(&item), 1, 1, None);
+    dup_external.external.push(entry.clone());
+    dup_external.external.push(entry);
+    expect_restore_rejected(&dup_external, "owned by both").await;
+
     // A scope whose parent is missing from the tree.
     let mut broken_parent = crate::engine::State::default();
     let missing = ScopeId::new();
