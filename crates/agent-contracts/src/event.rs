@@ -31,6 +31,23 @@ pub struct RestoreRevision {
     pub effective: u64,
 }
 
+/// Authority split of one task-anchor patch. Autonomous patches touch only
+/// runtime-evolvable fields (interpretation, plan, open loops, criteria,
+/// refs) and apply without confirmation; boundary patches touch user
+/// authority (goal, constraints/waiver) and must clear the approval gate
+/// first. The split is task-anchor policy, so it lives in the contract the
+/// runtime and its consumers both see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorPatchKind {
+    /// Runtime-evolvable fields only; applied directly, no approval round.
+    #[default]
+    Autonomous,
+    /// Goal / constraints / waiver touched; the patch had to clear the
+    /// approval gate before it reached the task table.
+    Boundary,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEvent {
@@ -142,14 +159,21 @@ pub enum RuntimeEvent {
         summary: String,
     },
     /// A task's anchor was replaced through whole-set CAS. The event is the
-    /// bounded audit row: task identity, the resulting revision, and the
-    /// names of the fields whose content moved (capped). Full anchor content
-    /// lives in RuntimeCheckpoint, never in the event stream.
+    /// bounded audit row: task identity, the resulting revision, the names
+    /// of the fields whose content moved (capped), and the authority split
+    /// of the patch that moved them. Full anchor content lives in
+    /// RuntimeCheckpoint, never in the event stream.
     TaskAnchorChanged {
         task_id: TaskId,
         revision: u64,
         #[serde(default)]
         changed_fields: Vec<String>,
+        /// Whether the patch applied autonomously (runtime-evolvable
+        /// fields only) or after clearing the approval gate (goal /
+        /// constraints / waiver touched). Default preserves old
+        /// wire/checkpoint rows.
+        #[serde(default)]
+        patch_kind: AnchorPatchKind,
     },
     TurnCompleted,
     /// A mandatory turn-commit step failed: the model answered, but the

@@ -12,16 +12,16 @@ use std::{
 
 use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
-    AgentError, AgentResult, AuthorityLease, CONTEXT_CONSUMPTION_ACK_ITEM_CAP, CancellationToken,
-    CompletionProposal, ContextConsumptionAck, ContextHints, ContextIngress,
+    AgentError, AgentResult, AnchorPatchKind, AuthorityLease, CONTEXT_CONSUMPTION_ACK_ITEM_CAP,
+    CancellationToken, CompletionProposal, ContextConsumptionAck, ContextHints, ContextIngress,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention, Effect,
     EffectDurability, EffectReceipt, ModelInput, ModelRequest, OperationId, OperationOutcome,
-    OperationResult, RestoreRevision, RuntimeDirective, RuntimeEvent, ScopeId, ScopeKind, TaskId,
-    ToolCall, ToolOutcome, ToolOutput, ToolResultDisposition, ToolSurfaceBlock,
+    OperationResult, RestoreRevision, RunId, RuntimeDirective, RuntimeEvent, ScopeId, ScopeKind,
+    TaskId, ToolCall, ToolOutcome, ToolOutput, ToolResultDisposition, ToolSurfaceBlock,
     ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceSnapshot, TurnFrame, TurnFrameStep,
     TurnId,
 };
-use agent_core::CoreAuthority;
+use agent_core::{ApprovalVerdict, CoreAuthority};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -37,7 +37,10 @@ use crate::prompt::PromptAssembler;
 use crate::services::RuntimeServices;
 use crate::sink::LiveSink;
 use crate::surface::{RoundSurfacePlan, SurfaceReportContext};
-use crate::task::{TaskManager, normalize_tool_requirements, validate_completion_proposal};
+use crate::task::{
+    AnchorPatch, TaskManager, changed_fields_kind, normalize_tool_requirements,
+    validate_completion_proposal,
+};
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -480,12 +483,14 @@ impl RuntimeActor {
                                 self.state.tasks.commit(txn);
                                 Ok(revision)
                             } else {
+                                let patch_kind = changed_fields_kind(&changed_fields);
                                 match self
                                     .kernel
                                     .emit_event(RuntimeEvent::TaskAnchorChanged {
                                         task_id,
                                         revision,
                                         changed_fields,
+                                        patch_kind,
                                     })
                                     .await
                                 {
@@ -500,6 +505,62 @@ impl RuntimeActor {
                         }
                     },
                 };
+                let _ = reply.send(result);
+            }
+            RuntimeCommand::PatchTaskAnchor {
+                task_id,
+                base_revision,
+                patch,
+                reply,
+            } => {
+                let result =
+                    match self.ensure_idle() {
+                        Err(error) => Err(error),
+                        Ok(()) => match self.state.tasks.prepare_patch_anchor(
+                            task_id,
+                            base_revision,
+                            &patch,
+                        ) {
+                            Err(error) => Err(error),
+                            Ok((txn, revision, changed_fields, kind)) => {
+                                if changed_fields.is_empty() {
+                                    // Equivalent patch: idempotent, no change
+                                    // event, no generation bump.
+                                    self.state.tasks.commit(txn);
+                                    Ok(revision)
+                                } else {
+                                    // Boundary patches touch user authority
+                                    // (goal / constraints / waiver) and must
+                                    // clear the approval gate first; autonomous
+                                    // patches apply directly.
+                                    if kind == AnchorPatchKind::Boundary
+                                        && let Err(error) =
+                                            self.authorize_anchor_patch(&patch).await
+                                    {
+                                        Err(error)
+                                    } else {
+                                        match self
+                                            .kernel
+                                            .emit_event(RuntimeEvent::TaskAnchorChanged {
+                                                task_id,
+                                                revision,
+                                                changed_fields,
+                                                patch_kind: kind,
+                                            })
+                                            .await
+                                        {
+                                            Err(error) => Err(error),
+                                            Ok(()) => {
+                                                self.state.tasks.commit(txn);
+                                                self.state.generation += 1;
+                                                Ok(revision)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    };
                 let _ = reply.send(result);
             }
             RuntimeCommand::Pin { content, reply } => {
@@ -731,6 +792,43 @@ impl RuntimeActor {
             ))
         } else {
             self.ensure_no_active_turn()
+        }
+    }
+
+    /// Ask the approval gate whether a boundary anchor patch (goal /
+    /// constraints / waiver) may proceed. The patch is presented as a
+    /// synthetic `task.anchor` tool call so existing approval policies (and
+    /// the v2 shadow gate) see a typed, serializable request instead of a
+    /// side channel. The gate decides; a deny or a failed check errors out
+    /// without touching the task table.
+    async fn authorize_anchor_patch(&self, patch: &AnchorPatch) -> AgentResult<()> {
+        let arguments = serde_json::to_value(patch).map_err(|error| {
+            AgentError::Internal(format!("anchor patch serialization: {error}"))
+        })?;
+        let call = ToolCall {
+            id: format!("anchor-patch-{}", RunId::new()),
+            name: "task.anchor".into(),
+            arguments,
+        };
+        let spec = agent_contracts::ToolSpec {
+            name: "task.anchor".into(),
+            description: "Patch the task anchor; goal/constraint fields require approval".into(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            risk: agent_contracts::ToolRisk::WorkspaceWrite,
+            output_budget: None,
+        };
+        let verdict = self
+            .kernel
+            .approval()
+            .authorize(&call, &spec, &CancellationToken::new())
+            .await;
+        match verdict {
+            ApprovalVerdict::Allowed => Ok(()),
+            ApprovalVerdict::Denied(message) | ApprovalVerdict::Failed(message) => {
+                Err(AgentError::InvalidRequest(format!(
+                    "boundary anchor patch denied by approval policy: {message}"
+                )))
+            }
         }
     }
 

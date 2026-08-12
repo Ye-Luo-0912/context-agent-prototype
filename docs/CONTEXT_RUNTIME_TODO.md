@@ -795,12 +795,92 @@ Requirements:
 - [ ] Keep vector retrieval deferred as an optional candidate provider; it
   may suggest ids but cannot own lifecycle truth or bypass admission.
 
+## Unified runtime input and discovery
+
+The next design slice should unify the *mechanics* of user input, tool
+results, collaborator results, runtime events, and deliberate recall without
+flattening their authority. A user message is tool-like in the sense that it
+arrives asynchronously, has a causal id, changes the next execution frame,
+is consumed exactly once, and eventually becomes collectible evidence. It is
+not an ordinary `ToolOutput`: only the user source may directly change the
+task goal/scope, interrupt work, revoke a standing grant, or override a plan.
+
+Target input pipeline:
+
+```text
+raw input
+  -> bounded RuntimeInputEnvelope(source, authority, task, causal parent)
+  -> typed interpretation / StatePatchProposal
+  -> RuntimeActor validates revision, policy, and source authority
+  -> Applied | Queued | Rejected | InterruptCommitted
+  -> exact consumption acknowledgement
+  -> episode evidence / GC lifecycle
+```
+
+The first taxonomy should cover normal dialogue, goal/constraint/priority
+patches, task cancellation or steering, artifact/evidence submission, and
+permission revocation. Model interpretation may propose a patch, but Runtime
+owns the commit. Tool or collaborator prose can propose evidence and open
+loops; it cannot impersonate a user patch merely because all sources share an
+event envelope.
+
+Discovery should likewise be federated rather than implemented as one new
+authoritative memory database:
+
+```text
+runtime.search(query, kinds, limits)
+  -> bounded ResourceDescriptor[]
+runtime.inspect(ref, revision)
+  -> bounded metadata/provenance
+runtime.resolve(ref, revision, range)
+  -> transient body/schema/handle
+explicit admit | surface | invoke
+```
+
+Candidate kinds are `Context`, `Tool`, `Artifact`, `Task`, `Agent`, `Skill`,
+`Capability`, and `Event`. Each provider keeps its existing source of truth;
+the shared layer standardizes stable typed refs, bounded descriptors,
+authority/taint, lifecycle, source revision, freshness, permission needs, and
+load cost. Search is read-only: it never admits context, loads a tool, starts
+an agent, grants permission, or mutates TaskAnchor by itself.
+
+Next tasks:
+
+- [ ] **CTX-DISC-01** Define the bounded, versioned resource-ref/descriptor
+  contract and distinguish `not found` from `provider unavailable`, stale
+  revision, denied, and exact evidence absence.
+- [ ] **CTX-DISC-02** Prototype non-vector federated search over the existing
+  context and capability/tool providers; keep provider-owned indexes and
+  deterministic ranking before adding artifacts/tasks/agents.
+- [ ] **CTX-DISC-03** Enforce `search -> inspect/resolve -> explicit
+  admit/surface/invoke`; record every transition and cap query count, fanout,
+  rows, bytes, tokens, latency, and repeated-search loops.
+- [ ] **CTX-EVENT-01** Generalize the current user-message path into a typed
+  input envelope plus source-authorized state proposals while preserving the
+  current direct, deterministic cancellation and command paths.
+- [ ] **CTX-EVENT-02** Give input records an explicit event lifecycle:
+  `Received -> Interpreted -> Applied/Queued/Rejected -> Consumed ->
+  Archived`; interruption and supersession must be revision-fenced and
+  replayable.
+- [ ] **CTX-EVENT-03** Replace the current full-content
+  `UserMessageAccepted` audit payload with a bounded preview plus stable body
+  ref, digest, size, authority, and task/turn ids. Store the exact body once
+  in the evidence plane and budget its model projection separately; event
+  logging must not become an unbounded duplicate of the transcript.
+- [ ] **CTX-GC-10** Couple search/resolve signals to bounded access
+  reinforcement and GC explanations, but never let a search hit override
+  terminal semantic state or mandatory TaskAnchor roots.
+
 ## Multi-agent context
 
 The topology is one authoritative coordinator plus bounded collaborators, not
 N independent transcript memories merged together.
 
 - The main runtime owns TaskAnchor and completion criteria.
+- The model-facing control may look tool-like — bounded
+  `agent.search/inspect/spawn/send/wait/cancel/status/collect` operations —
+  while the Runtime treats each child as a leased, asynchronous execution
+  resource rather than a one-shot function call.
 - A collaborator receives a scoped `AssignmentCard`: objective, constraints,
   acceptance condition, allowed evidence refs, budget, and child scope.
 - It returns a `HandoffCard`: status, findings, decisions, artifacts,
@@ -810,9 +890,30 @@ N independent transcript memories merged together.
 - Full collaborator output is stored once as an artifact/evidence body. The
   coordinator prompt gets the bounded card plus refs.
 - Closed collaborator scopes follow the same episode collection rules.
+- A child inherits a narrower permission set, context view, token/tool/time
+  budget, deadline, and cancellation generation. It can never widen its own
+  authority or commit directly to the parent's TaskAnchor, CompletionRecord,
+  approval policy, or evaluation Core.
+- Parent TaskAnchor open loops/root claims keep a delegated assignment alive;
+  accepted handoff refs replace those roots at completion. Cancelled, failed,
+  or abandoned children retain only the bounded evidence needed for diagnosis
+  and audit.
+
+Keep the collaborator run lifecycle independent from tool/catalog lifecycle:
+
+```text
+Allocated -> Starting -> Running <-> Waiting
+          -> Completed | Failed | Cancelled | Expired
+          -> Collected/Archived
+```
+
+The `RuntimeActor` remains the sole parent authority and lifecycle owner. A
+worker may execute a scoped agent loop through the runtime implementation, but
+it is not a peer orchestrator allowed to mutate shared parent state.
 
 This can be built after the single-agent TaskAnchor/Episode contract is
-stable; it should not introduce a second orchestrator.
+stable and after effect/sandbox/evaluation gates. It should not introduce a
+second authority or another transcript-based context system.
 
 ## Ordered implementation queue
 
@@ -905,9 +1006,23 @@ stable; it should not introduce a second orchestrator.
   TaskAnchor as the only task-authority owner; add typed CAS patches for goal,
   constraints, criteria, progress, open loops and evidence plus completion
   refs. Do not duplicate this authority in `FocusState` or ContextEngine.
-- [ ] Make Anchor plan/focus/open-loop/criteria/evidence patches autonomous by
+- [x] Make Anchor plan/focus/open-loop/criteria/evidence patches autonomous by
   default; encode the few goal/scope/waiver conflicts that require a boundary
   escalation instead of per-step confirmation.
+  **Done 2026-08-12.** `AnchorPatch` is a bounded field-level patch
+  (serde names mirror `TaskAnchor`, applied through one CAS against
+  `base_revision`) and the authority split is explicit policy:
+  interpretation/plan/open-loops/criteria/refs are `Autonomous` and apply
+  directly, while goal/constraints are `Boundary` and must clear the
+  approval gate first (`PatchTaskAnchor` presents them as a synthetic
+  `task.anchor` tool call so existing approval policies and the v2 shadow
+  gate see a typed request; a deny errors out and leaves the anchor
+  untouched). `TaskAnchorChanged` now carries the `patch_kind` label, and
+  whole-anchor replacements are labeled by the same field split. Unit
+  tests cover classification/apply/CAS, E2E covers autonomous-lands,
+  boundary-approved and boundary-denied under `PolicyApprovalGate`. The
+  model-facing `task.anchor` tool entry point remains (queued with the
+  canonical-catalog work).
 - [x] Implement atomic completion root transfer: the context engine records
   the completed task and closes its scopes first (rollback on failure), then
   the `TaskManager` commits status + outcome; fault injection proves no
@@ -1047,6 +1162,15 @@ stable; it should not introduce a second orchestrator.
   pass evaluation.
 - [ ] Define independent storage retention profiles for coding, research,
   general assistant, and audit-sensitive runs.
+- [ ] Land `CTX-DISC-01..03` over Context + Tool only; compare separate
+  `context.manage`/`capability.manage` surfaces with one merged discovery
+  surface before replacing either public contract.
+- [ ] Land `CTX-EVENT-01..03`: typed user-input lifecycle, bounded event
+  bodies, and source-authorized state patches. Do not route user authority
+  through `ToolOutput`.
+- [ ] Specify the managed-child lifecycle and `agent.manage` surface, but keep
+  spawning disabled until the effect, sandbox, resource, and real-evaluation
+  gates can enforce it.
 
 ### Phase 4 — Evaluation-gated tuning
 
@@ -1181,18 +1305,24 @@ all tokens, latency, failures, and run-to-run variance.
 
 ## Next discussion gates
 
-1. Treat the bounded exact-tool `TaskToolRequirementSet` as the ratified first
-   slice only; ratify the remaining TaskAnchor fields, patch authority, and
-   typed Prompt/Resident/Storage root claims.
-2. Ratify CompletionRecord fields, exact-output retention, outcome statuses,
-   and the durable barrier required before active roots are released.
-3. Ratify the autonomous interaction boundary: automatic Anchor patches,
-   task-scoped standing grants, and the small set of true escalation cases.
-4. Ratify Episode close statuses, promotion table, and failure/rollback rule.
-5. Decide whether Focus `ScopeId` is sufficient as the v0 episode identity.
-6. Choose the per-event GC work budget and acceptable backlog semantics.
-7. Choose the initial coding workload and success/goal-retention metrics for
-   Phase 0 baseline capture.
+1. Ratify the source-authority table: which user inputs commit directly,
+   which need typed interpretation, and which tool/agent proposals can only
+   become evidence.
+2. Ratify `ResourceRef`/`ResourceDescriptor`, provider revision semantics,
+   and the hard limits for one federated search round.
+3. Decide whether v0 adds a new `runtime.search` surface or first implements a
+   shared internal planner behind existing `context.manage` and
+   `capability.manage` controls.
+4. Ratify the independent catalog/schema, invocation/effect, host-process,
+   and managed-child lifecycles.
+5. Ratify child budget inheritance, cancellation, parent root transfer, and
+   the minimum AssignmentCard/HandoffCard fields.
+6. Choose per-event GC/search work budgets and acceptable deferred-work
+   backlog semantics.
+7. Extend M15 with search precision/cost, stale-resource rejection, steering
+   latency, child cancellation, handoff fidelity, and parent task-success
+   metrics before enabling broad multi-agent execution.
 
-Until those gates are decided, implementation should continue only on the
-already-confirmed correctness items in Phase 1.
+Implementation may begin with the bounded read-only Context + Tool discovery
+prototype and typed user-event envelope. Managed-child execution remains
+gated on trusted effects, sandboxing, resource policy, and real evaluation.

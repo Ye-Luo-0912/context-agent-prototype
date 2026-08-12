@@ -815,8 +815,9 @@ async fn task_anchor_update_publishes_a_bounded_event() {
         .unwrap();
     assert_eq!(revision, 1);
 
-    // The bounded audit event names the task, the resulting revision and
-    // the fields that moved — never the full anchor content.
+    // The bounded audit event names the task, the resulting revision, the
+    // fields that moved and the authority split — never the full anchor
+    // content.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let mut saw = None;
     while tokio::time::Instant::now() < deadline && saw.is_none() {
@@ -825,9 +826,10 @@ async fn task_anchor_update_publishes_a_bounded_event() {
                 task_id: event_task,
                 revision: event_rev,
                 changed_fields,
+                patch_kind,
             } = envelope.event
             {
-                saw = Some((event_task, event_rev, changed_fields));
+                saw = Some((event_task, event_rev, changed_fields, patch_kind));
                 break;
             }
         }
@@ -835,10 +837,15 @@ async fn task_anchor_update_publishes_a_bounded_event() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
-    let (event_task, event_rev, changed_fields) =
+    let (event_task, event_rev, changed_fields, patch_kind) =
         saw.expect("anchor update must publish its event");
     assert_eq!(event_task, task_id);
     assert_eq!(event_rev, 1);
+    assert_eq!(
+        patch_kind,
+        agent_contracts::AnchorPatchKind::Autonomous,
+        "a whole-anchor replacement that moves only evolution fields is labeled autonomous"
+    );
     for field in [
         "current_interpretation",
         "acceptance_criteria",
@@ -852,6 +859,189 @@ async fn task_anchor_update_publishes_a_bounded_event() {
     assert!(
         !changed_fields.iter().any(|name| name == "original_goal"),
         "an unchanged field must not be named: {changed_fields:?}"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn autonomous_anchor_patch_applies_without_approval() {
+    // read-only approval: autonomous patches never consult the gate, so
+    // they land even under the strictest policy.
+    let context = Arc::new(context_simple::SimpleContextEngine::new(
+        context_simple::SimpleContextConfig::default(),
+    ));
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        context,
+        Arc::new(QuietModel),
+        Arc::new(EmptyTools),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    instance.start().await.unwrap();
+    let mut events = instance.handle().subscribe();
+    instance
+        .handle()
+        .set_focus("refactor auth".into())
+        .await
+        .unwrap();
+    let task_id = instance.handle().list_tasks().await.unwrap()[0].id;
+
+    let revision = instance
+        .handle()
+        .patch_task_anchor(
+            task_id,
+            0,
+            agent_runtime::AnchorPatch {
+                plan_progress: Some(vec!["read the module".into()]),
+                open_loops: Some(vec!["verify edge cases".into()]),
+                ..agent_runtime::AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(revision, 1);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw = None;
+    while tokio::time::Instant::now() < deadline && saw.is_none() {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::TaskAnchorChanged { patch_kind, .. } = envelope.event {
+                saw = Some(patch_kind);
+            }
+        }
+        if saw.is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    assert_eq!(
+        saw,
+        Some(agent_contracts::AnchorPatchKind::Autonomous),
+        "the audit event must label the autonomous patch"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn boundary_anchor_patch_clears_approval_and_is_labeled_boundary() {
+    // permissive approval: the boundary patch (constraints) passes the gate.
+    let context = Arc::new(context_simple::SimpleContextEngine::new(
+        context_simple::SimpleContextConfig::default(),
+    ));
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        context,
+        Arc::new(QuietModel),
+        Arc::new(EmptyTools),
+        Arc::new(PolicyApprovalGate::permissive()),
+        None,
+    );
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    instance.start().await.unwrap();
+    let mut events = instance.handle().subscribe();
+    instance
+        .handle()
+        .set_focus("refactor auth".into())
+        .await
+        .unwrap();
+    let task_id = instance.handle().list_tasks().await.unwrap()[0].id;
+
+    let revision = instance
+        .handle()
+        .patch_task_anchor(
+            task_id,
+            0,
+            agent_runtime::AnchorPatch {
+                constraints: Some(vec!["no dependency changes".into()]),
+                ..agent_runtime::AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(revision, 1);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw = None;
+    while tokio::time::Instant::now() < deadline && saw.is_none() {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::TaskAnchorChanged { patch_kind, .. } = envelope.event {
+                saw = Some(patch_kind);
+            }
+        }
+        if saw.is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    assert_eq!(
+        saw,
+        Some(agent_contracts::AnchorPatchKind::Boundary),
+        "the audit event must label the boundary patch"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn boundary_anchor_patch_denied_leaves_the_anchor_untouched() {
+    // read-only approval: a boundary patch (goal) is denied and must not
+    // reach the task table — no revision bump, no change event.
+    let context = Arc::new(context_simple::SimpleContextEngine::new(
+        context_simple::SimpleContextConfig::default(),
+    ));
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        context,
+        Arc::new(QuietModel),
+        Arc::new(EmptyTools),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    instance.start().await.unwrap();
+    let mut events = instance.handle().subscribe();
+    instance
+        .handle()
+        .set_focus("refactor auth".into())
+        .await
+        .unwrap();
+    let task_id = instance.handle().list_tasks().await.unwrap()[0].id;
+
+    let denied = instance
+        .handle()
+        .patch_task_anchor(
+            task_id,
+            0,
+            agent_runtime::AnchorPatch {
+                original_goal: Some("rewrite from scratch".into()),
+                ..agent_runtime::AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        denied.to_string().contains("denied by approval policy"),
+        "a denied boundary patch must error with the policy message: {denied}"
+    );
+
+    // No change event was published and the anchor is untouched.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let mut saw_change = false;
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if matches!(envelope.event, RuntimeEvent::TaskAnchorChanged { .. }) {
+                saw_change = true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !saw_change,
+        "a denied patch must not publish a change event"
+    );
+    assert_eq!(
+        instance.handle().list_tasks().await.unwrap()[0].anchor_revision,
+        0,
+        "a denied patch must not bump the anchor revision"
     );
     instance.shutdown().await.unwrap();
 }

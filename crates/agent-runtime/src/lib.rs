@@ -44,6 +44,6 @@ pub use plugin::{
 pub use prompt::PromptAssembler;
 pub use services::RuntimeServices;
 pub use task::{
-    ContextRootClaim, RootClaimRole, RootClaimStrength, TaskAnchor, TaskInfo, TaskManager,
-    TaskRecord, TaskStatus, TaskToolRequirementSet,
+    AnchorPatch, ContextRootClaim, RootClaimRole, RootClaimStrength, TaskAnchor, TaskInfo,
+    TaskManager, TaskRecord, TaskStatus, TaskToolRequirementSet,
 };

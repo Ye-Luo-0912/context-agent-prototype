@@ -275,11 +275,13 @@ impl AppState {
                 task_id,
                 revision,
                 changed_fields,
+                patch_kind,
             } => {
-                // Bounded audit row: the event names the moved fields, never
-                // the anchor content (which lives in the checkpoint).
+                // Bounded audit row: the event names the moved fields and
+                // the authority split (autonomous vs boundary), never the
+                // anchor content (which lives in the checkpoint).
                 self.push_system(format!(
-                    "task {task_id} anchor r{revision} updated: {}",
+                    "task {task_id} anchor r{revision} updated ({patch_kind:?}): {}",
                     changed_fields.join(", ")
                 ));
             }

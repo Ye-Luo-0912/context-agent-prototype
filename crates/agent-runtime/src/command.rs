@@ -7,7 +7,7 @@ use agent_contracts::{
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::checkpoint::RuntimeCheckpoint;
-use crate::task::{TaskAnchor, TaskInfo};
+use crate::task::{AnchorPatch, TaskAnchor, TaskInfo};
 
 /// Reply channel back to the caller of a command.
 pub type Reply<T> = oneshot::Sender<T>;
@@ -55,6 +55,16 @@ pub enum RuntimeCommand {
         task_id: TaskId,
         base_revision: u64,
         anchor: TaskAnchor,
+        reply: Reply<AgentResult<u64>>,
+    },
+    /// Atomically apply a bounded, field-level patch to one task's anchor
+    /// when `base_revision` still matches. The patch is classified before
+    /// it reaches the task table: evolution fields apply autonomously,
+    /// goal/constraint fields must clear the approval gate first.
+    PatchTaskAnchor {
+        task_id: TaskId,
+        base_revision: u64,
+        patch: AnchorPatch,
         reply: Reply<AgentResult<u64>>,
     },
     Pin {
@@ -187,6 +197,26 @@ impl RuntimeHandle {
             task_id,
             base_revision,
             anchor,
+            reply,
+        })
+        .await
+    }
+
+    /// Apply a bounded, field-level patch to a task's anchor through CAS
+    /// and return the resulting revision. Evolution fields apply
+    /// autonomously; goal/constraint fields first clear the approval gate
+    /// (a denied boundary patch errors without touching the anchor). An
+    /// equivalent patch is idempotent and returns the existing revision.
+    pub async fn patch_task_anchor(
+        &self,
+        task_id: TaskId,
+        base_revision: u64,
+        patch: AnchorPatch,
+    ) -> AgentResult<u64> {
+        self.call(|reply| RuntimeCommand::PatchTaskAnchor {
+            task_id,
+            base_revision,
+            patch,
             reply,
         })
         .await

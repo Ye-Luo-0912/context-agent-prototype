@@ -13,7 +13,7 @@
 //! scopes. A prepared-but-uncommitted transition is simply discarded.
 
 use agent_contracts::{
-    AgentError, AgentResult, CompletionProposal, MAX_COMPLETION_ARTIFACTS,
+    AgentError, AgentResult, AnchorPatchKind, CompletionProposal, MAX_COMPLETION_ARTIFACTS,
     MAX_COMPLETION_REF_CHARS, MAX_COMPLETION_SUMMARY_CHARS, MAX_TASK_ANCHOR_CHANGED_FIELDS,
     MAX_TASK_ANCHOR_CLAIMS, MAX_TASK_ANCHOR_ITEM_CHARS, MAX_TASK_ANCHOR_LIST_ITEMS,
     MAX_TASK_ANCHOR_TEXT_CHARS, MAX_TASK_TOOL_REQUIREMENTS, MAX_TOOL_REQUIREMENT_NAME_CHARS,
@@ -96,6 +96,77 @@ pub struct TaskAnchor {
     /// Typed retention claims that must survive in storage but are not
     /// automatic prompt/residency roots for unrelated tasks.
     pub evidence_refs: Vec<ContextRootClaim>,
+}
+
+/// A bounded, field-level patch to one task's anchor. `None` fields are
+/// left untouched; the patch applies through one CAS against
+/// `base_revision`, so concurrent writers cannot merge intent. Field names
+/// mirror the `TaskAnchor` serde names, so the changed-fields audit on
+/// `TaskAnchorChanged` matches whole-anchor replacements.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AnchorPatch {
+    /// `TaskAnchor.original_goal` — boundary: user authority.
+    pub original_goal: Option<String>,
+    /// `TaskAnchor.constraints` — boundary: scope/waiver authority.
+    pub constraints: Option<Vec<String>>,
+    /// `TaskAnchor.current_interpretation` — autonomous.
+    pub current_interpretation: Option<String>,
+    /// `TaskAnchor.acceptance_criteria` — autonomous.
+    pub acceptance_criteria: Option<Vec<String>>,
+    /// `TaskAnchor.plan_progress` — autonomous.
+    pub plan_progress: Option<Vec<String>>,
+    /// `TaskAnchor.open_loops` — autonomous.
+    pub open_loops: Option<Vec<String>>,
+    /// `TaskAnchor.working_refs` — autonomous.
+    pub working_refs: Option<Vec<ContextRootClaim>>,
+    /// `TaskAnchor.evidence_refs` — autonomous.
+    pub evidence_refs: Option<Vec<ContextRootClaim>>,
+}
+
+impl AnchorPatch {
+    /// The patch's authority kind: boundary when any goal/constraint field
+    /// moves (user authority), autonomous otherwise (runtime-evolvable
+    /// interpretation/plan/open-loop/criteria/ref fields).
+    pub fn kind(&self) -> AnchorPatchKind {
+        if self.original_goal.is_some() || self.constraints.is_some() {
+            AnchorPatchKind::Boundary
+        } else {
+            AnchorPatchKind::Autonomous
+        }
+    }
+
+    /// Produce the candidate replacement anchor. Untouched fields keep
+    /// their current values, so a field-level patch never resets sibling
+    /// fields the way a whole-anchor replacement can.
+    pub fn apply_to(&self, anchor: &TaskAnchor) -> TaskAnchor {
+        let mut next = anchor.clone();
+        if let Some(value) = &self.original_goal {
+            next.original_goal = value.clone();
+        }
+        if let Some(value) = &self.constraints {
+            next.constraints = value.clone();
+        }
+        if let Some(value) = &self.current_interpretation {
+            next.current_interpretation = value.clone();
+        }
+        if let Some(value) = &self.acceptance_criteria {
+            next.acceptance_criteria = value.clone();
+        }
+        if let Some(value) = &self.plan_progress {
+            next.plan_progress = value.clone();
+        }
+        if let Some(value) = &self.open_loops {
+            next.open_loops = value.clone();
+        }
+        if let Some(value) = &self.working_refs {
+            next.working_refs = value.clone();
+        }
+        if let Some(value) = &self.evidence_refs {
+            next.evidence_refs = value.clone();
+        }
+        next
+    }
 }
 
 /// One typed root claim inside a `TaskAnchor`. The role says *why* the claim
@@ -497,6 +568,61 @@ impl TaskManager {
         ))
     }
 
+    /// Plan a bounded, field-level CAS patch of one task's anchor.
+    ///
+    /// The patch is classified before it reaches the task table: patches
+    /// touching only runtime-evolvable fields (interpretation, plan, open
+    /// loops, criteria, refs) are `Autonomous` and apply directly; patches
+    /// touching goal/constraints are `Boundary` and must clear the approval
+    /// gate before this transaction is committed. Completed tasks are
+    /// immutable and the `base_revision` must still match, exactly like a
+    /// whole-anchor replacement. Returns the transaction, the resulting
+    /// revision, the capped changed-field list and the authority kind.
+    pub fn prepare_patch_anchor(
+        &self,
+        task_id: TaskId,
+        base_revision: u64,
+        patch: &AnchorPatch,
+    ) -> AgentResult<(TaskTxn, u64, Vec<String>, AnchorPatchKind)> {
+        let task = self.get(task_id).ok_or_else(|| {
+            AgentError::InvalidRequest(format!("task {task_id} is not registered"))
+        })?;
+        if task.status == TaskStatus::Completed {
+            return Err(AgentError::InvalidRequest(format!(
+                "task {task_id} is completed and its anchor is immutable"
+            )));
+        }
+        if task.anchor.revision != base_revision {
+            return Err(AgentError::InvalidRequest(format!(
+                "task {task_id} anchor revision mismatch: expected {}, got {base_revision}",
+                task.anchor.revision
+            )));
+        }
+        let kind = patch.kind();
+        let mut replacement = patch.apply_to(&task.anchor);
+        normalize_anchor(&mut replacement)?;
+        let changed_fields = anchor_changed_fields(&task.anchor, &replacement);
+        let revision = if changed_fields.is_empty() {
+            base_revision
+        } else {
+            base_revision.checked_add(1).ok_or_else(|| {
+                AgentError::InvalidRequest(format!("task {task_id} anchor revision is exhausted"))
+            })?
+        };
+        replacement.revision = revision;
+        Ok((
+            TaskTxn {
+                plan: TaskPlan::ReplaceAnchor {
+                    target: task_id,
+                    replacement,
+                },
+            },
+            revision,
+            changed_fields,
+            kind,
+        ))
+    }
+
     /// Apply a prepared transition. Call only after the external transition
     /// (the engine's `set_focus` / `clear_focus` / task completion) has
     /// succeeded, so the task table and the engine's scopes stay in sync.
@@ -743,6 +869,22 @@ pub(crate) fn anchor_changed_fields(old: &TaskAnchor, new: &TaskAnchor) -> Vec<S
     changed
 }
 
+/// The authority split of an anchor change whose moved fields are known:
+/// boundary when any goal/constraint field moved (user authority), else
+/// autonomous. Used both by whole-anchor replacements (audit labeling) and
+/// field-level patches (where `AnchorPatch::kind` classifies the intent and
+/// this labels the result consistently).
+pub(crate) fn changed_fields_kind(changed_fields: &[String]) -> AnchorPatchKind {
+    if changed_fields
+        .iter()
+        .any(|field| field == "original_goal" || field == "constraints")
+    {
+        AnchorPatchKind::Boundary
+    } else {
+        AnchorPatchKind::Autonomous
+    }
+}
+
 fn check_bounded_text(field: &str, value: &str) -> AgentResult<()> {
     let chars = value.chars().count();
     if chars > MAX_TASK_ANCHOR_TEXT_CHARS {
@@ -907,6 +1049,180 @@ mod tests {
             tasks
                 .prepare_complete("done".into(), None, None, Vec::new())
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn anchor_patch_kind_classifies_authority() {
+        let autonomous = AnchorPatch {
+            plan_progress: Some(vec!["step 1".into()]),
+            ..AnchorPatch::default()
+        };
+        assert_eq!(autonomous.kind(), AnchorPatchKind::Autonomous);
+        assert_eq!(
+            AnchorPatch {
+                open_loops: Some(vec!["loop".into()]),
+                acceptance_criteria: Some(vec!["crit".into()]),
+                ..AnchorPatch::default()
+            }
+            .kind(),
+            AnchorPatchKind::Autonomous
+        );
+
+        let boundary = AnchorPatch {
+            constraints: Some(vec!["no network".into()]),
+            ..AnchorPatch::default()
+        };
+        assert_eq!(boundary.kind(), AnchorPatchKind::Boundary);
+        assert_eq!(
+            AnchorPatch {
+                original_goal: Some("rewrite".into()),
+                plan_progress: Some(vec!["step 1".into()]),
+                ..AnchorPatch::default()
+            }
+            .kind(),
+            AnchorPatchKind::Boundary,
+            "a patch touching goal authority is boundary even with autonomous fields"
+        );
+    }
+
+    #[test]
+    fn anchor_patch_applies_only_touched_fields() {
+        let claim =
+            |role: RootClaimRole, strength: RootClaimStrength, field: &str| ContextRootClaim {
+                item_ref: "ref".into(),
+                role,
+                strength,
+                source_field_id: field.into(),
+            };
+        let anchor = TaskAnchor {
+            original_goal: "goal".into(),
+            current_interpretation: "interpretation".into(),
+            constraints: vec!["c1".into()],
+            acceptance_criteria: vec!["crit".into()],
+            plan_progress: vec!["done".into()],
+            open_loops: vec!["loop".into()],
+            working_refs: vec![claim(
+                RootClaimRole::ActiveDecision,
+                RootClaimStrength::ResidentRequired,
+                "working_refs",
+            )],
+            evidence_refs: vec![claim(
+                RootClaimRole::AcceptanceEvidence,
+                RootClaimStrength::StorageRequired,
+                "evidence_refs",
+            )],
+            revision: 0,
+        };
+        let next = AnchorPatch {
+            plan_progress: Some(vec!["next".into()]),
+            ..AnchorPatch::default()
+        }
+        .apply_to(&anchor);
+        assert_eq!(next.original_goal, "goal");
+        assert_eq!(next.current_interpretation, "interpretation");
+        assert_eq!(next.constraints, vec!["c1".to_string()]);
+        assert_eq!(next.acceptance_criteria, vec!["crit".to_string()]);
+        assert_eq!(next.plan_progress, vec!["next".to_string()]);
+        assert_eq!(next.open_loops, vec!["loop".to_string()]);
+        assert_eq!(next.working_refs.len(), 1);
+        assert_eq!(next.evidence_refs.len(), 1);
+        assert_eq!(next.revision, 0, "the patch does not re-stamp the revision");
+    }
+
+    #[test]
+    fn prepare_patch_anchor_bumps_revision_and_reports_kind() {
+        let mut tasks = TaskManager::new();
+        let id = create(&mut tasks, "goal");
+
+        let (txn, revision, changed_fields, kind) = tasks
+            .prepare_patch_anchor(
+                id,
+                0,
+                &AnchorPatch {
+                    open_loops: Some(vec!["verify".into()]),
+                    ..AnchorPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(revision, 1);
+        assert_eq!(kind, AnchorPatchKind::Autonomous);
+        assert_eq!(changed_fields, vec!["open_loops".to_string()]);
+        tasks.commit(txn);
+
+        // Idempotent: the same patch again changes nothing and keeps the
+        // revision.
+        let (txn, revision, changed_fields, _kind) = tasks
+            .prepare_patch_anchor(
+                id,
+                1,
+                &AnchorPatch {
+                    open_loops: Some(vec!["verify".into()]),
+                    ..AnchorPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(revision, 1);
+        assert!(changed_fields.is_empty());
+        tasks.commit(txn);
+
+        // Boundary classification is reported for goal/constraint patches.
+        let (_txn, revision, changed_fields, kind) = tasks
+            .prepare_patch_anchor(
+                id,
+                1,
+                &AnchorPatch {
+                    constraints: Some(vec!["no network".into()]),
+                    ..AnchorPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(revision, 2);
+        assert_eq!(kind, AnchorPatchKind::Boundary);
+        assert_eq!(changed_fields, vec!["constraints".to_string()]);
+    }
+
+    #[test]
+    fn prepare_patch_anchor_rejects_completed_and_stale_revisions() {
+        let mut tasks = TaskManager::new();
+        let id = create(&mut tasks, "goal");
+
+        let stale = tasks.prepare_patch_anchor(
+            id,
+            9,
+            &AnchorPatch {
+                open_loops: Some(vec!["x".into()]),
+                ..AnchorPatch::default()
+            },
+        );
+        assert!(
+            stale
+                .err()
+                .expect("a stale base revision must be refused")
+                .to_string()
+                .contains("revision mismatch"),
+            "a stale base revision must be refused"
+        );
+
+        let (txn, _record) = tasks
+            .prepare_complete("done".into(), None, None, Vec::new())
+            .expect("active task completes");
+        tasks.commit(txn);
+        let closed = tasks.prepare_patch_anchor(
+            id,
+            1,
+            &AnchorPatch {
+                open_loops: Some(vec!["x".into()]),
+                ..AnchorPatch::default()
+            },
+        );
+        assert!(
+            closed
+                .err()
+                .expect("a completed task's anchor must be immutable")
+                .to_string()
+                .contains("immutable"),
+            "a completed task's anchor must be immutable"
         );
     }
 
