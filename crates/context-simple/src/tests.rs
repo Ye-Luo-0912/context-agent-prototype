@@ -2401,6 +2401,162 @@ async fn external_retrieval_searches_inspects_and_fetches() {
 }
 
 #[tokio::test]
+async fn search_hits_stamp_a_bounded_recency_reinforcement() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    // 种入 10 个外部条目：content 不含大写/特殊字符，entities 为空，
+    // 排序键只剩 last_access_tick（= 外部化 tick i），hits 顺序确定。
+    {
+        let mut state = engine.state.lock().await;
+        let config = SimpleContextConfig::default();
+        for i in 0..10u64 {
+            let mut item = crate::item::make_item(
+                &state,
+                &config,
+                format!("item-{i} finding"),
+                ContextKind::Note,
+                ContextScope::Task,
+                ContextRetention::Working,
+                0.5,
+                None,
+            );
+            item.id = ContextItemId::new();
+            let reference = crate::store::externalize(dir.path(), &item).unwrap();
+            state.external.push(crate::store::to_external_entry(
+                &item, reference, i, 0, None,
+            ));
+        }
+    }
+
+    let before = engine.state.lock().await.event_seq;
+    let hits = engine
+        .search_external(ContextSearchQuery::new("item", 10))
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 10, "every seeded entry matches the query");
+
+    // search 返回排序后的 clone（命中顺序 = 外部化 tick 降序 9..0），
+    // recency 强化是内部副作用，只能从 state.external 观察：前 8 个命中
+    // （tick 9..2）的 last_access 时钟被刷新，超出上限的（tick 1/0）不动。
+    let state = engine.state.lock().await;
+    for entry in state.external.iter() {
+        let tick = entry.externalized_at_tick;
+        if tick >= 2 {
+            assert_eq!(
+                entry.last_access_tick, before,
+                "命中（tick {tick}）必须被刷新 recency"
+            );
+            assert_eq!(
+                entry.last_access_gc_epoch,
+                Some(state.gc_epoch),
+                "命中（tick {tick}）必须锚定当前 GC 世代"
+            );
+        } else {
+            assert_eq!(
+                entry.last_access_tick, tick,
+                "超出强化上限的命中（tick {tick}）必须保持原时钟"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn search_reinforcement_delays_cold_to_external_aging() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_external_ttl_generations: 2,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    // 两个外部条目都锚定在 epoch 0（Cold）；A 的 summary 含 "alpha"，
+    // B 不含，所以 "alpha" 只会命中 A。
+    let (id_a, id_b) = {
+        let mut state = engine.state.lock().await;
+        let config = SimpleContextConfig::default();
+        let mut seed = |content: &str, tick: u64| {
+            let mut item = crate::item::make_item(
+                &state,
+                &config,
+                content.to_string(),
+                ContextKind::Note,
+                ContextScope::Task,
+                ContextRetention::Working,
+                0.5,
+                None,
+            );
+            item.id = ContextItemId::new();
+            let reference = crate::store::externalize(dir.path(), &item).unwrap();
+            state.external.push(crate::store::to_external_entry(
+                &item, reference, tick, 0, None,
+            ));
+            item.id
+        };
+        (seed("alpha finding", 0), seed("beta finding", 1))
+    };
+
+    // 第一次完整 GC：epoch 1，两个条目 idle = 1 < ttl 2，都保持 Cold。
+    let report = engine.gc().await.unwrap();
+    assert_eq!(report.aged_external, 0, "首轮 GC 必须没有条目老化");
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(state.gc_epoch, 1);
+        for entry in state.external.iter() {
+            assert_eq!(entry.residency, ContextResidency::Cold);
+        }
+    }
+
+    // search 只命中 A，把它锚定到当前世代（1）。
+    let hits = engine
+        .search_external(ContextSearchQuery::new("alpha", 10))
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "只有 A 匹配 alpha");
+    assert_eq!(hits[0].item_id, id_a);
+    {
+        let state = engine.state.lock().await;
+        let a = state
+            .external
+            .iter()
+            .find(|e| e.item_id == id_a)
+            .expect("A 仍在外部映射中");
+        assert_eq!(
+            a.last_access_gc_epoch,
+            Some(1),
+            "search 命中必须刷新 A 的世代锚点"
+        );
+    }
+
+    // 第二次完整 GC：epoch 2。A idle = 1 < 2 保持 Cold；B idle = 2 >= 2
+    // 正常降级 External——search 的强化延迟了老化，但不会让条目永生。
+    let report = engine.gc().await.unwrap();
+    assert_eq!(report.aged_external, 1, "未被强化的 B 必须老化");
+    let state = engine.state.lock().await;
+    let a = state
+        .external
+        .iter()
+        .find(|e| e.item_id == id_a)
+        .expect("A 仍在外部映射中");
+    let b = state
+        .external
+        .iter()
+        .find(|e| e.item_id == id_b)
+        .expect("B 仍在外部映射中");
+    assert_eq!(
+        a.residency,
+        ContextResidency::Cold,
+        "被 search 强化的条目必须延缓 Cold -> External 老化"
+    );
+    assert_eq!(
+        b.residency,
+        ContextResidency::External,
+        "未被强化的条目按 ttl 正常老化"
+    );
+}
+
+#[tokio::test]
 async fn terminal_external_entries_are_hidden_from_every_retrieval_surface() {
     let dir = tempfile::tempdir().unwrap();
     let engine = SimpleContextEngine::new(SimpleContextConfig {

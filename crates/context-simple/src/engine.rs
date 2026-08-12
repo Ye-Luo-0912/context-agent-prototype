@@ -19,6 +19,11 @@ use crate::materializer;
 use crate::scope;
 use crate::store;
 
+/// 每次 `context.search` 调用最多强化 recency 的命中数。被检索到说明
+/// 条目被重新关注，Cold -> External 的老化应延迟；有界防止反复搜索
+/// 无限刷 recency。只动 last_access 时钟，从不覆盖终态语义或根集。
+pub(crate) const SEARCH_REINFORCE_MAX_PER_CALL: usize = 8;
+
 #[derive(Debug, Clone)]
 pub struct SimpleContextConfig {
     pub active_threshold: f32,
@@ -938,8 +943,22 @@ impl ContextEngine for SimpleContextEngine {
         &self,
         query: agent_contracts::ContextSearchQuery,
     ) -> AgentResult<Vec<agent_contracts::ExternalizedContext>> {
-        let state = self.state.lock().await;
-        Ok(crate::store::search_entries(&state.external, &query))
+        let mut state = self.state.lock().await;
+        let hits = crate::store::search_entries(&state.external, &query);
+        // search 命中给条目一个有界的 recency 强化——被检索到说明条目被
+        // 重新关注，Cold -> External 的老化应延迟。有界：每次调用最多
+        // 强化前 SEARCH_REINFORCE_MAX_PER_CALL 个命中，只动 last_access
+        // 时钟；terminal 命中已被 externally_retrievable 过滤，search
+        // 从不覆盖终态语义或 GC 根集（根集由 mark_roots 决定）。
+        let now_tick = state.event_seq;
+        let gc_epoch = state.gc_epoch;
+        for hit in hits.iter().take(SEARCH_REINFORCE_MAX_PER_CALL) {
+            if let Some(entry) = state.external.get_mut(hit.item_id) {
+                entry.last_access_tick = now_tick;
+                entry.last_access_gc_epoch = Some(gc_epoch);
+            }
+        }
+        Ok(hits)
     }
 
     async fn inspect_external(

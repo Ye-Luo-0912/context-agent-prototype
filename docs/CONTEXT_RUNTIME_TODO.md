@@ -908,9 +908,16 @@ Next tasks:
   ref, digest, size, authority, and task/turn ids. Store the exact body once
   in the evidence plane and budget its model projection separately; event
   logging must not become an unbounded duplicate of the transcript.
-- [ ] **CTX-GC-10** Couple search/resolve signals to bounded access
+- [x] **CTX-GC-10** Couple search/resolve signals to bounded access
   reinforcement and GC explanations, but never let a search hit override
-  terminal semantic state or mandatory TaskAnchor roots.
+  terminal semantic state or mandatory TaskAnchor roots. Landed 2026-08-12:
+  `context.search` now stamps a bounded slice of hits (at most 8 per call)
+  with a fresh recency clock and GC-epoch anchor, delaying Cold -> External
+  aging for re-referenced entries; terminal hits stay filtered out by
+  `externally_retrievable` and GC roots are untouched, so a search can
+  reinforce access without ever resurrecting dead semantics or unmarking a
+  mandatory root. Covered by `search_hits_stamp_a_bounded_recency_
+  reinforcement` and `search_reinforcement_delays_cold_to_external_aging`.
 
 ## Multi-agent context
 
