@@ -847,8 +847,23 @@ stable; it should not introduce a second orchestrator.
   append/rolling on the same workload, with a 9-resident + 3-warm final
   working set). Store I/O, materialize p50/p95 latency and recall count
   remain (they need latency instrumentation and store accounting).
-- [ ] Replace the placeholder “summary” evaluation arm with a real rolling
+- [x] Replace the placeholder “summary” evaluation arm with a real rolling
   summary baseline and count all manager/derivation tokens.
+  **Done 2026-08-12.** `context-baselines` gained a `Summarizer` trait
+  (injected via `RollingSummaryEngine::with_summarizer`) plus a bounded
+  fold-digest (`SUMMARIZER_PRIOR_CAP = 2 000` chars), so the rolling marker
+  reflects the folded content instead of a constant placeholder; the eval
+  harness injects a deterministic `ScriptedSummarizer` and the cross-engine
+  comparison now folds on the fixture workload (the default 9 000-token
+  threshold would never fire — the whole run stays near 300 tokens — so the
+  rolling arm uses 200/100 thresholds and folds from the fourth turn).
+  Manager/derivation cost is counted separately from the input-token gap:
+  `manager_token_cost` re-materializes the final state and sums the
+  `Summary`/`source == "derived"` items, surfaced as `EngineRun.
+  manager_tokens` in the comparison table (measured: rolling folds 3-4
+  records with a 26-token marker at ~12 960 model_in vs append ~13 220 vs
+  dynamic ~12 090 on the same five-turn script; append/dynamic inject zero
+  manager tokens — the fixtures never complete a task or derive).
 
 ### Phase 1 — Correctness before smarter policy
 

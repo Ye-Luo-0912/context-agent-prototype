@@ -3,12 +3,14 @@
 //! Everything is appended like baseline A, but when the retained history
 //! crosses `summary_threshold_tokens` the oldest records — those strictly
 //! older than the newest `keep_most_recent_tokens` verbatim window — are
-//! folded into a single placeholder summary marker. This models the classic
-//! "summarize when the window fills" baseline; the marker stands in for an
-//! LLM summary because the metric of interest here is token growth, not
-//! summary quality.
+//! folded into a single rolling summary marker. This models the classic
+//! "summarize when the window fills" baseline. The marker defaults to a
+//! fixed placeholder (the metric of interest is token growth, not summary
+//! quality), but a `Summarizer` can be injected (e.g. a scripted stand-in
+//! in the eval harness) so the baseline's summary cost tracks the actual
+//! folded content instead of a constant.
 
-use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_contracts::{
     AgentError, AgentResult, AttentionState, ContextDiagnostics, ContextEngine, ContextIngress,
@@ -40,6 +42,20 @@ impl Default for RollingConfig {
             keep_most_recent_tokens: 8_000,
         }
     }
+}
+
+/// How many chars of folded content the engine hands to a summarizer —
+/// the summary input stays bounded no matter how much was folded.
+pub const SUMMARIZER_PRIOR_CAP: usize = 2_000;
+
+/// Turns the folded records into the rolling summary marker. The baseline
+/// ships without one (a fixed placeholder); the eval harness injects a
+/// deterministic stand-in so the summary cost reflects the folded content.
+pub trait Summarizer: Send + Sync {
+    /// Produce the summary text. `folded` is how many records were
+    /// collapsed into the marker; `prior` is a bounded digest of what was
+    /// folded (at most `SUMMARIZER_PRIOR_CAP` chars).
+    fn summarize(&self, folded: usize, prior: &str) -> String;
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -79,6 +95,9 @@ impl RollingState {
 pub struct RollingSummaryEngine {
     state: StdMutex<RollingState>,
     config: RollingConfig,
+    /// When set, each collapse calls the summarizer on a bounded digest of
+    /// the folded records instead of emitting the fixed placeholder marker.
+    summarizer: Option<Arc<dyn Summarizer>>,
 }
 
 impl RollingSummaryEngine {
@@ -90,7 +109,16 @@ impl RollingSummaryEngine {
         Self {
             state: StdMutex::new(RollingState::default()),
             config,
+            summarizer: None,
         }
+    }
+
+    /// Inject a summarizer that turns the folded records into the rolling
+    /// summary marker (e.g. a scripted stand-in in the eval harness). The
+    /// default keeps the fixed placeholder.
+    pub fn with_summarizer(mut self, summarizer: Arc<dyn Summarizer>) -> Self {
+        self.summarizer = Some(summarizer);
+        self
     }
 }
 
@@ -135,8 +163,20 @@ impl ContextEngine for RollingSummaryEngine {
                 break;
             }
 
+            // Fold the oldest records, collecting a bounded digest of what
+            // was folded for the summarizer (the summary input must not
+            // grow with the folded amount).
+            let mut prior = String::new();
+            let mut prior_chars = 0usize;
             for _ in 0..fold_candidates {
                 let record = state.records.remove(0);
+                if prior_chars < SUMMARIZER_PRIOR_CAP {
+                    let remaining = SUMMARIZER_PRIOR_CAP - prior_chars;
+                    let part: String = record.content.chars().take(remaining).collect();
+                    prior.push_str(&part);
+                    prior.push('\n');
+                    prior_chars += part.chars().count() + 1;
+                }
                 state.collapsed += 1;
                 transitions.push(ContextStateTransition {
                     item_id: record.id,
@@ -153,14 +193,18 @@ impl ContextEngine for RollingSummaryEngine {
                 .as_ref()
                 .map(|summary| summary.id)
                 .unwrap_or_default();
+            let content = match &self.summarizer {
+                Some(summarizer) => summarizer.summarize(state.collapsed, &prior),
+                None => format!(
+                    "Earlier context: {} prior messages collapsed (goals, decisions, tool results). The work below is current.",
+                    state.collapsed
+                ),
+            };
             state.summary = Some(Record {
                 id: summary_id,
                 kind: ContextKind::Summary,
                 scope: ContextScope::Task,
-                content: format!(
-                    "Earlier context: {} prior messages collapsed (goals, decisions, tool results). The work below is current.",
-                    state.collapsed
-                ),
+                content,
                 created_turn: 0,
                 source: Some("rolling summary".into()),
             });

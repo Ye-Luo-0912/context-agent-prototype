@@ -15,7 +15,7 @@ mod rolling;
 mod shared;
 
 pub use append::AppendOnlyEngine;
-pub use rolling::{RollingConfig, RollingSummaryEngine};
+pub use rolling::{RollingConfig, RollingSummaryEngine, SUMMARIZER_PRIOR_CAP, Summarizer};
 
 #[cfg(test)]
 mod tests {
@@ -25,6 +25,7 @@ mod tests {
         MaterializedContext, ToolOutput,
     };
     use serde_json::json;
+    use std::sync::Arc;
 
     fn tool_output(ok: bool, model_content: &str) -> ToolOutput {
         ToolOutput {
@@ -142,6 +143,51 @@ mod tests {
         assert!(
             tokens <= 60 + 400,
             "rolling summary must bound the snapshot, got {tokens}"
+        );
+    }
+
+    /// A summarizer that embeds the folded count and the digest, so the
+    /// marker observably depends on the folded content.
+    struct EchoSummarizer;
+
+    impl Summarizer for EchoSummarizer {
+        fn summarize(&self, folded: usize, prior: &str) -> String {
+            format!("[rolled up {folded} earlier messages; digest {prior}]")
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_summarizer_replaces_the_placeholder_marker() {
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 60,
+            keep_most_recent_tokens: 20,
+        })
+        .with_summarizer(Arc::new(EchoSummarizer));
+        for turn in 0..20 {
+            run_turn(&engine, &format!("turn {turn}"), 1).await;
+        }
+        let materialized = engine
+            .materialize(ContextQuery {
+                current_input: "next".into(),
+                budget_tokens: 100_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        let summary = materialized
+            .items
+            .iter()
+            .find(|item| item.kind == agent_contracts::ContextKind::Summary)
+            .expect("collapse must leave a summary marker");
+        assert!(
+            summary.content.starts_with("[rolled up "),
+            "the injected summarizer must produce the marker, got: {}",
+            summary.content
+        );
+        assert!(
+            summary.content.contains("digest "),
+            "the marker must reflect the folded content: {}",
+            summary.content
         );
     }
 
