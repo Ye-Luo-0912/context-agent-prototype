@@ -637,6 +637,7 @@ mod tests {
                 RuntimeEvent::ContextPrepared {
                     diagnostics: ContextDiagnostics::default(),
                     selected: Vec::new(),
+                    materialize_ms: 0,
                 },
             ),
             envelope(
@@ -694,6 +695,7 @@ mod tests {
                 RuntimeEvent::ContextPrepared {
                     diagnostics: ContextDiagnostics::default(),
                     selected: Vec::new(),
+                    materialize_ms: 0,
                 },
             ),
             envelope(
@@ -791,6 +793,7 @@ mod tests {
                 RuntimeEvent::ContextPrepared {
                     diagnostics: ContextDiagnostics::default(),
                     selected: vec![recorded.clone()],
+                    materialize_ms: 0,
                 },
             ),
             envelope(
@@ -861,6 +864,7 @@ mod tests {
                 RuntimeEvent::ContextPrepared {
                     diagnostics: ContextDiagnostics::default(),
                     selected: preview.selected,
+                    materialize_ms: 0,
                 },
             ),
             // A later empty frame succeeds. It supersedes the first pending
@@ -871,6 +875,7 @@ mod tests {
                 RuntimeEvent::ContextPrepared {
                     diagnostics: ContextDiagnostics::default(),
                     selected: Vec::new(),
+                    materialize_ms: 0,
                 },
             ),
             envelope(
@@ -981,6 +986,7 @@ mod tests {
                 RuntimeEvent::ContextPrepared {
                     diagnostics: ContextDiagnostics::default(),
                     selected: Vec::new(),
+                    materialize_ms: 0,
                 },
             ),
             envelope(
@@ -1068,6 +1074,7 @@ mod tests {
                 RuntimeEvent::ContextPrepared {
                     diagnostics: ContextDiagnostics::default(),
                     selected: Vec::new(),
+                    materialize_ms: 0,
                 },
             ),
             envelope(
@@ -1099,6 +1106,7 @@ mod tests {
                 RuntimeEvent::ContextPrepared {
                     diagnostics: ContextDiagnostics::default(),
                     selected: Vec::new(),
+                    materialize_ms: 0,
                 },
             ),
             envelope(
@@ -1140,6 +1148,7 @@ mod tests {
                 RuntimeEvent::ContextPrepared {
                     diagnostics: ContextDiagnostics::default(),
                     selected: Vec::new(),
+                    materialize_ms: 0,
                 },
             ),
             envelope(
@@ -1163,6 +1172,7 @@ mod tests {
                 RuntimeEvent::ContextPrepared {
                     diagnostics: ContextDiagnostics::default(),
                     selected: Vec::new(),
+                    materialize_ms: 0,
                 },
             ),
             envelope(

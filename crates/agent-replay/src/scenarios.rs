@@ -150,6 +150,7 @@ impl Script {
         self.push(RuntimeEvent::ContextPrepared {
             diagnostics: ContextDiagnostics::default(),
             selected: Vec::new(),
+            materialize_ms: 0,
         });
     }
 

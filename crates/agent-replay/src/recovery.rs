@@ -427,6 +427,7 @@ mod tests {
             RuntimeEvent::ContextPrepared {
                 diagnostics: ContextDiagnostics::default(),
                 selected: Vec::<ContextSelection>::new(),
+                materialize_ms: 0,
             },
         )
     }

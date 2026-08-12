@@ -243,7 +243,8 @@ pub fn render_comparison(runs: &[EngineRun]) -> String {
         let metrics = &run.eval.metrics;
         out.push_str(&format!(
             "  {:8} passed={} model_in={:>7} model_out={:>5} schema_tokens={:>6} rounds={} turns={} tool_calls={} lifecycle={} manager_tokens={}\n\
-               {:8}   selected_items={} active_tokens={} residency(resident/warm/cold/ext)={}/{}/{}/{}\n",
+               {:8}   selected_items={} active_tokens={} residency(resident/warm/cold/ext)={}/{}/{}/{}\n\
+               {:8}   materialize(p50/p95)={}ms/{}ms store(w/r/recalled)={}/{}/{}\n",
             run.engine,
             run.eval.passed,
             metrics.model_input_tokens,
@@ -261,6 +262,12 @@ pub fn render_comparison(runs: &[EngineRun]) -> String {
             metrics.final_warm_items,
             metrics.final_cold_items,
             metrics.final_external_items,
+            "",
+            metrics.materialize_ms_p50,
+            metrics.materialize_ms_p95,
+            metrics.store_write_bytes_total,
+            metrics.store_read_bytes_total,
+            metrics.store_recalled_items_total,
         ));
     }
     out

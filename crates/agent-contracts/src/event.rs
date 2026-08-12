@@ -75,6 +75,11 @@ pub enum RuntimeEvent {
         diagnostics: ContextDiagnostics,
         #[serde(default)]
         selected: Vec<ContextSelection>,
+        /// Engine materialization latency in milliseconds (the engine's
+        /// own `materialize` call, not the runtime's later rendering
+        /// overhead). Default preserves old wire/checkpoint rows.
+        #[serde(default)]
+        materialize_ms: u64,
     },
     /// A successful model operation consumed exactly this bounded subset of
     /// one materialization preview. Failed/cancelled/refused/stale operations

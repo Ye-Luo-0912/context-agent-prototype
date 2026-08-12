@@ -385,6 +385,14 @@ pub(crate) fn commit_full_gc(
     // The store map: successful writes become Cold entries (carrying the
     // checksum captured at write time for the reconcile)...
     let externalized_count = io.externalized.len();
+    // Store I/O accounting: the bodies written this pass, read back this
+    // pass, and how many items were recalled (M15 baseline, aggregated by
+    // the eval harness from the event stream).
+    let store_write_bytes = io
+        .externalized
+        .iter()
+        .map(|(item, _, _)| item.content.len() as u64)
+        .sum::<u64>();
     for (item, context_ref, checksum) in io.externalized {
         state.gc_externalized_total += 1;
         state.external.push(store::to_external_entry(
@@ -413,6 +421,12 @@ pub(crate) fn commit_full_gc(
             .external
             .retain(|entry| !recalled_ids.contains(&entry.item_id));
     }
+    let store_read_bytes = io
+        .recalled
+        .iter()
+        .map(|item| item.content.len() as u64)
+        .sum::<u64>();
+    let store_recalled_items = io.recalled.len() as u64;
 
     // Recalled items re-enter the heap as active residents, exactly like a
     // warm-buffer reactivation.
@@ -454,6 +468,9 @@ pub(crate) fn commit_full_gc(
         externalized: externalized_count,
         reactivated: plan.reactivated + recalled_reactivations.len(),
         aged_external: plan.aged_external,
+        store_write_bytes,
+        store_read_bytes,
+        store_recalled_items,
         diagnostics: diagnostics::compute(state),
         ..ContextGcReport::default()
     };

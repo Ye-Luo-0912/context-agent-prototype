@@ -808,6 +808,18 @@ pub struct ContextGcReport {
     /// by the next startup reconcile.
     #[serde(default)]
     pub store_blob_delete_errors: usize,
+    /// Bytes written to the external context store this pass (full
+    /// externalization bodies). Store I/O accounting for the M15 baseline.
+    #[serde(default)]
+    pub store_write_bytes: u64,
+    /// Bytes read back from the external context store this pass (recall
+    /// bodies).
+    #[serde(default)]
+    pub store_read_bytes: u64,
+    /// Items recalled from the external context store this pass
+    /// (full-body reads).
+    #[serde(default)]
+    pub store_recalled_items: u64,
     pub diagnostics: ContextDiagnostics,
 }
 

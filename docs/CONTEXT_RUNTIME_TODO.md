@@ -936,7 +936,7 @@ second authority or another transcript-based context system.
   `final_total` is a real catalog total — `context-simple/src/diagnostics.rs`
   computes the split and the external map maintains Cold/External counts in
   O(1).
-- [~] Record baseline Resident/Warm/Cold/External counts, candidate count,
+- [x] Record baseline Resident/Warm/Cold/External counts, candidate count,
   selected count/tokens, maintenance work, GC work, store I/O, materialize
   p50/p95, recall count, and task success.
   **Counts/tokens landed 2026-08-12** — `agent-eval` `RunMetrics` now
@@ -946,8 +946,15 @@ second authority or another transcript-based context system.
   comparison table prints them per engine (measured on the fixtures:
   dynamic selects 20 items / 380 active tokens vs 48 / ~1 250 for
   append/rolling on the same workload, with a 9-resident + 3-warm final
-  working set). Store I/O, materialize p50/p95 latency and recall count
-  remain (they need latency instrumentation and store accounting).
+  working set).
+  **Store I/O + latency + recall landed 2026-08-12** — `ContextGcReport`
+  carries `store_write_bytes` / `store_read_bytes` / `store_recalled_items`
+  (filled by `commit_full_gc` from the externalization/recall bodies),
+  `ContextPrepared` carries `materialize_ms` (the engine's own materialize
+  call, timed by the runtime before rendering overhead), and `RunMetrics`
+  aggregates cumulative store I/O plus nearest-rank `materialize_ms_p50` /
+  `p95`; the comparison table prints them per engine. Recall count is the
+  store recall side of full GC (`store_recalled_items`).
 - [x] Replace the placeholder “summary” evaluation arm with a real rolling
   summary baseline and count all manager/derivation tokens.
   **Done 2026-08-12.** `context-baselines` gained a `Summarizer` trait

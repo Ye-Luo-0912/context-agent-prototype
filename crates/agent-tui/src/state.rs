@@ -291,6 +291,7 @@ impl AppState {
             RuntimeEvent::ContextPrepared {
                 diagnostics,
                 selected,
+                ..
             } => {
                 self.context = diagnostics;
                 self.context_selected = selected;

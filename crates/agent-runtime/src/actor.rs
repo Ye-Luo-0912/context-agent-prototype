@@ -1421,6 +1421,7 @@ impl RuntimeActor {
             turn_frame_tokens,
             active_tools_tokens,
         );
+        let materialize_started = std::time::Instant::now();
         let materialized = match self
             .services
             .context_materialize(ContextQuery {
@@ -1444,6 +1445,7 @@ impl RuntimeActor {
                 return;
             }
         };
+        let materialize_ms = materialize_started.elapsed().as_millis() as u64;
         // Runtime final guard: the engine priced the working-set content,
         // but the assembler's rendering overhead (section headers, per-item
         // frame labels) is the runtime's share. The assembled request must
@@ -1531,6 +1533,7 @@ impl RuntimeActor {
             .emit_event(RuntimeEvent::ContextPrepared {
                 diagnostics: materialized.diagnostics.clone(),
                 selected: materialized.selected.clone(),
+                materialize_ms,
             })
             .await
         {

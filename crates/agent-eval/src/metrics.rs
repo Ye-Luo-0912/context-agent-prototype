@@ -67,12 +67,24 @@ pub struct RunMetrics {
     pub final_warm_items: u64,
     pub final_cold_items: u64,
     pub final_external_items: u64,
+    /// Cumulative store I/O from full-GC passes (`ContextGc`): bytes
+    /// written (externalization), bytes read back (recall), and items
+    /// recalled from the store.
+    pub store_write_bytes_total: u64,
+    pub store_read_bytes_total: u64,
+    pub store_recalled_items_total: u64,
+    /// Materialization latency percentiles (ms) across `ContextPrepared`
+    /// previews (the engine's own materialize call, before runtime
+    /// rendering overhead). 0 when no preview carried a timestamp.
+    pub materialize_ms_p50: u64,
+    pub materialize_ms_p95: u64,
 }
 
 /// Aggregate one run's envelopes. The caller filters to a single run.
 pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     let mut metrics = RunMetrics::default();
     let mut read_paths: HashSet<String> = HashSet::new();
+    let mut materialize_ms_samples: Vec<u64> = Vec::new();
 
     for envelope in events {
         match &envelope.event {
@@ -102,6 +114,9 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 metrics.gc_evictions += report.evicted as u64;
                 metrics.gc_reactivations += report.reactivated as u64;
                 metrics.gc_externalizations += report.externalized as u64;
+                metrics.store_write_bytes_total += report.store_write_bytes;
+                metrics.store_read_bytes_total += report.store_read_bytes;
+                metrics.store_recalled_items_total += report.store_recalled_items;
             }
             RuntimeEvent::ToolSurfacePlanned { report } => {
                 metrics.rounds += 1;
@@ -117,6 +132,7 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             RuntimeEvent::ContextPrepared {
                 diagnostics,
                 selected,
+                materialize_ms,
             } => {
                 metrics.materialize_rounds += 1;
                 metrics.selected_items_total += selected.len() as u64;
@@ -125,6 +141,9 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     .map(|item| item.approx_tokens as u64)
                     .sum::<u64>();
                 metrics.active_tokens_total += diagnostics.approx_active_tokens as u64;
+                if *materialize_ms > 0 {
+                    materialize_ms_samples.push(*materialize_ms);
+                }
                 // The last preview's diagnostics are the run's final
                 // residency snapshot (Resident/Warm/Cold/External counts).
                 metrics.final_total_items = diagnostics.total_items as u64;
@@ -136,7 +155,20 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             _ => {}
         }
     }
+    if !materialize_ms_samples.is_empty() {
+        materialize_ms_samples.sort_unstable();
+        metrics.materialize_ms_p50 = percentile(&materialize_ms_samples, 50);
+        metrics.materialize_ms_p95 = percentile(&materialize_ms_samples, 95);
+    }
     metrics
+}
+
+/// The nearest-rank percentile of a sorted sample: index
+/// `round((len - 1) * pct / 100)`.
+fn percentile(sorted: &[u64], pct: u64) -> u64 {
+    debug_assert!(!sorted.is_empty());
+    let index = ((sorted.len() - 1) as f64 * pct as f64 / 100.0).round() as usize;
+    sorted[index.min(sorted.len() - 1)]
 }
 
 /// Human-readable metric block for one run.
@@ -145,7 +177,9 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         "cost: model_in={} model_out={} schema_tokens={} rounds={} turns={} lifecycle_transitions={}\n\
          gc: evictions={} reactivations={} externalizations={}\n\
          materialize: rounds={} selected_items={} selected_tokens={} active_tokens={}\n\
+         materialize_latency: p50={}ms p95={}ms\n\
          residency(final): total={} resident={} warm={} cold={} external={}\n\
+         store: write_bytes={} read_bytes={} recalled_items={}\n\
          behavior: tool_calls={} failed_outputs={} spills={} output_chars={} repeated_fs_reads={}\n",
         metrics.model_input_tokens,
         metrics.model_output_tokens,
@@ -160,11 +194,16 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.selected_items_total,
         metrics.selected_tokens_total,
         metrics.active_tokens_total,
+        metrics.materialize_ms_p50,
+        metrics.materialize_ms_p95,
         metrics.final_total_items,
         metrics.final_resident_items,
         metrics.final_warm_items,
         metrics.final_cold_items,
         metrics.final_external_items,
+        metrics.store_write_bytes_total,
+        metrics.store_read_bytes_total,
+        metrics.store_recalled_items_total,
         metrics.tool_calls,
         metrics.failed_tool_outputs,
         metrics.artifact_spills,
@@ -319,6 +358,9 @@ mod tests {
                     evictions: Vec::new(),
                     reactivations: Vec::new(),
                     store_blob_delete_errors: 0,
+                    store_write_bytes: 512,
+                    store_read_bytes: 128,
+                    store_recalled_items: 2,
                     diagnostics: Default::default(),
                 },
             },
@@ -363,7 +405,8 @@ mod tests {
         ));
         seq += 1;
         // Two materialization previews: cumulative sums add up, the final
-        // residency snapshot is the last preview's.
+        // residency snapshot is the last preview's, and the latency
+        // percentiles come from the timestamped samples.
         events.push(envelope(
             run,
             seq,
@@ -393,6 +436,7 @@ mod tests {
                         breakdown: ScoreBreakdown::default(),
                     },
                 ],
+                materialize_ms: 10,
             },
         ));
         seq += 1;
@@ -416,6 +460,7 @@ mod tests {
                     reason: "focus".into(),
                     breakdown: ScoreBreakdown::default(),
                 }],
+                materialize_ms: 20,
             },
         ));
         seq += 1;
@@ -445,6 +490,13 @@ mod tests {
         assert_eq!(metrics.final_warm_items, 2);
         assert_eq!(metrics.final_cold_items, 1);
         assert_eq!(metrics.final_external_items, 1);
+        assert_eq!(metrics.store_write_bytes_total, 512);
+        assert_eq!(metrics.store_read_bytes_total, 128);
+        assert_eq!(metrics.store_recalled_items_total, 2);
+        // Two samples [10, 20]: the nearest-rank p50/p95 both land on the
+        // second sample.
+        assert_eq!(metrics.materialize_ms_p50, 20);
+        assert_eq!(metrics.materialize_ms_p95, 20);
 
         let rendered = render_metrics(&metrics);
         assert!(rendered.contains("model_in=9000"));
@@ -453,5 +505,20 @@ mod tests {
         assert!(
             rendered.contains("residency(final): total=11 resident=7 warm=2 cold=1 external=1")
         );
+        assert!(rendered.contains("materialize_latency: p50=20ms p95=20ms"));
+        assert!(rendered.contains("store: write_bytes=512 read_bytes=128 recalled_items=2"));
+    }
+
+    #[test]
+    fn materialize_percentiles_use_nearest_rank() {
+        // Four samples [10, 20, 30, 40]: p50 = round(1.5) -> index 2 (30),
+        // p95 = round(2.85) -> index 3 (40).
+        let sorted = vec![10u64, 20, 30, 40];
+        assert_eq!(percentile(&sorted, 50), 30);
+        assert_eq!(percentile(&sorted, 95), 40);
+
+        // A single sample is both p50 and p95.
+        assert_eq!(percentile(&[7u64], 50), 7);
+        assert_eq!(percentile(&[7u64], 95), 7);
     }
 }
