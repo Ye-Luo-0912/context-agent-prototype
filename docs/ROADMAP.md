@@ -1246,9 +1246,14 @@ letting the LLM grow capabilities autonomously.
    pack by fit before top-K exclusion, and avoid O(total-history)
    external/session candidate scans. Diagnostics already counts the logical
    catalog in O(1) and `inspect` is memory-bounded by its limit (not by
-   history size). Record
-   Resident bytes, candidate count and materialization p95 before changing
-   scoring weights.
+   history size). **Resident/candidate/selected counts and tokens are now
+   recorded** (2026-08-12): `agent-eval` aggregates materialize rounds,
+   selected items/tokens, active tokens and the final
+   Resident/Warm/Cold/External snapshot per run, printed by
+   `--compare-arm`/`--metrics` — on the deterministic fixtures the dynamic
+   engine feeds the model ~1 200 active tokens per round baseline vs ~380
+   dynamic. Record Resident *bytes*, materialize p50/p95 latency and store
+   I/O before changing scoring weights.
 6. **Run the real gate (M15).** Compare append-only, actual compaction and
    dynamic GC on paired coding tasks, with hidden tests and total token/tool/
    store/latency cost. Only then consider learned/vector recall or V2.

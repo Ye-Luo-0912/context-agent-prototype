@@ -47,6 +47,26 @@ pub struct RunMetrics {
     /// Repeated `fs.read` of the same workspace path (the second and later
     /// reads of one path — a proxy for search/re-read inefficiency).
     pub repeated_fs_reads: u64,
+
+    // Materialization (the Phase 0 measurement baseline: how big the model
+    // input actually was and where the working set lived).
+    /// `ContextPrepared` events: model rounds that produced a
+    /// materialization preview.
+    pub materialize_rounds: u64,
+    /// Cumulative selected items across previews (`selected.len()`).
+    pub selected_items_total: u64,
+    /// Cumulative selected-item token estimate (`ContextSelection.approx_tokens`).
+    pub selected_tokens_total: u64,
+    /// Cumulative `approx_active_tokens` across previews — the engine's
+    /// estimate of the model-visible working set per round.
+    pub active_tokens_total: u64,
+    /// Final materialization diagnostics: the residency split the last
+    /// preview saw (resident heap / warm buffer / cold store / external).
+    pub final_total_items: u64,
+    pub final_resident_items: u64,
+    pub final_warm_items: u64,
+    pub final_cold_items: u64,
+    pub final_external_items: u64,
 }
 
 /// Aggregate one run's envelopes. The caller filters to a single run.
@@ -94,6 +114,25 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 metrics.model_input_tokens += input_tokens;
                 metrics.model_output_tokens += output_tokens;
             }
+            RuntimeEvent::ContextPrepared {
+                diagnostics,
+                selected,
+            } => {
+                metrics.materialize_rounds += 1;
+                metrics.selected_items_total += selected.len() as u64;
+                metrics.selected_tokens_total += selected
+                    .iter()
+                    .map(|item| item.approx_tokens as u64)
+                    .sum::<u64>();
+                metrics.active_tokens_total += diagnostics.approx_active_tokens as u64;
+                // The last preview's diagnostics are the run's final
+                // residency snapshot (Resident/Warm/Cold/External counts).
+                metrics.final_total_items = diagnostics.total_items as u64;
+                metrics.final_resident_items = diagnostics.resident_items as u64;
+                metrics.final_warm_items = diagnostics.warm_items as u64;
+                metrics.final_cold_items = diagnostics.cold_items as u64;
+                metrics.final_external_items = diagnostics.external_items as u64;
+            }
             _ => {}
         }
     }
@@ -105,6 +144,8 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
     format!(
         "cost: model_in={} model_out={} schema_tokens={} rounds={} turns={} lifecycle_transitions={}\n\
          gc: evictions={} reactivations={} externalizations={}\n\
+         materialize: rounds={} selected_items={} selected_tokens={} active_tokens={}\n\
+         residency(final): total={} resident={} warm={} cold={} external={}\n\
          behavior: tool_calls={} failed_outputs={} spills={} output_chars={} repeated_fs_reads={}\n",
         metrics.model_input_tokens,
         metrics.model_output_tokens,
@@ -115,6 +156,15 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.gc_evictions,
         metrics.gc_reactivations,
         metrics.gc_externalizations,
+        metrics.materialize_rounds,
+        metrics.selected_items_total,
+        metrics.selected_tokens_total,
+        metrics.active_tokens_total,
+        metrics.final_total_items,
+        metrics.final_resident_items,
+        metrics.final_warm_items,
+        metrics.final_cold_items,
+        metrics.final_external_items,
         metrics.tool_calls,
         metrics.failed_tool_outputs,
         metrics.artifact_spills,
@@ -127,9 +177,10 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
 mod tests {
     use super::*;
     use agent_contracts::{
-        AttentionState, ContextGcReport, ContextItemId, ContextKind, ContextMaintenanceReport,
-        ContextMaintenanceTrigger, ContextScope, ContextStateTransition, RunId, TaskId, ToolOutput,
-        ToolSurfaceDemand, ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceSelection,
+        AttentionState, ContextDiagnostics, ContextGcReport, ContextItemId, ContextKind,
+        ContextMaintenanceReport, ContextMaintenanceTrigger, ContextScope, ContextSelection,
+        ContextStateTransition, RunId, ScoreBreakdown, TaskId, ToolOutput, ToolSurfaceDemand,
+        ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceSelection,
         ToolSurfaceSourceRevisions, TurnId,
     };
     use serde_json::json;
@@ -311,6 +362,63 @@ mod tests {
             },
         ));
         seq += 1;
+        // Two materialization previews: cumulative sums add up, the final
+        // residency snapshot is the last preview's.
+        events.push(envelope(
+            run,
+            seq,
+            RuntimeEvent::ContextPrepared {
+                diagnostics: ContextDiagnostics {
+                    total_items: 10,
+                    resident_items: 6,
+                    warm_items: 2,
+                    cold_items: 1,
+                    external_items: 1,
+                    approx_active_tokens: 5_000,
+                    ..ContextDiagnostics::default()
+                },
+                selected: vec![
+                    ContextSelection {
+                        item_id: ContextItemId::new(),
+                        score: 1.0,
+                        approx_tokens: 300,
+                        reason: "focus".into(),
+                        breakdown: ScoreBreakdown::default(),
+                    },
+                    ContextSelection {
+                        item_id: ContextItemId::new(),
+                        score: 0.5,
+                        approx_tokens: 200,
+                        reason: "recall".into(),
+                        breakdown: ScoreBreakdown::default(),
+                    },
+                ],
+            },
+        ));
+        seq += 1;
+        events.push(envelope(
+            run,
+            seq,
+            RuntimeEvent::ContextPrepared {
+                diagnostics: ContextDiagnostics {
+                    total_items: 11,
+                    resident_items: 7,
+                    warm_items: 2,
+                    cold_items: 1,
+                    external_items: 1,
+                    approx_active_tokens: 4_000,
+                    ..ContextDiagnostics::default()
+                },
+                selected: vec![ContextSelection {
+                    item_id: ContextItemId::new(),
+                    score: 0.9,
+                    approx_tokens: 250,
+                    reason: "focus".into(),
+                    breakdown: ScoreBreakdown::default(),
+                }],
+            },
+        ));
+        seq += 1;
         events.push(envelope(run, seq, RuntimeEvent::TurnCompleted));
 
         let metrics = aggregate_metrics(&events);
@@ -328,9 +436,22 @@ mod tests {
         assert_eq!(metrics.schema_tokens_total, 512);
         assert_eq!(metrics.model_input_tokens, 9_000);
         assert_eq!(metrics.model_output_tokens, 120);
+        assert_eq!(metrics.materialize_rounds, 2);
+        assert_eq!(metrics.selected_items_total, 3);
+        assert_eq!(metrics.selected_tokens_total, 750);
+        assert_eq!(metrics.active_tokens_total, 9_000);
+        assert_eq!(metrics.final_total_items, 11);
+        assert_eq!(metrics.final_resident_items, 7);
+        assert_eq!(metrics.final_warm_items, 2);
+        assert_eq!(metrics.final_cold_items, 1);
+        assert_eq!(metrics.final_external_items, 1);
 
         let rendered = render_metrics(&metrics);
         assert!(rendered.contains("model_in=9000"));
         assert!(rendered.contains("repeated_fs_reads=1"));
+        assert!(rendered.contains("materialize: rounds=2 selected_items=3 selected_tokens=750"));
+        assert!(
+            rendered.contains("residency(final): total=11 resident=7 warm=2 cold=1 external=1")
+        );
     }
 }

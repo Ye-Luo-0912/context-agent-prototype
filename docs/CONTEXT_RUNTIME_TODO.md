@@ -830,9 +830,18 @@ stable; it should not introduce a second orchestrator.
 - [ ] Rename/split Resident-only diagnostics from real logical catalog totals
   before using `total_items`, `inspect`, or replay `final_total` as retention
   evidence.
-- [ ] Record baseline Resident/Warm/Cold/External counts, candidate count,
+- [~] Record baseline Resident/Warm/Cold/External counts, candidate count,
   selected count/tokens, maintenance work, GC work, store I/O, materialize
   p50/p95, recall count, and task success.
+  **Counts/tokens landed 2026-08-12** — `agent-eval` `RunMetrics` now
+  aggregates materialize rounds, cumulative selected items/tokens,
+  cumulative `approx_active_tokens` and the final Resident/Warm/Cold/
+  External snapshot from `ContextPrepared`, and the cross-engine
+  comparison table prints them per engine (measured on the fixtures:
+  dynamic selects 20 items / 380 active tokens vs 48 / ~1 250 for
+  append/rolling on the same workload, with a 9-resident + 3-warm final
+  working set). Store I/O, materialize p50/p95 latency and recall count
+  remain (they need latency instrumentation and store accounting).
 - [ ] Replace the placeholder “summary” evaluation arm with a real rolling
   summary baseline and count all manager/derivation tokens.
 

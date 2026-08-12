@@ -181,7 +181,8 @@ pub fn render_comparison(runs: &[EngineRun]) -> String {
     for run in runs {
         let metrics = &run.eval.metrics;
         out.push_str(&format!(
-            "  {:8} passed={} model_in={:>7} model_out={:>5} schema_tokens={:>6} rounds={} turns={} tool_calls={} lifecycle={}\n",
+            "  {:8} passed={} model_in={:>7} model_out={:>5} schema_tokens={:>6} rounds={} turns={} tool_calls={} lifecycle={}\n\
+               {:8}   selected_items={} active_tokens={} residency(resident/warm/cold/ext)={}/{}/{}/{}\n",
             run.engine,
             run.eval.passed,
             metrics.model_input_tokens,
@@ -191,6 +192,13 @@ pub fn render_comparison(runs: &[EngineRun]) -> String {
             metrics.turns,
             metrics.tool_calls,
             metrics.lifecycle_transitions,
+            "",
+            metrics.selected_items_total,
+            metrics.active_tokens_total,
+            metrics.final_resident_items,
+            metrics.final_warm_items,
+            metrics.final_cold_items,
+            metrics.final_external_items,
         ));
     }
     out
@@ -406,6 +414,23 @@ mod tests {
                     run.eval.passed,
                     "engine '{}' must pass fixture '{}'",
                     run.engine, fixture.id
+                );
+            }
+            // The materialization baseline is actually recorded: every
+            // engine's event stream carries ContextPrepared with a
+            // non-empty residency snapshot.
+            for run in &runs {
+                assert!(
+                    run.eval.metrics.materialize_rounds >= 1,
+                    "engine '{}' must record materialization rounds on '{}'",
+                    run.engine,
+                    fixture.id
+                );
+                assert!(
+                    run.eval.metrics.final_total_items >= 1,
+                    "engine '{}' must record a residency snapshot on '{}'",
+                    run.engine,
+                    fixture.id
                 );
             }
             // The multi-turn script actually exercised the tool surface.
