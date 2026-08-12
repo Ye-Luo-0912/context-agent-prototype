@@ -908,10 +908,31 @@ stable; it should not introduce a second orchestrator.
   episode past `episode_max_user_turns`, asserts the guard fires at the
   budget boundary (not immediately), then verifies five related messages in
   the next episode do not rotate and stay resident.
-- [ ] Apply TTL/terminal aging coherently across every body location and keep
+- [x] Apply TTL/terminal aging coherently across every body location and keep
   full GC progressing in external-only state.
-- [ ] Make dependency roots and scope-close transitions location-independent;
+  **Landed:** ephemeral TTL/staleness age in user turns wherever the item
+  lives — resident heap (`residency.rs`) and the warm reversible buffer
+  (`gc/minor.rs`: "ephemeral TTL expired in the warm buffer" / "stale in
+  the warm buffer", tombstoned once dead); externalized (`Cold`) entries
+  age to `External` by full-GC generations (`gc_external_ttl_generations`,
+  `store::age_external_entries`), and a full GC whose heap and buffer are
+  empty still runs and ages external entries (`gc/full.rs`: "An
+  external-only state must ...") — so aging never stalls when nothing is
+  resident. Storage GC deletes only entries whose semantic lifecycle ended
+  `storage_ttl_ticks` ago (`store::plan_storage_gc`). Regressions cover
+  the external-only path (`gc_external_ttl_generations: 1` scenario) and
+  the warm-buffer TTL.
+- [x] Make dependency roots and scope-close transitions location-independent;
   surface tool-scope close transitions/errors as mandatory audit events.
+  **Landed:** supersession, error-verification and dependency scans cover
+  the heap, the warm buffer and the external map (`gc/reachability.rs`:
+  "the scan covers the heap, the warm buffer and the external map"), so a
+  decision that was evicted and externalized is still the same decision
+  and still gets superseded/verified anywhere its body lives; the target
+  may live in any body location ("Lifecycle authority must not [depend on
+  location]"). Tool-scope close publishes its transitions and failures as
+  audit events (`CTX-06`: `tool_scope_close_publishes_its_transitions`,
+  `tool_scope_close_failure_is_published_as_an_error`).
 - [x] Verify transient search/inspect/fetch disposition and process-service
   parity (`CTX-03`).
 - [x] Implement bounded `admit`/`derive`: admit preserves the source identity
