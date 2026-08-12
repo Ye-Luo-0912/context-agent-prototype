@@ -39,8 +39,11 @@ const MAX_SESSIONS: usize = 16;
 /// Bounded wait for a child's remaining buffered output after it exits:
 /// process exit and pipe EOF are two different events, and a poll must not
 /// report "exited" until the readers are at EOF so the model-facing tail
-/// is complete. The bound only bites when a reader is wedged (e.g. a
-/// grandchild holding the pipe open); a later poll keeps draining.
+/// is complete. When the bound bites (a reader wedged or heavily delayed,
+/// e.g. a grandchild holding the pipe open) the poll reports "running"
+/// instead — the output keeps accumulating in the session's tail, so a
+/// later poll drains it; "exited" therefore always means the tail is
+/// complete.
 const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A running (or finished-but-unreaped) session: the live child plus the
@@ -89,9 +92,10 @@ impl ProcessSession {
             // and pipe EOF are two different events. Block (bounded) until
             // the channel disconnects — the readers' EOF — so a poll that
             // reports "exited" always carries the complete model-facing
-            // tail. The bound is a safety valve: a wedged reader (a
-            // grandchild holding the pipe open) must never block a poll
-            // forever, and a later poll keeps draining.
+            // tail. If the bound bites (a reader wedged or heavily
+            // delayed), report "running" instead of "exited": the output
+            // already recorded stays in the tail and a later poll keeps
+            // draining, so no output is ever fabricated as complete.
             loop {
                 match tokio::time::timeout(EXIT_DRAIN_TIMEOUT, self.rx.recv()).await {
                     Ok(Some(StreamLine::Stdout(line))) | Ok(Some(StreamLine::Stderr(line))) => {
@@ -105,8 +109,12 @@ impl ProcessSession {
                         .await?;
                         new_lines += 1;
                     }
-                    Ok(None) => break, // all readers at EOF
-                    Err(_) => break,   // bounded: never block a poll forever
+                    Ok(None) => break, // all readers at EOF: the tail is complete
+                    Err(_) => {
+                        // Bounded: never block a poll forever, but never
+                        // claim "exited" with a possibly-incomplete tail.
+                        return Ok((new_lines, false));
+                    }
                 }
             }
             exited = true;
@@ -545,7 +553,11 @@ mod tests {
         let output = value(output);
         let session_id = output.metadata["session_id"].as_str().unwrap().to_string();
 
-        // Poll until the process has exited and its output drained.
+        // Poll until the process has exited and its output has drained
+        // into the model-facing tail. `exited` is only reported once the
+        // readers are at EOF, but a wedged reader degrades to "running",
+        // so the test keeps polling and never asserts on a half-drained
+        // tail.
         let mut last: Option<ToolOutput> = None;
         for _ in 0..50 {
             let output = tool
@@ -558,7 +570,9 @@ mod tests {
                 .await
                 .unwrap();
             let output = value(output);
-            if output.metadata["status"] == "exited" {
+            if output.metadata["status"] == "exited"
+                && output.model_content.contains("hello session")
+            {
                 last = Some(output);
                 break;
             }
