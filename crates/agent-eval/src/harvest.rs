@@ -55,7 +55,7 @@ pub fn load_swebench_jsonl(path: &std::path::Path) -> anyhow::Result<Vec<SuiteTa
 }
 
 pub fn row_to_task(row: SwebenchRow, index: usize) -> SuiteTask {
-    let recall = index % RECALL_EVERY == 0;
+    let recall = index.is_multiple_of(RECALL_EVERY);
     let description = row.problem_statement.replace('\r', " ");
     let instance = serde_json::json!({
         "dataset": DATASET,
@@ -566,10 +566,10 @@ fn gold_resolved(work: &Path, instance_id: &str, stdout: &str, stderr: &str) -> 
 }
 
 fn report_marks_resolved(value: &serde_json::Value, instance_id: &str) -> bool {
-    if let Some(ids) = value.get("resolved_ids").and_then(|row| row.as_array()) {
-        if ids.iter().any(|id| id.as_str() == Some(instance_id)) {
-            return true;
-        }
+    if let Some(ids) = value.get("resolved_ids").and_then(|row| row.as_array())
+        && ids.iter().any(|id| id.as_str() == Some(instance_id))
+    {
+        return true;
     }
     if value
         .get("resolved")

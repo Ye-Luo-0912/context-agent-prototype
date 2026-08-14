@@ -34,6 +34,8 @@ pub const GATE_REPEATS: u32 = 3;
 /// 300×3 接受细胞仍须先做剩余校准。
 pub const SUITE_FROZEN: bool = true;
 
+/// 日期种子 YYYY_MM_DD，不是按千分位分组的整数。
+#[allow(clippy::inconsistent_digit_grouping)]
 const POWER_SEED: u64 = 2026_08_14;
 const POWER_SIMS: u32 = 5_000;
 
@@ -171,7 +173,7 @@ impl CellRecord {
 }
 
 pub fn spec_sha256() -> String {
-    hex_encode(&Sha256::digest(SPEC.as_bytes()))
+    hex_encode(Sha256::digest(SPEC.as_bytes()))
 }
 
 /// Live 细胞的引擎顺序：按 fixture × repeat 打乱，抵消供应商时间漂移。

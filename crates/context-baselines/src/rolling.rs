@@ -235,10 +235,7 @@ impl ContextEngine for RollingSummaryEngine {
         let mut transitions: Vec<ContextStateTransition> = Vec::new();
         let mut pass_in = 0u64;
         let mut pass_out = 0u64;
-        loop {
-            let Some(job) = self.take_fold_job() else {
-                break;
-            };
+        while let Some(job) = self.take_fold_job() {
             let compacted = self.compact_fold(&job).await;
             pass_in = pass_in.saturating_add(compacted.input_tokens);
             pass_out = pass_out.saturating_add(compacted.output_tokens);

@@ -2583,8 +2583,10 @@ async fn user_message_event_is_a_bounded_preview_while_ingest_keeps_the_body() {
         input.body_ref.is_none(),
         "this kernel has no artifact workspace"
     );
-    let ingested = context.user_messages.lock().unwrap();
-    assert_eq!(ingested.as_slice(), std::slice::from_ref(&body));
+    {
+        let ingested = context.user_messages.lock().unwrap();
+        assert_eq!(ingested.as_slice(), std::slice::from_ref(&body));
+    }
     handle.stop().await.unwrap();
 }
 

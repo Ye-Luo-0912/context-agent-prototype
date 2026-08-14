@@ -103,7 +103,7 @@ pub fn sample_sha256(ids: &[String]) -> String {
         hasher.update(id.as_bytes());
         hasher.update(b"\n");
     }
-    hex_encode(&hasher.finalize())
+    hex_encode(hasher.finalize())
 }
 
 fn rank_key(id: &str) -> [u8; 32] {
@@ -335,9 +335,10 @@ pub fn calibrate(
                 .into(),
         );
     }
-    notes.push(format!(
+    notes.push(
         "power-model strata p: small=0.90 medium=0.70 large=0.40; observed A by size is diagnostic only"
-    ));
+            .to_string(),
+    );
 
     CalibrationReport {
         decision: "pilot",

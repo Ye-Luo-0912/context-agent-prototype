@@ -135,14 +135,14 @@ pub fn check_output_envelope(output: &ToolOutput) -> Vec<ConformanceViolation> {
             "a failed result must carry a non-empty summary explaining the failure",
         ));
     }
-    if let Some(reference) = &output.artifact_ref {
-        if let Err(error) = ArtifactLocator::parse(reference) {
-            violations.push(ConformanceViolation::new(
-                &subject,
-                "output",
-                format!("artifact_ref is not a canonical owner/digest locator: {error}"),
-            ));
-        }
+    if let Some(reference) = &output.artifact_ref
+        && let Err(error) = ArtifactLocator::parse(reference)
+    {
+        violations.push(ConformanceViolation::new(
+            &subject,
+            "output",
+            format!("artifact_ref is not a canonical owner/digest locator: {error}"),
+        ));
     }
     violations
 }

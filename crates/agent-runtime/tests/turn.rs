@@ -3333,8 +3333,10 @@ async fn final_assistant_response_is_persisted_in_full_before_contextitem_trunca
     .expect("the turn must complete before reading its raw evidence");
 
     // Read the single published assistant-response artifact back.
+    // user-input bodies also live under artifacts/; this assertion is about
+    // the final assistant response only.
     let artifacts_dir = workspace.state_dir().join("artifacts");
-    let artifacts = collect_txt_files(&artifacts_dir);
+    let artifacts = collect_owner_files(&artifacts_dir, "assistant-response");
     assert_eq!(
         artifacts.len(),
         1,
@@ -3365,6 +3367,17 @@ fn collect_txt_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+fn collect_owner_files(dir: &std::path::Path, owner: &str) -> Vec<std::path::PathBuf> {
+    collect_txt_files(dir)
+        .into_iter()
+        .filter(|path| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .contains(&format!("/{owner}/"))
+        })
+        .collect()
 }
 
 /// Round 0 proposes `task.complete`; round 1 answers with one very long
@@ -3473,8 +3486,12 @@ async fn completion_record_attaches_the_raw_final_response_artifact() {
 
     // The artifact exists and carries the complete untruncated response.
     let artifacts_dir = workspace.state_dir().join("artifacts");
-    let files = collect_txt_files(&artifacts_dir);
-    assert_eq!(files.len(), 1, "one artifact per final response");
+    let files = collect_owner_files(&artifacts_dir, "assistant-response");
+    assert_eq!(
+        files.len(),
+        1,
+        "one assistant-response artifact per final response"
+    );
     let content = std::fs::read_to_string(&files[0]).unwrap();
     assert_eq!(
         content.len(),

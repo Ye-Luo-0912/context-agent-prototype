@@ -28,6 +28,9 @@ pub(crate) struct ResidencyOutcome {
 /// attention after the model turn — and leave the semantic lifecycle
 /// entirely once their TTL/staleness passes. Everything else is ranked by
 /// the policy score and capped by the stale-task gate.
+/// 参数是正交的 residency 输入（item/config/trigger/clocks/focus/file-body），
+/// 不收成一个只会在这一处使用的包。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn next_residency(
     item: &ContextItem,
     config: &SimpleContextConfig,

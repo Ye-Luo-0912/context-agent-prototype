@@ -575,6 +575,7 @@ pub async fn run_fixture_with_model(
 /// inside one turn the TurnFrame carries the tool protocol, so every engine
 /// sees the same in-turn context. The fixture's hidden verification runs
 /// after the last turn.
+#[allow(clippy::too_many_arguments)]
 async fn run_fixture_with_engine(
     fixture: &workload::CodingFixture,
     workspace_root: &Path,
@@ -614,6 +615,7 @@ async fn run_fixture_with_engine(
     Ok(eval)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_suite_with_engine(
     task: &suite::SuiteTask,
     workspace_root: &Path,

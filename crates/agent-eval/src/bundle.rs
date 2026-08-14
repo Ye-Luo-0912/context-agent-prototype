@@ -95,6 +95,7 @@ pub struct CellSummary {
 
 /// 一次 cell 跑完（或中途失败）后写入证据包。失败也要落盘，否则超时
 /// 细胞从配对里消失，ITT 无法重建。
+#[allow(clippy::too_many_arguments)]
 pub fn write_cell(
     dir: &Path,
     fixture: &CodingFixture,
@@ -129,6 +130,7 @@ pub fn write_cell(
 }
 
 /// 套件 live 细胞：hidden 是可执行命令，不是烟雾 fixture 的文件体断言。
+#[allow(clippy::too_many_arguments)]
 pub fn write_suite_cell(
     dir: &Path,
     task: &crate::suite::SuiteTask,
@@ -174,6 +176,7 @@ pub fn write_suite_cell(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_cell_parts(
     dir: &Path,
     fixture_id: &str,
@@ -354,30 +357,41 @@ fn render_cell(dir: &Path) -> anyhow::Result<String> {
     if let Some(error) = &summary.error {
         out.push_str(&format!("           error={error}\n"));
     }
-    if parent.join("verify.json").is_file() {
-        if let Ok(text) = fs::read_to_string(parent.join("verify.json")) {
-            if let Ok(report) = serde_json::from_str::<HiddenReport>(&text) {
+    if parent.join("verify.json").is_file()
+        && let Ok(text) = fs::read_to_string(parent.join("verify.json"))
+        && let Ok(report) = serde_json::from_str::<HiddenReport>(&text)
+    {
+        out.push_str(&format!(
+            "           hidden kind={} passed={} replay_complete={} asserts={}/{}\n",
+            report.kind,
+            report.passed,
+            report.replay_complete,
+            report.assertions.iter().filter(|row| row.passed).count(),
+            report.assertions.len()
+        ));
+        match crate::workload::reverify_from_report(&report) {
+            Ok(replayed) if replayed != report.passed => {
                 out.push_str(&format!(
-                    "           hidden kind={} passed={} replay_complete={} asserts={}/{}\n",
-                    report.kind,
-                    report.passed,
-                    report.replay_complete,
-                    report.assertions.iter().filter(|row| row.passed).count(),
-                    report.assertions.len()
+                    "           hidden reverify mismatch stored={} replayed={replayed}\n",
+                    report.passed
                 ));
-                for row in &report.assertions {
-                    if !row.passed {
-                        out.push_str(&format!(
-                            "           hidden FAIL {} {} {:?}\n",
-                            row.path, row.pred, row.needles
-                        ));
-                    }
-                }
-                for row in &report.commands {
-                    if !row.passed {
-                        out.push_str(&format!("           hidden CMD FAIL {:?}\n", row.argv));
-                    }
-                }
+            }
+            Err(error) => {
+                out.push_str(&format!("           hidden reverify error={error}\n"));
+            }
+            _ => {}
+        }
+        for row in &report.assertions {
+            if !row.passed {
+                out.push_str(&format!(
+                    "           hidden FAIL {} {} {:?}\n",
+                    row.path, row.pred, row.needles
+                ));
+            }
+        }
+        for row in &report.commands {
+            if !row.passed {
+                out.push_str(&format!("           hidden CMD FAIL {:?}\n", row.argv));
             }
         }
     }
@@ -408,7 +422,7 @@ pub fn fixture_sha256(fixture: &CodingFixture) -> String {
     }
     hasher.update(fixture.expected_edit.as_bytes());
     crate::workload::hash_hidden(fixture, &mut hasher);
-    hex_encode(&hasher.finalize())
+    hex_encode(hasher.finalize())
 }
 
 pub fn suite_task_sha256(task: &crate::suite::SuiteTask) -> String {
@@ -434,7 +448,7 @@ pub fn suite_task_sha256(task: &crate::suite::SuiteTask) -> String {
         }
         hasher.update(b"\n");
     }
-    hex_encode(&hasher.finalize())
+    hex_encode(hasher.finalize())
 }
 
 /// 广播流里的 `ModelDelta` 不占新的 durable seq；检查时跳过它们。
@@ -489,7 +503,7 @@ fn hash_workspace(root: &Path) -> anyhow::Result<(String, Vec<String>)> {
         hasher.update(&bytes);
         hasher.update(b"\n");
     }
-    Ok((hex_encode(&hasher.finalize()), files))
+    Ok((hex_encode(hasher.finalize()), files))
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> anyhow::Result<()> {
@@ -599,7 +613,7 @@ fn git_dirty() -> Option<bool> {
 fn git_dirty_sha256() -> Option<String> {
     let bytes = git_porcelain()?;
     let digest = Sha256::digest(&bytes);
-    Some(hex_encode(&digest))
+    Some(hex_encode(digest))
 }
 
 #[cfg(test)]

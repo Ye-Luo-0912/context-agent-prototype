@@ -1363,12 +1363,12 @@ fn reconcile_recovered_operations(
             break;
         }
     }
-    if let Some(reconciler) = reconciler {
-        if let Err(error) = reconciler.recover_orphans() {
-            operations.require_recovery(format!(
-                "startup could not contain leftover process trees: {error}"
-            ));
-        }
+    if let Some(reconciler) = reconciler
+        && let Err(error) = reconciler.recover_orphans()
+    {
+        operations.require_recovery(format!(
+            "startup could not contain leftover process trees: {error}"
+        ));
     }
 }
 

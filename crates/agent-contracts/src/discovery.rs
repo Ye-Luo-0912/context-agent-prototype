@@ -453,9 +453,7 @@ impl ToolCatalogIndex {
         if !any_token {
             return None;
         }
-        let Some(set) = ids else {
-            return None;
-        };
+        let set = ids?;
         if set.is_empty() {
             return None;
         }

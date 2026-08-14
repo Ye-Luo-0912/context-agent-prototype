@@ -268,7 +268,7 @@ fn normalize_key(key: Option<&str>) -> AgentResult<Option<String>> {
             "remote idempotency key exceeds {MAX_IDEMPOTENCY_KEY_BYTES} bytes"
         )));
     }
-    if key.bytes().any(|byte| byte < 0x20 || byte > 0x7e) {
+    if key.bytes().any(|byte| !(0x20..=0x7e).contains(&byte)) {
         return Err(AgentError::InvalidRequest(
             "remote idempotency key must be printable ASCII".into(),
         ));
@@ -326,9 +326,9 @@ fn validate_fold(state: &RecoveryState, transition: &JournalTransition) -> Resul
             if let Some(key) = idempotency_key
                 && in_flight_key(state, key).is_some()
             {
-                return Err(format!(
-                    "remote idempotency key is already in flight; at-most-one commit refuses a second dispatch"
-                ));
+                return Err(
+                    "remote idempotency key is already in flight; at-most-one commit refuses a second dispatch".to_string(),
+                );
             }
             Ok(())
         }

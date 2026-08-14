@@ -106,7 +106,7 @@ pub(crate) fn latest_file_body_ids<'a>(
         }
     }
     let mut ranked: Vec<(u64, ContextItemId)> = latest.into_values().collect();
-    ranked.sort_by(|a, b| b.0.cmp(&a.0));
+    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     ranked
         .into_iter()
         .take(MAX_RECENT_FILE_BODIES)

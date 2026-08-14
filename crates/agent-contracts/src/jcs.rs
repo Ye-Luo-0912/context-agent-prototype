@@ -213,6 +213,9 @@ mod tests {
 
     #[test]
     fn rfc8785_sample_object_is_canonical() {
+        // RFC 8785 appendix sample: the extra digit is the spec's input, not
+        // a rounding we should "fix" in the fixture.
+        #[allow(clippy::excessive_precision)]
         let value = json!({
             "numbers": [333333333.33333329, 1E30, 4.50, 2e-3, 1e-27],
             "string": "€$\u{000F}\nA'B\"\\\\\"/",

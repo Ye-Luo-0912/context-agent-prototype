@@ -832,7 +832,9 @@ mod tests {
         assert!(pack.frozen());
         assert_eq!(pack.tasks.len(), 509, "{:?}", pack.tasks.len());
         assert!(pack.blockers.is_empty(), "{:?}", pack.blockers);
-        assert!(crate::analysis::SUITE_FROZEN);
+        const {
+            assert!(crate::analysis::SUITE_FROZEN);
+        }
         let rendered = render_suite(&pack);
         assert!(rendered.contains("frozen=true"));
         assert!(rendered.contains("n=509/300"));

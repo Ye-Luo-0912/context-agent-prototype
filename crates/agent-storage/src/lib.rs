@@ -233,10 +233,7 @@ fn load_or_create_authority_metadata(path: &Path) -> AgentResult<AuthorityJourna
     Ok(metadata)
 }
 
-fn persist_authority_metadata(
-    path: &Path,
-    metadata: &AuthorityJournalMetadata,
-) -> AgentResult<()> {
+fn persist_authority_metadata(path: &Path, metadata: &AuthorityJournalMetadata) -> AgentResult<()> {
     let payload = serde_json::to_vec(metadata)
         .map_err(|error| AgentError::Storage(format!("serialize authority metadata: {error}")))?;
     let stored = StoredAuthorityJournalMetadata {
@@ -377,10 +374,7 @@ impl OperationJournal for FileOperationJournal {
         transition: &OperationJournalTransition,
     ) -> AgentResult<OperationJournalRecord> {
         transition.validate().map_err(AgentError::InvalidRequest)?;
-        if matches!(
-            transition,
-            OperationJournalTransition::Compacted { .. }
-        ) {
+        if matches!(transition, OperationJournalTransition::Compacted { .. }) {
             return Err(AgentError::InvalidRequest(
                 "Compacted baseline can only be written by journal compaction".into(),
             ));
@@ -452,7 +446,12 @@ impl OperationJournal for FileOperationJournal {
             return Err(authority_marker_mismatch(expected, &writer)?);
         }
         if expected.generation != writer.metadata.generation {
-            if writer.metadata.ancestors.iter().any(|ancestor| ancestor == expected) {
+            if writer
+                .metadata
+                .ancestors
+                .iter()
+                .any(|ancestor| ancestor == expected)
+            {
                 return Ok(());
             }
             return Err(authority_marker_mismatch(expected, &writer)?);
@@ -486,11 +485,9 @@ fn compact_locked(
         return authority_checkpoint_marker(&writer.metadata, &writer.recovery);
     }
     let previous = authority_checkpoint_marker(&writer.metadata, &writer.recovery)?;
-    let next_generation = writer
-        .metadata
-        .generation
-        .checked_add(1)
-        .ok_or_else(|| AgentError::RecoveryRequired("authority journal generation exhausted".into()))?;
+    let next_generation = writer.metadata.generation.checked_add(1).ok_or_else(|| {
+        AgentError::RecoveryRequired("authority journal generation exhausted".into())
+    })?;
     let new_path = authority_wal_path(base_path, next_generation);
     let mut operations = writer.recovery.operations.clone();
     operations.sort_by_key(|snapshot| snapshot.identity.operation_id.to_string());
@@ -548,9 +545,9 @@ fn compact_locked(
     persist_authority_metadata(&base_path.with_extension("meta.json"), &new_metadata)?;
 
     let last_seq = records.last().map(|record| record.seq).unwrap_or(1);
-    let next_seq = last_seq
-        .checked_add(1)
-        .ok_or_else(|| AgentError::RecoveryRequired("operation journal sequence exhausted".into()))?;
+    let next_seq = last_seq.checked_add(1).ok_or_else(|| {
+        AgentError::RecoveryRequired("operation journal sequence exhausted".into())
+    })?;
     let mut recovery = writer.recovery.clone();
     recovery.last_seq = last_seq;
     recovery.compacted_from = Some(previous);
@@ -578,10 +575,7 @@ fn compact_locked(
     authority_checkpoint_marker(&writer.metadata, &writer.recovery)
 }
 
-fn write_operation_records(
-    file: &mut File,
-    records: &[OperationJournalRecord],
-) -> AgentResult<()> {
+fn write_operation_records(file: &mut File, records: &[OperationJournalRecord]) -> AgentResult<()> {
     let mut encoded_all = Vec::new();
     for record in records {
         let payload = serde_json::to_vec(record).map_err(|error| {
@@ -611,7 +605,9 @@ fn write_operation_records(
     file.write_all(&encoded_all)
         .and_then(|_| file.flush())
         .and_then(|_| file.sync_all())
-        .map_err(|error| AgentError::Storage(format!("persist compacted operation journal: {error}")))
+        .map_err(|error| {
+            AgentError::Storage(format!("persist compacted operation journal: {error}"))
+        })
 }
 
 fn ensure_operation_writer_healthy(writer: &OperationWriterState) -> AgentResult<()> {
@@ -965,7 +961,9 @@ fn fold_operation_record(
         }
         OperationJournalTransition::Compacted { previous } => {
             if recovery.last_seq != 0 || recovery.compacted_from.is_some() {
-                return Err("Compacted baseline must be the first record of a compacted WAL".into());
+                return Err(
+                    "Compacted baseline must be the first record of a compacted WAL".into(),
+                );
             }
             previous.validate()?;
             recovery.authority_epoch = previous.authority_epoch;

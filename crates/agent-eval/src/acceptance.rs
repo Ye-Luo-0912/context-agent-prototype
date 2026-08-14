@@ -38,7 +38,7 @@ pub fn ids_sha256(ids: &[String]) -> String {
         hasher.update(id.as_bytes());
         hasher.update(b"\n");
     }
-    hex_encode(&hasher.finalize())
+    hex_encode(hasher.finalize())
 }
 
 fn rank_key(id: &str) -> [u8; 32] {
@@ -83,10 +83,10 @@ pub fn select_acceptance_ids(pack: &SuitePack) -> Vec<String> {
     for id in pilot::FROZEN_PILOT_IDS {
         if seen.insert(*id) {
             selected.push((*id).to_string());
-            if let Some(task) = by_id.get(id) {
-                if let Some(left) = need.get_mut(task.size.as_str()) {
-                    *left = left.saturating_sub(1);
-                }
+            if let Some(task) = by_id.get(id)
+                && let Some(left) = need.get_mut(task.size.as_str())
+            {
+                *left = left.saturating_sub(1);
             }
         }
     }

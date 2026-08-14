@@ -446,7 +446,7 @@ async fn run_live_compare(
             )
             .await?;
             if repeats > 1 {
-                print!("fixture {} repeat {round}/{repeats}\n", fixture.id);
+                println!("fixture {} repeat {round}/{repeats}", fixture.id);
             }
             print!("{}", fixture_driver::render_live_comparison(&runs));
             print!(
@@ -534,7 +534,7 @@ async fn run_pilot_live(
             let runs =
                 fixture_driver::compare_suite_live(task, dir.path(), model.clone(), Some(&pair))
                     .await?;
-            print!("task {} repeat {round}/{repeats}\n", task.id);
+            println!("task {} repeat {round}/{repeats}", task.id);
             print!("{}", fixture_driver::render_live_comparison(&runs));
             print!(
                 "{}",

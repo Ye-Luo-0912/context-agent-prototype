@@ -173,10 +173,8 @@ impl ContextCatalog {
         if !needle.is_empty() {
             let text_ids = self.text_key_ids(needle);
             if text_ids.is_empty() {
-                if candidates.is_none() {
-                    // 无过滤、实体/标签键也未命中：摘要/uri/正文只能残差扫描。
-                    return None;
-                }
+                // 无过滤、实体/标签键也未命中：摘要/uri/正文只能残差扫描。
+                candidates.as_ref()?;
             } else {
                 intersect(&text_ids);
             }
@@ -301,6 +299,8 @@ impl ContextCatalog {
         );
     }
 
+    /// 各生命周期维度各自入索引，参数就是这些正交键，不是漏收成 struct。
+    #[allow(clippy::too_many_arguments)]
     fn index_keys<'a>(
         &mut self,
         id: ContextItemId,

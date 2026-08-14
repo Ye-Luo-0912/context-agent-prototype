@@ -36,7 +36,7 @@ impl ToolNameCodec {
         to_wire_tool_name(name)
     }
 
-    pub(crate) fn from_wire_name(&self, wire: &str) -> String {
+    pub(crate) fn decode_wire_name(&self, wire: &str) -> String {
         self.from_wire
             .get(wire)
             .cloned()
@@ -51,7 +51,7 @@ impl ToolNameCodec {
                 arguments_delta,
             } => ModelChunk::ToolCallDelta {
                 call_id,
-                name: name.map(|wire| self.from_wire_name(&wire)),
+                name: name.map(|wire| self.decode_wire_name(&wire)),
                 arguments_delta,
             },
             other => other,
@@ -62,7 +62,7 @@ impl ToolNameCodec {
         calls
             .into_iter()
             .map(|mut call| {
-                call.name = self.from_wire_name(&call.name);
+                call.name = self.decode_wire_name(&call.name);
                 call
             })
             .collect()
@@ -128,9 +128,9 @@ mod tests {
         let codec = ToolNameCodec::from_request(&request_with_tools(&["fs.list", "get_time"]))
             .expect("no collision");
         assert_eq!(codec.to_wire("fs.list"), "fs_list");
-        assert_eq!(codec.from_wire_name("fs_list"), "fs.list");
-        assert_eq!(codec.from_wire_name("get_time"), "get_time");
-        assert_eq!(codec.from_wire_name("hallucinated"), "hallucinated");
+        assert_eq!(codec.decode_wire_name("fs_list"), "fs.list");
+        assert_eq!(codec.decode_wire_name("get_time"), "get_time");
+        assert_eq!(codec.decode_wire_name("hallucinated"), "hallucinated");
     }
 
     #[test]
@@ -157,7 +157,7 @@ mod tests {
             cancel: CancellationToken::new(),
         };
         let codec = ToolNameCodec::from_request(&request).expect("no collision");
-        assert_eq!(codec.from_wire_name("edit_replace"), "edit.replace");
+        assert_eq!(codec.decode_wire_name("edit_replace"), "edit.replace");
     }
 
     #[test]

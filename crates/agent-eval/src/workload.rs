@@ -384,7 +384,7 @@ fn read_hidden_file(root: &Path, rel: &str) -> HiddenFileBody {
     let path = root.join(rel);
     match std::fs::read(&path) {
         Ok(bytes) => {
-            let digest = hex_encode(&Sha256::digest(&bytes));
+            let digest = hex_encode(Sha256::digest(&bytes));
             let truncated = bytes.len() > HIDDEN_BODY_CAP;
             let slice = if truncated {
                 &bytes[..HIDDEN_BODY_CAP]
@@ -403,7 +403,7 @@ fn read_hidden_file(root: &Path, rel: &str) -> HiddenFileBody {
         Err(_) => HiddenFileBody {
             path: rel.to_string(),
             exists: false,
-            sha256: hex_encode(&Sha256::digest([])),
+            sha256: hex_encode(Sha256::digest([])),
             bytes: 0,
             truncated: false,
             body: String::new(),

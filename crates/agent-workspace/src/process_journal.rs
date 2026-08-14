@@ -689,5 +689,6 @@ mod tests {
             Err(error) => panic!("recover_orphans must fail closed or succeed: {error}"),
         }
         let _ = child.kill();
+        let _ = child.wait();
     }
 }
