@@ -375,11 +375,11 @@ it to extensions:
    adapter) keep working unchanged.
 5. `diagnostics` — expose bounded observability.
 6. `search_external` / `inspect_external` / `fetch_external` — the
-   deterministic retrieval surface for externalized refs (default no-ops,
-   so engines without a store keep working). Search filters the indexed
-   dimensions of the external map (entity signature, kind, scope, task);
-   inspect returns one entry's metadata without a store read; fetch pulls
-   the full content back. See `docs/CONTEXT_LIFECYCLE.md` §9g.
+   deterministic retrieval surface (default no-ops, so engines without a
+   store keep working). Search and inspect cover the live catalog
+   (Resident/Warm heap projections plus Cold/External store descriptors)
+   on indexed dimensions (entity signature, kind, scope, task, label);
+   fetch pulls stored content only. See `docs/CONTEXT_LIFECYCLE.md` §9g.
 
 The API is asynchronous even though `context-simple` is in-process. This
 leaves room for a future ContextCore service adapter over local IPC/HTTP/gRPC
@@ -827,17 +827,22 @@ residual of a full request budget computed at the runtime top level
 (`agent-runtime::budget::ModelBudget`):
 
 ```text
-Provider Context Window (ModelCapabilities.context_window, falls back to
-                         the kernel's configured budget)
+Send window (ModelCapabilities.context_window, else the kernel pack budget)
         - Output Reserve        (max_output_tokens, or a default reserve)
+        = Input budget          (runtime final send guard)
+
+Pack window = min(kernel context_budget_tokens, send window)
+        - Output Reserve
         - System Policy         (the assembled system prompt)
         - Turn Frame            (wire-form estimate of the turn stack)
         - Active Tool Schemas   (wire-form estimate of the tool specs)
         = Context Frame Budget  (the only number the engine receives)
 ```
 
-The engine never sees the window, the output reserve or the tool schemas —
-it just knows it has N tokens for the working set. The current user input is
+The engine never sees the send window, the output reserve or the tool schemas —
+it just knows it has N tokens for the working set. A large declared provider
+window must not inflate C's working set; append-only A may ignore the pack
+query and grow until the send guard trims it. The current user input is
 charged inside the turn frame (it rides there), so the engine does not
 deduct it a second time; the focus frame stays engine-owned. Pinned items
 get selection priority (they go first) but not exemption: every selected
@@ -856,7 +861,7 @@ Two refinements since V1-M9 close the accounting gap:
   `CURRENT FOCUS` rendering overhead, which the engine never accounts),
   the runtime estimates the wire tokens and trims the context frame
   (largest unpinned item first) until the assembled request fits
-  `context_window - output_reserve` — the *input* budget. Rendering
+  `send_window - output_reserve` — the *input* budget. Rendering
   overhead may never eat into the space reserved for the answer. When the
   context frame is emptied and the fixed layers (system + turn + tools)
   still overshoot, the round planner omits eligible optional schemas from
@@ -1596,8 +1601,9 @@ not trait/vtable dispatch or small-object clones. The P0 items:
 - **External ContextMap is never fully cloned.** `materialize` surfaces a
   bounded view (`MAX_EXTERNAL_REFS = 32`, hot-entity/open-loop/recency
   ranking via quickselect); `search_external` truncates to the query limit
-  before cloning; `inspect_external` clones one entry. The full map stays
-  in the engine. This bounds copied/model-facing data, not CPU: ranking still
+  before cloning (Resident/Warm hits are heap projections, not store
+  clones); `inspect_external` returns one catalog descriptor. The full map
+  stays in the engine. This bounds copied/model-facing data, not CPU: ranking still
   scans and collects O(total refs) borrowed entries pending CTX-07.
 
 ## 9f. Consistency invariant test suite

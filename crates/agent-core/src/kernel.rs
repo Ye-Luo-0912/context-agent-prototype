@@ -7,11 +7,12 @@ use agent_contracts::{
     AgentError, AgentResult, ArgumentDigest, AuthorityLease, AuthorityRecoveryStatus,
     CONTEXT_SEARCH_MAX_LIMIT, CONTEXT_SEARCH_MAX_QUERY_CHARS, CancellationToken,
     ContextConsumptionAck, ContextEngine, ContextItemId, ContextMaintenanceTrigger, ContextQuery,
-    ContextSearchQuery, DiscoveryMiss, EffectDurability, EffectId, EffectReconciler,
-    EffectReconciliation, EngineQuery, OperationEffectContext, OperationId, OperationQueryResult,
-    OperationSnapshot, OperationState, OperationTerminal, OutputBroker, ResourceDescriptor, RunId,
-    RuntimeEvent, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOperationIdentity,
-    ToolOutcome, ToolOutput, ToolRisk, ToolSurfaceSnapshot, derive_effect_intent,
+    ContextResidency, ContextSearchQuery, DiscoveryMiss, EffectDurability, EffectId,
+    EffectReconciler, EffectReconciliation, EngineQuery, OperationEffectContext, OperationId,
+    OperationQueryResult, OperationSnapshot, OperationState, OperationTerminal, OutputBroker,
+    ResourceDescriptor, RunId, RuntimeEvent, TaskId, ToolCall, ToolDispatcher,
+    ToolExecutionRequest, ToolOperationIdentity, ToolOutcome, ToolOutput, ToolRisk,
+    ToolSurfaceSnapshot, derive_effect_intent,
 };
 
 use crate::authority::{
@@ -68,12 +69,7 @@ impl std::fmt::Debug for CoreAuthorityConfig {
 impl Default for CoreAuthorityConfig {
     fn default() -> Self {
         Self {
-            system_prompt: concat!(
-                "You are a focused coding agent. Work on the current task only. ",
-                "Treat SELECTED WORKING CONTEXT as a bounded cache, not a complete transcript. ",
-                "Use tools when needed. Do not assume omitted history is relevant."
-            )
-            .to_string(),
+            system_prompt: agent_contracts::DEFAULT_CODING_AGENT_SYSTEM_PROMPT.to_string(),
             context_budget_tokens: 24_000,
             max_tool_rounds: 16,
             output_broker: None,
@@ -523,9 +519,7 @@ impl CoreAuthority {
                 // 自由文本查询同样有硬上限：超长查询在到达引擎前按字符截断，
                 // 避免模型用巨型查询字符串冲刷检索路径。
                 let query: String = query.chars().take(CONTEXT_SEARCH_MAX_QUERY_CHARS).collect();
-                // 空结果需要区分"确实没有外部化证据"（无过滤）与"当前过滤条件下
-                // 未命中"（带过滤）：前者提示模型放弃检索，后者提示证据可能
-                // 存在于别的过滤条件下，值得换个条件重试。
+                // 空结果区分无过滤与带过滤，方便换条件；不在这里写工作集说明书。
                 let has_filter =
                     kind.is_some() || scope.is_some() || task_id.is_some() || label.is_some();
                 let search = ContextSearchQuery {
@@ -539,11 +533,11 @@ impl CoreAuthority {
                 match self.context.search_external(search).await {
                     Ok(hits) if hits.is_empty() => {
                         output.ok = true;
-                        output.summary = "no external refs match".into();
+                        output.summary = "no catalog items match".into();
                         output.model_content = if has_filter {
-                            "context.search: nothing matches within the requested filter — evidence may exist under a different filter.".into()
+                            "context.search: nothing matches within the requested filter.".into()
                         } else {
-                            "context.search: no externalized items match the query.".into()
+                            "context.search: no catalog items match.".into()
                         };
                         output.metadata = serde_json::json!({
                             "op": "search",
@@ -553,15 +547,14 @@ impl CoreAuthority {
                     }
                     Ok(hits) => {
                         output.ok = true;
-                        output.summary = format!("{} external ref(s) match", hits.len());
-                        // 每行命中都带上来源权威（source）：检索结果让模型
-                        // 直接看到条目来自哪里（工具/用户/派生等），None 显示
-                        // "-" 与 task 占位风格一致；这是权威校验的可观察基础。
+                        output.summary = format!("{} catalog hit(s)", hits.len());
+                        // 命中行只报事实：source / residency。下一步由 residency
+                        // 自己表达，不在工具输出里写操作说明书。
                         output.model_content = hits
                             .iter()
                             .map(|entry| {
                                 format!(
-                                    "{} | kind={:?} scope={:?} task={} source={} | {}\n  tags: {}\n  entities: {}",
+                                    "{} | kind={:?} scope={:?} task={} source={} residency={:?} | {}\n  tags: {}\n  entities: {}",
                                     entry.context_ref.uri,
                                     entry.kind,
                                     entry.scope,
@@ -573,6 +566,7 @@ impl CoreAuthority {
                                         .source
                                         .as_deref()
                                         .unwrap_or("-"),
+                                    entry.residency,
                                     entry.context_ref.summary,
                                     if entry.tags.is_empty() {
                                         "-".to_string()
@@ -650,13 +644,13 @@ impl CoreAuthority {
                     Ok(None) => {
                         let miss = context_inspect_miss(self.context.as_ref(), item_id).await;
                         output.ok = true;
-                        output.summary = "no such external ref".into();
+                        output.summary = "no such catalog item".into();
                         output.model_content = match &miss {
                             DiscoveryMiss::EvidenceAbsent { reason } => format!(
                                 "context.inspect: item {item_id} is not current evidence ({reason})."
                             ),
                             _ => {
-                                format!("context.inspect: no externalized item with id {item_id}.")
+                                format!("context.inspect: no catalog item with id {item_id}.")
                             }
                         };
                         output.metadata = miss.to_metadata();
@@ -689,18 +683,37 @@ impl CoreAuthority {
                         );
                     }
                     Ok(None) => {
-                        let miss = context_inspect_miss(self.context.as_ref(), item_id).await;
-                        output.ok = true;
-                        output.summary = "no such external ref".into();
-                        output.model_content = match &miss {
-                            DiscoveryMiss::EvidenceAbsent { reason } => format!(
-                                "context.fetch: item {item_id} is not current evidence ({reason})."
-                            ),
-                            _ => format!(
-                                "context.fetch: no externalized item with id {item_id} (it may have been deleted by storage GC)."
-                            ),
-                        };
-                        output.metadata = miss.to_metadata();
+                        if let Ok(Some(entry)) = self.context.inspect_external(item_id).await
+                            && matches!(
+                                entry.residency,
+                                ContextResidency::Resident | ContextResidency::Warm
+                            )
+                        {
+                            output.ok = true;
+                            output.summary = "item already in catalog".into();
+                            output.model_content = format!(
+                                "context.fetch: item {item_id} is {:?}; body is already in the working set.",
+                                entry.residency
+                            );
+                            output.metadata = serde_json::json!({
+                                "op": "fetch",
+                                "kind": "context",
+                                "descriptor": ResourceDescriptor::from_context(&entry),
+                            });
+                        } else {
+                            let miss = context_inspect_miss(self.context.as_ref(), item_id).await;
+                            output.ok = true;
+                            output.summary = "no such external ref".into();
+                            output.model_content = match &miss {
+                                DiscoveryMiss::EvidenceAbsent { reason } => format!(
+                                    "context.fetch: item {item_id} is not current evidence ({reason})."
+                                ),
+                                _ => format!(
+                                    "context.fetch: no stored item with id {item_id} (it may have been deleted by storage GC)."
+                                ),
+                            };
+                            output.metadata = miss.to_metadata();
+                        }
                     }
                     Err(error) => {
                         output.ok = false;
@@ -2220,8 +2233,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_search_distinguishes_no_evidence_from_filter_miss() {
-        // 无过滤的空结果说明确实没有外部化证据；带过滤的空结果提示
-        // 证据可能存在于别的过滤条件下——模型据此决定放弃还是换过滤重试。
+        // 无过滤与带过滤的空结果文案不同，方便换条件，不写工作集说明书。
         let engine = Arc::new(RecordingEngine {
             searched_limits: Default::default(),
             searched_queries: Default::default(),
@@ -2269,10 +2281,8 @@ mod tests {
             )
             .await;
         assert!(
-            no_filter
-                .model_content
-                .contains("no externalized items match"),
-            "no filter must report that there is genuinely no externalized evidence"
+            no_filter.model_content.contains("no catalog items match"),
+            "no filter must report that there is genuinely no catalog evidence"
         );
         let filtered = kernel
             .resolve_engine_query(
@@ -2288,8 +2298,9 @@ mod tests {
             )
             .await;
         assert!(
-            filtered.model_content.contains("different filter"),
-            "a filter miss must hint that evidence may exist under another filter"
+            filtered.model_content.contains("requested filter"),
+            "a filter miss must name the filter, not absent evidence: {}",
+            filtered.model_content
         );
     }
 
@@ -2348,6 +2359,16 @@ mod tests {
         assert!(
             output.model_content.contains("source=tool-capture"),
             "a hit with a known source must render it: {}",
+            output.model_content
+        );
+        assert!(
+            output.model_content.contains("residency="),
+            "hits must name residency as data: {}",
+            output.model_content
+        );
+        assert!(
+            !output.model_content.contains("next:"),
+            "search hits must not include an instruction line: {}",
             output.model_content
         );
         assert!(
@@ -2572,6 +2593,31 @@ mod tests {
             output.model_content
         );
         assert!(output.model_content.contains("stored body"));
+    }
+
+    #[tokio::test]
+    async fn fetch_of_resident_explains_already_in_catalog() {
+        let mut entry = external_entry(None);
+        entry.residency = ContextResidency::Resident;
+        let kernel = query_kernel(Arc::new(RecordingEngine {
+            inspect_external_entry: std::sync::Mutex::new(Some(entry)),
+            ..Default::default()
+        }));
+        let output = kernel
+            .resolve_engine_query(
+                placeholder_output(),
+                EngineQuery::FetchExternal {
+                    item_id: ContextItemId::new(),
+                },
+            )
+            .await;
+        assert!(output.ok);
+        assert_eq!(output.summary, "item already in catalog");
+        assert!(
+            output.model_content.contains("already in the working set"),
+            "a Resident fetch names the location, it does not lecture: {}",
+            output.model_content
+        );
     }
 
     // --- ACI v2 shadow mode (IntentShadowGate) ---

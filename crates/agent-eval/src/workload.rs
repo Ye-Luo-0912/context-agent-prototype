@@ -4,10 +4,11 @@
 //! workload fixtures each arm must solve. The fixtures are the *data*
 //! half of M15: deterministic seed workspaces, model-visible task
 //! descriptions (plus optional extra live turns), and hidden verification
-//! (pure file-content assertions, so they run identically on every
-//! platform without an interpreter). The live A/B/C/D run against a real
-//! model is the M15 acceptance; this module makes the inputs well-formed
-//! and self-checked first.
+//! hidden verification (pure file-content assertions, so they run identically
+//! on every platform without an interpreter and without executing student
+//! code). Executable hidden build/tests live on the suite pack, not here:
+//! binding smoke fixtures to `python`/`cargo` would make CI fail-closed on
+//! a missing interpreter and would exec model-written files on the host.
 
 use std::collections::BTreeMap;
 use std::path::Path;

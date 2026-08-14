@@ -173,32 +173,45 @@ fn bump_access(state: &mut State, signal: AccessSignal) {
 }
 
 fn apply_search_hit(state: &mut State, item_id: ContextItemId, now_tick: u64, gc_epoch: u64) {
-    let stamped = {
-        let Some(entry) = state.external.get_mut(item_id) else {
-            return;
+    if state.external.get(item_id).is_some() {
+        let stamped = {
+            let Some(entry) = state.external.get_mut(item_id) else {
+                return;
+            };
+            if !externally_retrievable(entry) {
+                return;
+            }
+            if entry.last_access_signal.rank() > AccessSignal::SearchHit.rank() {
+                return;
+            }
+            // 同一 event_seq 内 search 已写过：冷却，避免同一次检索循环连刷。
+            if entry.last_access_signal == AccessSignal::SearchHit
+                && entry.last_access_tick == now_tick
+            {
+                return;
+            }
+            entry.last_access_tick = now_tick;
+            entry.last_access_signal = AccessSignal::SearchHit;
+            if entry.search_reinforce_count < SEARCH_REINFORCE_SATURATION {
+                entry.last_access_gc_epoch = Some(gc_epoch);
+                entry.search_reinforce_count = entry.search_reinforce_count.saturating_add(1);
+            }
+            true
         };
-        if !externally_retrievable(entry) {
-            return;
+        if stamped {
+            bump_access(state, AccessSignal::SearchHit);
         }
-        if entry.last_access_signal.rank() > AccessSignal::SearchHit.rank() {
-            return;
-        }
-        // 同一 event_seq 内 search 已写过：冷却，避免同一次检索循环连刷。
-        if entry.last_access_signal == AccessSignal::SearchHit && entry.last_access_tick == now_tick
-        {
-            return;
-        }
-        entry.last_access_tick = now_tick;
-        entry.last_access_signal = AccessSignal::SearchHit;
-        if entry.search_reinforce_count < SEARCH_REINFORCE_SATURATION {
-            entry.last_access_gc_epoch = Some(gc_epoch);
-            entry.search_reinforce_count = entry.search_reinforce_count.saturating_add(1);
-        }
-        true
-    };
-    if stamped {
-        bump_access(state, AccessSignal::SearchHit);
+        return;
     }
+    // Resident/Warm：最弱戳，不碰 Cold 老化世代。
+    stamp(
+        state,
+        item_id,
+        AccessSignal::SearchHit,
+        now_tick,
+        None,
+        None,
+    );
 }
 
 fn query_fingerprint(query: &ContextSearchQuery) -> u64 {

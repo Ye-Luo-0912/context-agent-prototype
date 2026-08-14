@@ -5,18 +5,19 @@
 //! older than the newest `keep_most_recent_tokens` verbatim window — are
 //! folded into a single rolling summary marker. This models the classic
 //! "summarize when the window fills" baseline. The marker defaults to a
-//! fixed placeholder (the metric of interest is token growth, not summary
-//! quality), but a `Summarizer` can be injected (e.g. a scripted stand-in
-//! in the eval harness) so the baseline's summary cost tracks the actual
-//! folded content instead of a constant.
+//! bounded placeholder; inject a [`BoundedCompactor`] so live B uses the
+//! same model-backed operator as C's task distillation. CI keeps a
+//! scripted digest. Fold work is taken under the mutex, then the
+//! compactor runs without holding it.
 
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_contracts::{
-    AgentError, AgentResult, AttentionState, ContextDiagnostics, ContextEngine, ContextIngress,
+    AgentError, AgentResult, AttentionState, BoundedCompactor, COMPACTION_SOURCE_CHARS,
+    CompactionOutput, CompactionRequest, ContextDiagnostics, ContextEngine, ContextIngress,
     ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextScope,
     ContextSelection, ContextStateTransition, MaterializedContext, ScopeId, ScopeKind,
-    ScoreBreakdown,
+    ScoreBreakdown, bound_compaction_output, bound_compaction_source,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -44,19 +45,8 @@ impl Default for RollingConfig {
     }
 }
 
-/// How many chars of folded content the engine hands to a summarizer —
-/// the summary input stays bounded no matter how much was folded.
-pub const SUMMARIZER_PRIOR_CAP: usize = 2_000;
-
-/// Turns the folded records into the rolling summary marker. The baseline
-/// ships without one (a fixed placeholder); the eval harness injects a
-/// deterministic stand-in so the summary cost reflects the folded content.
-pub trait Summarizer: Send + Sync {
-    /// Produce the summary text. `folded` is how many records were
-    /// collapsed into the marker; `prior` is a bounded digest of what was
-    /// folded (at most `SUMMARIZER_PRIOR_CAP` chars).
-    fn summarize(&self, folded: usize, prior: &str) -> String;
-}
+/// 兼容旧名：折叠正文交给压缩器之前的字符上限。
+pub const SUMMARIZER_PRIOR_CAP: usize = COMPACTION_SOURCE_CHARS;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct RollingState {
@@ -69,6 +59,10 @@ struct RollingState {
     turn: u64,
     #[serde(default)]
     materialization_revision: u64,
+    #[serde(default)]
+    compaction_input_tokens: u64,
+    #[serde(default)]
+    compaction_output_tokens: u64,
 }
 
 impl RollingState {
@@ -86,7 +80,11 @@ impl RollingState {
     }
 
     fn diagnostics(&self) -> ContextDiagnostics {
-        active_diagnostics(&self.records, self.summary.as_ref(), self.collapsed)
+        let mut diagnostics =
+            active_diagnostics(&self.records, self.summary.as_ref(), self.collapsed);
+        diagnostics.compaction_input_tokens = self.compaction_input_tokens;
+        diagnostics.compaction_output_tokens = self.compaction_output_tokens;
+        diagnostics
     }
 }
 
@@ -95,9 +93,8 @@ impl RollingState {
 pub struct RollingSummaryEngine {
     state: StdMutex<RollingState>,
     config: RollingConfig,
-    /// When set, each collapse calls the summarizer on a bounded digest of
-    /// the folded records instead of emitting the fixed placeholder marker.
-    summarizer: Option<Arc<dyn Summarizer>>,
+    /// 注入后每次折叠走有界压缩器；缺省仍用固定占位标记。
+    compactor: Option<Arc<dyn BoundedCompactor>>,
 }
 
 impl RollingSummaryEngine {
@@ -109,17 +106,105 @@ impl RollingSummaryEngine {
         Self {
             state: StdMutex::new(RollingState::default()),
             config,
-            summarizer: None,
+            compactor: None,
         }
     }
 
-    /// Inject a summarizer that turns the folded records into the rolling
-    /// summary marker (e.g. a scripted stand-in in the eval harness). The
-    /// default keeps the fixed placeholder.
-    pub fn with_summarizer(mut self, summarizer: Arc<dyn Summarizer>) -> Self {
-        self.summarizer = Some(summarizer);
+    /// B 与 C 共用的有界压缩器。脚本化实现留给 CI；live 注入模型实现。
+    pub fn with_compactor(mut self, compactor: Arc<dyn BoundedCompactor>) -> Self {
+        self.compactor = Some(compactor);
         self
     }
+
+    fn take_fold_job(&self) -> Option<FoldJob> {
+        let mut state = self.state.lock().expect("rolling state poisoned");
+        if state.total_tokens() <= self.config.summary_threshold_tokens {
+            return None;
+        }
+        let mut kept_tokens = 0usize;
+        let mut fold_candidates = 0usize;
+        for record in state.records.iter().rev() {
+            if kept_tokens >= self.config.keep_most_recent_tokens {
+                fold_candidates += 1;
+            }
+            kept_tokens += approx_tokens(&record.content);
+        }
+        if fold_candidates == 0 {
+            return None;
+        }
+        let mut prior = String::new();
+        let mut transitions = Vec::new();
+        for _ in 0..fold_candidates {
+            let record = state.records.remove(0);
+            if prior.chars().count() < SUMMARIZER_PRIOR_CAP {
+                prior.push_str(&record.content);
+                prior.push('\n');
+            }
+            state.collapsed += 1;
+            transitions.push(ContextStateTransition {
+                item_id: record.id,
+                kind: record.kind,
+                scope: record.scope,
+                from: AttentionState::Active,
+                to: AttentionState::Archived,
+                turn: state.turn,
+                reason: "collapsed into rolling summary (baseline B)".into(),
+            });
+        }
+        let summary_id = state
+            .summary
+            .as_ref()
+            .map(|summary| summary.id)
+            .unwrap_or_default();
+        Some(FoldJob {
+            prior: bound_compaction_source(&prior),
+            collapsed: state.collapsed,
+            summary_id,
+            transitions,
+        })
+    }
+
+    async fn compact_fold(&self, job: &FoldJob) -> CompactionOutput {
+        let fallback = fallback_marker(job.collapsed, &job.prior);
+        let Some(compactor) = &self.compactor else {
+            return CompactionOutput {
+                text: fallback,
+                ..CompactionOutput::default()
+            };
+        };
+        match compactor
+            .compact(CompactionRequest {
+                folded_items: job.collapsed,
+                source: job.prior.clone(),
+            })
+            .await
+        {
+            Ok(mut output) => {
+                output.text = bound_compaction_output(&output.text);
+                if output.text.is_empty() {
+                    output.text = fallback;
+                }
+                output
+            }
+            Err(_) => CompactionOutput {
+                text: fallback,
+                ..CompactionOutput::default()
+            },
+        }
+    }
+}
+
+struct FoldJob {
+    prior: String,
+    collapsed: usize,
+    summary_id: agent_contracts::ContextItemId,
+    transitions: Vec<ContextStateTransition>,
+}
+
+fn fallback_marker(collapsed: usize, prior: &str) -> String {
+    bound_compaction_output(&format!(
+        "Earlier context: {collapsed} prior messages collapsed. {prior}"
+    ))
 }
 
 impl Default for RollingSummaryEngine {
@@ -144,77 +229,47 @@ impl ContextEngine for RollingSummaryEngine {
         &self,
         _trigger: ContextMaintenanceTrigger,
     ) -> AgentResult<ContextMaintenanceReport> {
-        let mut state = self.state.lock().expect("rolling state poisoned");
+        // 折叠从锁里取出源文本后必须放开锁再调压缩器：模型调用不能占着
+        // StdMutex。记录已在取 job 时移出 working set；压缩失败则写回
+        // 有界占位，B 仍然完成折叠而不是卡死回合。
         let mut transitions: Vec<ContextStateTransition> = Vec::new();
-        while state.total_tokens() > self.config.summary_threshold_tokens {
-            // How many oldest records fall outside the newest verbatim
-            // window (measured in tokens, newest first)?
-            let mut kept_tokens = 0usize;
-            let mut fold_candidates = 0usize;
-            for record in state.records.iter().rev() {
-                if kept_tokens >= self.config.keep_most_recent_tokens {
-                    fold_candidates += 1;
-                }
-                kept_tokens += approx_tokens(&record.content);
-            }
-            if fold_candidates == 0 {
-                // Even the verbatim window alone is over the threshold; the
-                // summary approach cannot help further. Stop folding.
+        let mut pass_in = 0u64;
+        let mut pass_out = 0u64;
+        loop {
+            let Some(job) = self.take_fold_job() else {
                 break;
-            }
-
-            // Fold the oldest records, collecting a bounded digest of what
-            // was folded for the summarizer (the summary input must not
-            // grow with the folded amount).
-            let mut prior = String::new();
-            let mut prior_chars = 0usize;
-            for _ in 0..fold_candidates {
-                let record = state.records.remove(0);
-                if prior_chars < SUMMARIZER_PRIOR_CAP {
-                    let remaining = SUMMARIZER_PRIOR_CAP - prior_chars;
-                    let part: String = record.content.chars().take(remaining).collect();
-                    prior.push_str(&part);
-                    prior.push('\n');
-                    prior_chars += part.chars().count() + 1;
-                }
-                state.collapsed += 1;
-                transitions.push(ContextStateTransition {
-                    item_id: record.id,
-                    kind: record.kind,
-                    scope: record.scope,
-                    from: AttentionState::Active,
-                    to: AttentionState::Archived,
-                    turn: state.turn,
-                    reason: "collapsed into rolling summary (baseline B)".into(),
+            };
+            let compacted = self.compact_fold(&job).await;
+            pass_in = pass_in.saturating_add(compacted.input_tokens);
+            pass_out = pass_out.saturating_add(compacted.output_tokens);
+            {
+                let mut state = self.state.lock().expect("rolling state poisoned");
+                state.compaction_input_tokens = state
+                    .compaction_input_tokens
+                    .saturating_add(compacted.input_tokens);
+                state.compaction_output_tokens = state
+                    .compaction_output_tokens
+                    .saturating_add(compacted.output_tokens);
+                state.summary = Some(Record {
+                    id: job.summary_id,
+                    kind: ContextKind::Summary,
+                    scope: ContextScope::Task,
+                    content: compacted.text,
+                    created_turn: 0,
+                    source: Some("rolling summary".into()),
                 });
             }
-            let summary_id = state
-                .summary
-                .as_ref()
-                .map(|summary| summary.id)
-                .unwrap_or_default();
-            let content = match &self.summarizer {
-                Some(summarizer) => summarizer.summarize(state.collapsed, &prior),
-                None => format!(
-                    "Earlier context: {} prior messages collapsed (goals, decisions, tool results). The work below is current.",
-                    state.collapsed
-                ),
-            };
-            state.summary = Some(Record {
-                id: summary_id,
-                kind: ContextKind::Summary,
-                scope: ContextScope::Task,
-                content,
-                created_turn: 0,
-                source: Some("rolling summary".into()),
-            });
+            transitions.extend(job.transitions);
         }
 
+        let state = self.state.lock().expect("rolling state poisoned");
         Ok(ContextMaintenanceReport {
             archived: transitions.len(),
             turn: state.turn,
             transitions,
             diagnostics: state.diagnostics(),
+            compaction_input_tokens: pass_in,
+            compaction_output_tokens: pass_out,
             ..ContextMaintenanceReport::default()
         })
     }

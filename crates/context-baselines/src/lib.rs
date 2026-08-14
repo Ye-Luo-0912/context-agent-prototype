@@ -15,14 +15,14 @@ mod rolling;
 mod shared;
 
 pub use append::AppendOnlyEngine;
-pub use rolling::{RollingConfig, RollingSummaryEngine, SUMMARIZER_PRIOR_CAP, Summarizer};
+pub use rolling::{RollingConfig, RollingSummaryEngine, SUMMARIZER_PRIOR_CAP};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_contracts::{
-        ContextEngine, ContextHints, ContextIngress, ContextMaintenanceTrigger, ContextQuery,
-        MaterializedContext, ToolOutput,
+        BoundedCompactor, CompactionOutput, CompactionRequest, ContextEngine, ContextHints,
+        ContextIngress, ContextMaintenanceTrigger, ContextQuery, MaterializedContext, ToolOutput,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -146,13 +146,23 @@ mod tests {
         );
     }
 
-    /// A summarizer that embeds the folded count and the digest, so the
-    /// marker observably depends on the folded content.
-    struct EchoSummarizer;
+    /// 把折叠次数和 digest 写进标记，证明压缩器看到了被折叠正文。
+    struct EchoCompactor;
 
-    impl Summarizer for EchoSummarizer {
-        fn summarize(&self, folded: usize, prior: &str) -> String {
-            format!("[rolled up {folded} earlier messages; digest {prior}]")
+    #[async_trait::async_trait]
+    impl BoundedCompactor for EchoCompactor {
+        async fn compact(
+            &self,
+            request: CompactionRequest,
+        ) -> agent_contracts::AgentResult<CompactionOutput> {
+            Ok(CompactionOutput {
+                text: format!(
+                    "[rolled up {} earlier messages; digest {}]",
+                    request.folded_items, request.source
+                ),
+                input_tokens: 4,
+                output_tokens: 2,
+            })
         }
     }
 
@@ -162,7 +172,7 @@ mod tests {
             summary_threshold_tokens: 60,
             keep_most_recent_tokens: 20,
         })
-        .with_summarizer(Arc::new(EchoSummarizer));
+        .with_compactor(Arc::new(EchoCompactor));
         for turn in 0..20 {
             run_turn(&engine, &format!("turn {turn}"), 1).await;
         }
@@ -187,6 +197,62 @@ mod tests {
         assert!(
             summary.content.contains("digest "),
             "the marker must reflect the folded content: {}",
+            summary.content
+        );
+        assert!(
+            materialized.diagnostics.compaction_input_tokens >= 4,
+            "compactor usage must accumulate on diagnostics, got in={}",
+            materialized.diagnostics.compaction_input_tokens
+        );
+        assert!(
+            materialized.diagnostics.compaction_output_tokens >= 2,
+            "compactor usage must accumulate on diagnostics, got out={}",
+            materialized.diagnostics.compaction_output_tokens
+        );
+    }
+
+    struct EmptyCompactor;
+
+    #[async_trait::async_trait]
+    impl BoundedCompactor for EmptyCompactor {
+        async fn compact(
+            &self,
+            _request: CompactionRequest,
+        ) -> agent_contracts::AgentResult<CompactionOutput> {
+            Ok(CompactionOutput {
+                text: String::new(),
+                input_tokens: 1,
+                output_tokens: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_compactor_output_falls_back_to_a_bounded_marker() {
+        let engine = RollingSummaryEngine::with_config(RollingConfig {
+            summary_threshold_tokens: 60,
+            keep_most_recent_tokens: 20,
+        })
+        .with_compactor(Arc::new(EmptyCompactor));
+        for turn in 0..20 {
+            run_turn(&engine, &format!("turn {turn}"), 1).await;
+        }
+        let materialized = engine
+            .materialize(ContextQuery {
+                current_input: "next".into(),
+                budget_tokens: 100_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        let summary = materialized
+            .items
+            .iter()
+            .find(|item| item.kind == agent_contracts::ContextKind::Summary)
+            .expect("collapse must leave a summary marker");
+        assert!(
+            summary.content.contains("Earlier context:"),
+            "empty compact output must fall back, got: {}",
             summary.content
         );
     }

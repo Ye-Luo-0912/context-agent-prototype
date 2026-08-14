@@ -112,6 +112,9 @@ pub struct RunMetrics {
     pub access_fetches: u64,
     pub access_admits: u64,
     pub access_consumption_acks: u64,
+    /// 有界压缩器累计 provider 输入（diagnostics 快照，B 折叠 / C 蒸馏）。
+    pub compaction_input_tokens: u64,
+    pub compaction_output_tokens: u64,
 }
 
 /// Aggregate one run's envelopes. The caller filters to a single run.
@@ -339,6 +342,8 @@ fn snapshot_access(metrics: &mut RunMetrics, diagnostics: &agent_contracts::Cont
     metrics.access_fetches = diagnostics.access_fetches;
     metrics.access_admits = diagnostics.access_admits;
     metrics.access_consumption_acks = diagnostics.access_consumption_acks;
+    metrics.compaction_input_tokens = diagnostics.compaction_input_tokens;
+    metrics.compaction_output_tokens = diagnostics.compaction_output_tokens;
 }
 
 /// The nearest-rank percentile of a sorted sample: index
@@ -363,6 +368,7 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          retrieval_latency: p50={}ms p95={}ms inspect={} fetch={} admit={}\n\
          recovery: forgotten={} recovered={}\n\
          access: search_hits={} inspects={} fetches={} admits={} acks={}\n\
+         compaction: in={} out={}\n\
          behavior: tool_calls={} failed_outputs={} spills={} output_chars={} repeated_fs_reads={}\n",
         metrics.model_input_tokens,
         metrics.model_output_tokens,
@@ -407,6 +413,8 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.access_fetches,
         metrics.access_admits,
         metrics.access_consumption_acks,
+        metrics.compaction_input_tokens,
+        metrics.compaction_output_tokens,
         metrics.tool_calls,
         metrics.failed_tool_outputs,
         metrics.artifact_spills,
@@ -541,6 +549,7 @@ mod tests {
                     turn: 1,
                     transitions: vec![transition(), transition()],
                     diagnostics: Default::default(),
+                    ..ContextMaintenanceReport::default()
                 },
             },
         ));

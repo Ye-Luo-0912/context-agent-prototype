@@ -106,14 +106,9 @@ impl Tool for ContextManageTool {
         ToolSpec {
             name: CONTEXT_MANAGE.into(),
             description: concat!(
-                "One entry point for runtime context control and the externalized-ref retrieval loop. ",
-                "Directive ops (gc_hint/tag/lease/collect) ask the runtime to change context state; ",
-                "admit re-enters an externalized ref into the working set under its original id ",
-                "(one lifecycle transition, identity preserved); derive persists a fact as a new ",
-                "item with a DerivedFrom link to the ref. Query ops (search/inspect/fetch) read ",
-                "externalized refs — search lists refs matching an entity/kind/scope/task/label query, ",
-                "inspect shows one ref's metadata, fetch pulls its full content back on demand. ",
-                "Item ids come from the materialized context frame."
+                "Runtime context control and catalog retrieval. ",
+                "Directive ops: gc_hint, tag, lease, collect, admit, derive. ",
+                "Query ops: search, inspect, fetch. Item ids come from the working-set frame or search hits."
             )
             .to_string(),
             input_schema: json!({
@@ -130,7 +125,7 @@ impl Tool for ContextManageTool {
                     "turns": {"type": "integer", "minimum": 1, "description": "lease: how many turns the item stays protected"},
                     "reason": {"type": "string", "description": "admit: why this ref is being pulled back into the working set"},
                     "fact": {"type": "string", "description": "derive: the fact to persist as a new derived item"},
-                    "query": {"type": "string", "description": "search: free text matched against entity signatures and summaries"},
+                    "query": {"type": "string", "description": "search: free text across the catalog"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 64, "description": "search: max refs to return (default 16)"},
                     "kind": {"type": "string", "description": "search: optional ContextKind filter"},
                     "scope": {"type": "string", "description": "search: optional ContextScope filter"},

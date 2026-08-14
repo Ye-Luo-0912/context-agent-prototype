@@ -1,12 +1,15 @@
 use agent_contracts::{
-    AgentError, AgentResult, ContextAction, ContextConsumptionAck, ContextDiagnostics,
-    ContextEngine, ContextGcReport, ContextIngress, ContextItem, ContextItemId, ContextItemSummary,
-    ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
-    ContextRetention, ContextScope, ContextStateTransition, CoreLabel, FocusState, Label,
-    MaterializedContext, ScopeId, ScopeKind, ScopeState, StoreReconcileReport,
+    AgentError, AgentResult, BoundedCompactor, CompactionOutput, CompactionRequest, ContextAction,
+    ContextConsumptionAck, ContextDiagnostics, ContextEngine, ContextGcReport, ContextIngress,
+    ContextItem, ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
+    ContextMaintenanceTrigger, ContextQuery, ContextRetention, ContextScope,
+    ContextStateTransition, CoreLabel, DependencyEdge, DependencyKind, FocusState, Label,
+    MaterializedContext, ScopeId, ScopeKind, ScopeState, StoreReconcileReport, TaskId,
+    bound_compaction_output, bound_compaction_source,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::checkpoint;
@@ -284,6 +287,11 @@ pub(crate) struct State {
     pub(crate) access_admits: u64,
     #[serde(default)]
     pub(crate) access_consumption_acks: u64,
+    /// 引擎自有蒸馏（任务完成）累计的压缩器花费。
+    #[serde(default)]
+    pub(crate) compaction_input_tokens: u64,
+    #[serde(default)]
+    pub(crate) compaction_output_tokens: u64,
     /// Directives counted against the per-turn admit cap. Reset by the
     /// next user message (turn boundary); a turn whose admits are refused
     /// keeps the count so the model learns the cap from refusals.
@@ -362,6 +370,9 @@ pub struct SimpleContextEngine {
     /// maintain, materialize, ...) are atomic under the state lock alone
     /// and never take the gate — lock order is always gate, then state.
     pub(crate) op_gate: Mutex<()>,
+    /// 与 B 共用的有界压缩器。缺省为 None：任务摘要仍用 runtime 给的原文。
+    /// 注入后，任务完成会蒸馏成带 `DerivedFrom` 的派生摘要，原文条目保留。
+    compactor: Option<Arc<dyn BoundedCompactor>>,
 }
 
 impl SimpleContextEngine {
@@ -374,6 +385,41 @@ impl SimpleContextEngine {
             config,
             state: Mutex::new(state),
             op_gate: Mutex::new(()),
+            compactor: None,
+        }
+    }
+
+    pub fn with_compactor(mut self, compactor: Arc<dyn BoundedCompactor>) -> Self {
+        self.compactor = Some(compactor);
+        self
+    }
+
+    async fn run_task_distill(&self, job: &TaskDistillJob) -> CompactionOutput {
+        let fallback = bound_compaction_output(&job.summary);
+        let Some(compactor) = &self.compactor else {
+            return CompactionOutput {
+                text: fallback,
+                ..CompactionOutput::default()
+            };
+        };
+        match compactor
+            .compact(CompactionRequest {
+                folded_items: job.source_ids.len(),
+                source: job.source.clone(),
+            })
+            .await
+        {
+            Ok(mut output) => {
+                output.text = bound_compaction_output(&output.text);
+                if output.text.is_empty() {
+                    output.text = fallback;
+                }
+                output
+            }
+            Err(_) => CompactionOutput {
+                text: fallback,
+                ..CompactionOutput::default()
+            },
         }
     }
 
@@ -425,354 +471,451 @@ fn stamp_consumed(
     crate::access::stamp_consumed(state, item_id, now_tick, turn, gc_epoch)
 }
 
+struct TaskDistillJob {
+    completed_task: Option<TaskId>,
+    summary_scope_id: Option<ScopeId>,
+    summary: String,
+    source: String,
+    source_ids: Vec<ContextItemId>,
+}
+
+const MAX_TASK_DISTILL_SOURCES: usize = 8;
+
+fn plan_task_distill(
+    state: &State,
+    completed_task: Option<TaskId>,
+    summary_scope_id: Option<ScopeId>,
+    summary: String,
+) -> TaskDistillJob {
+    let mut source = String::new();
+    let mut source_ids = Vec::new();
+    if let Some(task) = completed_task {
+        for item in &state.items {
+            if item.task_id == Some(task) && source_ids.len() < MAX_TASK_DISTILL_SOURCES {
+                source_ids.push(item.id);
+                source.push_str(&item.content);
+                source.push('\n');
+            }
+        }
+    }
+    source.push_str(&summary);
+    TaskDistillJob {
+        completed_task,
+        summary_scope_id,
+        summary,
+        source: bound_compaction_source(&source),
+        source_ids,
+    }
+}
+
+fn insert_task_summary(
+    state: &mut State,
+    config: &SimpleContextConfig,
+    completed_task: Option<TaskId>,
+    summary_scope_id: Option<ScopeId>,
+    content: String,
+    source_ids: &[ContextItemId],
+) {
+    let source_label = if source_ids.is_empty() {
+        "task-summary"
+    } else {
+        "derived"
+    };
+    let mut item = item::make_item(
+        state,
+        config,
+        content,
+        ContextKind::Summary,
+        ContextScope::Session,
+        ContextRetention::Durable,
+        0.84,
+        Some(source_label.to_string()),
+    );
+    item.task_id = completed_task;
+    if let Some(scope_id) = summary_scope_id {
+        item.scope_id = Some(scope_id);
+    }
+    for source_id in source_ids {
+        item.dependencies.push(DependencyEdge {
+            target: *source_id,
+            kind: DependencyKind::DerivedFrom,
+        });
+    }
+    dependency::push_linked(state, config, item);
+}
+
 #[async_trait::async_trait]
 impl ContextEngine for SimpleContextEngine {
     async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
-        let mut state = self.state.lock().await;
-        state.event_seq += 1;
+        let mut distill: Option<TaskDistillJob> = None;
+        {
+            let mut state = self.state.lock().await;
+            state.event_seq += 1;
 
-        match ingress {
-            ContextIngress::UserMessage { content } => {
-                // A new user message starts a new turn and resets the tool
-                // round counter; the hot entity set is reset to the new
-                // instruction.
-                state.turn += 1;
-                state.tool_round = 0;
-                // Per-turn directive quotas reset at the turn boundary: the
-                // admit/derive caps are per user turn, not per process run.
-                state.admits_this_turn = 0;
-                state.derives_this_turn = 0;
-                state.search_query_stamps_this_turn.clear();
-                // Episode rotation: the working set is bounded by the current
-                // episode plus unresolved semantic state, not by task turns.
-                // A new instruction that is semantically distant from the
-                // current episode (below the token-overlap threshold, and
-                // informative enough to be a phase change rather than a
-                // continuation token), or an episode that exhausted its turn
-                // budget, closes the focus episode: durable outcomes promote
-                // to the task scope, ordinary dialogue leaves the working
-                // set. The transitions are applied here and surfaced by the
-                // next maintenance report.
-                if needs_episode_rotation(&state, &self.config, &content) {
-                    let transitions = scope::close_focus_episode(&mut state);
-                    state.pending_ingest_transitions.extend(transitions);
-                }
-                state.hot_entities = entity::extract_entities(&content);
-                if let Some(focus) = state.focus.as_mut() {
-                    focus.current_query = content.clone();
-                    focus.active_entities = entity::extract_entities(&content);
-                    focus.generation += 1;
-                }
-                // A user message with no focus is a session-level message:
-                // the engine never mints a `TaskId` (task identity is
-                // runtime-owned, established via `FocusChanged`), so no
-                // focus is invented here — the item lands in the session
-                // scope and stays selectable while focus is absent.
-                let has_focus = state.focus.is_some();
-                // The user message opens (or touches) the task and focus
-                // scopes of the current work; without a focus this falls
-                // back to the session scope.
-                scope::open_focus_scope(&mut state);
+            match ingress {
+                ContextIngress::UserMessage { content } => {
+                    // A new user message starts a new turn and resets the tool
+                    // round counter; the hot entity set is reset to the new
+                    // instruction.
+                    state.turn += 1;
+                    state.tool_round = 0;
+                    // Per-turn directive quotas reset at the turn boundary: the
+                    // admit/derive caps are per user turn, not per process run.
+                    state.admits_this_turn = 0;
+                    state.derives_this_turn = 0;
+                    state.search_query_stamps_this_turn.clear();
+                    // Episode rotation: the working set is bounded by the current
+                    // episode plus unresolved semantic state, not by task turns.
+                    // A new instruction that is semantically distant from the
+                    // current episode (below the token-overlap threshold, and
+                    // informative enough to be a phase change rather than a
+                    // continuation token), or an episode that exhausted its turn
+                    // budget, closes the focus episode: durable outcomes promote
+                    // to the task scope, ordinary dialogue leaves the working
+                    // set. The transitions are applied here and surfaced by the
+                    // next maintenance report.
+                    if needs_episode_rotation(&state, &self.config, &content) {
+                        let transitions = scope::close_focus_episode(&mut state);
+                        state.pending_ingest_transitions.extend(transitions);
+                    }
+                    state.hot_entities = entity::extract_entities(&content);
+                    if let Some(focus) = state.focus.as_mut() {
+                        focus.current_query = content.clone();
+                        focus.active_entities = entity::extract_entities(&content);
+                        focus.generation += 1;
+                    }
+                    // A user message with no focus is a session-level message:
+                    // the engine never mints a `TaskId` (task identity is
+                    // runtime-owned, established via `FocusChanged`), so no
+                    // focus is invented here — the item lands in the session
+                    // scope and stays selectable while focus is absent.
+                    let has_focus = state.focus.is_some();
+                    // The user message opens (or touches) the task and focus
+                    // scopes of the current work; without a focus this falls
+                    // back to the session scope.
+                    scope::open_focus_scope(&mut state);
 
-                let mut item = item::make_item(
-                    &state,
-                    &self.config,
-                    content.clone(),
-                    ContextKind::UserMessage,
-                    if has_focus {
-                        ContextScope::Task
+                    let mut item = item::make_item(
+                        &state,
+                        &self.config,
+                        content.clone(),
+                        ContextKind::UserMessage,
+                        if has_focus {
+                            ContextScope::Task
+                        } else {
+                            ContextScope::Session
+                        },
+                        ContextRetention::Working,
+                        0.62,
+                        Some("user".to_string()),
+                    );
+                    if self.config.supersession && reachability::classify_decision(&content) {
+                        // Decisions are promoted and tracked so later decisions
+                        // can supersede them.
+                        item.tags.push(Label::core(CoreLabel::Decision));
+                        item.importance = 0.72;
+                    }
+                    let item_id = dependency::push_linked(&mut state, &self.config, item);
+
+                    if self.config.supersession && reachability::classify_decision(&content) {
+                        let snippet: String = content.chars().take(60).collect();
+                        let turn = state.turn;
+                        reachability::queue_decision_supersessions(
+                            &mut state,
+                            &content,
+                            &format!("superseded by decision at turn {turn}: '{snippet}'"),
+                            item_id,
+                        );
+                    }
+                }
+                ContextIngress::AssistantMessage { content } => {
+                    let item = item::make_item(
+                        &state,
+                        &self.config,
+                        content,
+                        ContextKind::AssistantMessage,
+                        ContextScope::Task,
+                        ContextRetention::Working,
+                        0.40,
+                        Some("assistant".to_string()),
+                    );
+                    dependency::push_linked(&mut state, &self.config, item);
+                }
+                ContextIngress::ToolObservation { output, scope_id } => {
+                    state.tool_round += 1;
+                    let mut content = output.model_content;
+                    if let Some(artifact_ref) = output.artifact_ref {
+                        content.push_str("\nartifact: ");
+                        content.push_str(&artifact_ref);
+                    }
+                    let ok = output.ok;
+                    let round = state.tool_round;
+                    let kind = if ok {
+                        ContextKind::ToolObservation
                     } else {
-                        ContextScope::Session
-                    },
-                    ContextRetention::Working,
-                    0.62,
-                    Some("user".to_string()),
-                );
-                if self.config.supersession && reachability::classify_decision(&content) {
-                    // Decisions are promoted and tracked so later decisions
-                    // can supersede them.
-                    item.tags.push(Label::core(CoreLabel::Decision));
-                    item.importance = 0.72;
-                }
-                let item_id = dependency::push_linked(&mut state, &self.config, item);
-
-                if self.config.supersession && reachability::classify_decision(&content) {
-                    let snippet: String = content.chars().take(60).collect();
-                    let turn = state.turn;
-                    reachability::queue_decision_supersessions(
-                        &mut state,
-                        &content,
-                        &format!("superseded by decision at turn {turn}: '{snippet}'"),
-                        item_id,
+                        ContextKind::Error
+                    };
+                    // Failed observations persist as Working until verified or
+                    // superseded; successful observations stay ephemeral and
+                    // leave after the model consumes them.
+                    let retention = if ok {
+                        ContextRetention::Ephemeral
+                    } else {
+                        ContextRetention::Working
+                    };
+                    let mut item = item::make_item(
+                        &state,
+                        &self.config,
+                        content.clone(),
+                        kind,
+                        ContextScope::Turn,
+                        retention,
+                        if ok { 0.58 } else { 0.82 },
+                        Some(format!("tool:{}", output.tool_name)),
                     );
-                }
-            }
-            ContextIngress::AssistantMessage { content } => {
-                let item = item::make_item(
-                    &state,
-                    &self.config,
-                    content,
-                    ContextKind::AssistantMessage,
-                    ContextScope::Task,
-                    ContextRetention::Working,
-                    0.40,
-                    Some("assistant".to_string()),
-                );
-                dependency::push_linked(&mut state, &self.config, item);
-            }
-            ContextIngress::ToolObservation { output, scope_id } => {
-                state.tool_round += 1;
-                let mut content = output.model_content;
-                if let Some(artifact_ref) = output.artifact_ref {
-                    content.push_str("\nartifact: ");
-                    content.push_str(&artifact_ref);
-                }
-                let ok = output.ok;
-                let round = state.tool_round;
-                let kind = if ok {
-                    ContextKind::ToolObservation
-                } else {
-                    ContextKind::Error
-                };
-                // Failed observations persist as Working until verified or
-                // superseded; successful observations stay ephemeral and
-                // leave after the model consumes them.
-                let retention = if ok {
-                    ContextRetention::Ephemeral
-                } else {
-                    ContextRetention::Working
-                };
-                let mut item = item::make_item(
-                    &state,
-                    &self.config,
-                    content.clone(),
-                    kind,
-                    ContextScope::Turn,
-                    retention,
-                    if ok { 0.58 } else { 0.82 },
-                    Some(format!("tool:{}", output.tool_name)),
-                );
-                // The runtime opened the tool scope at tool start; the
-                // observation is tagged with that frame even though it is
-                // persisted at turn end.
-                if let Some(tool_scope_id) = scope_id {
-                    item.scope_id = Some(tool_scope_id);
-                }
-                // The observation itself is the `by` of the intents it
-                // queues: verification (success) or recurrence supersession
-                // (failure). It must exist with its id before queueing so
-                // the semantic state can name it, but it is pushed to the
-                // heap only after queueing so intents never see it.
-                let observation_id = item.id;
-                if self.config.error_verification && !ok {
-                    reachability::queue_error_recurrence(
-                        &mut state,
-                        &content,
-                        round,
-                        observation_id,
-                    );
-                }
-                if self.config.error_verification && ok {
-                    reachability::queue_error_verifications(
-                        &mut state,
-                        &content,
-                        &format!("error verified fixed by successful tool result (round {round})"),
-                        observation_id,
-                    );
-                }
-                if ok {
-                    reachability::queue_file_body_supersessions(
-                        &mut state,
-                        &content,
-                        observation_id,
-                    );
-                }
-                // Entities the agent actually touched via tools extend the
-                // hot set for the rest of this turn.
-                if self.config.entity_affinity {
-                    entity::merge_hot_entities(
-                        &mut state.hot_entities,
-                        entity::extract_entities(&content),
-                    );
-                }
-                dependency::push_linked(&mut state, &self.config, item);
-            }
-            ContextIngress::FocusChanged { mut focus } => {
-                focus.generation += 1;
-                // A new focus defines the hot set from its own active entities.
-                state.hot_entities = focus.active_entities.clone();
-                state.focus = Some(focus);
-                // The focus (and its task) scope opens or reactivates.
-                scope::open_focus_scope(&mut state);
-            }
-            ContextIngress::FocusCleared => {
-                // Suspend (not complete) the active task: its scopes stay
-                // open so a later FocusChanged with the same task id
-                // resumes them; focus returns to None until then.
-                let task_id = state.focus.as_ref().map(|focus| focus.task_id);
-                state.focus = None;
-                state.hot_entities.clear();
-                if let Some(task_id) = task_id {
-                    for scope in state.scopes.iter_mut() {
-                        if scope.task_id == Some(task_id) && scope.state == ScopeState::Active {
-                            scope.state = ScopeState::Suspended;
-                        }
+                    // The runtime opened the tool scope at tool start; the
+                    // observation is tagged with that frame even though it is
+                    // persisted at turn end.
+                    if let Some(tool_scope_id) = scope_id {
+                        item.scope_id = Some(tool_scope_id);
                     }
-                }
-                if let Some(session) = state
-                    .scopes
-                    .iter()
-                    .find(|scope| scope.kind == ScopeKind::Session)
-                {
-                    state.active_scope_id = Some(session.id);
-                }
-            }
-            ContextIngress::WorkingSetSignal { content } => {
-                // A mid-turn signal from a tool commit: the entities the
-                // tool just touched become hot for the *next* model round,
-                // without persisting a body yet (the observation lands at
-                // turn end). Bounded merge, no item, no scope change — the
-                // signal only extends the hot-entity set.
-                if self.config.entity_affinity {
-                    entity::merge_hot_entities(
-                        &mut state.hot_entities,
-                        entity::extract_entities(&content),
-                    );
-                }
-            }
-            ContextIngress::Pin { content, kind } => {
-                // A pin is session-level: it guarantees the session scope
-                // exists even when no task has started yet.
-                scope::ensure_session(&mut state);
-                let item = item::make_item(
-                    &state,
-                    &self.config,
-                    content,
-                    kind,
-                    ContextScope::Pinned,
-                    ContextRetention::Pinned,
-                    1.0,
-                    Some("explicit-pin".to_string()),
-                );
-                dependency::push_linked(&mut state, &self.config, item);
-            }
-            ContextIngress::TaskCompleted { task_id, summary } => {
-                // Record which task completed; the scope close (promotion of
-                // durable outcomes, eviction of the working set) happens in
-                // maintain(TaskCompleted) so it is observable.
-                let completed_task = task_id.or_else(|| state.focus.as_ref().map(|f| f.task_id));
-                // The summary belongs to the completed task line, not to
-                // whatever scope happens to be active right now: capture the
-                // completed task's scope *before* the focus/close machinery
-                // runs, so a named summary never inherits the current focus
-                // identity (a completed task can arrive while another task
-                // is focused, and `state.focus` is cleared below before the
-                // item is built).
-                let summary_scope_id = completed_task
-                    .and_then(|task| {
-                        state.scopes.iter().find(|scope| {
-                            scope.kind == ScopeKind::Task
-                                && scope.task_id == Some(task)
-                                && scope.state != ScopeState::Closed
-                        })
-                    })
-                    .map(|scope| scope.id)
-                    .or_else(|| {
-                        state
-                            .scopes
-                            .iter()
-                            .find(|scope| scope.kind == ScopeKind::Session)
-                            .map(|scope| scope.id)
-                    });
-                if let Some(completed_task) = completed_task {
-                    if state.focus.as_ref().map(|f| f.task_id) == Some(completed_task) {
-                        state.focus = None;
+                    // The observation itself is the `by` of the intents it
+                    // queues: verification (success) or recurrence supersession
+                    // (failure). It must exist with its id before queueing so
+                    // the semantic state can name it, but it is pushed to the
+                    // heap only after queueing so intents never see it.
+                    let observation_id = item.id;
+                    if self.config.error_verification && !ok {
+                        reachability::queue_error_recurrence(
+                            &mut state,
+                            &content,
+                            round,
+                            observation_id,
+                        );
                     }
-                    // Model hints are per-task: when the task completes its
-                    // keep_alive and lease protections expire in *every* body
-                    // location, so a completed task cannot keep rooting items
-                    // forever. A keep-alive item is normally a GC
-                    // root and stays in the heap, but a warm-buffer item from
-                    // an older checkpoint must not retain the protection.
-                    for item in &mut state.items {
-                        if item.task_id == Some(completed_task) {
-                            item.keep_alive = false;
-                            item.lease_until_turn = None;
-                        }
+                    if self.config.error_verification && ok {
+                        reachability::queue_error_verifications(
+                            &mut state,
+                            &content,
+                            &format!(
+                                "error verified fixed by successful tool result (round {round})"
+                            ),
+                            observation_id,
+                        );
                     }
-                    for item in &mut state.eviction_buffer {
-                        if item.task_id == Some(completed_task) {
-                            item.keep_alive = false;
-                            item.lease_until_turn = None;
-                        }
+                    if ok {
+                        reachability::queue_file_body_supersessions(
+                            &mut state,
+                            &content,
+                            observation_id,
+                        );
                     }
-                    // External entries carry the same protection fields
-                    // (captured at externalize time); a completed task
-                    // clears them there too, so no body location can keep
-                    // rooting the finished task's records.
-                    let mut external = state.external.take_all();
-                    for entry in &mut external {
-                        if entry.task_id == Some(completed_task) {
-                            entry.keep_alive = false;
-                            entry.lease_until_turn = None;
-                        }
+                    // Entities the agent actually touched via tools extend the
+                    // hot set for the rest of this turn.
+                    if self.config.entity_affinity {
+                        entity::merge_hot_entities(
+                            &mut state.hot_entities,
+                            entity::extract_entities(&content),
+                        );
                     }
-                    state.external.replace_all(external);
-                    scope::queue_task_scope_close(&mut state, completed_task);
+                    dependency::push_linked(&mut state, &self.config, item);
                 }
-                let mut item = item::make_item(
-                    &state,
-                    &self.config,
-                    summary,
-                    ContextKind::Summary,
-                    ContextScope::Session,
-                    ContextRetention::Durable,
-                    0.84,
-                    Some("task-summary".to_string()),
-                );
-                // Re-stamp the identity the focus machinery above may have
-                // cleared or displaced: the summary belongs to the completed
-                // task and its scope, never to the current focus.
-                item.task_id = completed_task;
-                if let Some(scope_id) = summary_scope_id {
-                    item.scope_id = Some(scope_id);
+                ContextIngress::FocusChanged { mut focus } => {
+                    focus.generation += 1;
+                    // A new focus defines the hot set from its own active entities.
+                    state.hot_entities = focus.active_entities.clone();
+                    state.focus = Some(focus);
+                    // The focus (and its task) scope opens or reactivates.
+                    scope::open_focus_scope(&mut state);
                 }
-                dependency::push_linked(&mut state, &self.config, item);
-            }
-            ContextIngress::ContextDirective { action } => {
-                // Admit of an externalized item reads its content back from
-                // the context store. Plan under the lock, read outside it,
-                // re-apply under a fresh lock — the state lock is never held
-                // across disk IO (same phases as the GC's store step).
-                let read_plan = match &action {
-                    ContextAction::Admit { item_id, .. } => {
-                        match crate::directive::plan_admit(&state, *item_id) {
-                            crate::directive::AdmitPlan::Refused(reason) => {
-                                return Err(AgentError::InvalidRequest(reason));
+                ContextIngress::FocusCleared => {
+                    // Suspend (not complete) the active task: its scopes stay
+                    // open so a later FocusChanged with the same task id
+                    // resumes them; focus returns to None until then.
+                    let task_id = state.focus.as_ref().map(|focus| focus.task_id);
+                    state.focus = None;
+                    state.hot_entities.clear();
+                    if let Some(task_id) = task_id {
+                        for scope in state.scopes.iter_mut() {
+                            if scope.task_id == Some(task_id) && scope.state == ScopeState::Active {
+                                scope.state = ScopeState::Suspended;
                             }
-                            crate::directive::AdmitPlan::ReadExternal(id) => Some(id),
-                            crate::directive::AdmitPlan::InMemory
-                            | crate::directive::AdmitPlan::Missing => None,
                         }
                     }
-                    _ => None,
-                };
-                let external_read = match read_plan {
-                    Some(item_id) => {
-                        let dir = crate::store::store_dir(&self.config);
-                        Some((item_id, crate::store::read_item_async(&dir, item_id).await))
+                    if let Some(session) = state
+                        .scopes
+                        .iter()
+                        .find(|scope| scope.kind == ScopeKind::Session)
+                    {
+                        state.active_scope_id = Some(session.id);
                     }
-                    None => None,
-                };
-                if let Some(reason) =
-                    apply_directive(&mut state, &self.config, action, external_read)
-                {
-                    // A quota refused the directive: surface it so the model
-                    // (which believes the hint/lease was granted) learns it
-                    // was not.
-                    return Err(AgentError::InvalidRequest(reason));
+                }
+                ContextIngress::WorkingSetSignal { content } => {
+                    // A mid-turn signal from a tool commit: the entities the
+                    // tool just touched become hot for the *next* model round,
+                    // without persisting a body yet (the observation lands at
+                    // turn end). Bounded merge, no item, no scope change — the
+                    // signal only extends the hot-entity set.
+                    if self.config.entity_affinity {
+                        entity::merge_hot_entities(
+                            &mut state.hot_entities,
+                            entity::extract_entities(&content),
+                        );
+                    }
+                }
+                ContextIngress::Pin { content, kind } => {
+                    // A pin is session-level: it guarantees the session scope
+                    // exists even when no task has started yet.
+                    scope::ensure_session(&mut state);
+                    let item = item::make_item(
+                        &state,
+                        &self.config,
+                        content,
+                        kind,
+                        ContextScope::Pinned,
+                        ContextRetention::Pinned,
+                        1.0,
+                        Some("explicit-pin".to_string()),
+                    );
+                    dependency::push_linked(&mut state, &self.config, item);
+                }
+                ContextIngress::TaskCompleted { task_id, summary } => {
+                    // Record which task completed; the scope close (promotion of
+                    // durable outcomes, eviction of the working set) happens in
+                    // maintain(TaskCompleted) so it is observable.
+                    let completed_task =
+                        task_id.or_else(|| state.focus.as_ref().map(|f| f.task_id));
+                    // The summary belongs to the completed task line, not to
+                    // whatever scope happens to be active right now: capture the
+                    // completed task's scope *before* the focus/close machinery
+                    // runs, so a named summary never inherits the current focus
+                    // identity (a completed task can arrive while another task
+                    // is focused, and `state.focus` is cleared below before the
+                    // item is built).
+                    let summary_scope_id = completed_task
+                        .and_then(|task| {
+                            state.scopes.iter().find(|scope| {
+                                scope.kind == ScopeKind::Task
+                                    && scope.task_id == Some(task)
+                                    && scope.state != ScopeState::Closed
+                            })
+                        })
+                        .map(|scope| scope.id)
+                        .or_else(|| {
+                            state
+                                .scopes
+                                .iter()
+                                .find(|scope| scope.kind == ScopeKind::Session)
+                                .map(|scope| scope.id)
+                        });
+                    if let Some(completed_task) = completed_task {
+                        if state.focus.as_ref().map(|f| f.task_id) == Some(completed_task) {
+                            state.focus = None;
+                        }
+                        // Model hints are per-task: when the task completes its
+                        // keep_alive and lease protections expire in *every* body
+                        // location, so a completed task cannot keep rooting items
+                        // forever. A keep-alive item is normally a GC
+                        // root and stays in the heap, but a warm-buffer item from
+                        // an older checkpoint must not retain the protection.
+                        for item in &mut state.items {
+                            if item.task_id == Some(completed_task) {
+                                item.keep_alive = false;
+                                item.lease_until_turn = None;
+                            }
+                        }
+                        for item in &mut state.eviction_buffer {
+                            if item.task_id == Some(completed_task) {
+                                item.keep_alive = false;
+                                item.lease_until_turn = None;
+                            }
+                        }
+                        // External entries carry the same protection fields
+                        // (captured at externalize time); a completed task
+                        // clears them there too, so no body location can keep
+                        // rooting the finished task's records.
+                        let mut external = state.external.take_all();
+                        for entry in &mut external {
+                            if entry.task_id == Some(completed_task) {
+                                entry.keep_alive = false;
+                                entry.lease_until_turn = None;
+                            }
+                        }
+                        state.external.replace_all(external);
+                        scope::queue_task_scope_close(&mut state, completed_task);
+                    }
+                    if self.compactor.is_some() {
+                        distill = Some(plan_task_distill(
+                            &state,
+                            completed_task,
+                            summary_scope_id,
+                            summary,
+                        ));
+                    } else {
+                        insert_task_summary(
+                            &mut state,
+                            &self.config,
+                            completed_task,
+                            summary_scope_id,
+                            summary,
+                            &[],
+                        );
+                    }
+                }
+                ContextIngress::ContextDirective { action } => {
+                    // Admit of an externalized item reads its content back from
+                    // the context store. Plan under the lock, read outside it,
+                    // re-apply under a fresh lock — the state lock is never held
+                    // across disk IO (same phases as the GC's store step).
+                    let read_plan = match &action {
+                        ContextAction::Admit { item_id, .. } => {
+                            match crate::directive::plan_admit(&state, *item_id) {
+                                crate::directive::AdmitPlan::Refused(reason) => {
+                                    return Err(AgentError::InvalidRequest(reason));
+                                }
+                                crate::directive::AdmitPlan::ReadExternal(id) => Some(id),
+                                crate::directive::AdmitPlan::InMemory
+                                | crate::directive::AdmitPlan::Missing => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    let external_read = match read_plan {
+                        Some(item_id) => {
+                            let dir = crate::store::store_dir(&self.config);
+                            Some((item_id, crate::store::read_item_async(&dir, item_id).await))
+                        }
+                        None => None,
+                    };
+                    if let Some(reason) =
+                        apply_directive(&mut state, &self.config, action, external_read)
+                    {
+                        // A quota refused the directive: surface it so the model
+                        // (which believes the hint/lease was granted) learns it
+                        // was not.
+                        return Err(AgentError::InvalidRequest(reason));
+                    }
                 }
             }
+        }
+
+        if let Some(job) = distill {
+            let output = self.run_task_distill(&job).await;
+            let mut state = self.state.lock().await;
+            insert_task_summary(
+                &mut state,
+                &self.config,
+                job.completed_task,
+                job.summary_scope_id,
+                output.text,
+                &job.source_ids,
+            );
+            state.compaction_input_tokens = state
+                .compaction_input_tokens
+                .saturating_add(output.input_tokens);
+            state.compaction_output_tokens = state
+                .compaction_output_tokens
+                .saturating_add(output.output_tokens);
         }
 
         Ok(())
@@ -1023,17 +1166,14 @@ impl ContextEngine for SimpleContextEngine {
         item_id: ContextItemId,
     ) -> AgentResult<Option<agent_contracts::ExternalizedContext>> {
         let mut state = self.state.lock().await;
-        let retrievable = state
-            .external
-            .get(item_id)
-            .is_some_and(crate::store::externally_retrievable);
-        if !retrievable {
+        state.sync_catalog();
+        // 目录级 inspect：Resident/Warm 投影 heap，Stored 用 map 描述符。
+        // 终态语义仍被 project_search_hit 过滤，不会把 Tombstoned 交回模型。
+        if crate::store::project_search_hit(&state, item_id).is_none() {
             return Ok(None);
         }
-        // inspect 是故意读取描述符，强于 search。更强信号（fetch/ack）
-        // 已经写过时 stamp 拒绝降级，返回值仍是当前权威描述符。
         crate::access::stamp_read(&mut state, item_id, agent_contracts::AccessSignal::Inspect);
-        Ok(state.external.get(item_id).cloned())
+        Ok(crate::store::project_search_hit(&state, item_id))
     }
 
     async fn fetch_external(&self, item_id: ContextItemId) -> AgentResult<Option<ContextItem>> {

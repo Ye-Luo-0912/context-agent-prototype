@@ -2,8 +2,9 @@
 //!
 //! 冻结条件由本模块计算：`manifest.frozen` 不能单独打开门禁。9 道文件题
 //! 加上 500 道 SWE-bench Verified 使 n≥300。异质性、出处、可执行 hidden
-//! 已审查；pack 已冻结。EVAL-01.3b 将 `SUITE_FROZEN` 与 SPEC 一并冻结。
-//! 300×3 接受细胞仍须先做 ~30×3 校准。不得发明一行 stand-in。
+//! 已审查；pack 已冻结。EVAL-01.3c 将 `SUITE_FROZEN`、exact 300 acceptance
+//! ids 与 SPEC 一并冻结。门禁是这 300 题，不是 509 包里任意子集。
+//! 300×3 接受细胞仍须先做剩余校准。不得发明一行 stand-in。
 //!
 //! `evaluate_suite_task` 由测试、`--suite-check` 和 `--pilot-run` 调用。
 
@@ -344,11 +345,19 @@ pub fn evaluate_suite_task(
             })
             .collect());
     }
+    evaluate_overlay_commands(workspace, &task.hidden_overlay, &task.hidden_commands)
+}
+
+/// 复制工作区、叠 overlay、跑命令。overlay 不写回模型工作区。
+pub fn evaluate_overlay_commands(
+    workspace: &Path,
+    overlay: &[SuiteSeedFile],
+    commands: &[SuiteHiddenCommand],
+) -> anyhow::Result<Vec<HiddenCommandResult>> {
     let tmp = tempfile::tempdir()?;
     copy_tree(workspace, tmp.path())?;
-    apply_files(tmp.path(), &task.hidden_overlay)?;
-    Ok(task
-        .hidden_commands
+    apply_files(tmp.path(), overlay)?;
+    Ok(commands
         .iter()
         .map(|spec| run_hidden_command(tmp.path(), spec))
         .collect())
@@ -526,6 +535,14 @@ pub fn standin_reason(task: &SuiteTask) -> Option<String> {
     None
 }
 
+fn resolve_program(name: &str) -> String {
+    if name == "python" {
+        crate::harvest::python_bin()
+    } else {
+        name.to_string()
+    }
+}
+
 pub fn run_hidden_command(root: &Path, spec: &SuiteHiddenCommand) -> HiddenCommandResult {
     if spec.argv.is_empty() {
         return HiddenCommandResult {
@@ -540,7 +557,8 @@ pub fn run_hidden_command(root: &Path, spec: &SuiteHiddenCommand) -> HiddenComma
     } else {
         spec.timeout_ms.clamp(1, MAX_TIMEOUT_MS)
     });
-    let mut command = Command::new(&spec.argv[0]);
+    let program = resolve_program(&spec.argv[0]);
+    let mut command = Command::new(&program);
     command
         .args(&spec.argv[1..])
         .current_dir(root)

@@ -81,6 +81,7 @@ pub struct CalibrationReport {
     pub by_size: BTreeMap<String, SizeRates>,
     pub task_corr_ac: Option<f64>,
     pub cell_phi_ac: Option<f64>,
+    pub residual_corr_ac: Option<f64>,
     pub mean_a_var_ratio: Option<f64>,
     pub interval: Option<Interval>,
     pub tasks: Vec<TaskPair>,
@@ -122,9 +123,7 @@ pub fn select_pilot(pack: &SuitePack) -> anyhow::Result<PilotSample> {
         anyhow::bail!("pilot sample n={} (want {PILOT_N})", ids.len());
     }
     if ids != FROZEN_PILOT_IDS {
-        anyhow::bail!(
-            "pilot sample drifted from the freeze lock; re-register before seeing cells"
-        );
+        anyhow::bail!("pilot sample drifted from the freeze lock; re-register before seeing cells");
     }
     let sha = sample_sha256(&ids);
     if sha != FROZEN_PILOT_SHA256 {
@@ -168,7 +167,11 @@ pub fn select_pilot_ids(pack: &SuitePack) -> Vec<String> {
     }
     for size in ["small", "medium", "large"] {
         let mut cands = swebench.remove(size).unwrap_or_default();
-        cands.sort_by(|left, right| rank_key(&left.id).cmp(&rank_key(&right.id)).then_with(|| left.id.cmp(&right.id)));
+        cands.sort_by(|left, right| {
+            rank_key(&left.id)
+                .cmp(&rank_key(&right.id))
+                .then_with(|| left.id.cmp(&right.id))
+        });
         let want = need.get(size).copied().unwrap_or(0);
         for task in cands.into_iter().take(want) {
             selected.push(task.id.clone());
@@ -259,7 +262,9 @@ pub fn calibrate(
 
     let mut notes = Vec::new();
     notes.push("decision=pilot; never treat this as the 300x3 gate".into());
-    notes.push("amend n only by EVAL-01.3 re-registration, never after seeing acceptance cells".into());
+    notes.push(
+        "amend n only by EVAL-01.3 re-registration, never after seeing acceptance cells".into(),
+    );
     if !missing_ids.is_empty() {
         notes.push(format!(
             "incomplete sample: missing {}/{} tasks (file-only runs skip swebench-docker)",
@@ -268,10 +273,16 @@ pub fn calibrate(
         ));
     }
     if !extra_ids.is_empty() {
-        notes.push(format!("extra ids outside the frozen sample: {}", extra_ids.join(",")));
+        notes.push(format!(
+            "extra ids outside the frozen sample: {}",
+            extra_ids.join(",")
+        ));
     }
     if gate.eligible {
-        notes.push("BUG: analyze() marked a pilot cell set eligible; the 300-task gate must stay closed".into());
+        notes.push(
+            "BUG: analyze() marked a pilot cell set eligible; the 300-task gate must stay closed"
+                .into(),
+        );
     }
 
     let intended_cells = (expected_ids.len() as u32)
@@ -282,10 +293,19 @@ pub fn calibrate(
     let (overall_a, overall_b, overall_c) = overall_rates(cells.iter());
     let by_size = rates_by_size(cells, sizes);
     let task_corr_ac = pearson(
-        &gate.tasks.iter().map(|task| task.a_rate).collect::<Vec<_>>(),
-        &gate.tasks.iter().map(|task| task.c_rate).collect::<Vec<_>>(),
+        &gate
+            .tasks
+            .iter()
+            .map(|task| task.a_rate)
+            .collect::<Vec<_>>(),
+        &gate
+            .tasks
+            .iter()
+            .map(|task| task.c_rate)
+            .collect::<Vec<_>>(),
     );
     let cell_phi_ac = phi_ac(cells);
+    let residual_corr_ac = task_residual_corr_ac(cells);
     let mean_a_var_ratio = mean_bernoulli_var_ratio(cells);
     let diffs: Vec<f64> = gate.tasks.iter().map(|task| task.diff).collect();
     let interval = analysis::one_sided_lcl(&diffs);
@@ -302,8 +322,18 @@ pub fn calibrate(
     }
     if let Some(phi) = cell_phi_ac {
         notes.push(format!(
-            "repeat-level phi(A, C) = {phi:.3} (A ⟂ C | task predicts near 0)"
+            "repeat-level pooled phi(A, C) = {phi:.3} (confounded by task difficulty; not a test of A ⟂ C | task)"
         ));
+    }
+    if let Some(corr) = residual_corr_ac {
+        notes.push(format!(
+            "task-residual corr(A, C) = {corr:.3} (A_i - task A rate vs C_i - task C rate; A ⟂ C | task predicts ~0)"
+        ));
+    } else {
+        notes.push(
+            "task-residual corr(A, C) undefined (zero residual variance; pooled phi cannot reject A ⟂ C | task)"
+                .into(),
+        );
     }
     notes.push(format!(
         "power-model strata p: small=0.90 medium=0.70 large=0.40; observed A by size is diagnostic only"
@@ -324,6 +354,7 @@ pub fn calibrate(
         by_size,
         task_corr_ac,
         cell_phi_ac,
+        residual_corr_ac,
         mean_a_var_ratio,
         interval,
         tasks: gate.tasks.clone(),
@@ -377,8 +408,15 @@ pub fn render_calibration(report: &CalibrationReport) -> String {
     }
     if let Some(phi) = report.cell_phi_ac {
         out.push_str(&format!(
-            "repeat-level phi(A,C)={phi:.3} (A indep C | task predicts ~0)\n"
+            "repeat-level pooled phi(A,C)={phi:.3} (confounded by task difficulty; not A indep C | task)\n"
         ));
+    }
+    if let Some(corr) = report.residual_corr_ac {
+        out.push_str(&format!(
+            "task-residual corr(A,C)={corr:.3} (A_i - task rate vs C_i - task rate; A indep C | task predicts ~0)\n"
+        ));
+    } else {
+        out.push_str("task-residual corr(A,C)=undefined (zero residual variance)\n");
     }
     if let Some(ratio) = report.mean_a_var_ratio {
         out.push_str(&format!(
@@ -461,15 +499,7 @@ fn rates_by_size(
                 .map(|cell| cell.fixture_id.as_str())
                 .collect::<BTreeSet<_>>()
                 .len();
-            (
-                size,
-                SizeRates {
-                    n_tasks,
-                    a,
-                    b,
-                    c,
-                },
-            )
+            (size, SizeRates { n_tasks, a, b, c })
         })
         .collect()
 }
@@ -542,6 +572,49 @@ fn phi_ac(cells: &[CellRecord]) -> Option<f64> {
         return None;
     }
     Some((n11 * n00 - n10 * n01) / prod.sqrt())
+}
+
+fn task_residual_corr_ac(cells: &[CellRecord]) -> Option<f64> {
+    let mut by_key: BTreeMap<(String, u32), (Option<bool>, Option<bool>)> = BTreeMap::new();
+    for cell in cells {
+        let entry = by_key
+            .entry((cell.fixture_id.clone(), cell.repeat))
+            .or_insert((None, None));
+        if cell.engine == "append" {
+            entry.0 = Some(cell.itt_success());
+        } else if cell.engine == "dynamic" {
+            entry.1 = Some(cell.itt_success());
+        }
+    }
+    let mut pairs: Vec<(String, f64, f64)> = Vec::new();
+    for ((fixture, _), (a, c)) in &by_key {
+        let (Some(a), Some(c)) = (a, c) else {
+            continue;
+        };
+        pairs.push((
+            fixture.clone(),
+            if *a { 1.0 } else { 0.0 },
+            if *c { 1.0 } else { 0.0 },
+        ));
+    }
+    if pairs.len() < 3 {
+        return None;
+    }
+    let mut sums: BTreeMap<&str, (f64, f64, f64)> = BTreeMap::new();
+    for (fixture, a, c) in &pairs {
+        let entry = sums.entry(fixture.as_str()).or_insert((0.0, 0.0, 0.0));
+        entry.0 += *a;
+        entry.1 += *c;
+        entry.2 += 1.0;
+    }
+    let mut xs = Vec::with_capacity(pairs.len());
+    let mut ys = Vec::with_capacity(pairs.len());
+    for (fixture, a, c) in &pairs {
+        let (sa, sc, n) = sums.get(fixture.as_str())?;
+        xs.push(*a - *sa / *n);
+        ys.push(*c - *sc / *n);
+    }
+    pearson(&xs, &ys)
 }
 
 fn mean_bernoulli_var_ratio(cells: &[CellRecord]) -> Option<f64> {
@@ -662,8 +735,28 @@ mod tests {
         assert!((report.overall_a - 1.0).abs() < 1e-12);
         let text = render_calibration(&report);
         assert!(text.contains("decision=pilot"));
-        assert!(text.contains("n_tasks=30 < 300"));
+        assert!(text.contains("n_tasks=30 != 300"));
         assert!(!text.contains("decision=pass\n"));
+    }
+
+    #[test]
+    fn pooled_phi_is_confounded_by_task_difficulty() {
+        let mut cells = Vec::new();
+        for repeat in 1..=3 {
+            cells.push(cell("easy", repeat, "append", true));
+            cells.push(cell("easy", repeat, "dynamic", true));
+            cells.push(cell("hard", repeat, "append", false));
+            cells.push(cell("hard", repeat, "dynamic", false));
+        }
+        let phi = phi_ac(&cells).unwrap();
+        assert!(
+            phi > 0.99,
+            "unconditional phi should be ~1 when tasks share difficulty: {phi}"
+        );
+        assert!(
+            task_residual_corr_ac(&cells).is_none(),
+            "zero within-task residual variance is undefined, not evidence against A ⟂ C | task"
+        );
     }
 
     #[test]
@@ -685,9 +778,11 @@ mod tests {
         assert_eq!(report.observed_n, 9);
         assert_eq!(report.missing_ids.len(), 21);
         assert!(!report.gate.eligible);
-        assert!(report
-            .notes
-            .iter()
-            .any(|note| note.contains("incomplete sample")));
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("incomplete sample"))
+        );
     }
 }

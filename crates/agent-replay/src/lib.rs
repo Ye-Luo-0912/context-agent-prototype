@@ -58,12 +58,7 @@ pub struct ReplayConfig {
 impl Default for ReplayConfig {
     fn default() -> Self {
         Self {
-            system_prompt: concat!(
-                "You are a focused coding agent. Work on the current task only. ",
-                "Treat SELECTED WORKING CONTEXT as a bounded cache, not a complete transcript. ",
-                "Use tools when needed. Do not assume omitted history is relevant."
-            )
-            .to_string(),
+            system_prompt: agent_contracts::DEFAULT_CODING_AGENT_SYSTEM_PROMPT.to_string(),
             budget_tokens: 24_000,
             artifact_workspace: None,
         }

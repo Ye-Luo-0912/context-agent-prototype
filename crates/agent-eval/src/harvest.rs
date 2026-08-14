@@ -4,6 +4,7 @@
 //! `princeton-nlp/SWE-bench_Verified` 为准。单元测试不拉镜像；gold 评测走
 //! `AGENT_EVAL_SWEBENCH_DOCKER=1` / `--swebench-gold`。
 
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -149,7 +150,7 @@ pub fn instance_id_from_suite_id(suite_id: &str) -> Option<&str> {
     suite_id.strip_prefix("swebench-")
 }
 
-fn python_bin() -> String {
+pub(crate) fn python_bin() -> String {
     std::env::var("AGENT_EVAL_PYTHON").unwrap_or_else(|_| "python".into())
 }
 
@@ -208,11 +209,7 @@ pub fn run_gold_eval(instance_id: &str) -> anyhow::Result<HiddenCommandResult> {
     std::fs::create_dir_all(&work)?;
     let run_id = format!("agent-eval-gold-{instance_id}");
     clear_eval_logs(&work, &run_id);
-    run_harness(
-        &work,
-        &gold_eval_argv(instance_id),
-        instance_id,
-    )
+    run_harness(&work, &gold_eval_argv(instance_id), instance_id)
 }
 
 /// 用模型产出的 git diff 跑官方 harness。默认关闭；单元测试不得调用。
@@ -223,6 +220,15 @@ pub fn run_prediction_eval(
 ) -> anyhow::Result<HiddenCommandResult> {
     refuse_instance_id(instance_id)?;
     refuse_run_id(run_id)?;
+    if model_patch.trim().is_empty() {
+        // 空补丁会被官方 harness 直接丢掉（No instances to run），不必再打 GitHub/HF。
+        return Ok(HiddenCommandResult {
+            argv: vec!["swebench-docker".into(), "eval".into(), instance_id.into()],
+            stderr: "skipped swebench docker: empty model patch".into(),
+            passed: false,
+            ..HiddenCommandResult::default()
+        });
+    }
     let work = gold_work_dir();
     std::fs::create_dir_all(&work)?;
     let pred_path = work.join(format!("{run_id}.jsonl"));
@@ -384,7 +390,14 @@ pub fn clone_engine_workspace(cache: &Path, dest: &Path) -> anyhow::Result<()> {
 }
 
 /// 相对 HEAD 的模型补丁（含未跟踪文件）。空 diff 仍交给 harness，ITT 记失败。
+/// `.focus-agent/` 是运行时目录，不得进入 SWE-bench prediction。
 pub fn git_model_patch(workspace: &Path) -> anyhow::Result<String> {
+    exclude_runtime_dir(workspace)?;
+    let _ = Command::new("git")
+        .args(["reset", "-q", "--", ".focus-agent"])
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .status();
     let add = Command::new("git")
         .args(["add", "-A"])
         .current_dir(workspace)
@@ -404,13 +417,38 @@ pub fn git_model_patch(workspace: &Path) -> anyhow::Result<String> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"))
+    let patch = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    if patch.contains(".focus-agent/") || patch.contains(".focus-agent\\") {
+        anyhow::bail!("model patch leaked .focus-agent runtime files");
+    }
+    Ok(patch)
+}
+
+fn exclude_runtime_dir(workspace: &Path) -> anyhow::Result<()> {
+    let path = workspace.join(".git").join("info").join("exclude");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut body = fs::read_to_string(&path).unwrap_or_default();
+    let already = body.lines().any(|line| {
+        let line = line.trim();
+        line == ".focus-agent" || line == ".focus-agent/"
+    });
+    if already {
+        return Ok(());
+    }
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(".focus-agent/\n");
+    fs::write(path, body)?;
+    Ok(())
 }
 
 fn refuse_github_url(url: &str) -> anyhow::Result<()> {
-    let rest = url
-        .strip_prefix("https://github.com/")
-        .ok_or_else(|| anyhow::anyhow!("swebench clone URL must be https://github.com/owner/repo"))?;
+    let rest = url.strip_prefix("https://github.com/").ok_or_else(|| {
+        anyhow::anyhow!("swebench clone URL must be https://github.com/owner/repo")
+    })?;
     let rest = rest.trim_end_matches('/').trim_end_matches(".git");
     let mut parts = rest.split('/');
     let owner = parts.next().unwrap_or("");
@@ -431,10 +469,7 @@ fn refuse_github_url(url: &str) -> anyhow::Result<()> {
 }
 
 fn refuse_commit(commit: &str) -> anyhow::Result<()> {
-    if commit.len() < 7
-        || commit.len() > 40
-        || !commit.chars().all(|ch| ch.is_ascii_hexdigit())
-    {
+    if commit.len() < 7 || commit.len() > 40 || !commit.chars().all(|ch| ch.is_ascii_hexdigit()) {
         anyhow::bail!("refusing swebench commit {commit:?}");
     }
     Ok(())
@@ -618,6 +653,47 @@ mod tests {
         assert!(argv.contains(&"pred.jsonl".into()));
         assert!(!argv.contains(&"gold".into()));
         assert!(argv.contains(&"agent-eval-pred-flask-append-1".into()));
+    }
+
+    #[test]
+    fn empty_patch_skips_the_harness() {
+        let result =
+            run_prediction_eval(GOLD_SMOKE_INSTANCE, "  \n", "agent-eval-empty-patch").unwrap();
+        assert!(!result.passed);
+        assert!(result.stderr.contains("empty model patch"));
+        assert_eq!(result.argv[0], "swebench-docker");
+    }
+
+    #[test]
+    fn git_model_patch_omits_runtime_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git_in(root, &["init", "-b", "main"]);
+        git_in(root, &["config", "user.email", "eval@test"]);
+        git_in(root, &["config", "user.name", "eval"]);
+        std::fs::write(root.join("app.py"), "print(1)\n").unwrap();
+        git_in(root, &["add", "app.py"]);
+        git_in(root, &["commit", "-m", "seed"]);
+        std::fs::write(root.join("app.py"), "print(2)\n").unwrap();
+        std::fs::create_dir_all(root.join(".focus-agent/authority")).unwrap();
+        std::fs::write(root.join(".focus-agent/authority/secret.jsonl"), "lease\n").unwrap();
+        let patch = git_model_patch(root).unwrap();
+        assert!(patch.contains("print(2)"), "{patch}");
+        assert!(
+            !patch.contains(".focus-agent"),
+            "runtime dir leaked into prediction:\n{patch}"
+        );
+        assert!(!patch.contains("secret.jsonl"), "{patch}");
+    }
+
+    fn git_in(cwd: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git {args:?} failed: {status}");
     }
 
     #[test]

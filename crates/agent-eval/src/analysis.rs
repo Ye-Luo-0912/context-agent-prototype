@@ -1,10 +1,11 @@
-//! EVAL-01.2 / EVAL-01.3 / EVAL-01.3b：正式门禁的预注册分析。
+//! EVAL-01.2 / EVAL-01.3 / EVAL-01.3b / EVAL-01.3c：正式门禁的预注册分析。
 //!
 //! EVAL-01.2 冻结估计量、聚类、单侧区间、ITT 规则，以及历史 30×3 功效表。
 //! EVAL-01.3 在收集接受细胞之前，用同一模型重冻 n/repeats：300 题 × 3 次重复。
 //! 边际保持 −5 pp。EVAL-01.3b 冻结套件并声明检索次级指标，不改门禁 n/边际。
+//! EVAL-01.3c 锁死 exact 300 acceptance ids，并让 token 诊断遵守 cost_eligible。
 //!
-//! 不把 `--repeats` 烟雾当成独立任务。300×3 接受细胞须先做冻结的 ~30×3 校准。
+//! 不把 `--repeats` 烟雾当成独立任务。300×3 接受细胞须先做剩余校准。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -29,7 +30,8 @@ pub const HISTORICAL_REPEATS: u32 = 3;
 /// 290×3 只有 4003/5000（刀口），300×3 才锁成门禁 n。
 pub const MIN_TASKS: usize = 300;
 pub const GATE_REPEATS: u32 = 3;
-/// 接受套件已冻结（EVAL-01.3b）。300×3 接受细胞仍须先做 ~30×3 校准。
+/// 接受套件已冻结（EVAL-01.3b）。EVAL-01.3c 锁死 exact 300 ids。
+/// 300×3 接受细胞仍须先做剩余校准。
 pub const SUITE_FROZEN: bool = true;
 
 const POWER_SEED: u64 = 2026_08_14;
@@ -45,9 +47,10 @@ itt=timeout, round-cap, runtime error, missing cell => success 0; never drop the
 cost_eligible=usage complete, journaled seq contiguous, broadcast_lagged=0; ineligible cost is omitted from token diagnostics only
 interval=one-sided 95% Student-t LCL on the n_tasks paired differences
 margin=-0.05
-gate=LCL>=-0.05 AND n_tasks>=300 AND every task has 3 repeats AND suite_frozen
+gate=LCL>=-0.05 AND n_tasks==300 AND evidence_ids==acceptance_ids AND every task has 3 repeats AND suite_frozen
 repeats_are_not_tasks=true
 both_pass_tokens=secondary diagnostic only
+cost_missing_rate=share of intended A/C pairs that fail cost_eligible; omitted from token means; not in the primary LCL gate
 arm_order=Fisher-Yates of [append,rolling,dynamic] from splitmix64(sha256(agent-eval.arm-order.v1||fixture||repeat)); live only
 power_seed=20260814
 power_sims=5000
@@ -60,10 +63,17 @@ design=300 tasks x 3 repeats (100/100/100)
 power_result_d0=4048/5000
 power_result_d_m05=258/5000
 power_result_d_m10=0/5000
-power_note=EVAL-01.3b freezes the suite and declares retrieval secondaries; n/repeats/margin stay EVAL-01.3 (300x3, -5pp); do not collect 300x3 acceptance cells until the frozen ~30x3 calibration pilot; do not invent tasks
+power_note=EVAL-01.3c locks exact 300 acceptance ids (pilot 30 is a subset); n/repeats/margin stay EVAL-01.3 (300x3, -5pp); pack remains 509 and is not an optional pool; SWE-bench large n=46 so harvest sizes are 107/147/46; power-model thirds stay index-based; do not collect 300x3 acceptance cells until remaining calibration; do not invent tasks
 suite_frozen=true
 suite_pack=agent-eval.suite.v1 n=509 (9 file + 500 princeton-nlp/SWE-bench_Verified)
+acceptance_ids=agent-eval.acceptance.v1 n=300 sha256=7ff6b5ddefc7e6e6dc138e5e582de75b0cfc4f5eba831385cc550e4df8c124a7
 retrieval_secondaries=search recall/latency, found-after-forgotten, graded-access distribution; same A/B/C cells; not in the primary LCL gate
+live_protocol=eval-01.5.p1
+live_send_window=provider context_window (eval live default 128000; OPENAI_CONTEXT_WINDOW overrides); kernel 24000 is not the send fallback when a window is declared
+live_pack_budget=min(kernel context_budget_tokens, send window); C/B pack against this
+live_A=append retains history; runtime trims to send window (grows until window); not a smaller send than C
+live_rounds=48 shared A/B/C (harness and kernel max_tool_rounds); do not give C a higher cap than A; C extra rounds under the cap are a treatment effect
+p0_protocol=send=kernel-fallback 19904 rounds=12; file-only 81 cells plus SWE-bench floor cells; do not mix p0 and p1 in one ITT table
 ";
 
 #[derive(Debug, Clone)]
@@ -127,6 +137,14 @@ pub struct CostSummary {
 }
 
 #[derive(Debug, Clone)]
+pub struct CostMissing {
+    pub intended_pairs: u32,
+    pub eligible_pairs: u32,
+    pub missing_pairs: u32,
+    pub missing_rate: f64,
+}
+
+#[derive(Debug, Clone)]
 pub struct GateReport {
     pub spec_sha256: String,
     pub suite_frozen: bool,
@@ -136,8 +154,9 @@ pub struct GateReport {
     pub interval: Option<Interval>,
     pub tasks: Vec<TaskPair>,
     pub power: PowerReport,
-    pub itt_cost: Option<CostSummary>,
+    pub cost_eligible_cost: Option<CostSummary>,
     pub both_pass_cost: Option<CostSummary>,
+    pub cost_missing: Option<CostMissing>,
     pub outcomes: BTreeMap<&'static str, u32>,
 }
 
@@ -267,9 +286,11 @@ pub fn analyze(cells: &[CellRecord]) -> GateReport {
             Err(_) => reasons.push("SUITE_FROZEN but suite pack unreadable".into()),
         }
     }
-    if tasks.len() < MIN_TASKS {
-        reasons.push(format!("n_tasks={} < {MIN_TASKS}", tasks.len()));
+    if tasks.len() != MIN_TASKS {
+        reasons.push(format!("n_tasks={} != {MIN_TASKS}", tasks.len()));
     }
+    let observed_ids: BTreeSet<String> = tasks.iter().map(|task| task.fixture_id.clone()).collect();
+    reasons.extend(crate::acceptance::evidence_id_reasons(&observed_ids));
     match observed_repeats(&tasks) {
         Some(repeats) if repeats == GATE_REPEATS => {}
         Some(repeats) => reasons.push(format!("repeats={repeats} (gate requires {GATE_REPEATS})")),
@@ -297,8 +318,9 @@ pub fn analyze(cells: &[CellRecord]) -> GateReport {
         ineligible_reasons: reasons,
         decision,
         interval,
-        itt_cost: cost_summary(cells, false),
+        cost_eligible_cost: cost_summary(cells, false),
         both_pass_cost: cost_summary(cells, true),
+        cost_missing: cost_missing(cells),
         tasks,
         power: power_simulation(),
         outcomes: outcome_histogram(cells),
@@ -362,7 +384,7 @@ pub fn render_preregister() -> String {
     out.push_str("design 300x3 (EVAL-01.3 gate n/repeats):\n");
     out.push_str(&render_power(&design));
     out.push_str(
-        "power note: n/repeats/margin frozen; suite frozen; retrieval secondaries declared; do not collect 300x3 acceptance cells until the ~30x3 calibration pilot; this is not an M15 close.\n",
+        "power note: n/repeats/margin frozen; suite frozen; exact 300 acceptance ids locked; retrieval secondaries declared; do not collect 300x3 acceptance cells until remaining calibration; this is not an M15 close.\n",
     );
     if let Ok(pack) = crate::suite::load_pack() {
         if let Ok(sample) = crate::pilot::select_pilot(&pack) {
@@ -370,6 +392,13 @@ pub fn render_preregister() -> String {
                 "calibration sample: n={} sha256={} (--pilot / --pilot-run / --pilot-calibrate; decision=pilot)\n",
                 sample.tasks.len(),
                 sample.sha256
+            ));
+        }
+        if let Ok(ids) = crate::acceptance::select_acceptance(&pack) {
+            out.push_str(&format!(
+                "acceptance ids: n={} sha256={} (--acceptance; gate requires this exact set)\n",
+                ids.len(),
+                crate::acceptance::FROZEN_ACCEPTANCE_SHA256
             ));
         }
     }
@@ -420,12 +449,23 @@ pub fn render_report(report: &GateReport) -> String {
             task.diff
         ));
     }
-    if let Some(cost) = &report.itt_cost {
+    if let Some(missing) = &report.cost_missing {
         out.push_str(&format!(
-            "itt tokens (all intended pairs): n={} mean_A={:.1} mean_C={:.1} C-A={:+.1} rounds A/C={:.1}/{:.1} tools A/C={:.1}/{:.1}\n",
+            "cost-missing rate: intended={} eligible={} missing={} rate={:.3} (usage incomplete / seq gap / broadcast lagged / missing arm; not in the LCL gate)\n",
+            missing.intended_pairs,
+            missing.eligible_pairs,
+            missing.missing_pairs,
+            missing.missing_rate
+        ));
+    }
+    if let Some(cost) = &report.cost_eligible_cost {
+        out.push_str(&format!(
+            "cost-eligible tokens (paired, usage complete): n={} mean_A={:.1} mean_C={:.1} C-A={:+.1} rounds A/C={:.1}/{:.1} tools A/C={:.1}/{:.1}\n",
             cost.pairs, cost.mean_a_input, cost.mean_c_input, cost.mean_c_minus_a,
             cost.mean_a_rounds, cost.mean_c_rounds, cost.mean_a_tools, cost.mean_c_tools
         ));
+    } else {
+        out.push_str("cost-eligible tokens (paired, usage complete): no eligible pairs\n");
     }
     if let Some(cost) = &report.both_pass_cost {
         out.push_str(&format!(
@@ -438,7 +478,7 @@ pub fn render_report(report: &GateReport) -> String {
     }
     out.push_str(&render_power(&report.power));
     out.push_str(
-        "this is still not an M15 close: the gate also requires a frozen 300-task suite and a model-backed B.\n",
+        "this is still not an M15 close: the gate also requires the exact frozen 300 ids and a model-backed B.\n",
     );
     out
 }
@@ -641,14 +681,24 @@ fn observed_repeats(tasks: &[TaskPair]) -> Option<u32> {
     }
 }
 
-fn cost_summary(cells: &[CellRecord], both_pass: bool) -> Option<CostSummary> {
-    let mut by_key: BTreeMap<(String, u32), Vec<&CellRecord>> = BTreeMap::new();
+fn paired_ac<'a>(
+    cells: &'a [CellRecord],
+) -> impl Iterator<Item = (&'a CellRecord, &'a CellRecord)> {
+    let mut by_key: BTreeMap<(String, u32), Vec<&'a CellRecord>> = BTreeMap::new();
     for cell in cells {
         by_key
             .entry((cell.fixture_id.clone(), cell.repeat))
             .or_default()
             .push(cell);
     }
+    by_key.into_values().filter_map(|rows| {
+        let a = rows.iter().copied().find(|cell| cell.engine == "append")?;
+        let c = rows.iter().copied().find(|cell| cell.engine == "dynamic")?;
+        Some((a, c))
+    })
+}
+
+fn cost_summary(cells: &[CellRecord], both_pass: bool) -> Option<CostSummary> {
     let mut n = 0u32;
     let mut sum_a = 0.0;
     let mut sum_c = 0.0;
@@ -656,21 +706,11 @@ fn cost_summary(cells: &[CellRecord], both_pass: bool) -> Option<CostSummary> {
     let mut sum_c_rounds = 0.0;
     let mut sum_a_tools = 0.0;
     let mut sum_c_tools = 0.0;
-    for rows in by_key.values() {
-        let Some(a) = rows.iter().find(|cell| cell.engine == "append") else {
+    for (a, c) in paired_ac(cells) {
+        if !a.cost_eligible() || !c.cost_eligible() {
             continue;
-        };
-        let Some(c) = rows.iter().find(|cell| cell.engine == "dynamic") else {
-            continue;
-        };
-        if both_pass {
-            if !a.itt_success() || !c.itt_success() {
-                continue;
-            }
-            if !a.cost_eligible() || !c.cost_eligible() {
-                continue;
-            }
-        } else if a.missing && c.missing {
+        }
+        if both_pass && (!a.itt_success() || !c.itt_success()) {
             continue;
         }
         n += 1;
@@ -695,6 +735,27 @@ fn cost_summary(cells: &[CellRecord], both_pass: bool) -> Option<CostSummary> {
         mean_c_rounds: sum_c_rounds / n as f64,
         mean_a_tools: sum_a_tools / n as f64,
         mean_c_tools: sum_c_tools / n as f64,
+    })
+}
+
+fn cost_missing(cells: &[CellRecord]) -> Option<CostMissing> {
+    let mut intended_pairs = 0u32;
+    let mut eligible_pairs = 0u32;
+    for (a, c) in paired_ac(cells) {
+        intended_pairs += 1;
+        if a.cost_eligible() && c.cost_eligible() {
+            eligible_pairs += 1;
+        }
+    }
+    if intended_pairs == 0 {
+        return None;
+    }
+    let missing_pairs = intended_pairs - eligible_pairs;
+    Some(CostMissing {
+        intended_pairs,
+        eligible_pairs,
+        missing_pairs,
+        missing_rate: missing_pairs as f64 / intended_pairs as f64,
     })
 }
 
@@ -961,12 +1022,11 @@ mod tests {
     #[test]
     fn frozen_full_size_synthetic_cells_are_gate_eligible() {
         let mut cells = Vec::new();
-        for task in 0..MIN_TASKS {
-            let id = format!("t{task:03}");
+        for id in crate::acceptance::frozen_ids() {
             for repeat in 1..=GATE_REPEATS {
-                cells.push(cell(&id, repeat, "append", true));
-                cells.push(cell(&id, repeat, "rolling", true));
-                cells.push(cell(&id, repeat, "dynamic", true));
+                cells.push(cell(id, repeat, "append", true));
+                cells.push(cell(id, repeat, "rolling", true));
+                cells.push(cell(id, repeat, "dynamic", true));
             }
         }
         let report = analyze(&cells);
@@ -986,8 +1046,91 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("n_tasks="))
         );
+        assert!(
+            !report
+                .ineligible_reasons
+                .iter()
+                .any(|reason| reason.contains("evidence ids")),
+            "{:?}",
+            report.ineligible_reasons
+        );
         assert!(report.eligible, "{:?}", report.ineligible_reasons);
         assert_eq!(report.decision, "pass");
+    }
+
+    #[test]
+    fn any_300_from_the_pack_is_not_gate_eligible() {
+        let mut cells = Vec::new();
+        for task in 0..MIN_TASKS {
+            let id = format!("t{task:03}");
+            for repeat in 1..=GATE_REPEATS {
+                cells.push(cell(&id, repeat, "append", true));
+                cells.push(cell(&id, repeat, "rolling", true));
+                cells.push(cell(&id, repeat, "dynamic", true));
+            }
+        }
+        let report = analyze(&cells);
+        assert_eq!(report.tasks.len(), MIN_TASKS);
+        assert!(!report.eligible);
+        assert_eq!(report.decision, "ineligible");
+        assert!(
+            report
+                .ineligible_reasons
+                .iter()
+                .any(|reason| reason.contains("evidence ids")),
+            "{:?}",
+            report.ineligible_reasons
+        );
+    }
+
+    #[test]
+    fn usage_incomplete_zeros_are_omitted_from_cost_not_from_itt() {
+        let mut cells = vec![
+            CellRecord {
+                model_input_tokens: 100,
+                ..cell("ok", 1, "append", true)
+            },
+            CellRecord {
+                model_input_tokens: 200,
+                ..cell("ok", 1, "dynamic", true)
+            },
+            CellRecord {
+                model_input_tokens: 0,
+                usage_incomplete: true,
+                passed: false,
+                outcome: "verify_failed".into(),
+                ..cell("uuid-like", 1, "append", false)
+            },
+            CellRecord {
+                model_input_tokens: 0,
+                usage_incomplete: true,
+                passed: false,
+                outcome: "verify_failed".into(),
+                ..cell("uuid-like", 1, "dynamic", false)
+            },
+        ];
+        cells.push(cell("ok", 1, "rolling", true));
+        cells.push(cell("uuid-like", 1, "rolling", false));
+        let report = analyze(&cells);
+        assert_eq!(report.tasks.len(), 2);
+        let uuid = report
+            .tasks
+            .iter()
+            .find(|task| task.fixture_id == "uuid-like")
+            .unwrap();
+        assert_eq!(uuid.a_successes, 0);
+        assert_eq!(uuid.c_successes, 0);
+        let missing = report.cost_missing.as_ref().unwrap();
+        assert_eq!(missing.intended_pairs, 2);
+        assert_eq!(missing.eligible_pairs, 1);
+        assert!((missing.missing_rate - 0.5).abs() < 1e-12);
+        let cost = report.cost_eligible_cost.as_ref().unwrap();
+        assert_eq!(cost.pairs, 1);
+        assert!((cost.mean_a_input - 100.0).abs() < 1e-12);
+        assert!((cost.mean_c_input - 200.0).abs() < 1e-12);
+        let text = render_report(&report);
+        assert!(text.contains("cost-eligible tokens"));
+        assert!(!text.contains("itt tokens (all intended pairs)"));
     }
 
     #[test]
@@ -996,7 +1139,7 @@ mod tests {
         assert_eq!(spec_sha256().len(), 64);
         assert_eq!(
             spec_sha256(),
-            "c28a2ea8d54077d821a0cc7e121d2639b999e25108f2d9c618452ffd711de2b6"
+            "2469ebcab44b6246ed35f1c82a35574d262ecb4b3912b858eb13dca407c344c2"
         );
         assert_eq!(ANALYSIS_SCHEMA, crate::bundle::ANALYSIS_SCHEMA);
         assert!(SPEC.contains("schema=agent-eval.analysis.v2"));
@@ -1006,7 +1149,14 @@ mod tests {
         assert!(SPEC.contains("suite_frozen=true"));
         assert!(SPEC.contains("retrieval_secondaries="));
         assert!(SPEC.contains("margin=-0.05"));
-        assert!(SPEC.contains("n_tasks>=300"));
+        assert!(SPEC.contains("n_tasks==300"));
+        assert!(SPEC.contains("evidence_ids==acceptance_ids"));
+        assert!(SPEC.contains("acceptance_ids=agent-eval.acceptance.v1"));
+        assert!(SPEC.contains("cost_missing_rate="));
+        assert!(SPEC.contains("live_protocol=eval-01.5.p1"));
+        assert!(SPEC.contains("live_rounds=48 shared"));
+        assert!(SPEC.contains("p0_protocol="));
+        assert!(SPEC.contains(crate::acceptance::FROZEN_ACCEPTANCE_SHA256));
         assert!(crate::workload::render_fixtures().contains(&format!(
             "{}/{}",
             crate::workload::FIXTURES.len(),

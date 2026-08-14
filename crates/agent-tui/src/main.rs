@@ -59,9 +59,11 @@ async fn main() -> anyhow::Result<()> {
     // The context engine and the model are composition-root choices shared
     // with CLI/eval (agent-compose): the same kernel, tools and UI run
     // against any `ContextEngine` implementation (the A/B/C baselines, and
-    // the process-boundary adapter).
-    let context_engine = build_context_engine(policy, workspace.state_dir()).await?;
+    // the process-boundary adapter). Rolling/dynamic 与 live eval 共用同一
+    // 有界压缩器，避免 TUI 仍走占位折叠。
     let model = model_from_env();
+    let context_engine =
+        build_context_engine(policy, workspace.state_dir(), Some(model.clone())).await?;
     if read_only && !grant_args.is_empty() {
         anyhow::bail!("--grant cannot be combined with --read-only");
     }
@@ -108,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         journal: Some(journal),
         artifact_store: Some(artifact_store),
         output_broker: Some(output_broker),
+        max_tool_rounds: None,
     })
     .await?;
     let mut runtime_events = composed.subscribe();

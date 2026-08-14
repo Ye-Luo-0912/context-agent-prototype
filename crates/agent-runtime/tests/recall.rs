@@ -18,10 +18,11 @@ use agent_contracts::{
     AgentError, AgentResult, CONTEXT_MANAGE, ContextConsumptionAck, ContextDiagnostics,
     ContextEngine, ContextGcReport, ContextHints, ContextIngress, ContextItem, ContextItemId,
     ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
-    ContextQuery, ContextSearchQuery, ContextStateTransition, EngineQuery, ExternalizedContext,
-    FocusState, MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport,
-    RuntimeEvent, ScopeId, ScopeKind, StorageGcReport, StoreReconcileReport, TaskId, ToolCall,
-    ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    ContextQuery, ContextResidency, ContextSearchQuery, ContextStateTransition, EngineQuery,
+    ExternalizedContext, FocusState, MaterializedContext, ModelCapabilities, ModelOutput,
+    ModelRequest, ModelTransport, RuntimeEvent, ScopeId, ScopeKind, StorageGcReport,
+    StoreReconcileReport, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome,
+    ToolOutput, ToolRisk, ToolSpec,
 };
 
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
@@ -606,9 +607,19 @@ async fn recall_turn_pulls_external_content_back_without_polluting_the_prompt() 
         summaries.iter().any(|s| s.id == target_id),
         "the recalled entry must be resident with its original id"
     );
+    let recalled = engine
+        .inspect_external(target_id)
+        .await
+        .unwrap()
+        .expect("catalog inspect covers the heap after recall");
+    assert_eq!(
+        recalled.residency,
+        ContextResidency::Resident,
+        "recall is a location move into the working set, not a store miss"
+    );
     assert!(
-        engine.inspect_external(target_id).await.unwrap().is_none(),
-        "a recalled entry leaves the external map (it lives in the heap again)"
+        engine.fetch_external(target_id).await.unwrap().is_none(),
+        "fetch stays a store read; the recalled body is not a store blob"
     );
 }
 
@@ -741,9 +752,19 @@ async fn admit_and_derive_through_the_runtime_never_duplicate_observations() {
         summaries.iter().any(|s| s.kind == ContextKind::Note),
         "the derived fact must be persisted as a new Note"
     );
+    let admitted_entry = engine
+        .inspect_external(target_id)
+        .await
+        .unwrap()
+        .expect("catalog inspect covers the admitted heap item");
+    assert_eq!(
+        admitted_entry.residency,
+        ContextResidency::Resident,
+        "admit is a location move into the working set, not a store miss"
+    );
     assert!(
-        engine.inspect_external(target_id).await.unwrap().is_none(),
-        "the admitted item must leave the external map (no duplicate owner)"
+        engine.fetch_external(target_id).await.unwrap().is_none(),
+        "the admitted item must leave the store (no duplicate owner)"
     );
     // The two seeded step observations remain the only ToolObservations in
     // the logical catalog (one warm in the buffer, one admitted back into

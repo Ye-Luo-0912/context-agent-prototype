@@ -133,7 +133,11 @@ cannot break the frame. And the engine's budget is a *target*: the
 runtime re-estimates the fully assembled request (system + focus +
 context + turn + tool schemas, including the rendering overhead the
 engine never sees) and trims the context frame if the wire estimate
-exceeds the provider window. The engine proposes; the runtime disposes.
+exceeds the send input budget (`provider context_window - output
+reserve`, not the kernel pack cap). The engine proposes; the runtime
+disposes. Pack and send are split: C materializes against
+`min(kernel context_budget_tokens, send window)`; A may retain history
+until the send guard trims.
 
 Selection and consumption are separate operations:
 
@@ -468,15 +472,19 @@ The catalog directory is a single `item_id -> location` record per id
 (Resident / Warm / Stored) with shared query indexes (id / task / scope /
 kind / entity / label / residency / attention). Authority metadata stays
 on the body; GC moves location. `context.search` generates candidates from
-those indexes; a free-text needle that hits no entity/label key still
-residual-scans summaries/uris. See `docs/AUDIT_TODO.md` CTX-02.
+those indexes across Resident/Warm/Stored; a live working-set file is a
+catalog hit (heap projection), not an empty miss. A free-text needle that
+hits no entity/label key still residual-scans summaries/uris/bodies. See
+`docs/AUDIT_TODO.md` CTX-02.
 
 ### Retrieval results are transient; admit and derive move items deliberately (CTX-03)
 
 The model-facing retrieval loop (`context.manage` op=search/inspect/fetch)
-is a **store read, not an observation**: the result is visible to the
-current turn through the tool result, but finalization must not persist it
-under a new `ToolObservation` id. Every `TurnFrameStep::ToolResult` carries
+is **not an observation**: search/inspect may return catalog projections
+(including Resident/Warm heap descriptors); fetch remains a store read.
+The result is visible to the current turn through the tool result, but
+finalization must not persist it under a new `ToolObservation` id. Every
+`TurnFrameStep::ToolResult` carries
 a `ToolResultDisposition`:
 
 - `PersistObservation` (default) — the result becomes a long-term
@@ -847,9 +855,13 @@ a missing override cannot pass by returning the trait default. Three
 always-loaded
 read-only meta-tools (`context.search` / `context.inspect` /
 `context.fetch`) produce an `EngineQuery` the kernel resolves against the
-engine (invariant 3 — tools still never touch the engine). The prompt's
-`EXTERNAL CONTEXT` section shows refs only (uri + kind/scope + summary) and
-explicitly points the model at the retrieval loop; `fetch` stamps recency
+engine (invariant 3 — tools still never touch the engine). As of
+2026-08-15, search/inspect cover the live catalog (Resident/Warm
+projections plus Stored), so a file still in SELECTED WORKING CONTEXT is
+a hit with `residency=` as data, not an empty miss. `fetch_external`
+stays a store read; a Resident/Warm id states that the body is already
+in the working set. The prompt's `EXTERNAL CONTEXT` section shows refs
+only (uri + id + kind/scope + residency + summary); `fetch` stamps recency
 and the GC generation on the entry so ranking and Cold -> External aging
 stay honest. A fetch is a deliberate read, not an automatic reactivation —
 the model decides what re-enters the working set. The whole loop is

@@ -21,7 +21,10 @@ mod surface;
 pub mod task;
 
 pub use actor::spawn_runtime;
-pub use budget::{DEFAULT_OUTPUT_RESERVE, ModelBudget, approx_layer_tokens};
+pub use budget::{
+    DEFAULT_OUTPUT_RESERVE, ModelBudget, approx_layer_tokens, engine_pack_window,
+    provider_send_window,
+};
 pub use capability::{
     CapabilityAwareDispatcher, CapabilityCatalogEntry, CapabilityRegistry, CapabilityRunState,
 };

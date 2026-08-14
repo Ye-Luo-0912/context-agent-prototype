@@ -33,8 +33,10 @@ use context_simple::{SimpleContextConfig, SimpleContextEngine};
 use provider_openai::{OpenAiConfig, OpenAiProvider, RetryingTransport};
 use tokio::sync::broadcast;
 
+mod compactor;
 mod mock_model;
 
+pub use compactor::ModelBackedCompactor;
 pub use mock_model::MockModelTransport;
 
 /// The context-engine policy, a composition-root choice shared by every
@@ -77,19 +79,35 @@ impl ContextPolicy {
 /// lives under the run's state directory — never guessed from the CWD, so a
 /// run started from a crate directory does not scatter `.focus-agent`
 /// folders around the tree.
+///
+/// `model` 非空时，rolling / dynamic 注入同一有界压缩器：B 折叠和 C 的
+/// `TaskCompleted` 蒸馏共用，比较的是生命周期而不是摘要质量。`append` 和
+/// 进程外 `service` 不注入（子进程引擎没有这条 in-process 注入缝）。
 pub async fn build_context_engine(
     policy: ContextPolicy,
     state_dir: &Path,
+    model: Option<Arc<dyn ModelTransport>>,
 ) -> anyhow::Result<Arc<dyn ContextEngine>> {
+    let compactor = model.map(|model| Arc::new(ModelBackedCompactor::new(model)));
     match policy {
         ContextPolicy::Append => Ok(Arc::new(AppendOnlyEngine::new())),
-        ContextPolicy::Rolling => Ok(Arc::new(RollingSummaryEngine::with_config(
-            RollingConfig::default(),
-        ))),
-        ContextPolicy::Dynamic => Ok(Arc::new(SimpleContextEngine::new(SimpleContextConfig {
-            context_store_dir: Some(state_dir.join("context-store")),
-            ..SimpleContextConfig::default()
-        }))),
+        ContextPolicy::Rolling => {
+            let engine = RollingSummaryEngine::with_config(RollingConfig::default());
+            Ok(Arc::new(match compactor {
+                Some(compactor) => engine.with_compactor(compactor),
+                None => engine,
+            }))
+        }
+        ContextPolicy::Dynamic => {
+            let engine = SimpleContextEngine::new(SimpleContextConfig {
+                context_store_dir: Some(state_dir.join("context-store")),
+                ..SimpleContextConfig::default()
+            });
+            Ok(Arc::new(match compactor {
+                Some(compactor) => engine.with_compactor(compactor),
+                None => engine,
+            }))
+        }
         ContextPolicy::Service => connect_engine(&ContextServiceConfig {
             engine: ServiceEngine::Dynamic,
             // The service's context store must live under the workspace
@@ -109,6 +127,7 @@ pub async fn build_context_engine(
 /// - `OPENAI_BASE_URL` (default `https://api.openai.com/v1`) — point at
 ///   DeepSeek (`https://api.deepseek.com/v1`), Qwen, Moonshot, GLM, ...
 /// - `OPENAI_MODEL` (default `gpt-4o-mini`)
+/// - `OPENAI_CONTEXT_WINDOW` (default 128000 declared send window)
 pub fn model_from_env() -> Arc<dyn ModelTransport> {
     let Ok(api_key) = std::env::var("OPENAI_API_KEY") else {
         return Arc::new(MockModelTransport);
@@ -120,6 +139,7 @@ pub fn model_from_env() -> Arc<dyn ModelTransport> {
     let base_url = std::env::var("OPENAI_BASE_URL")
         .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
     let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let context_window = env_declared_context_window();
     let provider = OpenAiProvider::new(OpenAiConfig {
         api_key,
         base_url,
@@ -129,12 +149,23 @@ pub fn model_from_env() -> Arc<dyn ModelTransport> {
         send_stream_options: true,
         send_max_tokens: true,
         max_stream_bytes: provider_openai::DEFAULT_MAX_STREAM_BYTES,
+        context_window: Some(context_window),
     });
     Arc::new(RetryingTransport::new(
         provider,
         3,
         std::time::Duration::from_millis(500),
     ))
+}
+
+fn env_declared_context_window() -> usize {
+    match std::env::var("OPENAI_CONTEXT_WINDOW") {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .trim()
+            .parse()
+            .unwrap_or(provider_openai::DEFAULT_DECLARED_CONTEXT_WINDOW),
+        _ => provider_openai::DEFAULT_DECLARED_CONTEXT_WINDOW,
+    }
 }
 
 /// Everything a composed run differs on. The composition root (TUI/CLI/
@@ -162,6 +193,9 @@ pub struct ComposeConfig {
     /// Optional output broker (bounds every model-facing tool field and
     /// spills oversized content under the run's artifact directory).
     pub output_broker: Option<Arc<dyn agent_contracts::OutputBroker>>,
+    /// Live eval 把内核 tool-loop 上限抬到与 harness 相同的共享 cap。
+    /// `None` 保持 `CoreAuthorityConfig` 默认 16（TUI）。不要给 C 比 A 更高的上限。
+    pub max_tool_rounds: Option<usize>,
 }
 
 /// A composed runtime. Owns the workspace and the spawned `RuntimeInstance`
@@ -214,6 +248,7 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         journal,
         artifact_store,
         output_broker,
+        max_tool_rounds,
     } = config;
 
     let mut host = ModuleHost::new();
@@ -258,12 +293,16 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         )?
         .0,
     );
+    let mut authority = CoreAuthorityConfig {
+        output_broker,
+        ..CoreAuthorityConfig::default()
+    };
+    if let Some(max_tool_rounds) = max_tool_rounds {
+        authority.max_tool_rounds = max_tool_rounds;
+    }
     let services = RuntimeServices::from_registry_with_operation_journal(
         host.registry(),
-        CoreAuthorityConfig {
-            output_broker,
-            ..CoreAuthorityConfig::default()
-        },
+        authority,
         AuthorityRecoveryServices::new(operation_journal, Some(Arc::new(workspace.clone()))),
     )?;
     let instance = RuntimeInstance::spawn(host, services);

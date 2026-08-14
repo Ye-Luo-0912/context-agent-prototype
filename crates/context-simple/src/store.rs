@@ -18,7 +18,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use agent_contracts::{
-    ContextItem, ContextItemId, ContextRef, ContextResidency, ContextRetention,
+    AccessSignal, ContextItem, ContextItemId, ContextRef, ContextResidency, ContextRetention,
     ExternalizedContext, StorageGcReport, StoreReconcileReport,
 };
 
@@ -136,25 +136,97 @@ pub(crate) async fn read_item_async(dir: &Path, item_id: ContextItemId) -> Optio
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Deterministic search over externalized refs — no vectors, no store
-/// reads. Candidate generation prefers the catalog indexes (kind/scope/
-/// task/label/entity keys); a free-text needle that hits none of those
-/// keys residual-scans summaries/uris so coverage stays the same as the
-/// previous full-history walk. Ranking is unchanged: entity matches first,
-/// then recency, bounded to `limit`.
+/// Deterministic catalog search — no vectors. Candidate generation prefers
+/// the catalog indexes (kind/scope/task/label/entity keys) across Resident,
+/// Warm, and Stored. A free-text needle that hits none of those keys
+/// residual-scans summaries/uris/bodies. Ranking is unchanged: entity
+/// matches first, then recency, bounded to `limit`. Resident/Warm hits are
+/// projected descriptors (no store read) so a live file is not an empty miss.
 pub(crate) fn search_catalog(
     state: &State,
     query: &agent_contracts::ContextSearchQuery,
 ) -> Vec<ExternalizedContext> {
-    match state.catalog.stored_search_ids(query) {
-        Some(ids) => {
-            let entries: Vec<&ExternalizedContext> = ids
-                .iter()
-                .filter_map(|id| state.external.get(*id))
-                .collect();
-            search_entries(entries, query)
+    let projected: Vec<ExternalizedContext> = match state.catalog.search_ids(query) {
+        Some(ids) => ids
+            .into_iter()
+            .filter_map(|id| project_search_hit(state, id))
+            .collect(),
+        None => project_all_live(state),
+    };
+    search_entries(projected.iter(), query)
+}
+
+fn project_all_live(state: &State) -> Vec<ExternalizedContext> {
+    let mut rows = Vec::new();
+    for item in state.items.iter() {
+        if item.semantic.is_live() {
+            rows.push(project_item(item));
         }
-        None => search_entries(state.external.iter(), query),
+    }
+    for item in &state.eviction_buffer {
+        if item.semantic.is_live() {
+            rows.push(project_item(item));
+        }
+    }
+    rows.extend(
+        state
+            .external
+            .iter()
+            .filter(|entry| externally_retrievable(entry))
+            .cloned(),
+    );
+    rows
+}
+
+pub(crate) fn project_search_hit(state: &State, id: ContextItemId) -> Option<ExternalizedContext> {
+    if let Some(index) = state.items.indexes().get(id) {
+        let item = &state.items[index];
+        return item.semantic.is_live().then(|| project_item(item));
+    }
+    if let Some(item) = state.eviction_buffer.iter().find(|item| item.id == id) {
+        return item.semantic.is_live().then(|| project_item(item));
+    }
+    state
+        .external
+        .get(id)
+        .filter(|entry| externally_retrievable(entry))
+        .cloned()
+}
+
+/// 驻留/Warm 条目的检索投影：权威元数据来自 heap，不读 store。
+fn project_item(item: &ContextItem) -> ExternalizedContext {
+    ExternalizedContext {
+        item_id: item.id,
+        task_id: item.task_id,
+        scope_id: item.scope_id,
+        kind: item.kind,
+        scope: item.scope,
+        retention: item.retention,
+        attention: item.attention,
+        semantic: item.semantic,
+        context_ref: make_context_ref(item),
+        externalized_at_tick: 0,
+        last_access_tick: item.last_access_tick,
+        residency: item.residency,
+        entities: item.entities.clone(),
+        tags: item.tags.clone(),
+        dependencies: item.dependencies.clone(),
+        keep_alive: item.keep_alive,
+        lease_until_turn: item.lease_until_turn,
+        last_access_gc_epoch: None,
+        blob_checksum: None,
+        source: item.source.clone(),
+        importance: item.importance,
+        relevance: item.relevance,
+        created_tick: item.created_tick,
+        created_turn: item.created_turn,
+        last_access_turn: item.last_access_turn,
+        last_selected_turn: item.last_selected_turn,
+        access_count: item.access_count,
+        last_access_signal: AccessSignal::None,
+        search_reinforce_count: 0,
+        gc_generation: item.gc_generation,
+        evicted_at_tick: item.evicted_at_tick,
     }
 }
 

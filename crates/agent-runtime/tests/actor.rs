@@ -21,7 +21,7 @@ use agent_contracts::{
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{
     ModelBudget, ModuleHost, RuntimeHandle, RuntimeInstance, RuntimeServices, approx_layer_tokens,
-    spawn_runtime,
+    engine_pack_window, spawn_runtime,
 };
 
 #[derive(Debug)]
@@ -287,7 +287,7 @@ async fn stop_ends_the_actor_cleanly() {
 }
 
 /// Records every `ContextQuery` the actor hands to the engine, so a test can
-/// assert what slice of the provider window actually reaches the working set.
+/// assert what slice of the pack window actually reaches the working set.
 #[derive(Debug, Default)]
 struct RecordingContextEngine {
     queries: Mutex<Vec<ContextQuery>>,
@@ -419,15 +419,21 @@ async fn engine_receives_only_the_context_frame_budget() {
     // The turn is a single model round; the engine query is recorded before
     // the actor replies, so the budget is observable immediately.
     let turn_tokens = approx_layer_tokens(&[ModelMessage::user("hello")]);
-    let expected = ModelBudget::compute(30_000, 2_000, system_tokens, turn_tokens, tools_tokens)
-        .context_frame_budget;
+    let pack_window = engine_pack_window(Some(30_000), 24_000);
+    let expected =
+        ModelBudget::compute(pack_window, 2_000, system_tokens, turn_tokens, tools_tokens)
+            .context_frame_budget;
 
     {
         let queries = context.queries.lock().unwrap();
         assert_eq!(queries.len(), 1, "one model round -> one materialization");
         assert_eq!(
             queries[0].budget_tokens, expected,
-            "the engine must receive the window minus output/system/turn/tools"
+            "the engine must receive the kernel pack cap minus output/system/turn/tools, not the larger provider send window"
+        );
+        assert!(
+            pack_window < 30_000,
+            "a 30k send window must not raise C's pack cap above the 24k kernel budget"
         );
     }
 
@@ -849,10 +855,23 @@ async fn failed_clear_focus_never_mutates_the_task_table() {
 
 /// Records every request it receives and finishes immediately, so the test
 /// can assert on exactly what the final budget guard let through.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RecordingModel {
     requests: Mutex<Vec<ModelRequest>>,
     calls: AtomicUsize,
+    context_window: usize,
+    max_output_tokens: usize,
+}
+
+impl Default for RecordingModel {
+    fn default() -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+            context_window: 10_000,
+            max_output_tokens: 4_000,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -861,8 +880,8 @@ impl ModelTransport for RecordingModel {
         ModelCapabilities {
             streaming: true,
             tool_calls: true,
-            max_output_tokens: 4_000,
-            context_window: Some(10_000),
+            max_output_tokens: self.max_output_tokens,
+            context_window: Some(self.context_window),
         }
     }
     async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
@@ -887,11 +906,27 @@ impl ModelTransport for RecordingModel {
     }
 }
 
-/// A context engine whose materialization returns three large working-set
-/// items — enough to overshoot the input budget once assembled.
-#[derive(Debug, Default)]
+/// A context engine whose materialization returns large working-set items
+/// and ignores `query.budget_tokens` — append-only A behavior.
+#[derive(Debug)]
 struct BigContextEngine {
     acks: Mutex<Vec<ContextConsumptionAck>>,
+    item_count: usize,
+}
+
+impl Default for BigContextEngine {
+    fn default() -> Self {
+        Self::with_items(3)
+    }
+}
+
+impl BigContextEngine {
+    fn with_items(item_count: usize) -> Self {
+        Self {
+            acks: Mutex::new(Vec::new()),
+            item_count,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -907,7 +942,7 @@ impl ContextEngine for BigContextEngine {
     }
     async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
         // ~3_000 tokens per item (ASCII estimate: 4 chars per token).
-        let items: Vec<MaterializedItem> = (0..3)
+        let items: Vec<MaterializedItem> = (0..self.item_count)
             .map(|i| MaterializedItem {
                 item_id: ContextItemId::new(),
                 kind: ContextKind::FileObservation,
@@ -919,13 +954,14 @@ impl ContextEngine for BigContextEngine {
                 source: None,
             })
             .collect();
+        let approx_tokens = self.item_count.saturating_mul(3_000);
         Ok(MaterializedContext {
             materialization_id: 1,
             focus: None,
             items,
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
-            approx_tokens: 9_000,
+            approx_tokens,
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -1332,6 +1368,47 @@ async fn final_guard_trims_to_the_input_budget_not_the_window() {
             !acks[0].item_ids.is_empty() && acks[0].item_ids.len() < 3,
             "the ack must name the final post-trim subset, got {:?}",
             acks[0].item_ids
+        );
+    }
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn send_guard_uses_provider_window_pack_uses_kernel_cap() {
+    // Kernel pack 24k, provider send 50k, output reserve 4k → input 46k.
+    // Append-like engine returns ~36k of history. Coupled 24k send would
+    // trim below 24k; a competent A baseline must keep the larger send.
+    let model = Arc::new(RecordingModel {
+        context_window: 50_000,
+        max_output_tokens: 4_000,
+        ..RecordingModel::default()
+    });
+    let context = Arc::new(BigContextEngine::with_items(12));
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        context.clone(),
+        model.clone(),
+        Arc::new(OneToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel.clone());
+    handle.start().await.unwrap();
+    handle.user_message("hello".into()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    {
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "the turn must send exactly one request");
+        let request = &requests[0];
+        let total = approx_layer_tokens(&request.messages) + approx_layer_tokens(&request.tools);
+        assert!(
+            total > 24_000,
+            "A must be allowed to grow past the 24k pack cap when the send window is larger (got {total})"
+        );
+        assert!(
+            total <= 46_000,
+            "the send guard is still window - output_reserve (got {total})"
         );
     }
     handle.stop().await.unwrap();

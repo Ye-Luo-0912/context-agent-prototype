@@ -107,7 +107,7 @@ boundedness, and integrity rather than replace it with transcript history.
 | Immediate tool signal | Implemented (`CTX-08`) | Tool commit emits a bounded, body-free `WorkingSetSignal`; discovered entities heat related context before the immediately following model round while the tool body remains in `TurnFrame` until finalization. |
 | Final model-consumption acknowledgement | Implemented (`CTX-07`) | `materialize` returns a non-consuming preview. After final packing, only a successful non-stale ModelOutput commits a bounded `ContextConsumptionAck` with the exact inline/external ids; failure paths do not reinforce. Fit-before-top-K, bounded/charged external refs, and bounded candidate generation are covered; workload cost evaluation remains separate. |
 | Prompt authority separation | Implemented (`CORE-05`) | `PromptAssembler` keeps policy in System, renders selected history/external refs as delimited low-authority User observations, and preserves live file/tool output as Tool-role content. Injection regressions cover all three paths. |
-| Real evaluation | Partial | Unit/property coverage is strong and the 10,000-turn residency regression exists. `agent-eval --compare-live` is the live paired coding harness (real model, independent workspaces, hidden verify). EVAL-01.1 writes per-cell bundles; EVAL-01.1b persists replayable file-content hidden asserts. EVAL-01.2 freezes the clustered C−A estimator; EVAL-01.3 re-freezes the gate at 300×3 / −5 pp (historical 30×3 is underpowered). EVAL-01.4e freezes the 509-task pack; EVAL-01.3b sets `SUITE_FROZEN=true` and declares retrieval secondaries in SPEC (no gate n/margin change). EVAL-01.5 freezes the 30-task calibration sample; a file-only 9×3 live spend is in `crates/agent-eval/evidence/pilot-30` (`decision=pilot`, 21 SWE-bench cells still missing). Then model-backed B. The 300×3 non-inferiority run is still open. |
+| Real evaluation | Partial | Unit/property coverage is strong and the 10,000-turn residency regression exists. `agent-eval --compare-live` is the live paired coding harness (real model, independent workspaces, hidden verify). EVAL-01.1 writes per-cell bundles; EVAL-01.1b persists replayable file-content hidden asserts. EVAL-01.2 freezes the clustered C−A estimator; EVAL-01.3 re-freezes the gate at 300×3 / −5 pp (historical 30×3 is underpowered). EVAL-01.4e freezes the 509-task pack; EVAL-01.3b sets `SUITE_FROZEN=true` and declares retrieval secondaries in SPEC (no gate n/margin change). EVAL-01.3c locks the exact 300 acceptance ids and makes token diagnostics honor `cost_eligible`. EVAL-01.5 freezes the 30-task calibration sample; a file-only 9×3 live spend is in `crates/agent-eval/evidence/pilot-30` (`decision=pilot`). EVAL-01.5.p1 splits send vs pack and raises the shared live round cap to 48; remaining P0 SWE-bench (24k/12) is skipped as a floor-effect host. EVAL-01.5.p1b lands the shared model-backed bounded compactor for live B and C `TaskCompleted` distillation (CI keeps the scripted digest). EVAL-01.5.p1c is the retrieval-trust slice (catalog-wide search/inspect, trusted packed-set prompt); extra C rounds are still a treatment effect to re-measure, not closed. Next: executable hidden tests, then a P1 SWE-bench cohort. Do not mix P0/P1 ITT tables. The 300×3 non-inferiority run is still open. |
 
 This table is the baseline for the work queue below. A checked defect in
 `AUDIT_TODO.md` must not be reopened here under a new name.
@@ -812,12 +812,12 @@ Requirements:
   recording only reinforces recency — it never changes the item's prompt
   role.
 - [x] Distinguish “evidence does not exist” from “not found by this search.”
-  **Done 2026-08-12.** An empty search result now distinguishes the two
-  cases in the model-facing message: with no kind/scope/task filter it
-  reports that no externalized items match, with a filter it says nothing
-  matches within the requested filter and evidence may exist under a
-  different filter — so the model can decide to give up or retry under
-  another filter instead of misreading a filter miss as absent evidence.
+  **Done 2026-08-12.** An empty search result distinguishes the two
+  cases: no filter reports that no catalog items match; a filter reports
+  that nothing matches within the requested filter. The copy names the
+  miss, it does not lecture about the working set.
+  **Follow-up 2026-08-15.** Search is catalog-wide (Resident/Warm
+  projections plus Stored). A live file is a hit, not an empty miss.
 - [~] Require source authority/taint checks again at fetch/admit time.
   **Precondition landed 2026-08-12.** `ExternalizedContext` now carries
   the item's `source` authority captured at externalize time, and the
@@ -1053,8 +1053,13 @@ Phase 4 below; this list does not duplicate checkbox state):
    where practical. **Done EVAL-01.3b:** pack frozen at 509/300;
    `SUITE_FROZEN=true`; SPEC re-registered with retrieval secondaries
    (search recall/latency, found-after-forgotten, graded-access
-   distribution) and no gate n/margin change. Do not collect 300×3
-   acceptance cells until the frozen ~30×3 calibration pilot.
+   distribution) and no gate n/margin change. **Done EVAL-01.3c:** exact
+   300 acceptance ids locked (`agent-eval.acceptance.v1`, sha256
+   `7ff6b5dd…`, harvest sizes 107/147/46 because SWE-bench large n=46);
+   gate is `n_tasks==300 AND evidence_ids==acceptance_ids`, not any
+   ≥300 subset of the 509 pack. Cost diagnostics omit
+   `cost_eligible=false` cells; cost-missing rate is reported separately.
+   Do not collect 300×3 acceptance cells until remaining calibration.
 2. Calibrate before spending the 300×3 budget: one frozen
    non-acceptance pilot (~30 tasks × 3) to check the power simulation's
    variance/clustering assumptions against real cells. Amend n only by
@@ -1070,10 +1075,22 @@ Phase 4 below; this list does not duplicate checkbox state):
    **Live file-only spend (2026-08-14):** 9 tasks × 3 repeats × 3
    engines = 81 cells under `crates/agent-eval/evidence/pilot-30`. ITT A=C=
    0.778, B=0.704; task-level corr(A,C)=0.78; diagnostic C−A LCL=
-   −0.146 (not a gate). `analyze()` stays ineligible (`n_tasks=9<300`).
-   21 SWE-bench cells uncollected. Do not amend n. Do not retune
-   scoring. Do not start model-backed B until the remaining 21-task
-   spend or an explicit skip.
+   −0.146 (not a gate). `analyze()` stays ineligible (`n_tasks=9 != 300`
+   and evidence ids ≠ frozen acceptance set). Pooled φ(A,C)=0.36 is
+   labeled confounded; task-residual corr(A,C)=−0.41 is the power-model
+   diagnostic (n=9, noisy). Cost-missing 6/27; cost-eligible paired
+   tokens n=21 (A 54318 / C 56251). **EVAL-01.5.p1:** remaining P0
+   SWE-bench under send=kernel-fallback 19904 / rounds=12 is skipped
+   (floor effect: empty context still overflowed; 12 rounds aborted
+   tool loops). Do not mix P0 and P1 ITT tables. P1 shared host:
+   declared send window (default 128k), kernel pack 24k for C/B, A
+   grows until send, 48 rounds shared. Do not amend n. Do not retune
+   scoring. **Done EVAL-01.5.p1b:** model-backed bounded compaction B
+   (shared operator with C `TaskCompleted` distillation). **Partial
+   EVAL-01.5.p1c:** catalog-wide search/inspect; system prompt and
+   assembler headers stay labels/facts, not retrieval tutorials. Smoke
+   fixtures stay file-content; executable hidden stays on the suite
+   pack. Next: a P1 SWE-bench cohort. Do not mix P0 and P1 ITT tables.
 3. Model-backed bounded compaction B (`EVAL-01` closure item 5): B must
    summarize with a model under a budget, with its compactor cost
    counted; the scripted digest remains a deterministic CI arm only.
@@ -1086,16 +1103,52 @@ Phase 4 below; this list does not duplicate checkbox state):
    C a summary is a `derive`d item with `DerivedFrom` provenance and the
    raw bodies stay externally retrievable, so a bad summary is
    correctable through search/fetch/admit instead of permanent.
+   **Partial 2026-08-15 (EVAL-01.5.p1b).** `BoundedCompactor` lives in
+   `agent-contracts` (source/output char caps 2000/512). Live eval and
+   TUI inject `ModelBackedCompactor` into rolling B and dynamic C; CI
+   rolling uses `ScriptedCompactor` (0 provider tokens). B folds without
+   holding the engine mutex across the model call; compact failure or
+   empty output falls back to a bounded marker and does not fail the
+   coding turn. C distills only on `TaskCompleted` (episode-rotation
+   distillation still deferred): the result is a `derived` Summary with
+   `DerivedFrom` edges; source items stay. Compactor usage is on
+   `ContextDiagnostics` and `manager_token_cost`. Do not retune scoring.
+   Do not amend SPEC n/margin.
 4. Explain and reduce dynamic's extra live rounds — the measured
    treatment effect. The lever is the just-landed retrieval surface
    (catalog indexes, graded access, discovery descriptors): make recall
    cheap and trusted so the model re-verifies less, then re-measure on
    `recall_after_fix`-class fixtures. Scoring stays frozen: behavior
-   changes come from retrieval/navigation or the prompt surface, and any
-   scoring change waits for suite evidence, not n=1 live cells.
+   changes come from retrieval/navigation and from removing prompt
+   distrust, not from adding tutorials. Any scoring change waits for
+   suite evidence, not n=1 live cells.
+   **Partial 2026-08-15 (EVAL-01.5.p1c).** 2026-08-14 traces stand: extra
+   rounds were not "the model cannot see the current-turn tool output"
+   (tool results render in the turn frame as `ModelRole::Tool`). Causes:
+   prompt distrust (working set called a cache / optional), empty search
+   of a still-Resident file (first smoke), a no-tool first turn on C,
+   failed `git.status` / `shell.exec` probes, extra rereads. Across user
+   turns, successful `fs.read`-shaped observations are ephemeral; the
+   latest-file-body-of-active-task policy is the keep-in-view mechanism.
+   This slice does not retune scoring and does not hide `git.status`.
+   Changes: `DEFAULT_CODING_AGENT_SYSTEM_PROMPT` is two sentences;
+   assembler headers are labels only; `search_ids` / `search_catalog` /
+   `inspect_external` cover Resident/Warm/Stored; hits carry `residency=`
+   as data, not a next-step tutorial; `fetch_external` stays store-only
+   and a Resident/Warm id states the body is already in the working set;
+   empty search copy is a catalog miss, not "no externalized items".
+   Extra live rounds remain a treatment effect to re-measure. Do not
+   amend SPEC n/margin.
 5. Executable hidden build/test verification for fixtures (`EVAL-01`
-   closure item 5, first half), so hidden checks stop being static
-   file-content assertions.
+   closure item 5, first half).
+   **Decision 2026-08-15.** Do not bind the five smoke `FIXTURES` to
+   executable hidden commands. Those fixtures stay interpreter-free
+   file-content asserts so CI does not fail-closed on a missing
+   `python`/`cargo` and does not exec model-written files on the host.
+   Executable hidden already lives on the suite pack (overlay +
+   `hidden_commands`; SWE-bench docker remains opt-in). Dual-oracling
+   smoke would make the cheap path as fragile as the suite path. Scoring
+   of the five smoke fixtures is unchanged. Do not amend n.
 
 Explicitly not in this slice: retuning GC scoring from small-n live
 cells; Artifact/Task/Agent/Skill/Event discovery providers; a public
@@ -1243,6 +1296,11 @@ current slice above.)
   rolling arm uses 200/100 thresholds and folds from the fourth turn).
   This is a real bounded fold mechanism with a scripted summarizer, not a
   competitive model-backed compactor; the latter remains a Phase 4/M15 arm.
+  **Follow-up 2026-08-15 (EVAL-01.5.p1b).** The scripted digest stays the
+  CI arm. Live B now injects the shared `ModelBackedCompactor`; C uses
+  the same operator on `TaskCompleted` as a sourced distill, not a
+  lossy fold. Compactor provider tokens are counted. Episode-rotation
+  distillation remains open.
   Manager/derivation cost is counted separately from the input-token gap:
   `manager_token_cost` re-materializes the final state and sums the
   `Summary`/`source == "derived"` items, surfaced as `EngineRun.
@@ -1511,11 +1569,13 @@ current slice above.)
 - [ ] Introduce descriptor cards and stable content-digested `body_ref`s.
 - [ ] Produce Task/Episode/Decision/Finding/OpenLoop/Artifact/Evidence cards
   from typed events; never infer runtime authority from prose alone.
-- [ ] Add task-completion trajectory distillation with verification and
+- [~] Add task-completion trajectory distillation with verification and
   source refs; do not inject full old trajectories by default. Reuse the
-  M15 model-backed bounded compactor (current slice item 3) as the
+  M15 model-backed bounded compactor (working-order item 3) as the
   distillation operator instead of building a second summarizer; inside
   C its output is a `derive`d item with provenance, never a lossy fold.
+  **Partial 2026-08-15.** `TaskCompleted` distillation is landed when a
+  `BoundedCompactor` is injected. Episode-rotation distillation is not.
 - [ ] Add AssignmentCard/HandoffCard after single-agent episode semantics
   pass evaluation.
 - [ ] Define independent storage retention profiles for coding, research,
@@ -1575,6 +1635,11 @@ current slice above.)
   pack n=509, retrieval secondaries declared, gate n/margin unchanged.
   Do not collect 300×3 acceptance cells until the frozen ~30×3 calibration
   pilot.
+  **Partial 2026-08-14 (EVAL-01.3c).** Exact 300 acceptance ids frozen
+  (`7ff6b5dd…`); gate requires that set. Cost-eligible paired tokens
+  replace the old ITT-token mean; cost-missing rate is reported
+  separately. Task-residual corr(A,C) is the power-model diagnostic;
+  pooled φ is confounded by task difficulty.
   **Partial 2026-08-14 (EVAL-01.4a).** `crates/agent-eval/suite/` is the
   reviewed-deliverable pack: freeze computed from n/provenance/executable
   hidden commands/heterogeneity/review flags. `--suite` reports n/300 and
@@ -1596,10 +1661,13 @@ current slice above.)
   `SUITE_FROZEN=true`. SPEC re-registered: retrieval secondaries declared,
   n/repeats/margin unchanged. Do not collect 300×3 acceptance cells
   until the frozen ~30×3 calibration pilot.
+  **Partial 2026-08-14 (EVAL-01.3c).** Exact 300 acceptance ids + hash;
+  509 is not an optional pool.
   **Partial 2026-08-14 (EVAL-01.5).** Frozen 30-id sample + `--pilot-run`
   / `--pilot-calibrate`. File-only live 9×3 (81 cells) collected under
   `crates/agent-eval/evidence/pilot-30`; `decision=pilot`, gate ineligible.
-  21 SWE-bench cells uncollected.
+  **EVAL-01.5.p1 (2026-08-15).** Remaining P0 SWE-bench skipped; send vs
+  pack split + shared 48-round live cap. Do not mix P0/P1 tables.
 
 - [ ] Compare at least:
   - full/sliding transcript;
@@ -1621,6 +1689,10 @@ current slice above.)
   no-tool first turn, then failed `git.status` / `shell.exec` probes and
   extra rereads — not empty search. n=1; scoring stays frozen; this is not
   an end-to-end token-saving claim and does not close M15.
+  **Follow-up 2026-08-15 (EVAL-01.5.p1c).** Catalog-wide search/inspect
+  landed; prompt stuffing (cache/optional/how-to) was removed rather
+  than replaced with a longer tutorial. Extra rounds are still a
+  treatment effect to re-measure; no new live spend in this slice.
 
 ## Acceptance properties
 

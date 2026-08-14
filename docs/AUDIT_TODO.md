@@ -1568,8 +1568,9 @@ Confirmed 2026-08-14:
   not counterbalanced;
 - the stated 30×3 / −5 pp gate has no frozen paired estimator, clustering,
   one-sided interval, infrastructure-failure rule or power calculation;
-- current hidden checks are mostly static file-content assertions, and B uses
-  a scripted summarizer rather than a model-backed bounded compactor;
+- current hidden checks are mostly static file-content assertions;
+  live B now uses a model-backed bounded compactor (CI keeps the
+  scripted digest); executable hidden build/tests remain open;
 - replay Resident `peak` samples pre-model previews rather than every heap
   mutation; report that scope explicitly and never claim an all-time peak.
 
@@ -1601,8 +1602,10 @@ Required closure:
    recall pressure) before freezing;
    **Partial 2026-08-14 (EVAL-01.4e / EVAL-01.3b).** Suite pack frozen at
    509/300. `SUITE_FROZEN=true`. SPEC re-registered with retrieval
-   secondaries (no gate n/margin change). Do not collect 300×3 acceptance
-   cells until the frozen ~30×3 calibration pilot.
+   secondaries (no gate n/margin change). **EVAL-01.3c:** exact 300
+   acceptance ids locked (`--acceptance`, sha256 `7ff6b5dd…`); the gate
+   is that set, not any ≥300 subset of the 509 pack. Do not collect
+   300×3 acceptance cells until remaining calibration.
 3. pre-register a task-clustered paired binary analysis and power simulation;
    three repeats measure within-task variance and are not independent tasks;
    **Partial 2026-08-14 (EVAL-01.2).** `agent-eval --preregister` /
@@ -1614,25 +1617,46 @@ Required closure:
    **Partial 2026-08-14 (EVAL-01.3).** Same model, seed and margin; gate n
    is 300×3 (4048/258/0). **EVAL-01.3b** freezes the suite
    (`SUITE_FROZEN=true`, pack 509) and declares retrieval secondaries
-   in SPEC; n/repeats/margin unchanged. Before the 300×3 spend, run one
-   frozen non-acceptance pilot (~30×3) to check the simulated
-   variance/clustering assumptions against real cells; amend n only by
-   re-registration, never after seeing acceptance cells.
+   in SPEC; n/repeats/margin unchanged. **EVAL-01.3c** locks exact 300
+   acceptance ids and requires `evidence_ids==acceptance_ids`; token
+   means use only `cost_eligible` pairs; cost-missing rate is separate;
+   power-model φ is task-residual corr, not pooled φ. Before the 300×3
+   spend, run one frozen non-acceptance pilot (~30×3) to check the
+   simulated variance/clustering assumptions against real cells; amend n
+   only by re-registration, never after seeing acceptance cells.
    **Partial 2026-08-14 (EVAL-01.5).** 30-id sample frozen
    (`agent-eval.pilot.v1`, 10/10/10, sha256 `fa8c5308…`). `--pilot-run`
    / `--pilot-calibrate` landed; `decision=pilot` cannot pass the gate.
    File-only live 9×3 collected (81 cells, `crates/agent-eval/evidence/pilot-30`):
-   ITT A=C=0.778, diagnostic C−A LCL=−0.146, `n_tasks=9<300` ineligible.
-   21 SWE-bench cells uncollected. Do not amend n from this spend.
+   ITT A=C=0.778, diagnostic C−A LCL=−0.146, `n_tasks=9 != 300` ineligible.
+   **EVAL-01.5.p1 (2026-08-15).** P0 SWE-bench remaining spend skipped
+   (send floor 19904 + 12 rounds cannot host the workload). P1: declared
+   send window (default 128k), C/B pack 24k, A grows until send, 48
+   rounds shared A/B/C. Do not mix P0/P1 ITT tables. Do not amend n.
 4. report intent-to-treat end-to-end tokens/rounds/tools/store/retrieval/
    latency. Live C's extra rounds are a treatment effect to explain, not data
    to discard; both-pass cost may appear only as a secondary diagnostic.
+   **EVAL-01.3c:** success stays ITT; token means use only cost-eligible
+   A/C pairs; cost-missing rate is reported separately and is not in the
+   LCL gate. Usage-incomplete 0-token cells are unknown cost, not cost=0.
    **Decision 2026-08-14:** Search/GC evaluation is folded into M15 —
    retrieval metrics (search recall/latency, found-after-forgotten,
    graded-access distribution) are secondary lifecycle endpoints reported
    from the same cells; no separate later retrieval experiment. Declared
    in SPEC at EVAL-01.3b (no gate change).
 5. use executable hidden build/tests and a model-backed bounded compaction B.
+   **Partial 2026-08-15 (EVAL-01.5.p1b).** Shared `BoundedCompactor` is
+   live for B fold and C `TaskCompleted` distill; scripted digest remains
+   CI. Executable hidden build/test commands are still open. Do not
+   amend n. Do not mix P0/P1 ITT tables.
+   **Partial 2026-08-15 (EVAL-01.5.p1c).** Catalog-wide search/inspect;
+   prompt stuffing (cache/optional/how-to) was removed rather than
+   replaced with a longer tutorial. Extra C rounds are still a treatment
+   effect to re-measure; scoring stays frozen.
+   **Decision 2026-08-15.** Smoke `FIXTURES` stay interpreter-free
+   file-content asserts. Executable hidden stays on the suite pack
+   (overlay + commands; SWE-bench docker opt-in). Do not bind the cheap
+   CI path to `python`/`cargo` or exec model-written files. Do not amend n.
 
 Until closure, M15, V2, learned/vector policy and PLAT-08 evidence gates stay
 closed. M12/M13 remain independent trusted-execution blockers.
@@ -1641,9 +1665,13 @@ closed. M12/M13 remain independent trusted-execution blockers.
 - replace weak `SharesEntities` pseudo-dependencies with typed edges;
 - add store corruption/reconcile and lifecycle growth-slope metrics;
 - [x] fact comparison replays cost and coverage on independent fresh engines;
-- replace the scripted rolling summarizer with a model-backed bounded
+- [~] replace the scripted rolling summarizer with a model-backed bounded
   compactor and account for actor, compactor, recall, store, tool-schema and
   wall-time cost;
+  **Partial 2026-08-15.** Live B/C inject `ModelBackedCompactor`; CI
+  rolling keeps `ScriptedCompactor`. Compactor tokens are on diagnostics
+  / `manager_token_cost` / rendered metrics. Actor/recall/store/schema
+  wall-time accounting was already on the event stream.
 - audit process parity whenever `ContextEngine` gains a method;
 - compare dynamic, rolling and append-only engines on these scenarios:
 

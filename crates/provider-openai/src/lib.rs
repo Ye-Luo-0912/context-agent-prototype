@@ -53,6 +53,11 @@ pub struct OpenAiConfig {
     /// broken or malicious provider cannot make the runtime buffer an
     /// unbounded stream.
     pub max_stream_bytes: usize,
+    /// Declared provider context window in tokens. `None` keeps the adapter
+    /// silent; the runtime then falls back to the kernel pack budget for
+    /// both send and pack. Live eval/TUI should set this so a tool-loop
+    /// turn is sendable while C still packs to the kernel working-set cap.
+    pub context_window: Option<usize>,
 }
 
 /// Cap on the provider error body carried in the error string, so a huge
@@ -63,6 +68,11 @@ const MAX_ERROR_BODY_CHARS: usize = 512;
 /// fails: a broken or malicious provider must not make the runtime buffer
 /// an unbounded model stream (the M14 resource boundary).
 pub const DEFAULT_MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
+
+/// Conservative declared send window when the compatible API does not
+/// advertise one through this adapter. Not a claim about any specific
+/// model's real limit; override with `OPENAI_CONTEXT_WINDOW`.
+pub const DEFAULT_DECLARED_CONTEXT_WINDOW: usize = 128_000;
 
 fn truncate_error_body(body: &str) -> String {
     let trimmed = body.trim();
@@ -96,7 +106,7 @@ impl ModelTransport for OpenAiProvider {
             streaming: true,
             tool_calls: true,
             max_output_tokens: self.config.max_output_tokens,
-            context_window: None,
+            context_window: self.config.context_window,
         }
     }
 
@@ -307,7 +317,7 @@ impl ModelEventSink for NoopSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{CancellationToken, ModelMessage, ToolSpec};
+    use agent_contracts::{CancellationToken, ModelMessage, ModelTransport, ToolSpec};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
@@ -342,6 +352,7 @@ mod tests {
             send_stream_options: true,
             send_max_tokens: true,
             max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
+            context_window: None,
         };
         let codec = ToolNameCodec::from_request(&request).expect("no name collision");
         let wire = build_wire_request(&request, &config, &codec);
@@ -388,6 +399,7 @@ mod tests {
             send_stream_options: false,
             send_max_tokens: false,
             max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
+            context_window: None,
         };
         let codec = ToolNameCodec::from_request(&request).expect("no name collision");
         let wire = build_wire_request(&request, &config, &codec);
@@ -412,6 +424,7 @@ mod tests {
             send_stream_options: false,
             send_max_tokens: false,
             max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
+            context_window: None,
         }
     }
 
@@ -534,6 +547,7 @@ mod tests {
             send_stream_options: true,
             send_max_tokens: true,
             max_stream_bytes: 512, // deliberately tiny cap
+            context_window: None,
         };
         let provider = OpenAiProvider::new(config);
         let request = ModelRequest {
@@ -550,6 +564,17 @@ mod tests {
         assert!(
             error.contains("512"),
             "the cap value must be surfaced: {error}"
+        );
+    }
+
+    #[test]
+    fn capabilities_surface_the_declared_window() {
+        let mut config = dummy_config("http://127.0.0.1:1/v1".into());
+        config.context_window = Some(DEFAULT_DECLARED_CONTEXT_WINDOW);
+        let provider = OpenAiProvider::new(config);
+        assert_eq!(
+            provider.capabilities().context_window,
+            Some(DEFAULT_DECLARED_CONTEXT_WINDOW)
         );
     }
 }

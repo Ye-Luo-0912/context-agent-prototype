@@ -18,7 +18,7 @@ use agent_contracts::{
     ToolSpec, tokens,
 };
 use agent_runtime::RuntimeHandle;
-use context_baselines::{RollingConfig, RollingSummaryEngine, Summarizer};
+use context_baselines::{RollingConfig, RollingSummaryEngine};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -29,8 +29,9 @@ use crate::{bundle, harvest, metrics, mock_model::ScriptedModel, suite, workload
 const SCRIPTED_IDLE: Duration = Duration::from_secs(120);
 /// 真模型一轮（含 reasoning）可能远长于脚本化路径。
 const LIVE_IDLE: Duration = Duration::from_secs(300);
-/// 真模型 tool-loop 上限：这些 fixture 只需几次调用；超出即取消，避免烧钱。
-const LIVE_MAX_MODEL_ROUNDS: u32 = 12;
+/// 真模型 tool-loop 上限：A/B/C 共用。12 只够 file-only smoke；SWE-bench
+/// 探索-编辑-验证需要更高。不要给 C 比 A 更高的 cap。
+const LIVE_MAX_MODEL_ROUNDS: u32 = 48;
 
 /// Per-turn wait policy. Live runs use a longer idle and a round cap.
 #[derive(Clone, Copy)]
@@ -49,17 +50,24 @@ const LIVE_LIMITS: TurnLimits = TurnLimits {
     max_model_rounds: Some(LIVE_MAX_MODEL_ROUNDS),
 };
 
-/// Deterministic stand-in for an LLM rolling summary: a bounded digest of
-/// the folded content, so baseline B's summary marker is content-dependent
-/// instead of a fixed placeholder and its cost shows up in the accounting.
-pub struct ScriptedSummarizer;
+/// CI 确定性压缩器：live 注入 `ModelBackedCompactor`。
+pub struct ScriptedCompactor;
 
-impl Summarizer for ScriptedSummarizer {
-    fn summarize(&self, folded: usize, prior: &str) -> String {
-        let word_count = prior.split_whitespace().count();
-        format!(
-            "[rolling summary of {folded} earlier messages, {word_count} folded words: the work below is current (scripted digest)]"
-        )
+#[async_trait::async_trait]
+impl agent_contracts::BoundedCompactor for ScriptedCompactor {
+    async fn compact(
+        &self,
+        request: agent_contracts::CompactionRequest,
+    ) -> agent_contracts::AgentResult<agent_contracts::CompactionOutput> {
+        let word_count = request.source.split_whitespace().count();
+        Ok(agent_contracts::CompactionOutput {
+            text: format!(
+                "[rolling summary of {} earlier messages, {word_count} folded words: the work below is current (scripted digest)]",
+                request.folded_items
+            ),
+            input_tokens: 0,
+            output_tokens: 0,
+        })
     }
 }
 
@@ -227,14 +235,17 @@ async fn manager_token_cost(engine: &dyn ContextEngine) -> anyhow::Result<u64> {
             hints: ContextHints::default(),
         })
         .await?;
-    Ok(materialized
+    let visible = materialized
         .items
         .iter()
         .filter(|item| {
             item.kind == ContextKind::Summary || item.source.as_deref() == Some("derived")
         })
         .map(|item| tokens::approx_tokens(&item.content) as u64)
-        .sum())
+        .sum::<u64>();
+    Ok(visible
+        .saturating_add(materialized.diagnostics.compaction_input_tokens)
+        .saturating_add(materialized.diagnostics.compaction_output_tokens))
 }
 
 /// Run one fixture through the append-only, rolling-summary and dynamic
@@ -248,10 +259,9 @@ pub async fn compare_engines(
     compare_engines_with_model(fixture, workspace_root, None, None).await
 }
 
-/// Live M15 pairing: same three engines and hidden verification as
-/// `--compare-arm`, but each cell is driven by `model` on `live_turns`
-/// (one prompt for the original four; five for `recall_after_fix`).
-/// Rolling still folds with the scripted digest.
+/// Live pairing: real model, `live_turns`, independent workspaces.
+/// Rolling uses the shared model-backed bounded compactor; scripted digest
+/// remains the CI arm.
 pub async fn compare_engines_live(
     fixture: &workload::CodingFixture,
     workspace_root: &Path,
@@ -289,7 +299,8 @@ async fn compare_suite_with_model(
     };
     let mut runs = Vec::new();
     for name in order {
-        let engine = named_engine(name)?;
+        let cell_model = model();
+        let engine = named_engine(name, live.then_some(cell_model.clone()))?;
         let root = workspace_root.join(name);
         eprintln!("  engine {name}: seeding {}", task.id);
         let _ = std::io::Write::flush(&mut std::io::stderr());
@@ -299,7 +310,7 @@ async fn compare_suite_with_model(
         let eval = run_suite_with_engine(
             task,
             &root,
-            model(),
+            cell_model,
             engine.clone(),
             &turns,
             limits,
@@ -347,16 +358,16 @@ async fn compare_engines_with_model(
     };
     let mut runs = Vec::new();
     for name in order {
-        let engine = named_engine(name)?;
+        let model: Arc<dyn ModelTransport> = match &live_model {
+            Some(live) => live.clone(),
+            None => Arc::new(scripted_model_for(fixture, /*compare_arm*/ true)),
+        };
+        let engine = named_engine(name, live_model.clone())?;
         let root = workspace_root.join(name);
         std::fs::create_dir_all(&root)?;
         workload::seed_fixture(fixture, &root);
         eprintln!("  engine {name}: starting");
         let _ = std::io::Write::flush(&mut std::io::stderr());
-        let model: Arc<dyn ModelTransport> = match &live_model {
-            Some(live) => live.clone(),
-            None => Arc::new(scripted_model_for(fixture, /*compare_arm*/ true)),
-        };
         let eval = run_fixture_with_engine(
             fixture,
             &root,
@@ -386,27 +397,37 @@ async fn compare_engines_with_model(
     Ok(runs)
 }
 
-fn named_engine(name: &'static str) -> anyhow::Result<Arc<dyn ContextEngine>> {
+fn named_engine(
+    name: &'static str,
+    live_model: Option<Arc<dyn ModelTransport>>,
+) -> anyhow::Result<Arc<dyn ContextEngine>> {
     Ok(match name {
         "append" => Arc::new(context_baselines::AppendOnlyEngine::new()) as Arc<dyn ContextEngine>,
         "rolling" => {
-            // A real rolling baseline on the fixture workload: the default
-            // 9 000-token threshold never folds a five-turn fixture (the
-            // whole run stays near 300 tokens), so the arm would silently
-            // degrade to append-only. These thresholds fold from the
-            // fourth turn onward, so the scripted summarizer actually runs
-            // and its marker cost is measurable. Live cells keep the same
-            // fold; B is still not a model summarizer.
-            Arc::new(
-                RollingSummaryEngine::with_config(RollingConfig {
-                    summary_threshold_tokens: 200,
-                    keep_most_recent_tokens: 100,
-                })
-                .with_summarizer(Arc::new(ScriptedSummarizer)),
-            ) as Arc<dyn ContextEngine>
+            // 默认 9000 token 阈值在五轮 fixture 上不会折叠，所以评测臂用
+            // 200/100，从第四轮开始折叠。CI 用脚本化压缩器；live 用同一
+            // 模型上的有界压缩器。
+            let rolling = RollingSummaryEngine::with_config(RollingConfig {
+                summary_threshold_tokens: 200,
+                keep_most_recent_tokens: 100,
+            });
+            let rolling = match live_model.clone() {
+                Some(model) => rolling
+                    .with_compactor(Arc::new(agent_compose::ModelBackedCompactor::new(model))),
+                None => rolling.with_compactor(Arc::new(ScriptedCompactor)),
+            };
+            Arc::new(rolling) as Arc<dyn ContextEngine>
         }
-        "dynamic" => Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()))
-            as Arc<dyn ContextEngine>,
+        "dynamic" => {
+            let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+            let engine = match live_model {
+                Some(model) => {
+                    engine.with_compactor(Arc::new(agent_compose::ModelBackedCompactor::new(model)))
+                }
+                None => engine,
+            };
+            Arc::new(engine) as Arc<dyn ContextEngine>
+        }
         other => anyhow::bail!("unknown engine {other}"),
     })
 }
@@ -564,7 +585,8 @@ async fn run_fixture_with_engine(
     engine: &'static str,
     pair: Option<&bundle::PairSink>,
 ) -> anyhow::Result<FixtureEval> {
-    let session = run_workspace_session(workspace_root, model, context_engine, turns, limits).await?;
+    let session =
+        run_workspace_session(workspace_root, model, context_engine, turns, limits).await?;
     let passed = session.error.is_none() && workload::fixture_passes(fixture, workspace_root);
     let eval = FixtureEval {
         fixture_id: fixture.id.to_string(),
@@ -602,21 +624,35 @@ async fn run_suite_with_engine(
     engine: &'static str,
     pair: Option<&bundle::PairSink>,
 ) -> anyhow::Result<FixtureEval> {
-    let session = run_workspace_session(workspace_root, model, context_engine, turns, limits).await?;
+    let session =
+        run_workspace_session(workspace_root, model, context_engine, turns, limits).await?;
     let run_tag = format!(
         "pilot-{}-{}-r{}",
         harvest::instance_id_from_suite_id(&task.id).unwrap_or(&task.id),
         engine,
         pair.map(|p| p.repeat).unwrap_or(1)
     );
-    let commands = match evaluate_after_live(task, workspace_root, &run_tag) {
-        Ok(commands) => commands,
-        Err(error) => vec![workload::HiddenCommandResult {
+    // round-cap / timeout 已经是 ITT 失败；再拉 SWE-bench 镜像只烧时间。
+    let commands = if session.error.is_some() {
+        vec![workload::HiddenCommandResult {
             argv: vec!["evaluate".into()],
-            stderr: error.to_string(),
+            stderr: format!(
+                "skipped swebench docker: {}",
+                session.error.as_deref().unwrap_or("session error")
+            ),
             passed: false,
             ..workload::HiddenCommandResult::default()
-        }],
+        }]
+    } else {
+        match evaluate_after_live(task, workspace_root, &run_tag) {
+            Ok(commands) => commands,
+            Err(error) => vec![workload::HiddenCommandResult {
+                argv: vec!["evaluate".into()],
+                stderr: error.to_string(),
+                passed: false,
+                ..workload::HiddenCommandResult::default()
+            }],
+        }
     };
     let passed = session.error.is_none() && suite::all_hidden_passed(&commands);
     let eval = FixtureEval {
@@ -660,7 +696,9 @@ fn evaluate_after_live(
     let instance = harvest::instance_id_from_suite_id(&task.id)
         .ok_or_else(|| anyhow::anyhow!("{} is not a swebench suite id", task.id))?;
     let patch = harvest::git_model_patch(workspace_root)?;
-    Ok(vec![harvest::run_prediction_eval(instance, &patch, run_tag)?])
+    Ok(vec![harvest::run_prediction_eval(
+        instance, &patch, run_tag,
+    )?])
 }
 
 struct WorkspaceSession {
@@ -712,6 +750,7 @@ async fn run_workspace_session(
         journal: None,
         artifact_store: None,
         output_broker: None,
+        max_tool_rounds: limits.max_model_rounds.map(|n| n as usize),
     })
     .await?;
     let mut events = composed.subscribe();
@@ -819,6 +858,54 @@ mod tests {
     use super::*;
     use workload::FIXTURES;
 
+    #[test]
+    fn live_round_cap_is_shared_and_hosts_swebench() {
+        assert_eq!(LIVE_MAX_MODEL_ROUNDS, 48);
+        assert_eq!(LIVE_LIMITS.max_model_rounds, Some(48));
+        assert_eq!(SCRIPTED_LIMITS.max_model_rounds, None);
+    }
+
+    #[tokio::test]
+    async fn named_rolling_engine_uses_scripted_compactor_without_a_live_model() {
+        use agent_contracts::{ContextIngress, ContextMaintenanceTrigger};
+
+        let engine = named_engine("rolling", None).unwrap();
+        for turn in 0..20 {
+            engine
+                .ingest(ContextIngress::UserMessage {
+                    content: format!("turn {turn} enough tokens to fold the rolling window"),
+                })
+                .await
+                .unwrap();
+            engine
+                .maintain(ContextMaintenanceTrigger::UserInput)
+                .await
+                .unwrap();
+        }
+        let materialized = engine
+            .materialize(ContextQuery {
+                current_input: "next".into(),
+                budget_tokens: 100_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        let summary = materialized
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::Summary)
+            .expect("rolling CI arm must fold");
+        assert!(
+            summary.content.contains("scripted digest"),
+            "CI rolling must use ScriptedCompactor, got: {}",
+            summary.content
+        );
+        assert_eq!(
+            materialized.diagnostics.compaction_input_tokens, 0,
+            "scripted compact reports no provider tokens"
+        );
+    }
+
     /// Every fixture must complete successfully through the real tool
     /// surface, and the cost accounting must record the scripted edit.
     #[tokio::test(flavor = "multi_thread")]
@@ -877,7 +964,7 @@ mod tests {
             summary_threshold_tokens: 20,
             keep_most_recent_tokens: 5,
         })
-        .with_summarizer(Arc::new(ScriptedSummarizer));
+        .with_compactor(Arc::new(ScriptedCompactor));
         for turn in 0..20 {
             rolling
                 .ingest(ContextIngress::UserMessage {
@@ -1160,9 +1247,15 @@ mod tests {
             .expect("file-harvested task");
         assert!(!task.expected_files.is_empty());
         let dir = tempfile::tempdir().unwrap();
-        let runs = compare_suite_with_model(task, dir.path(), || Arc::new(oracle_model(task)), None, false)
-            .await
-            .unwrap();
+        let runs = compare_suite_with_model(
+            task,
+            dir.path(),
+            || Arc::new(oracle_model(task)),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(runs.len(), 3);
         for run in &runs {
             assert!(

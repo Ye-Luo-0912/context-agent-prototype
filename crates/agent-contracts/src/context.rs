@@ -783,6 +783,12 @@ pub struct ContextDiagnostics {
     pub access_admits: u64,
     #[serde(default)]
     pub access_consumption_acks: u64,
+    /// 有界压缩器（B 折叠 / C 派生）累计的 provider 输入 token。
+    #[serde(default)]
+    pub compaction_input_tokens: u64,
+    /// 有界压缩器累计的 provider 输出 token。
+    #[serde(default)]
+    pub compaction_output_tokens: u64,
 }
 
 /// One structured entry of the materialized working set. The engine returns
@@ -848,6 +854,12 @@ pub struct ContextMaintenanceReport {
     #[serde(default)]
     pub transitions: Vec<ContextStateTransition>,
     pub diagnostics: ContextDiagnostics,
+    /// 本轮维护里压缩器花费的 provider 输入 token（脚本化实现为 0）。
+    #[serde(default)]
+    pub compaction_input_tokens: u64,
+    /// 本轮维护里压缩器花费的 provider 输出 token。
+    #[serde(default)]
+    pub compaction_output_tokens: u64,
 }
 
 /// One reversible eviction produced by a full GC pass: the item left the
@@ -1068,6 +1080,12 @@ pub struct ExternalizedContext {
 /// should see a handful of pullable refs, not the whole external history.
 pub const CONTEXT_MAP_VIEW_CAP: usize = 32;
 
+/// Default coding-agent system policy. Two sentences on purpose: the packed
+/// working set and tool results carry facts; this string must not teach
+/// retrieval. Do not retune scoring from this text.
+pub const DEFAULT_CODING_AGENT_SYSTEM_PROMPT: &str =
+    "You are a focused coding agent. Work on the current task only.";
+
 /// The bounded, model-facing view of the external context map. The engine
 /// selects at most [`CONTEXT_MAP_VIEW_CAP`] refs per materialization; the
 /// type enforces that bound, so a producer that forgets the cap fails
@@ -1150,11 +1168,12 @@ impl<'de> Deserialize<'de> for ContextMapView {
     }
 }
 
-/// Deterministic search over the external context map — no vectors.
+/// Deterministic search over the catalog — no vectors.
 /// Implemented dimensions: free-text over entity signatures, summary and
-/// uri; kind/scope/task/label filters; recency-aware ranking. Candidate
-/// generation uses the engine's `ContextCatalog` indexes (not a full-history
-/// scan) when a filter or an entity/label key can bound the set.
+/// uri; kind/scope/task/label filters; recency-aware ranking. Hits may be
+/// Resident, Warm, Cold, or External. Candidate generation uses the
+/// engine's `ContextCatalog` indexes (not a full-history scan) when a
+/// filter or an entity/label key can bound the set.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextSearchQuery {
     /// Free-text query matched (case-insensitively) against entity
@@ -1353,11 +1372,12 @@ pub trait ContextEngine: Send + Sync {
     /// Bounded projection of live items, oldest first, capped at `limit`.
     async fn inspect(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>>;
 
-    /// Deterministic search over externalized refs: matches the query
-    /// against entity signatures, kind/scope/task/label filters and recency,
-    /// capped at `query.limit`. The default implementation returns nothing,
-    /// so engines without an external store (baselines, adapters) keep
-    /// working unchanged.
+    /// Deterministic catalog search: matches the query against entity
+    /// signatures, kind/scope/task/label filters and recency, capped at
+    /// `query.limit`. Hits may be Resident, Warm, Cold, or External so a
+    /// live file already in the working set is not an empty miss. The
+    /// default implementation returns nothing, so engines without a catalog
+    /// (baselines) keep working unchanged.
     async fn search_external(
         &self,
         query: ContextSearchQuery,
@@ -1366,9 +1386,9 @@ pub trait ContextEngine: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// One externalized entry's metadata by item id. No store read — the
-    /// map entry already carries everything the model needs to decide
-    /// whether to fetch.
+    /// One catalog entry's metadata by item id. Resident/Warm projections
+    /// need no store read; stored entries use the map descriptor. Default
+    /// returns nothing.
     async fn inspect_external(
         &self,
         item_id: ContextItemId,
@@ -1584,5 +1604,17 @@ mod tests {
         let target = ContextItemId::new();
         let legacy: Vec<DependencyEdge> = serde_json::from_str(&format!("[\"{target}\"]")).unwrap();
         assert_eq!(legacy, vec![DependencyEdge::shares(target)]);
+    }
+
+    #[test]
+    fn default_coding_prompt_stays_two_sentences() {
+        assert_eq!(
+            DEFAULT_CODING_AGENT_SYSTEM_PROMPT,
+            "You are a focused coding agent. Work on the current task only."
+        );
+        assert!(
+            !DEFAULT_CODING_AGENT_SYSTEM_PROMPT.contains("bounded cache"),
+            "calling the working set a cache made the model re-read it"
+        );
     }
 }

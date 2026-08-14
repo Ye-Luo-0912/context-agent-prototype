@@ -125,22 +125,15 @@ impl ContextCatalog {
             .unwrap_or_default()
     }
 
-    /// Stored (Cold/External) candidate ids for `context.search`.
+    /// Catalog candidate ids for `context.search` (Resident, Warm, Stored).
     ///
     /// `Some(ids)` means the catalog indexes bounded the set. `None` means
     /// the free-text needle did not hit an entity/label key and no filter
-    /// was set, so the caller must residual-scan summaries/uris.
-    pub(crate) fn stored_search_ids(
-        &self,
-        query: &ContextSearchQuery,
-    ) -> Option<Vec<ContextItemId>> {
+    /// was set, so the caller must residual-scan summaries/uris/bodies.
+    pub(crate) fn search_ids(&self, query: &ContextSearchQuery) -> Option<Vec<ContextItemId>> {
         let mut candidates: Option<HashSet<ContextItemId>> = None;
         let mut intersect = |bucket: &[ContextItemId]| {
-            let incoming: HashSet<ContextItemId> = bucket
-                .iter()
-                .copied()
-                .filter(|id| self.is_stored(*id))
-                .collect();
+            let incoming: HashSet<ContextItemId> = bucket.iter().copied().collect();
             candidates = Some(match candidates.take() {
                 None => incoming,
                 Some(set) => set.intersection(&incoming).copied().collect(),
@@ -181,7 +174,7 @@ impl ContextCatalog {
             let text_ids = self.text_key_ids(needle);
             if text_ids.is_empty() {
                 if candidates.is_none() {
-                    // 无过滤、实体/标签键也未命中：摘要/uri 只能残差扫描。
+                    // 无过滤、实体/标签键也未命中：摘要/uri/正文只能残差扫描。
                     return None;
                 }
             } else {
@@ -192,11 +185,16 @@ impl ContextCatalog {
         let ids = match candidates {
             Some(set) => set
                 .into_iter()
-                .filter(|id| self.is_stored(*id) && self.live.contains(id))
+                .filter(|id| self.live.contains(id))
                 .collect(),
             None => {
                 let mut ids = Vec::new();
-                for residency in [ContextResidency::Cold, ContextResidency::External] {
+                for residency in [
+                    ContextResidency::Resident,
+                    ContextResidency::Warm,
+                    ContextResidency::Cold,
+                    ContextResidency::External,
+                ] {
                     for id in self.ids_for_residency(residency) {
                         if self.live.contains(id) {
                             ids.push(*id);
@@ -209,6 +207,21 @@ impl ContextCatalog {
         Some(ids)
     }
 
+    /// Stored (Cold/External) candidate ids for store-only ranking tests.
+    ///
+    /// Production search uses [`Self::search_ids`]. This filter exists so
+    /// catalog tests can still assert that a resident-only entity is not a
+    /// store hit.
+    #[cfg(test)]
+    pub(crate) fn stored_search_ids(
+        &self,
+        query: &ContextSearchQuery,
+    ) -> Option<Vec<ContextItemId>> {
+        self.search_ids(query)
+            .map(|ids| ids.into_iter().filter(|id| self.is_stored(*id)).collect())
+    }
+
+    #[cfg(test)]
     fn is_stored(&self, id: ContextItemId) -> bool {
         matches!(self.by_id.get(&id), Some(CatalogLocation::Stored))
     }
@@ -467,6 +480,28 @@ mod tests {
                 .stored_search_ids(&ContextSearchQuery::new("not-an-entity", 8))
                 .is_none(),
             "summary-only needles must residual-scan"
+        );
+    }
+
+    #[test]
+    fn search_ids_include_resident_hits() {
+        let resident_id = ContextItemId::new();
+        let stored_id = ContextItemId::new();
+        let heap = vec![item(resident_id, "AuthService.rs", None)];
+        let stored = vec![stored(&item(stored_id, "CacheStore.rs", None))];
+        let mut catalog = ContextCatalog::default();
+        catalog.rebuild(&heap, &[], &stored);
+
+        let hits = catalog
+            .search_ids(&ContextSearchQuery::new("AuthService", 8))
+            .expect("entity keys bound the set");
+        assert_eq!(hits, vec![resident_id]);
+        assert!(
+            catalog
+                .stored_search_ids(&ContextSearchQuery::new("AuthService", 8))
+                .expect("stored filter still runs")
+                .is_empty(),
+            "a resident-only entity must not appear in stored_search_ids"
         );
     }
 }

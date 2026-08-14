@@ -375,10 +375,7 @@ fn render_cell(dir: &Path) -> anyhow::Result<String> {
                 }
                 for row in &report.commands {
                     if !row.passed {
-                        out.push_str(&format!(
-                            "           hidden CMD FAIL {:?}\n",
-                            row.argv
-                        ));
+                        out.push_str(&format!("           hidden CMD FAIL {:?}\n", row.argv));
                     }
                 }
             }

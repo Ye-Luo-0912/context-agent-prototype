@@ -9,6 +9,7 @@
 //! endpoint does accept function calling; dotted Core ids are mapped by
 //! `provider-openai`. Coding live runs use `--fixture-live`.
 
+mod acceptance;
 mod analysis;
 mod bundle;
 mod driver;
@@ -101,10 +102,15 @@ fn usage() -> ! {
          \n\
          usage: agent-eval --preregister\n\
          \n\
-         Print the frozen EVAL-01.3b analysis spec, spec hash, and power\n\
+         Print the frozen EVAL-01.3c analysis spec, spec hash, and power\n\
          simulation (historical 30×3 plus the 300×3 design). The suite pack\n\
-         is frozen; 300×3 acceptance cells wait on the ~30×3 calibration\n\
-         pilot. This does not close M15.\n\
+         is frozen; the gate requires the exact 300 acceptance ids, not any\n\
+         ≥300 subset of the 509 pack. 300×3 acceptance cells wait on the\n\
+         remaining calibration. This does not close M15.\n\
+         \n\
+         usage: agent-eval --acceptance\n\
+         \n\
+         Print the frozen exact 300 acceptance ids and sha256.\n\
          \n\
          usage: agent-eval --pilot\n\
          usage: agent-eval [--repeats N] [--evidence-dir <dir>] [--include-swebench] [--pilot-id <id>] --pilot-run\n\
@@ -256,6 +262,10 @@ async fn main() -> anyhow::Result<()> {
             }
             "--preregister" => {
                 print!("{}", analysis::render_preregister());
+                return Ok(());
+            }
+            "--acceptance" => {
+                print!("{}", acceptance::render_acceptance(&suite::load_pack()?)?);
                 return Ok(());
             }
             "--include-swebench" => {
@@ -498,6 +508,16 @@ async fn run_pilot_live(
     eprintln!("evidence dir: {}", evidence_root.display());
     for task in tasks {
         for round in 1..=repeats {
+            let pair_dir = evidence_root.join(&task.id).join(format!("r{round}"));
+            if pair_dir.join("pair.json").is_file() {
+                // 已有 pair 不重跑，才能从 file-only 81 格 resume 到剩余 SWE-bench。
+                eprintln!(
+                    "== skip existing {} repeat {round}/{repeats} ({}) ==",
+                    task.id,
+                    pair_dir.display()
+                );
+                continue;
+            }
             eprintln!(
                 "== pilot {} engine-pair repeat {round}/{repeats} order={:?} ==",
                 task.id,
@@ -511,13 +531,9 @@ async fn run_pilot_live(
                 repeats,
                 live: true,
             };
-            let runs = fixture_driver::compare_suite_live(
-                task,
-                dir.path(),
-                model.clone(),
-                Some(&pair),
-            )
-            .await?;
+            let runs =
+                fixture_driver::compare_suite_live(task, dir.path(), model.clone(), Some(&pair))
+                    .await?;
             print!("task {} repeat {round}/{repeats}\n", task.id);
             print!("{}", fixture_driver::render_live_comparison(&runs));
             print!(

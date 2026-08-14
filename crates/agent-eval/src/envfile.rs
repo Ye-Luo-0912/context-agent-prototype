@@ -5,7 +5,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-const ALLOWED: &[&str] = &["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"];
+const ALLOWED: &[&str] = &[
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_MODEL",
+    "OPENAI_CONTEXT_WINDOW",
+];
 
 struct Loaded {
     path: PathBuf,
@@ -40,6 +45,25 @@ pub fn get(key: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// 声明的发送窗口。未设置时用 adapter 的保守默认，不是某模型的厂商数字。
+pub fn context_window() -> anyhow::Result<usize> {
+    parse_context_window(get("OPENAI_CONTEXT_WINDOW").as_deref())
+}
+
+pub fn parse_context_window(raw: Option<&str>) -> anyhow::Result<usize> {
+    const DEFAULT: usize = provider_openai::DEFAULT_DECLARED_CONTEXT_WINDOW;
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(DEFAULT);
+    };
+    let parsed: usize = value.parse().map_err(|_| {
+        anyhow::anyhow!("OPENAI_CONTEXT_WINDOW must be a positive integer, got {value:?}")
+    })?;
+    if parsed == 0 {
+        anyhow::bail!("OPENAI_CONTEXT_WINDOW must be > 0");
+    }
+    Ok(parsed)
+}
+
 pub fn status_line(path: &Path) -> String {
     let model = get("OPENAI_MODEL").unwrap_or_else(|| "(unset)".into());
     let base = get("OPENAI_BASE_URL").unwrap_or_else(|| "(unset)".into());
@@ -70,7 +94,7 @@ pub fn parse_eval_env(text: &str) -> anyhow::Result<BTreeMap<String, String>> {
         let key = key.trim();
         if !ALLOWED.contains(&key) {
             anyhow::bail!(
-                "line {}: refusing to load {key} (only OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL)",
+                "line {}: refusing to load {key} (only OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL / OPENAI_CONTEXT_WINDOW)",
                 index + 1
             );
         }
@@ -127,7 +151,8 @@ mod tests {
             "# comment\n\
              export OPENAI_MODEL=\"gpt-5.6-luna\"\n\
              OPENAI_BASE_URL=https://api.pinaic.com/v1\n\
-             OPENAI_API_KEY='sk-test'\n",
+             OPENAI_API_KEY='sk-test'\n\
+             OPENAI_CONTEXT_WINDOW=128000\n",
         )
         .unwrap();
         assert_eq!(
@@ -141,6 +166,10 @@ mod tests {
         assert_eq!(
             map.get("OPENAI_API_KEY").map(String::as_str),
             Some("sk-test")
+        );
+        assert_eq!(
+            map.get("OPENAI_CONTEXT_WINDOW").map(String::as_str),
+            Some("128000")
         );
     }
 
@@ -158,5 +187,16 @@ mod tests {
             map.get("OPENAI_MODEL").map(String::as_str),
             Some("gpt-4o-mini")
         );
+    }
+
+    #[test]
+    fn context_window_defaults_and_rejects_zero() {
+        assert_eq!(
+            parse_context_window(None).unwrap(),
+            provider_openai::DEFAULT_DECLARED_CONTEXT_WINDOW
+        );
+        assert_eq!(parse_context_window(Some("64000")).unwrap(), 64_000);
+        assert!(parse_context_window(Some("0")).is_err());
+        assert!(parse_context_window(Some("nope")).is_err());
     }
 }

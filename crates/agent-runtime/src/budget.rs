@@ -1,11 +1,17 @@
-//! The model budget: how much of the provider's context window the context
-//! engine may spend on the working set for one request.
+//! The model budget: how much of the *pack* window the context engine may
+//! spend on the working set for one request.
 //!
-//! The budget is computed at the runtime top level, where the provider's
-//! declared window and every non-engine layer are known:
+//! Send and pack are different numbers. The provider window is the send
+//! guard (a SWE-bench tool-loop turn must still be transmittable). The
+//! engine's working-set cap is the kernel pack budget, min'd against that
+//! window so a tiny provider still binds:
 //!
 //! ```text
-//! Provider Context Window
+//! Send window (declared provider context_window, else kernel budget)
+//!         - Output Reserve
+//!         = Input budget           (runtime final send guard)
+//!
+//! Pack window = min(kernel context_budget_tokens, send window)
 //!         - Output Reserve
 //!         - System Policy
 //!         - Turn Frame
@@ -16,6 +22,8 @@
 //! The engine then only sees "you have N tokens" — it never has to
 //! understand the model request shape, and every layer is a hard
 //! subtraction (the frame budget is the remaining slice, saturated at zero).
+//! Append-only baselines may ignore the pack query and grow until the send
+//! guard trims them.
 
 use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
@@ -113,6 +121,21 @@ pub(crate) fn omit_largest_optional_tool(
         })
         .map(|(index, _)| index)?;
     Some(specs.remove(index))
+}
+
+/// 发送侧窗口：已声明的 provider 窗口，否则回退到内核 pack budget。
+/// `None` 时发送与打包共用内核值，保持未声明窗口的旧行为。
+pub fn provider_send_window(provider_window: Option<usize>, kernel_budget: usize) -> usize {
+    provider_window.unwrap_or(kernel_budget)
+}
+
+/// 引擎工作集窗口：不超过内核 pack cap，也不超过 provider 窗口。
+/// 大窗口不能把 C 的 working set 撑到整段 send；小窗口仍能收紧 pack。
+pub fn engine_pack_window(provider_window: Option<usize>, kernel_budget: usize) -> usize {
+    match provider_window {
+        Some(window) => kernel_budget.min(window),
+        None => kernel_budget,
+    }
 }
 
 /// One request's budget breakdown. `context_frame_budget` is what gets handed
@@ -331,5 +354,15 @@ mod tests {
         assert!(omit_largest_optional_tool(&mut specs, |_| false).is_none());
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "core.read");
+    }
+
+    #[test]
+    fn pack_window_is_kernel_cap_min_provider() {
+        assert_eq!(engine_pack_window(None, 24_000), 24_000);
+        assert_eq!(engine_pack_window(Some(128_000), 24_000), 24_000);
+        assert_eq!(engine_pack_window(Some(1_000), 24_000), 1_000);
+        assert_eq!(provider_send_window(None, 24_000), 24_000);
+        assert_eq!(provider_send_window(Some(128_000), 24_000), 128_000);
+        assert_eq!(provider_send_window(Some(1_000), 24_000), 1_000);
     }
 }

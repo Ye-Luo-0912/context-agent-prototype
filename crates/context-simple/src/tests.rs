@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use agent_contracts::{
-    AccessSignal, AgentError, AttentionState, ContextAction, ContextConsumptionAck, ContextEngine,
-    ContextHints, ContextIngress, ContextItem, ContextItemId, ContextKind,
-    ContextMaintenanceTrigger, ContextQuery, ContextResidency, ContextRetention, ContextScope,
-    ContextSearchQuery, CoreLabel, DependencyEdge, DependencyKind, FocusState, Label,
-    LifecycleLabel, MaterializedContext, OperationId, ScopeId, ScopeKind, ScopeState,
-    SemanticState, TaskId, ToolOutput, TurnId,
+    AccessSignal, AgentError, AttentionState, BoundedCompactor, CompactionOutput,
+    CompactionRequest, ContextAction, ContextConsumptionAck, ContextEngine, ContextHints,
+    ContextIngress, ContextItem, ContextItemId, ContextKind, ContextMaintenanceTrigger,
+    ContextQuery, ContextResidency, ContextRetention, ContextScope, ContextSearchQuery, CoreLabel,
+    DependencyEdge, DependencyKind, FocusState, Label, LifecycleLabel, MaterializedContext,
+    OperationId, ScopeId, ScopeKind, ScopeState, SemanticState, TaskId, ToolOutput, TurnId,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -2460,6 +2460,47 @@ async fn external_retrieval_searches_inspects_and_fetches() {
         entry.source.as_deref(),
         Some("tool-capture"),
         "fetch must not re-enter the working set, and the source authority survives externalization"
+    );
+}
+
+#[tokio::test]
+async fn catalog_search_surfaces_resident_hits_instead_of_empty() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "fix AuthService.rs").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "keep AuthService.rs in the working set".into(),
+        })
+        .await
+        .unwrap();
+
+    let hits = engine
+        .search_external(ContextSearchQuery::new("AuthService", 8))
+        .await
+        .unwrap();
+    assert!(
+        hits.iter()
+            .any(|hit| hit.residency == ContextResidency::Resident
+                && hit.entities.iter().any(|e| e.contains("AuthService"))),
+        "a live working-set file must be a catalog hit, not an empty miss: {hits:?}"
+    );
+    let resident = hits
+        .iter()
+        .find(|hit| hit.residency == ContextResidency::Resident)
+        .unwrap();
+    let inspected = engine
+        .inspect_external(resident.item_id)
+        .await
+        .unwrap()
+        .expect("resident inspect returns a descriptor");
+    assert_eq!(inspected.residency, ContextResidency::Resident);
+    assert!(
+        engine
+            .fetch_external(resident.item_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "fetch remains a store read; resident bodies stay in the working set"
     );
 }
 
@@ -6480,6 +6521,94 @@ async fn unnamed_task_summary_keeps_the_focused_tasks_identity() {
         Some(task_a_scope),
         "the summary must point at the completed task's scope"
     );
+    assert_eq!(
+        summary.content, "A is done",
+        "without a compactor the runtime summary is stored verbatim"
+    );
+    assert_eq!(summary.source.as_deref(), Some("task-summary"));
+    assert!(
+        summary.dependencies.is_empty(),
+        "verbatim summaries have no DerivedFrom edges"
+    );
+}
+
+/// 注入压缩器后，任务完成蒸馏成带 `DerivedFrom` 的派生摘要；原文条目保留。
+struct TaskDistillCompactor;
+
+#[async_trait::async_trait]
+impl BoundedCompactor for TaskDistillCompactor {
+    async fn compact(
+        &self,
+        request: CompactionRequest,
+    ) -> agent_contracts::AgentResult<CompactionOutput> {
+        Ok(CompactionOutput {
+            text: format!("[distilled] {}", request.source),
+            input_tokens: 5,
+            output_tokens: 3,
+        })
+    }
+}
+
+#[tokio::test]
+async fn task_completion_distills_with_derived_from_and_keeps_sources() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default())
+        .with_compactor(Arc::new(TaskDistillCompactor));
+    let task = open_focus(&engine, "finish task A").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "keep AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::TaskCompleted {
+            task_id: Some(task),
+            summary: "A is done".into(),
+        })
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    let source = state
+        .items
+        .iter()
+        .find(|item| item.kind == ContextKind::UserMessage)
+        .expect("source user message must remain retrievable");
+    let source_id = source.id;
+    assert!(
+        source.content.contains("AuthService.rs"),
+        "raw bodies stay after distillation"
+    );
+    let summary = state
+        .items
+        .iter()
+        .find(|item| item.kind == ContextKind::Summary)
+        .expect("distilled summary must exist");
+    assert_eq!(summary.task_id, Some(task));
+    assert_eq!(summary.source.as_deref(), Some("derived"));
+    assert!(
+        summary.content.contains("[distilled]"),
+        "compactor output must become the summary, got: {}",
+        summary.content
+    );
+    assert!(
+        summary.content.contains("AuthService.rs"),
+        "distill source must include the task body, got: {}",
+        summary.content
+    );
+    assert!(
+        summary
+            .dependencies
+            .iter()
+            .any(|edge| edge.kind == DependencyKind::DerivedFrom && edge.target == source_id),
+        "distilled summary must carry DerivedFrom, got: {:?}",
+        summary.dependencies
+    );
+    drop(state);
+
+    let diagnostics = engine.diagnostics().await.unwrap();
+    assert_eq!(diagnostics.compaction_input_tokens, 5);
+    assert_eq!(diagnostics.compaction_output_tokens, 3);
 }
 
 /// The dependency-expansion token reserve is only carved out when expansion

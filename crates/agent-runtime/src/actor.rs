@@ -37,6 +37,7 @@ use tokio::task::JoinHandle;
 
 use crate::budget::{
     DEFAULT_OUTPUT_RESERVE, MAX_TOOL_SURFACE_TOKENS, ModelBudget, approx_layer_tokens,
+    engine_pack_window, provider_send_window,
 };
 use crate::checkpoint::{
     RUNTIME_CHECKPOINT_VERSION, RunMetadata, RuntimeCheckpoint, TaskManagerSnapshot,
@@ -1997,16 +1998,15 @@ impl RuntimeActor {
             return;
         }
 
-        // The engine only ever sees its own slice of the provider window:
-        // the output reserve, system policy, turn frame and active tool
-        // schemas are the runtime's share and are subtracted before the
-        // engine budgets the working set.
+        // 发送窗口与打包窗口分离：SWE-bench 工具轮的 turn frame 必须
+        // 能发出去；C 的 working set 仍按内核 pack cap 收。未声明
+        // provider 窗口时两者都回退到内核 budget（旧行为）。
         let capabilities = self.services.model_capabilities();
         let turn_frame_tokens = approx_layer_tokens(&turn_frame.messages());
         let active_tools_tokens = approx_layer_tokens(&surface_plan.specs());
-        let provider_window = capabilities
-            .context_window
-            .unwrap_or_else(|| self.services.context_budget_tokens());
+        let kernel_budget = self.services.context_budget_tokens();
+        let send_window = provider_send_window(capabilities.context_window, kernel_budget);
+        let pack_window = engine_pack_window(capabilities.context_window, kernel_budget);
         // The output reserve is a hard subtraction: the answer must always
         // have room, and rendering overhead must never eat into it.
         let output_reserve = if capabilities.max_output_tokens > 0 {
@@ -2015,7 +2015,7 @@ impl RuntimeActor {
             DEFAULT_OUTPUT_RESERVE
         };
         let model_budget = ModelBudget::compute(
-            provider_window,
+            pack_window,
             output_reserve,
             self.assembler.system_prompt_tokens(),
             turn_frame_tokens,
@@ -2059,13 +2059,14 @@ impl RuntimeActor {
         // Runtime final guard: the engine priced the working-set content,
         // but the assembler's rendering overhead (section headers, per-item
         // frame labels) is the runtime's share. The assembled request must
-        // fit the *input* budget — the window minus the output reserve —
-        // because the answer must always have room. Trim the context frame
-        // until it fits; if the fixed layers alone (system + turn + tools)
-        // still overshoot, omit optional schemas from this round snapshot;
-        // a request whose mandatory fixed layers still do not fit is a hard
-        // error, never a lifecycle mutation or silently over-budget send.
-        let max_input_budget = provider_window.saturating_sub(output_reserve);
+        // fit the *send* input budget — the provider window minus the
+        // output reserve — because the answer must always have room. Trim
+        // the context frame until it fits; if the fixed layers alone
+        // (system + turn + tools) still overshoot, omit optional schemas
+        // from this round snapshot; a request whose mandatory fixed layers
+        // still do not fit is a hard error, never a lifecycle mutation or
+        // silently over-budget send.
+        let max_input_budget = send_window.saturating_sub(output_reserve);
         let mut materialized = materialized;
         let mut input =
             self.assembler

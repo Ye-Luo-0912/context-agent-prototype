@@ -39,6 +39,8 @@ pub(crate) fn compute(state: &State) -> ContextDiagnostics {
         access_fetches: state.access_fetches,
         access_admits: state.access_admits,
         access_consumption_acks: state.access_consumption_acks,
+        compaction_input_tokens: state.compaction_input_tokens,
+        compaction_output_tokens: state.compaction_output_tokens,
         ..ContextDiagnostics::default()
     };
 

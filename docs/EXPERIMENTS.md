@@ -8,12 +8,19 @@ tasks. The current experiment is a deterministic, coding-shaped policy replay;
 it is not yet the real coding-workload acceptance test:
 
 - **A — append-only**: every message and tool result is resent every model
-  turn until the window limit forces a stop.
+  turn until the *send* window forces a trim. Live P1 does not starve A
+  with a smaller send limit than C; A is a competent long-context baseline.
 - **B — rolling marker baseline** (`RollingSummaryEngine`): append like A,
   but when retained history crosses a threshold, drop the oldest part outside
-  a verbatim recency window and insert a fixed marker. No model-generated
-  compaction is run, so B must not be presented as a competitive summarizer.
-- **C — dynamic working set**: `SimpleContextEngine` (this design).
+  a verbatim recency window and insert a bounded summary. Live P1 injects the
+  shared `ModelBackedCompactor` (same operator as C's `TaskCompleted`
+  distill); CI keeps a scripted digest. Compactor provider tokens are
+  counted separately from the visible working set. B packs against the
+  same kernel working-set cap as C.
+- **C — dynamic working set**: `SimpleContextEngine` (this design). Live P1
+  packs C against the kernel ~24k working-set budget even when the provider
+  send window is 128k. Extra tool rounds under the shared 48-round cap are a
+  treatment effect, not a reason to give C more rounds than A.
 
 The comparison is offline and deterministic: the same scripted scenarios are
 replayed through all three `ContextEngine` implementations and measured with
@@ -251,8 +258,9 @@ P3-era numbers; `SimpleContextConfig::default()` runs the full P4 policy.
 
 Before claiming real-evaluation completion:
 
-- replace or supplement B with actual bounded compaction and count its model
-  cost;
+- live B now uses a shared model-backed bounded compactor (CI keeps the
+  scripted digest) and counts its provider tokens; episode-rotation
+  distillation and executable hidden build/tests remain open;
 - run paired feature/bug/refactor tasks with real repository tools and hidden
   build/test verification;
 - count provider I/O, PromptAssembler/TurnFrame/tool schemas, context and
@@ -346,7 +354,7 @@ regression.
 independent workspaces, hidden verify). The milestone is **not** closed:
 n=4 × 1 repeat cannot support the historical −5 pp / 30×3 proposal,
 nor the EVAL-01.3 300×3 amendment;
-a model-backed B, the 300-task freeze and Phase 4 remain open. Live cells
+a P1 SWE-bench cohort, the 300-task freeze and Phase 4 remain open. Live cells
 now write versioned evidence bundles (EVAL-01.1); `--preregister` freezes
 the C−A clustered estimator (EVAL-01.2) and the 300×3 sample size
 (EVAL-01.3). Historical 30×3 is underpowered. The 2026-08-14 smoke itself still cannot be rebuilt because
@@ -602,8 +610,11 @@ current-file / `handle_21` slice is landed (active-task latest file body,
    remain 5 smoke/diagnostic tasks. EVAL-01.3b freezes the suite
    (`suite_frozen=true`, pack 509=9 file + 500 SWE-bench Verified) and
    declares retrieval secondaries; n/repeats/margin stay 300×3 / −5 pp.
-   Do not collect 300×3 acceptance cells until the frozen ~30×3
-   calibration pilot. Unit tests do not pull images.
+   EVAL-01.3c locks the exact 300 acceptance ids (sha256 `7ff6b5dd…`,
+   harvest sizes 107/147/46) so the 509 pack is not an optional pool;
+   cost-eligible paired tokens omit usage-incomplete zeros; pooled φ is
+   not the A ⟂ C | task diagnostic. Do not collect 300×3 acceptance
+   cells until remaining calibration. Unit tests do not pull images.
    **EVAL-01.5 (2026-08-14):** 30-id calibration sample frozen
    (`--pilot`, sha256 `fa8c5308…`, 10/10/10). `--pilot-run` is the live
    A/B/C path on that sample (default 9 file tasks; SWE-bench is
@@ -611,10 +622,31 @@ current-file / `handle_21` slice is landed (active-task latest file body,
    reports `decision=pilot` and cannot pass the 300×3 gate.
    File-only live 9×3 collected in `crates/agent-eval/evidence/pilot-30`
    (81 cells; ITT A=C=0.778; diagnostic C−A LCL=−0.146; gate
-   ineligible). 21 SWE-bench cells not collected. Do not amend n.
+   ineligible). **EVAL-01.5.p1 (2026-08-15):** P0 host was kernel-fallback
+   send 19904 + 12 rounds (and kernel `max_tool_rounds` 16). That cannot
+   host SWE-bench: empty context still overflowed the send floor, and the
+   round cap aborted tool loops. Remaining P0 SWE-bench spend is skipped;
+   do not mix P0 and P1 cells in one ITT table; do not re-run file-only
+   under P1 for the same table. P1 shared host: declared send window
+   (eval default 128000, `OPENAI_CONTEXT_WINDOW` override), output reserve
+   4096, 48 rounds for A/B/C (harness + kernel). Engine treatment: C/B
+   pack to kernel 24k; A grows until the send window. Do not give A a
+   smaller send than C or C a higher round cap than A. Do not amend n.
    Live `--compare-live*`
    now counterbalances append/rolling/dynamic per fixture×repeat;
-4. use a model-backed bounded compactor for B and include its manager cost.
+4. **Partial 2026-08-15:** live B/C use a model-backed bounded
+   compactor; CI keeps the scripted digest; manager/compactor cost is
+   counted. Episode-rotation distillation and executable hidden
+   build/tests remain open.
+   **EVAL-01.5.p1c (2026-08-15):** C extra-round diagnosis stands: not
+   missing current-turn tool output. Causes were prompt distrust (working
+   set called a cache / optional), empty search of a still-Resident file,
+   a no-tool first turn, failed probes, and extra rereads. Catalog search
+   is catalog-wide. System prompt and assembler headers are labels/facts,
+   not retrieval tutorials. Extra rounds remain a treatment effect to
+   re-measure. Smoke fixtures stay file-content; executable hidden stays
+   on the suite pack. Do not retune scoring. Do not amend n. Do not mix
+   P0/P1 ITT tables.
 
 Until those artifacts and the predeclared interval exist, the live tables are
 diagnostic observations rather than independently reproducible acceptance

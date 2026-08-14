@@ -102,6 +102,7 @@ fn build_model_with_timeout(timeout: Duration) -> anyhow::Result<Arc<dyn ModelTr
     let base_url = crate::envfile::get("OPENAI_BASE_URL")
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
     let model = crate::envfile::get("OPENAI_MODEL").unwrap_or_else(|| "gpt-4o-mini".to_string());
+    let context_window = crate::envfile::context_window()?;
     let provider = OpenAiProvider::new(OpenAiConfig {
         api_key,
         base_url,
@@ -111,6 +112,7 @@ fn build_model_with_timeout(timeout: Duration) -> anyhow::Result<Arc<dyn ModelTr
         send_stream_options: true,
         send_max_tokens: true,
         max_stream_bytes: provider_openai::DEFAULT_MAX_STREAM_BYTES,
+        context_window: Some(context_window),
     });
     Ok(Arc::new(RetryingTransport::new(
         provider,
