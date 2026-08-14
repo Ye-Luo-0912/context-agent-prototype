@@ -1,0 +1,8 @@
+{
+  "files": 2,
+  "listed": [
+    "symbols.py",
+    "tests/test_symbols.py"
+  ],
+  "sha256": "50248037e9f2141225124e8f175a59b43f5103fc523f847d1c1a6024ce47d5f8"
+}

@@ -1,0 +1,28 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "hidden_command",
+  "fixture_id": "rust-jcs-canonical-objects",
+  "expected_edit": "",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [],
+  "files": [],
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--offline",
+        "--quiet"
+      ],
+      "expect_exit": 0,
+      "exit": 101,
+      "timed_out": false,
+      "stdout": "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 2 tests\nobjects_are_key_sorted_without_whitespace --- FAILED\nnested_array_and_literals --- FAILED\n\nfailures:\n\n---- objects_are_key_sorted_without_whitespace stdout ----\n\nthread 'objects_are_key_sorted_without_whitespace' (35548) panicked at tests\\hidden.rs:9:5:\nassertion `left == right` failed\n  left: \"{ \\\"b\\\": 1, \\\"a\\\": 2 }\"\n right: \"{\\\"a\\\":2,\\\"b\\\":1}\"\n\n---- nested_array_and_literals stdout ----\n\nthread 'nested_array_and_literals' (5132) panicked at tests\\hidden.rs:20:5:\nassertion `left == right` failed\n  left: \"[ null, true, \\\"x\\\\\\\"y\\\", -3 ]\"\n right: \"[null,true,\\\"x\\\\\\\"y\\\",-3]\"\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    nested_array_and_literals\n    objects_are_key_sorted_without_whitespace\n\ntest result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "error: test failed, to rerun pass `--test hidden`\n",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

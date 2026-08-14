@@ -23,7 +23,7 @@ use context_simple::{SimpleContextConfig, SimpleContextEngine};
 use serde_json::json;
 use tokio::sync::broadcast;
 
-use crate::{bundle, metrics, mock_model::ScriptedModel, workload};
+use crate::{bundle, harvest, metrics, mock_model::ScriptedModel, suite, workload};
 
 /// 脚本化 fixture：事件之间最多等这么久（本机工具面，不该接近这个上限）。
 const SCRIPTED_IDLE: Duration = Duration::from_secs(120);
@@ -67,7 +67,7 @@ impl Summarizer for ScriptedSummarizer {
 /// all-module cost accounting of the run.
 #[derive(Debug, Clone)]
 pub struct FixtureEval {
-    pub fixture_id: &'static str,
+    pub fixture_id: String,
     pub passed: bool,
     pub metrics: metrics::RunMetrics,
     /// Wall time of this harness cell (composition + turns + shutdown).
@@ -259,6 +259,70 @@ pub async fn compare_engines_live(
     pair: Option<&bundle::PairSink>,
 ) -> anyhow::Result<Vec<EngineRun>> {
     compare_engines_with_model(fixture, workspace_root, Some(model), pair).await
+}
+
+/// 套件 live：独立 workspace、打乱臂序、可执行 hidden command。
+pub async fn compare_suite_live(
+    task: &suite::SuiteTask,
+    workspace_root: &Path,
+    model: Arc<dyn ModelTransport>,
+    pair: Option<&bundle::PairSink>,
+) -> anyhow::Result<Vec<EngineRun>> {
+    compare_suite_with_model(task, workspace_root, move || model.clone(), pair, true).await
+}
+
+async fn compare_suite_with_model(
+    task: &suite::SuiteTask,
+    workspace_root: &Path,
+    model: impl Fn() -> Arc<dyn ModelTransport>,
+    pair: Option<&bundle::PairSink>,
+    live: bool,
+) -> anyhow::Result<Vec<EngineRun>> {
+    let prompts = suite::live_turns(task);
+    let turns: Vec<&str> = prompts.iter().map(String::as_str).collect();
+    let limits = if live { LIVE_LIMITS } else { SCRIPTED_LIMITS };
+    let repeat = pair.map(|p| p.repeat).unwrap_or(1);
+    let order = if live {
+        crate::analysis::arm_order(&task.id, repeat)
+    } else {
+        crate::analysis::SCRIPTED_ARM_ORDER
+    };
+    let mut runs = Vec::new();
+    for name in order {
+        let engine = named_engine(name)?;
+        let root = workspace_root.join(name);
+        eprintln!("  engine {name}: seeding {}", task.id);
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        suite::materialize_live_workspace(task, &root)?;
+        eprintln!("  engine {name}: starting");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        let eval = run_suite_with_engine(
+            task,
+            &root,
+            model(),
+            engine.clone(),
+            &turns,
+            limits,
+            name,
+            pair,
+        )
+        .await?;
+        eprintln!(
+            "  engine {name}: passed={} wall_ms={} model_in={} error={:?}",
+            eval.passed, eval.wall_ms, eval.metrics.model_input_tokens, eval.error
+        );
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        let manager_tokens = manager_token_cost(engine.as_ref()).await?;
+        runs.push(EngineRun {
+            engine: name,
+            eval,
+            manager_tokens,
+        });
+    }
+    if let Some(pair) = pair {
+        bundle::write_pair(pair, &order)?;
+    }
+    Ok(runs)
 }
 
 async fn compare_engines_with_model(
@@ -500,6 +564,120 @@ async fn run_fixture_with_engine(
     engine: &'static str,
     pair: Option<&bundle::PairSink>,
 ) -> anyhow::Result<FixtureEval> {
+    let session = run_workspace_session(workspace_root, model, context_engine, turns, limits).await?;
+    let passed = session.error.is_none() && workload::fixture_passes(fixture, workspace_root);
+    let eval = FixtureEval {
+        fixture_id: fixture.id.to_string(),
+        passed,
+        metrics: metrics::aggregate_metrics(&session.events),
+        wall_ms: session.wall_ms,
+        error: session.error.clone(),
+    };
+    if let Some(pair) = pair {
+        bundle::write_cell(
+            &pair.cell_dir(engine),
+            fixture,
+            engine,
+            pair,
+            &session.events,
+            &eval.metrics,
+            eval.passed,
+            eval.wall_ms,
+            eval.error.as_deref(),
+            workspace_root,
+            session.lagged,
+            session.deltas_omitted,
+        )?;
+    }
+    Ok(eval)
+}
+
+async fn run_suite_with_engine(
+    task: &suite::SuiteTask,
+    workspace_root: &Path,
+    model: Arc<dyn ModelTransport>,
+    context_engine: Arc<dyn ContextEngine>,
+    turns: &[&str],
+    limits: TurnLimits,
+    engine: &'static str,
+    pair: Option<&bundle::PairSink>,
+) -> anyhow::Result<FixtureEval> {
+    let session = run_workspace_session(workspace_root, model, context_engine, turns, limits).await?;
+    let run_tag = format!(
+        "pilot-{}-{}-r{}",
+        harvest::instance_id_from_suite_id(&task.id).unwrap_or(&task.id),
+        engine,
+        pair.map(|p| p.repeat).unwrap_or(1)
+    );
+    let commands = match evaluate_after_live(task, workspace_root, &run_tag) {
+        Ok(commands) => commands,
+        Err(error) => vec![workload::HiddenCommandResult {
+            argv: vec!["evaluate".into()],
+            stderr: error.to_string(),
+            passed: false,
+            ..workload::HiddenCommandResult::default()
+        }],
+    };
+    let passed = session.error.is_none() && suite::all_hidden_passed(&commands);
+    let eval = FixtureEval {
+        fixture_id: task.id.clone(),
+        passed,
+        metrics: metrics::aggregate_metrics(&session.events),
+        wall_ms: session.wall_ms,
+        error: session.error.clone(),
+    };
+    if let Some(pair) = pair {
+        bundle::write_suite_cell(
+            &pair.cell_dir(engine),
+            task,
+            engine,
+            pair,
+            &session.events,
+            &eval.metrics,
+            eval.passed,
+            eval.wall_ms,
+            eval.error.as_deref(),
+            workspace_root,
+            session.lagged,
+            session.deltas_omitted,
+            commands,
+        )?;
+    }
+    Ok(eval)
+}
+
+fn evaluate_after_live(
+    task: &suite::SuiteTask,
+    workspace_root: &Path,
+    run_tag: &str,
+) -> anyhow::Result<Vec<workload::HiddenCommandResult>> {
+    if task.runtime != harvest::RUNTIME {
+        return suite::evaluate_suite_task(task, workspace_root);
+    }
+    if !harvest::docker_opt_in() {
+        anyhow::bail!("set AGENT_EVAL_SWEBENCH_DOCKER=1 to score a model patch");
+    }
+    let instance = harvest::instance_id_from_suite_id(&task.id)
+        .ok_or_else(|| anyhow::anyhow!("{} is not a swebench suite id", task.id))?;
+    let patch = harvest::git_model_patch(workspace_root)?;
+    Ok(vec![harvest::run_prediction_eval(instance, &patch, run_tag)?])
+}
+
+struct WorkspaceSession {
+    events: Vec<RuntimeEventEnvelope>,
+    lagged: u64,
+    deltas_omitted: u64,
+    wall_ms: u64,
+    error: Option<String>,
+}
+
+async fn run_workspace_session(
+    workspace_root: &Path,
+    model: Arc<dyn ModelTransport>,
+    context_engine: Arc<dyn ContextEngine>,
+    turns: &[&str],
+    limits: TurnLimits,
+) -> anyhow::Result<WorkspaceSession> {
     let started = Instant::now();
     let approval: Arc<dyn ApprovalGate> = Arc::new(AllowAllGate);
 
@@ -524,10 +702,6 @@ async fn run_fixture_with_engine(
             },
         ));
 
-    // One shared composition (agent-compose): the host wiring, kernel
-    // services and actor spawn are identical to the TUI/CLI roots; the
-    // harness only differs in the pieces it hands in (engine, model,
-    // approval, plain dispatcher, no journal/artifacts/output broker).
     let composed = agent_compose::compose(agent_compose::ComposeConfig {
         workspace,
         context_engine,
@@ -554,33 +728,14 @@ async fn run_fixture_with_engine(
             break;
         }
     }
-    let passed = error.is_none() && workload::fixture_passes(fixture, workspace_root);
     let _ = composed.shutdown().await;
-
-    let eval = FixtureEval {
-        fixture_id: fixture.id,
-        passed,
-        metrics: metrics::aggregate_metrics(&capture.events),
+    Ok(WorkspaceSession {
+        events: capture.events,
+        lagged: capture.lagged,
+        deltas_omitted: capture.deltas_omitted,
         wall_ms: started.elapsed().as_millis() as u64,
-        error: error.clone(),
-    };
-    if let Some(pair) = pair {
-        bundle::write_cell(
-            &pair.cell_dir(engine),
-            fixture,
-            engine,
-            pair,
-            &capture.events,
-            &eval.metrics,
-            eval.passed,
-            eval.wall_ms,
-            eval.error.as_deref(),
-            workspace_root,
-            capture.lagged,
-            capture.deltas_omitted,
-        )?;
-    }
-    Ok(eval)
+        error,
+    })
 }
 
 #[derive(Default)]
@@ -976,5 +1131,45 @@ mod tests {
             shown.contains("append") && shown.contains("dynamic"),
             "{shown}"
         );
+    }
+
+    fn oracle_model(task: &suite::SuiteTask) -> ScriptedModel {
+        let steps = task
+            .expected_files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| ToolCall {
+                id: format!("c{}", index + 1),
+                name: "fs.write".into(),
+                arguments: json!({
+                    "path": file.path,
+                    "content": file.content,
+                }),
+            })
+            .collect();
+        ScriptedModel::new(steps, format!("{}: done", task.id))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn suite_oracle_passes_hidden_commands_on_a_file_task() {
+        let pack = suite::load_pack().unwrap();
+        let task = pack
+            .tasks
+            .iter()
+            .find(|task| task.id == "python-itertools-batched")
+            .expect("file-harvested task");
+        assert!(!task.expected_files.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let runs = compare_suite_with_model(task, dir.path(), || Arc::new(oracle_model(task)), None, false)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 3);
+        for run in &runs {
+            assert!(
+                run.eval.passed,
+                "engine '{}' must pass {} after writing expected files: {:?}",
+                run.engine, task.id, run.eval.error
+            );
+        }
     }
 }

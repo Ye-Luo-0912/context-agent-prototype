@@ -1,6 +1,6 @@
 //! 每个 intended cell 一份有界证据包（EVAL-01）：事件 JSONL、机器可读
-//! 摘要、workspace 哈希、hidden-verify 结果。报告表从这些包重建，不靠
-//! 已经删掉的临时目录。不含 API key。
+//! 摘要、workspace 哈希、可重放的 hidden 断言（文件体 + 谓词结果）。
+//! 报告表从这些包重建，不靠已经删掉的临时目录。不含 API key。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -13,7 +13,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::metrics::RunMetrics;
-use crate::workload::CodingFixture;
+use crate::workload::{self, CodingFixture, HiddenReport};
 
 /// 证据包 schema。升版本时旧包仍可读，新字段要有 default。
 /// `ANALYSIS_SCHEMA` 跟着预注册 spec 走；旧 `pair.json` 里的 v1 仍能加载。
@@ -109,15 +109,96 @@ pub fn write_cell(
     broadcast_lagged: u64,
     model_deltas_omitted: u64,
 ) -> anyhow::Result<()> {
+    let report = workload::evaluate_hidden(fixture, workspace_root);
+    write_cell_parts(
+        dir,
+        fixture.id,
+        &fixture_sha256(fixture),
+        engine,
+        pair,
+        events,
+        metrics,
+        passed,
+        wall_ms,
+        error,
+        workspace_root,
+        broadcast_lagged,
+        model_deltas_omitted,
+        &report,
+    )
+}
+
+/// 套件 live 细胞：hidden 是可执行命令，不是烟雾 fixture 的文件体断言。
+pub fn write_suite_cell(
+    dir: &Path,
+    task: &crate::suite::SuiteTask,
+    engine: &str,
+    pair: &PairSink,
+    events: &[RuntimeEventEnvelope],
+    metrics: &RunMetrics,
+    passed: bool,
+    wall_ms: u64,
+    error: Option<&str>,
+    workspace_root: &Path,
+    broadcast_lagged: u64,
+    model_deltas_omitted: u64,
+    commands: Vec<crate::workload::HiddenCommandResult>,
+) -> anyhow::Result<()> {
+    let command_passed = crate::suite::all_hidden_passed(&commands);
+    let report = HiddenReport {
+        schema: crate::workload::VERIFY_SCHEMA.to_string(),
+        kind: "hidden_command".into(),
+        fixture_id: task.id.clone(),
+        expected_edit: String::new(),
+        passed: command_passed,
+        replay_complete: true,
+        assertions: Vec::new(),
+        files: Vec::new(),
+        commands,
+    };
+    write_cell_parts(
+        dir,
+        &task.id,
+        &suite_task_sha256(task),
+        engine,
+        pair,
+        events,
+        metrics,
+        passed,
+        wall_ms,
+        error,
+        workspace_root,
+        broadcast_lagged,
+        model_deltas_omitted,
+        &report,
+    )
+}
+
+fn write_cell_parts(
+    dir: &Path,
+    fixture_id: &str,
+    fixture_sha256: &str,
+    engine: &str,
+    pair: &PairSink,
+    events: &[RuntimeEventEnvelope],
+    metrics: &RunMetrics,
+    passed: bool,
+    wall_ms: u64,
+    error: Option<&str>,
+    workspace_root: &Path,
+    broadcast_lagged: u64,
+    model_deltas_omitted: u64,
+    report: &HiddenReport,
+) -> anyhow::Result<()> {
     fs::create_dir_all(dir)?;
     let manifest = CellManifest {
         schema: CELL_SCHEMA.to_string(),
-        fixture_id: fixture.id.to_string(),
+        fixture_id: fixture_id.to_string(),
         engine: engine.to_string(),
         repeat: pair.repeat,
         repeats: pair.repeats,
         live: pair.live,
-        fixture_sha256: fixture_sha256(fixture),
+        fixture_sha256: fixture_sha256.to_string(),
         git_head: git_head(),
         git_dirty: git_dirty(),
         git_dirty_sha256: git_dirty_sha256(),
@@ -142,14 +223,7 @@ pub fn write_cell(
             "listed": file_list,
         }),
     )?;
-
-    write_json(
-        dir.join("verify.json"),
-        &json!({
-            "passed": passed,
-            "expected_edit": fixture.expected_edit,
-        }),
-    )?;
+    write_json(dir.join("verify.json"), report)?;
 
     let seq_gap = first_journaled_seq_gap(events);
     let model_started = count_event(events, |e| matches!(e, RuntimeEvent::ModelStarted { .. }));
@@ -280,6 +354,36 @@ fn render_cell(dir: &Path) -> anyhow::Result<String> {
     if let Some(error) = &summary.error {
         out.push_str(&format!("           error={error}\n"));
     }
+    if parent.join("verify.json").is_file() {
+        if let Ok(text) = fs::read_to_string(parent.join("verify.json")) {
+            if let Ok(report) = serde_json::from_str::<HiddenReport>(&text) {
+                out.push_str(&format!(
+                    "           hidden kind={} passed={} replay_complete={} asserts={}/{}\n",
+                    report.kind,
+                    report.passed,
+                    report.replay_complete,
+                    report.assertions.iter().filter(|row| row.passed).count(),
+                    report.assertions.len()
+                ));
+                for row in &report.assertions {
+                    if !row.passed {
+                        out.push_str(&format!(
+                            "           hidden FAIL {} {} {:?}\n",
+                            row.path, row.pred, row.needles
+                        ));
+                    }
+                }
+                for row in &report.commands {
+                    if !row.passed {
+                        out.push_str(&format!(
+                            "           hidden CMD FAIL {:?}\n",
+                            row.argv
+                        ));
+                    }
+                }
+            }
+        }
+    }
     for tool in &summary.tools {
         out.push_str(&format!(
             "           tool {} calls={} failed={}\n",
@@ -306,6 +410,33 @@ pub fn fixture_sha256(fixture: &CodingFixture) -> String {
         hasher.update(b"\n");
     }
     hasher.update(fixture.expected_edit.as_bytes());
+    crate::workload::hash_hidden(fixture, &mut hasher);
+    hex_encode(&hasher.finalize())
+}
+
+pub fn suite_task_sha256(task: &crate::suite::SuiteTask) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(task.id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(task.description.as_bytes());
+    hasher.update(b"\n");
+    for turn in &task.extra_live_turns {
+        hasher.update(turn.as_bytes());
+        hasher.update(b"\n");
+    }
+    for file in &task.seed {
+        hasher.update(file.path.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(file.content.as_bytes());
+        hasher.update(b"\n");
+    }
+    for cmd in &task.hidden_commands {
+        for arg in &cmd.argv {
+            hasher.update(arg.as_bytes());
+            hasher.update(b"\0");
+        }
+        hasher.update(b"\n");
+    }
     hex_encode(&hasher.finalize())
 }
 
@@ -571,5 +702,78 @@ mod tests {
         assert_eq!(summary.tools[0].name, "fs.read");
         let shown = render_cell(&cell).unwrap();
         assert!(shown.contains("fs.read"), "{shown}");
+        let report: crate::workload::HiddenReport =
+            serde_json::from_str(&fs::read_to_string(cell.join("verify.json")).unwrap()).unwrap();
+        assert_eq!(report.schema, crate::workload::VERIFY_SCHEMA);
+        assert_eq!(report.kind, "file_content");
+        assert!(!report.assertions.is_empty());
+        assert!(report.replay_complete);
+        // 工作区只有 ok\n，hidden 应失败并点名 src/util.py。
+        assert!(!report.passed);
+        assert!(
+            report
+                .assertions
+                .iter()
+                .any(|row| row.path == "src/util.py" && !row.passed),
+            "{:?}",
+            report.assertions
+        );
+        assert!(!crate::workload::reverify_from_report(&report).unwrap());
+        std::fs::remove_dir_all(&workspace).unwrap();
+        assert!(!crate::workload::reverify_from_report(&report).unwrap());
+        assert!(shown.contains("hidden FAIL"), "{shown}");
+    }
+
+    #[test]
+    fn writes_a_hidden_command_suite_cell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("seed.py"), "x = 1\n").unwrap();
+        let pack = crate::suite::load_pack().unwrap();
+        let task = pack
+            .tasks
+            .iter()
+            .find(|task| task.id == "python-itertools-batched")
+            .expect("file task");
+        let pair = PairSink {
+            root: tmp.path().join("evidence"),
+            fixture_id: task.id.clone(),
+            repeat: 1,
+            repeats: 1,
+            live: true,
+        };
+        let commands = vec![crate::workload::HiddenCommandResult {
+            argv: vec!["python".into(), "-m".into(), "unittest".into()],
+            expect_exit: 0,
+            exit: Some(0),
+            passed: true,
+            ..crate::workload::HiddenCommandResult::default()
+        }];
+        let cell = pair.cell_dir("append");
+        write_suite_cell(
+            &cell,
+            task,
+            "append",
+            &pair,
+            &[],
+            &crate::metrics::RunMetrics::default(),
+            true,
+            3,
+            None,
+            &workspace,
+            0,
+            0,
+            commands,
+        )
+        .unwrap();
+        let report: crate::workload::HiddenReport =
+            serde_json::from_str(&fs::read_to_string(cell.join("verify.json")).unwrap()).unwrap();
+        assert_eq!(report.kind, "hidden_command");
+        assert!(report.passed);
+        assert!(crate::workload::reverify_from_report(&report).unwrap());
+        let summary: CellSummary =
+            serde_json::from_str(&fs::read_to_string(cell.join("summary.json")).unwrap()).unwrap();
+        assert_eq!(summary.outcome, "passed");
     }
 }

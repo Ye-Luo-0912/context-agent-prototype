@@ -1,0 +1,24 @@
+{
+  "id": "js-ms-minutes-shadow",
+  "name": "ms minutes unit must not shadow the match variable",
+  "class": "refactor",
+  "language": "javascript",
+  "size": "small",
+  "edit_shape": "rename-to-unshadow",
+  "recall_pressure": "none",
+  "source": {
+    "kind": "git",
+    "repo": "https://github.com/vercel/ms",
+    "commit": "9992f8a962332c4071ce9c6f0750358b1ddbf36b",
+    "path": "index.js",
+    "note": "Minimized from vercel/ms #22: parse stored the regex result in m, shadowing the minutes constant m = s * 60, so case 'm' returned n * MatchArray. Rename the match binding; do not change the unit table."
+  },
+  "description": "parse() stores the regex result in a local named m, which shadows the module-level minutes constant m = s * 60. The minutes branch therefore multiplies by the match array instead of 60000, so parse('2m') is wrong while parse('2s') still works. Rename the regex binding so case 'm' uses the minutes constant. Do not change the conversion table or the public parse() contract.",
+  "hidden_commands": [
+    {
+      "argv": ["node", "--test", "tests/hidden.test.js"],
+      "timeout_ms": 30000,
+      "expect_exit": 0
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "openai-wire-tool-names",
+  "name": "OpenAI wire tool-name codec",
+  "class": "bug",
+  "language": "rust",
+  "size": "small",
+  "edit_shape": "encoder-plus-collision-guard",
+  "recall_pressure": "none",
+  "source": {
+    "kind": "git",
+    "repo": "https://github.com/Ye-Luo-0912/context-agent-prototype",
+    "commit": "1f89e5b9f1e3c1d2dd50ec71f9131e631b7cfcb2",
+    "path": "crates/provider-openai/src/wire_names.rs",
+    "note": "Minimized from the provider-openai codec: OpenAI function names are ^[a-zA-Z0-9_-]+$ while Core ids allow '.' and ':'. Standalone crate; no workspace deps."
+  },
+  "description": "OpenAI Chat Completions requires tools[].function.name to match ^[a-zA-Z0-9_-]+$, but this crate's Core-style tool ids include '.' and ':' (for example fs.list and mcp:tool). Implement to_wire_tool_name so those two characters become '_', and implement mappings so a wire name round-trips back to the original Core id. If two different Core ids collapse to the same wire name (fs.list vs fs_list), mappings must return Err instead of last-wins. Names that are already legal, such as get_time, stay unchanged.",
+  "hidden_commands": [
+    {
+      "argv": ["cargo", "test", "--offline", "--quiet"],
+      "timeout_ms": 120000,
+      "expect_exit": 0
+    }
+  ]
+}

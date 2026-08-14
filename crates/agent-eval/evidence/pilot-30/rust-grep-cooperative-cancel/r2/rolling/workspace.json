@@ -1,0 +1,12 @@
+{
+  "files": 6,
+  "listed": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "data/a.txt",
+    "data/b.txt",
+    "data/c.txt",
+    "src/lib.rs"
+  ],
+  "sha256": "5b560c29fd2c5121d7a697e948462e6d269abf1fdfb0678c58ab764a5c50d196"
+}

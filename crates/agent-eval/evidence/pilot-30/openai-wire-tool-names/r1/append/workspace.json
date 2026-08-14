@@ -1,0 +1,9 @@
+{
+  "files": 3,
+  "listed": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "src/lib.rs"
+  ],
+  "sha256": "b2c33d224ea1b343e952e745dbb375baf846278880b5036c57f49b119da3bbb1"
+}

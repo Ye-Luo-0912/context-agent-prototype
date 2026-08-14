@@ -14,9 +14,12 @@ mod bundle;
 mod driver;
 mod envfile;
 mod fixture_driver;
+mod harvest;
 mod metrics;
 mod mock_model;
+mod pilot;
 mod retrieval;
+mod suite;
 mod task;
 mod workload;
 
@@ -78,16 +81,48 @@ fn usage() -> ! {
          \n\
          Rebuild the comparison/tool table from a persisted evidence bundle.\n\
          \n\
+         usage: agent-eval --suite\n\
+         \n\
+         Print the acceptance-suite pack status (n/300, freeze blockers).\n\
+         Smoke FIXTURES do not count. File-harvested tasks plus SWE-bench\n\
+         Verified docker instances. Pack freeze is not the analysis gate\n\
+         Pack freeze is not the 300×3 acceptance run.\n\
+         \n\
+         usage: agent-eval --suite-check\n\
+         \n\
+         Self-check the 9 file-harvested tasks (seed fails, expected passes).\n\
+         Does not pull SWE-bench images.\n\
+         \n\
+         usage: agent-eval --swebench-gold [instance_id]\n\
+         \n\
+         Opt-in official harness gold eval for one Verified instance\n\
+         (default pallets__flask-5014). Requires Docker. Set\n\
+         AGENT_EVAL_SWEBENCH_DOCKER=1. Does not pull all 500 images.\n\
+         \n\
          usage: agent-eval --preregister\n\
          \n\
-         Print the frozen EVAL-01.3 analysis spec, spec hash, and power\n\
-         simulation (historical 30×3 plus the 300×3 design). The acceptance\n\
-         suite is not frozen (5 fixtures). This does not close M15.\n\
+         Print the frozen EVAL-01.3b analysis spec, spec hash, and power\n\
+         simulation (historical 30×3 plus the 300×3 design). The suite pack\n\
+         is frozen; 300×3 acceptance cells wait on the ~30×3 calibration\n\
+         pilot. This does not close M15.\n\
+         \n\
+         usage: agent-eval --pilot\n\
+         usage: agent-eval [--repeats N] [--evidence-dir <dir>] [--include-swebench] [--pilot-id <id>] --pilot-run\n\
+         usage: agent-eval --pilot-calibrate <dir>\n\
+         \n\
+         Frozen EVAL-01.5 sample (30 ids, 10/10/10 size). --pilot lists it.\n\
+         --pilot-run is live A/B/C on that sample; default file-only (9 tasks).\n\
+         --include-swebench clones GitHub at base_commit and scores a git\n\
+         diff with the official Docker harness (AGENT_EVAL_SWEBENCH_CLONE=1\n\
+         and AGENT_EVAL_SWEBENCH_DOCKER=1). Calibration design is 3 repeats;\n\
+         --pilot-calibrate prints decision=pilot and never opens the gate.\n\
+         Do not collect 300×3 acceptance cells from this command.\n\
          \n\
          usage: agent-eval --analyze-evidence <dir>\n\
          \n\
          Rebuild the predeclared C-A clustered interval from EVAL-01.1\n\
-         bundles. A result is ineligible until the 300-task suite is frozen.\n\
+         bundles. Eligible only when the suite is frozen and the cell set\n\
+         meets 300×3. The ~30×3 calibration pilot is not acceptance.\n\
          \n\
          usage: agent-eval --retrieval\n\
          \n\
@@ -106,6 +141,8 @@ async fn main() -> anyhow::Result<()> {
     let mut engines: Vec<&'static str> = Vec::new();
     let mut repeats: u32 = 1;
     let mut evidence_dir: Option<std::path::PathBuf> = None;
+    let mut include_swebench = false;
+    let mut pilot_id: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -113,6 +150,43 @@ async fn main() -> anyhow::Result<()> {
             "--fixtures" => {
                 workload::verify_fixture_inputs()?;
                 print!("{}", workload::render_fixtures());
+                return Ok(());
+            }
+            "--suite" => {
+                print!("{}", suite::render_suite(&suite::load_pack()?));
+                return Ok(());
+            }
+            "--suite-check" => {
+                println!("{}", suite::check_file_harvest(&suite::load_pack()?)?);
+                return Ok(());
+            }
+            "--swebench-gold" => {
+                if !harvest::docker_opt_in() {
+                    anyhow::bail!(
+                        "set AGENT_EVAL_SWEBENCH_DOCKER=1 to run official harness gold eval"
+                    );
+                }
+                let instance_id = args
+                    .next()
+                    .filter(|value| !value.starts_with('-'))
+                    .unwrap_or_else(|| harvest::GOLD_SMOKE_INSTANCE.to_string());
+                let instance_id = harvest::instance_id_from_suite_id(&instance_id)
+                    .unwrap_or(instance_id.as_str())
+                    .to_string();
+                let result = harvest::run_gold_eval(&instance_id)?;
+                println!(
+                    "swebench-gold {instance_id} passed={} exit={:?} timed_out={}",
+                    result.passed, result.exit, result.timed_out
+                );
+                if !result.stdout.is_empty() {
+                    println!("{}", result.stdout);
+                }
+                if !result.stderr.is_empty() {
+                    eprintln!("{}", result.stderr);
+                }
+                if !result.passed {
+                    anyhow::bail!("swebench gold eval did not resolve {instance_id}");
+                }
                 return Ok(());
             }
             "--fixture" => {
@@ -182,6 +256,32 @@ async fn main() -> anyhow::Result<()> {
             }
             "--preregister" => {
                 print!("{}", analysis::render_preregister());
+                return Ok(());
+            }
+            "--include-swebench" => {
+                include_swebench = true;
+            }
+            "--pilot-id" => {
+                let Some(id) = args.next() else {
+                    usage();
+                };
+                pilot_id = Some(id);
+            }
+            "--pilot" => {
+                let sample = pilot::select_pilot(&suite::load_pack()?)?;
+                print!("{}", pilot::render_pilot(&sample));
+                return Ok(());
+            }
+            "--pilot-run" => {
+                run_pilot_live(pilot_id, repeats, evidence_dir, include_swebench).await?;
+                return Ok(());
+            }
+            "--pilot-calibrate" => {
+                let Some(path) = args.next() else {
+                    usage();
+                };
+                let report = pilot::load_and_calibrate(std::path::Path::new(&path))?;
+                print!("{}", pilot::render_calibration(&report));
                 return Ok(());
             }
             "--analyze-evidence" => {
@@ -345,6 +445,91 @@ async fn run_live_compare(
             );
         }
     }
+    Ok(())
+}
+
+async fn run_pilot_live(
+    only_id: Option<String>,
+    repeats: u32,
+    evidence_dir: Option<std::path::PathBuf>,
+    include_swebench: bool,
+) -> anyhow::Result<()> {
+    let pack = suite::load_pack()?;
+    let sample = pilot::select_pilot(&pack)?;
+    let mut tasks: Vec<&suite::SuiteTask> = sample.tasks.iter().collect();
+    if let Some(id) = &only_id {
+        tasks.retain(|task| task.id == *id);
+        if tasks.is_empty() {
+            anyhow::bail!("{id} is not in the frozen 30-task calibration sample (see --pilot)");
+        }
+    }
+    if include_swebench {
+        if !harvest::clone_opt_in() || !harvest::docker_opt_in() {
+            anyhow::bail!(
+                "--include-swebench requires AGENT_EVAL_SWEBENCH_CLONE=1 and AGENT_EVAL_SWEBENCH_DOCKER=1"
+            );
+        }
+    } else {
+        tasks.retain(|task| pilot::is_file_runtime(task));
+    }
+    if tasks.is_empty() {
+        anyhow::bail!("no pilot tasks selected");
+    }
+    let cells = (tasks.len() as u32)
+        .saturating_mul(repeats)
+        .saturating_mul(3);
+    eprintln!(
+        "pilot-run n={} repeats={} engines=3 cells={} include_swebench={} sample={}",
+        tasks.len(),
+        repeats,
+        cells,
+        include_swebench,
+        sample.sha256
+    );
+    if repeats != analysis::GATE_REPEATS {
+        eprintln!(
+            "warning: calibration design is {} repeats; this run uses {repeats}",
+            analysis::GATE_REPEATS
+        );
+    }
+    let model = driver::build_live_coding_model()?;
+    let evidence_root = evidence_dir.unwrap_or_else(default_evidence_dir);
+    std::fs::create_dir_all(&evidence_root)?;
+    eprintln!("evidence dir: {}", evidence_root.display());
+    for task in tasks {
+        for round in 1..=repeats {
+            eprintln!(
+                "== pilot {} engine-pair repeat {round}/{repeats} order={:?} ==",
+                task.id,
+                analysis::arm_order(&task.id, round)
+            );
+            let dir = tempfile::tempdir()?;
+            let pair = bundle::PairSink {
+                root: evidence_root.clone(),
+                fixture_id: task.id.clone(),
+                repeat: round,
+                repeats,
+                live: true,
+            };
+            let runs = fixture_driver::compare_suite_live(
+                task,
+                dir.path(),
+                model.clone(),
+                Some(&pair),
+            )
+            .await?;
+            print!("task {} repeat {round}/{repeats}\n", task.id);
+            print!("{}", fixture_driver::render_live_comparison(&runs));
+            print!(
+                "{}",
+                bundle::render_evidence(&pair.root.join(&task.id).join(format!("r{round}")))?
+            );
+        }
+    }
+    eprintln!(
+        "pilot cells written under {}. --pilot-calibrate that directory; decision=pilot.",
+        evidence_root.display()
+    );
     Ok(())
 }
 

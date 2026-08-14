@@ -1,0 +1,14 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "fixture_id": "rust-grep-cooperative-cancel",
+  "engine": "append",
+  "repeat": 3,
+  "repeats": 3,
+  "live": true,
+  "fixture_sha256": "a7fee00c7339143e16e15737aa321fd36253609ac04fe2bb32fb32745432dae3",
+  "git_head": "1f89e5b9f1e3c1d2dd50ec71f9131e631b7cfcb2",
+  "git_dirty": true,
+  "git_dirty_sha256": "52dcbf711759a2508229ead556b8cdbeae40a49b830b3fb27999a12ec0011ab7",
+  "openai_model": "gpt-5.6-luna",
+  "openai_base_url": "https://api.pinaic.com/v1"
+}

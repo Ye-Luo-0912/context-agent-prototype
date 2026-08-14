@@ -1,0 +1,24 @@
+{
+  "id": "js-ms-negative-parse",
+  "name": "ms parse accepts negative durations",
+  "class": "bug",
+  "language": "javascript",
+  "size": "small",
+  "edit_shape": "regex-sign-capture",
+  "recall_pressure": "none",
+  "source": {
+    "kind": "git",
+    "repo": "https://github.com/vercel/ms",
+    "commit": "f0bc0a2bfa34b2f4a424afaa330fd828cbf1b5b8",
+    "path": "index.js",
+    "note": "Minimized from vercel/ms #70 / #96: parse regex did not accept a leading minus, so ms('-5') failed. Standalone parse(); format helpers omitted."
+  },
+  "description": "This duration parser is the vercel/ms parse() helper. Positive values such as 1h and .5ms already work. Negative inputs including -5, -.5ms and -0.5ms must return negative milliseconds. The seed regex does not allow a leading minus, so those strings fail to match and parse returns undefined. Update the capture so a leading '-' is accepted without breaking the existing positive cases.",
+  "hidden_commands": [
+    {
+      "argv": ["node", "--test", "tests/hidden.test.js"],
+      "timeout_ms": 30000,
+      "expect_exit": 0
+    }
+  ]
+}

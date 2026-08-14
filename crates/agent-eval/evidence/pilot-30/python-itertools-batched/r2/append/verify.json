@@ -1,0 +1,31 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "hidden_command",
+  "fixture_id": "python-itertools-batched",
+  "expected_edit": "",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [],
+  "files": [],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-q"
+      ],
+      "expect_exit": 0,
+      "exit": 1,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "======================================================================\r\nFAIL: test_groups_and_short_tail (test_hidden.TestBatched.test_groups_and_short_tail)\r\n----------------------------------------------------------------------\r\nTraceback (most recent call last):\r\n  File \"C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpbCxs5Z\\tests\\test_hidden.py\", line 12, in test_groups_and_short_tail\r\n    self.assertEqual(\r\nAssertionError: Lists differ: [['A', 'B', 'C', 'D', 'E', 'F', 'G']] != [['A', 'B', 'C'], ['D', 'E', 'F'], ['G']]\r\n\r\nFirst differing element 0:\r\n['A', 'B', 'C', 'D', 'E', 'F', 'G']\r\n['A', 'B', 'C']\r\n\r\nSecond list contains 2 additional elements.\r\nFirst extra element 1:\r\n['D', 'E', 'F']\r\n\r\n- [['A', 'B', 'C', 'D', 'E', 'F', 'G']]\r\n+ [['A', 'B', 'C'], ['D', 'E', 'F'], ['G']]\r\n?                +  +             +  +\r\n\r\n\r\n======================================================================\r\nFAIL: test_preserves_order (test_hidden.TestBatched.test_preserves_order)\r\n----------------------------------------------------------------------\r\nTraceback (most recent call last):\r\n  File \"C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpbCxs5Z\\tests\\test_hidden.py\", line 37, in test_preserves_order\r\n    self.assertLessEqual(len(last), n)\r\nAssertionError: 26 not less than or equal to 1\r\n\r\n----------------------------------------------------------------------\r\nRan 3 tests in 0.001s\r\n\r\nFAILED (failures=2)\r\n",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

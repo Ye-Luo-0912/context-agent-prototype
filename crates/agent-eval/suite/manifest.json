@@ -1,0 +1,11 @@
+{
+  "schema": "agent-eval.suite.v1",
+  "frozen": true,
+  "target_n": 300,
+  "review": {
+    "heterogeneity_reviewed": true,
+    "provenance_reviewed": true,
+    "executable_hidden_reviewed": true,
+    "notes": "EVAL-01.3b: pack frozen 509=9 file + 500 SWE-bench Verified; SUITE_FROZEN=true; retrieval secondaries declared in SPEC. Do not collect 300x3 acceptance cells until the frozen ~30x3 calibration pilot."
+  }
+}

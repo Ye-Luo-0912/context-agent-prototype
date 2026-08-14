@@ -1,0 +1,10 @@
+{
+  "files": 4,
+  "listed": [
+    "__pycache__/symbols.cpython-312.pyc",
+    "symbols.py",
+    "tests/__pycache__/test_symbols.cpython-312.pyc",
+    "tests/test_symbols.py"
+  ],
+  "sha256": "8efb99ecf2477a4fcfb1098943b4f505ab81e04bc143547744302c186ceb3079"
+}

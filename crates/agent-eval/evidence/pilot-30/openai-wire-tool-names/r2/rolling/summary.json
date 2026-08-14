@@ -1,0 +1,42 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "verify_failed",
+  "error": null,
+  "passed": false,
+  "wall_ms": 20174,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 26,
+  "model_started": 3,
+  "model_used": 3,
+  "usage_incomplete": false,
+  "workspace_sha256": "91e1ea63b81088718e5efe2d0df90e19f16b329219fba7a99ef3e7f414160116",
+  "workspace_files": 3,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 2,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "failed_tool_outputs": 0,
+    "final_resident_bytes": 609,
+    "forgotten_items": 0,
+    "lifecycle_transitions": 1,
+    "materialize_rounds": 3,
+    "model_input_tokens": 11766,
+    "model_output_tokens": 95,
+    "peak_resident_bytes": 609,
+    "recovered_items": 0,
+    "repeated_fs_reads": 0,
+    "rounds": 3,
+    "schema_tokens_total": 4308,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "tool_calls": 2,
+    "turns": 1
+  }
+}

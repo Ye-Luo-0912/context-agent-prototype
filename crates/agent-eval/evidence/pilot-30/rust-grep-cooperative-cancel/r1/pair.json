@@ -1,0 +1,27 @@
+{
+  "analysis_schema": "agent-eval.analysis.v2",
+  "arm_order": [
+    "rolling",
+    "append",
+    "dynamic"
+  ],
+  "cells": [
+    {
+      "dir": "rolling",
+      "engine": "rolling"
+    },
+    {
+      "dir": "append",
+      "engine": "append"
+    },
+    {
+      "dir": "dynamic",
+      "engine": "dynamic"
+    }
+  ],
+  "fixture_id": "rust-grep-cooperative-cancel",
+  "live": true,
+  "repeat": 1,
+  "repeats": 3,
+  "schema": "agent-eval.pair.v1"
+}

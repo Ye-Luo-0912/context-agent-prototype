@@ -1,0 +1,62 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 20837,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 203,
+  "model_started": 4,
+  "model_used": 4,
+  "usage_incomplete": false,
+  "workspace_sha256": "f1cb29ad249fe20c21e1191e926a2cb017d6a78fbdbb65db96e45282bc2d900c",
+  "workspace_files": 2,
+  "tools": [
+    {
+      "name": "fs.list",
+      "calls": 3,
+      "failed": 1
+    },
+    {
+      "name": "fs.read",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "fs.write",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 1,
+      "failed": 1
+    },
+    {
+      "name": "shell.exec",
+      "calls": 1,
+      "failed": 1
+    }
+  ],
+  "metrics": {
+    "failed_tool_outputs": 3,
+    "final_resident_bytes": 825,
+    "forgotten_items": 0,
+    "lifecycle_transitions": 0,
+    "materialize_rounds": 4,
+    "model_input_tokens": 25783,
+    "model_output_tokens": 693,
+    "peak_resident_bytes": 825,
+    "recovered_items": 0,
+    "repeated_fs_reads": 0,
+    "rounds": 4,
+    "schema_tokens_total": 5744,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "tool_calls": 8,
+    "turns": 1
+  }
+}

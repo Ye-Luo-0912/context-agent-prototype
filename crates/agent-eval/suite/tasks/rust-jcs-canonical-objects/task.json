@@ -1,0 +1,24 @@
+{
+  "id": "rust-jcs-canonical-objects",
+  "name": "RFC 8785 object-key canonicalization",
+  "class": "feature",
+  "language": "rust",
+  "size": "medium",
+  "edit_shape": "sorted-object-no-whitespace",
+  "recall_pressure": "none",
+  "source": {
+    "kind": "git",
+    "repo": "https://github.com/Ye-Luo-0912/context-agent-prototype",
+    "commit": "1f89e5b9f1e3c1d2dd50ec71f9131e631b7cfcb2",
+    "path": "crates/agent-contracts/src/jcs.rs",
+    "note": "Minimized from the RFC 8785 JCS writer used by ArgumentDigest: object keys sorted by UTF-16 code units, no insignificant whitespace. Numbers are i64 only so the crate has no serde_json dependency."
+  },
+  "description": "canonicalize must emit RFC 8785 JSON Canonicalization Scheme text for a tiny JSON subset (null, bool, i64, string, array, object). Object keys are sorted by UTF-16 code units, there is no whitespace, and strings escape quote/backslash/controls. The seed inserts spaces and keeps object keys in insertion order, so equal objects compare unequal after canonicalize. Nested arrays and objects must recurse. ASCII keys may be sorted lexicographically; that matches UTF-16 for this subset.",
+  "hidden_commands": [
+    {
+      "argv": ["cargo", "test", "--offline", "--quiet"],
+      "timeout_ms": 120000,
+      "expect_exit": 0
+    }
+  ]
+}

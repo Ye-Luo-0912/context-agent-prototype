@@ -1,0 +1,28 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "hidden_command",
+  "fixture_id": "uuid-parity-keys",
+  "expected_edit": "",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [],
+  "files": [],
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--offline",
+        "--quiet"
+      ],
+      "expect_exit": 0,
+      "exit": 101,
+      "timed_out": false,
+      "stdout": "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 1 test\nequal_multisets_match_regardless_of_order --- FAILED\n\nfailures:\n\n---- equal_multisets_match_regardless_of_order stdout ----\n\nthread 'equal_multisets_match_regardless_of_order' (25400) panicked at tests\\hidden.rs:11:5:\nassertion `left == right` failed\n  left: {\"<uuid>\": 1, \"keep\": 9}\n right: {\"<uuid>\": 3, \"keep\": 9}\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    equal_multisets_match_regardless_of_order\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "error: test failed, to rerun pass `--test hidden`\n",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

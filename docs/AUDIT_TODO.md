@@ -1585,13 +1585,24 @@ Required closure:
    omitted; seq check skips those repeats), usage-incomplete and broadcast-lag
    flags, workspace sha256, verify.json, tool histogram, pair.json.
    Failed cells remain in the pair. `--show-evidence` rebuilds the table.
-   Not yet: executable hidden-test artifacts, or
-   rebuild of the 2026-08-14 `recall_after_fix` round-inflation (those
-   workspaces were deleted). Manifests now carry `git_dirty_sha256`.
+   **Partial 2026-08-14 (EVAL-01.1b).** `verify.json` is now
+   `agent-eval.verify.v1`: named file-content asserts, bounded file bodies,
+   and `reverify_from_report` after the workspace is gone. This is not a
+   pytest/build hidden test; scoring of the five smoke fixtures is unchanged.
+   Not yet: executable hidden build/test commands for the 300-task suite.
 2. freeze at least 300 independent heterogeneous coding tasks before the run,
    counterbalance arm order, and record every intended cell including task,
    infrastructure, timeout and censored outcomes; do not invent one-line
    stand-ins;
+   **Method guidance (2026-08-14):** treat the frozen suite as its own
+   reviewed deliverable — source task shapes from real repository
+   histories where practical, require executable hidden verification per
+   task, and review heterogeneity (language, size, edit shape, multi-turn
+   recall pressure) before freezing;
+   **Partial 2026-08-14 (EVAL-01.4e / EVAL-01.3b).** Suite pack frozen at
+   509/300. `SUITE_FROZEN=true`. SPEC re-registered with retrieval
+   secondaries (no gate n/margin change). Do not collect 300×3 acceptance
+   cells until the frozen ~30×3 calibration pilot.
 3. pre-register a task-clustered paired binary analysis and power simulation;
    three repeats measure within-task variance and are not independent tasks;
    **Partial 2026-08-14 (EVAL-01.2).** `agent-eval --preregister` /
@@ -1601,11 +1612,26 @@ Required closure:
    underpowered for −5 pp under A ⟂ C | task. Live arm order is now
    shuffled per fixture×repeat and recorded in `pair.json`.
    **Partial 2026-08-14 (EVAL-01.3).** Same model, seed and margin; gate n
-   is 300×3 (4048/258/0). `SUITE_FROZEN=false`; do not collect acceptance
-   cells.
+   is 300×3 (4048/258/0). **EVAL-01.3b** freezes the suite
+   (`SUITE_FROZEN=true`, pack 509) and declares retrieval secondaries
+   in SPEC; n/repeats/margin unchanged. Before the 300×3 spend, run one
+   frozen non-acceptance pilot (~30×3) to check the simulated
+   variance/clustering assumptions against real cells; amend n only by
+   re-registration, never after seeing acceptance cells.
+   **Partial 2026-08-14 (EVAL-01.5).** 30-id sample frozen
+   (`agent-eval.pilot.v1`, 10/10/10, sha256 `fa8c5308…`). `--pilot-run`
+   / `--pilot-calibrate` landed; `decision=pilot` cannot pass the gate.
+   File-only live 9×3 collected (81 cells, `crates/agent-eval/evidence/pilot-30`):
+   ITT A=C=0.778, diagnostic C−A LCL=−0.146, `n_tasks=9<300` ineligible.
+   21 SWE-bench cells uncollected. Do not amend n from this spend.
 4. report intent-to-treat end-to-end tokens/rounds/tools/store/retrieval/
    latency. Live C's extra rounds are a treatment effect to explain, not data
-   to discard; both-pass cost may appear only as a secondary diagnostic;
+   to discard; both-pass cost may appear only as a secondary diagnostic.
+   **Decision 2026-08-14:** Search/GC evaluation is folded into M15 —
+   retrieval metrics (search recall/latency, found-after-forgotten,
+   graded-access distribution) are secondary lifecycle endpoints reported
+   from the same cells; no separate later retrieval experiment. Declared
+   in SPEC at EVAL-01.3b (no gate change).
 5. use executable hidden build/tests and a model-backed bounded compaction B.
 
 Until closure, M15, V2, learned/vector policy and PLAT-08 evidence gates stay
@@ -1661,7 +1687,9 @@ as new work. The independent queues that are still actionable are:
    distribution) landed 2026-08-14 on the event stream plus
    `agent-eval --retrieval`. Live paired coding harness
    (`--compare-live` / `--compare-live-all`) landed 2026-08-14; the
-   30×3 non-inferiority gate is still open. Typed user-input envelope (`CTX-EVENT-01..03`) landed 2026-08-14:
+   300×3 non-inferiority gate (EVAL-01.3) is still open, and its
+   retrieval secondaries ride the same cells (no separate Search/GC
+   experiment). Typed user-input envelope (`CTX-EVENT-01..03`) landed 2026-08-14:
    bounded `UserMessageAccepted` preview, optional `user-input` artifact,
    1-slot in-memory queue, `InterruptCommitted` after `TurnCancelled`,
    `Consumed`/`Archived` on successful turns, and `body_ref` replay when a

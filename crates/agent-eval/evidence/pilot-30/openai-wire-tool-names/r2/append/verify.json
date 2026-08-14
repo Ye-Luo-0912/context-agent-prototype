@@ -1,0 +1,28 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "hidden_command",
+  "fixture_id": "openai-wire-tool-names",
+  "expected_edit": "",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [],
+  "files": [],
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--offline",
+        "--quiet"
+      ],
+      "expect_exit": 0,
+      "exit": 101,
+      "timed_out": false,
+      "stdout": "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 3 tests\ndotted_and_colon_names_become_underscores --- FAILED\ncolliding_core_ids_fail_closed --- FAILED\nmappings_restore_core_ids --- FAILED\n\nfailures:\n\n---- dotted_and_colon_names_become_underscores stdout ----\n\nthread 'dotted_and_colon_names_become_underscores' (27464) panicked at tests\\hidden.rs:5:5:\nassertion `left == right` failed\n  left: \"fs.list\"\n right: \"fs_list\"\n\n---- colliding_core_ids_fail_closed stdout ----\n\nthread 'colliding_core_ids_fail_closed' (12888) panicked at tests\\hidden.rs:19:49:\ncollision: {\"fs_list\": \"fs_list\", \"fs.list\": \"fs.list\"}\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n---- mappings_restore_core_ids stdout ----\n\nthread 'mappings_restore_core_ids' (55252) panicked at tests\\hidden.rs:13:5:\nassertion `left == right` failed\n  left: None\n right: Some(\"fs.list\")\n\n\nfailures:\n    colliding_core_ids_fail_closed\n    dotted_and_colon_names_become_underscores\n    mappings_restore_core_ids\n\ntest result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": "error: test failed, to rerun pass `--test hidden`\n",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

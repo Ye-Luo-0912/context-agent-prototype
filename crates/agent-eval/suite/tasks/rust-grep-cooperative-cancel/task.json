@@ -1,0 +1,24 @@
+{
+  "id": "rust-grep-cooperative-cancel",
+  "name": "search.grep observes cancel between files and inside large files",
+  "class": "bug",
+  "language": "rust",
+  "size": "large",
+  "edit_shape": "cooperative-cancel-checks",
+  "recall_pressure": "none",
+  "source": {
+    "kind": "git",
+    "repo": "https://github.com/Ye-Luo-0912/context-agent-prototype",
+    "commit": "1f89e5b9f1e3c1d2dd50ec71f9131e631b7cfcb2",
+    "path": "crates/tool-runtime/src/tools/search.rs",
+    "note": "Minimized from TOOL-01: search.grep checks CancellationToken between files and every 256 lines inside a file, returning hits already found. Standalone scanner with AtomicBool; no workspace/tokio."
+  },
+  "description": "scan(files, needle, cancel) must walk each (path, body) pair and collect matching lines. If cancel trips, return the hits already found plus cancelled=true instead of finishing the remaining files. Check the token at the start of every file and every 8 lines inside a file so a large file can stop mid-scan. The seed ignores cancel and always reports a complete scan. Keep line numbers 1-based. Do not drop hits collected before the token trips.",
+  "hidden_commands": [
+    {
+      "argv": ["cargo", "test", "--offline", "--quiet"],
+      "timeout_ms": 120000,
+      "expect_exit": 0
+    }
+  ]
+}

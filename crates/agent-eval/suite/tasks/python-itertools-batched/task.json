@@ -1,0 +1,24 @@
+{
+  "id": "python-itertools-batched",
+  "name": "Implement itertools.batched",
+  "class": "feature",
+  "language": "python",
+  "size": "small",
+  "edit_shape": "lazy-batch-generator",
+  "recall_pressure": "none",
+  "source": {
+    "kind": "git",
+    "repo": "https://github.com/python/cpython",
+    "commit": "de3ece769a8bc10c207a648c8a446f520504fa7e",
+    "path": "Lib/itertools.py",
+    "note": "Minimized from GH-98363 / GH-98364: the documented pure-Python recipe for itertools.batched. Standalone module; does not import CPython's C helper."
+  },
+  "description": "Implement batched(iterable, n) as added to CPython 3.12. It must lazily consume the input and yield lists of length n, with the final list allowed to be shorter. n < 1 must raise ValueError('n must be at least one'). The seed currently dumps the whole iterable into a single list and ignores batching. Do not import itertools.batched from the standard library; implement the recipe locally.",
+  "hidden_commands": [
+    {
+      "argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-q"],
+      "timeout_ms": 30000,
+      "expect_exit": 0
+    }
+  ]
+}

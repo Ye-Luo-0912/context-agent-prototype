@@ -107,7 +107,7 @@ boundedness, and integrity rather than replace it with transcript history.
 | Immediate tool signal | Implemented (`CTX-08`) | Tool commit emits a bounded, body-free `WorkingSetSignal`; discovered entities heat related context before the immediately following model round while the tool body remains in `TurnFrame` until finalization. |
 | Final model-consumption acknowledgement | Implemented (`CTX-07`) | `materialize` returns a non-consuming preview. After final packing, only a successful non-stale ModelOutput commits a bounded `ContextConsumptionAck` with the exact inline/external ids; failure paths do not reinforce. Fit-before-top-K, bounded/charged external refs, and bounded candidate generation are covered; workload cost evaluation remains separate. |
 | Prompt authority separation | Implemented (`CORE-05`) | `PromptAssembler` keeps policy in System, renders selected history/external refs as delimited low-authority User observations, and preserves live file/tool output as Tool-role content. Injection regressions cover all three paths. |
-| Real evaluation | Partial | Unit/property coverage is strong and the 10,000-turn residency regression exists. `agent-eval --compare-live` is the live paired coding harness (real model, independent workspaces, hidden verify). EVAL-01.1 writes per-cell bundles; EVAL-01.2 freezes the clustered C−A estimator; EVAL-01.3 re-freezes the gate at 300×3 / −5 pp (historical 30×3 is underpowered). The 300-task suite, model-backed B and the rest of Phase 4 remain open. |
+| Real evaluation | Partial | Unit/property coverage is strong and the 10,000-turn residency regression exists. `agent-eval --compare-live` is the live paired coding harness (real model, independent workspaces, hidden verify). EVAL-01.1 writes per-cell bundles; EVAL-01.1b persists replayable file-content hidden asserts. EVAL-01.2 freezes the clustered C−A estimator; EVAL-01.3 re-freezes the gate at 300×3 / −5 pp (historical 30×3 is underpowered). EVAL-01.4e freezes the 509-task pack; EVAL-01.3b sets `SUITE_FROZEN=true` and declares retrieval secondaries in SPEC (no gate n/margin change). EVAL-01.5 freezes the 30-task calibration sample; a file-only 9×3 live spend is in `crates/agent-eval/evidence/pilot-30` (`decision=pilot`, 21 SWE-bench cells still missing). Then model-backed B. The 300×3 non-inferiority run is still open. |
 
 This table is the baseline for the work queue below. A checked defect in
 `AUDIT_TODO.md` must not be reopened here under a new name.
@@ -1023,7 +1023,89 @@ second authority or another transcript-based context system.
 
 ## Ordered implementation queue
 
-### Current slice (2026-08-14) — pair GC with Search/Discovery
+### Current slice (registered 2026-08-14 evening) — close the M15 evidence loop
+
+The GC↔Search machinery and its instrumentation landed today; the live
+paired cells produced the first real treatment-effect signal: dynamic
+matches append on hidden-check success but spends more end-to-end
+because it takes extra tool rounds (deferred first fix, repeated
+probes/rereads — see EXPERIMENTS "Why C spent more"). The evaluation
+loop, not more machinery, is now the bottleneck.
+
+Decision (2026-08-14): Search/GC evaluation is folded directly into
+M15. Retrieval metrics — search recall/latency, found-after-forgotten,
+graded-access distribution — ride the same live A/B/C cells and
+evidence bundles as secondary lifecycle endpoints of the same runs;
+there is no separate, later Search/GC experiment. Declared in SPEC at
+EVAL-01.3b (no gate change). Discovery feature residuals (Artifact/Task/Agent/
+Skill/Event providers) stay out of scope; M15 measures the retrieval
+surface that exists.
+
+Working order (owning entries stay authoritative: `EVAL-01` in AUDIT,
+Phase 4 below; this list does not duplicate checkbox state):
+
+1. Freeze the 300-task suite (`EVAL-01` closure item 2). Heterogeneous
+   real coding tasks with executable hidden verification; treat the
+   suite as its own reviewed deliverable (language, size, edit shape and
+   multi-turn recall pressure reviewed before freezing); no one-line
+   stand-ins. `SUITE_FROZEN=true` only after that review, and no
+   acceptance cells before it. Source from real repository histories
+   where practical. **Done EVAL-01.3b:** pack frozen at 509/300;
+   `SUITE_FROZEN=true`; SPEC re-registered with retrieval secondaries
+   (search recall/latency, found-after-forgotten, graded-access
+   distribution) and no gate n/margin change. Do not collect 300×3
+   acceptance cells until the frozen ~30×3 calibration pilot.
+2. Calibrate before spending the 300×3 budget: one frozen
+   non-acceptance pilot (~30 tasks × 3) to check the power simulation's
+   variance/clustering assumptions against real cells. Amend n only by
+   re-registration (an EVAL-01.3 amendment), never after seeing
+   acceptance cells.
+   **Partial EVAL-01.5 (2026-08-14):** sample frozen at 30 ids
+   (`fa8c5308…`, 10/10/10 size, 9 file + 21 SWE-bench). `--pilot` lists
+   it; `--pilot-run` is live A/B/C with executable hidden commands
+   (default file-only); `--include-swebench` clones `base_commit` and
+   scores a git diff with the official Docker harness;
+   `--pilot-calibrate` prints `decision=pilot` and cannot open the
+   300×3 gate.
+   **Live file-only spend (2026-08-14):** 9 tasks × 3 repeats × 3
+   engines = 81 cells under `crates/agent-eval/evidence/pilot-30`. ITT A=C=
+   0.778, B=0.704; task-level corr(A,C)=0.78; diagnostic C−A LCL=
+   −0.146 (not a gate). `analyze()` stays ineligible (`n_tasks=9<300`).
+   21 SWE-bench cells uncollected. Do not amend n. Do not retune
+   scoring. Do not start model-backed B until the remaining 21-task
+   spend or an explicit skip.
+3. Model-backed bounded compaction B (`EVAL-01` closure item 5): B must
+   summarize with a model under a budget, with its compactor cost
+   counted; the scripted digest remains a deterministic CI arm only.
+   Build the compactor once as a shared component: the same bounded
+   model summarizer is the B arm *and* C's episode/trajectory
+   distillation operator (Phase 3). Same summarizer in both arms keeps
+   the comparison fair — a measured C−B difference is then purely
+   lifecycle + retrieval, not summary quality. The two roles differ only
+   in what happens to the source: B folds history lossily, while inside
+   C a summary is a `derive`d item with `DerivedFrom` provenance and the
+   raw bodies stay externally retrievable, so a bad summary is
+   correctable through search/fetch/admit instead of permanent.
+4. Explain and reduce dynamic's extra live rounds — the measured
+   treatment effect. The lever is the just-landed retrieval surface
+   (catalog indexes, graded access, discovery descriptors): make recall
+   cheap and trusted so the model re-verifies less, then re-measure on
+   `recall_after_fix`-class fixtures. Scoring stays frozen: behavior
+   changes come from retrieval/navigation or the prompt surface, and any
+   scoring change waits for suite evidence, not n=1 live cells.
+5. Executable hidden build/test verification for fixtures (`EVAL-01`
+   closure item 5, first half), so hidden checks stop being static
+   file-content assertions.
+
+Explicitly not in this slice: retuning GC scoring from small-n live
+cells; Artifact/Task/Agent/Skill/Event discovery providers; a public
+`runtime.search` schema; any vector index (AGENTS.md invariant 8);
+Phase 2 incremental GC beyond what the catalog forces; and scale
+engineering for thousands of tools or million-entry stores without a
+measured need. The PLAT/M12/M13 trusted-execution lane continues
+independently per ROADMAP and is not gated by this slice.
+
+### Completed slice (2026-08-14) — pair GC with Search/Discovery
 
 GC currently runs ahead of retrieval: eviction/externalization policy is
 richer than the machinery for finding things back. This slice closes that
@@ -1082,7 +1164,7 @@ This slice is closed 2026-08-14. The typed user-input envelope
 (`CTX-EVENT-01..03`) is landed below with residuals. Do not reopen Phase 4
 from here.
 
-### Current slice (2026-08-14) — typed user input (`CTX-EVENT`)
+### Completed slice (2026-08-14) — typed user input (`CTX-EVENT`)
 
 1. [x] `CTX-EVENT-01` dialogue envelope + keep cancel/command direct.
 2. [x] `CTX-EVENT-02` `Applied` / 1-slot `Queued` / overflow `Rejected` /
@@ -1092,12 +1174,8 @@ from here.
    `body_ref` when a workspace is supplied.
 
 Do not interpret user authority from prose, do not add `runtime.search`,
-and do not start PLAT-05+.
-
-Explicitly not in this slice: Phase 2 incremental GC beyond what the
-catalog forces; Artifact/Task/Agent/Skill/Event discovery providers;
-any vector index (AGENTS.md invariant 8); and scale engineering for
-thousands of tools or million-entry stores without a measured need.
+and do not start PLAT-05+. (The shared exclusion list now lives in the
+current slice above.)
 
 ### Phase 0 — Freeze and measure the current baseline
 
@@ -1434,7 +1512,10 @@ thousands of tools or million-entry stores without a measured need.
 - [ ] Produce Task/Episode/Decision/Finding/OpenLoop/Artifact/Evidence cards
   from typed events; never infer runtime authority from prose alone.
 - [ ] Add task-completion trajectory distillation with verification and
-  source refs; do not inject full old trajectories by default.
+  source refs; do not inject full old trajectories by default. Reuse the
+  M15 model-backed bounded compactor (current slice item 3) as the
+  distillation operator instead of building a second summarizer; inside
+  C its output is a `derive`d item with provenance, never a lossy fold.
 - [ ] Add AssignmentCard/HandoffCard after single-agent episode semantics
   pass evaluation.
 - [ ] Define independent storage retention profiles for coding, research,
@@ -1471,11 +1552,13 @@ thousands of tools or million-entry stores without a measured need.
   key; events.jsonl without `ModelDelta`; summary with seq-gap, broadcast
   lag, usage-incomplete, tool histogram; workspace sha256 not a copy;
   verify.json). Timeout/round-cap/runtime errors stay in the pair as
-  `outcome=error`. `--show-evidence` rebuilds the table. Still missing:
-  dirty-tree digest is now on the manifest (`git_dirty_sha256`); live arm
-  order is counterbalanced (EVAL-01.2). Remaining: executable hidden-test
-  artifacts, and any explanation of live C round inflation (the 2026-08-14
-  traces were never persisted).
+  `outcome=error`. `--show-evidence` rebuilds the table.
+  **Partial 2026-08-14 (EVAL-01.1b).** Hidden checks persist as named
+  file-content asserts plus bounded bodies (`agent-eval.verify.v1`);
+  `--show-evidence` prints failing asserts, and the report can be re-run
+  after the workspace is gone. Not pytest/build; the 300-task suite still
+  needs executable hidden tests. Scoring of the five smoke fixtures is
+  unchanged.
 - [ ] Pre-register the formal paired analysis before collecting acceptance
   cells: at least 300 independent heterogeneous tasks, counterbalanced arm
   order, three within-task repeats, paired binary estimator, task-clustered
@@ -1488,6 +1571,35 @@ thousands of tools or million-entry stores without a measured need.
   power at Δ=0; EVAL-01.3 amends the gate to 300×3 (4048/5000 ≈ 81% at Δ=0,
   margin still −5 pp). The suite is not frozen; do not collect acceptance
   cells; do not invent 300 tasks.
+  **Partial 2026-08-14 (EVAL-01.3b).** SPEC re-registered: `suite_frozen=true`,
+  pack n=509, retrieval secondaries declared, gate n/margin unchanged.
+  Do not collect 300×3 acceptance cells until the frozen ~30×3 calibration
+  pilot.
+  **Partial 2026-08-14 (EVAL-01.4a).** `crates/agent-eval/suite/` is the
+  reviewed-deliverable pack: freeze computed from n/provenance/executable
+  hidden commands/heterogeneity/review flags. `--suite` reports n/300 and
+  blockers. `manifest.frozen=true` with blockers fails closed.
+  **Partial 2026-08-14 (EVAL-01.4b).** Two tasks harvested from this
+  repository (`openai-wire-tool-names` @ `1f89e5b`, `uuid-parity-keys` @
+  `0d2dd2f`): directory pack with model-visible `seed/`, verify-only
+  `hidden/` overlay, and `expected/` self-check oracle. Seed fails
+  `cargo test --offline`; the expected patch passes. Hidden tests are
+  not in the seed.
+  **Partial 2026-08-14 (EVAL-01.4c).** Suite is 9/300: added CPython
+  `itertools.batched` / PEP 616 `removeprefix` (recall after distractor
+  notes), TOOLS-09 Python symbol tests, vercel/ms negative-parse and
+  minutes-shadow, plus this-repo JCS object canonicalization and
+  search.grep cooperative cancel. Languages rust/python/javascript;
+  classes bug/feature/refactor/test/recall; sizes small/medium/large;
+  one notes-then-reuse task.
+  **Partial 2026-08-14 (EVAL-01.4e / EVAL-01.3b).** Pack frozen and
+  `SUITE_FROZEN=true`. SPEC re-registered: retrieval secondaries declared,
+  n/repeats/margin unchanged. Do not collect 300×3 acceptance cells
+  until the frozen ~30×3 calibration pilot.
+  **Partial 2026-08-14 (EVAL-01.5).** Frozen 30-id sample + `--pilot-run`
+  / `--pilot-calibrate`. File-only live 9×3 (81 cells) collected under
+  `crates/agent-eval/evidence/pilot-30`; `decision=pilot`, gate ineligible.
+  21 SWE-bench cells uncollected.
 
 - [ ] Compare at least:
   - full/sliding transcript;

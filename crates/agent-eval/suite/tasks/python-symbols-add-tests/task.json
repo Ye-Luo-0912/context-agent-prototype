@@ -1,0 +1,24 @@
+{
+  "id": "python-symbols-add-tests",
+  "name": "Add tests for the Python code.symbols rules",
+  "class": "test",
+  "language": "python",
+  "size": "small",
+  "edit_shape": "add-unit-tests",
+  "recall_pressure": "none",
+  "source": {
+    "kind": "git",
+    "repo": "https://github.com/Ye-Luo-0912/context-agent-prototype",
+    "commit": "d51b67bdf999923a815558b0764c143b3bdd102d",
+    "path": "crates/tool-runtime/src/tools/code.rs",
+    "note": "TOOLS-09 Python rules: ^\\s*(?:async\\s+)?def and ^\\s*class, comments skipped. Seed already has the scanner; the task is to add tests/test_symbols.py covering those cases. Hidden overlay requires that file."
+  },
+  "description": "symbols.py already implements the TOOLS-09 Python lexical rules: leading def / async def / class names, comment lines skipped. Add tests/test_symbols.py that imports symbols and covers a plain def, an async def, a class, and a commented-out def that must not appear. Do not change the scanner unless a test proves it is wrong. Hidden verification will refuse the workspace if tests/test_symbols.py is missing.",
+  "hidden_commands": [
+    {
+      "argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-q"],
+      "timeout_ms": 30000,
+      "expect_exit": 0
+    }
+  ]
+}

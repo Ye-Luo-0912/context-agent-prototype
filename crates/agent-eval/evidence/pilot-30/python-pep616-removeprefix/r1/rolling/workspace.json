@@ -1,0 +1,11 @@
+{
+  "files": 5,
+  "listed": [
+    "__pycache__/remove_prefix.cpython-312.pyc",
+    "data/names.txt",
+    "remove_prefix.py",
+    "src/clean.py",
+    "src/notes.md"
+  ],
+  "sha256": "61f7a7d68ca5139bfaba7e6145db3c3e2df0fafd1b68d537737bdf18d85e5928"
+}

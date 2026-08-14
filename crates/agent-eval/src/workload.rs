@@ -9,6 +9,12 @@
 //! model is the M15 acceptance; this module makes the inputs well-formed
 //! and self-checked first.
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
 /// One tool-surface arm of the A/B/C/D comparison.
 #[derive(Debug, Clone)]
 pub struct ToolArm {
@@ -81,6 +87,29 @@ pub const ARMS: [ToolArm; 4] = [
     },
 ];
 
+/// 证据包里 hidden check 的 schema。旧 `verify.json` 只有 passed/expected_edit，
+/// 加载时缺字段当不可重放，不改 summary 的 ITT 对错。
+pub const VERIFY_SCHEMA: &str = "agent-eval.verify.v1";
+/// 写入证据包的文件体上限。当前 smoke 文件远小于此；超限仍记 sha256，
+/// 重放标 incomplete，不得假装完整复跑。
+const HIDDEN_BODY_CAP: usize = 16 * 1024;
+
+/// 一条跨平台、无解释器的 hidden 断言。题意仍是文件内容性质，不是 pytest。
+#[derive(Debug, Clone, Copy)]
+pub struct HiddenAssert {
+    pub path: &'static str,
+    pub pred: HiddenPred,
+}
+
+/// 文件内容谓词。缺文件按空串计，与原先 `unwrap_or_default` 一致。
+#[derive(Debug, Clone, Copy)]
+pub enum HiddenPred {
+    Contains(&'static str),
+    NotContains(&'static str),
+    ContainsAny(&'static [&'static str]),
+    MinMatches { needle: &'static str, min: usize },
+}
+
 /// One coding workload fixture: how the workspace starts, what the model is
 /// asked to do, and how success is verified without a model.
 #[derive(Debug, Clone)]
@@ -92,9 +121,8 @@ pub struct CodingFixture {
     /// `(workspace-relative path, content)` seed files written before the
     /// task starts.
     pub seed: &'static [(&'static str, &'static str)],
-    /// Hidden verification: must return `true` only after the task is done
-    /// correctly. Reads the workspace root.
-    pub verify: fn(&std::path::Path) -> bool,
+    /// Hidden verification: named file-content asserts. All must pass.
+    pub hidden: &'static [HiddenAssert],
     /// The expected edit, used only by the self-check tests (never exposed
     /// to the model).
     pub expected_edit: &'static str,
@@ -123,10 +151,16 @@ pub const FIXTURES: [CodingFixture; 5] = [
             "src/util.py",
             "def visit_all(items):\n    out = []\n    for i in range(len(items)):\n        out.append(items[i + 1])\n    return out\n",
         )],
-        verify: |root| {
-            let content = std::fs::read_to_string(root.join("src/util.py")).unwrap_or_default();
-            !content.contains("i + 1") && content.contains("range(len(items))")
-        },
+        hidden: &[
+            HiddenAssert {
+                path: "src/util.py",
+                pred: HiddenPred::NotContains("i + 1"),
+            },
+            HiddenAssert {
+                path: "src/util.py",
+                pred: HiddenPred::Contains("range(len(items))"),
+            },
+        ],
         expected_edit: "replace `items[i + 1]` with `items[i]`",
         extra_live_turns: &[],
     },
@@ -138,11 +172,16 @@ pub const FIXTURES: [CodingFixture; 5] = [
             "src/math.py",
             "def double(x):\n    # TODO: implement\n    pass\n",
         )],
-        verify: |root| {
-            let content = std::fs::read_to_string(root.join("src/math.py")).unwrap_or_default();
-            !content.contains("pass")
-                && (content.contains("return x * 2") || content.contains("return 2 * x"))
-        },
+        hidden: &[
+            HiddenAssert {
+                path: "src/math.py",
+                pred: HiddenPred::NotContains("pass"),
+            },
+            HiddenAssert {
+                path: "src/math.py",
+                pred: HiddenPred::ContainsAny(&["return x * 2", "return 2 * x"]),
+            },
+        ],
         expected_edit: "replace the `pass` stub with `return x * 2`",
         extra_live_turns: &[],
     },
@@ -154,10 +193,19 @@ pub const FIXTURES: [CodingFixture; 5] = [
             "src/app.py",
             "old_name = \"value\"\nprint(old_name)\ndef use():\n    return old_name\n",
         )],
-        verify: |root| {
-            let content = std::fs::read_to_string(root.join("src/app.py")).unwrap_or_default();
-            !content.contains("old_name") && content.matches("new_name").count() >= 3
-        },
+        hidden: &[
+            HiddenAssert {
+                path: "src/app.py",
+                pred: HiddenPred::NotContains("old_name"),
+            },
+            HiddenAssert {
+                path: "src/app.py",
+                pred: HiddenPred::MinMatches {
+                    needle: "new_name",
+                    min: 3,
+                },
+            },
+        ],
         expected_edit: "rename all three `old_name` occurrences to `new_name`",
         extra_live_turns: &[],
     },
@@ -166,11 +214,16 @@ pub const FIXTURES: [CodingFixture; 5] = [
         name: "add a test for an existing function",
         description: "src/calc.py defines `add(a, b)`. Append a `def test_add()` function to that same file (`src/calc.py`) that asserts `add` behaves correctly for a non-trivial case. Do not create a new test file.",
         seed: &[("src/calc.py", "def add(a, b):\n    return a + b\n")],
-        verify: |root| {
-            let content = std::fs::read_to_string(root.join("src/calc.py")).unwrap_or_default();
-            (content.contains("def test_add") || content.contains("assert add("))
-                && !content.contains("# TODO")
-        },
+        hidden: &[
+            HiddenAssert {
+                path: "src/calc.py",
+                pred: HiddenPred::ContainsAny(&["def test_add", "assert add("]),
+            },
+            HiddenAssert {
+                path: "src/calc.py",
+                pred: HiddenPred::NotContains("# TODO"),
+            },
+        ],
         expected_edit: "append a `def test_add():` block asserting `add` in `src/calc.py`",
         extra_live_turns: &[],
     },
@@ -182,19 +235,40 @@ pub const FIXTURES: [CodingFixture; 5] = [
             "src/util.py",
             "def visit_all(items):\n    out = []\n    for i in range(len(items)):\n        out.append(items[i + 1])\n    return out\n",
         )],
-        verify: |root| {
-            let util = std::fs::read_to_string(root.join("src/util.py")).unwrap_or_default();
-            let scratch = std::fs::read_to_string(root.join("src/scratch.md")).unwrap_or_default();
-            let main = std::fs::read_to_string(root.join("src/main.py")).unwrap_or_default();
-            !util.contains("i + 1")
-                && util.contains("range(len(items))")
-                && scratch.contains("Breville")
-                && scratch.contains("200")
-                && scratch.contains("HDMI")
-                && scratch.contains("4B")
-                && main.contains("visit_all")
-                && !main.contains("i + 1")
-        },
+        hidden: &[
+            HiddenAssert {
+                path: "src/util.py",
+                pred: HiddenPred::NotContains("i + 1"),
+            },
+            HiddenAssert {
+                path: "src/util.py",
+                pred: HiddenPred::Contains("range(len(items))"),
+            },
+            HiddenAssert {
+                path: "src/scratch.md",
+                pred: HiddenPred::Contains("Breville"),
+            },
+            HiddenAssert {
+                path: "src/scratch.md",
+                pred: HiddenPred::Contains("200"),
+            },
+            HiddenAssert {
+                path: "src/scratch.md",
+                pred: HiddenPred::Contains("HDMI"),
+            },
+            HiddenAssert {
+                path: "src/scratch.md",
+                pred: HiddenPred::Contains("4B"),
+            },
+            HiddenAssert {
+                path: "src/main.py",
+                pred: HiddenPred::Contains("visit_all"),
+            },
+            HiddenAssert {
+                path: "src/main.py",
+                pred: HiddenPred::NotContains("i + 1"),
+            },
+        ],
         expected_edit: "fix util, write the scratch notes, then add main.py that calls visit_all without reintroducing i + 1",
         extra_live_turns: &[
             RECALL_TURN_NOTE_1,
@@ -233,9 +307,243 @@ pub fn seed_fixture(fixture: &CodingFixture, root: &std::path::Path) {
     }
 }
 
+/// 对工作区跑完全部 hidden 断言，并带上有界文件体，供证据包重放。
+pub fn evaluate_hidden(fixture: &CodingFixture, root: &Path) -> HiddenReport {
+    let mut bodies: BTreeMap<String, HiddenFileBody> = BTreeMap::new();
+    for assert in fixture.hidden {
+        bodies
+            .entry(assert.path.to_string())
+            .or_insert_with(|| read_hidden_file(root, assert.path));
+    }
+    let assertions: Vec<HiddenAssertionResult> = fixture
+        .hidden
+        .iter()
+        .map(|assert| {
+            let file = bodies
+                .get(assert.path)
+                .expect("every hidden path is collected");
+            eval_assert(assert, file)
+        })
+        .collect();
+    HiddenReport {
+        schema: VERIFY_SCHEMA.to_string(),
+        kind: "file_content".into(),
+        fixture_id: fixture.id.to_string(),
+        expected_edit: fixture.expected_edit.to_string(),
+        passed: assertions.iter().all(|row| row.passed),
+        replay_complete: bodies.values().all(|file| !file.truncated),
+        assertions,
+        files: bodies.into_values().collect(),
+        commands: Vec::new(),
+    }
+}
+
 /// Whether the fixture currently passes its hidden verification.
-pub fn fixture_passes(fixture: &CodingFixture, root: &std::path::Path) -> bool {
-    (fixture.verify)(root)
+pub fn fixture_passes(fixture: &CodingFixture, root: &Path) -> bool {
+    evaluate_hidden(fixture, root).passed
+}
+
+/// 用证据包里保存的文件体重跑断言。工作区已删时仍可核对。
+/// 截断或不完整的包返回 `Err`，不得把缺体当成通过。
+pub fn reverify_from_report(report: &HiddenReport) -> anyhow::Result<bool> {
+    if report.schema != VERIFY_SCHEMA {
+        anyhow::bail!("unsupported verify schema {}", report.schema);
+    }
+    if report.kind == "hidden_command" {
+        if !report.replay_complete || report.commands.is_empty() {
+            anyhow::bail!("hidden command report is incomplete");
+        }
+        return Ok(report.commands.iter().all(|row| row.passed));
+    }
+    if report.kind != "file_content" {
+        anyhow::bail!("unsupported hidden kind {}", report.kind);
+    }
+    if !report.replay_complete || report.files.iter().any(|file| file.truncated) {
+        anyhow::bail!("hidden file bodies were truncated; replay is incomplete");
+    }
+    let mut by_path: BTreeMap<&str, &HiddenFileBody> = BTreeMap::new();
+    for file in &report.files {
+        by_path.insert(file.path.as_str(), file);
+    }
+    let mut passed = true;
+    for row in &report.assertions {
+        let file = by_path
+            .get(row.path.as_str())
+            .ok_or_else(|| anyhow::anyhow!("verify report missing body for {}", row.path))?;
+        let needles: Vec<&str> = row.needles.iter().map(String::as_str).collect();
+        let (ok, _) = eval_pred(&file.body, &row.pred, &needles, row.min);
+        if !ok {
+            passed = false;
+        }
+    }
+    Ok(passed)
+}
+
+fn read_hidden_file(root: &Path, rel: &str) -> HiddenFileBody {
+    let path = root.join(rel);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let digest = hex_encode(&Sha256::digest(&bytes));
+            let truncated = bytes.len() > HIDDEN_BODY_CAP;
+            let slice = if truncated {
+                &bytes[..HIDDEN_BODY_CAP]
+            } else {
+                &bytes
+            };
+            HiddenFileBody {
+                path: rel.to_string(),
+                exists: true,
+                sha256: digest,
+                bytes: bytes.len(),
+                truncated,
+                body: String::from_utf8_lossy(slice).into_owned(),
+            }
+        }
+        Err(_) => HiddenFileBody {
+            path: rel.to_string(),
+            exists: false,
+            sha256: hex_encode(&Sha256::digest([])),
+            bytes: 0,
+            truncated: false,
+            body: String::new(),
+        },
+    }
+}
+
+fn eval_assert(assert: &HiddenAssert, file: &HiddenFileBody) -> HiddenAssertionResult {
+    let (kind, needles, min) = pred_parts(assert.pred);
+    let (passed, count) = eval_pred(&file.body, kind, &needles, min);
+    HiddenAssertionResult {
+        path: assert.path.to_string(),
+        pred: kind.to_string(),
+        needles: needles.iter().map(|needle| (*needle).to_string()).collect(),
+        min,
+        count: Some(count),
+        passed,
+        file_exists: file.exists,
+    }
+}
+
+fn pred_parts(pred: HiddenPred) -> (&'static str, Vec<&'static str>, Option<usize>) {
+    match pred {
+        HiddenPred::Contains(needle) => ("contains", vec![needle], None),
+        HiddenPred::NotContains(needle) => ("not_contains", vec![needle], None),
+        HiddenPred::ContainsAny(needles) => ("contains_any", needles.to_vec(), None),
+        HiddenPred::MinMatches { needle, min } => ("min_matches", vec![needle], Some(min)),
+    }
+}
+
+fn eval_pred(content: &str, kind: &str, needles: &[&str], min: Option<usize>) -> (bool, usize) {
+    match kind {
+        "contains" => {
+            let needle = needles.first().copied().unwrap_or("");
+            let count = content.matches(needle).count();
+            (count > 0, count)
+        }
+        "not_contains" => {
+            let needle = needles.first().copied().unwrap_or("");
+            let count = content.matches(needle).count();
+            (count == 0, count)
+        }
+        "contains_any" => {
+            let count = needles
+                .iter()
+                .filter(|needle| content.contains(*needle))
+                .count();
+            (count > 0, count)
+        }
+        "min_matches" => {
+            let needle = needles.first().copied().unwrap_or("");
+            let count = content.matches(needle).count();
+            (count >= min.unwrap_or(0), count)
+        }
+        _ => (false, 0),
+    }
+}
+
+pub(crate) fn hash_hidden(fixture: &CodingFixture, hasher: &mut Sha256) {
+    for assert in fixture.hidden {
+        hasher.update(assert.path.as_bytes());
+        hasher.update(b"\n");
+        let (kind, needles, min) = pred_parts(assert.pred);
+        hasher.update(kind.as_bytes());
+        hasher.update(b"\n");
+        for needle in needles {
+            hasher.update(needle.as_bytes());
+            hasher.update(b"\n");
+        }
+        if let Some(min) = min {
+            hasher.update(min.to_string().as_bytes());
+            hasher.update(b"\n");
+        }
+    }
+}
+
+fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HiddenReport {
+    pub schema: String,
+    pub kind: String,
+    pub fixture_id: String,
+    pub expected_edit: String,
+    pub passed: bool,
+    /// 所有被检查文件的体都完整写入（未截断）。
+    #[serde(default)]
+    pub replay_complete: bool,
+    pub assertions: Vec<HiddenAssertionResult>,
+    pub files: Vec<HiddenFileBody>,
+    /// 可执行 hidden 命令的捕获记录。空表示本题仍是纯文件断言。
+    #[serde(default)]
+    pub commands: Vec<HiddenCommandResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HiddenAssertionResult {
+    pub path: String,
+    pub pred: String,
+    pub needles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
+    pub passed: bool,
+    pub file_exists: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HiddenFileBody {
+    pub path: String,
+    pub exists: bool,
+    pub sha256: String,
+    pub bytes: usize,
+    pub truncated: bool,
+    pub body: String,
+}
+
+/// 一次 hidden 命令的有界捕获。stdout/stderr 截断后仍保留退出码。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HiddenCommandResult {
+    pub argv: Vec<String>,
+    pub expect_exit: i32,
+    pub exit: Option<i32>,
+    pub timed_out: bool,
+    pub stdout: String,
+    pub stderr: String,
+    #[serde(default)]
+    pub stdout_truncated: bool,
+    #[serde(default)]
+    pub stderr_truncated: bool,
+    pub passed: bool,
 }
 
 /// Self-check the evaluation inputs: every fixture's seed must be writable
@@ -291,10 +599,30 @@ pub fn fixture_role(id: &str) -> &'static str {
 pub fn render_fixtures() -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "acceptance suite: not frozen ({}/{}). current fixtures are smoke/diagnostic only.\n\n",
+        "acceptance suite: frozen (pack). smoke fixtures {}/{} are diagnostic only.\n",
         FIXTURES.len(),
         crate::analysis::MIN_TASKS,
     ));
+    if let Ok(pack) = crate::suite::load_pack() {
+        out.push_str(&format!(
+            "suite pack: {}/{} frozen={}. smoke FIXTURES below do not count.\n\n",
+            pack.tasks.len(),
+            pack.manifest.target_n,
+            pack.frozen()
+        ));
+    } else {
+        out.push('\n');
+    }
+    if let Ok(pack) = crate::suite::load_pack() {
+        out.push_str(&format!(
+            "suite pack: {}/{} frozen={}. smoke FIXTURES below do not count.\n\n",
+            pack.tasks.len(),
+            pack.manifest.target_n,
+            pack.frozen()
+        ));
+    } else {
+        out.push('\n');
+    }
     out.push_str("A/B/C/D tool-surface arms:\n");
     for arm in &ARMS {
         out.push_str(&format!(
@@ -318,6 +646,10 @@ pub fn render_fixtures() -> String {
         let files: Vec<&str> = fixture.seed.iter().map(|(path, _)| *path).collect();
         out.push_str(&format!("    seeds: {}\n", files.join(", ")));
         out.push_str(&format!("    expected edit: {}\n", fixture.expected_edit));
+        out.push_str(&format!(
+            "    hidden: {} file_content asserts\n",
+            fixture.hidden.len()
+        ));
         let turns = live_turns(fixture);
         if turns.len() > 1 {
             out.push_str(&format!("    live turns: {}\n", turns.len()));
@@ -341,6 +673,24 @@ mod tests {
             assert!(!fixture.name.is_empty());
             assert!(!fixture.description.is_empty());
             assert!(!fixture.expected_edit.is_empty());
+            assert!(
+                !fixture.hidden.is_empty(),
+                "fixture '{}' needs at least one hidden assert",
+                fixture.id
+            );
+            for assert in fixture.hidden {
+                assert!(
+                    !std::path::Path::new(assert.path).is_absolute(),
+                    "hidden path must be workspace-relative: {}",
+                    assert.path
+                );
+                let (_, needles, _) = pred_parts(assert.pred);
+                assert!(
+                    !needles.is_empty() && needles.iter().all(|needle| !needle.is_empty()),
+                    "hidden assert on {} has an empty needle",
+                    assert.path
+                );
+            }
             assert!(
                 ids.insert(fixture.id),
                 "duplicate fixture id: {}",
@@ -490,6 +840,61 @@ mod tests {
             !fixture_passes(fixture, dir.path()),
             "reintroducing i + 1 in main.py must fail the hidden check"
         );
+        let report = evaluate_hidden(fixture, dir.path());
+        assert!(!report.passed);
+        assert!(
+            report.assertions.iter().any(|row| {
+                row.path == "src/main.py" && row.pred == "not_contains" && !row.passed
+            }),
+            "the failing assert must name src/main.py not_contains i + 1: {:?}",
+            report.assertions
+        );
+        assert!(reverify_from_report(&report).unwrap() == report.passed);
+    }
+
+    #[test]
+    fn hidden_report_replays_after_workspace_is_gone() {
+        let fixture = FIXTURES
+            .iter()
+            .find(|fixture| fixture.id == "add_test")
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/calc.py"),
+            "def add(a, b):\n    return a + b\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+        )
+        .unwrap();
+        let report = evaluate_hidden(fixture, dir.path());
+        assert!(report.passed);
+        assert!(report.replay_complete);
+        drop(dir);
+        assert!(reverify_from_report(&report).unwrap());
+    }
+
+    #[test]
+    fn recall_missing_main_names_the_failed_assert() {
+        let fixture = FIXTURES
+            .iter()
+            .find(|fixture| fixture.id == "recall_after_fix")
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/util.py"),
+            "def visit_all(items):\n    out = []\n    for i in range(len(items)):\n        out.append(items[i])\n    return out\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/scratch.md"), "Breville 200 HDMI 4B\n").unwrap();
+        let report = evaluate_hidden(fixture, dir.path());
+        assert!(!report.passed);
+        let main = report
+            .assertions
+            .iter()
+            .find(|row| row.path == "src/main.py" && row.pred == "contains")
+            .expect("visit_all assert");
+        assert!(!main.file_exists);
+        assert!(!main.passed);
     }
 
     #[test]

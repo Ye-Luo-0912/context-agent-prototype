@@ -267,6 +267,9 @@ Before claiming real-evaluation completion:
   cover search recall/latency, found-after-forgotten and graded-access stamps;
   replay reports Resident final/preview-peak bytes. The remaining work is to
   make every live cell durable and auditable, not to add another aggregate.
+  Decision (2026-08-14): Search/GC evaluation is folded into these same
+  cells — retrieval metrics are secondary lifecycle endpoints of the
+  paired A/B/C runs, recorded per cell, not a separate later experiment.
 
 ### Contemporaneous smoke bound (2026-08-14; not a formal preregistration)
 
@@ -581,8 +584,11 @@ current-file / `handle_21` slice is landed (active-task latest file body,
 2. before the formal gate, make each intended cell produce a versioned result
    bundle. **EVAL-01.1 (2026-08-14) landed the writer:** live `--compare-live*`
    writes `agent-eval.cell.v1` (manifest, events.jsonl, summary, workspace
-   hash, verify.json) and `--show-evidence` rebuilds the table. Remaining
-   gaps: executable hidden tests. A persisted `recall_after_fix` pair now
+   hash, verify.json) and `--show-evidence` rebuilds the table.
+   **EVAL-01.1b (2026-08-14):** `verify.json` records named file-content
+   asserts plus bounded bodies so the hidden check can be replayed after the
+   workspace is deleted. Scoring of the five smoke fixtures is unchanged;
+   this is not pytest/build. A persisted `recall_after_fix` pair now
    exists under `target/eval-evidence/reasonable-live-retry`;
 3. freeze a heterogeneous suite of at least 300 independent bug/feature/
    refactor/long-tool-loop tasks with executable hidden build/tests. Three
@@ -593,7 +599,20 @@ current-file / `handle_21` slice is landed (active-task latest file body,
    20260814, 5000 sims) historical 30×3 has P(pass|Δ=0)=961/5000 ≈ 19%;
    300×3 has 4048/5000 ≈ 81%. Do not collect acceptance cells until the
    suite is frozen. Do not invent 300 one-line fixtures. Current FIXTURES
-   remain 5 smoke/diagnostic tasks (`suite_frozen=false`). Live `--compare-live*`
+   remain 5 smoke/diagnostic tasks. EVAL-01.3b freezes the suite
+   (`suite_frozen=true`, pack 509=9 file + 500 SWE-bench Verified) and
+   declares retrieval secondaries; n/repeats/margin stay 300×3 / −5 pp.
+   Do not collect 300×3 acceptance cells until the frozen ~30×3
+   calibration pilot. Unit tests do not pull images.
+   **EVAL-01.5 (2026-08-14):** 30-id calibration sample frozen
+   (`--pilot`, sha256 `fa8c5308…`, 10/10/10). `--pilot-run` is the live
+   A/B/C path on that sample (default 9 file tasks; SWE-bench is
+   `--include-swebench` + clone/Docker opt-in). `--pilot-calibrate`
+   reports `decision=pilot` and cannot pass the 300×3 gate.
+   File-only live 9×3 collected in `crates/agent-eval/evidence/pilot-30`
+   (81 cells; ITT A=C=0.778; diagnostic C−A LCL=−0.146; gate
+   ineligible). 21 SWE-bench cells not collected. Do not amend n.
+   Live `--compare-live*`
    now counterbalances append/rolling/dynamic per fixture×repeat;
 4. use a model-backed bounded compactor for B and include its manager cost.
 

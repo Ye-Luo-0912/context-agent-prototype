@@ -1,0 +1,29 @@
+{
+  "id": "python-pep616-removeprefix",
+  "name": "PEP 616 prefix strip is not lstrip",
+  "class": "recall",
+  "language": "python",
+  "size": "medium",
+  "edit_shape": "prefix-not-charset",
+  "recall_pressure": "notes-then-reuse",
+  "source": {
+    "kind": "git",
+    "repo": "https://github.com/python/cpython",
+    "commit": "a81849b0315277bb3937271174aaaa5059c0b445",
+    "path": "Objects/unicodeobject.c",
+    "note": "Minimized from bpo-39939 / PEP 616: str.removeprefix. The PEP exists because str.lstrip(prefix) treats the argument as a character set. Standalone helper; extra live turns ask the model to reuse it after distractor notes."
+  },
+  "description": "PEP 616 added str.removeprefix because the usual workaround s.lstrip(prefix) is wrong: lstrip takes a set of characters, not a literal prefix, so remove_prefix('test', 't') must return 'est' rather than stripping every leading t. Implement remove_prefix(s, prefix) so it returns s[len(prefix):] only when s.startswith(prefix), otherwise a copy of s. Empty prefix leaves the string unchanged. After the fix, later turns will ask you to reuse this helper on data/names.txt; do not switch back to lstrip.",
+  "extra_live_turns": [
+    "Write src/notes.md with three unrelated observations about logging formatters and calendar rendering. Do not edit remove_prefix.py.",
+    "Add another short note to src/notes.md about timezone abbreviations. Still do not touch the prefix helper.",
+    "Using remove_prefix, write src/clean.py that prints each line of data/names.txt with the literal prefix tmp_ removed. Do not use str.lstrip."
+  ],
+  "hidden_commands": [
+    {
+      "argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-q"],
+      "timeout_ms": 30000,
+      "expect_exit": 0
+    }
+  ]
+}

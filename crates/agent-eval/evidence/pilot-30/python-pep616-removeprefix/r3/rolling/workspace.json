@@ -1,0 +1,9 @@
+{
+  "files": 3,
+  "listed": [
+    "data/names.txt",
+    "remove_prefix.py",
+    "src/notes.md"
+  ],
+  "sha256": "8ae98461e76b0260f3f5d0d6cb533f828061dfb586ef96c94f61d64bb99dd3e3"
+}

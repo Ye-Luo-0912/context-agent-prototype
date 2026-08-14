@@ -1,0 +1,24 @@
+{
+  "id": "uuid-parity-keys",
+  "name": "UUID map-key collapse is order-insensitive",
+  "class": "bug",
+  "language": "rust",
+  "size": "small",
+  "edit_shape": "last-wins-to-sorted-rekey",
+  "recall_pressure": "none",
+  "source": {
+    "kind": "git",
+    "repo": "https://github.com/Ye-Luo-0912/context-agent-prototype",
+    "commit": "0d2dd2ffd9bd66dbc0bf6dfc183815bd41eb70d2",
+    "path": "crates/context-contextcore/tests/service.rs",
+    "note": "Minimized from strip_random_uuids: last-wins UUID key collapse flaked on HashMap/iteration order. Standalone crate; values are i32 so there is no serde_json dependency."
+  },
+  "description": "Two engine snapshots mint different UUID-shaped map keys for the same logical records. collapse_uuid_keys must make those snapshots comparable: every UUID-shaped key is replaced with a placeholder <uuid>, <uuid>1>, and so on. The current implementation last-wins onto a single <uuid> key, so the surviving value depends on input order. Collect every UUID-keyed value, sort them, and re-key deterministically so equal value multisets compare equal regardless of entry order. Non-UUID keys such as keep must be preserved.",
+  "hidden_commands": [
+    {
+      "argv": ["cargo", "test", "--offline", "--quiet"],
+      "timeout_ms": 120000,
+      "expect_exit": 0
+    }
+  ]
+}

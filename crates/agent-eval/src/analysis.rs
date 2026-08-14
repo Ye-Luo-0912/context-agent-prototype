@@ -1,11 +1,10 @@
-//! EVAL-01.2 / EVAL-01.3：正式门禁的预注册分析。
+//! EVAL-01.2 / EVAL-01.3 / EVAL-01.3b：正式门禁的预注册分析。
 //!
 //! EVAL-01.2 冻结估计量、聚类、单侧区间、ITT 规则，以及历史 30×3 功效表。
-//! 该表显示 30×3 / −5 pp 在保守模型下功效不足。EVAL-01.3 在收集接受
-//! 细胞之前，用同一模型重冻 n/repeats：300 题 × 3 次重复。边际保持
-//! −5 pp，不把 live 诊断拿来改门槛。套件仍未冻结（`SUITE_FROZEN = false`）。
+//! EVAL-01.3 在收集接受细胞之前，用同一模型重冻 n/repeats：300 题 × 3 次重复。
+//! 边际保持 −5 pp。EVAL-01.3b 冻结套件并声明检索次级指标，不改门禁 n/边际。
 //!
-//! 不在这里发明 300 道题，也不把 `--repeats` 烟雾当成独立任务。
+//! 不把 `--repeats` 烟雾当成独立任务。300×3 接受细胞须先做冻结的 ~30×3 校准。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -30,8 +29,8 @@ pub const HISTORICAL_REPEATS: u32 = 3;
 /// 290×3 只有 4003/5000（刀口），300×3 才锁成门禁 n。
 pub const MIN_TASKS: usize = 300;
 pub const GATE_REPEATS: u32 = 3;
-/// 接受套件尚未冻结。现有 5 题只是 harness / 诊断。
-pub const SUITE_FROZEN: bool = false;
+/// 接受套件已冻结（EVAL-01.3b）。300×3 接受细胞仍须先做 ~30×3 校准。
+pub const SUITE_FROZEN: bool = true;
 
 const POWER_SEED: u64 = 2026_08_14;
 const POWER_SIMS: u32 = 5_000;
@@ -61,8 +60,10 @@ design=300 tasks x 3 repeats (100/100/100)
 power_result_d0=4048/5000
 power_result_d_m05=258/5000
 power_result_d_m10=0/5000
-power_note=EVAL-01.3 amends n/repeats only; margin stays -5pp; historical 30x3 is underpowered (961/5000 at d=0); 300x3 is the smallest even-thirds r=3 design with P(pass|d=0)>=0.80 (4048/5000); 290x3 was a Monte-Carlo knife-edge; do not collect acceptance cells until the suite is frozen; do not invent tasks
-suite_frozen=false
+power_note=EVAL-01.3b freezes the suite and declares retrieval secondaries; n/repeats/margin stay EVAL-01.3 (300x3, -5pp); do not collect 300x3 acceptance cells until the frozen ~30x3 calibration pilot; do not invent tasks
+suite_frozen=true
+suite_pack=agent-eval.suite.v1 n=509 (9 file + 500 princeton-nlp/SWE-bench_Verified)
+retrieval_secondaries=search recall/latency, found-after-forgotten, graded-access distribution; same A/B/C cells; not in the primary LCL gate
 ";
 
 #[derive(Debug, Clone)]
@@ -253,9 +254,18 @@ pub fn analyze(cells: &[CellRecord]) -> GateReport {
     let interval = one_sided_lcl(&diffs);
     let mut reasons = Vec::new();
     if !SUITE_FROZEN {
+        let pack_note = crate::suite::load_pack()
+            .map(|pack| format!("suite pack {}/{}", pack.tasks.len(), crate::suite::TARGET_N))
+            .unwrap_or_else(|_| "suite pack unreadable".into());
         reasons.push(format!(
-            "acceptance suite is not frozen (5 smoke/diagnostic fixtures, not {MIN_TASKS} tasks)"
+            "acceptance suite is not frozen ({pack_note}; 5 smoke/diagnostic fixtures, not {MIN_TASKS} tasks)"
         ));
+    } else {
+        match crate::suite::load_pack() {
+            Ok(pack) if pack.frozen() => {}
+            Ok(_) => reasons.push("SUITE_FROZEN but suite pack is not frozen".into()),
+            Err(_) => reasons.push("SUITE_FROZEN but suite pack unreadable".into()),
+        }
     }
     if tasks.len() < MIN_TASKS {
         reasons.push(format!("n_tasks={} < {MIN_TASKS}", tasks.len()));
@@ -330,12 +340,21 @@ pub fn render_preregister() -> String {
         "{ANALYSIS_SCHEMA} spec_sha256={}\n",
         spec_sha256()
     ));
-    out.push_str("suite_frozen=false\n");
+    out.push_str(&format!("suite_frozen={SUITE_FROZEN}\n"));
     out.push_str(&format!(
-        "acceptance tasks: {}/{} (current FIXTURES are smoke/diagnostic only)\n",
+        "smoke FIXTURES: {}/{} (diagnostic only; pack is the acceptance suite)\n",
         crate::workload::FIXTURES.len(),
         MIN_TASKS
     ));
+    if let Ok(pack) = crate::suite::load_pack() {
+        out.push_str(&format!(
+            "suite pack: {}/{} frozen={} blockers={}\n",
+            pack.tasks.len(),
+            pack.manifest.target_n,
+            pack.frozen(),
+            pack.blockers.len()
+        ));
+    }
     out.push_str(SPEC);
     out.push('\n');
     out.push_str("historical 30x3 (EVAL-01.2, not the gate):\n");
@@ -343,8 +362,17 @@ pub fn render_preregister() -> String {
     out.push_str("design 300x3 (EVAL-01.3 gate n/repeats):\n");
     out.push_str(&render_power(&design));
     out.push_str(
-        "power note: n/repeats are frozen; the suite is not; do not collect acceptance cells; this is not an M15 close.\n",
+        "power note: n/repeats/margin frozen; suite frozen; retrieval secondaries declared; do not collect 300x3 acceptance cells until the ~30x3 calibration pilot; this is not an M15 close.\n",
     );
+    if let Ok(pack) = crate::suite::load_pack() {
+        if let Ok(sample) = crate::pilot::select_pilot(&pack) {
+            out.push_str(&format!(
+                "calibration sample: n={} sha256={} (--pilot / --pilot-run / --pilot-calibrate; decision=pilot)\n",
+                sample.tasks.len(),
+                sample.sha256
+            ));
+        }
+    }
     out
 }
 
@@ -866,9 +894,9 @@ mod tests {
         let report = analyze(&cells);
         assert!(!report.eligible);
         assert_eq!(report.decision, "ineligible");
-        assert!(!report.suite_frozen);
+        assert!(report.suite_frozen);
         assert!(
-            report
+            !report
                 .ineligible_reasons
                 .iter()
                 .any(|reason| reason.contains("not frozen"))
@@ -931,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn unfrozen_full_size_suite_is_still_ineligible() {
+    fn frozen_full_size_synthetic_cells_are_gate_eligible() {
         let mut cells = Vec::new();
         for task in 0..MIN_TASKS {
             let id = format!("t{task:03}");
@@ -942,14 +970,15 @@ mod tests {
             }
         }
         let report = analyze(&cells);
-        assert!(!report.eligible);
-        assert_eq!(report.decision, "ineligible");
+        assert!(report.suite_frozen);
         assert_eq!(report.tasks.len(), MIN_TASKS);
         assert!(
-            report
+            !report
                 .ineligible_reasons
                 .iter()
-                .any(|reason| reason.contains("not frozen"))
+                .any(|reason| reason.contains("not frozen")),
+            "{:?}",
+            report.ineligible_reasons
         );
         assert!(
             !report
@@ -957,6 +986,8 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("n_tasks="))
         );
+        assert!(report.eligible, "{:?}", report.ineligible_reasons);
+        assert_eq!(report.decision, "pass");
     }
 
     #[test]
@@ -965,18 +996,19 @@ mod tests {
         assert_eq!(spec_sha256().len(), 64);
         assert_eq!(
             spec_sha256(),
-            "45a43d283a92df2a765fc1452aa662fb093876f40664d02f1190d360bc9ce33f"
+            "c28a2ea8d54077d821a0cc7e121d2639b999e25108f2d9c618452ffd711de2b6"
         );
         assert_eq!(ANALYSIS_SCHEMA, crate::bundle::ANALYSIS_SCHEMA);
         assert!(SPEC.contains("schema=agent-eval.analysis.v2"));
         assert!(SPEC.contains("historical_power_d0=961/5000"));
         assert!(SPEC.contains("power_result_d0=4048/5000"));
         assert!(SPEC.contains("design=300 tasks x 3 repeats"));
-        assert!(SPEC.contains("suite_frozen=false"));
+        assert!(SPEC.contains("suite_frozen=true"));
+        assert!(SPEC.contains("retrieval_secondaries="));
         assert!(SPEC.contains("margin=-0.05"));
         assert!(SPEC.contains("n_tasks>=300"));
         assert!(crate::workload::render_fixtures().contains(&format!(
-            "({}/{})",
+            "{}/{}",
             crate::workload::FIXTURES.len(),
             MIN_TASKS
         )));

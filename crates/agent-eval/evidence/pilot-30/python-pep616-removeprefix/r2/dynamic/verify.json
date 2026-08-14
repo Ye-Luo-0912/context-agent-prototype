@@ -1,0 +1,31 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "hidden_command",
+  "fixture_id": "python-pep616-removeprefix",
+  "expected_edit": "",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [],
+  "files": [],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-q"
+      ],
+      "expect_exit": 0,
+      "exit": 1,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "======================================================================\r\nFAIL: test_literal_prefix_not_charset (test_hidden.TestRemovePrefix.test_literal_prefix_not_charset)\r\n----------------------------------------------------------------------\r\nTraceback (most recent call last):\r\n  File \"C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpabFS8a\\tests\\test_hidden.py\", line 14, in test_literal_prefix_not_charset\r\n    self.assertEqual(remove_prefix(\"www.example.com\", \"w\"), \"ww.example.com\")\r\nAssertionError: '.example.com' != 'ww.example.com'\r\n- .example.com\r\n+ ww.example.com\r\n? ++\r\n\r\n\r\n----------------------------------------------------------------------\r\nRan 3 tests in 0.001s\r\n\r\nFAILED (failures=1)\r\n",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}
