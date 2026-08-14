@@ -1,10 +1,13 @@
-//! `RuntimeCheckpoint`: the complete runtime snapshot.
+//! `RuntimeCheckpoint`: the actor/context/capability snapshot plus a durable
+//! Core-authority checkpoint marker.
 //!
 //! `ContextEngine::checkpoint` alone is not a full checkpoint since the
 //! actor gained its own state: the engine captures items, the scope tree,
-//! focus and GC state, but not the runtime's `TaskManager` or the dynamic
-//! capability surface. Restoring only the engine state resurrects task
-//! scopes the runtime knows nothing about. This type bundles both planes:
+//! focus and GC state, but not the runtime's `TaskManager`, dynamic
+//! capability surface, or Core operation authority. Restoring only the
+//! engine state resurrects task scopes the runtime knows nothing about.
+//! This type bundles the actor-owned planes and references — but never
+//! embeds or rewinds — the durable Core authority journal:
 //!
 //! ```text
 //! RuntimeCheckpoint
@@ -14,7 +17,8 @@
 //!   ├─ current TaskId (the actor's belief, kept in sync with the engine)
 //!   ├─ focus and last-issued surface revisions
 //!   ├─ context checkpoint (the engine's own JSON state)
-//!   └─ capability surface state (activation + loaded tools per capability)
+//!   ├─ capability surface state (activation + loaded tools per capability)
+//!   └─ authority marker (journal lineage + verified durable prefix)
 //! ```
 //!
 //! Tool lifecycle and context-store generation are deliberately optional
@@ -25,8 +29,8 @@
 use std::collections::HashSet;
 
 use agent_contracts::{
-    AgentError, AgentResult, MAX_COMPLETION_ARTIFACTS, MAX_COMPLETION_REF_CHARS,
-    MAX_COMPLETION_SUMMARY_CHARS, RunId, TaskId,
+    AgentError, AgentResult, AuthorityCheckpointMarker, MAX_COMPLETION_ARTIFACTS,
+    MAX_COMPLETION_REF_CHARS, MAX_COMPLETION_SUMMARY_CHARS, RunId, TaskId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +40,7 @@ use crate::task::{
 };
 
 /// Bump when the checkpoint shape changes; restore rejects mismatches.
-pub const RUNTIME_CHECKPOINT_VERSION: u32 = 3;
+pub const RUNTIME_CHECKPOINT_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeCheckpoint {
@@ -61,6 +65,13 @@ pub struct RuntimeCheckpoint {
     /// Dynamic capability surface state, applied by the host on restore.
     #[serde(default)]
     pub capabilities: Vec<CapabilitySnapshot>,
+    /// A read-only reference to one verified durable prefix of Core's
+    /// operation-authority journal. It is absent only for explicitly
+    /// ephemeral, in-process compositions with no operation journal.
+    /// Restore validates this marker against the live Core before any
+    /// mutation and never installs its epoch or journal state.
+    #[serde(default)]
+    pub authority: Option<AuthorityCheckpointMarker>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +137,14 @@ impl RuntimeCheckpoint {
                 "checkpoint version {} is not supported (expected {}); automatic migration is not available",
                 self.version, RUNTIME_CHECKPOINT_VERSION
             )));
+        }
+
+        if let Some(marker) = &self.authority {
+            marker.validate().map_err(|error| {
+                AgentError::InvalidRequest(format!(
+                    "checkpoint has an invalid authority marker: {error}"
+                ))
+            })?;
         }
 
         if self.tasks.active != self.current_task_id {
@@ -354,11 +373,12 @@ mod tests {
             last_surface_revision: 11,
             context: serde_json::json!({}),
             capabilities: Vec::new(),
+            authority: None,
         }
     }
 
     #[test]
-    fn v2_round_trip_preserves_task_and_surface_revisions() {
+    fn v4_round_trip_preserves_task_surface_and_authority_shape() {
         let checkpoint = checkpoint(&task_manager_with_requirements());
         checkpoint.validate().unwrap();
 
@@ -371,6 +391,7 @@ mod tests {
         assert_eq!(requirements.revision, 1);
         assert_eq!(requirements.entries[0].tool_name, "fs.read");
         assert_eq!(requirements.entries[1].tool_name, "search.grep");
+        assert!(decoded.authority.is_none());
     }
 
     #[test]
@@ -388,6 +409,19 @@ mod tests {
         let decoded: RuntimeCheckpoint = serde_json::from_value(value).unwrap();
         let error = decoded.validate().unwrap_err().to_string();
         assert!(error.contains("checkpoint version 1 is not supported"));
+    }
+
+    #[test]
+    fn legacy_v3_deserializes_only_to_receive_an_explicit_version_rejection() {
+        let mut value =
+            serde_json::to_value(checkpoint(&task_manager_with_requirements())).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("version".into(), serde_json::json!(3));
+        object.remove("authority");
+
+        let decoded: RuntimeCheckpoint = serde_json::from_value(value).unwrap();
+        let error = decoded.validate().unwrap_err().to_string();
+        assert!(error.contains("checkpoint version 3 is not supported"));
     }
 
     #[test]

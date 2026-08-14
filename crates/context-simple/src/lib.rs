@@ -1,3 +1,4 @@
+mod access;
 mod checkpoint;
 mod diagnostics;
 mod directive;

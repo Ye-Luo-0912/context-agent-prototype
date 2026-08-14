@@ -38,6 +38,8 @@ pub(crate) struct GcPlan {
     pub(crate) evicted: usize,
     pub(crate) reactivated: usize,
     pub(crate) aged_external: usize,
+    /// Live resident items protected this pass by anchor root claims.
+    pub(crate) anchor_roots_protected: usize,
 }
 
 /// The store IO outcomes, applied by the commit under a fresh lock.
@@ -93,6 +95,7 @@ pub(crate) fn plan_full_gc(
     // grows on ingest/maintain/materialize.
     state.gc_epoch += 1;
     let gc_epoch = state.gc_epoch;
+    state.sync_catalog();
 
     let mut plan = GcPlan {
         externalize: Vec::new(),
@@ -103,18 +106,28 @@ pub(crate) fn plan_full_gc(
         evicted: 0,
         reactivated: 0,
         aged_external: 0,
+        anchor_roots_protected: 0,
     };
 
     // ----- Mark phase: the root set --------------------------------
     // Roots are the current attention: pins, members of the active focus
     // scope (including open tool frames under it), durable task
     // constraints, durable session memory, items whose entities are hot,
-    // plus a bounded slice of their dependencies. The task id alone is a
+    // the latest body of each recent file in the active task, plus a
+    // bounded slice of their dependencies. The task id alone is a
     // boundary, not a root — a long task's cooled history is not protected
     // just because it shares the task id.
     let focus = state.focus.clone();
     let hot_entities = state.hot_entities.clone();
-    let marked = mark_roots(state, config, focus.as_ref(), &hot_entities);
+    let latest_file_bodies = state.latest_file_body_ids();
+    let (marked, anchor_roots_protected) = mark_roots(
+        state,
+        config,
+        focus.as_ref(),
+        &hot_entities,
+        &latest_file_bodies,
+    );
+    plan.anchor_roots_protected = anchor_roots_protected;
     // The ids of items whose entities are hot right now, mirroring the
     // mark phase's `hot` test. The sweep exempts hot items from the
     // ordinary-dialogue aging rule, and the reactivate phase applies the
@@ -148,9 +161,11 @@ pub(crate) fn plan_full_gc(
             || item
                 .lease_until_turn
                 .is_some_and(|until| state.turn <= until);
+        let latest_file_body = latest_file_bodies.contains(&item.id);
         let consumed_ephemeral = item.attention == AttentionState::Archived
             && item.retention == ContextRetention::Ephemeral
-            && item.scope == ContextScope::Turn;
+            && item.scope == ContextScope::Turn
+            && !latest_file_body;
         // Ordinary dialogue of the *open* focus episode has a shelf life
         // too: related messages share tokens, so the score floor keeps
         // them Active forever and the focus-scope root would accumulate
@@ -385,6 +400,8 @@ pub(crate) fn commit_full_gc(
     // The store map: successful writes become Cold entries (carrying the
     // checksum captured at write time for the reconcile)...
     let externalized_count = io.externalized.len();
+    let externalized_ids: Vec<ContextItemId> =
+        io.externalized.iter().map(|(item, _, _)| item.id).collect();
     // Store I/O accounting: the bodies written this pass, read back this
     // pass, and how many items were recalled (M15 baseline, aggregated by
     // the eval harness from the event stream).
@@ -468,12 +485,14 @@ pub(crate) fn commit_full_gc(
         externalized: externalized_count,
         reactivated: plan.reactivated + recalled_reactivations.len(),
         aged_external: plan.aged_external,
+        anchor_roots_protected: plan.anchor_roots_protected,
         store_write_bytes,
         store_read_bytes,
         store_recalled_items,
         diagnostics: diagnostics::compute(state),
         ..ContextGcReport::default()
     };
+    report.externalized_ids = externalized_ids;
     report.evictions = plan.evictions;
     let mut reactivations = plan.buffer_reactivations;
     reactivations.extend(recalled_reactivations);
@@ -482,14 +501,16 @@ pub(crate) fn commit_full_gc(
 }
 
 /// Mark the root set: pins, members of the active focus scope tree, durable
-/// task constraints, durable session memory, hot-entity matches, and a
-/// bounded transitive slice of their dependencies.
+/// task constraints, durable session memory, hot-entity matches, the latest
+/// body of each recent file in the active task, and a bounded transitive
+/// slice of their dependencies.
 fn mark_roots(
     state: &State,
     config: &SimpleContextConfig,
     focus: Option<&FocusState>,
     hot_entities: &[String],
-) -> Vec<ContextItemId> {
+    latest_file_bodies: &HashSet<ContextItemId>,
+) -> (Vec<ContextItemId>, usize) {
     let active_task = focus.map(|f| f.task_id);
     // The active focus scope of the current task: the attention container.
     // Members of the whole open subtree under it (open tool frames) are
@@ -550,6 +571,18 @@ fn mark_roots(
             || item
                 .lease_until_turn
                 .is_some_and(|until| state.turn <= until);
+        // TaskAnchor 投影的根声明（runtime 推送）：ResidentRequired /
+        // PromptRequired 的声明指向的条目是根。任务权威在 TaskManager，
+        // 这里只消费投影；semantic 死亡是终态，sweep 的 alive_root 仍
+        // 要求 live，所以声明从不复活死条目。
+        let anchor_rooted = state.anchor_roots.iter().any(|claim| {
+            matches!(
+                claim.strength,
+                agent_contracts::AnchorRootStrength::ResidentRequired
+                    | agent_contracts::AnchorRootStrength::PromptRequired
+            ) && crate::engine::anchor_claim_matches_item(claim, item)
+        });
+        let latest_file_body = latest_file_bodies.contains(&item.id);
         if is_pin
             || in_active_focus_scope
             || durable_task_constraint
@@ -557,10 +590,30 @@ fn mark_roots(
             || durable_session_memory
             || hot
             || model_directed_root
+            || anchor_rooted
+            || latest_file_body
         {
             marked.push(item.id);
         }
     }
+
+    // 本 pass 由 anchor 根声明保护的 *live* resident 条目数（报告可
+    // 解释性）。semantic 死亡是终态，即使声明匹配也不算"受保护"——
+    // sweep 不会让它存活，计数必须与 sweep 的存活判定一致。
+    let anchor_roots_protected = state
+        .items
+        .iter()
+        .filter(|item| {
+            item.semantic.is_live()
+                && state.anchor_roots.iter().any(|claim| {
+                    matches!(
+                        claim.strength,
+                        agent_contracts::AnchorRootStrength::ResidentRequired
+                            | agent_contracts::AnchorRootStrength::PromptRequired
+                    ) && crate::engine::anchor_claim_matches_item(claim, item)
+                })
+        })
+        .count();
 
     // Reachability through dependency edges, bounded: a root pulls in the
     // items it *depends on*, so the evidence behind a working item stays
@@ -591,7 +644,7 @@ fn mark_roots(
             }
         }
     }
-    marked
+    (marked, anchor_roots_protected)
 }
 
 /// The dependency edges of an item wherever its record lives: the resident
@@ -790,9 +843,18 @@ fn reactivate(
         // score (or its focus-scope membership) must not bounce it back
         // and forth across the heap/buffer boundary every GC pass. Only a
         // hot entity right now (a fresh causal reason, checked by
-        // `aged_ordinary_dialogue` itself) exempts it.
+        // `aged_ordinary_dialogue` itself) exempts it. An anchor root
+        // claim exempts it the same way — task authority outranks the
+        // aging heuristic (computed below and re-checked here).
+        let anchor_rooted = state.anchor_roots.iter().any(|claim| {
+            matches!(
+                claim.strength,
+                agent_contracts::AnchorRootStrength::ResidentRequired
+                    | agent_contracts::AnchorRootStrength::PromptRequired
+            ) && crate::engine::anchor_claim_matches_item(claim, item)
+        });
         let hot_now = !hot_entities.is_empty() && entities_match(&item.entities, &hot_entities);
-        if aged_ordinary_dialogue(item, config, state.turn, hot_now) {
+        if !anchor_rooted && aged_ordinary_dialogue(item, config, state.turn, hot_now) {
             continue;
         }
         let live_root_dep = marked.contains(&item.id);
@@ -808,6 +870,7 @@ fn reactivate(
                     completed_task: task_completed(state, item.task_id),
                 },
                 live_root_dep,
+                anchor_rooted,
             },
         ) else {
             continue;
@@ -837,6 +900,9 @@ fn reactivate(
             reason,
         });
         plan.reactivated += 1;
+        if anchor_rooted {
+            plan.anchor_roots_protected += 1;
+        }
         state.gc_reactivated_total += 1;
         // The heap push indexes the item at its slot in the same step.
         state.items.push(item);
@@ -857,10 +923,36 @@ fn reactivate(
     // is fast. Skip the whole pass when no store directory exists yet.
     if remaining > 0
         && store::store_ready(config)
-        && (!hot_entities.is_empty() || !marked.is_empty())
+        && (!hot_entities.is_empty() || !marked.is_empty() || !state.anchor_roots.is_empty())
     {
         let mut covered: HashSet<ContextItemId> = HashSet::new();
-        // Marked dependencies first: a Cold entry that a live root depends
+        // Anchor root claims first: a Cold entry a ResidentRequired /
+        // PromptRequired claim targets must be recalled — task authority
+        // says it belongs in the working set, regardless of hot entities.
+        if !state.anchor_roots.is_empty() {
+            for entry in state.external.iter() {
+                if remaining == 0 {
+                    break;
+                }
+                let claimed = state.anchor_roots.iter().any(|claim| {
+                    matches!(
+                        claim.strength,
+                        agent_contracts::AnchorRootStrength::ResidentRequired
+                            | agent_contracts::AnchorRootStrength::PromptRequired
+                    ) && crate::engine::anchor_claim_matches_entry(claim, entry)
+                });
+                if claimed
+                    && entry.semantic.is_live()
+                    && store::recallable(entry)
+                    && covered.insert(entry.item_id)
+                {
+                    plan.recall_candidates.push(entry.item_id);
+                    plan.anchor_roots_protected += 1;
+                    remaining -= 1;
+                }
+            }
+        }
+        // Marked dependencies next: a Cold entry that a live root depends
         // on is recalled even when no hot entity names it.
         for entry in state.external.iter() {
             if remaining == 0 {
@@ -880,9 +972,14 @@ fn reactivate(
                 if remaining == 0 {
                     break;
                 }
-                for id in state.external.ids_for_entity(hot) {
+                for id in state.catalog.ids_for_entity(hot) {
                     if remaining == 0 {
                         break;
+                    }
+                    if state.catalog.location(*id)
+                        != Some(crate::index::catalog::CatalogLocation::Stored)
+                    {
+                        continue;
                     }
                     if !covered.insert(*id) {
                         continue;
@@ -958,6 +1055,9 @@ struct ReactivationInput<'a> {
     /// The item was marked during the mark phase because a live root
     /// depends on it.
     live_root_dep: bool,
+    /// The item is targeted by a ResidentRequired/PromptRequired anchor
+    /// root claim — task authority says it must be resident.
+    anchor_rooted: bool,
 }
 
 /// Why an evicted item earns a second chance. `None` keeps it in the buffer.
@@ -974,6 +1074,13 @@ fn reactivation_reason(item: &ContextItem, input: &ReactivationInput) -> Option<
         return Some(
             "dependency of a marked root (reachable through dependency edges)".to_string(),
         );
+    }
+    // An anchor root claim is the same kind of authority: the active task's
+    // TaskAnchor says this item must stay resident, so a claim-targeted
+    // evicted item re-enters the heap (semantic death stays terminal — the
+    // caller filters dead items before this decision).
+    if input.anchor_rooted {
+        return Some("protected by an anchor root claim (task authority)".to_string());
     }
     if item.retention == ContextRetention::Pinned || item.scope == ContextScope::Pinned {
         return Some("explicitly pinned again".to_string());
@@ -1023,8 +1130,8 @@ mod tests {
     use crate::engine::SimpleContextEngine;
     use crate::index::entity::extract_entities;
     use agent_contracts::{
-        ContextEngine, ContextIngress, ContextItemId, ContextKind, ContextMaintenanceTrigger,
-        ContextRetention, TaskId, ToolOutput,
+        ContextEngine, ContextHints, ContextIngress, ContextItemId, ContextKind,
+        ContextMaintenanceTrigger, ContextQuery, ContextRetention, FocusState, TaskId, ToolOutput,
     };
     use serde_json::json;
 
@@ -1084,6 +1191,135 @@ mod tests {
         assert_eq!(
             after.total_items, 2,
             "the logical catalog keeps the user message in the heap and the consumed observation in the warm buffer"
+        );
+    }
+
+    async fn file_read_turn(engine: &SimpleContextEngine, path: &str, body: &str) {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: format!("refactor {path}"),
+            })
+            .await
+            .unwrap();
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                output: ToolOutput {
+                    call_id: "1".into(),
+                    tool_name: "fs.read".into(),
+                    ok: true,
+                    summary: "ok".into(),
+                    model_content: format!("{path}:\n{body}\n"),
+                    artifact_ref: None,
+                    metadata: json!({}),
+                },
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+        engine
+            .maintain(ContextMaintenanceTrigger::AfterModel)
+            .await
+            .unwrap();
+        engine.gc().await.unwrap();
+    }
+
+    fn snapshot_text(snapshot: &agent_contracts::MaterializedContext) -> String {
+        snapshot
+            .items
+            .iter()
+            .map(|item| item.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_latest_file_body_when_the_task_cycles_to_another_file() {
+        let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+        engine
+            .ingest(ContextIngress::FocusChanged {
+                focus: FocusState::for_task(TaskId::new(), "refactor auth to async"),
+            })
+            .await
+            .unwrap();
+
+        file_read_turn(&engine, "src/auth/login.rs", "fn handle_21()").await;
+        file_read_turn(&engine, "src/auth/session.rs", "fn handle_22()").await;
+
+        let snapshot = engine
+            .materialize(ContextQuery {
+                current_input: "continue session.rs".into(),
+                budget_tokens: 8_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        let rendered = snapshot_text(&snapshot);
+        assert!(
+            rendered.contains("fn handle_21()"),
+            "the previous file's latest body must stay in the working set, got {rendered}"
+        );
+        assert!(
+            rendered.contains("fn handle_22()"),
+            "the current file body must stay, got {rendered}"
+        );
+
+        // 同一路径的更新读覆盖旧正文：handle_21 离开，handle_24 留下。
+        file_read_turn(&engine, "src/auth/login.rs", "fn handle_24()").await;
+        let snapshot = engine
+            .materialize(ContextQuery {
+                current_input: "continue login.rs".into(),
+                budget_tokens: 8_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        let rendered = snapshot_text(&snapshot);
+        assert!(
+            !rendered.contains("fn handle_21()"),
+            "a superseded file body must leave the working set, got {rendered}"
+        );
+        assert!(
+            rendered.contains("fn handle_24()"),
+            "the newer file body must stay, got {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_drops_file_bodies_when_focus_moves_to_another_task() {
+        let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+        let first = TaskId::new();
+        engine
+            .ingest(ContextIngress::FocusChanged {
+                focus: FocusState::for_task(first, "fix pagination"),
+            })
+            .await
+            .unwrap();
+        file_read_turn(&engine, "src/api/items.rs", "fn list()").await;
+
+        engine
+            .ingest(ContextIngress::FocusChanged {
+                focus: FocusState::for_task(TaskId::new(), "add csv export"),
+            })
+            .await
+            .unwrap();
+        file_read_turn(&engine, "src/api/export.rs", "fn export()").await;
+
+        let snapshot = engine
+            .materialize(ContextQuery {
+                current_input: "continue export.rs".into(),
+                budget_tokens: 8_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        let rendered = snapshot_text(&snapshot);
+        assert!(
+            !rendered.contains("fn list()"),
+            "a previous task's file body must not contaminate the new task, got {rendered}"
+        );
+        assert!(
+            rendered.contains("fn export()"),
+            "the active task's file body must stay, got {rendered}"
         );
     }
 

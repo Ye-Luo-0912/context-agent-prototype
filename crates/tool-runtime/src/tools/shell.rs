@@ -1,14 +1,14 @@
 //! `shell.exec` — shell-string process execution with streaming, bounded
 //! output.
 //!
-//! The process's stdout/stderr are read line-by-line into a bounded ring
-//! buffer (for the model-facing tail) and appended incrementally to an
-//! artifact file (so arbitrarily large logs never live in memory or in the
-//! prompt). The command is killed on timeout or on request cancellation.
+//! The process's stdout/stderr are read as bounded byte fragments into a
+//! bounded ring buffer (for the model-facing tail). A bounded raw prefix is
+//! captured as an artifact; overflow is still drained but is not stored. The
+//! command is killed on timeout or on request cancellation.
 //! `process.run` is the structured argv alternative; the raw shell string
 //! stays as the controlled escape hatch (TOOLS-06).
 
-use std::{collections::VecDeque, process::Stdio};
+use std::process::Stdio;
 
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
@@ -18,15 +18,12 @@ use agent_workspace::Workspace;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
-    process::Command,
-    sync::mpsc,
-    time::Duration,
-};
+use tokio::{io::BufWriter, process::Command, sync::mpsc, time::Duration};
 
 use super::Tool;
-use super::stream::{BUFFER_LINES, MODEL_OUTPUT_CHARS, StreamLine, record_line, tail_chars};
+use super::stream::{
+    MAX_ARTIFACT_BYTES, StreamCapture, StreamChunk, spawn_stderr_reader, spawn_stdout_reader,
+};
 
 const MAX_TIMEOUT_MS: u64 = 120_000;
 
@@ -56,7 +53,7 @@ impl Tool for ShellExecTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "shell.exec".into(),
-            description: "Execute a shell command with the workspace as cwd. Output streams to an artifact; only a bounded tail reaches the model.".into(),
+            description: "Execute a shell command with the workspace as cwd. A bounded output prefix streams to an artifact; only a bounded tail reaches the model.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["command"],
@@ -75,6 +72,7 @@ impl Tool for ShellExecTool {
         run_id: RunId,
         call_id: &str,
         arguments: Value,
+        effect_context: Option<agent_contracts::OperationEffectContext>,
         cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let args: ShellArgs = serde_json::from_value(arguments)
@@ -110,43 +108,33 @@ impl Tool for ShellExecTool {
         let mut child = command
             .spawn()
             .map_err(|e| AgentError::Tool(format!("spawn command: {e}")))?;
+        let pid = match super::persist_spawned_process(&self.workspace, &effect_context, &child) {
+            Ok(pid) => pid,
+            Err(error) => {
+                super::abandon_spawned_process(&mut child);
+                let _ = child.kill().await;
+                return Err(error);
+            }
+        };
 
-        let (artifact_ref, artifact_file) = self
-            .workspace
-            .create_artifact(run_id, "shell", "log")
-            .await?;
-        let mut artifact = BufWriter::new(artifact_file);
+        let mut artifact = BufWriter::new(
+            self.workspace
+                .create_artifact(run_id, "shell", "log")
+                .await?,
+        );
 
-        // Two reader tasks push (bounded) lines into one channel; the main
-        // loop selects on lines, cancellation, and the timeout.
-        let (line_tx, mut line_rx) = mpsc::channel::<StreamLine>(512);
+        // Two fixed-buffer readers push bounded line fragments into one
+        // bounded channel; a missing newline can never grow an allocation.
+        let (line_tx, mut line_rx) = mpsc::channel::<StreamChunk>(512);
         if let Some(stdout) = child.stdout.take() {
-            let tx = line_tx.clone();
-            let mut lines = BufReader::new(stdout).lines();
-            tokio::spawn(async move {
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx.send(StreamLine::Stdout(line)).await.is_err() {
-                        break;
-                    }
-                }
-            });
+            spawn_stdout_reader(stdout, line_tx.clone());
         }
         if let Some(stderr) = child.stderr.take() {
-            let tx = line_tx.clone();
-            let mut lines = BufReader::new(stderr).lines();
-            tokio::spawn(async move {
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx.send(StreamLine::Stderr(line)).await.is_err() {
-                        break;
-                    }
-                }
-            });
+            spawn_stderr_reader(stderr, line_tx.clone());
         }
         drop(line_tx);
 
-        let mut tail: VecDeque<String> = VecDeque::with_capacity(BUFFER_LINES + 1);
-        let mut total_lines = 0usize;
-        let mut total_chars = 0usize;
+        let mut capture = StreamCapture::new();
 
         let deadline = tokio::time::sleep(Duration::from_millis(timeout_ms));
         tokio::pin!(deadline);
@@ -183,11 +171,8 @@ impl Tool for ShellExecTool {
                 _ = &mut grace, if grace_started => break,
                 line = line_rx.recv() => {
                     match line {
-                        Some(StreamLine::Stdout(line)) => {
-                            record_line(&line, &mut tail, &mut artifact, &mut total_lines, &mut total_chars).await?;
-                        }
-                        Some(StreamLine::Stderr(line)) => {
-                            record_line(&line, &mut tail, &mut artifact, &mut total_lines, &mut total_chars).await?;
+                        Some(line) => {
+                            capture.record(line, &mut artifact).await?;
                         }
                         None => {
                             // All output drained; the process may still be
@@ -209,20 +194,18 @@ impl Tool for ShellExecTool {
                     .map_err(|e| AgentError::Tool(format!("wait: {e}")))?,
             );
         }
-        artifact
-            .flush()
-            .await
-            .map_err(|e| AgentError::Io(format!("flush artifact: {e}")))?;
+        super::persist_process_exit(
+            &self.workspace,
+            pid,
+            exited.as_ref().and_then(|status| status.code()),
+        )?;
+        let artifact_ref = self.workspace.seal_buffered_artifact(artifact).await?;
 
-        let omitted = total_lines.saturating_sub(tail.len());
-        let mut model_content = tail.iter().cloned().collect::<Vec<_>>().join("\n");
-        if model_content.chars().count() > MODEL_OUTPUT_CHARS {
-            model_content = tail_chars(&model_content, MODEL_OUTPUT_CHARS);
-        }
-        if omitted > 0 {
-            model_content =
-                format!("[{total_lines} lines total; {omitted} omitted]\n{model_content}");
-        }
+        let model_content = capture.model_tail();
+        let total_lines = capture.total_lines();
+        let total_bytes = capture.total_bytes();
+        let artifact_bytes = capture.artifact_bytes();
+        let artifact_truncated = capture.artifact_truncated();
 
         let exit_code = exited.as_ref().and_then(|status| status.code());
         let ok = outcome == "completed" && exited.as_ref().is_some_and(|s| s.success());
@@ -233,21 +216,38 @@ impl Tool for ShellExecTool {
                 outcome.into()
             }
         });
+        let artifact_note = if artifact_truncated {
+            format!(
+                "Artifact capture truncated at {MAX_ARTIFACT_BYTES} bytes; remaining output was drained but not stored. Captured prefix: {artifact_ref}"
+            )
+        } else {
+            format!("Full output: {artifact_ref}")
+        };
+        let truncation_summary = if artifact_truncated {
+            ", artifact truncated"
+        } else {
+            ""
+        };
 
         Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
             tool_name: "shell.exec".into(),
             ok,
             summary: format!(
-                "command {outcome} (exit={exit_text}, {total_lines} lines, ~{} KB in artifact)",
-                total_chars / 1024
+                "command {outcome} (exit={exit_text}, {total_lines} lines, ~{} KB output, ~{} KB captured{truncation_summary})",
+                total_bytes / 1024,
+                artifact_bytes / 1024,
             ),
-            model_content: format!("{model_content}\n\nFull output: {artifact_ref}"),
+            model_content: format!("{model_content}\n\n{artifact_note}"),
             artifact_ref: Some(artifact_ref),
             metadata: json!({
                 "exit_code": exit_code,
                 "timeout_ms": timeout_ms,
                 "lines": total_lines,
+                "output_bytes": total_bytes,
+                "artifact_bytes": artifact_bytes,
+                "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
+                "artifact_truncated": artifact_truncated,
                 "outcome": outcome,
             }),
         }))
@@ -259,6 +259,8 @@ mod tests {
     use super::*;
     use agent_contracts::ToolExecutionRequest;
     use serde_json::json;
+
+    use crate::tools::stream::MODEL_OUTPUT_CHARS;
 
     /// Unwrap a plain tool value (shell.exec never stages an effect).
     fn value(outcome: ToolOutcome) -> ToolOutput {
@@ -295,10 +297,11 @@ mod tests {
                 name: "shell.exec".into(),
                 arguments: json!({"command": long_command(), "timeout_ms": 20000}),
             },
+            effect_context: None,
             cancel: CancellationToken::new(),
         };
         let output = tool
-            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .execute(run_id, "c", request.call.arguments, None, request.cancel)
             .await
             .unwrap();
         let output = value(output);
@@ -341,6 +344,7 @@ mod tests {
                     RunId::new(),
                     "c",
                     json!({"command": command, "timeout_ms": 60000}),
+                    None,
                     cancel_for_task,
                 )
                 .await
@@ -406,6 +410,7 @@ mod tests {
                 RunId::new(),
                 "c",
                 json!({"command": command, "timeout_ms": 60000}),
+                None,
                 cancel_for_task,
             )
             .await

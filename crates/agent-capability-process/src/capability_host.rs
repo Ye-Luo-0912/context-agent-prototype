@@ -13,10 +13,13 @@ use std::time::Duration;
 
 use agent_contracts::{
     AgentError, AgentResult, Capability, CapabilityInvocationContext, CapabilityManifest,
-    CapabilityOutcome, CapabilityTransport, ProcessInvokeResponse, ToolCall, ToolOutput, ToolRisk,
-    WORKSPACE_READ, WORKSPACE_WRITE, WireEffect, WorkspaceHandle, validate_capability_id,
+    CapabilityOutcome, CapabilityTransport, ProcessInvokeResponse, ToolCall, ToolRisk,
+    WORKSPACE_READ, WORKSPACE_WRITE, WorkspaceHandle, validate_capability_id,
 };
-use agent_process::{ProcessHost, ProcessHostConfig, ProcessSandbox, SystemBroker};
+use agent_platform_protocol::FEATURE_LEGACY_INVOKE_OUTPUT;
+use agent_process::{
+    MAX_SYSTEM_REQUESTS_PER_CALL, ProcessHost, ProcessHostConfig, ProcessSandbox, SystemBroker,
+};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -32,6 +35,13 @@ pub struct ProcessCapabilityAdapter {
     /// usable before then.
     host: Mutex<Option<ProcessHost>>,
 }
+
+/// How many raw bytes one brokered `fs.read` answer may carry. The control
+/// plane is not a file transport: larger files come back as a bounded
+/// prefix with a truncation marker, and the host's system-answer cap
+/// (`ProcessHostConfig::max_system_answer_bytes`) re-checks the encoded
+/// answer at the frame boundary.
+pub const BROKER_FS_READ_MAX_BYTES: usize = 256 * 1024;
 
 impl ProcessCapabilityAdapter {
     /// Build the adapter from a manifest declaring `CapabilityTransport::Process`.
@@ -61,6 +71,13 @@ impl ProcessCapabilityAdapter {
             }
         };
         let private_dir = private_capability_dir(&manifest.id);
+        // The mid-invoke system broker is this capability's sanctioned I/O
+        // path, so the per-call byte budget must cover the worst legitimate
+        // exchange: one request + one response plus every brokered
+        // round trip. The broker's own answers are bounded (see
+        // `InvokeFsBroker`), so this cumulative cap is the backstop that
+        // makes a flood cost real work.
+        let max_system_answer_bytes = 512 * 1024;
         let config = ProcessHostConfig {
             program,
             args: Vec::new(),
@@ -68,6 +85,11 @@ impl ProcessCapabilityAdapter {
             startup_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
             max_frame_bytes: 16 * 1024 * 1024,
+            max_call_bytes: (16usize * 1024 * 1024).saturating_mul(2).saturating_add(
+                MAX_SYSTEM_REQUESTS_PER_CALL.saturating_mul(max_system_answer_bytes),
+            ),
+            max_system_answer_bytes,
+            offered_features: Default::default(),
             sandbox: ProcessSandbox {
                 // No parent secrets: only the non-secret platform essentials
                 // are inherited; anything else must be granted explicitly
@@ -159,14 +181,13 @@ impl Capability for ProcessCapabilityAdapter {
             ))
         })?;
         // The process receives the call plus the granted permissions so it
-        // knows what it may do. The response is either a plain `ToolOutput`
-        // (no side effects — the historical shape) or a
-        // `ProcessInvokeResponse` carrying structured wire effects the child
-        // asks the runtime to commit: the child never mutates anything
-        // itself, it declares intent. The adapter validates every effect
-        // against the granted permissions and stages it through the
-        // confined workspace handle, so a process mutation crosses the same
-        // generation-fence effect commit as a builtin tool's `PreparedEffect`.
+        // knows what it may do. The current `{output, effects}` envelope is
+        // always accepted. Plain `ToolOutput` requires a ping-negotiated
+        // `legacy.invoke-output.v1` feature. A non-empty wire-effect
+        // list is quarantined below: the current wire shape carries only a
+        // broad permission word, not a host-derived/canonical actual intent
+        // that Core can prove is inside the invocation lease. Staging such
+        // an effect would let a child widen a narrow path authorization.
         // Mid-invoke, the child may also send *system requests* (a brokered
         // filesystem read): the broker answers them from the confined
         // workspace handle, so the child's filesystem access is brokered
@@ -176,6 +197,12 @@ impl Capability for ProcessCapabilityAdapter {
             grant: &ctx.granted_permissions,
             workspace: ctx.workspace.as_ref(),
         };
+        // The request is the trusted source of invocation identity. A
+        // capability child may report content and status, but it must not
+        // relabel the result as another call or tool at this boundary.
+        let request_call_id = call.id.clone();
+        let request_tool_name = call.name.clone();
+        let allow_legacy = host.allows_feature(FEATURE_LEGACY_INVOKE_OUTPUT);
         let value = host
             .call_with_cancel_and_broker(
                 json!({
@@ -187,69 +214,51 @@ impl Capability for ProcessCapabilityAdapter {
                 &broker,
             )
             .await?;
-        match serde_json::from_value::<ProcessInvokeResponse>(value.clone()) {
-            Ok(response) if !response.effects.is_empty() => {
-                let effects = self.stage_wire_effects(&response.effects, &ctx).await?;
-                Ok(CapabilityOutcome::EffectRequest {
-                    output: response.output,
-                    effect: Box::new(effects),
-                })
-            }
-            _ => {
-                // No wire effects: either the child answered with the
-                // historical plain `ToolOutput` shape, or it declared an
-                // empty effect list. Either way the output passes through.
-                let output: ToolOutput = serde_json::from_value(value)
-                    .map_err(|e| AgentError::Context(format!("decode capability output: {e}")))?;
-                Ok(CapabilityOutcome::Value(output))
-            }
+        let response = decode_process_invoke_response(
+            value,
+            request_call_id,
+            request_tool_name,
+            allow_legacy,
+        )?;
+        if response.effects.is_empty() {
+            return Ok(CapabilityOutcome::Value(response.output));
         }
+        Err(AgentError::InvalidRequest(format!(
+            "capability '{}' returned {} wire effect(s), but process wire effects are disabled until the host can prove canonical actual intent is within the invocation lease; no workspace mutation was staged",
+            self.manifest.id,
+            response.effects.len()
+        )))
     }
 }
 
-impl ProcessCapabilityAdapter {
-    /// Validate every wire effect against the granted permissions and stage
-    /// it through the confined workspace handle. The child declared intent;
-    /// the runtime's handle does the actual path resolution and staging, so
-    /// an undeclared or over-granted effect is refused before anything can
-    /// land.
-    async fn stage_wire_effects(
-        &self,
-        effects: &[WireEffect],
-        ctx: &CapabilityInvocationContext,
-    ) -> AgentResult<Vec<Box<dyn agent_contracts::Effect>>> {
-        let mut staged: Vec<Box<dyn agent_contracts::Effect>> = Vec::new();
-        for effect in effects {
-            match effect {
-                WireEffect::WorkspaceWrite { path, content_b64 } => {
-                    if !ctx.granted_permissions.iter().any(|p| p == WORKSPACE_WRITE) {
-                        return Err(AgentError::InvalidRequest(format!(
-                            "capability '{}' declared a workspace write effect without '{WORKSPACE_WRITE}' permission",
-                            self.manifest.id
-                        )));
-                    }
-                    let workspace = ctx.workspace.as_ref().ok_or_else(|| {
-                        AgentError::InvalidRequest(format!(
-                            "capability '{}' has no workspace handle: '{WORKSPACE_WRITE}' was not granted",
-                            self.manifest.id
-                        ))
-                    })?;
-                    let content = base64::Engine::decode(
-                        &base64::engine::general_purpose::STANDARD,
-                        content_b64,
-                    )
-                    .map_err(|e| {
-                        AgentError::Context(format!(
-                            "capability '{}' sent an invalid base64 write payload: {e}",
-                            self.manifest.id
-                        ))
-                    })?;
-                    staged.push(workspace.prepare_write(path, &content).await?);
-                }
-            }
+/// Decode the current `{output, effects}` envelope. The historical plain
+/// `ToolOutput` shape is accepted only when `legacy.invoke-output.v1` was
+/// crossed at ping; otherwise a child cannot silently reopen the old shape.
+fn decode_process_invoke_response(
+    value: Value,
+    request_call_id: String,
+    request_tool_name: String,
+    allow_legacy: bool,
+) -> AgentResult<ProcessInvokeResponse> {
+    let is_current_envelope = value.get("output").is_some();
+    let mut response = if is_current_envelope {
+        serde_json::from_value(value)
+            .map_err(|e| AgentError::Context(format!("decode capability output: {e}")))?
+    } else if allow_legacy {
+        ProcessInvokeResponse {
+            output: serde_json::from_value(value)
+                .map_err(|e| AgentError::Context(format!("decode capability output: {e}")))?,
+            effects: Vec::new(),
         }
-        Ok(staged)
-    }
+    } else {
+        return Err(AgentError::InvalidRequest(
+            "plain ToolOutput is disabled unless legacy.invoke-output.v1 was negotiated at ping"
+                .into(),
+        ));
+    };
+    response.output.call_id = request_call_id;
+    response.output.tool_name = request_tool_name;
+    Ok(response)
 }
 
 /// A broker for the child's mid-invoke system requests. Slice 1 brokers
@@ -354,12 +363,20 @@ impl InvokeFsBroker<'_> {
                 self.id
             ))
         })?;
-        let content = workspace.read(path).await?;
+        let content = workspace
+            .read_bounded(path, BROKER_FS_READ_MAX_BYTES)
+            .await?;
+        // The control plane is not a file transport: a large file is
+        // served as a bounded prefix with a truncation marker, never copied
+        // base64-whole through the JSON pipe. The host caps the encoded
+        // answer again; this bound keeps the broker's own work bounded too.
         Ok(json!({
             "content_b64": base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
-                &content,
+                &content.content,
             ),
+            "byte_len": content.byte_len,
+            "truncated": content.truncated,
         }))
     }
 }
@@ -382,6 +399,68 @@ fn private_capability_dir(id: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn output_value(call_id: &str, tool_name: &str) -> Value {
+        serde_json::to_value(agent_contracts::ToolOutput {
+            call_id: call_id.into(),
+            tool_name: tool_name.into(),
+            ok: true,
+            summary: "done".into(),
+            model_content: "bounded result".into(),
+            artifact_ref: None,
+            metadata: json!({}),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn structured_response_with_empty_effects_decodes_and_uses_request_identity() {
+        let response = decode_process_invoke_response(
+            json!({
+                "output": output_value("forged-call", "forged.tool"),
+                "effects": [],
+            }),
+            "requested-call".into(),
+            "process-demo.invoke".into(),
+            false,
+        )
+        .unwrap();
+
+        assert!(response.effects.is_empty());
+        assert_eq!(response.output.call_id, "requested-call");
+        assert_eq!(response.output.tool_name, "process-demo.invoke");
+        assert_eq!(response.output.model_content, "bounded result");
+    }
+
+    #[test]
+    fn legacy_plain_output_is_rejected_unless_negotiated() {
+        let error = decode_process_invoke_response(
+            output_value("forged-call", "forged.tool"),
+            "requested-call".into(),
+            "process-demo.invoke".into(),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("legacy.invoke-output.v1"),
+            "plain ToolOutput must stay closed without negotiation: {error}"
+        );
+    }
+
+    #[test]
+    fn legacy_plain_output_uses_request_identity_when_negotiated() {
+        let response = decode_process_invoke_response(
+            output_value("forged-call", "forged.tool"),
+            "requested-call".into(),
+            "process-demo.invoke".into(),
+            true,
+        )
+        .unwrap();
+
+        assert!(response.effects.is_empty());
+        assert_eq!(response.output.call_id, "requested-call");
+        assert_eq!(response.output.tool_name, "process-demo.invoke");
+    }
 
     #[test]
     fn private_capability_dirs_are_unpredictable_and_path_safe() {

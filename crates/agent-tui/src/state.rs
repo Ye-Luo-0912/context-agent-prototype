@@ -1,7 +1,7 @@
 use agent_contracts::{
     ContextDiagnostics, ContextSelection, ContextStateTransition, OperationId, RunId, RuntimeEvent,
-    RuntimeEventEnvelope, ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfacePlanReport,
-    ToolSurfacePlanStatus, TurnId,
+    RuntimeEventEnvelope, RuntimeInputId, ToolSurfaceBlockReason, ToolSurfaceDemand,
+    ToolSurfacePlanReport, ToolSurfacePlanStatus, TurnId,
 };
 use agent_core::ApprovalRequest;
 
@@ -174,6 +174,8 @@ pub struct AppState {
     /// superseded turn and is dropped — the fence against a cancelled
     /// turn's late text leaking into the next turn's transcript.
     current_op: Option<(TurnId, OperationId, u64)>,
+    /// Queued 然后 Applied 共用 input_id，避免用户气泡重复。
+    last_shown_input_id: Option<RuntimeInputId>,
 }
 
 impl AppState {
@@ -198,6 +200,7 @@ impl AppState {
             input_tokens: 0,
             output_tokens: 0,
             current_op: None,
+            last_shown_input_id: None,
         }
     }
 
@@ -246,14 +249,32 @@ impl AppState {
     pub fn apply_runtime_event(&mut self, envelope: RuntimeEventEnvelope) {
         match envelope.event {
             RuntimeEvent::RunStarted => self.status = "ready".into(),
-            RuntimeEvent::UserMessageAccepted { content } => {
-                self.busy = true;
-                self.status = "working".into();
-                self.scroll = 0;
-                self.messages.push(UiMessage {
-                    role: UiRole::User,
-                    content,
-                });
+            RuntimeEvent::UserMessageAccepted { input } => {
+                if input.appears_in_user_transcript() {
+                    let already_shown = input
+                        .input_id
+                        .is_some_and(|id| self.last_shown_input_id == Some(id));
+                    if !already_shown {
+                        if let Some(id) = input.input_id {
+                            self.last_shown_input_id = Some(id);
+                        }
+                        self.messages.push(UiMessage {
+                            role: UiRole::User,
+                            content: input.preview.clone(),
+                        });
+                    }
+                    if input.is_applied() {
+                        self.busy = true;
+                        self.status = "working".into();
+                        self.scroll = 0;
+                    } else {
+                        self.status = "queued".into();
+                    }
+                } else if input.lifecycle == agent_contracts::InputLifecycle::Rejected {
+                    self.push_system(format!("input rejected: {}", input.preview));
+                } else if input.lifecycle == agent_contracts::InputLifecycle::InterruptCommitted {
+                    self.push_system(format!("turn interrupted: {}", input.preview));
+                }
             }
             RuntimeEvent::FocusChanged { task_id, goal } => {
                 self.push_system(format!("focus -> task {task_id}: {goal}"));
@@ -429,6 +450,12 @@ impl AppState {
                     }),
                 }
             }
+            RuntimeEvent::OperationAccepted { .. } => {
+                // This is an authority/discovery event for authorized
+                // Platform observers. It deliberately does not mean the tool
+                // body has started, so the UI waits for `ToolStarted` before
+                // changing user-visible execution state.
+            }
             RuntimeEvent::ToolStarted { call } => {
                 self.busy = true;
                 self.tool_status = format!("running {}", call.name);
@@ -491,6 +518,14 @@ impl AppState {
                 self.streaming = false;
                 self.status = "idle".into();
                 self.tool_status = "none".into();
+            }
+            RuntimeEvent::TurnCancelled { reason, .. } => {
+                self.current_op = None;
+                self.busy = false;
+                self.streaming = false;
+                self.status = "cancelled".into();
+                self.tool_status = "none".into();
+                self.push_system(format!("turn cancelled ({reason:?})"));
             }
             RuntimeEvent::TurnCommitFailed { phase, message } => {
                 // The model answered, but the runtime did not durably commit
@@ -663,6 +698,34 @@ mod tests {
     }
 
     #[test]
+    fn turn_cancelled_clears_live_operation_without_claiming_completion() {
+        let mut app = AppState::new(RunId::new());
+        let turn = TurnId::new();
+        let operation = OperationId::new();
+        app.apply_runtime_event(envelope(RuntimeEvent::ModelStarted {
+            turn_id: turn,
+            operation_id: operation,
+            generation: 4,
+            surface_revision: 1,
+            model_round: 1,
+        }));
+
+        app.apply_runtime_event(envelope(RuntimeEvent::TurnCancelled {
+            turn_id: turn,
+            task_id: None,
+            operation_id: Some(operation),
+            cancelled_generation: 4,
+            effective_generation: 5,
+            reason: agent_contracts::TurnCancellationReason::Requested,
+        }));
+
+        assert!(!app.busy);
+        assert!(!app.streaming);
+        assert_eq!(app.status, "cancelled");
+        assert!(app.current_op.is_none());
+    }
+
+    #[test]
     fn tool_surface_event_is_rendered_with_defensive_bounds() {
         let mut app = AppState::new(RunId::new());
         let long_name = "very-long-tool-name-".repeat(20);
@@ -761,5 +824,49 @@ mod tests {
                 .iter()
                 .all(|message| !message.content.contains("LATE"))
         );
+    }
+
+    #[test]
+    fn rejected_user_input_is_system_notice_not_a_turn() {
+        let mut app = AppState::new(RunId::new());
+        let input = agent_contracts::RuntimeInputEnvelope::from_preview("second")
+            .with_lifecycle(agent_contracts::InputLifecycle::Rejected);
+        app.apply_runtime_event(envelope(RuntimeEvent::UserMessageAccepted { input }));
+        assert!(!app.busy);
+        let last = app.messages.last().expect("rejected notice");
+        assert_eq!(last.role, UiRole::System);
+        assert!(last.content.contains("rejected"));
+        assert!(last.content.contains("second"));
+        assert!(
+            app.messages
+                .iter()
+                .all(|message| message.role != UiRole::User),
+            "rejected input must not appear as a user turn"
+        );
+    }
+
+    #[test]
+    fn queued_then_applied_same_id_is_a_single_user_bubble() {
+        let mut app = AppState::new(RunId::new());
+        let id = RuntimeInputId::new();
+        let mut queued = agent_contracts::RuntimeInputEnvelope::from_preview("later");
+        queued.input_id = Some(id);
+        queued.lifecycle = agent_contracts::InputLifecycle::Queued;
+        app.apply_runtime_event(envelope(RuntimeEvent::UserMessageAccepted {
+            input: queued.clone(),
+        }));
+        let mut applied = queued;
+        applied.lifecycle = agent_contracts::InputLifecycle::Applied;
+        app.apply_runtime_event(envelope(RuntimeEvent::UserMessageAccepted {
+            input: applied,
+        }));
+        let user_bubbles: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|message| message.role == UiRole::User)
+            .collect();
+        assert_eq!(user_bubbles.len(), 1);
+        assert_eq!(user_bubbles[0].content, "later");
+        assert!(app.busy);
     }
 }

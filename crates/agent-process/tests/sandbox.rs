@@ -40,6 +40,9 @@ async fn connect_with(sandbox: ProcessSandbox) -> ProcessHost {
         startup_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(5),
         max_frame_bytes: 1024 * 1024,
+        max_call_bytes: 4 * 1024 * 1024,
+        max_system_answer_bytes: 512 * 1024,
+        offered_features: Default::default(),
         sandbox,
     })
     .await
@@ -121,6 +124,9 @@ async fn explicit_env_grants_land_after_the_whitelist() {
         startup_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(5),
         max_frame_bytes: 1024 * 1024,
+        max_call_bytes: 4 * 1024 * 1024,
+        max_system_answer_bytes: 512 * 1024,
+        offered_features: Default::default(),
         sandbox: ProcessSandbox {
             env_whitelist: Some(vec!["PATH".into()]),
             ..ProcessSandbox::default()

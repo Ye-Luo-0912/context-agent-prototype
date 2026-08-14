@@ -16,7 +16,7 @@ use agent_contracts::{
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::Workspace;
+use crate::{MAX_ARTIFACT_REFERENCE_BYTES, Workspace};
 
 /// Keep the head and tail of an over-limit string and insert a visible
 /// marker that names the field, the original size and (when present) the
@@ -78,6 +78,20 @@ impl WorkspaceOutputBroker {
     pub fn new(workspace: Arc<Workspace>) -> Self {
         Self { workspace }
     }
+
+    async fn normalized_reference_for_run(&self, run_id: RunId, reference: &str) -> Option<String> {
+        if reference.len() > MAX_ARTIFACT_REFERENCE_BYTES {
+            return None;
+        }
+        let Ok((normalized, _file)) = self
+            .workspace
+            .open_artifact_for_run(reference, run_id)
+            .await
+        else {
+            return None;
+        };
+        Some(normalized)
+    }
 }
 
 #[async_trait]
@@ -100,45 +114,33 @@ impl OutputBroker for WorkspaceOutputBroker {
             truncate_with_marker(&output.summary, MAX_TOOL_SUMMARY_CHARS, "summary", None);
         output.metadata = bound_metadata(std::mem::take(&mut output.metadata));
 
-        // 2. Oversized content spills to an artifact once. A producer that
-        //    already returned a reference keeps it; a producer that did not
-        //    spill no longer loses the truncated middle — the full content
-        //    is stored and the preview points at it.
+        // 2. A producer-supplied locator is untrusted. For content that stays
+        //    inline, keep only a normalized, current-run, pinned-readable
+        //    regular file. A locator alone cannot prove that it contains the
+        //    exact bytes this broker is about to truncate, so every truncation
+        //    below receives a fresh broker-owned spill and replaces it.
         let char_count = output.model_content.chars().count();
+        let mut broker_spilled = false;
         if char_count > content_cap {
-            if output.artifact_ref.is_none() {
-                match self
-                    .workspace
-                    .write_artifact(
-                        run_id,
-                        "tool-output",
-                        "txt",
-                        output.model_content.as_bytes(),
-                    )
-                    .await
-                {
-                    Ok(reference) => output.artifact_ref = Some(reference),
-                    Err(error) => {
-                        output.artifact_ref = None;
-                        output.model_content = format!(
-                            "{}\n...[output broker could not spill oversized tool output to an artifact: {error}]...\n",
-                            truncate_with_marker(
-                                &output.model_content,
-                                content_cap,
-                                "model_content",
-                                None
-                            )
-                        );
-                        return output;
-                    }
-                }
-            }
+            output.artifact_ref = self
+                .workspace
+                .write_artifact(
+                    run_id,
+                    "tool-output",
+                    "txt",
+                    output.model_content.as_bytes(),
+                )
+                .await
+                .ok();
+            broker_spilled = output.artifact_ref.is_some();
             output.model_content = truncate_with_marker(
                 &output.model_content,
                 content_cap,
                 "model_content",
                 output.artifact_ref.as_deref(),
             );
+        } else if let Some(reference) = output.artifact_ref.take() {
+            output.artifact_ref = self.normalized_reference_for_run(run_id, &reference).await;
         }
 
         // 3. Decoded-total cap: even when each field individually fits, the
@@ -150,6 +152,21 @@ impl OutputBroker for WorkspaceOutputBroker {
         let total_chars =
             output.summary.chars().count() + output.model_content.chars().count() + metadata_chars;
         if total_chars > MAX_TOOL_OUTPUT_TOTAL_CHARS {
+            // This path truncates content even though its per-field cap fit.
+            // Store the still-complete field under a fresh trusted reference;
+            // an arbitrary producer reference is not evidence of these bytes.
+            if !broker_spilled {
+                output.artifact_ref = self
+                    .workspace
+                    .write_artifact(
+                        run_id,
+                        "tool-output",
+                        "txt",
+                        output.model_content.as_bytes(),
+                    )
+                    .await
+                    .ok();
+            }
             let content_allowance = MAX_TOOL_OUTPUT_TOTAL_CHARS
                 .saturating_sub(output.summary.chars().count() + metadata_chars);
             output.model_content = truncate_with_marker(
@@ -195,17 +212,16 @@ mod tests {
         }
     }
 
-    /// Read back the spilled artifact bytes for a run: the broker writes
-    /// `tool-output-*.txt` under the run's artifact directory.
+    /// 读回 broker 溢出的字节：现在落在 `<run>/tool-output/<digest>`。
     async fn read_spilled(workspace: &Workspace, run_id: RunId) -> Vec<u8> {
         let dir = workspace
             .state_dir()
             .join("artifacts")
-            .join(run_id.to_string());
-        let mut entries = tokio::fs::read_dir(&dir).await.expect("artifact dir");
+            .join(run_id.to_string())
+            .join("tool-output");
+        let mut entries = tokio::fs::read_dir(&dir).await.expect("artifact owner dir");
         while let Some(entry) = entries.next_entry().await.expect("entry") {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("tool-output-") {
+            if entry.file_type().await.expect("type").is_file() {
                 return tokio::fs::read(entry.path()).await.expect("artifact bytes");
             }
         }
@@ -260,24 +276,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_reference_is_preserved_not_overwritten() {
+    async fn readable_regular_reference_is_preserved_while_content_stays_inline() {
         let (workspace, _dir) = workspace().await;
-        let broker = WorkspaceOutputBroker::new(workspace);
-        let content = "x".repeat(MAX_TOOL_MODEL_CONTENT_CHARS + 1);
+        let broker = WorkspaceOutputBroker::new(workspace.clone());
+        let run_id = RunId::new();
+        let reference = workspace
+            .write_artifact(run_id, "producer", "txt", b"producer body")
+            .await
+            .unwrap();
+        let content = "small inline result".to_string();
         let bounded = broker
             .bound(
-                RunId::new(),
+                run_id,
                 None,
                 output(
-                    content,
+                    content.clone(),
                     "done".into(),
                     Value::Null,
-                    Some("artifact://producer".into()),
+                    Some(reference.clone()),
                 ),
             )
             .await;
-        assert_eq!(bounded.artifact_ref.as_deref(), Some("artifact://producer"));
-        assert!(bounded.model_content.contains("artifact://producer"));
+        assert_eq!(bounded.artifact_ref.as_deref(), Some(reference.as_str()));
+        assert_eq!(bounded.model_content, content);
+    }
+
+    #[tokio::test]
+    async fn oversized_content_always_replaces_a_producer_reference() {
+        let (workspace, _dir) = workspace().await;
+        let broker = WorkspaceOutputBroker::new(workspace.clone());
+        let run_id = RunId::new();
+        let producer_reference = workspace
+            .write_artifact(run_id, "producer", "txt", b"unrelated producer body")
+            .await
+            .unwrap();
+        let content = "x".repeat(MAX_TOOL_MODEL_CONTENT_CHARS + 1);
+        let bounded = broker
+            .bound(
+                run_id,
+                None,
+                output(
+                    content.clone(),
+                    "done".into(),
+                    Value::Null,
+                    Some(producer_reference.clone()),
+                ),
+            )
+            .await;
+
+        let trusted = bounded.artifact_ref.expect("broker spill reference");
+        assert_ne!(trusted, producer_reference);
+        assert!(bounded.model_content.contains(&trusted));
+        let (_normalized, file) = workspace
+            .open_artifact_for_run(&trusted, run_id)
+            .await
+            .unwrap();
+        let bytes = tokio::fs::read(file.display()).await.unwrap();
+        assert_eq!(bytes, content.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn directory_reference_is_not_preserved_as_an_artifact() {
+        let (workspace, _dir) = workspace().await;
+        let broker = WorkspaceOutputBroker::new(workspace.clone());
+        let run_id = RunId::new();
+        workspace
+            .write_artifact(run_id, "seed", "txt", b"seed")
+            .await
+            .unwrap();
+        let directory_reference = format!("artifact://.focus-agent/artifacts/{run_id}");
+        let bounded = broker
+            .bound(
+                run_id,
+                None,
+                output(
+                    "small".into(),
+                    "done".into(),
+                    Value::Null,
+                    Some(directory_reference),
+                ),
+            )
+            .await;
+        assert!(bounded.artifact_ref.is_none());
+    }
+
+    #[tokio::test]
+    async fn cross_run_or_forged_reference_is_replaced_before_truncation() {
+        let (workspace, _dir) = workspace().await;
+        let broker = WorkspaceOutputBroker::new(workspace.clone());
+        let producer_run = RunId::new();
+        let current_run = RunId::new();
+        let cross_run = workspace
+            .write_artifact(producer_run, "producer", "txt", b"other run")
+            .await
+            .unwrap();
+        let content = "x".repeat(MAX_TOOL_MODEL_CONTENT_CHARS + 1);
+
+        let bounded = broker
+            .bound(
+                current_run,
+                None,
+                output(content, "done".into(), Value::Null, Some(cross_run.clone())),
+            )
+            .await;
+
+        let replacement = bounded
+            .artifact_ref
+            .expect("oversized content must receive a trusted spill reference");
+        assert_ne!(replacement, cross_run);
+        assert!(replacement.contains(&current_run.to_string()));
+        assert!(bounded.model_content.contains(&replacement));
     }
 
     #[tokio::test]

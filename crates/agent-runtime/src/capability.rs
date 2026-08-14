@@ -19,12 +19,12 @@ use agent_contracts::{
     AgentError, AgentResult, ArtifactHandle, CAPABILITY_MANAGE, CAPABILITY_SEARCH_DEFAULT_LIMIT,
     CAPABILITY_SEARCH_MAX_LIMIT, Capability, CapabilityActivation, CapabilityInvocationContext,
     CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
-    CapabilityTransport, Effect, RUNTIME_CONTEXT_CONTROL, ToolCatalogEntry, ToolDispatcher,
-    ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolSpec, ToolSurfaceSnapshot,
-    WORKSPACE_READ, WORKSPACE_WRITE, WorkspaceHandle,
+    CapabilityTransport, Effect, RUNTIME_CONTEXT_CONTROL, ResourceDescriptor, ToolCatalogEntry,
+    ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolSpec,
+    ToolSurfaceSnapshot, WORKSPACE_READ, WORKSPACE_WRITE, WorkspaceHandle, search_tool_catalog,
 };
 use agent_core::{CapabilityAdmission, CapabilityState, CapabilityStateAuthority};
-use agent_workspace::{ArtifactStoreHandle, ConfinedWorkspaceHandle, Workspace};
+use agent_workspace::{ArtifactStoreHandle, ConfinedWorkspaceHandle, RemoteEffectAck, Workspace};
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -96,6 +96,22 @@ struct Entry {
 struct CapabilityToolState {
     lifecycle: ToolLifecycle,
     last_used_tick: u64,
+}
+
+/// Fail-closed meet for activation restored from an older authority
+/// snapshot. Restore may preserve or reduce live authority, never promote a
+/// currently Disabled/Quarantined capability back to Enabled. Quarantine is
+/// the strongest state and therefore also survives a stale Disabled row.
+fn restore_activation_meet(
+    current: CapabilityActivation,
+    checkpoint: CapabilityActivation,
+) -> CapabilityActivation {
+    use CapabilityActivation::{Disabled, Enabled, Quarantined};
+    match (current, checkpoint) {
+        (Quarantined, _) | (_, Quarantined) => Quarantined,
+        (Disabled, _) | (_, Disabled) => Disabled,
+        (Enabled, Enabled) => Enabled,
+    }
 }
 
 /// One row of the platform's capability catalog (the discovery surface).
@@ -605,6 +621,7 @@ impl CapabilityRegistry {
                         state,
                         owner: owner.clone(),
                         description: spec.description.clone(),
+                        risk: spec.risk,
                     });
                 }
             }
@@ -740,26 +757,40 @@ impl CapabilityRegistry {
         entries
     }
 
-    /// Re-apply a checkpoint's capability surface state: the loaded-tool
-    /// surface is rebuilt from the checkpoint (a loaded flag without a
-    /// usable activation is dropped — activation is the gate in front of
-    /// the model surface), and the activation itself is re-applied to the
-    /// core's state authority. Old whole-capability checkpoints
+    /// Re-apply a checkpoint's capability surface state. Activation uses a
+    /// fail-closed monotonic meet with current live authority, so an old
+    /// Enabled checkpoint cannot undo a newer disable/quarantine. The
+    /// loaded-tool surface is rebuilt only when that effective activation
+    /// remains usable. Old whole-capability checkpoints
     /// (`loaded: true` with no tool list) migrate to "every declared tool
-    /// loaded".
-    pub fn restore(&self, state: &[crate::checkpoint::CapabilitySnapshot]) {
+    /// loaded". Returns how many registered capability rows were actually
+    /// applied; unknown ids do not count.
+    pub fn restore(&self, state: &[crate::checkpoint::CapabilitySnapshot]) -> usize {
         let _surface = self
             .surface_gate
             .write()
             .expect("capability registry poisoned");
+        // The surface gate freezes registry activation transitions, so this
+        // one authority view stays valid while the mechanical surface is
+        // rebuilt below without nesting authority and registry locks.
+        let live_states = self.state.state_map();
         let mut inner = self.inner.write().expect("capability registry poisoned");
+        let mut restored_states = Vec::with_capacity(state.len());
         for entry in state {
             let Some(current) = inner.get_mut(&entry.id) else {
                 // The capability is not registered in this run; its flags
                 // have nothing to apply to.
                 continue;
             };
-            if !entry.loaded_tools.is_empty() {
+            let Some(live_state) = live_states.get(&entry.id).copied() else {
+                // Registration guarantees a core state row. If that
+                // invariant is ever broken, fail closed rather than
+                // constructing a model-visible surface without authority.
+                current.tool_states.clear();
+                continue;
+            };
+            let activation = restore_activation_meet(live_state.activation, entry.activation);
+            if activation.usable() && !entry.loaded_tools.is_empty() {
                 // Per-tool format: only the named tools go on the surface,
                 // and only those the capability actually declares in this
                 // run (names unknown here are dropped).
@@ -782,7 +813,7 @@ impl CapabilityRegistry {
                         )
                     })
                     .collect();
-            } else if entry.loaded {
+            } else if activation.usable() && entry.loaded {
                 // Legacy whole-capability format: everything was on the
                 // surface in the checkpoint.
                 current.tool_states = current
@@ -801,35 +832,23 @@ impl CapabilityRegistry {
             } else {
                 current.tool_states.clear();
             }
-            // A loaded flag without a usable activation is dropped —
-            // activation is the gate in front of the model surface. The
-            // checkpoint's activation is the value being restored.
-            if !entry.activation.usable() {
-                current.tool_states.clear();
-            }
+            restored_states.push((
+                entry.id.clone(),
+                CapabilityState {
+                    status: live_state.status,
+                    activation,
+                },
+            ));
         }
         drop(inner);
-        // The authority record comes last, still under the surface gate:
-        // the loaded-tool decisions above used the checkpoint's activation
-        // directly, so no authority read was needed while `inner` was held.
-        let mut states = Vec::with_capacity(state.len());
-        for entry in state {
-            if let Some(status) = self.state.status(&entry.id) {
-                states.push((
-                    entry.id.clone(),
-                    CapabilityState {
-                        status,
-                        activation: entry.activation,
-                    },
-                ));
-            }
-        }
-        self.state.restore(&states);
-        // Restore changes the model-visible surface just like explicit
-        // activation/load operations, so both the audit generation and the
-        // derived discovery rows must advance.
+        let applied = restored_states.len();
+        self.state.restore(&restored_states);
+        // The restore attempt is a serialized surface epoch even when none
+        // of its ids are registered. Preserve that generation fence while
+        // reporting only actually matched rows to the restore event.
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.catalog_version.fetch_add(1, Ordering::Relaxed);
+        applied
     }
 
     /// Start every eager capability that has not started yet (host start).
@@ -1081,7 +1100,7 @@ impl CapabilityAwareDispatcher {
                     "properties": {
                         "op": {"type": "string", "enum": ["search", "inspect", "load", "unload"]},
                         "name": {"type": "string", "description": "Tool name for inspect/load/unload"},
-                        "query": {"type": "string", "description": "search: optional name filter"},
+                        "query": {"type": "string", "description": "search: optional case-insensitive filter over name, description, owner, state, and risk"},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "search: max rows in the model-facing page (default 20)"},
                         "cursor": {"type": "string", "description": "search: last tool name of the previous page"}
                     }
@@ -1105,8 +1124,9 @@ impl CapabilityAwareDispatcher {
 mod tests {
     use super::*;
     use agent_contracts::{
-        CancellationToken, CapabilityKind, ContextAction, RunId, RuntimeDirective, ToolCall,
-        ToolRisk,
+        ArgumentDigest, CancellationToken, CapabilityKind, ContextAction, EffectId,
+        EffectReconciler, EffectReconciliation, OperationId, RunId, RuntimeDirective, ToolCall,
+        ToolOperationIdentity, ToolOutput, ToolRisk, TurnId, WORKSPACE_WRITE,
     };
     use std::{
         sync::{Mutex, mpsc},
@@ -1495,6 +1515,7 @@ mod tests {
                     name: "esc.run".into(),
                     arguments: json!({}),
                 },
+                effect_context: None,
                 cancel: CancellationToken::new(),
             })
             .await
@@ -1675,6 +1696,60 @@ mod tests {
     }
 
     #[test]
+    fn capability_restore_cannot_promote_live_disabled_or_quarantined_authority() {
+        for live_activation in [
+            CapabilityActivation::Disabled,
+            CapabilityActivation::Quarantined,
+        ] {
+            let registry = CapabilityRegistry::new();
+            registry
+                .register(Arc::new(demo_capability("demo")))
+                .expect("registration succeeds");
+            registry
+                .set_activation("demo", live_activation)
+                .expect("live restriction applies");
+
+            let applied = registry.restore(&[crate::checkpoint::CapabilitySnapshot {
+                id: "demo".into(),
+                activation: CapabilityActivation::Enabled,
+                loaded: true,
+                loaded_tools: vec!["demo.one".into()],
+            }]);
+
+            assert_eq!(applied, 1);
+            assert_eq!(registry.activation("demo"), Some(live_activation));
+            assert_eq!(
+                registry.tool_state("demo.one"),
+                Some(ToolLifecycle::Available),
+                "a stale Enabled checkpoint must not rebuild a restricted surface"
+            );
+            assert!(registry.loaded_tool_specs().is_empty());
+        }
+    }
+
+    #[test]
+    fn capability_restore_reports_only_registered_rows_as_applied() {
+        let registry = CapabilityRegistry::new();
+        registry
+            .register(Arc::new(demo_capability("known")))
+            .expect("registration succeeds");
+
+        let applied = registry.restore(&[crate::checkpoint::CapabilitySnapshot {
+            id: "unknown".into(),
+            activation: CapabilityActivation::Enabled,
+            loaded: true,
+            loaded_tools: vec!["unknown.one".into()],
+        }]);
+
+        assert_eq!(applied, 0, "unknown checkpoint ids are not applied");
+        assert_eq!(
+            registry.activation("known"),
+            Some(CapabilityActivation::Enabled)
+        );
+        assert!(registry.loaded_tool_specs().is_empty());
+    }
+
+    #[test]
     fn legacy_whole_capability_checkpoint_migrates_to_all_tools() {
         let registry = CapabilityRegistry::new();
         registry
@@ -1709,6 +1784,103 @@ mod tests {
         let snapshot: crate::checkpoint::CapabilitySnapshot = serde_json::from_value(json).unwrap();
         assert!(snapshot.loaded);
         assert!(snapshot.loaded_tools.is_empty());
+    }
+
+    struct EffectfulCapability {
+        manifest: CapabilityManifest,
+    }
+
+    #[async_trait::async_trait]
+    impl Capability for EffectfulCapability {
+        fn manifest(&self) -> &CapabilityManifest {
+            &self.manifest
+        }
+
+        async fn invoke(
+            &self,
+            call: ToolCall,
+            _ctx: CapabilityInvocationContext,
+        ) -> AgentResult<CapabilityOutcome> {
+            Ok(CapabilityOutcome::Value(ToolOutput {
+                call_id: call.id,
+                tool_name: call.name,
+                ok: true,
+                summary: "remote call finished".into(),
+                model_content: "ok".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn effectful_capability_invoke_persists_remote_ack() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Arc::new(Workspace::open(directory.path()).await.unwrap());
+        let registry = Arc::new(CapabilityRegistry::new());
+        let dispatcher = CapabilityAwareDispatcher::with_workspace(
+            Arc::new(EmptyBase),
+            registry.clone(),
+            Some(workspace.clone()),
+        );
+        registry
+            .register(Arc::new(EffectfulCapability {
+                manifest: CapabilityManifest {
+                    id: "fx".into(),
+                    version: "0.1.0".into(),
+                    name: "fx".into(),
+                    summary: "effectful".into(),
+                    status: CapabilityStatus::Experimental,
+                    provides: Vec::new(),
+                    permissions: vec![WORKSPACE_WRITE.into()],
+                    requires: Vec::new(),
+                    tools: vec![ToolSpec {
+                        name: "fx.run".into(),
+                        description: "effectful remote-ish call".into(),
+                        input_schema: json!({"type": "object"}),
+                        risk: ToolRisk::WorkspaceWrite,
+                        output_budget: None,
+                    }],
+                    lifecycle: CapabilityLifecycle::Lazy,
+                    transport: CapabilityTransport::Builtin,
+                },
+            }))
+            .unwrap();
+        registry.load_tool("fx.run").unwrap();
+
+        let run_id = RunId::new();
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "fx.run".into(),
+            arguments: json!({}),
+        };
+        let context = agent_contracts::OperationEffectContext {
+            identity: ToolOperationIdentity {
+                run_id,
+                task_id: None,
+                turn_id: TurnId::new(),
+                scope_id: None,
+                operation_id: OperationId::new(),
+                generation: 1,
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest: ArgumentDigest::from_json(&call.arguments),
+            },
+            effect_id: EffectId::new(),
+        };
+        dispatcher
+            .execute(ToolExecutionRequest {
+                run_id,
+                call,
+                effect_context: Some(context.clone()),
+                cancel: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            workspace.reconcile(&context).unwrap(),
+            EffectReconciliation::CompletedValue { .. }
+        ));
     }
 }
 
@@ -1814,11 +1986,26 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
     }
 
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        request.validate().map_err(AgentError::InvalidRequest)?;
         let name = request.call.name.clone();
         match name.as_str() {
             CAPABILITY_MANAGE => self.run_manage(request).await.map(ToolOutcome::Value),
             _ => {
                 if let Some(id) = self.capabilities.owner_of(&name) {
+                    let effectful = self
+                        .capabilities
+                        .tool_spec(&name)
+                        .is_some_and(|spec| spec.risk != agent_contracts::ToolRisk::ReadOnly);
+                    if effectful != request.effect_context.is_some() {
+                        return Err(AgentError::InvalidRequest(format!(
+                            "capability tool '{name}' {} a Core-issued effect context",
+                            if effectful {
+                                "requires"
+                            } else {
+                                "must not receive"
+                            }
+                        )));
+                    }
                     let capability = self
                         .capabilities
                         .by_tool(&name)
@@ -1847,41 +2034,11 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
                     self.capabilities.ensure_started(&id).await?;
                     self.capabilities.mark_active(&name);
                     let ctx = self.invocation_context(&grant, &request);
-                    let outcome = capability.invoke(request.call, ctx).await;
+                    let outcome = self
+                        .invoke_capability_with_remote_barrier(capability.as_ref(), request, ctx)
+                        .await;
                     self.capabilities.mark_idle(&name);
-                    // The core owns every side effect: a capability can only
-                    // stage an effect (the actor commits it behind the
-                    // generation fence) or attach a runtime directive —
-                    // which is refused unless the registered grant declares
-                    // `runtime:context-control`. A plain value passes
-                    // through unchanged.
-                    return match outcome? {
-                        CapabilityOutcome::Value(output) => Ok(ToolOutcome::Value(output)),
-                        CapabilityOutcome::EffectRequest { output, effect } => {
-                            Ok(ToolOutcome::PreparedEffect { output, effect })
-                        }
-                        CapabilityOutcome::RuntimeDirective { output, directive } => {
-                            if grant
-                                .iter()
-                                .any(|permission| permission == RUNTIME_CONTEXT_CONTROL)
-                            {
-                                Ok(ToolOutcome::RuntimeDirective { output, directive })
-                            } else {
-                                Ok(ToolOutcome::Value(ToolOutput {
-                                    ok: false,
-                                    summary: format!(
-                                        "capability '{id}' attempted a runtime directive without '{}' permission",
-                                        RUNTIME_CONTEXT_CONTROL
-                                    ),
-                                    model_content: format!(
-                                        "runtime directive denied: capability '{id}' does not hold '{}' permission",
-                                        RUNTIME_CONTEXT_CONTROL
-                                    ),
-                                    ..output
-                                }))
-                            }
-                        }
-                    };
+                    return Self::map_capability_outcome(&id, &grant, outcome);
                 }
                 self.base.execute(request).await
             }
@@ -1907,6 +2064,13 @@ impl WorkspaceHandle for StagedOnlyWorkspace {
     }
     async fn read(&self, relative: &str) -> AgentResult<Vec<u8>> {
         self.0.read(relative).await
+    }
+    async fn read_bounded(
+        &self,
+        relative: &str,
+        max_bytes: usize,
+    ) -> AgentResult<agent_contracts::BoundedRead> {
+        self.0.read_bounded(relative, max_bytes).await
     }
     async fn write(&self, _relative: &str, _content: &[u8]) -> AgentResult<()> {
         Err(AgentError::InvalidRequest(
@@ -1934,6 +2098,13 @@ impl WorkspaceHandle for ReadOnlyWorkspace {
     async fn read(&self, relative: &str) -> AgentResult<Vec<u8>> {
         self.0.read(relative).await
     }
+    async fn read_bounded(
+        &self,
+        relative: &str,
+        max_bytes: usize,
+    ) -> AgentResult<agent_contracts::BoundedRead> {
+        self.0.read_bounded(relative, max_bytes).await
+    }
     async fn write(&self, _relative: &str, _content: &[u8]) -> AgentResult<()> {
         Err(AgentError::InvalidRequest(
             "workspace:write was not granted to this capability".into(),
@@ -1951,6 +2122,72 @@ impl WorkspaceHandle for ReadOnlyWorkspace {
 }
 
 impl CapabilityAwareDispatcher {
+    /// 有 workspace 且这次调用带 Core effect 身份时，先落下远程幂等屏障
+    /// 再把请求交给子进程/MCP。没有屏障的崩溃窗口不得声称 at-most-one。
+    async fn invoke_capability_with_remote_barrier(
+        &self,
+        capability: &dyn Capability,
+        request: ToolExecutionRequest,
+        ctx: CapabilityInvocationContext,
+    ) -> AgentResult<CapabilityOutcome> {
+        let Some((context, workspace)) =
+            request.effect_context.as_ref().zip(self.workspace.as_ref())
+        else {
+            return capability.invoke(request.call, ctx).await;
+        };
+        workspace
+            .record_remote_reserved(context, Some(&context.identity.operation_id.to_string()))?;
+        workspace.record_remote_dispatched(context.effect_id)?;
+        let outcome = capability.invoke(request.call, ctx).await;
+        let ack = match &outcome {
+            Ok(CapabilityOutcome::EffectRequest { .. }) => RemoteEffectAck::Staged,
+            Ok(_) => RemoteEffectAck::Completed,
+            Err(_) => RemoteEffectAck::Failed,
+        };
+        workspace.record_remote_acked(context.effect_id, ack)?;
+        outcome
+    }
+
+    fn map_capability_outcome(
+        id: &str,
+        grant: &[String],
+        outcome: AgentResult<CapabilityOutcome>,
+    ) -> AgentResult<ToolOutcome> {
+        // The core owns every side effect: a capability can only
+        // stage an effect (the actor commits it behind the
+        // generation fence) or attach a runtime directive —
+        // which is refused unless the registered grant declares
+        // `runtime:context-control`. A plain value passes
+        // through unchanged.
+        match outcome? {
+            CapabilityOutcome::Value(output) => Ok(ToolOutcome::Value(output)),
+            CapabilityOutcome::EffectRequest { output, effect } => {
+                Ok(ToolOutcome::PreparedEffect { output, effect })
+            }
+            CapabilityOutcome::RuntimeDirective { output, directive } => {
+                if grant
+                    .iter()
+                    .any(|permission| permission == RUNTIME_CONTEXT_CONTROL)
+                {
+                    Ok(ToolOutcome::RuntimeDirective { output, directive })
+                } else {
+                    Ok(ToolOutcome::Value(ToolOutput {
+                        ok: false,
+                        summary: format!(
+                            "capability '{id}' attempted a runtime directive without '{}' permission",
+                            RUNTIME_CONTEXT_CONTROL
+                        ),
+                        model_content: format!(
+                            "runtime directive denied: capability '{id}' does not hold '{}' permission",
+                            RUNTIME_CONTEXT_CONTROL
+                        ),
+                        ..output
+                    }))
+                }
+            }
+        }
+    }
+
     /// Build the invocation context for one capability call from its
     /// *registered* grant (the admission-validated permissions), plus
     /// confined handles for everything the runtime actually wired in. A
@@ -1965,8 +2202,16 @@ impl CapabilityAwareDispatcher {
 
         let workspace = if declares(WORKSPACE_READ) || declares(WORKSPACE_WRITE) {
             self.workspace.as_ref().map(|workspace| {
-                let handle: Arc<dyn WorkspaceHandle> =
-                    Arc::new(ConfinedWorkspaceHandle::new(workspace, &request.call.name));
+                let handle: Arc<dyn WorkspaceHandle> = match &request.effect_context {
+                    Some(effect_context) => {
+                        Arc::new(ConfinedWorkspaceHandle::new_with_effect_context(
+                            workspace,
+                            &request.call.name,
+                            effect_context.clone(),
+                        ))
+                    }
+                    None => Arc::new(ConfinedWorkspaceHandle::new(workspace, &request.call.name)),
+                };
                 if declares(WORKSPACE_WRITE) {
                     // Writes are staged, never applied during invoke.
                     Arc::new(StagedOnlyWorkspace(handle)) as Arc<dyn WorkspaceHandle>
@@ -2030,10 +2275,9 @@ impl CapabilityAwareDispatcher {
             .limit
             .unwrap_or(CAPABILITY_SEARCH_DEFAULT_LIMIT)
             .clamp(1, CAPABILITY_SEARCH_MAX_LIMIT);
-        let mut entries = self.unified_catalog();
-        if let Some(query) = args.query.as_deref() {
-            entries.retain(|entry| entry.name.contains(query));
-        }
+        // 描述符索引检索：name/description/owner/state/risk，大小写不敏感。
+        let mut entries =
+            search_tool_catalog(&self.unified_catalog(), args.query.as_deref(), usize::MAX);
         let active = entries
             .iter()
             .filter(|entry| entry.state.in_surface())
@@ -2102,10 +2346,13 @@ impl CapabilityAwareDispatcher {
             },
             artifact_ref,
             metadata: json!({
+                "op": "search",
+                "kind": "tool",
                 "total": total,
                 "active": active,
                 "returned": page.len(),
                 "has_more": has_more,
+                "descriptors": page.iter().map(|entry| ResourceDescriptor::from_tool(entry, None)).collect::<Vec<_>>(),
             }),
         })
     }
@@ -2116,6 +2363,8 @@ impl CapabilityAwareDispatcher {
         name: String,
     ) -> AgentResult<ToolOutput> {
         let Some(spec) = self.inspect_tool(&name) else {
+            let mut metadata = agent_contracts::DiscoveryMiss::NotFound.to_metadata();
+            metadata["op"] = json!("inspect");
             return Ok(ToolOutput {
                 call_id: request.call.id,
                 tool_name: CAPABILITY_MANAGE.into(),
@@ -2123,7 +2372,7 @@ impl CapabilityAwareDispatcher {
                 summary: format!("unknown tool: {name}"),
                 model_content: format!("unknown tool: {name}"),
                 artifact_ref: None,
-                metadata: json!({}),
+                metadata,
             });
         };
         let state = self
@@ -2166,6 +2415,7 @@ impl CapabilityAwareDispatcher {
             ),
             artifact_ref: None,
             metadata: json!({
+                "op": "inspect",
                 "name": spec.name,
                 "owner": owner,
                 "activation": activation,

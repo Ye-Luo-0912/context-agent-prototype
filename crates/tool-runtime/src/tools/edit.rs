@@ -74,6 +74,7 @@ impl Tool for EditReplaceTool {
         _run_id: RunId,
         call_id: &str,
         arguments: Value,
+        effect_context: Option<agent_contracts::OperationEffectContext>,
         _cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let args: ReplaceArgs = serde_json::from_value(arguments)
@@ -165,7 +166,14 @@ impl Tool for EditReplaceTool {
         // rename (the side effect) is committed by the runtime after the
         // generation fence, so a stale operation rolls back instead of
         // silently modifying the file.
-        let prepared = transaction.prepare(updated.as_bytes()).await?;
+        let prepared = match effect_context {
+            Some(context) => {
+                transaction
+                    .prepare_with_effect_context(updated.as_bytes(), context)
+                    .await?
+            }
+            None => transaction.prepare(updated.as_bytes()).await?,
+        };
         let effect: Box<dyn Effect> = Box::new(prepared);
 
         Ok(ToolOutcome::PreparedEffect {
@@ -208,6 +216,7 @@ mod tests {
                 name: "edit.replace".into(),
                 arguments: args,
             },
+            effect_context: None,
             cancel: CancellationToken::new(),
         }
     }
@@ -228,7 +237,7 @@ mod tests {
             json!({"path": "lib.rs", "old": "auth() {}", "new": "auth() -> bool { true }"}),
         );
         let outcome = tool
-            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .execute(run_id, "c", request.call.arguments, None, request.cancel)
             .await
             .unwrap();
         let ToolOutcome::PreparedEffect { output, effect } = outcome else {
@@ -286,6 +295,7 @@ mod tests {
                 request(run_id, json!({"path": "f.txt", "old": "a", "new": "x"}))
                     .call
                     .arguments,
+                None,
                 CancellationToken::new(),
             )
             .await;
@@ -298,7 +308,7 @@ mod tests {
             json!({"path": "f.txt", "old": "a", "new": "x", "replace_all": true}),
         );
         let outcome = tool
-            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .execute(run_id, "c", request.call.arguments, None, request.cancel)
             .await
             .unwrap();
         let ToolOutcome::PreparedEffect { output, effect } = outcome else {

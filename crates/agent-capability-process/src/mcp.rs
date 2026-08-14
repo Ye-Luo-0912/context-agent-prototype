@@ -12,13 +12,17 @@
 use std::time::Duration;
 
 use agent_contracts::{
-    AgentError, AgentResult, Capability, CapabilityInvocationContext, CapabilityKind,
-    CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
-    CapabilityTransport, ToolCall, ToolOutput, ToolRisk, ToolSpec, validate_capability_id,
+    AgentError, AgentResult, CancellationToken, Capability, CapabilityInvocationContext,
+    CapabilityKind, CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
+    CapabilityTransport, OperationId, ToolCall, ToolOutput, ToolRisk, ToolSpec,
+    validate_capability_id,
 };
+use agent_platform_protocol::{JsonDecodeBudget, decode_value};
+use agent_process::kill_process_tree;
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::process::Child;
 
 /// MCP protocol version this client speaks.
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -26,10 +30,16 @@ pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 /// Default per-request timeout for MCP calls.
 pub const DEFAULT_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default bound on one stdio frame (a JSON-RPC document).
-pub const DEFAULT_MCP_MAX_FRAME_BYTES: u64 = 16 * 1024 * 1024;
-/// Bounds on one tool's text content (chars) after concatenation; the
+pub const DEFAULT_MCP_MAX_FRAME_BYTES: u64 = 4 * 1024 * 1024;
+/// Bounds on one tool's text content (chars) while aggregating; the
 /// kernel output broker clamps the model-facing envelope anyway.
 pub const MAX_MCP_TOOL_TEXT_CHARS: usize = 16_000;
+/// How many notification frames a request may skip before the
+/// client treats the server as flooding and poisons the connection. A
+/// well-behaved server never emits a flood of notifications ahead of one
+/// response.
+pub const DEFAULT_MAX_SKIPPED_FRAMES_PER_REQUEST: usize = 64;
+pub const DEFAULT_MAX_SKIPPED_BYTES_PER_REQUEST: u64 = 1024 * 1024;
 
 /// A declared MCP server: identity plus how to spawn it. The id follows the
 /// capability id grammar (it is embedded in catalog routes).
@@ -66,12 +76,33 @@ pub struct McpCallResult {
 /// A minimal JSON-RPC 2.0 client over an arbitrary byte stream (MCP's
 /// stdio transport). Generic over the reader/writer so the protocol is
 /// unit-testable against in-memory duplex streams without a real process.
+///
+/// Frames are bounded in both directions (the shared `agent-process` frame
+/// codec), and a stdio client owns its server child: a poisoned, timed-out
+/// or cancelled exchange kills and reaps the whole process tree, so late
+/// output can never be admitted and a dropped connection never orphans the
+/// server.
 pub struct McpClient<R, W> {
     reader: BufReader<R>,
     writer: BufWriter<W>,
-    next_id: u64,
     request_timeout: Duration,
     max_frame_bytes: u64,
+    /// Bound on frames skipped while waiting for the matching response (a
+    /// server that floods notifications is poisoned instead of
+    /// being read forever).
+    max_skipped_frames: usize,
+    /// Cumulative notification bytes accepted before one response. A count
+    /// limit alone would still permit hundreds of individually large frames;
+    /// use one frame budget for the whole skipped prefix as well.
+    max_skipped_bytes: u64,
+    /// The spawned server child (stdio transports only), owned by the
+    /// client for the whole connection lifetime.
+    child: Option<Child>,
+    pid: Option<u32>,
+    /// `Some(reason)` once the connection is unusable. Poisoned clients
+    /// reject every further call; the adapter replaces them on the next
+    /// invoke.
+    poisoned: Option<String>,
     /// Owned by the client so the child's private cwd outlives the spawn
     /// call (dropped when the connection is torn down).
     _private_cwd: Option<tempfile::TempDir>,
@@ -86,20 +117,60 @@ const MCP_ENV_KEYS: &[&str] = &["PATH", "SystemRoot", "SystemDrive", "TEMP", "TM
 
 impl<R, W> McpClient<R, W>
 where
-    R: AsyncRead + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     /// Wrap an existing byte stream. Callers run [`Self::initialize`]
-    /// before issuing tool calls.
+    /// before issuing tool calls. The stream variant owns no child (see
+    /// [`Self::connect_stdio`]).
     pub fn new(reader: R, writer: W, request_timeout: Duration, max_frame_bytes: u64) -> Self {
         Self {
             reader: BufReader::new(reader),
             writer: BufWriter::new(writer),
-            next_id: 1,
             request_timeout,
             max_frame_bytes,
+            max_skipped_frames: DEFAULT_MAX_SKIPPED_FRAMES_PER_REQUEST,
+            max_skipped_bytes: max_frame_bytes.min(DEFAULT_MAX_SKIPPED_BYTES_PER_REQUEST),
+            child: None,
+            pid: None,
+            poisoned: None,
             _private_cwd: None,
         }
+    }
+
+    /// True once the connection is unusable. The adapter replaces a
+    /// poisoned client on the next invoke instead of reusing it.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.is_some()
+    }
+
+    /// Mark the connection poisoned, kill the owned server tree and return
+    /// the caller-facing error. Killing happens synchronously so every
+    /// exit path (parse failure, oversize frame, timeout, cancel, flood)
+    /// terminates the child before the error is surfaced; callers that can
+    /// await follow up with [`Self::reap`].
+    fn poison(&mut self, reason: String) -> AgentError {
+        self.poisoned = Some(reason.clone());
+        if let Some(pid) = self.pid {
+            kill_process_tree(pid);
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+        AgentError::Tool(format!("MCP connection poisoned: {reason}"))
+    }
+
+    /// Reap the owned child after a kill (avoids a zombie on Unix). Safe to
+    /// call on a stream variant (no child): a no-op.
+    async fn reap(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.wait().await;
+        }
+        // A reaped pid may be reused by the OS. Clear it before Drop so the
+        // backstop cannot terminate an unrelated process that later receives
+        // the same numeric pid.
+        self.child = None;
+        self.pid = None;
     }
 
     /// The MCP `initialize` handshake: send the initialize request, check
@@ -121,8 +192,8 @@ where
             .and_then(Value::as_str)
             .unwrap_or_default();
         if server_version != MCP_PROTOCOL_VERSION {
-            return Err(AgentError::Tool(format!(
-                "MCP server protocol version '{server_version}' is not supported (expected {MCP_PROTOCOL_VERSION})"
+            return Err(self.poison(format!(
+                "server protocol version '{server_version}' is not supported (expected {MCP_PROTOCOL_VERSION})"
             )));
         }
         self.notify("notifications/initialized", json!({})).await?;
@@ -164,117 +235,245 @@ where
     /// `tools/call`: invoke one tool with its arguments and return the
     /// concatenated text content, bounded.
     pub async fn call_tool(&mut self, name: &str, arguments: Value) -> AgentResult<McpCallResult> {
+        let cancel = CancellationToken::new();
+        self.call_tool_with_cancel(name, arguments, &cancel).await
+    }
+
+    /// `tools/call` that also aborts when `cancel` fires. A cancelled
+    /// exchange poisons the connection and kills the owned server tree
+    /// before the error surfaces, so the server's late response can never
+    /// be admitted as the answer to a later call.
+    pub async fn call_tool_with_cancel(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        cancel: &CancellationToken,
+    ) -> AgentResult<McpCallResult> {
         let result = self
-            .request("tools/call", json!({"name": name, "arguments": arguments}))
+            .request_with_cancel(
+                "tools/call",
+                json!({"name": name, "arguments": arguments}),
+                cancel,
+            )
             .await?;
         let is_error = result
             .get("isError")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let content = result.get("content").and_then(Value::as_array);
-        let text: String = content
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        let text = clip_text(&text);
+        let text = bounded_tool_text(result.get("content").and_then(Value::as_array));
         Ok(McpCallResult { text, is_error })
     }
 
     /// Send one request and read the matching response, enforcing the
     /// request timeout and the frame bound. Notifications (no `id`) from
-    /// the server are skipped until the matching id arrives.
+    /// the server are skipped until the matching id arrives; a flood of
+    /// skipped frames poisons the connection.
     async fn request(&mut self, method: &str, params: Value) -> AgentResult<Value> {
-        let id = self.next_id;
-        self.next_id += 1;
+        let cancel = CancellationToken::new();
+        self.request_with_cancel(method, params, &cancel).await
+    }
+
+    /// Send one request and read the matching response, also aborting when
+    /// `cancel` fires. Every failure path — timeout, cancellation, framing
+    /// violation, flood — poisons the connection and kills the owned server
+    /// tree, so a late or half-read response can never corrupt a later
+    /// exchange.
+    async fn request_with_cancel(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: &CancellationToken,
+    ) -> AgentResult<Value> {
+        if self.is_poisoned() {
+            return Err(AgentError::Tool(format!(
+                "MCP connection poisoned: {}",
+                self.poisoned.as_deref().unwrap_or("unknown")
+            )));
+        }
+        // A fresh v4 UUID for every exchange prevents a peer from predicting
+        // the next id and pre-sending a response that a later request could
+        // accidentally accept. `OperationId` is the contracts-owned UUID
+        // generator; the MCP id remains an opaque JSON-RPC string.
+        let id = OperationId::new().to_string();
         let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        self.send_frame(&request).await?;
-        tokio::time::timeout(self.request_timeout, self.read_matching(id))
-            .await
-            .map_err(|_| AgentError::Tool(format!("MCP request '{method}' timed out")))?
+
+        enum Exchange {
+            Cancelled,
+            TimedOut,
+            Completed(AgentResult<Value>),
+        }
+
+        let request_timeout = self.request_timeout;
+        let exchange = async {
+            self.send_frame(&request).await?;
+            self.read_matching(&id).await
+        };
+        let outcome = tokio::select! {
+            // An already-cancelled request must not write anything to the
+            // child even when the pipe is immediately writable.
+            biased;
+            _ = cancel.cancelled() => Exchange::Cancelled,
+            result = tokio::time::timeout(request_timeout, exchange) => match result {
+                Ok(result) => Exchange::Completed(result),
+                Err(_) => Exchange::TimedOut,
+            }
+        };
+        match outcome {
+            Exchange::Cancelled => {
+                // A late answer must never be admitted as a later call's
+                // response, so cancellation destroys this session.
+                self.poison(format!("request '{method}' cancelled by the runtime"));
+                self.reap().await;
+                Err(AgentError::Cancelled)
+            }
+            Exchange::TimedOut => {
+                let error = self.poison(format!("request '{method}' timed out"));
+                self.reap().await;
+                Err(error)
+            }
+            Exchange::Completed(result) => {
+                if result.is_err() && self.is_poisoned() {
+                    self.reap().await;
+                }
+                result
+            }
+        }
     }
 
     /// Send a notification (a JSON-RPC message with no `id`).
     async fn notify(&mut self, method: &str, params: Value) -> AgentResult<()> {
         let frame = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        self.send_frame(&frame).await
+        match tokio::time::timeout(self.request_timeout, self.send_frame(&frame)).await {
+            Ok(result) => result,
+            Err(_) => Err(self.poison(format!("notification '{method}' timed out"))),
+        }
     }
 
+    /// Write one frame with the outbound bound: an over-cap frame is
+    /// rejected before a byte reaches the pipe (the connection stays
+    /// usable — nothing was written).
     async fn send_frame(&mut self, frame: &Value) -> AgentResult<()> {
-        let mut line = serde_json::to_string(frame)
-            .map_err(|e| AgentError::Tool(format!("serialize MCP frame: {e}")))?;
-        line.push('\n');
-        self.writer
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| AgentError::Tool(format!("write MCP frame: {e}")))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|e| AgentError::Tool(format!("flush MCP frame: {e}")))?;
+        let limit = usize::try_from(self.max_frame_bytes).map_err(|_| {
+            AgentError::InvalidRequest(format!(
+                "MCP frame bound {} does not fit this platform",
+                self.max_frame_bytes
+            ))
+        })?;
+        // Encoding (including the size check) happens before any write. An
+        // oversize caller value therefore leaves the connection usable.
+        let line = agent_process::encode_frame(frame, limit)?;
+        if let Err(error) = self.writer.write_all(&line).await {
+            return Err(self.poison(format!("write frame: {error}")));
+        }
+        if let Err(error) = self.writer.flush().await {
+            return Err(self.poison(format!("flush frame: {error}")));
+        }
         Ok(())
     }
 
-    /// Read frames until the one carrying `id` arrives; notifications are
-    /// skipped. Errors (a JSON-RPC error object) surface as `AgentError`.
-    async fn read_matching(&mut self, id: u64) -> AgentResult<Value> {
+    /// Read frames until the one carrying `id` arrives; notifications and
+    /// notifications are skipped, up to `max_skipped_frames`. A response
+    /// carrying any other id is a protocol violation under single-inflight:
+    /// it may be a late or pre-sent answer and poisons the connection.
+    async fn read_matching(&mut self, id: &str) -> AgentResult<Value> {
+        let mut skipped = 0usize;
+        let mut skipped_bytes = 0u64;
         loop {
-            let frame = self.read_frame().await?;
+            let (frame, frame_bytes) = self.read_frame().await?;
+            // Identity comes first. In particular, an error attached to a
+            // different id is not the current request's error. Under the
+            // single-inflight contract it is fatal, not a skippable response.
             let frame_id = frame.get("id");
-            if let Some(value) = frame.get("error") {
-                let message = value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown MCP error")
-                    .to_string();
+            if frame_id.is_some() && frame_id.and_then(Value::as_str) != Some(id) {
+                return Err(self.poison(format!(
+                    "response id mismatch while waiting for request {id}"
+                )));
+            }
+            if frame_id.is_none() {
+                if frame.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+                    || frame.get("method").and_then(Value::as_str).is_none()
+                {
+                    return Err(self.poison(format!(
+                        "malformed notification while waiting for request {id}"
+                    )));
+                }
+                skipped += 1;
+                skipped_bytes =
+                    skipped_bytes.saturating_add(u64::try_from(frame_bytes).unwrap_or(u64::MAX));
+                if skipped > self.max_skipped_frames || skipped_bytes > self.max_skipped_bytes {
+                    return Err(self.poison(format!(
+                        "request {id}: notification flood exceeded {} frames or {} bytes",
+                        self.max_skipped_frames, self.max_skipped_bytes
+                    )));
+                }
+                continue;
+            }
+            if frame.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+                return Err(self.poison(format!("response {id} has an invalid JSON-RPC version")));
+            }
+            let result = frame.get("result");
+            let error = frame.get("error");
+            if result.is_some() == error.is_some() {
+                return Err(self.poison(format!(
+                    "response {id} must contain exactly one of result or error"
+                )));
+            }
+            if let Some(value) = error {
+                let Some(message) = value.get("message").and_then(Value::as_str) else {
+                    return Err(
+                        self.poison(format!("response {id} has a malformed JSON-RPC error"))
+                    );
+                };
                 return Err(AgentError::Tool(format!(
                     "MCP request {id} failed: {message}"
                 )));
             }
-            if frame_id.and_then(Value::as_u64) == Some(id) {
-                return frame
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| AgentError::Tool(format!("MCP response {id} has no result")));
-            }
-            // A notification or a stale id: skip and keep reading.
+            return Ok(result.expect("exactly one result/error checked").clone());
         }
     }
 
-    /// Read one newline-delimited JSON frame, enforcing the frame bound.
-    async fn read_frame(&mut self) -> AgentResult<Value> {
-        let mut line = Vec::new();
-        let read = tokio::time::timeout(self.request_timeout, async {
-            self.reader
-                .read_until(b'\n', &mut line)
-                .await
-                .map_err(|e| AgentError::Tool(format!("read MCP frame: {e}")))
-        })
-        .await
-        .map_err(|_| AgentError::Tool("MCP read timed out".into()))??;
-        if read == 0 {
-            return Err(AgentError::Tool("MCP server closed the connection".into()));
-        }
-        if line.len() as u64 > self.max_frame_bytes {
+    /// Read one newline-delimited JSON frame. The shared incremental frame
+    /// codec enforces the bound while reading (an over-cap line is rejected
+    /// instead of buffered in full); every framing failure poisons the
+    /// connection so the half-read stream is never reused.
+    async fn read_frame(&mut self) -> AgentResult<(Value, usize)> {
+        if self.is_poisoned() {
             return Err(AgentError::Tool(format!(
-                "MCP frame is {} bytes, above the {}-byte bound",
-                line.len(),
-                self.max_frame_bytes
+                "MCP connection poisoned: {}",
+                self.poisoned.as_deref().unwrap_or("unknown")
             )));
         }
-        serde_json::from_slice(&line).map_err(|e| AgentError::Tool(format!("parse MCP frame: {e}")))
+        let limit = usize::try_from(self.max_frame_bytes).map_err(|_| {
+            AgentError::InvalidRequest(format!(
+                "MCP frame bound {} does not fit this platform",
+                self.max_frame_bytes
+            ))
+        })?;
+        let frame = match agent_process::read_frame(&mut self.reader, limit).await {
+            Ok(frame) => frame,
+            Err(error) => {
+                return Err(self.poison(error.to_string()));
+            }
+        };
+        let frame_bytes = frame.len();
+        // 编码帧已封顶；这里再挡 `[{},…]` 一类解码 DOM 放大。
+        let budget = JsonDecodeBudget::for_frame_bytes(limit);
+        match decode_value(&frame, &budget) {
+            Ok(value) => Ok((value, frame_bytes)),
+            Err(error) => Err(self.poison(format!("parse MCP frame: {error}"))),
+        }
     }
 }
 
 impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
     /// Spawn the declared server over stdio with a scrubbed environment and
-    /// a private cwd, then run the MCP `initialize` handshake. The child's
-    /// stderr is discarded (the runtime's process host owns stderr
-    /// accounting for its own protocol; MCP servers log to stderr freely).
+    /// a private cwd, then run the MCP `initialize` handshake. The child is
+    /// owned by the client for the whole connection: teardown, timeout,
+    /// cancellation and framing failures kill and reap the whole process
+    /// tree, so a dead or abandoned server never keeps running and late
+    /// output can never be admitted. The child's stderr is discarded (the
+    /// runtime's process host owns stderr accounting for its own protocol;
+    /// MCP servers log to stderr freely).
     pub async fn connect_stdio(
         decl: &McpServerDecl,
         request_timeout: Duration,
@@ -290,7 +489,10 @@ impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
             .env_clear()
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            // The child dies with its owning handle even when every explicit
+            // teardown path is skipped (e.g. the adapter is dropped).
+            .kill_on_drop(true);
         for key in MCP_ENV_KEYS {
             if let Ok(value) = std::env::var(key) {
                 command.env(key, value);
@@ -320,19 +522,36 @@ impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
                 }
             }
         }
+        #[cfg(unix)]
+        command.process_group(0);
         let mut child = command
             .spawn()
             .map_err(|e| AgentError::Tool(format!("spawn MCP server '{}': {e}", decl.program)))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| AgentError::Tool("MCP server stdin not available".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| AgentError::Tool("MCP server stdout not available".into()))?;
+        let pid = child.id();
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                terminate_child(&mut child, pid).await;
+                return Err(AgentError::Tool("MCP server stdin not available".into()));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                terminate_child(&mut child, pid).await;
+                return Err(AgentError::Tool("MCP server stdout not available".into()));
+            }
+        };
         let mut client = Self::new(stdout, stdin, request_timeout, max_frame_bytes);
-        client.initialize().await?;
+        client.child = Some(child);
+        client.pid = pid;
+        if let Err(error) = client.initialize().await {
+            // The handshake failed: the spawned server must not be left
+            // running. Kill and reap it before surfacing the error.
+            client.poison("initialize handshake failed".into());
+            client.reap().await;
+            return Err(error);
+        }
         // The private cwd is owned by the client: it lives for the child's
         // lifetime and is removed when the connection is torn down.
         client._private_cwd = Some(private);
@@ -340,12 +559,67 @@ impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
     }
 }
 
-fn clip_text(text: &str) -> String {
-    if text.chars().count() <= MAX_MCP_TOOL_TEXT_CHARS {
-        return text.to_string();
+impl<R, W> Drop for McpClient<R, W> {
+    fn drop(&mut self) {
+        // The child is owned by the client for its whole lifetime; dropping
+        // the connection must never orphan the server process. Explicit
+        // teardown paths (stop, cancel, timeout, poison) kill and reap
+        // first; this backstop kills the tree when the client is dropped
+        // any other way. (`kill_on_drop` on the spawn command covers the
+        // direct child; the tree kill covers descendants.)
+        if let Some(pid) = self.pid.take() {
+            kill_process_tree(pid);
+        }
+        if let Some(child) = self.child.as_mut() {
+            // Drop cannot await, but `kill_on_drop` plus this explicit start
+            // guarantees the direct child is terminated. Awaiting reaping is
+            // reserved for stop/cancel/timeout paths, which all call `reap`.
+            let _ = child.start_kill();
+        }
     }
-    let clipped: String = text.chars().take(MAX_MCP_TOOL_TEXT_CHARS).collect();
-    format!("{clipped}\n... (MCP text truncated)")
+}
+
+async fn terminate_child(child: &mut Child, pid: Option<u32>) {
+    if let Some(pid) = pid {
+        kill_process_tree(pid);
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+fn bounded_tool_text(content: Option<&Vec<Value>>) -> String {
+    let Some(items) = content else {
+        return String::new();
+    };
+    let mut text = String::new();
+    let mut remaining = MAX_MCP_TOOL_TEXT_CHARS;
+    let mut truncated = false;
+    for item in items {
+        let Some(part) = item.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if !text.is_empty() {
+            if remaining == 0 {
+                truncated = true;
+                break;
+            }
+            text.push('\n');
+            remaining -= 1;
+        }
+        let count = part.chars().count();
+        if count <= remaining {
+            text.push_str(part);
+            remaining -= count;
+        } else {
+            text.extend(part.chars().take(remaining));
+            truncated = true;
+            break;
+        }
+    }
+    if truncated {
+        text.push_str("\n... (MCP text truncated)");
+    }
+    text
 }
 
 /// An MCP server as a `Capability`: the tools discovered at connect time
@@ -375,7 +649,18 @@ impl McpCapabilityAdapter {
     ) -> AgentResult<Self> {
         validate_capability_id(&decl.id).map_err(AgentError::InvalidRequest)?;
         let mut client = McpClient::connect_stdio(&decl, request_timeout, max_frame_bytes).await?;
-        let tools = client.list_tools().await?;
+        let tools = match client.list_tools().await {
+            Ok(tools) => tools,
+            Err(error) => {
+                client.poison("tool discovery failed".into());
+                client.reap().await;
+                return Err(error);
+            }
+        };
+        // Discovery establishes the static manifest only. The declared
+        // lifecycle is Lazy, so no server stays resident until first invoke.
+        client.poison("tool discovery completed".into());
+        client.reap().await;
         let tool_specs: Vec<ToolSpec> = tools
             .into_iter()
             .map(|tool| ToolSpec {
@@ -406,7 +691,7 @@ impl McpCapabilityAdapter {
             decl,
             request_timeout,
             max_frame_bytes,
-            client: tokio::sync::Mutex::new(Some(client)),
+            client: tokio::sync::Mutex::new(None),
         })
     }
 }
@@ -428,17 +713,34 @@ impl Capability for McpCapabilityAdapter {
     async fn invoke(
         &self,
         call: ToolCall,
-        _ctx: CapabilityInvocationContext,
+        ctx: CapabilityInvocationContext,
     ) -> AgentResult<CapabilityOutcome> {
+        if ctx.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
         let mut guard = self.client.lock().await;
-        if guard.is_none() {
+        // Cancellation may occur while queued behind the single-inflight
+        // lock; do not reconnect or write a request after that point.
+        if ctx.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        if guard.as_ref().is_none_or(|client| client.is_poisoned()) {
+            // A poisoned client (timeout, cancel, framing failure) is
+            // replaced with a fresh connection; the old server tree was
+            // already killed and reaped, so its late output can never be
+            // admitted.
+            if let Some(mut stale) = guard.take() {
+                stale.reap().await;
+            }
             *guard = Some(
                 McpClient::connect_stdio(&self.decl, self.request_timeout, self.max_frame_bytes)
                     .await?,
             );
         }
         let client = guard.as_mut().expect("client present after ensure");
-        let result = client.call_tool(&call.name, call.arguments).await?;
+        let result = client
+            .call_tool_with_cancel(&call.name, call.arguments, &ctx.cancel)
+            .await?;
         let output = ToolOutput {
             call_id: call.id,
             tool_name: call.name,
@@ -453,6 +755,17 @@ impl Capability for McpCapabilityAdapter {
             metadata: json!({"mcp": true, "is_error": result.is_error}),
         };
         Ok(CapabilityOutcome::Value(output))
+    }
+
+    /// Teardown: the owned server child is killed and reaped, so host stop
+    /// never leaves the server process behind.
+    async fn stop(&self) -> AgentResult<()> {
+        let mut guard = self.client.lock().await;
+        if let Some(mut client) = guard.take() {
+            client.poison("capability stopped by the runtime".into());
+            client.reap().await;
+        }
+        Ok(())
     }
 }
 
@@ -645,7 +958,6 @@ mod tests {
             1024 * 1024,
         );
         // Skip the real handshake protocol details: drive calls directly.
-        client.next_id = 1;
         let result = client
             .call_tool("mock.echo", json!({"text": "x"}))
             .await
@@ -672,10 +984,163 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn notification_flood_is_bounded_and_poisons_the_client() {
+        // A server that streams notifications forever instead of answering:
+        // the client must stop after the skip bound and poison itself, so a
+        // flooding server is never read forever and a later call cannot
+        // mistake a stale frame for its answer.
+        let (client_read, mut server_write) = duplex(64 * 1024);
+        let (_server_read, client_write) = duplex(64 * 1024);
+        tokio::spawn(async move {
+            let flood = DEFAULT_MAX_SKIPPED_FRAMES_PER_REQUEST + 10;
+            for _ in 0..flood {
+                let _ = server_write
+                    .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"server/notification\"}\n")
+                    .await;
+            }
+            let _ = server_write.flush().await;
+            // Never answer the request; the client must give up on its own.
+            std::future::pending::<()>().await;
+        });
+        let mut client = McpClient::new(
+            client_read,
+            client_write,
+            Duration::from_secs(5),
+            1024 * 1024,
+        );
+        let result = client.call_tool("mock.echo", json!({})).await;
+        assert!(
+            result.is_err(),
+            "a notification flood must not be read forever"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("notification flood"),
+            "the flood must be named in the error"
+        );
+        assert!(client.is_poisoned(), "the flooded client must be poisoned");
+
+        let second = client.call_tool("mock.echo", json!({})).await;
+        assert!(
+            second.is_err(),
+            "a poisoned client rejects further calls immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn decoded_json_node_budget_poisons_the_client() {
+        let (client_read, mut server_write) = duplex(512 * 1024);
+        let (_server_read, client_write) = duplex(64 * 1024);
+        tokio::spawn(async move {
+            let mut frame = Vec::from(&b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":["[..]);
+            for index in 0..70_000 {
+                if index > 0 {
+                    frame.push(b',');
+                }
+                frame.extend_from_slice(b"{}");
+            }
+            frame.extend_from_slice(b"]}\n");
+            let _ = server_write.write_all(&frame).await;
+            let _ = server_write.flush().await;
+        });
+        let mut client = McpClient::new(
+            client_read,
+            client_write,
+            Duration::from_secs(5),
+            1024 * 1024,
+        );
+        let error = client.call_tool("mock.echo", json!({})).await.unwrap_err();
+        assert!(
+            error.to_string().contains("json decode budget"),
+            "a frame-legal empty-object array must fail the decoded node budget, got: {error}"
+        );
+        assert!(client.is_poisoned());
+    }
+
+    #[tokio::test]
+    async fn notification_bytes_are_bounded_even_below_the_count_limit() {
+        let (client_read, mut server_write) = duplex(64 * 1024);
+        let (_server_read, client_write) = duplex(64 * 1024);
+        tokio::spawn(async move {
+            // Four sub-frame notifications exceed the cumulative 1 KiB
+            // skipped-byte budget while staying far below the count bound.
+            let frame = format!(
+                "{{\"jsonrpc\":\"2.0\",\"method\":\"notice\",\"params\":{{\"data\":\"{}\"}}}}\n",
+                "x".repeat(300)
+            );
+            for _ in 0..4 {
+                let _ = server_write.write_all(frame.as_bytes()).await;
+            }
+            let _ = server_write.flush().await;
+            std::future::pending::<()>().await;
+        });
+        let mut client = McpClient::new(client_read, client_write, Duration::from_secs(5), 1024);
+        let error = client.call_tool("mock.echo", json!({})).await.unwrap_err();
+        assert!(error.to_string().contains("notification flood"));
+        assert!(client.is_poisoned());
+    }
+
+    #[tokio::test]
+    async fn outbound_oversize_writes_nothing_and_connection_remains_usable() {
+        let (client_read, server_write) = duplex(64 * 1024);
+        let (server_read, client_write) = duplex(64 * 1024);
+        tokio::spawn(async move {
+            mock_server(server_read, server_write).await;
+        });
+        let mut client = McpClient::new(client_read, client_write, Duration::from_secs(5), 512);
+        let error = client
+            .call_tool("mock.echo", json!({"text": "x".repeat(1024)}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("nothing was written"));
+        assert!(!client.is_poisoned());
+
+        let result = client
+            .call_tool("mock.echo", json!({"text": "small"}))
+            .await
+            .expect("pre-write rejection leaves framing intact");
+        assert_eq!(result.text, "small");
+    }
+
+    #[tokio::test]
+    async fn oversize_frame_is_rejected_while_reading_and_poisons() {
+        // A single over-cap line: the incremental frame reader must reject
+        // it while reading (never buffer it in full) and poison the client.
+        let (client_read, mut server_write) = duplex(64 * 1024);
+        let (_server_read, client_write) = duplex(64 * 1024);
+        tokio::spawn(async move {
+            let mut line = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"".to_vec();
+            line.extend(std::iter::repeat_n(b'x', 2 * 1024 * 1024));
+            line.extend_from_slice(b"\"}]}}\n");
+            let _ = server_write.write_all(&line).await;
+            let _ = server_write.flush().await;
+            std::future::pending::<()>().await;
+        });
+        let mut client =
+            McpClient::new(client_read, client_write, Duration::from_secs(5), 64 * 1024);
+        let result = client.call_tool("mock.echo", json!({})).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("byte limit"),
+            "oversize must be reported as a frame-bound violation"
+        );
+        assert!(client.is_poisoned(), "the client must be poisoned");
+
+        let second = client.call_tool("mock.echo", json!({})).await;
+        assert!(
+            second.is_err(),
+            "a poisoned client rejects further calls immediately"
+        );
+    }
+
     #[test]
     fn text_clipping_is_bounded() {
         let long = "x".repeat(MAX_MCP_TOOL_TEXT_CHARS + 500);
-        let clipped = clip_text(&long);
+        let content = vec![json!({"type": "text", "text": long})];
+        let clipped = bounded_tool_text(Some(&content));
         assert!(
             clipped.chars().count() <= MAX_MCP_TOOL_TEXT_CHARS + 64,
             "clip must stay bounded"
@@ -730,6 +1195,10 @@ mod tests {
         assert!(manifest.tools.iter().any(|t| t.name == "mock.echo"));
         assert!(manifest.tools.iter().any(|t| t.name == "mock.add"));
         assert!(manifest.tools.iter().any(|t| t.name == "mock.fail"));
+        assert!(
+            adapter.client.lock().await.is_none(),
+            "lazy discovery must reap its temporary server"
+        );
 
         // Invoke mock.echo through the Capability boundary.
         let call = ToolCall {
@@ -749,6 +1218,10 @@ mod tests {
             )
             .await
             .expect("invoke succeeds");
+        assert!(
+            adapter.client.lock().await.is_some(),
+            "first invoke must establish the lazy execution session"
+        );
         let CapabilityOutcome::Value(output) = outcome else {
             panic!("mock.echo must return a plain value");
         };

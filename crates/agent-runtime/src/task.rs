@@ -13,11 +13,12 @@
 //! scopes. A prepared-but-uncommitted transition is simply discarded.
 
 use agent_contracts::{
-    AgentError, AgentResult, AnchorPatchKind, CompletionProposal, MAX_COMPLETION_ARTIFACTS,
-    MAX_COMPLETION_REF_CHARS, MAX_COMPLETION_SUMMARY_CHARS, MAX_TASK_ANCHOR_CHANGED_FIELDS,
-    MAX_TASK_ANCHOR_CLAIMS, MAX_TASK_ANCHOR_ITEM_CHARS, MAX_TASK_ANCHOR_LIST_ITEMS,
-    MAX_TASK_ANCHOR_TEXT_CHARS, MAX_TASK_TOOL_REQUIREMENTS, MAX_TOOL_REQUIREMENT_NAME_CHARS,
-    MAX_TOOL_REQUIREMENT_REASON_CHARS, TaskId, ToolSurfaceRequirement,
+    AgentError, AgentResult, AnchorPatchKind, ArtifactLocator, CompletionProposal,
+    MAX_COMPLETION_ARTIFACTS, MAX_COMPLETION_REF_CHARS, MAX_COMPLETION_SUMMARY_CHARS,
+    MAX_TASK_ANCHOR_CHANGED_FIELDS, MAX_TASK_ANCHOR_CLAIMS, MAX_TASK_ANCHOR_ITEM_CHARS,
+    MAX_TASK_ANCHOR_LIST_ITEMS, MAX_TASK_ANCHOR_TEXT_CHARS, MAX_TASK_TOOL_REQUIREMENTS,
+    MAX_TOOL_REQUIREMENT_NAME_CHARS, MAX_TOOL_REQUIREMENT_REASON_CHARS, TaskId,
+    ToolSurfaceRequirement,
 };
 
 /// Lifecycle of a task. `Suspended` tasks keep their scopes in the engine
@@ -209,6 +210,44 @@ pub enum RootClaimStrength {
     Recallable,
 }
 
+/// 把任务锚的根声明投影为上下文策略消费的有界集合。任务权威留在
+/// `TaskManager`；GC/materialization 只看到这条投影（有界、按强度原样
+/// 映射、来源字段保留），从不复制锚本身。working_refs 与 evidence_refs
+/// 都投影；超出 `MAX_ANCHOR_ROOT_CLAIMS` 的尾部截断（TaskAnchor 本身
+/// 已被 `MAX_TASK_ANCHOR_CLAIMS` 限制，双上限下投影不会膨胀）。
+pub fn anchor_root_claims(anchor: &TaskAnchor) -> Vec<agent_contracts::AnchorRootClaim> {
+    let mut claims = Vec::with_capacity(
+        anchor
+            .working_refs
+            .len()
+            .saturating_add(anchor.evidence_refs.len()),
+    );
+    for claim in anchor
+        .working_refs
+        .iter()
+        .chain(anchor.evidence_refs.iter())
+    {
+        claims.push(agent_contracts::AnchorRootClaim {
+            item_ref: claim.item_ref.clone(),
+            strength: match claim.strength {
+                RootClaimStrength::PromptRequired => {
+                    agent_contracts::AnchorRootStrength::PromptRequired
+                }
+                RootClaimStrength::ResidentRequired => {
+                    agent_contracts::AnchorRootStrength::ResidentRequired
+                }
+                RootClaimStrength::StorageRequired => {
+                    agent_contracts::AnchorRootStrength::StorageRequired
+                }
+                RootClaimStrength::Recallable => agent_contracts::AnchorRootStrength::Recallable,
+            },
+            source_field_id: claim.source_field_id.clone(),
+        });
+    }
+    claims.truncate(agent_contracts::MAX_ANCHOR_ROOT_CLAIMS);
+    claims
+}
+
 /// One immutable, typed task completion outcome.
 ///
 /// A completed task owns exactly one committed `CompletionRecord`: it is the
@@ -241,7 +280,11 @@ pub struct CompletionRecord {
 /// of artifact refs, each a genuine `artifact://` reference of bounded
 /// length. The same caps that guard a persisted `CompletionRecord` guard
 /// the proposal, so a committed record can never exceed them.
-pub(crate) fn validate_completion_proposal(proposal: &CompletionProposal) -> AgentResult<()> {
+pub(crate) fn validate_completion_proposal(
+    proposal: &CompletionProposal,
+    workspace: Option<&agent_workspace::Workspace>,
+    run_id: agent_contracts::RunId,
+) -> AgentResult<()> {
     if proposal.summary.trim().is_empty() {
         return Err(AgentError::InvalidRequest(
             "completion summary must not be empty".into(),
@@ -260,17 +303,20 @@ pub(crate) fn validate_completion_proposal(proposal: &CompletionProposal) -> Age
         )));
     }
     for artifact in &proposal.artifacts {
-        if !artifact.starts_with("artifact://") {
-            return Err(AgentError::InvalidRequest(format!(
-                "completion artifact must be an artifact:// reference: {artifact:?}"
-            )));
-        }
+        let locator = ArtifactLocator::parse_sealed(artifact)?;
         if artifact.chars().count() > MAX_COMPLETION_REF_CHARS {
             return Err(AgentError::InvalidRequest(format!(
                 "completion artifact ref has {} chars, above the {MAX_COMPLETION_REF_CHARS} cap",
                 artifact.chars().count()
             )));
         }
+        let Some(workspace) = workspace else {
+            return Err(AgentError::InvalidRequest(
+                "completion artifacts require a trusted artifact workspace".into(),
+            ));
+        };
+        locator.ensure_run(run_id)?;
+        workspace.artifact_relative_path_for_run(artifact, run_id)?;
     }
     Ok(())
 }
@@ -1551,5 +1597,71 @@ mod tests {
         assert_eq!(stored.anchor_revision, 1);
         assert_eq!(stored.summary, "auth refactor shipped");
         assert_eq!(tasks.active(), None);
+    }
+
+    #[test]
+    fn anchor_root_claims_project_boundedly_with_strength_and_source() {
+        use agent_contracts::AnchorRootStrength;
+        let anchor = TaskAnchor {
+            original_goal: "refactor auth".into(),
+            current_interpretation: "split the module".into(),
+            working_refs: vec![
+                ContextRootClaim {
+                    item_ref: "context://run/abc".into(),
+                    role: RootClaimRole::ActiveDecision,
+                    strength: RootClaimStrength::PromptRequired,
+                    source_field_id: "working_refs".into(),
+                },
+                ContextRootClaim {
+                    item_ref: "AuthService.rs".into(),
+                    role: RootClaimRole::WorkingArtifact,
+                    strength: RootClaimStrength::ResidentRequired,
+                    source_field_id: "plan_progress".into(),
+                },
+            ],
+            evidence_refs: vec![ContextRootClaim {
+                item_ref: "context://run/evidence".into(),
+                role: RootClaimRole::Verification,
+                strength: RootClaimStrength::StorageRequired,
+                source_field_id: "evidence_refs".into(),
+            }],
+            ..TaskAnchor::default()
+        };
+        let claims = anchor_root_claims(&anchor);
+        assert_eq!(claims.len(), 3, "working + evidence 全部投影");
+        assert_eq!(claims[0].item_ref, "context://run/abc");
+        assert_eq!(
+            claims[0].strength,
+            AnchorRootStrength::PromptRequired,
+            "强度原样映射"
+        );
+        assert_eq!(claims[0].source_field_id, "working_refs");
+        assert_eq!(claims[1].strength, AnchorRootStrength::ResidentRequired);
+        assert_eq!(claims[2].strength, AnchorRootStrength::StorageRequired);
+        assert_eq!(claims[2].source_field_id, "evidence_refs");
+    }
+
+    #[test]
+    fn anchor_root_claims_truncate_beyond_the_projection_cap() {
+        let mut working = Vec::new();
+        for i in 0..(agent_contracts::MAX_ANCHOR_ROOT_CLAIMS + 8) {
+            working.push(ContextRootClaim {
+                item_ref: format!("item-{i}"),
+                role: RootClaimRole::WorkingArtifact,
+                strength: RootClaimStrength::Recallable,
+                source_field_id: "working_refs".into(),
+            });
+        }
+        let anchor = TaskAnchor {
+            original_goal: "x".into(),
+            working_refs: working,
+            ..TaskAnchor::default()
+        };
+        let claims = anchor_root_claims(&anchor);
+        assert_eq!(
+            claims.len(),
+            agent_contracts::MAX_ANCHOR_ROOT_CLAIMS,
+            "投影必须截断到有界上限"
+        );
     }
 }

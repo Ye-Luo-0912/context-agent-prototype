@@ -7,9 +7,13 @@
 //! The provider normalizes vendor wire chunks into `ModelChunk` events and
 //! returns the final assembled `ModelOutput` (content, tool calls, usage). All
 //! vendor-specific parsing lives here; the kernel only sees the contract.
+//!
+//! OpenAI 函数名不允许 `.` / `:`。出网时由 `wire_names` 换成 `_`，回包还原成
+//! Core 工具 id，避免 `fs.list` 这类内建名被上游 400。
 
 mod retry;
 mod sse;
+mod wire_names;
 
 pub use retry::RetryingTransport;
 
@@ -27,6 +31,7 @@ use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
 
 use crate::sse::{StreamAccumulator, WireChunk, parse_sse_data};
+use crate::wire_names::ToolNameCodec;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiConfig {
@@ -104,7 +109,8 @@ impl ModelTransport for OpenAiProvider {
         request: ModelRequest,
         sink: &dyn ModelEventSink,
     ) -> AgentResult<ModelOutput> {
-        let payload = build_wire_request(&request, &self.config);
+        let codec = ToolNameCodec::from_request(&request)?;
+        let payload = build_wire_request(&request, &self.config, &codec);
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
@@ -170,7 +176,7 @@ impl ModelTransport for OpenAiProvider {
                             match serde_json::from_str::<WireChunk>(payload) {
                                 Ok(chunk) => {
                                     for event in accumulator.apply(&chunk) {
-                                        sink.on_chunk(event).await?;
+                                        sink.on_chunk(codec.remap_chunk(event)).await?;
                                     }
                                 }
                                 Err(error) => {
@@ -192,6 +198,7 @@ impl ModelTransport for OpenAiProvider {
 
         let usage = accumulator.usage.clone().unwrap_or_default();
         let (content, tool_calls) = accumulator.finalize();
+        let tool_calls = codec.remap_calls(tool_calls);
         sink.on_chunk(ModelChunk::Done).await?;
 
         Ok(ModelOutput {
@@ -202,7 +209,11 @@ impl ModelTransport for OpenAiProvider {
     }
 }
 
-fn build_wire_request(request: &ModelRequest, config: &OpenAiConfig) -> Value {
+fn build_wire_request(
+    request: &ModelRequest,
+    config: &OpenAiConfig,
+    codec: &ToolNameCodec,
+) -> Value {
     let messages: Vec<Value> = request
         .messages
         .iter()
@@ -222,7 +233,7 @@ fn build_wire_request(request: &ModelRequest, config: &OpenAiConfig) -> Value {
                                 "id": call.id,
                                 "type": "function",
                                 "function": {
-                                    "name": call.name,
+                                    "name": codec.to_wire(&call.name),
                                     "arguments": call.arguments.to_string(),
                                 }
                             })
@@ -250,7 +261,7 @@ fn build_wire_request(request: &ModelRequest, config: &OpenAiConfig) -> Value {
             json!({
                 "type": "function",
                 "function": {
-                    "name": tool.name,
+                    "name": codec.to_wire(&tool.name),
                     "description": tool.description,
                     "parameters": tool.input_schema,
                 }
@@ -332,13 +343,14 @@ mod tests {
             send_max_tokens: true,
             max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
         };
-        let wire = build_wire_request(&request, &config);
+        let codec = ToolNameCodec::from_request(&request).expect("no name collision");
+        let wire = build_wire_request(&request, &config, &codec);
         assert_eq!(wire["model"], "deepseek-chat");
         assert_eq!(wire["stream"], true);
         assert_eq!(wire["stream_options"]["include_usage"], true);
         assert_eq!(wire["messages"][0]["role"], "system");
         assert_eq!(wire["messages"][1]["role"], "user");
-        assert_eq!(wire["tools"][0]["function"]["name"], "fs.list");
+        assert_eq!(wire["tools"][0]["function"]["name"], "fs_list");
         assert_eq!(wire["max_tokens"], 2048);
 
         // Assistant tool calls serialize as function calls with string args.
@@ -346,7 +358,7 @@ mod tests {
         assert_eq!(assistant["role"], "assistant");
         assert_eq!(assistant["tool_calls"][0]["id"], "call-1");
         assert_eq!(assistant["tool_calls"][0]["type"], "function");
-        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "fs.list");
+        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "fs_list");
         assert_eq!(
             assistant["tool_calls"][0]["function"]["arguments"],
             "{\"path\":\"\"}"
@@ -377,7 +389,8 @@ mod tests {
             send_max_tokens: false,
             max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
         };
-        let wire = build_wire_request(&request, &config);
+        let codec = ToolNameCodec::from_request(&request).expect("no name collision");
+        let wire = build_wire_request(&request, &config, &codec);
         assert!(
             wire.get("stream_options").is_none(),
             "a provider that rejects stream_options must not receive it"
@@ -387,6 +400,88 @@ mod tests {
             "a provider that rejects max_tokens must not receive it"
         );
         assert_eq!(wire["stream"], true);
+    }
+
+    fn dummy_config(base_url: String) -> OpenAiConfig {
+        OpenAiConfig {
+            api_key: "secret".into(),
+            base_url,
+            model: "mock".into(),
+            max_output_tokens: 64,
+            timeout: Duration::from_secs(5),
+            send_stream_options: false,
+            send_max_tokens: false,
+            max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
+        }
+    }
+
+    fn fs_list_request() -> ModelRequest {
+        ModelRequest {
+            messages: vec![ModelMessage::user("list files")],
+            tools: vec![ToolSpec {
+                name: "fs.list".into(),
+                description: "list files".into(),
+                input_schema: json!({"type": "object"}),
+                risk: agent_contracts::ToolRisk::ReadOnly,
+                output_budget: None,
+            }],
+            metadata: json!({}),
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn colliding_wire_names_fail_before_the_http_call() {
+        let provider = OpenAiProvider::new(dummy_config("http://127.0.0.1:1/v1".into()));
+        let mut request = fs_list_request();
+        request.tools.push(ToolSpec {
+            name: "fs_list".into(),
+            description: "already underscored".into(),
+            input_schema: json!({"type": "object"}),
+            risk: agent_contracts::ToolRisk::ReadOnly,
+            output_budget: None,
+        });
+        let error = provider.complete(request).await.unwrap_err().to_string();
+        assert!(
+            error.contains("both serialize"),
+            "collision must be named: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dotted_core_tool_ids_round_trip_on_the_wire() {
+        // 上游看到 fs_list；内核仍收到 fs.list。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let n = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                request.contains("\"fs_list\""),
+                "wire function name must be OpenAI-legal: {request}"
+            );
+            assert!(
+                !request.contains("\"fs.list\""),
+                "Core id must not appear as the function name: {request}"
+            );
+            let sse = concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"fs_list\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let provider = OpenAiProvider::new(dummy_config(format!("http://{addr}/v1")));
+        let output = provider.complete(fs_list_request()).await.unwrap();
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].id, "c1");
+        assert_eq!(output.tool_calls[0].name, "fs.list");
     }
 
     #[test]

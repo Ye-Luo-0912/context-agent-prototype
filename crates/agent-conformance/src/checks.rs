@@ -3,7 +3,7 @@
 //! against concrete dispatchers and assert the aggregate report is clean.
 
 use agent_contracts::{
-    AgentError, CAPABILITY_MANAGE, CONTEXT_MANAGE, MAX_TOOL_METADATA_BYTES,
+    AgentError, ArtifactLocator, CAPABILITY_MANAGE, CONTEXT_MANAGE, MAX_TOOL_METADATA_BYTES,
     MAX_TOOL_MODEL_CONTENT_CHARS, MAX_TOOL_OUTPUT_TOTAL_CHARS, MAX_TOOL_SUMMARY_CHARS,
     MAX_TOOL_SURFACE_REPORT_NAME_BYTES, ToolDispatcher, ToolOutput, ToolSpec,
 };
@@ -135,14 +135,14 @@ pub fn check_output_envelope(output: &ToolOutput) -> Vec<ConformanceViolation> {
             "a failed result must carry a non-empty summary explaining the failure",
         ));
     }
-    if let Some(reference) = &output.artifact_ref
-        && !reference.starts_with("artifact://")
-    {
-        violations.push(ConformanceViolation::new(
-            &subject,
-            "output",
-            format!("artifact_ref must be an artifact:// reference, got: {reference:?}"),
-        ));
+    if let Some(reference) = &output.artifact_ref {
+        if let Err(error) = ArtifactLocator::parse(reference) {
+            violations.push(ConformanceViolation::new(
+                &subject,
+                "output",
+                format!("artifact_ref is not a canonical owner/digest locator: {error}"),
+            ));
+        }
     }
     violations
 }

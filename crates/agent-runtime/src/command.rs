@@ -1,8 +1,8 @@
 //! Runtime commands and the handle callers use to drive the actor.
 
 use agent_contracts::{
-    AgentError, AgentResult, ContextItemSummary, RunId, RuntimeEventEnvelope, TaskId,
-    ToolSurfaceRequirement,
+    AgentError, AgentResult, ContextItemSummary, OperationId, OperationQueryResult, RunId,
+    RuntimeEventEnvelope, TaskId, ToolOperationIdentity, ToolSurfaceRequirement, TurnCancelAck,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -20,10 +20,13 @@ pub enum RuntimeCommand {
     Start {
         reply: Reply<AgentResult<()>>,
     },
+    /// 用户对话。Actor 收成 `RuntimeInputEnvelope`（Dialogue / UserSteering）。
+    /// 周转中最多排队一条；`/cancel` `/focus` `/done` 不走这条命令。
     UserMessage {
         content: String,
         reply: Reply<AgentResult<()>>,
     },
+    /// 显式改焦点。直达命令，不经 UserMessage 解释。
     SetFocus {
         goal: String,
         reply: Reply<AgentResult<()>>,
@@ -71,6 +74,7 @@ pub enum RuntimeCommand {
         content: String,
         reply: Reply<AgentResult<()>>,
     },
+    /// `/done`：直达完成命令，不经 UserMessage。
     CompleteTask {
         summary: String,
         reply: Reply<AgentResult<()>>,
@@ -78,10 +82,19 @@ pub enum RuntimeCommand {
     Checkpoint {
         reply: Reply<AgentResult<RuntimeCheckpoint>>,
     },
-    /// Restore the runtime (task table, current task, context engine) from
-    /// a checkpoint. The host re-applies the capability surface separately.
-    Restore {
+    /// Prepare a full restore: transactionally install context + task
+    /// authority, then leave the actor fenced until the host has applied
+    /// the capability plane and sends `FinalizeRestore`.
+    PrepareRestore {
         checkpoint: RuntimeCheckpoint,
+        reply: Reply<AgentResult<u64>>,
+    },
+    /// Publish the durable restore-commit record with the host's actual
+    /// capability-application result. Only a successful barrier clears the
+    /// recovery fence left by `PrepareRestore`.
+    FinalizeRestore {
+        restore_id: u64,
+        capabilities_applied: bool,
         reply: Reply<AgentResult<()>>,
     },
     EmitDiagnostics {
@@ -91,8 +104,22 @@ pub enum RuntimeCommand {
         limit: usize,
         reply: Reply<AgentResult<Vec<ContextItemSummary>>>,
     },
+    /// Read Core's bounded authority truth for one tool operation. This is
+    /// diagnostic/control-plane state, not a request to redispatch work.
+    QueryOperation {
+        operation_id: OperationId,
+        reply: Reply<AgentResult<OperationQueryResult>>,
+    },
+    /// Cancel only the current in-flight tool operation when every identity
+    /// field matches. Historical, model, and partially matching operations
+    /// are deliberately outside this V1 control surface.
+    CancelOperation {
+        identity: ToolOperationIdentity,
+        reply: Reply<AgentResult<OperationQueryResult>>,
+    },
+    /// `/cancel`：直达取消，不经 UserMessage 信封解释。
     CancelTurn {
-        reply: Reply<()>,
+        reply: Reply<AgentResult<TurnCancelAck>>,
     },
     Stop {
         reply: Reply<AgentResult<()>>,
@@ -232,20 +259,35 @@ impl RuntimeHandle {
             .await
     }
 
-    /// Snapshot of the whole runtime: the actor's state (task table, current
-    /// task) plus the context engine's checkpoint. Capability surface state
-    /// is merged in by `RuntimeInstance`, which owns the host.
-    pub async fn checkpoint(&self) -> AgentResult<RuntimeCheckpoint> {
+    /// Capture the actor-owned checkpoint plane for `RuntimeInstance`.
+    /// Kept crate-private because this value deliberately omits host-owned
+    /// capability state and must never be persisted as a complete runtime
+    /// checkpoint by an external caller.
+    pub(crate) async fn checkpoint(&self) -> AgentResult<RuntimeCheckpoint> {
         self.call(|reply| RuntimeCommand::Checkpoint { reply })
             .await
     }
 
-    /// Restore the actor-side state (task table, current task, context
-    /// engine) from a checkpoint. Call `RuntimeInstance::restore` instead to
-    /// also restore the capability surface.
-    pub async fn restore(&self, checkpoint: RuntimeCheckpoint) -> AgentResult<()> {
-        self.call(|reply| RuntimeCommand::Restore { checkpoint, reply })
+    /// First half of `RuntimeInstance::restore`. Kept crate-private so a
+    /// caller cannot prepare actor state and forget to finalize it.
+    pub(crate) async fn prepare_restore(&self, checkpoint: RuntimeCheckpoint) -> AgentResult<u64> {
+        self.call(|reply| RuntimeCommand::PrepareRestore { checkpoint, reply })
             .await
+    }
+
+    /// Second half of `RuntimeInstance::restore`: durably commit the
+    /// prepared state after the host capability plane has been applied.
+    pub(crate) async fn finalize_restore(
+        &self,
+        restore_id: u64,
+        capabilities_applied: bool,
+    ) -> AgentResult<()> {
+        self.call(|reply| RuntimeCommand::FinalizeRestore {
+            restore_id,
+            capabilities_applied,
+            reply,
+        })
+        .await
     }
 
     pub async fn emit_diagnostics(&self) -> AgentResult<()> {
@@ -258,19 +300,57 @@ impl RuntimeHandle {
             .await
     }
 
+    /// Read Core's exact retained truth for one tool operation. The three
+    /// results stay distinct: `ExpiredOrPossiblySeen` must never be treated
+    /// as `NotFound` or permission to execute the operation again.
+    ///
+    /// This trusted in-process seam performs no external caller
+    /// authorization. A Platform router must enforce run visibility before
+    /// forwarding an operation id.
+    pub async fn query_operation(
+        &self,
+        operation_id: OperationId,
+    ) -> AgentResult<OperationQueryResult> {
+        self.call(|reply| RuntimeCommand::QueryOperation {
+            operation_id,
+            reply,
+        })
+        .await
+    }
+
+    /// Cancel the current in-flight tool operation through the owning turn.
+    /// The complete identity must match Runtime's active operation exactly;
+    /// a newly won cancellation is returned only after Core records
+    /// `CancelledBeforeCommit` and the distinct `TurnCancelled` durability
+    /// barrier succeeds. If Core had already reached a terminal or
+    /// `CommitStarted` state, `Ok` instead carries that pre-existing truth
+    /// without relabelling it as a successful cancellation.
+    ///
+    /// This trusted in-process seam performs no external authorization. A
+    /// Platform router must verify run visibility and control permission,
+    /// query by the envelope's work identity, and canonicalize the complete
+    /// identity from Core's snapshot before calling it. Query can recover
+    /// Core cancellation truth after a lost reply, but it does not prove the
+    /// actor's distinct durable `TurnCancelled` acknowledgement; without a
+    /// persisted actor ACK marker, cancellation must not be reported as a
+    /// retry success. This method is intentionally not a general historical-
+    /// operation kill or blind-retry API.
+    /// `CancelledBeforeCommit` only proves the Core-mediated commit did not
+    /// start; it cannot undo mutations a non-transactional child process
+    /// already performed before observing cancellation.
+    pub async fn cancel_operation(
+        &self,
+        identity: ToolOperationIdentity,
+    ) -> AgentResult<OperationQueryResult> {
+        self.call(|reply| RuntimeCommand::CancelOperation { identity, reply })
+            .await
+    }
+
     /// Cancel the in-flight turn (if any). The actor immediately considers
     /// the turn superseded, so its late completion is dropped as stale.
-    pub async fn cancel_turn(&self) {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .tx
-            .send(RuntimeCommand::CancelTurn { reply: tx })
+    pub async fn cancel_turn(&self) -> AgentResult<TurnCancelAck> {
+        self.call(|reply| RuntimeCommand::CancelTurn { reply })
             .await
-            .is_err()
-        {
-            return;
-        }
-        let _ = rx.await;
     }
 
     /// Stop the runtime: cancel any turn, stop the kernel (flush the journal,

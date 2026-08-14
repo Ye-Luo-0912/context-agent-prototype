@@ -44,9 +44,9 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use windows_sys::Wdk::{
     Foundation::OBJECT_ATTRIBUTES,
     Storage::FileSystem::{
-        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
-        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile,
-        NtSetInformationFile,
+        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+        FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile, NtSetInformationFile,
     },
 };
 #[cfg(windows)]
@@ -111,6 +111,32 @@ impl ConfinedDir {
     /// The lexical path this handle was opened through (display only).
     pub fn display(&self) -> &Path {
         &self.display
+    }
+
+    /// Establish a directory-entry durability barrier where the platform
+    /// exposes one. Windows has no supported directory `FlushFileBuffers`
+    /// equivalent; callers still sync the created file itself and retain the
+    /// documented power-loss window for its directory entry.
+    pub(crate) fn sync_all(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            // SAFETY: `dup` creates a new descriptor referring to the same
+            // pinned directory; `File` takes sole ownership of the duplicate.
+            let duplicated = unsafe { libc::dup(self.fd.as_raw_fd()) };
+            if duplicated < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let file = unsafe { std::fs::File::from_raw_fd(duplicated) };
+            file.sync_all()
+        }
+        #[cfg(windows)]
+        {
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            std::fs::File::open(&self.display)?.sync_all()
+        }
     }
 
     /// Open an intermediate component as a directory, refusing to follow a
@@ -294,6 +320,51 @@ impl ConfinedDir {
         {
             let mut options = std::fs::OpenOptions::new();
             options.create_new(true).write(true);
+            options.open(self.display.join(name))
+        }
+    }
+
+    /// Open or create one regular child file for a trusted runtime journal.
+    /// The file is resolved relative to this pinned directory and links are
+    /// never followed. Callers still own serialization, locking and sync.
+    pub(crate) fn open_or_create_regular_file(&self, name: &OsStr) -> io::Result<std::fs::File> {
+        #[cfg(unix)]
+        {
+            let cname = to_cstring(name)?;
+            // SAFETY: `cname` is NUL-terminated. O_NOFOLLOW rejects a link,
+            // and opening a directory read/write fails instead of accepting
+            // it as the authority journal.
+            let fd = unsafe {
+                libc::openat(
+                    self.fd.as_raw_fd(),
+                    cname.as_ptr(),
+                    libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `fd` is a fresh descriptor with no other owner.
+            Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+        }
+        #[cfg(windows)]
+        {
+            let handle = nt_open_relative(
+                self.handle.as_raw_handle(),
+                name,
+                GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
+                FILE_OPEN_IF,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+            )?;
+            check_not_reparse(handle, &self.display.join(name))?;
+            // SAFETY: `handle` is a fresh kernel handle with no other owner.
+            Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).read(true).write(true);
             options.open(self.display.join(name))
         }
     }

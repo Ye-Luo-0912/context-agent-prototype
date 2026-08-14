@@ -1,4 +1,4 @@
-# Initial Architecture
+# Agent OS Architecture
 
 ## 1. Purpose
 
@@ -12,44 +12,141 @@ The first version therefore prioritizes runtime/context boundaries over model fe
 
 ## 2. Layering
 
+The diagram combines the **landed PLAT-01 CorePort boundary**, **landed
+PLAT-02 semantic protocol contract** and **landed PLAT-03a1-a4 Core authority
+plus builtin workspace recovery** with the remaining
+recovery/adapter/SDK/supervision work in
+`PLAT-03..07`; it is not a
+claim that every seam is already a security boundary.
+
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│ Presentation                                                │
-│ agent-tui (composition root)                                │
-│ RuntimeEvent -> RunStateAggregator/AppState -> TUI          │
-└─────────────────────────────┬───────────────────────────────┘
-                              │ User command / RuntimeEvent
-┌─────────────────────────────v───────────────────────────────┐
-│ Orchestrator (evolvable)                                    │
-│ agent-runtime                                               │
-│ RuntimeActor: turn state machine, task manager, scope       │
-│   lifecycle, prompt assembly, effect fence                  │
-│ RuntimeServices: context/model/tool/config scheduling       │
-│ ModuleHost + capability registry + plugin registry          │
-└──────────────┬───────────────────┬──────────────────────────┘
-               │                   │
-     ContextEngine          ToolDispatcher / ModelTransport
-               │                   │
-┌──────────────v───────┐  ┌────────v─────────────────────────┐
-│ Context Selection    │  │ Execution                       │
-│ context-simple       │  │ tool-runtime                    │
-│ working set          │  │ fs / shell                     │
-└──────────────────────┘  └────────┬─────────────────────────┘
-                                  │
-                         ┌────────v─────────────────────────┐
-                         │ agent-workspace                  │
-                         │ cwd boundary / artifacts         │
-                         └──────────────────────────────────┘
+UI / API / user ingress
+          │ RuntimeCommand / RuntimeEvent
+          v
+┌──────────────────────────────────────────────────────────────┐
+│ Platform (evolvable user space) — agent-runtime              │
+│ RuntimeActor: the only task/turn orchestrator                │
+│ TaskAnchor / Episode / Focus / prompt and surface planning   │
+│ ModuleHost / target process supervision / extension lifecycle│
+└───────────────┬──────────────────────────┬───────────────────┘
+                │ CorePort                 │ Platform Protocol
+                │ typed internal calls     │ for isolated modules
+                v                          v
+┌─────────────────────────────┐   ┌────────────────────────────┐
+│ Target Trusted Core /       │   │ Tools / Skill workers /    │
+│ reference monitor           │   │ Agents / MCP / Context     │
+│ grants / leases / effects / │   │ services / model adapters  │
+│ hard bounds / audit         │   │ (no direct Core access)    │
+└───────────────┬─────────────┘   └────────────────────────────┘
+                │ brokered resource operations
+                v
+┌──────────────────────────────────────────────────────────────┐
+│ Workspace / process / network / artifact / durable storage   │
+└──────────────────────────────────────────────────────────────┘
 
-Trusted core (stateless, the agent cannot modify):
-agent-core: CoreAuthority — events / approval / effects / output /
-  tool-execution wiring, plus the admission and state authorities
-  (capability_admission / capability_state / plugin_admission /
-  plugin_state)
-
-RuntimeEvent ───────────────────────────────> agent-storage
-                                               JSONL files
+agent-compose / agent-tui = bootloader and product composition only;
+they do not own a second scheduler or authority loop.
 ```
+
+**Current V1 deployment.** `RuntimeActor` is the only task/turn orchestrator,
+and PLAT-01 now makes its concrete type private. Public trusted composition
+constructs `RuntimeServices`, whose fields and scheduling methods are private
+and whose only Core facade is `Arc<dyn CorePort>`; the concrete
+`CoreAuthority` and its event/approval/effect/output component handles are not
+exported. Capability/plugin admission and state primitives remain explicit
+public Core contracts used by their registries. Mediated effect commits carry
+run/turn/operation/effect/digest/epoch/lease identity. Core owns a
+monotonic authority epoch and a bounded resident
+operation registry. It validates the epoch, exact operation identity and its
+issued lease, assigns prepared-effect IDs, and prevents exact duplicate
+dispatch/commit within the retained authority history. A production-dependency
+conformance test enforces the forbidden graph and prevents isolated adapters
+from importing Core or Runtime internals.
+
+This remains one operator-trusted address space, not process isolation. Core
+now owns the authority epoch; Runtime requests compare-and-swap advances
+and retains only a scheduling mirror. Core rejects stale tool dispatch both
+before and after approval, independently rejects stale effect commit, and
+cancellation advances the Core fence and installs an exact-identity terminal
+reservation before any await or cleanup. A delayed admission therefore observes
+the cancelled duplicate instead of dispatching. The bounded
+registry keeps unresolved operations and recent terminal state, exposes an
+in-process query, and never treats an evicted known ID as unseen. Its fixed-size
+seen-ID filter is fail-closed: a collision is reported as
+`ExpiredOrPossiblySeen` and can reject a genuinely new random ID. PLAT-03a3 now
+persists epoch and operation transitions through a contracts-only journal
+injected by composition. Core performs journal-first state publication;
+`FileOperationJournal` uses an exclusive writer, checksummed monotonic records
+and `sync_all`, repairs only a structurally incomplete final fragment, and
+fails closed on other corruption. It refuses new records before bounded
+recovery/file limits could make the next startup unrecoverable. PLAT-03a4 now
+preallocates the Core-issued `EffectId` before builtin workspace dispatch and
+passes exact operation/digest/effect identity into a separate, bounded,
+checksummed, exclusively locked and `sync_all`-barriered workspace-effect
+journal. Startup reconciles both journals and current file hashes: proven
+not-applied or applied mutations become durable terminal truth; partial,
+corrupt, unmanaged or ambiguous effects remain unresolved and raise the Core
+`RecoveryRequired` mutation fence. Generic shell/process tools now record
+spawn/exit in a sibling authority journal: never-spawned work is
+`NotApplied`, a durable wait settles as `CompletedValue`, and a crash
+window without exit stays `Ambiguous`. Leftover children are killed only
+when the OS create-time token still matches; PID reuse is never killed.
+Process recovery cannot roll back mutations the child already performed.
+Out-of-process capability/MCP invokes now record reserved/dispatch/ack in
+`.focus-agent/authority/remote-effects.jsonl`: never-sent work is
+`NotApplied`, a durable Completed/Failed ack settles as `CompletedValue`,
+and a dispatched crash window stays `Ambiguous`. An in-flight idempotency
+key refuses a second send. This is not a general HTTP exactly-once broker
+and cannot roll back peer mutations. RuntimeCheckpoint v4 now cross-checks an ancestor Core
+WAL marker before restore. The protocol crate defines strict operation
+query/cancel routes and truthful response DTOs. `agent-runtime` now owns a
+transport-independent `OperationControlRouter`: it resolves opaque authority
+references through a trusted composition-provided authorizer, hides foreign
+runs, canonicalizes complete identities from Core query truth, and forwards
+read-only queries and exact-current-tool cancellation through the sole actor.
+The router owns no Core handle, registry, transport or scheduler.
+Core linearizes cancellation against operation terminalization: a won cancel
+persists the epoch fence and exact cancellation terminal before Runtime
+publishes it, while a terminal/commit state that won first is returned
+unchanged and does not spuriously fence the actor. A partial authority-WAL
+failure leaves both Core and Runtime behind an observable recovery fence.
+Core `CancelledBeforeCommit` truth alone is not a Runtime cancellation ACK:
+without a durable actor-side `TurnCancelled` acknowledgement marker, a lost
+reply is resolved by query but is not reported as a replayed success.
+Tool admission is now split from execution: Core first returns a non-cloneable
+admission permit after the `Accepted` snapshot crosses its authority-WAL
+barrier. Runtime installs the in-flight operation and hands that permit back
+to Core; Core publishes `OperationAccepted`, then `ToolStarted`, and only on
+both successes upgrades it to the distinct one-shot dispatch permit.
+Authorized live subscribers therefore have a race-free identity source; an
+exact duplicate has no permit and cannot redispatch. Event history remains
+observability rather than operation authority, so lag is reported and the
+caller must query Core instead of guessing a missing identity. Concrete authenticated session/grant installation for operation-control is
+landed as an in-process adapter: composition installs a bounded session,
+the adapter binds that session to the connection and overwrites peer
+`authority_ref`, and query/cancel still go only through `RuntimeActor`.
+Framed JSON-lines operation-control over an inherited-pipe analogue is
+landed (`FramedProtocolSession` reads/writes bounded frames; the adapter
+still consumes one frame body and never owns the pipe). Named Pipe/UDS
+remain PLAT-08; parse-time decoded JSON DOM budgets, RFC 8785 JCS, explicit
+`legacy.invoke-output.v1` negotiation and the shared adapter fault matrix are
+landed (`PLAT-04`). Adapter envelope migration onto Platform DTOs remains
+`PLAT-07`. Artifact owner/digest
+identity locators are landed. This is not a persistent
+local-service endpoint. V1
+query/cancel requests target only the logical operation and
+must omit `effect_id`; the returned Core snapshot is authoritative for effect
+state. WAL compaction is landed (generation fold + bounded exact-tip
+ancestors). Generic process spawn/exit recovery is landed. In-process
+authenticated operation-control session installation is landed. Out-of-process
+capability/MCP invoke recovery is landed. Saturation metrics remain open.
+Unix synchronizes newly created parent directories; Windows syncs the file but
+retains an explicit power-loss directory-entry limitation because directory
+`FlushFileBuffers` is not a supported barrier.
+PLAT-03 is therefore partial. The workspace-local recovery slice is closed,
+but the system does not claim general crash exactly-once or a non-bypassable
+boundary against a malicious or self-modifying same-process Runtime. The common Platform
+Protocol/SDK and unified process supervision also remain open.
 
 ## 2b. Trust model: four rings, one orchestrator
 
@@ -57,40 +154,58 @@ The system arranges its components into four trust rings. Trust here
 means "who can modify what, and at what point in the run"; each ring has a
 distinct registration path and a distinct default posture.
 
-1. **Trusted core (`agent-core`)** — stateless authority primitives the
-   agent can never modify: `CoreAuthority` (event envelope identity /
-   sequence / durability, approval verdict normalization, effect
-   commit/rollback behind the generation fence, bounded output brokering)
+1. **Trusted core (`agent-core`)** — turn-stateless, operator-trusted
+   authority primitives: `CoreAuthority` (event envelope identity /
+   sequence / durability, approval verdict normalization, mediated effect
+   commit/rollback, bounded output brokering)
    and the admission/state authorities (capability admission, activation /
    quarantine / maturity, plugin package admission, plugin activation).
-   `CoreAuthority` owns no turn state; it is the seam that grows into the
-   long-term Trusted Core.
-2. **Runtime orchestrator (`agent-runtime`)** — everything evolvable:
-   `RuntimeActor` owns the turn state machine (turn frame, generation,
-   what to commit), the task manager, scope lifecycle, prompt assembly and
-   the effect fence; `RuntimeServices` owns scheduling; the module host,
-   capability registry and plugin registry own the extension catalogs.
+   The private concrete `CoreAuthority` owns no task, turn or prompt-frame
+   state and is exposed to `RuntimeServices` only through `CorePort`;
+   capability/plugin admission and state authorities remain explicit Core
+   primitives and intentionally own minimal mutable authority records. PLAT-01
+   narrowed the call surface; PLAT-03a1-a4 added the Core-owned epoch, bounded
+   operation registry and journal-first persistent transitions used for stale
+   and duplicate dispatch/commit validation, plus exact startup reconciliation
+   for builtin workspace mutations. Generic shell/process spawn/exit
+   evidence is now reconciled the same way; out-of-process capability/MCP
+   invokes now use the same reserved/dispatch/ack journal. A future HTTP
+   broker must reuse that barrier; peer mutations are never rolled back.
+2. **Platform / runtime orchestrator (`agent-runtime`)** — evolvable
+   user-space policy and service hosting:
+   `RuntimeActor` owns the turn state machine (turn frame, lifecycle transition
+   requests and what to commit), the task manager, scope lifecycle, prompt
+   assembly and the local epoch mirror; `RuntimeServices` owns scheduling;
+   the module host, capability registry and plugin registry own the extension
+   catalogs.
    There is exactly one orchestrator: no other component owns turn state
    or a second command loop.
-3. **Trusted composition plane (`agent-tui` + trusted modules)** —
+3. **Trusted Platform composition plane (`agent-compose`, `agent-tui`,
+   `tool-runtime` builtins + trusted modules)** —
    operator-trusted wiring. `ModuleHost::add_module` and
    `ServiceRegistry::register` publish typed services (context, model,
    tool, approval, event, artifact) at composition time; a module is
    refused after the host started. Composition adapters are not ordinary
-   plugins: they extend the trusted core plane, never the model-visible
-   catalog.
-4. **Dynamic capability plane (tool-runtime tools, process capabilities,
-   MCP adapters, plugin packages)** — runtime-loadable and permissioned.
+   plugins: they extend the Platform's trusted service plane, never Core
+   authority or the model-visible catalog. The composition root is a
+   bootloader, not a second orchestrator.
+4. **Dynamic extension plane (process capabilities, future executable Skill
+   workers, child Agents, MCP adapters, plugin packages)** — runtime-loadable
+   and permissioned Platform clients.
    Capabilities register through `register_capability` mid-run; every
    out-of-process transport is pinned to `Experimental` + `Disabled` at
    registration and enters the model surface only after explicit enable.
-   Their tools join the dispatcher under the registered grant; skills and
-   hooks are declared metadata that never execute in v0.
+   Their tools join the dispatcher under the registered grant; Skills and
+   hooks are declarative metadata that never execute in v0, so only a Tool,
+   Hook or worker referenced by a future Skill package becomes a protocol
+   peer. The SDK/protocol dependency is the target of `PLAT-07`, not current
+   code.
 
 The rule that binds all four rings: **there is one orchestrator**. The
-runtime actor drives every turn; the core stays stateless and never gains
-a turn loop; a second orchestrator is never introduced, and dynamic
-capabilities can never reach the trusted core plane.
+runtime actor drives every turn; the core stays turn-stateless and never gains
+a turn loop; a second orchestrator is never introduced. Dynamic capabilities
+reach authority only through Platform, while current operator-trusted
+in-process code remains outside a technical isolation boundary.
 
 Vocabulary: *composition module/adapter* names operator-trusted services
 on the composition plane; *capability* names runtime-loadable
@@ -99,48 +214,156 @@ Package* are defined separately in the manifest (ECO-01/ECO-03/ECO-06/
 ECO-07) — skills and hooks are validated metadata, only tools are
 interpreted.
 
+## 2c. Target Agent OS boundary and Platform Protocol
+
+The OS analogy is architectural, not a reason to turn every crate into a
+service:
+
+- **Target Core becomes the reference monitor.** It owns only mechanisms that
+  must eventually be non-bypassable:
+  admission and grant ceilings, short-lived leases, generation validation,
+  effect commit/rollback, hard resource bounds, durable audit identity, and
+  quarantine. It owns no TaskManager, turn loop, prompt, tool-selection
+  policy, child-Agent scheduler, or concrete extension.
+- **Platform becomes the syscall gateway and service manager.** The existing
+  `RuntimeActor` remains the sole orchestrator. It owns task/context policy,
+  lifecycle, unified process supervision, routing and user/model interaction,
+  but it cannot mint authority beyond the limits Core records. Today it owns
+  extension lifecycle while concrete adapters still own their child handles.
+- **Extensions are Platform clients.** Tools, Skills, hooks, child Agents,
+  MCP servers and independently deployed context/model adapters request
+  Platform services. Isolated processes never receive Rust Core/Runtime
+  objects or raw workspace roots. Trusted in-process capabilities may receive
+  permission-scoped `WorkspaceHandle` / `ArtifactHandle` views; those are
+  least-authority Platform facilities, not concrete unrestricted workspaces.
+
+Two contracts must remain distinct:
+
+1. **`CorePort` (landed in `PLAT-01`)** is the narrow internal authority API
+   used by Platform. `RuntimeServices` retains only `Arc<dyn CorePort>` as its
+   Core facade; the concrete Core, its event/approval/effect/output components,
+   and the concrete actor type are private. Commit requests carry run, turn,
+   operation, generation and lease identity. Core validates run identity, its
+   issued lease and its independently owned authority epoch; Runtime can only
+   advance the epoch through compare-and-swap. Composition injects both the
+   persistent authority journal and the builtin workspace reconciler. Core can
+   recover exact workspace mutation truth. RuntimeCheckpoint v4 now carries a
+   stable journal-lineage/generation/prefix/digest marker, validates it before
+   restore mutation, and only advances the live epoch; it never embeds or
+   rewinds operation truth. Typed operation query/cancel DTOs and the
+   authorized transport-independent router, WAL-first acceptance publication
+   and actor-owned control seam are landed. In-process authenticated
+   operation-control session installation is landed. Framed JSON-lines
+   operation-control over an inherited-pipe analogue is landed.
+   Out-of-process capability/MCP invoke recovery is landed.
+   Artifact owner/digest identity locators are landed (sealed SHA-256;
+   live captures remain explicit drafts until seal). Parse-time decoded JSON
+   DOM budgets are landed (`JsonDecodeBudget` at process/MCP/context-service/
+   operation-control parse sites). PLAT-04 common-contract proof is landed
+   (JCS, `legacy.invoke-output.v1` negotiation, shared adapter fault matrix).
+   Adapter envelope migration onto Platform DTOs remains `PLAT-07`.
+   Named Pipe/UDS remain a later measured transport.
+   The port stays an in-process typed Rust call in V1 for cheap, clear
+   transactions. If Self-Iteration makes a modifiable Runtime part of the
+   threat model, the same port may require authenticated isolation; Core still
+   gains no task loop and therefore does not become a second orchestrator.
+2. **Platform Protocol semantics (landed in `PLAT-02`)** live in the bottom-
+   layer `agent-platform-protocol` crate. They define strict typed UUIDs,
+   physical request versus logical operation/effect identity, exact negotiated
+   profiles, schema/argument digests, monotonic remaining deadlines, bounded
+   one-hop causality, an explicit success/error response carrier and a legal
+   retry/effect-state algebra. Core envelope structs reject unknown fields;
+   artifact owner/digest locators are landed as typed payload DTOs.
+   Parse-time decoded JSON DOM budgets are landed. RFC 8785 JCS and the
+   shared adapter fault matrix are landed (`PLAT-04`). Adapter envelope
+   migration stays `PLAT-07`.
+   The protocol becomes the stable boundary for isolated,
+   independently versioned or untrusted components. It owns version/feature
+   negotiation, schema identity, operation and effect ids, deadlines,
+   cancellation, structured errors, recovery queries, bounded frames and
+   artifact references. Tool/effect, context, ingress and managed-Agent
+   operations are typed namespaces of this protocol, not all one generic
+   `Tool` message. A declarative Skill is package metadata, not itself a peer.
+   The existing process/context/MCP adapters do not yet carry this envelope;
+   their migration remains `PLAT-07`, while recoverable operation state
+   remains `PLAT-03`. Operation-control DTOs now
+   exist, but no existing process/context/MCP adapter is permitted to treat
+   that as a migrated or authorized wire endpoint.
+
+**One semantic protocol does not require one physical transport.** All wire
+backends must carry the same bounded envelope and pass the same conformance
+suite, while deployment chooses the least exposed transport:
+
+| Boundary | Default transport |
+| --- | --- |
+| Trusted, same-process hot path | direct trait / actor message |
+| Platform-spawned, one-to-one child | inherited anonymous pipes (dedicated protocol handles; stdout/stderr are logs) |
+| Persistent or independently started local service | Windows Named Pipe / Unix Domain Socket, with ACL or peer-credential checks |
+| External ecosystem or remote service | MCP, HTTP or gRPC adapter terminating into Platform Protocol |
+| Large/binary result | immutable artifact/ref; never the control channel |
+
+Transport identity is connection admission, not operation authority. Every
+request is still checked against the registered grant, run/task scope,
+short-lived lease, operation generation and effect-specific decision. A local
+socket, process id or successful handshake never grants permission by itself.
+
 ## 3. Dependency direction
 
-The intended dependency direction is strict:
+The intended dependency direction is strict. `agent-platform-protocol` is a
+landed bottom-layer semantic DTO/validator crate that depends only on
+`agent-contracts`; `agent-platform-sdk` remains a planned extraction.
 
 ```text
-agent-contracts
-      ^
-      ├──────── context-simple
-      ├──────── agent-workspace
-      ├──────── tool-runtime
-      ├──────── agent-storage
-      ├──────── agent-process          (framed IPC / child lifecycle / sandbox)
-      └──────── agent-core             (stateless authority facade)
-                   ^
-                   ├── agent-runtime   (orchestrator: actor + services +
-                   │                    module host + registries)
-                   │
-                   │   agent-capability-process -> agent-process
-                   │   context-contextcore      -> agent-process
-                 agent-tui             (composition root; wires all
-                                        implementations)
+agent-contracts <- agent-platform-protocol (landed semantic DTOs)
+      ^                         ^
+      │                         └── agent-platform-sdk (planned extension API)
+      ├──────── agent-core          (private concrete Core behind landed CorePort)
+      ├──────── agent-process       (current host/control; target supervisor + transport + framing)
+      ├──────── context-simple / agent-workspace / agent-storage
+      ├──────── tool-runtime        (trusted builtins; narrow workspace/process facilities)
+      └──────── agent-runtime       (Platform; sole orchestrator)
+                       ^
+                       ├── trusted in-process adapters
+                       ├── process/MCP/context/Agent Platform adapters
+                       └── agent-compose / UI / API composition roots
+
+external Tool / Skill / Hook / child Agent
+      └── agent-platform-sdk -> agent-platform-protocol
+          (forbidden: extension -> agent-core | agent-runtime internals)
 ```
 
 Important consequences:
 
 - `agent-core` does not import `context-simple`.
 - `tool-runtime` does not import `context-simple` or any memory implementation.
-- `agent-tui` is the composition root and chooses concrete implementations.
+- `agent-compose` is the reusable composition root; `agent-tui` is one
+  product/frontend root that chooses concrete implementations.
 - `agent-runtime` is the only orchestrator and never imports a concrete
   context engine or tool dispatcher; `agent-core` never imports
   `agent-runtime`.
+- `agent-conformance/tests/dependency_boundaries.rs` checks these production
+  paths transitively, keeps `agent-contracts` at the bottom, and prevents
+  isolated/adapted Platform clients from depending on Core or Runtime.
+- Target dynamic extensions depend on Platform contracts only. They never import
+  `agent-core`, call `CorePort`, access RuntimeActor internals, or turn a
+  connection identity into a permission.
+- Trusted in-process implementations may satisfy the same semantic contract
+  by direct trait call. Process separation follows trust, failure, language
+  and independent-upgrade boundaries, not crate count.
 - `context-contextcore` implements `ContextEngine` over a process without
-  changing the kernel; the framed transport it uses is the shared
-  `agent-process` host, so every process boundary (context service and
-  process capabilities) speaks one framing/deadline/sandbox policy.
-- Future `context-contextcore` can implement `ContextEngine` without changing the kernel.
+  changing the Platform contract; the framed transport it uses is the shared
+  `agent-process` host, so the context service and native process capabilities
+  share one host implementation. This is not yet unified Platform process
+  supervision: each adapter owns lifecycle independently, and MCP has its own
+  stdio client. `PLAT-00` contains the current wire faults; `PLAT-05..07`
+  must still unify supervision, protocol sessions and SDK-facing adapters.
 
 ## 4. Stable contracts
 
 ### ContextEngine
 
-The kernel needs a small fixed surface:
+The Platform needs a small replaceable context surface; Core must not expose
+it to extensions:
 
 1. `ingest` — submit a meaningful runtime observation.
 2. `maintain` — trigger continuous lifecycle maintenance (the semantic
@@ -158,7 +381,9 @@ The kernel needs a small fixed surface:
    inspect returns one entry's metadata without a store read; fetch pulls
    the full content back. See `docs/CONTEXT_LIFECYCLE.md` §9g.
 
-The API is asynchronous even though `context-simple` is in-process. This leaves room for a future ContextCore service adapter over local IPC/HTTP/gRPC without changing the kernel contract.
+The API is asynchronous even though `context-simple` is in-process. This
+leaves room for a future ContextCore service adapter over local IPC/HTTP/gRPC
+without changing the Platform's `ContextEngine` contract.
 
 Since V1-P0-2 the engine never renders prompt text. It answers a
 `ContextQuery { current_input, budget_tokens, hints }` with a
@@ -187,7 +412,7 @@ process-boundary adapter:
   The service runs any in-process engine; swapping it for a real ContextCore
   runtime only changes what process is behind the pipe.
 
-The kernel never knows which one it runs; the composition root selects it
+The RuntimeActor remains implementation-agnostic; the composition root selects it
 (`agent-tui --context=append|rolling|dynamic|service`). `agent-replay
 --compare` replays the same scripted scenarios through all three and reports
 token cost and churn (`docs/EXPERIMENTS.md`).
@@ -199,15 +424,17 @@ explainable `ContextStateTransition`s (`docs/CONTEXT_LIFECYCLE.md` §9b).
 
 ### ModelTransport
 
-The model provider is deliberately outside the kernel. A provider adapter translates `ModelRequest`/`ModelOutput` to a vendor API.
+The model provider is deliberately outside Core. A Platform adapter translates
+`ModelRequest`/`ModelOutput` to a vendor API.
 
-The kernel never depends on provider-specific response IDs, SDK types, or streaming structures.
+Neither Core nor the RuntimeActor depends on provider-specific response IDs,
+SDK types, or streaming structures.
 
 The P1 contract adds:
 
 - `capabilities()` — `ModelCapabilities` (streaming, tool calls, max output
   tokens) so the UI/runtime can branch without vendor knowledge.
-- `complete_stream(request, sink)` — the kernel always drives the model through
+- `complete_stream(request, sink)` — the RuntimeActor always drives the model through
   this. The provider normalizes vendor wire chunks into `ModelChunk`
   (`TextDelta`, `ToolCallDelta`, `Done`) delivered to a `ModelEventSink`, and
   returns the final assembled `ModelOutput`. A default implementation bridges
@@ -215,11 +442,16 @@ The P1 contract adds:
   the streaming loop.
 - Cancellation — `ModelRequest.cancel` is a `CancellationToken`; the provider's
   stream loop `select!`s on it and aborts with `AgentError::Cancelled`. The
-  kernel exposes `cancel_current_turn()`, checks the token between tool rounds,
-  and ends a cancelled turn cleanly (`Warning` + `TurnCompleted`).
+  RuntimeHandle exposes `cancel_current_turn()`, while the actor checks the token between tool rounds,
+  and ends a cancelled turn with a durable, typed `TurnCancelled` event.
+  `TurnCompleted` remains reserved for a successfully committed model/context
+  result, while `RuntimeHandle::cancel_turn` returns `TurnCancelAck` only after
+  the cancellation barrier passes.
 - Streaming deltas are live-only: `RuntimeEvent::ModelDelta` is broadcast to
   UI subscribers but never journaled — the final `AssistantMessage` carries
-  the complete content for replay. Since V1-M9 each delta carries
+  the complete content for replay. Its envelope repeats the durable journal
+  cursor of the `ModelStarted` that opened the stream; it does not allocate a
+  journal sequence number, so persisted traces remain contiguous. Since V1-M9 each delta carries
   `turn_id`/`operation_id`/`generation` and the UI's `RunStateAggregator`
   accepts deltas only for the operation it currently renders, so a late
   delta from a cancelled turn can never leak into the next turn's view —
@@ -232,7 +464,10 @@ The P1 contract adds:
 `provider-openai` speaks the OpenAI Chat Completions SSE protocol, which
 DeepSeek, Qwen, Moonshot/Kimi, GLM, and most vendors also implement: point
 `OpenAiConfig::base_url` at any of them. All vendor wire parsing stays in that
-crate.
+crate. Function names on the wire are mapped to `^[a-zA-Z0-9_-]+$` (`.` and
+`:` become `_`); inbound `tool_calls` are mapped back to Core ids. Two Core
+ids that collapse to the same wire name fail closed before the HTTP call.
+Kernel tool ids are unchanged.
 
 ### ToolDispatcher
 
@@ -313,8 +548,8 @@ read-only meta-tools (`context.gc_hint` / `context.tag` / `context.lease` /
 themselves: each returns a `ToolOutcome::RuntimeDirective` carrying a typed
 `ContextAction` (`Collect` runs the GC pass via `ContextEngine::gc`; the
 rest become a `ContextDirective` ingest) — tools still never touch the
-engine or memory stores (invariant 3), and the kernel stays the only
-authority over how a directive is applied. The model addresses items by the
+  engine or memory stores (invariant 3), and the Platform remains the only
+  scheduler of how a directive is applied through Core's authority checks. The model addresses items by the
 ids exposed in the materialized context frame (`id=<...>` per item), and
 the engine silently ignores directives whose target item is gone.
 
@@ -474,7 +709,7 @@ exist:
 - `PolicyApprovalGate` — automatic policy (`read_only()`, `permissive()`, or a
   custom mix). No UI involved.
 - `InteractiveApprovalGate` — used by the TUI. Works with an `ApprovalBroker`
-  (shared hub): the kernel side broadcasts an `ApprovalRequest` (request id +
+  (shared hub): Core broadcasts an `ApprovalRequest` (request id +
   tool call + spec) and waits on a oneshot; the UI subscribes to the broker,
   shows the tool name and a bounded args preview, and answers y/n/Enter/Esc
   through `InteractiveApprovalGate::respond`. Late subscribers can drain
@@ -499,7 +734,7 @@ turn. `agent-tui` runs in interactive mode by default; `--read-only` selects
 `PolicyApprovalGate::read_only()` (and rejects `--grant`).
 
 ```text
-kernel execute_tool
+CoreAuthority.execute_tool
    │  authorize(call, spec)
    ▼
 InteractiveApprovalGate ── broadcast ──► ApprovalBroker ──► TUI prompt (y/n)
@@ -513,7 +748,7 @@ OutputBroker.bound(run, output)   ── cap fields / spill oversized to artifac
 
 ### Output broker
 
-A trusted `OutputBroker` (`agent-contracts`) runs inside the kernel before
+A trusted `OutputBroker` (`agent-contracts`) runs inside Core before
 any `ToolOutcome` reaches the actor. Every model-facing field has a hard
 cap (`summary` 2 000 chars, `model_content` 16 000 chars, serialized
 `metadata` 8 000 bytes, decoded total 24 000 chars); oversized
@@ -531,14 +766,22 @@ defense for producers that bypass the broker.
 ### EventJournal
 
 Runtime events form the learning/replay substrate. The initial implementation is an append-only JSONL journal. This records what the runtime actually did without turning governance/report data into the online hot path.
+`UserMessageAccepted` is a bounded preview plus identity (`CTX-EVENT-03`);
+the exact user body is stored once as a `user-input` artifact when a
+workspace is wired. Old journals that stored full `content` still
+deserialize. A second dialogue while a turn runs occupies one in-memory
+`Queued` slot; overflow is `Rejected`. `/cancel` still uses the durable
+`TurnCancelled` barrier and then emits `InterruptCommitted`. Replay
+resolves `body_ref` when given a workspace (`--workspace`).
 
 ## 5. Agent loop
 
 ```text
 User input
    │
-   ├─ emit UserMessageAccepted
-   ├─ ContextEngine.ingest(UserMessage)
+   ├─ persist exact body (user-input artifact, if workspace wired)
+   ├─ ContextEngine.ingest(UserMessage)   ── full body
+   ├─ emit UserMessageAccepted            ── bounded preview + envelope
    ├─ maintain(UserInput)
    │
    v
@@ -630,7 +873,7 @@ binds the surviving full-item ids plus at most 32 external-ref ids to the
 turn, model round and `OperationId` in a bounded `ContextConsumptionAck`.
 
 Only a non-stale successful `ModelOutput` commits that acknowledgement.
-Refused, failed, cancelled and stale operations commit none. The kernel treats
+Refused, failed, cancelled and stale operations commit none. Core treats
 reinforcement plus the bounded `ContextConsumed` audit event as one context
 transaction: it checkpoints first and restores if either the engine mutation
 or event append fails; the actor aborts the turn rather than committing an
@@ -728,7 +971,12 @@ explicit model-content budget and artifact policy:
 
 `search.grep` skips `.git`, `.focus-agent`, `target`, `node_modules`, `vendor`,
 `dist`, `build`, `.idea`, `.vscode` and caps files scanned (5000) and bytes per
-file (2 MB). `shell.exec` streams stdout/stderr through two reader tasks into a
+file (2 MB). It checks the request `CancellationToken` between files and every
+256 lines inside a file; a cancelled scan returns `ok: false` with
+`metadata.cancelled` and any hits already found (not `Err(Cancelled)`, which
+Core would strip to an empty tool error).
+
+`shell.exec` streams stdout/stderr through two reader tasks into a
 bounded channel (512), kills the child on timeout/cancel, and appends the full
 log incrementally to an artifact via `Workspace::create_artifact`.
 
@@ -743,7 +991,7 @@ into context.
 
 ## 8. UI model
 
-The TUI does not render internal kernel objects directly.
+The TUI does not render internal Core or RuntimeActor objects directly.
 
 ```text
 RuntimeEvent
@@ -765,7 +1013,7 @@ TUI
 
 The `context inspect` panel (Tab) is event-driven: it renders the latest
 `ContextPrepared` selections and the recent `ContextMaintained` transitions,
-so context behavior stays observable without binding widgets to kernel or
+so context behavior stays observable without binding widgets to Core, RuntimeActor, or
 context internals. Write/process tool calls replace the input line with an
 `Approval Required` prompt (tool name + args preview); `y`/`Enter` allow,
 `n`/`Esc` deny.
@@ -791,17 +1039,21 @@ from the event journal. `restore` reloads it. Traces are for learning/replay;
 checkpoints are for durable runtime state.
 
 Since the actor owns the task table, a checkpoint that only covered the
-context engine is no longer a complete snapshot: the runtime's checkpoint is
+context engine is no longer a complete actor/context snapshot: the runtime's checkpoint is
 a `RuntimeCheckpoint` (versioned) wrapping the task manager (task rows +
 current task id), the context checkpoint, capability activation state and
-store generation/refs, and `RuntimeInstance::restore` puts the whole runtime
-— task table included — back together. RuntimeCheckpoint v2 additionally
-persists each task's `TaskToolRequirementSet`, the runtime focus revision and
-the last allocated surface revision, so restore cannot reuse a round identity
-or lose this first task-authority subset. It deliberately does not persist a
-derived per-round `ToolSurfaceSnapshot`; the next safe point reconstructs it.
-Version 1 payloads can deserialize only far enough to receive an explicit
-unsupported-version error—there is no silent empty-requirement migration.
+store generation/refs, and `RuntimeInstance::restore` puts the actor, context
+and capability planes — task table included — back together. RuntimeCheckpoint
+v4 also carries a stable marker for one verified prefix of the Core operation
+WAL (`journal_id + generation + epoch + sequence + folded-state digest`).
+Restore verifies that marker as an ancestor before any mutation, then advances
+the live epoch; checkpoint data can never replace or rewind Core authority.
+Ephemeral checkpoints without a marker are same-run only. V4 persists each
+task's complete `TaskAnchor` plus `TaskToolRequirementSet`, the runtime focus
+revision and last allocated surface revision, but never a derived per-round
+`ToolSurfaceSnapshot`; the next safe point reconstructs it. Older versions
+deserialize only far enough to receive an explicit unsupported-version error—
+there is no silent empty-authority migration.
 The `TaskManager` applies its
 transitions transactionally: it validates and *prepares* a transition, the
 external side (kernel focus/context) commits first, and only then does the
@@ -811,17 +1063,18 @@ Focus/clear/complete are multi-step context transactions: the kernel takes a
 portable engine checkpoint before ingest + maintenance and restores it on
 either failure; the actor commits task authority only after that succeeds,
 then publishes audit/UI events. Restore validates the redundant active-task
-fields and restored engine focus before exposing the task table, and applies
-capability flags last. If context rollback itself fails, the actor fences
+fields and restored engine focus. `RuntimeInstance` installs task/context state
+behind a recovery fence, applies capability activation through a fail-closed
+meet, and clears the fence only after durable bounded `RuntimeRestored`.
+Unknown ids do not count as applied and old Enabled cannot lift a newer
+Disabled/Quarantined state. If context rollback itself fails, the actor fences
 further mutation and emits `RecoveryRequired` until a known-good full restore
 succeeds. For focus/task transitions, an audit-event failure after aligned
 state commits is handled the same way: state stays aligned, but the missing
 record is an explicit recovery gap rather than a retryable "nothing happened"
-result. Live restore rebases revisions but does not yet publish a bounded typed
-restore/rebase commit event, so that audit-failure transaction remains open.
-Cross-plane *capture* is also not frozen yet (actor state and the shared
-capability registry are sampled separately); `docs/AUDIT_TODO.md` CORE-03 owns
-both remaining gaps.
+result. Cross-plane capture uses a bounded capability-generation handshake; a
+moving surface retries instead of returning a mixed snapshot. `CORE-03` owns
+the fault regressions for both directions.
 
 ## 8c. Runtime actor and module host (V1-M3, hardened V1-P0-1/V1-P0-4)
 
@@ -833,7 +1086,7 @@ RuntimeHandle ── mpsc<RuntimeCommand> ──▶ RuntimeActor (owns mutable s
                      │                        │
                      │                        └── model/tool operations
                      │                            └─▶ OperationResult
-                     └──── events ◀── broadcast channel (kernel events)
+                     └──── events ◀── broadcast channel (Core event authority)
 ```
 
 - every mutation (user message, focus, pin, task completion, checkpoint)
@@ -850,8 +1103,9 @@ RuntimeHandle ── mpsc<RuntimeCommand> ──▶ RuntimeActor (owns mutable s
 - since V1-P0-1 the actor *is* the runtime: it owns the turn execution
   state machine and the `TurnFrame`. Model rounds and tool calls are
   spawned operations that report an `OperationResult` (run/turn/task/
-  scope/operation ids + generation); the actor validates the generation
-  and only then commits (turn-frame push, context ingest/maintenance,
+  scope/operation ids + generation); the actor validates its epoch mirror and
+  Core independently validates its owned epoch before dispatch/effect commit;
+  only then does the actor commit (turn-frame push, context ingest/maintenance,
   events). Stale results are dropped before they can change runtime
   state — `is_stale` no longer protects only "after the whole kernel
   turn ran";
@@ -860,17 +1114,23 @@ RuntimeHandle ── mpsc<RuntimeCommand> ──▶ RuntimeActor (owns mutable s
   plain `Value(ToolOutput)` or a `PreparedEffect { output, effect }`
   where the effect is a staged, rollback-able mutation (today:
   `agent-workspace`'s `PreparedMutation` with its journal
-  transaction). The actor checks the generation *between* the two
-  phases — a stale tool operation has its prepared effect rolled back
+  transaction). The actor checks its epoch mirror *between* the two phases and
+  Core independently checks its authority epoch before
+  effect commit — a stale tool operation has its prepared effect rolled back
   (temp file removed, `MutationRolledBack` journaled) instead of
   committed, so an external side effect cannot slip through the fence
   that protects model state;
-- `CoreAuthority` is now a stateless executor/helper: context/model/tool
-  primitives plus event plumbing (journal, sequence, broadcast). Its
-  turn loop, turn locks and `TurnFrame` ownership are gone;
+- `CoreAuthority` is now a private, turn-stateless authority implementation
+  behind the landed `CorePort`. Context/tool references needed to implement
+  that port remain inside Core, while scheduling lives in `RuntimeServices`.
+  The concrete actor and scheduling fields/methods are private; the public
+  `RuntimeServices` constructors and `spawn_runtime` remain trusted
+  composition seams. Core owns the atomic authority epoch;
+  Runtime requests CAS advances and keeps the scheduling mirror. Core has no
+  turn loop, turn locks or `TurnFrame`;
 - since V1-M9, a tool result can carry a context directive: the actor
   executes the `RuntimeDirective` at operation-commit time, inside the
-  same generation fence that guards effect commit — `Collect` runs
+  same epoch fence that guards effect commit — `Collect` runs
   `ContextEngine::gc()` immediately and emits `RuntimeEvent::ContextGc`,
   everything else becomes a `ContextDirective` ingest, so a hint/lease/tag
   lands before the observation it targets (see the meta-tools under §4
@@ -880,11 +1140,18 @@ RuntimeHandle ── mpsc<RuntimeCommand> ──▶ RuntimeActor (owns mutable s
   Normal producers still spill the full result to an artifact; the guard is
   defense against a capability/adapter violating that contract;
 - the actor selects on both the command channel and the operation
-  completion channel, so `/cancel` is processed mid-operation and a new
-  turn can start right after; cancellation is committed by the actor
-  immediately (warning + TurnCompleted).
+  completion channel, so `/cancel` is processed mid-operation. Cancellation
+  first advances the Core-owned epoch
+  before any await or cleanup, then cancels the operation and records it behind
+  a distinct durable `TurnCancelled` barrier. Recovery never mistakes that
+  audit fact for a successful `TurnCompleted` commit. Tool-scope closure has
+  bounded per-scope and total deadlines; a timeout raises `RecoveryRequired`
+  instead of acknowledging a cancellation whose cleanup is uncertain. A
+  cancelled tool operation remains an explicit pending-cleanup root, so normal
+  mutation waits until its late completion has taken the stale-effect rollback
+  path.
 
-Composition uses a module host over typed capabilities:
+Platform composition uses a module host over typed services:
 
 ```text
 ModuleHost ── add_module (register + validate) ──▶ ServiceRegistry (typed lookup)
@@ -893,11 +1160,14 @@ ModuleHost ── add_module (register + validate) ──▶ ServiceRegistry (ty
    └── start transactional, stop: capabilities first, then modules reverse
 ```
 
-There is no universal `handle_event`: modules publish typed capabilities
+There is no universal `handle_event`: trusted modules publish typed services
 (`ContextService`, `ModelProvider`, `ToolProvider`, `ApprovalPolicy`,
 `EventStore`, `ArtifactStore` — all `CapabilityProvider` markers in
-`agent-contracts`) and consumers look them up by type. The TUI composes the
-run through the host and reads the capabilities back into the kernel.
+`agent-contracts`) and Platform consumers look them up by type. The shared
+`agent-compose` bootloader builds the host, resolves one `RuntimeServices`,
+constructs one private Core implementation behind `CorePort` and spawns the
+sole RuntimeActor; the TUI, CLI and evaluator only select implementations and
+drive that instance.
 
 Since V1-M9 the host lifecycle is transactional. Start is all-or-nothing
 in order (a failing module rolls back the already-started ones), and stop
@@ -910,9 +1180,11 @@ layers; the host applies the same rule inside its own plane.
 
 Since V1-P0-4 the host is an extension platform with two planes:
 
-- **Trusted core (typed).** `ServiceRegistry::register` / `get` are public,
-  so external crates publish and retrieve typed services with their own
-  `CapabilityId`s — the core ids are the well-known set, not the only set.
+- **Trusted Platform composition plane (typed).**
+  `ServiceRegistry::register` / `get` let operator-trusted adapters publish
+  and retrieve typed services with their own `CapabilityId`s. This registry
+  is not Core, is not exposed over Platform Protocol and is not an extension
+  permission path.
 - **Dynamic capability plane.** A `Capability` (manifest + runtime object)
   advertises tool schemas that join the runtime's tool provider:
   `CapabilityRegistry` accepts registrations at composition time or mid-run
@@ -972,24 +1244,26 @@ ModuleHost
                            │
                      CapabilityAwareDispatcher (base tools + capability tools)
                            │
-                     kernel tool_provider -> model tool schemas -> invoke
+                      RuntimeServices -> round surface -> model -> invoke
 ```
 
 Capability invocation returns a `CapabilityOutcome`, not a raw `ToolOutput`:
 `Value(ToolOutput)`, `EffectRequest { output, effect }` (a staged,
-rollback-able mutation the core commits under the generation fence), or
+rollback-able mutation Core commits under its authority-epoch fence), or
 `RuntimeDirective { output, directive }` (the context-control path, gated on
 the `runtime:context-control` manifest permission). The dispatcher maps these
-onto the kernel's `ToolOutcome`, so trusted in-process capabilities can share
+onto Core's `ToolOutcome`, so trusted in-process capabilities can share
 the builtin prepared-effect fence.
 
-The process transport now enforces this contract. `ProcessCapabilityAdapter`
-decodes `ProcessInvokeResponse`: a plain `ToolOutput` still passes through
-as `CapabilityOutcome::Value`, while declared `WireEffect`s are validated
-against the invocation's granted permissions and staged through the
-confined workspace handle as `CapabilityOutcome::EffectRequest` — the core
-commits them behind the generation fence, exactly like a builtin tool's
-`PreparedEffect`. A child that mutates *outside* the wire contract (direct
+The process transport currently fails closed on non-empty `WireEffect`s:
+`ProcessCapabilityAdapter` accepts a plain `ToolOutput` or an envelope with an
+empty effect list as `CapabilityOutcome::Value`, but rejects a declared
+mutation before staging until the wire carries typed actual-intent identity
+that Core can prove is within the invocation lease. This deliberately disables
+the older staging path instead of trusting a broad `workspace:write` word.
+PLAT-03/04 must bind `operation_id + effect_id + argument_digest` and actual
+intent before structured process effects can be re-enabled. A child that
+mutates *outside* the wire contract (direct
 filesystem writes, network sockets) is not rollback-safe by construction:
 the mid-invoke system broker confines the brokered surface
 (permission-gated `fs.read`, deny-by-default network), but direct OS
@@ -1003,17 +1277,23 @@ Shutdown is a single ordered step with aggregated errors:
 ```text
 runtime.shutdown()
   cancel any turn
-    → stop the actor (kernel stop: flush journal, emit RunCompleted)
+    → boundedly drain a cancelled tool's late completion
+      (rollback any PreparedEffect; timeout → RecoveryRequired)
+    → stop the actor (Core stop: flush journal, emit RunCompleted)
     → stop the module host (dynamic capabilities first, then
       typed modules reverse — each step best-effort, errors aggregated)
     → join the actor task
     → aggregate errors
 ```
 
-The actor itself never returns silently: `Stop` replies with the kernel
+The actor itself never returns silently: `Stop` replies with the Core
 stop result, and the "all handles dropped" path (`rx.recv() -> None`)
 runs the same teardown so journal flush and `RunCompleted` do not depend
-on the caller remembering to stop.
+on the caller remembering to stop. Before Core stop, the actor boundedly drains
+the completion of a cancelled in-flight tool; a late `PreparedEffect` is routed
+through stale rollback rather than being discarded with the completion
+channel. If that explicit cleanup does not arrive by the shutdown deadline,
+shutdown reports `RecoveryRequired`.
 
 ## 9. ContextCore migration path
 
@@ -1052,7 +1332,7 @@ has to speak the same protocol — nothing on the agent side changes.
 
 The wire protocol carries only `agent-contracts` types — no ContextCore
 vocabulary leaks through the Agent API. A real ContextCore runtime replaces
-`agent-context-service` behind the same protocol; the kernel, tools,
+`agent-context-service` behind the same protocol; Core, tools,
 approvals, TUI and provider are untouched (`agent-tui --context=service`).
 
 Do not move Agent Kernel, tools, approvals, TUI, or provider code into ContextCore merely because ContextCore supplies context selection.
@@ -1104,10 +1384,27 @@ explicit `ProcessSandbox` (shared `ProcessHost`, since the crate split in
   surfaces the newest bytes for diagnostics. A chatty child can no longer
   inherit unbounded output into the parent console.
 - **Bounded control protocol** — the child speaks framed JSON-lines
-  (`ping`/`invoke`) with deadlines and connection poisoning. The protocol
-  bounds messages; the adapter's system broker gates the child's brokered
-  filesystem reads and denies network by default, but raw process syscalls
-  remain the child's own.
+  (`ping`/`invoke`) with deadlines and connection poisoning, and every
+  boundary shares one bounded codec (`agent-process::frame`): outbound
+  frames are capped *before* a byte is written, the in-flight cap is
+  enforced before each append while reading, and oversize/partial/malformed/
+  version/id/envelope faults poison the connection and kill the child tree.
+  The codec never treats OS read chunking as protocol state: multiple frames
+  delivered together remain distinct; session ids reject unsolicited/stale
+  responses. `ProcessHost` adds a per-call cumulative byte budget and a
+  control-plane answer cap; the context service and MCP client read and
+  write with the same codec and fail closed the same way (oversized broker
+  answers degrade to a refusal frame; MCP notifications are flood-capped).
+  After a frame is read, `JsonDecodeBudget` bounds the decoded DOM (depth,
+  nodes, strings, array/object width) so a frame-legal empty-object array
+  cannot inflate memory; this is independent of JCS or adapter envelope
+  migration.
+  The adapter's system
+  broker gates brokered filesystem reads through an allocation-bounded
+  primitive (at most a 256 KiB prefix with truncation metadata) and denies
+  network by default, but
+  raw process syscalls remain the child's own. See §2c: the current stdio is
+  an inherited anonymous-pipe backend, not the permanent protocol identity.
 
 `ProcessCapabilityAdapter::from_manifest` applies this hardened profile to
 every process capability; `invoke` forwards the call and the granted
@@ -1148,13 +1445,14 @@ refused at registration (`is_known_permission`), so undeclared access is
 denied by construction before any handle could exist. A `workspace:write`
 capability gets a `StagedOnlyWorkspace`: the direct `write` path is
 refused ("must be staged") and only `prepare_write` works, returning an
-`Effect` the core commits behind the generation fence — a capability
+`Effect` Core commits behind its authority-epoch fence — a capability
 mutation can no longer land during `invoke` (the CORE-01 bypass). Risk is
 derived, never self-declared: a capability declaring workspace-write or
 process-run authority may not mark any tool `ReadOnly` (ReadOnly
 auto-allows at the approval gate), a tool's risk may not exceed its grant,
-and a process-transport capability declaring `workspace:write` is refused
-until the wire-level effect broker exists. Both enforcement points are
+and a process-transport capability may declare `workspace:write`, but every
+non-empty wire effect is refused before staging until PLAT actual-intent proof
+exists. Both enforcement points are
 under test: `undeclared_permissions_receive_no_handle` and
 `capability_authority_is_derived_and_validated_at_registration`
 (agent-runtime) prove the grant-by-construction behavior end to end, and
@@ -1201,8 +1499,9 @@ value. The runtime no longer treats arithmetic combination as a unique round
 identity: `ToolSurfaceSourceRevisions` preserves builtin catalog, capability
 catalog, task requirement and focus revisions separately, while the monotonic
 `surface_revision` identifies the final round projection. Execution-policy and
-complete TaskAnchor/Episode revisions remain absent until those authority
-planes exist; zero is not used to pretend they were observed.
+  TaskAnchor and execution-policy revisions are populated by the runtime;
+  typed EpisodeOutcome revision remains absent until that authority plane
+  exists. Zero is not used to pretend an unobserved source was sampled.
 
 The registry never calls back into a capability object under its lock.
 Registration reads and validates the manifest and tool schemas exactly
@@ -1257,8 +1556,8 @@ standalone executable must also be rebuilt before the process test when its
 wire changes (`cargo build -p agent-context-service`); an old executable is
 rejected by the process test rather than treated as parity evidence.
 
-**Trusted Core direction.** The kernel is not headed toward retirement by
-merging into the runtime. Its stateless primitives — permission/approval,
+**Trusted Core direction.** Core is not headed toward retirement by
+merging into the runtime. Its turn-stateless primitives — permission/approval,
 effect brokering, event/audit/durability, resource budgets, capability
 authority, sandbox authority, runtime integrity — are the seed of an
 `agent-core` the agent cannot modify, while everything evolvable (actor,
@@ -1307,7 +1606,7 @@ Tests that guard the runtime's consistency claims, worth more than any
 extra scoring coefficient:
 
 - runtime task id == context task id (`runtime_task_id_matches_the_
-  context_task_id`); `kernel.set_focus` failure and `clear_focus` failure
+  context_task_id`); `CoreAuthority::set_focus` failure and `clear_focus` failure
   both leave the TaskManager untouched (`failed_focus_never_mutates_the_
   task_table`, `failed_clear_focus_never_mutates_the_task_table`);
   checkpoint → restore reproduces task ids, scopes and the current task
@@ -1342,6 +1641,35 @@ extra scoring coefficient:
   overlaps (hot `AuthService.rs` vs an entry entity `src/auth/AuthService
   .rs`) are not indexable with exact keys, so a residual scan over the
   entries the index did not propose keeps recall coverage identical.
+- **`ContextCatalog` is the shared navigation directory.** Each `item_id`
+  has exactly one body location (Resident / Warm / Stored). Query indexes
+  (task / scope / kind / entity / label / residency / attention) serve
+  both GC hot-entity recall and `context.search` candidate generation.
+  Authority metadata stays on the body; checkpoints serialize the three
+  stores and rebuild the directory. A free-text needle that hits no
+  entity/label key still residual-scans summaries/uris. `label` is a real
+  `ContextSearchQuery` dimension.
+- **Retrieval access is graded (`CTX-GC-11`).** Search-hit, inspect, fetch,
+  admit, and consumption ack are explicit ranks on the stored body
+  (`AccessSignal`). Search may delay Cold -> External aging once until a
+  stronger read, with per-item cooldown and a repeated-identical-query
+  budget; it cannot pin never-used entries. Inspect/fetch reset search
+  saturation. Ack is the strongest online signal (turn clocks +
+  `access_count` + GC epoch) and never reactivates the body.
+- **Federated discovery is an internal planner (`CTX-DISC-01..03`, `TOOLS-10`).**
+  `ResourceRef` / `ResourceDescriptor` / `DiscoveryMiss` are the shared card.
+  `context.manage` and `capability.manage` keep their public schemas; there
+  is no `runtime.search` tool. Search is read-only (no admit, no load).
+  Capability search uses a provider-owned token index over descriptor
+  fields. Per-turn query/identical-query caps live on the actor.
+  Artifact/Task/Agent/Skill/Event providers are not in this prototype;
+  inspect-by-id does not yet take a revision.
+- **Retrieval is metered on the event stream (M15 instrumentation).**
+  `ContextGcReport.externalized_ids` and `ContextDiagnostics` access-stamp
+  counters let `agent-eval` join forgotten ids to later search/inspect/
+  fetch/admit and report search latency plus reinforcement distribution.
+  `agent-eval --retrieval` is the engine-only found-after-forgotten
+  baseline. This is not the paired real-model coding acceptance.
 - **The materialized external view is bounded at the type level.**
   `MaterializedContext.external` is now `ContextMapView`
   (`CONTEXT_MAP_VIEW_CAP = 32`): the constructor asserts the cap and the

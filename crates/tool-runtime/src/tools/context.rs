@@ -77,6 +77,8 @@ struct ManageArgs {
     scope: Option<ContextScope>,
     #[serde(default)]
     task_id: Option<TaskId>,
+    #[serde(default)]
+    label: Option<String>,
     // Admit / derive
     #[serde(default)]
     reason: Option<String>,
@@ -109,7 +111,7 @@ impl Tool for ContextManageTool {
                 "admit re-enters an externalized ref into the working set under its original id ",
                 "(one lifecycle transition, identity preserved); derive persists a fact as a new ",
                 "item with a DerivedFrom link to the ref. Query ops (search/inspect/fetch) read ",
-                "externalized refs — search lists refs matching an entity/kind/scope/task query, ",
+                "externalized refs — search lists refs matching an entity/kind/scope/task/label query, ",
                 "inspect shows one ref's metadata, fetch pulls its full content back on demand. ",
                 "Item ids come from the materialized context frame."
             )
@@ -132,7 +134,8 @@ impl Tool for ContextManageTool {
                     "limit": {"type": "integer", "minimum": 1, "maximum": 64, "description": "search: max refs to return (default 16)"},
                     "kind": {"type": "string", "description": "search: optional ContextKind filter"},
                     "scope": {"type": "string", "description": "search: optional ContextScope filter"},
-                    "task_id": {"type": "string", "description": "search: optional TaskId filter"}
+                    "task_id": {"type": "string", "description": "search: optional TaskId filter"},
+                    "label": {"type": "string", "description": "search: optional label filter (decision, open-loop, ext:...)"}
                 }
             }),
             risk: ToolRisk::ReadOnly,
@@ -145,6 +148,7 @@ impl Tool for ContextManageTool {
         _run_id: RunId,
         call_id: &str,
         arguments: Value,
+        _effect_context: Option<agent_contracts::OperationEffectContext>,
         _cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let args: ManageArgs = serde_json::from_value(arguments)
@@ -242,6 +246,7 @@ impl Tool for ContextManageTool {
                         kind: args.kind,
                         scope: args.scope,
                         task_id: args.task_id,
+                        label: args.label,
                         limit: args.limit.unwrap_or(16),
                     },
                 })
@@ -343,6 +348,13 @@ fn describe(action: &ContextAction) -> String {
             reason,
         } => {
             format!("derive: '{fact}' persisted as a new item derived from {item_id} — {reason}")
+        }
+        // runtime 推送的整组根声明投影；模型不应看到完整列表（有界摘要）。
+        ContextAction::AnchorRoots { roots } => {
+            format!(
+                "anchor roots: {} claims projected from the task anchor",
+                roots.len()
+            )
         }
     }
 }

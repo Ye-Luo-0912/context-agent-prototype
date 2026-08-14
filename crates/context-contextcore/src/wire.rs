@@ -17,6 +17,11 @@ use serde_json::Value;
 /// process host so every protocol over a JSON-lines pipe speaks one version.
 pub use agent_process::PROTOCOL_VERSION;
 
+/// Default hard cap for one context-service JSON payload in either
+/// direction. The trailing newline delimiter is not part of this count.
+pub const DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const MIN_CONTEXT_SERVICE_MAX_FRAME_BYTES: usize = 1024;
+
 /// A single request. `id` is echoed by the response for correlation and
 /// debugging; the current adapter is strictly ping-pong (one in flight).
 #[derive(Debug, Clone, Serialize, Deserialize)]

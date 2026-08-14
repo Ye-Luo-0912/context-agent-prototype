@@ -90,59 +90,43 @@ boundedness, and integrity rather than replace it with transcript history.
 | Orthogonal lifecycle axes | Implemented | `ContextItem` separates attention, semantic state, physical residency, retention, and GC generation. This is the right base model. |
 | Reversible residency | Implemented baseline | `Resident -> Warm -> Cold -> External` moves old bodies through heap, bounded eviction buffer, and filesystem store; full GC reports eviction/reactivation reasons. |
 | Scope ownership | Implemented | Session, Task, Focus, and Tool scopes exist. Runtime owns Task/Tool transitions; the engine owns policy within the contract. |
-| Episode-bounded working set | Implemented baseline (`CTX-01`) | A Focus scope now acts as the current episode container. Low lexical overlap or a 500-user-turn guard rotates it; durable/core-labeled results promote and ordinary dialogue becomes evictable. A 10,000-turn test keeps Resident roughly flat. The focus generation is not reset on rotation, so the hard guard currently degenerates into rotation on every later user message after turn 500. |
-| Cross-residency lifecycle behavior | Partially fixed (`CTX-02`) | Terminal supersession/verification/recurrence and several completion/protection rules now reach more than Resident. Canonical metadata is still split by location; directives/protections are not fully representable on Stored records and TTL processing still primarily visits Resident. |
-| External search/inspect/fetch | Implemented baseline | Exact non-vector lookup and full-body fetch exist, including process-service parity. Terminal external entries are filtered. |
-| Transient retrieval result | Implemented baseline (`CTX-03`) | `ToolResultDisposition` keeps search/inspect/fetch transient in the current `TurnFrame`; runtime E2E and context-service parity verify that retrieval does not create duplicate observations. |
-| Admission/derivation | Partial | `admit` and `derive` operations, quotas and focused identity/non-duplication tests exist, but broader cross-residency rollback, authority/taint, storage-root and canonical-catalog semantics remain open. Do not infer their full lifecycle contract from the closed transient-retrieval defect. |
-| Task anchor | Implemented baseline (`CTX-10`) | Each `TaskRecord` owns a bounded, versioned `TaskAnchor` (goal interpretation, constraints, acceptance criteria, plan progress, open loops, typed root claims) with whole-set CAS, a bounded `TaskAnchorChanged` audit event, and RuntimeCheckpoint v3 persistence + restore validation. The tool-demand slice (`TaskToolRequirementSet`) remains its own bounded CAS surface. A prompt `TaskAnchorView` and Anchor-derived context GC root set (translating claims into engine roots) remain context-runtime work, not reasons to call the anchor itself absent. |
+| Episode-bounded working set | Implemented baseline (`CTX-01`) | A Focus scope acts as the current episode container. Low lexical overlap or a 500-user-turn guard rotates it; the episode-local generation resets on rotation, durable/core-labeled results promote, and ordinary dialogue becomes evictable. The 10,000-turn regression keeps Resident roughly flat. Typed episode boundaries and outcomes remain open. |
+| Cross-residency lifecycle behavior | Implemented behavior + catalog directory (`CTX-02`) | Terminal transitions, completion/protection handling, TTL aging, dependency scans, and scope-close promotion cover Resident/Warm/Cold/External. `ContextCatalog` is the `item_id -> location` directory across heap / warm buffer / external map; authority metadata stays on the single body. |
+| External search/inspect/fetch | Implemented baseline + indexed search + graded access (`CTX-GC-11`) + discovery cards (`CTX-DISC`) + M15 retrieval metrics | Exact non-vector lookup and full-body fetch exist, including process-service parity. Terminal external entries are filtered. `context.search` generates candidates from catalog indexes (kind/scope/task/label/entity); summary/uri needles that hit no key residual-scan. Hits carry `ResourceDescriptor`s; inspect/fetch misses distinguish `not_found` / `evidence_absent` / `provider_unavailable`. Access stamps are graded: search-hit weakest (one Cold-aging delay, per-item cooldown, identical-query budget), inspect/fetch stronger reads, `admit` a residency move, consumption ack the strongest. `agent-eval` meters search recall/latency and found-after-forgotten; that is instrumentation, not a policy change. |
+| Transient retrieval result | Implemented baseline (`CTX-03`) + capability search/inspect (`CTX-DISC-03`) | `ToolResultDisposition` keeps context search/inspect/fetch and `capability.manage` search/inspect transient in the current `TurnFrame`; load/unload still persist. Runtime E2E and context-service parity verify that context retrieval does not create duplicate observations. |
+| User input envelope | Partial (`CTX-EVENT`) | Dialogue goes through `RuntimeInputEnvelope`. `/focus` `/done` `/cancel` stay direct commands. `UserMessageAccepted` is a 240-char preview; the exact body is sealed as `user-input` when a workspace is wired. Busy dialogue uses a 1-slot in-memory `Queued` (overflow `Rejected`). Cancel publishes `InterruptCommitted` after `TurnCancelled`. Applied → Consumed → Archived on a successful turn. Replay resolves `body_ref` when given a workspace. Dialogue `proposal` is still `None`. |
+| Admission/derivation | Partial | `admit` and `derive` operations, quotas and identity/non-duplication tests exist, but authority/taint, richer provenance, storage-root, and canonical-catalog semantics remain open. Do not infer their full lifecycle contract from the closed transient-retrieval defect. |
+| Task anchor | Implemented baseline (`CTX-10`) | Each `TaskRecord` owns a bounded, versioned `TaskAnchor` (goal interpretation, constraints, acceptance criteria, plan progress, open loops, typed root claims) with whole-set CAS, a bounded `TaskAnchorChanged` audit event, and RuntimeCheckpoint v4 persistence + restore validation. The tool-demand slice (`TaskToolRequirementSet`) remains its own bounded CAS surface. A prompt `TaskAnchorView` and Anchor-derived context GC root set (translating claims into engine roots) remain context-runtime work, not reasons to call the anchor itself absent. |
 | Structured episode outcome | Partial | Task completion now commits an immutable typed `CompletionRecord` (task id, anchor revision, summary, final-output ref/digest, artifacts) atomically with the status flip (`CTX-10`). Episode rotation still does not derive a typed, sourced `EpisodeOutcome` per rotated focus episode. |
-| Task completion output | Implemented baseline (`CTX-10`) | `/done` commits a typed `CompletionRecord` owned by the completed task; `TaskCompleted` events carry task/result identity; the final output body's SHA-256 digest and ref are retained so the outcome is byte-for-byte verifiable after overflow/restart/Storage GC; completed-task records are storage roots, not residency roots (resident heap stays bounded across 1,000 completions). The exact raw final assistant response is still truncated before ContextItem — true raw evidence retention remains the `Immutable raw evidence` row. |
-| Canonical catalog | Missing structural target | `context-simple::State` still stores authoritative metadata with the full item in `items`, `eviction_buffer`, or `external`. `CTX-02` repaired behavior but not single-record ownership. |
-| Immutable raw evidence | Missing | Ingress truncates the context body to the configured 16,000-character item cap before storage. The current filesystem store preserves that bounded `ContextItem`, not necessarily the original raw output; true raw evidence must be stored once as an artifact/body before context truncation. |
+| Task completion output | Implemented baseline (`CTX-10`) | `/done`/`task.complete` commit one task-owned `CompletionRecord`; `TaskCompleted` carries task/result identity, and completed records are storage rather than residency roots. When an artifact workspace is wired, the actor writes the complete final assistant response before `ContextItem` truncation and attaches its artifact ref to the record. The dedicated `final_output_ref`/digest still identify the bounded completion summary, so richer outcome/evidence fields remain open. |
+| Canonical catalog | Implemented navigation directory | `ContextCatalog` is the `item_id -> location` directory plus task/scope/kind/entity/label/lifecycle indexes. Bodies remain in heap / warm / store; GC moves location, it does not copy authority. Checkpoints serialize the three stores and rebuild the directory. |
+| Immutable raw evidence | Partial | The final-assistant path stores the full response once as an artifact before bounded context ingest and makes it reachable from `CompletionRecord`. General user/tool/context ingress still preserves only bounded bodies (or tool artifacts where explicitly brokered); a uniform immutable `EvidenceBody` contract is not implemented. |
 | Store integrity | Implemented crash-recovery baseline (`CTX-04`) | Atomic write/rename, checksums, bounded I/O, post-commit recall deletion, startup reconcile, quarantine, and process-service parity are implemented. Canonical record ownership and the documented quarantine/operator workflow remain broader structural work. |
 | Strong provenance graph | Implemented storage-safety baseline (`CTX-05`) | `DerivedFrom`, `EvidenceFor`, `VerifiedBy`, `ArtifactOf`, and `Continuation` are strong edges; `SharesEntities` remains weak. Storage GC roots non-deletable stored records and traverses only strong edges, with deterministic and random-graph tests. Provenance admission/authority policy remains incomplete. |
 | Incremental GC work | Missing | Event-triggered minor maintenance scans the entire resident heap; full GC can scan history and issue broad store I/O. The policy is continuous, but the work itself is not yet bounded/incremental. |
-| Immediate tool signal | Missing | `AfterTool` persistence/maintenance occurs during turn finalization. A discovery cannot reliably heat related context for the immediately following model round without a bounded metadata-only signal (`CTX-08`). |
-| Final model-consumption acknowledgement | Implemented baseline (`CTX-07`) | `materialize` now returns a non-consuming monotonic preview. After PromptAssembler/final packing, a successful non-stale ModelOutput commits a bounded `ContextConsumptionAck` naming turn/operation/round/preview plus exact inline/external ids. Failed/refused/cancelled/stale operations send none; kernel checkpoint rollback couples reinforcement to the `ContextConsumed` audit event. Tests cover actor trim, refusal, cancellation/stale output, external refs, invalid atomic retry, journal rollback, replay and process parity. Candidate cost and external-ref token accounting remain open. |
-| Prompt authority separation | Missing | Selected historical/user/tool/file content is currently rendered in System messages. This is tracked by `CORE-05`. |
-| Real evaluation | Partial | Unit/property coverage is strong and the 10,000-turn residency regression exists. End-to-end A/B/C task quality, candidate/materialization cost, total manager cost, and failure-recovery metrics are still incomplete. |
+| Immediate tool signal | Implemented (`CTX-08`) | Tool commit emits a bounded, body-free `WorkingSetSignal`; discovered entities heat related context before the immediately following model round while the tool body remains in `TurnFrame` until finalization. |
+| Final model-consumption acknowledgement | Implemented (`CTX-07`) | `materialize` returns a non-consuming preview. After final packing, only a successful non-stale ModelOutput commits a bounded `ContextConsumptionAck` with the exact inline/external ids; failure paths do not reinforce. Fit-before-top-K, bounded/charged external refs, and bounded candidate generation are covered; workload cost evaluation remains separate. |
+| Prompt authority separation | Implemented (`CORE-05`) | `PromptAssembler` keeps policy in System, renders selected history/external refs as delimited low-authority User observations, and preserves live file/tool output as Tool-role content. Injection regressions cover all three paths. |
+| Real evaluation | Partial | Unit/property coverage is strong and the 10,000-turn residency regression exists. `agent-eval --compare-live` is the live paired coding harness (real model, independent workspaces, hidden verify). EVAL-01.1 writes per-cell bundles; EVAL-01.2 freezes the clustered C−A estimator; EVAL-01.3 re-freezes the gate at 300×3 / −5 pp (historical 30×3 is underpowered). The 300-task suite, model-backed B and the rest of Phase 4 remain open. |
 
 This table is the baseline for the work queue below. A checked defect in
 `AUDIT_TODO.md` must not be reopened here under a new name.
 
-### Confirmed baseline defects found during this re-grounding
+### Re-grounding status
 
-These are correctness work, not policy experiments:
+The original correctness list in this section is now closed in
+`AUDIT_TODO.md`: episode-counter reset, cross-residency aging/dependencies/
+scope close, tool-scope audit propagation, crash-safe store ownership,
+operation serialization, logical-catalog diagnostics, and replay isolation all
+have regression coverage. Do not reopen them here under stale baseline text.
 
-- Episode rotation closes/reopens the Focus scope but does not reset the
-  shared `FocusState.generation`. Once the 500-turn guard fires, each later
-  user message can rotate again.
-- Minor TTL/tombstone processing iterates Resident records. A live item that
-  moves to Warm/Cold/External can escape the same aging path and remain
-  ineligible for conservative Storage GC.
-- Full GC can return early when Resident and Warm are empty even if the
-  external map is non-empty, so `gc_epoch`, Cold aging, and automatic recall
-  may stop in an external-only state.
-- Online dependency marking walks Resident bodies; a marked dependency in
-  Warm/Cold is not guaranteed to reactivate.
-- Scope-close promotion/attention changes primarily visit Resident bodies;
-  old/checkpointed non-resident members can retain location-dependent state.
-- Tool-scope close currently discards returned transitions and errors, and
-  some `BeforeModel`/manual-collect audit emissions ignore journal errors.
-- A store I/O task `JoinError` can lose the externalizing item; successful
-  Cold recall can leave an unowned blob; plan/IO/commit has no revision fence.
-- Storage GC exists as an engine/service operation but the runtime does not
-  schedule it at a task, checkpoint, or retention boundary. Do not add an
-  automatic schedule until ownership and strong-edge safety are fixed.
-- `ContextDiagnostics.total_items` and `inspect()` currently mean Resident
-  items, not total logical catalog items. Existing replay “final total” and
-  the transient-fetch test must not be described as catalog-count proofs.
-- Replay fact comparison reuses one engine for an observing run and a second
-  coverage run, allowing the first run's state to contaminate the metric.
+The remaining context-runtime gaps are structural or evaluative:
 
-These are assigned to the matching `CTX-*` areas in `AUDIT_TODO.md`; closure
-evidence should remain there rather than being duplicated in this document.
+- `TaskAnchorView` plus typed prompt/residency/storage root projection;
+- sourced `EpisodeOutcome` and atomic episode close/root release;
+- bounded incremental minor-GC work and an explicit Storage-GC schedule;
+- uniform immutable evidence/provenance beyond the final-response special path;
+- real long-task A/B/C quality, cost, latency, and recovery evaluation.
 
 ## Target model: navigation plane plus evidence plane
 
@@ -238,31 +222,28 @@ Task
 
 ### TaskAnchor
 
-The TaskAnchor is the minimum authoritative state that prevents goal drift
-and defines the active task's GC roots. It must live with the actor-owned
-`TaskManager`, not as an ordinary Pinned/Durable `ContextItem`: otherwise a
-replaceable context policy could collect or rewrite task authority, and task
-state would again be duplicated across orchestrators.
+The TaskAnchor is the minimum authoritative state that prevents goal drift.
+It carries typed root claims, but projecting them into context GC remains open.
+It lives with the actor-owned `TaskManager`, not as an ordinary Pinned/Durable
+`ContextItem`: otherwise a replaceable context policy could collect or rewrite
+task authority, and task state would again be duplicated across orchestrators.
 
-#### Current first slice: TaskToolRequirements, not TaskAnchor
+#### Current implementation boundary
 
-The current working tree deliberately lands only the smallest task-owned
-subset needed to stop tool-surface decisions from drifting away from the
-active task. This subset is named `TaskToolRequirementSet`; it is not a
-renamed or partial claim that the complete `TaskAnchor` contract exists.
-
-Status at this stage:
+The first `TaskToolRequirementSet` slice has since grown into a bounded,
+actor-owned `TaskAnchor`; the two remain separate CAS surfaces because task
+authority and tool-surface demand have different consumers and revision
+cadences.
 
 | Status | Scope |
 | --- | --- |
-| Implemented in the working tree | Each `TaskRecord` owns an exact-name, canonical `TaskToolRequirementSet { revision, entries }`. Whole-set compare-and-swap rejects stale revisions and completed tasks; equivalent normalized replacements are idempotent. The set is capped at 32 entries, with bounded names and reasons. `RuntimeCommand`/`RuntimeHandle` expose the actor-serialized replacement API, `TaskInfo` exposes revision/count, and live restore rebases against a per-process high-water mark to prevent CAS ABA. |
-| Implemented in the working tree | `RuntimeCheckpoint` is version 2 and stores every task's requirement set plus runtime focus/surface revision counters. Version 1 can still deserialize far enough to produce an explicit unsupported-version error; there is no silent migration. A derived per-round surface is not checkpoint authority. |
-| Implemented and verified | `RoundSurfacePlan` is the sole schema-budget projection over the complete loaded catalog plus the active task's `MustSurface`, `PreferSurface`, and `KeepReady` demands. Actor tests prove GC-triggered KeepReady reload without prompt visibility, pre-provider Must refusal, deterministic provider-budget degradation/recovery without lifecycle mutation, bounded event ordering before `ModelStarted`, monotonic surface revisions, and checkpoint/suspend/restore reconstruction. Full workspace tests and strict Clippy pass. |
-| Verified behavior with an audit residual | Live restore rebases focus/surface/task-requirement revisions against per-process high-water marks, preventing revision reuse and CAS ABA. It still lacks a bounded typed `RuntimeRestored`/`TaskRequirementsRebased` commit event; failure to persist that event after state becomes visible must fence the runtime as recovery-required rather than return an unaudited success. |
-| Still future TaskAnchor work | Goal/constraint/acceptance authority, plan progress, open loops, evidence and working refs, provenance, autonomous typed patches, `TaskAnchorView`, context materialization roots, and Active/Suspended/Completing/Closed root transfer. |
-| Still future Episode/completion work | Typed `EpisodeOutcome`, ack-driven scope/root release for dialogue/reasoning/tool evidence, exact final-response retention, `CompletionPrepared -> CompletionCommitted`, and `CompletionRecord`. Exact model-frame consumption is implemented; the remaining issue is translating verified consumption/outcomes into typed promotion and root-transfer semantics rather than relying on the next-model-round tool-scope close heuristic. |
+| Implemented | Each `TaskRecord` owns a bounded `TaskAnchor`: original goal, current interpretation, constraints, acceptance criteria, plan progress, open loops, and typed working/evidence root claims. Whole-anchor and field-level CAS reject stale revisions; autonomous fields land directly, while goal/constraint patches use the approval boundary. `TaskAnchorChanged` is bounded and RuntimeCheckpoint v4 persists and validates anchors. |
+| Implemented | `TaskToolRequirementSet` retains exact-name `MustSurface`/`PreferSurface`/`KeepReady` demand. `RoundSurfacePlan` is the bounded per-round projection; loading remains lifecycle, never activation or permission. |
+| Implemented | Live restore rebases focus/surface/requirement revisions, applies capability state fail-closed, and publishes a bounded durable `RuntimeRestored` event before clearing the recovery fence. |
+| Implemented | Task completion atomically closes context/task authority and commits exactly one immutable typed `CompletionRecord`. With an artifact workspace, the complete final assistant response is persisted before bounded context ingest and its ref is attached to the record. |
+| Still open | A bounded `TaskAnchorView` and translation of typed claims into independent prompt/residency/storage roots; richer provenance and outcome fields; sourced `EpisodeOutcome`; ack/obligation-driven episode root release; canonical catalog ownership. |
 
-Demand semantics for this first slice are intentionally narrow:
+Tool-demand semantics remain intentionally narrow:
 
 - `MustSurface`: the exact schema is mandatory for the round or the runtime
   reports an unsatisfiable surface and does not call the provider;
@@ -276,9 +257,8 @@ Demand semantics for this first slice are intentionally narrow:
 
 Loading remains a lifecycle action rather than an authority grant. The current
 dynamic capability registry still has an owner-level `loaded` flag, so loading
-one required tool may mark its sibling schemas loaded. Per-tool capability
-lifecycle and process/schema separation remain explicit follow-up work; this
-slice must not be described as closing that gap.
+one required tool may mark sibling schemas loaded. Per-tool capability
+lifecycle and process/schema separation remain explicit follow-up work.
 
 Target complete shape:
 
@@ -377,13 +357,14 @@ is denied/skipped, the agent continues independent safe work, and the task
 finishes `Partial`/`Blocked` with one consolidated boundary report if the
 operation was essential.
 
-The actor supplies a bounded `TaskAnchorView` and its typed root claims through
-a versioned `ContextTaskView` on materialization/GC requests. The engine
-compiles the view but does not own or score it. This preserves the invariant
-that model input is built through `ContextEngine::materialize` without making
-the engine a second task manager.
+The next integration step is for the actor to supply a bounded
+`TaskAnchorView` and typed root claims through a versioned `ContextTaskView` on
+materialization/GC requests. The engine compiles the view but does not own or
+score it. This preserves the invariant that model input is built through
+`ContextEngine::materialize` without making the engine a second task manager.
 
-Task-state semantics:
+Target task-state semantics (the current runtime exposes
+`Active | Suspended | Completed` and has not yet landed the full root view):
 
 - **Active:** the anchor is a mandatory materialization tier; current
   `working_refs` are online residency roots.
@@ -516,20 +497,28 @@ promote verified outcomes and remain advisory, versioned, and reversible.
 
 ### Task completion and final output
 
-The current code has the importance relation backwards:
+The first authoritative completion slice is implemented:
 
-- the real final model output is ingested as an ordinary Working
-  `AssistantMessage`, truncated by the context item cap, and archived when
-  the task closes;
-- `/done <summary>` accepts unrelated free text and stores it as a Session
-  Durable Summary;
-- focus is cleared before that Summary is built, so it loses `task_id`;
-- Session Durable records become global GC roots/candidates, so accumulated
-  completion summaries can pollute unrelated future tasks;
-- neither `TaskRecord`, RuntimeCheckpoint, nor `TaskCompleted` event binds a
-  completed task to its final response, artifacts, criteria, or verification.
+- every completed task owns exactly one immutable `CompletionRecord`, committed
+  with the status flip and persisted in RuntimeCheckpoint v4;
+- the record binds task id, frozen anchor revision, bounded summary,
+  deterministic summary ref/digest, timestamp, and bounded artifact refs;
+- when the composition root provides an artifact workspace, the complete final
+  assistant response is written before bounded `ContextItem` ingest and its ref
+  is attached to the record;
+- the context close/maintenance transition succeeds before TaskManager commit;
+  the bounded `TaskCompleted` event and post-completion GC make the outcome
+  auditable without keeping completed task state Resident.
 
-Replace the free-form completion summary with two linked objects:
+This is not yet the richer outcome contract below. The current record has no
+typed success/partial/failure outcome, per-criterion results, verification or
+unresolved-loop fields, episode-outcome refs, or explicit prepared/pending
+state. Its `final_output_ref`/digest identify the bounded completion summary;
+the full final response currently travels as an attached artifact ref, and
+bare compositions without an artifact workspace skip that special retention
+path.
+
+Target complete shape:
 
 ```text
 FinalOutputBody {
@@ -557,10 +546,12 @@ CompletionRecord {
 }
 ```
 
-Task lifecycle (`Closed`) and outcome (`Succeeded`, `Partial`, etc.) are
-separate. Closing a task must not falsely claim success.
+Task lifecycle (`Completed` today; a possible richer `Closed` state later) and
+outcome (`Succeeded`, `Partial`, etc.) must remain separate. Closing a task
+must not falsely claim success.
 
-Completion is an atomic root transfer:
+The implemented context-first/task-commit ordering is the baseline. The target
+adds explicit outcome validation and retryable preparation around it:
 
 ```text
 Active TaskAnchor + current Episode + evidence roots
@@ -575,26 +566,32 @@ Active TaskAnchor + current Episode + evidence roots
 CompletionRecord + final-output/artifact/verification retention roots
 ```
 
-Required order:
+Target order (preserving the runtime's context-first/task-commit transaction):
 
 1. Finish and durably identify the final committed model turn.
 2. Persist the exact final output once, before context truncation, with digest.
-3. Freeze the TaskAnchor revision and write `CompletionPrepared`.
-4. Validate acceptance criteria and build the bounded CompletionRecord.
-5. Commit CompletionRecord + terminal anchor patch durably.
-6. Only then close Episode/Task scopes and release active working roots.
-7. Run context GC; keep the outcome/output/evidence protected from Storage GC
+3. Freeze the TaskAnchor revision and build/validate a bounded prepared
+   CompletionRecord against acceptance evidence.
+4. Transactionally close Episode/Task context scopes and transfer roots;
+   rollback this plane if the transition fails.
+5. Commit CompletionRecord + task status/terminal anchor patch, then publish
+   the durable completion event. A post-commit audit failure fences recovery.
+6. Run context GC; keep the outcome/output/evidence protected from Storage GC
    through strong typed edges.
 
-Any failure leaves `CompletionPending`/`ClosePending`, keeps the old roots, and
-is idempotently retryable. A queued journal write without the chosen durable
-barrier is not sufficient reason to release the only output/evidence roots.
+Any pre-commit failure must leave a recoverable active/prepared task with its
+old roots. Once context and TaskManager authority are aligned and committed, a
+durable-event failure must fence mutation rather than roll one plane back by
+itself. Future explicit `CompletionPrepared`/`ClosePending` metadata should
+make retries idempotent; a queued journal write without the chosen durable
+barrier is not sufficient reason to claim an auditable completion.
 
-After commit, the CompletionRecord may cool to Archived/Cold and should not
-enter unrelated prompts automatically. It remains directly discoverable by
-task id and protects the exact final output, deliverables, and verification
-from permanent deletion. A follow-up explicitly fetches/adopts the outcome or
-opens a linked continuation task.
+After commit, the task-owned CompletionRecord is not an online context root for
+unrelated work. Its bounded summary remains searchable by task id, while a
+future canonical evidence/catalog layer must make final output, deliverables,
+verification, and their strong retention edges uniformly discoverable. A
+follow-up should explicitly fetch/adopt the outcome or open a linked
+continuation task.
 
 ## Continuous GC integrated with the model
 
@@ -653,9 +650,9 @@ FocusChanged / TaskCompleted / Checkpoint
   -> checkpoint-safe reconciliation
 ```
 
-The current code already implements most trigger names. The important delta
-is that `AfterTool` signals must affect the next model round, and each pass
-must have bounded work rather than repeatedly scanning all retained history.
+The current code implements the trigger set and the immediate, body-free
+`WorkingSetSignal` at tool commit. The important remaining delta is bounded
+per-event work rather than repeatedly scanning the retained working set.
 
 ### Root priority
 
@@ -833,6 +830,10 @@ Requirements:
   so the model and audit can see where every retrieved item came from.
   The actual authority/taint check policy at fetch/admit time (what a
   given source may or may not do on re-entry) remains open.
+- [x] Make labels a real retrieval dimension. `ContextSearchQuery::label`
+  filters `ExternalizedContext::tags` through the catalog's label index
+  (exact, case-insensitive). Free-text still matches label keys as well as
+  entities. Landed with the catalog/search-index co-design (2026-08-14).
 - [ ] Keep vector retrieval deferred as an optional candidate provider; it
   may suggest ids but cannot own lifecycle truth or bypass admission.
 
@@ -887,27 +888,68 @@ an agent, grants permission, or mutates TaskAnchor by itself.
 
 Next tasks:
 
-- [ ] **CTX-DISC-01** Define the bounded, versioned resource-ref/descriptor
+- [x] **CTX-DISC-01** Define the bounded, versioned resource-ref/descriptor
   contract and distinguish `not found` from `provider unavailable`, stale
   revision, denied, and exact evidence absence.
-- [ ] **CTX-DISC-02** Prototype non-vector federated search over the existing
+  **Landed 2026-08-14.** `ResourceRef` / `ResourceDescriptor` /
+  `DiscoveryMiss` live in `agent-contracts` (`resource://v1/<kind>/<id>[@rev]`).
+  Inspect/fetch misses classify `not_found` vs `evidence_absent` (catalog
+  still shows a terminal semantic) vs `provider_unavailable`. `stale_revision`
+  and `denied` exist on the enum; inspect-by-id does not take a revision yet
+  and no deny path is wired.
+- [x] **CTX-DISC-02** Prototype non-vector federated search over the existing
   context and capability/tool providers; keep provider-owned indexes and
   deterministic ranking before adding artifacts/tasks/agents.
-- [ ] **CTX-DISC-03** Enforce `search -> inspect/resolve -> explicit
+  **Landed 2026-08-14.** Internal `federate` merges Context hits then Tool
+  hits (deterministic, capped). Public surfaces stay `context.manage` /
+  `capability.manage`; there is no `runtime.search` schema. Capability search
+  uses a provider-owned token index over name/description/owner/state/risk
+  (case-insensitive; residual scan if no token hits). Artifact/Task/Agent/
+  Skill/Event providers are still out.
+- [x] **CTX-DISC-03** Enforce `search -> inspect/resolve -> explicit
   admit/surface/invoke`; record every transition and cap query count, fanout,
   rows, bytes, tokens, latency, and repeated-search loops.
-- [ ] **CTX-EVENT-01** Generalize the current user-message path into a typed
+  **Landed 2026-08-14 (Context + Tool prototype caps).** Search is read-only:
+  it does not admit context or load a tool. `capability.manage` search/inspect
+  are `TransientNoPersist` (load/unload still persist). Actor-owned
+  `DiscoveryTurnBudget` caps searches per user turn (8) and identical
+  fingerprints (2). Fanout 2, 32 rows, 4000 result chars, 256 query chars.
+  Search latency is metered on the M15 event stream (`RunMetrics.search_ms_*`).
+- [x] **CTX-EVENT-01** Generalize the current user-message path into a typed
   input envelope plus source-authorized state proposals while preserving the
   current direct, deterministic cancellation and command paths.
-- [ ] **CTX-EVENT-02** Give input records an explicit event lifecycle:
+  **Landed 2026-08-14 (dialogue envelope).** `RuntimeInputEnvelope` carries
+  source/authority/kind/lifecycle/task/turn/causal parent. `UserMessage`
+  is Dialogue + UserSteering; `validate` refuses tool/collaborator
+  UserSteering. `/focus` `/done` `/cancel` stay `RuntimeCommand`s and do
+  not emit `UserMessageAccepted`. Dialogue `proposal` is always `None`
+  (no NL-inferred authority patch). Residuals: no `submit_input` API;
+  CancelTurn/Command kinds exist on the enum but are not constructed.
+- [x] **CTX-EVENT-02** Give input records an explicit event lifecycle:
   `Received -> Interpreted -> Applied/Queued/Rejected -> Consumed ->
   Archived`; interruption and supersession must be revision-fenced and
   replayable.
-- [ ] **CTX-EVENT-03** Replace the current full-content
+  **Landed 2026-08-14 with residuals.** Successful ingest publishes
+  `Applied`. One in-memory queue slot (`USER_INPUT_QUEUE_CAP = 1`) records
+  `Queued` then applies after the busy turn ends (cancel or commit);
+  overflow and cleanup still `Rejected`. `/cancel` stays a
+  `RuntimeCommand` and, after the durable `TurnCancelled` barrier, emits
+  `InterruptCommitted` (`kind=CancelTurn`, `causal_parent` = interrupted
+  Applied id). Model consumption ack publishes `Consumed`; the
+  `TurnCompleted` durable barrier then publishes `Archived` (input-record
+  terminal, not context GC; appended before the TurnCompleted flush). Residuals: queue is not checkpointed or
+  crash-durable; lifecycle follow-ups are not themselves durability
+  barriers; `Received`/`Interpreted` unused; no NL-inferred patch.
+- [x] **CTX-EVENT-03** Replace the current full-content
   `UserMessageAccepted` audit payload with a bounded preview plus stable body
   ref, digest, size, authority, and task/turn ids. Store the exact body once
   in the evidence plane and budget its model projection separately; event
   logging must not become an unbounded duplicate of the transcript.
+  **Landed 2026-08-14.** Preview cap 240 chars; old JSONL `content`
+  deserializes as `preview`. With a workspace, owner `user-input` seals the
+  exact bytes. Replay resolves `body_ref` from an optional workspace
+  (`ReplayConfig.artifact_workspace` / `agent-replay --workspace`); a
+  truncated preview without a workspace fail-closes.
 - [x] **CTX-GC-10** Couple search/resolve signals to bounded access
   reinforcement and GC explanations, but never let a search hit override
   terminal semantic state or mandatory TaskAnchor roots. Landed 2026-08-12:
@@ -918,6 +960,22 @@ Next tasks:
   reinforce access without ever resurrecting dead semantics or unmarking a
   mandatory root. Covered by `search_hits_stamp_a_bounded_recency_
   reinforcement` and `search_reinforcement_delays_cold_to_external_aging`.
+- [x] **CTX-GC-11** Grade retrieval access signals instead of one flat
+  reinforcement, and bound repeated-search gaming. Landed 2026-08-14:
+  search-hit is the weakest signal (at most one Cold-aging delay until a
+  stronger read, per-item cooldown inside one `event_seq`, and one
+  identical-query stamp per user turn), inspect/fetch are stronger
+  deliberate reads, `admit` remains an explicit residency action, and
+  `ContextConsumptionAck` is the strongest online evidence (turn clocks +
+  `access_count` + GC epoch). A weaker signal never overwrites a stronger
+  one, so a loop of broad searches cannot pin never-used Cold entries.
+  Covered by `search_hits_stamp_a_bounded_recency_reinforcement`,
+  `search_reinforcement_delays_cold_to_external_aging`,
+  `identical_search_query_budget_blocks_a_second_stamp_in_the_same_turn`,
+  `search_hit_cools_down_inside_the_same_event_seq`,
+  `inspect_outranks_search_and_resets_saturation`,
+  `search_saturation_cannot_pin_cold_entries_across_gc_passes`, and
+  `consumption_ack_stamps_an_external_descriptor_without_reactivating_it`.
 
 ## Multi-agent context
 
@@ -965,6 +1023,82 @@ second authority or another transcript-based context system.
 
 ## Ordered implementation queue
 
+### Current slice (2026-08-14) — pair GC with Search/Discovery
+
+GC currently runs ahead of retrieval: eviction/externalization policy is
+richer than the machinery for finding things back. This slice closes that
+gap instead of adding more GC scoring rules. Every item below lives where
+its owning entry already is (Phase/AUDIT/TOOL ids); this list only fixes
+the working order and does not duplicate checkbox state:
+
+1. [x] Fix `search.grep` cancellation (`TOOL-01`, AUDIT P1): search
+   observes its `CancellationToken` between files and periodically inside
+   large files, and a cancelled scan returns `ok: false` with
+   `metadata.cancelled` plus any hits already found. Landed 2026-08-14.
+2. [x] Land the `ContextCatalog` authority/body split *together with* its
+   query indexes (the Phase 1 catalog item). Landed 2026-08-14: one
+   `item_id -> location` directory whose id/task/scope/kind/entity/label/
+   lifecycle indexes serve GC recall and `context.search`. Candidate
+   generation uses index buckets plus the existing bounded ranking;
+   `label` is a real `ContextSearchQuery` dimension. Authority metadata
+   stays on the single body; the three stores remain the serde/body
+   layout. A summary/uri needle that hits no entity/label key still
+   residual-scans.
+3. [x] `CTX-GC-11`: graded access signals (search-hit weakest, inspect/fetch
+   stronger, `admit` an explicit residency action, consumption ack the
+   strongest) plus per-item cooldown and repeated-search budgets. Landed
+   2026-08-14: signal strength writes through the body (`AccessSignal` +
+   `search_reinforce_count` on `ExternalizedContext`); search cannot pin
+   Cold entries after one aging delay. Independent of item 4.
+4. [x] `CTX-DISC-01..03` over Context + Tool only (Phase 3 item): one
+   internal federated search planner shared by `context.manage` and
+   `capability.manage`; capability search widens from case-sensitive
+   name-contains to descriptor fields with provider-owned indexes
+   (`TOOLS-10`); read-only search and the CTX-DISC-03 caps are enforced
+   from the first prototype. No public `runtime.search` schema before the
+   Phase 3 comparison.
+   **Landed 2026-08-14.** Shared planner in `agent-contracts::discovery`;
+   public tools unchanged. Comparison decision: keep the two manage
+   surfaces; do not add `runtime.search` until a later measured need.
+   Honest residuals: Artifact/Task/Agent/Skill/Event providers; inspect
+   revision/`stale_revision`; `denied`. Search latency is now on the M15
+   event-stream metrics (item 5), not a discovery-schema residual.
+5. [x] M15 retrieval metrics — search recall/latency, post-GC recovery
+   success (found-after-forgotten rate), reinforcement distribution — and
+   runs the paired real-workload comparison (Phase 4). The first paired
+   run does not wait for item 4: it may run on the current catalog + graded
+   access baseline; later runs measure the discovery effect.
+   **Landed 2026-08-14 (instrumentation + engine baseline; coding gate still
+   open).** `RunMetrics` aggregates search/inspect/fetch/admit, miss
+   reasons, search latency from envelope timestamps, forgotten/recovered
+   ids (GC eviction + `externalized_ids` joined to search descriptors),
+   and final graded-access stamp counts from diagnostics.
+   `agent-eval --retrieval` is the catalog + graded-access found-after-
+   forgotten baseline. `--compare-arm` now prints retrieval rows (coding
+   fixtures usually stay at zero searches). This does **not** close the
+   paired real-model coding acceptance or Phase 4.
+
+This slice is closed 2026-08-14. The typed user-input envelope
+(`CTX-EVENT-01..03`) is landed below with residuals. Do not reopen Phase 4
+from here.
+
+### Current slice (2026-08-14) — typed user input (`CTX-EVENT`)
+
+1. [x] `CTX-EVENT-01` dialogue envelope + keep cancel/command direct.
+2. [x] `CTX-EVENT-02` `Applied` / 1-slot `Queued` / overflow `Rejected` /
+   `InterruptCommitted` after `TurnCancelled` / `Consumed` then `Archived`.
+   Queue is in-memory only; `Received`/`Interpreted` unused.
+3. [x] `CTX-EVENT-03` bounded preview + `user-input` artifact; replay reads
+   `body_ref` when a workspace is supplied.
+
+Do not interpret user authority from prose, do not add `runtime.search`,
+and do not start PLAT-05+.
+
+Explicitly not in this slice: Phase 2 incremental GC beyond what the
+catalog forces; Artifact/Task/Agent/Skill/Event discovery providers;
+any vector index (AGENTS.md invariant 8); and scale engineering for
+thousands of tools or million-entry stores without a measured need.
+
 ### Phase 0 — Freeze and measure the current baseline
 
 - [x] Keep event-triggered maintenance and turn-boundary GC independent of
@@ -1003,8 +1137,24 @@ second authority or another transcript-based context system.
   aggregates cumulative store I/O plus nearest-rank `materialize_ms_p50` /
   `p95`; the comparison table prints them per engine. Recall count is the
   store recall side of full GC (`store_recalled_items`).
-- [x] Replace the placeholder “summary” evaluation arm with a real rolling
-  summary baseline and count all manager/derivation tokens.
+  **Retrieval metrics landed 2026-08-14** — search/inspect/fetch/admit
+  counts, miss reasons, search latency, found-after-forgotten
+  (`externalized_ids` ⨝ search descriptors), and graded-access stamp
+  totals. `agent-eval --retrieval` is the engine baseline; `--compare-arm`
+  prints the same rows from the event stream. Paired real-model coding
+  acceptance stays open.
+  **Resident bytes landed 2026-08-14** — `ContextDiagnostics.resident_bytes`
+  is the UTF-8 size of Resident heap bodies; `RunMetrics` keeps last/max
+  pre-model samples; `agent-replay --compare` prints final/preview-peak
+  `res_bytes` / `peak_bytes`. The 10,000-turn episode fixture asserts byte
+  flatten. The first heavy replay omitted turn-boundary `ContextGc` and
+  incorrectly left C's heap ≈ A. With actor-parity GC, C's heap is a small
+  fraction of A (`long_refactor` 69 332 → 4 298). Active-task latest-file-body
+  policy then restored `fn handle_21()` on turns 22–24 (required **4/4**)
+  without growing Resident bytes or leaking forbidden facts. Scoring stays
+  frozen; turn-boundary GC stays on.
+- [x] Replace the constant marker with a deterministic rolling fold baseline
+  and count its visible derived-content cost.
   **Done 2026-08-12.** `context-baselines` gained a `Summarizer` trait
   (injected via `RollingSummaryEngine::with_summarizer`) plus a bounded
   fold-digest (`SUMMARIZER_PRIOR_CAP = 2 000` chars), so the rolling marker
@@ -1013,6 +1163,8 @@ second authority or another transcript-based context system.
   comparison now folds on the fixture workload (the default 9 000-token
   threshold would never fire — the whole run stays near 300 tokens — so the
   rolling arm uses 200/100 thresholds and folds from the fourth turn).
+  This is a real bounded fold mechanism with a scripted summarizer, not a
+  competitive model-backed compactor; the latter remains a Phase 4/M15 arm.
   Manager/derivation cost is counted separately from the input-token gap:
   `manager_token_cost` re-materializes the final state and sums the
   `Summary`/`source == "derived"` items, surfaced as `EngineRun.
@@ -1023,27 +1175,35 @@ second authority or another transcript-based context system.
 
 ### Phase 1 — Correctness before smarter policy
 
+- [x] Preserve the latest body for the current file/entity across the
+  `long_refactor` turn-23 window while keeping turn-boundary GC enabled.
+  **Done 2026-08-14.** Active-task latest-file-body roots (path-only first
+  line, cap 8, same-path reread supersedes, task switch drops the set)
+  make `long_refactor` required facts **4/4**; forbidden facts stay 0 on
+  C; Resident bytes on heavy scenarios remain a fraction of A. Scoring
+  and `active_threshold` / `archive_threshold` were not retuned.
+
 - [x] Verify the `TaskToolRequirementSet` first slice:
   actor-serialized whole-set CAS, `MustSurface`/`PreferSurface`/`KeepReady`
   round planning, bounded decision events, runtime surface revision, and
-  RuntimeCheckpoint v2 restore/resume. Full workspace tests and strict Clippy
-  pass. This item is a tool-demand subset and
-  must not be used as evidence that the complete TaskAnchor exists.
+  the requirement slice now carried by RuntimeCheckpoint v4 restore/resume.
+  Full workspace tests and strict Clippy
+  pass. This historical item proves only the tool-demand subset; the complete
+  TaskAnchor is implemented and tracked by its separate items below.
 - [x] Make live-restore rebasing a durable, bounded audit transaction
   (`CORE-03`): `RuntimeEvent::RuntimeRestored` carries typed
   old/restored/effective revision data and a capped rebased-task sample;
   an audit failure after restore commit leaves aligned restored state but
   sets `RecoveryRequired` and fences further mutation.
 - [x] Replace free-form task completion Summary with a typed `TaskOutcome` /
-  `CompletionRecord` carrying task id, anchor revision, exact final-output
-  ref/digest, and bounded artifact refs (`CTX-10`). Acceptance results,
-  verification and unresolved state remain anchor fields the runtime has not
-  yet sourced autonomously.
+  `CompletionRecord` carrying task id, anchor revision, a deterministic
+  completion-summary ref/digest, and bounded artifact refs (`CTX-10`).
+  The complete final assistant response is a separate attached artifact when
+  storage is wired; it has no dedicated raw-body digest yet. Acceptance results,
+  verification, typed outcome status, and unresolved-state snapshots remain
+  richer completion-contract work.
 - [x] Persist the exact final response before ContextItem truncation; stop
   treating task-less Session Durable summaries as the authoritative result.
-  The completion summary is now a typed task-owned record with a verifiable
-  digest, but the raw final assistant response is still truncated before
-  ContextItem — raw-evidence retention stays open.
   **Done 2026-08-12.** The actor writes the *full* final assistant response
   to an artifact (`state_dir/artifacts/<run>/assistant-response-<uuid>.txt`)
   before the bounded ContextItem is built, when the composition root wired
@@ -1124,7 +1284,7 @@ second authority or another transcript-based context system.
   and single ownership; derive creates a new item with `DerivedFrom`; both
   have per-turn quotas and runtime E2E tests. Canonical catalog and
   provenance/authority admission remain separate work.
-- [~] Introduce canonical `ContextCatalog` ownership; body movement changes
+- [x] Introduce canonical `ContextCatalog` ownership; body movement changes
   location only, never lifecycle authority (`CTX-02` structural target).
   **Authority-isomorphism step landed 2026-08-12.** `ExternalizedContext`
   now carries the item's full authoritative lifecycle metadata (importance/
@@ -1133,9 +1293,24 @@ second authority or another transcript-based context system.
   degrades authority, and `inspect` projects the real values instead of
   zeros or the externalization tick. Body movement no longer rewrites
   authority: `reenter_working_set` stopped clobbering `created_tick`/
-  `created_turn` on admit, matching the GC reactivate path. The single
-  `item_id -> ContextRecord` storage directory (merging heap / warm buffer
-  / external map) remains the open structural step.
+  `created_turn` on admit, matching the GC reactivate path.
+  **Directory + query indexes landed 2026-08-14.** `ContextCatalog` is the
+  `item_id -> location` directory over heap / warm buffer / external map,
+  with task/scope/kind/entity/label/residency/attention indexes. GC recall
+  and `context.search` consume those buckets; `label` is a real
+  `ContextSearchQuery` dimension. Authority metadata stays on the single
+  body (not copied into a second record). Checkpoints serialize the three
+  stores and rebuild the directory. A free-text needle that hits no
+  entity/label key still residual-scans summaries/uris. Duplicate-ownership
+  detection remains a three-store check: the catalog skips a duplicate on
+  rebuild and is not the fence. Regressions:
+  `catalog_assigns_exactly_one_location_per_id`,
+  `stored_search_ids_use_label_and_entity_indexes`,
+  `external_retrieval_searches_inspects_and_fetches` (label filter).
+  **Graded access (`CTX-GC-11`) landed 2026-08-14.** Search/inspect/fetch/ack
+  stamps write through the stored body (`AccessSignal`,
+  `search_reinforce_count`); the catalog stays a location directory. Search
+  is the weakest signal and cannot pin Cold entries after one aging delay.
 - [x] Make externalization/recall crash-safe and restart-reconcilable, with
   one owner per blob, checksum/revision, atomic writes, and bounded I/O
   (`CTX-04`).
@@ -1185,8 +1360,24 @@ second authority or another transcript-based context system.
 
 ### Phase 2 — Task/Episode state and continuous incremental GC
 
-- [ ] Pass a bounded active `TaskAnchorView` and typed root claims through
+- [x] Pass a bounded active `TaskAnchorView` and typed root claims through
   materialization/GC without duplicating TaskManager authority.
+  **Landed 2026-08-12.** The runtime projects the active task's anchor root
+  claims (`working_refs` + `evidence_refs`) into a bounded
+  `ContextHints.anchor_roots` on every materialization (PromptRequired
+  forces the target into the model frame) and pushes the same projection as
+  a `ContextAction::AnchorRoots` whole-set replacement before GC/Storage GC
+  (ResidentRequired/PromptRequired protect or recall working-set entries,
+  StorageRequired protects store retention; the completion boundary force-
+  clears the projection so finished work is no longer rooted). The engine
+  consumes claims by item id, `context://run/<id>` uri, or exact entity
+  signature, never resurrecting terminal semantic state. Task authority
+  stays with the TaskManager — the engine only ever sees the bounded
+  projection (`MAX_ANCHOR_ROOT_CLAIMS`). Covered by engine unit tests
+  (directive replacement/bounds, GC protection, buffer reactivation,
+  terminal non-resurrection, prompt-required selection, storage protection),
+  the process-boundary parity snapshot (directive + hinted materialize),
+  and E2E `task_anchor_roots_are_projected_into_materialization_hints`.
 - [ ] Split mandatory-materialization, online-residency, and storage-retention
   roots; report `anchor_revision + source_field + RootReason` for each root.
 - [ ] Implement Active/Suspended root downgrade and precise rehydration from
@@ -1227,10 +1418,11 @@ second authority or another transcript-based context system.
   task. The TUI surfaces the report (scanned/deleted/io-errors) when
   anything was deleted. E2E:
   `task_completion_schedules_storage_gc_and_publishes_the_report`.
-- [ ] Emit a bounded metadata-only `WorkingSetSignal` at tool commit so the
+- [x] Emit a bounded metadata-only `WorkingSetSignal` at tool commit so the
   next model round sees newly hot files/symbols (`CTX-08`).
-- [ ] Bound materialization candidates and external preview tokens; fix
-  fit-before-top-K and report candidate/materialize costs (`CTX-07`).
+- [x] Bound materialization candidates and external preview tokens and fix
+  fit-before-top-K (`CTX-07`). Keep candidate/materialize cost in the M15
+  evaluation queue rather than reopening the correctness defect.
 
 ### Phase 3 — Navigation, trajectories, and handoff
 
@@ -1247,17 +1439,55 @@ second authority or another transcript-based context system.
   pass evaluation.
 - [ ] Define independent storage retention profiles for coding, research,
   general assistant, and audit-sensitive runs.
-- [ ] Land `CTX-DISC-01..03` over Context + Tool only; compare separate
+- [x] Land `CTX-DISC-01..03` over Context + Tool only; compare separate
   `context.manage`/`capability.manage` surfaces with one merged discovery
   surface before replacing either public contract.
-- [ ] Land `CTX-EVENT-01..03`: typed user-input lifecycle, bounded event
+  **Landed 2026-08-14.** Shared internal planner; public contracts stay
+  separate. No `runtime.search`. Artifact/Task/Agent/Skill/Event still out.
+- [~] Land `CTX-EVENT-01..03`: typed user-input lifecycle, bounded event
   bodies, and source-authorized state patches. Do not route user authority
   through `ToolOutput`.
+  **Partial 2026-08-14.** Envelope, bounded journal, optional artifact,
+  1-slot queue, Rejected overflow, InterruptCommitted, Consumed/Archived,
+  and `body_ref` replay are landed. Source-authorized state patches
+  (`proposal` still `None` on dialogue) and crash-durable queuing remain
+  open.
 - [ ] Specify the managed-child lifecycle and `agent.manage` surface, but keep
   spawning disabled until the effect, sandbox, resource, and real-evaluation
   gates can enforce it.
 
 ### Phase 4 — Evaluation-gated tuning
+
+- [ ] Persist one auditable result bundle for every intended live cell:
+  run/cell/repeat id; commit + dirty-tree digest; provider/model, engine and
+  budget config; immutable suite/fixture/prompt/verify hashes; arm order;
+  complete event JSONL with sequence and usage-completeness validation; final
+  workspace diff/hash and executable hidden-test evidence; machine-readable
+  summary. Broadcast lag, missing usage, timeout and round-cap are explicit
+  invalid/failure outcomes, never silently omitted rows.
+  **Partial 2026-08-14 (EVAL-01.1).** Live `--compare-live*` writes a versioned
+  `agent-eval.cell.v1` / `pair.v1` bundle per intended cell (manifest with
+  fixture hash + git HEAD/dirty + `OPENAI_MODEL`/`OPENAI_BASE_URL` never the
+  key; events.jsonl without `ModelDelta`; summary with seq-gap, broadcast
+  lag, usage-incomplete, tool histogram; workspace sha256 not a copy;
+  verify.json). Timeout/round-cap/runtime errors stay in the pair as
+  `outcome=error`. `--show-evidence` rebuilds the table. Still missing:
+  dirty-tree digest is now on the manifest (`git_dirty_sha256`); live arm
+  order is counterbalanced (EVAL-01.2). Remaining: executable hidden-test
+  artifacts, and any explanation of live C round inflation (the 2026-08-14
+  traces were never persisted).
+- [ ] Pre-register the formal paired analysis before collecting acceptance
+  cells: at least 300 independent heterogeneous tasks, counterbalanced arm
+  order, three within-task repeats, paired binary estimator, task-clustered
+  one-sided interval, infrastructure-failure/timeout policy and power
+  simulation. Report intent-to-treat end-to-end cost; do not exclude C's extra
+  model/tool rounds as unfair noise.
+  **Partial 2026-08-14 (EVAL-01.2 / EVAL-01.3).** Estimator, ITT rule, live
+  arm-order shuffle and the 5000-sim tables are frozen in
+  `agent-eval --preregister`. Historical 30×3 / −5 pp has only 961/5000 ≈ 19%
+  power at Δ=0; EVAL-01.3 amends the gate to 300×3 (4048/5000 ≈ 81% at Δ=0,
+  margin still −5 pp). The suite is not frozen; do not collect acceptance
+  cells; do not invent 300 tasks.
 
 - [ ] Compare at least:
   - full/sliding transcript;
@@ -1271,6 +1501,14 @@ second authority or another transcript-based context system.
   restarts, collaborator handoffs, and deliberately old-but-required facts.
 - [ ] Only tune scoring/rotation thresholds after observability shows which
   explicit signals are insufficient.
+- [x] Explain the live C round inflation seen in `recall_after_fix` using the
+  persisted traces (empty searches, repeated reads, failed calls, tool-surface
+  and prompt differences) before claiming an end-to-end token saving.
+  **Done as a diagnostic, 2026-08-14.** Bundles in
+  `target/eval-evidence/reasonable-live-retry`: C's extra rounds were a
+  no-tool first turn, then failed `git.status` / `shell.exec` probes and
+  extra rereads — not empty search. n=1; scoring stays frozen; this is not
+  an end-to-end token-saving claim and does not close M15.
 
 ## Acceptance properties
 
@@ -1278,6 +1516,14 @@ second authority or another transcript-based context system.
 
 - Resident bytes and candidate count flatten with current episode plus live
   unresolved state across 10,000+ turns.
+  **10k episode fixture (2026-08-14):** item count and Resident bytes both
+  flatten (peak bytes asserted `< 80_000`, turn-10 000 vs turn-2 000 growth
+  capped). **Coding replay (2026-08-14, after turn-boundary `ContextGc`):**
+  C prompt tokens and Resident heap bytes both drop vs A (`long_refactor`
+  bytes 69 332 → 4 298). Active-task latest-file-body policy (2026-08-14)
+  keeps `fn handle_21()` in view (required 4/4) without putting the heap
+  back. The 10k dialogue fixture is not a substitute for that split.
+  Do not disable turn-boundary GC.
 - Preserve the existing 10,000-turn checks (Resident peak below 200 and
   turn-2,000-to-10,000 growth no greater than 20) while adding bytes and
   candidate work; these numeric thresholds describe the current fixture, not
@@ -1302,10 +1548,13 @@ second authority or another transcript-based context system.
   independent replacement body.
 - Task success is not lower than the best transcript/summary baseline at a
   comparable total inference budget.
-- Before claiming non-inferiority, use paired coding runs (proposed minimum:
-  30 tasks x 3 runs) and pre-register a success-rate-difference lower bound
-  (initial proposal: 95% interval lower bound no worse than -5 percentage
-  points). A 3-run paired smoke test is enough only to validate the harness.
+- Before claiming non-inferiority, use paired coding runs (minimum 30
+  independent tasks × 3 within-task repeats) and pre-register the paired
+  binary estimator, task clustering, one-sided confidence construction,
+  infrastructure-failure policy and a power simulation. The initial bound is
+  a 95% lower confidence limit on C − A no worse than −5 percentage points.
+  Repeats do not increase the independent task count; a 3-run paired smoke is
+  enough only to validate the harness.
 
 ### Lifecycle safety
 
@@ -1393,11 +1642,18 @@ all tokens, latency, failures, and run-to-run variance.
 1. Ratify the source-authority table: which user inputs commit directly,
    which need typed interpretation, and which tool/agent proposals can only
    become evidence.
-2. Ratify `ResourceRef`/`ResourceDescriptor`, provider revision semantics,
+2. [x] Ratify `ResourceRef`/`ResourceDescriptor`, provider revision semantics,
    and the hard limits for one federated search round.
-3. Decide whether v0 adds a new `runtime.search` surface or first implements a
+   **Decided 2026-08-14.** `resource://v1/<kind>/<id>[@rev]`; Context + Tool
+   only; fanout 2, 32 rows, 4000 result chars, 256 query chars, 8 searches
+   per turn, identical-query budget 2. Revision is optional (`gc_epoch` /
+   catalog generation when known); inspect-by-id does not yet request a
+   revision.
+3. [x] Decide whether v0 adds a new `runtime.search` surface or first implements a
    shared internal planner behind existing `context.manage` and
    `capability.manage` controls.
+   **Decided 2026-08-14.** Internal planner only; no public `runtime.search`
+   until a later Phase 3 comparison against measured need.
 4. Ratify the independent catalog/schema, invocation/effect, host-process,
    and managed-child lifecycles.
 5. Ratify child budget inheritance, cancellation, parent root transfer, and
@@ -1408,6 +1664,8 @@ all tokens, latency, failures, and run-to-run variance.
    latency, child cancellation, handoff fidelity, and parent task-success
    metrics before enabling broad multi-agent execution.
 
-Implementation may begin with the bounded read-only Context + Tool discovery
-prototype and typed user-event envelope. Managed-child execution remains
-gated on trusted effects, sandboxing, resource policy, and real evaluation.
+Implementation of the Context + Tool discovery prototype is landed; the
+typed user-input envelope (`CTX-EVENT-01..03`) is landed with residuals
+(in-memory queue, no NL-inferred patches). Managed-child execution
+remains gated on trusted effects, sandboxing, resource policy, and real
+evaluation.

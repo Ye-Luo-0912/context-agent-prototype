@@ -46,6 +46,15 @@ Rules for follow-up agents:
 - [x] Replay cost and fact-coverage observations use independent fresh engine
   instances; a regression compares the aggregate result with a standalone
   fresh coverage run.
+- [x] A failed mandatory turn commit now persists `recovery_required`; the
+  following user/task mutation is rejected until a known-good restore.
+- [x] Full runtime restore is two-stage: actor task/context state remains
+  recovery-fenced while capability state is applied; an old Enabled snapshot
+  cannot lift live Disabled/Quarantined authority, unknown ids do not count as
+  applied, and only durable `RuntimeRestored` releases the fence.
+- [x] Process capability responses with an empty effect list decode as the
+  current envelope, and current/legacy results have `call_id`/`tool_name`
+  overwritten from the trusted request rather than producer output.
 
 ## P0 — blocks the context goal or trusted execution
 
@@ -212,9 +221,17 @@ buffer-overflow externalize and a completed task cannot keep rooting its
 records through a stored reference. Regressions:
 `external_entries_carry_the_model_protection_fields`,
 `completed_task_clears_protections_in_external_entries`. The authority/body
-split (`ContextCatalog`, one `item_id -> ContextRecord` where GC moves
-`body_location` without duplicating authority metadata) remains the
-structural target.
+split landed 2026-08-14 as `ContextCatalog`: one `item_id -> location`
+directory plus shared query indexes. GC moves location; it does not copy
+authority metadata onto a second record. Bodies remain in heap / warm /
+store (the serde layout). Duplicate ownership is still detected by
+counting the three stores, because a catalog rebuild skips a duplicate.
+Regressions: `catalog_assigns_exactly_one_location_per_id`,
+`stored_search_ids_use_label_and_entity_indexes`. Graded retrieval access
+(`CTX-GC-11`) landed 2026-08-14: search/inspect/fetch/ack write through the
+stored body (`AccessSignal`); search cannot pin Cold entries. Regressions:
+`search_saturation_cannot_pin_cold_entries_across_gc_passes`,
+`identical_search_query_budget_blocks_a_second_stamp_in_the_same_turn`.
 
 ### CTX-03 — Fetch/Search/Inspect persist as new observations
 
@@ -280,7 +297,7 @@ derived Note; no directive result is duplicated).
 
 ### CTX-04 — Context-store blob ownership and crash recovery are incomplete
 
-Confirmed defects:
+Original confirmed defects (contained below unless listed as residual):
 
 - recall removes the external-map owner but leaves the file, making an orphan
   Storage GC cannot discover;
@@ -444,10 +461,12 @@ must leave exactly the closure survivors alive.
   commits (publishing the `ContextGc` report). Acceptance: 1,000 completed
   tasks stay bounded in the resident heap while every outcome stays
   searchable by task id.
-- **Verifiable final output** (`110fd6c`). Each `CompletionRecord` carries
-  a deterministic final-output ref (`task:<id>:completion`) and the
-  SHA-256 digest of the exact final output body, so the outcome stays
-  byte-for-byte verifiable after overflow, restart and Storage GC.
+- **Verifiable completion body + retained raw response** (`110fd6c`). Each
+  `CompletionRecord` carries a deterministic ref
+  (`task:<id>:completion`) and SHA-256 digest for its bounded completion
+  summary. When an artifact workspace is wired, the complete final assistant
+  response is stored separately before ContextItem truncation and attached as
+  an artifact ref. A dedicated raw-body digest remains future evidence work.
 
 Regressions: `task_anchor_update_publishes_a_bounded_event`,
 `task_anchor_survives_checkpoint_restore`,
@@ -468,8 +487,8 @@ Affected: `agent-capability-process`, `agent-process`, registration/approval.
 Confirmed chain:
 
 - a process mutates inside the child and returns only `ToolOutput`; the
-  adapter wraps it as `CapabilityOutcome::Value`, bypassing actor generation,
-  cancel and effect rollback;
+  adapter wraps it as `CapabilityOutcome::Value`, bypassing the Runtime/Core
+  epoch fence, cancellation and effect rollback;
 - an in-process capability granted `workspace:write` can call
   `WorkspaceHandle::write`, which applies the mutation immediately during
   `invoke`; only the sibling `prepare_write` path reaches a staged Effect;
@@ -484,7 +503,8 @@ Confirmed chain:
 - inherited stderr is unbounded.
 
 External process capabilities must remain disabled until this closes; M13
-is not yet a completed trust boundary (M12's wire effect broker has landed).
+is not yet a completed trust boundary. The old wire staging path is now
+fail-closed pending PLAT actual-intent proof.
 
 Required order:
 
@@ -498,10 +518,10 @@ Required order:
 7. adversarial tests proving a cancelled/ReadOnly process cannot mutate an
    absolute path, use undeclared network or outlive its operation.
 
-**Partially repaired 2026-08-10; wire broker landed 2026-08-11; mid-invoke
-system broker landed 2026-08-12.** The
-in-process/runtime-owned mutation path is fenced, process mutations now
-cross a brokered wire effect path, mid-invoke filesystem reads and network
+**Partially repaired 2026-08-10; wire mutation staging was disabled after the
+2026-08-13 authority audit; mid-invoke system broker landed 2026-08-12.** The
+trusted in-process/runtime-owned mutation path is fenced, non-empty process
+effects fail closed before staging, mid-invoke filesystem reads and network
 requests are brokered and permission-gated (item 9 below), and external
 process capabilities remain Disabled by default. The OS-level isolation
 defect below keeps CORE-01/M13 open.
@@ -523,12 +543,13 @@ Implemented:
    not mark any tool `ReadOnly` (ReadOnly auto-allows at the approval
    gate); a `WorkspaceWrite` tool needs `workspace:write`, a
    `ProcessExecution` tool needs `process:run`; a process-transport
-   capability may declare `workspace:write` because the wire effect broker
-   (item 8 below) stages its mutations.
+   capability may declare `workspace:write`, but a non-empty process wire
+   effect is currently refused before staging until PLAT actual-intent proof
+   exists (item 8 below).
 3. **No direct capability mutation** — the runtime hands a
    `workspace:write` capability a `StagedOnlyWorkspace` handle whose
    `write` is refused ("must be staged") and whose `prepare_write` returns
-   an `Effect` committed by the core behind the generation fence
+   an `Effect` committed by Core behind its authority-epoch fence
    (`CapabilityOutcome::EffectRequest`), exactly like a builtin tool. A
    mutation can no longer land during `invoke`.
 4. **Undeclared access denied by construction** — the invocation context is
@@ -546,35 +567,28 @@ Implemented:
    longer inherit unbounded output into the parent console.
 7. **Adversarial tests** — `capability_authority_is_derived_and_validated_
    at_registration` (path-unsafe id, self-declared ReadOnly,
-   over-granted tool risk, process `workspace:write` now registers through
-   the wire broker, read-only process allowed), `undeclared_permissions_
-   receive_no_handle` updated (direct write refused, staged write commits,
+   over-granted tool risk, process `workspace:write` can register but its
+   non-empty wire effect is refused, read-only process allowed),
+   `undeclared_permissions_receive_no_handle` updated (direct write refused,
+   trusted in-process staging remains Core-committed,
    unknown permission refused at registration),
    `from_manifest_rejects_ids_that_could_escape_a_path`,
    `from_manifest_rejects_readonly_tools_on_write_capabilities`,
    `private_capability_dirs_are_unpredictable_and_path_safe`, and
    `stderr_is_drained_into_a_bounded_tail` (a 4 MiB stderr flood leaves an
    8 KiB tail ending in the newest bytes).
-8. **Wire-level effect broker** — `WireEffect` (`agent-contracts`): a
-   process capability declares structured mutation intent over the invoke
-   wire (`workspace_write` with a base64 payload, so arbitrary bytes cross
-   JSON safely) instead of mutating inside the child. The adapter's
-   `stage_wire_effects` (`agent-capability-process`) validates every effect
-   against the invocation's granted permissions and stages it through the
-   confined workspace handle (`prepare_write`), then returns
-   `CapabilityOutcome::EffectRequest` — the core commits the composite
-   effect behind the generation fence exactly like a builtin tool's
-   `PreparedEffect`. A plain `ToolOutput` response still decodes as a
-   no-effect `Value` (backward compatible); `Vec<Box<dyn Effect>>` commits
-   sub-effects in order and stops at the first failure. The
-   registration-time refusal of process `workspace:write` is lifted. Wire
-   tests: `wire_effect_round_trips_binary_content_over_json`,
-   `composite_effect_commits_every_sub_effect_in_order` /
-   `composite_effect_stops_at_the_first_failure` /
-   `composite_effect_rolls_back_every_sub_effect`,
-   `staged_wire_write_returns_an_effect_request` (nothing lands until the
-   runtime commits), `wire_write_without_the_grant_is_refused` and
-   `wire_write_without_a_workspace_handle_is_refused`.
+8. **Wire-level effect contract (temporarily fail-closed)** — `WireEffect`
+   still describes the candidate `workspace_write` shape, but the process
+   adapter rejects every non-empty effect list before base64 decode, staging
+   or workspace mutation. Broad `workspace:write` plus an untrusted path is
+   not proof that actual intent is inside the lease. Empty-effect and legacy
+   plain `ToolOutput` responses remain usable. Re-enabling this path requires
+   PLAT-03/04 to bind `operation_id + effect_id + argument_digest` and typed
+   actual intent to Core authority. Tests assert `prepare_write` remains zero
+   and files remain unchanged with or without a grant/handle. Composite
+   effects remain relevant to trusted in-process builtins: they commit
+   sequentially and now truthfully report Applied+DurabilityFailed when an
+   earlier member landed before a later failure.
 9. **Mid-invoke system broker** — a child can issue `{"system": <op>, ...}`
    frames during an invoke; `ProcessHost` (`agent-process`,
    `call_with_cancel_and_broker`) routes them to a `SystemBroker` the
@@ -602,15 +616,157 @@ Implemented:
    `a_system_request_flood_poisons_and_kills_the_connection` (capability
    level) and `system_frames_without_a_broker_poison_and_kill_the_connection`
    (host level).
+10. **Response envelope and identity hotfix (2026-08-12)** — an explicit
+    `ProcessInvokeResponse` is accepted whether `effects` is empty or not;
+    only an actual envelope decode failure enters the legacy path. The adapter
+    overwrites producer `call_id` and `tool_name` with the request identity in
+    both shapes. Artifact ownership/digest, outbound frame caps and explicit
+    feature negotiation remain `PLAT-00/04` work.
 
 Residual (M13; CORE-01 remains open): OS-level filesystem/network isolation
 for the child process — a hostile child can still open arbitrary absolute
 paths or sockets directly at the OS layer (seccomp-bpf / AppContainer-style
 filtering is out of v0 scope) — and Windows Job-Object quota enforcement.
-The wire-level effect broker and the mid-invoke system broker are
-implemented: mutations are staged as `EffectRequest`s the core commits
-behind the generation fence, and filesystem reads / network requests are
-brokered and permission-gated.
+The mid-invoke system broker is implemented for bounded filesystem reads and
+deny-by-default network requests. Process mutations remain disabled at the
+wire boundary until PLAT actual-intent/operation proof exists; trusted
+in-process staged effects still commit behind the Core-owned
+authority-epoch/lease fence.
+
+### CORE-10 — Current wire containment landed; common protocol proof remains open
+
+Affected: `agent-process`, `agent-context-service`, MCP and process
+capability adapters.
+
+Confirmed defects:
+
+- `ProcessHost` bounded child responses, but request and broker-answer frames
+  had no equivalent encoded-size cap, and partial EOF lacked a typed failure;
+- the context service read an entire line before applying a limit and sent
+  responses without a symmetric bound;
+- the MCP client checked size only after `read_until`, did not bound
+  notification floods, dropped ownership of its spawned child, and did not
+  connect invocation cancellation to process-tree termination/poisoning;
+- large broker reads copied a whole value before truncating it at the control
+  plane boundary;
+- process invocation wire identity does not yet carry the runtime operation,
+  attempt, task/scope or deadline needed for recovery and idempotency;
+- producer artifact refs are path-confined, current-run bound, and now carry
+  owner plus an immutable SHA-256 digest in the sealed locator; live
+  captures use an explicit draft form until seal. Producer `call_id` and
+  `tool_name` spoofing is closed by the CORE-01 response hotfix above.
+
+Immediate acceptance (`PLAT-00`, before changing transport):
+
+1. one bounded frame codec for both directions, including encoded frame,
+   in-flight and cumulative byte/count limits, plus explicit caps on known
+   decoded large fields; exact parse-time typed budgets landed in `PLAT-04`;
+2. the codec preserves distinct frames independent of OS read chunking;
+   malformed/partial/oversize/version/id/envelope faults poison and terminate
+   owned sessions, while valid domain errors remain reusable;
+3. MCP retains and reaps the child, and cancel/timeout kills the owned process
+   tree before late output can be admitted;
+4. current broker reads allocate only a bounded prefix and locators are
+   run-scoped with owner/digest identity; parse-time JSON DOM budgets
+   landed in `PLAT-04`;
+5. regressions cover outbound oversize, broker/notification floods,
+   same-write multi-frame delivery, stale/pre-sent ids, partial EOF and
+   cancel-after-spawn.
+
+**Contained 2026-08-13 (current-wire PLAT-00 slice; common-contract proof landed PLAT-04):**
+`agent-process::frame` is the one shared codec — outbound frames are capped
+before a byte is written, the in-flight cap is enforced incrementally while
+reading (including a single large delivery, which previously bypassed the
+bound), and typed `Eof`/`PartialEof`/`Oversize` errors replace the raw reader.
+The codec deliberately does not call two frames in one OS read "coalesced":
+byte streams have no delivery boundary, so it returns exactly one frame and
+preserves the remainder. `ProcessHost` applies the codec in both directions,
+uses unpredictable host-owned request ids to reject pre-sent/stale responses,
+adds a per-call cumulative byte budget (`max_call_bytes`) and a control-plane answer
+cap (`max_system_answer_bytes`, oversized broker answers degrade to a refusal
+frame), and any framing violation poisons the connection and kills the child
+tree. The context service reads with the same codec, replaces over-cap
+responses with a bounded error frame, and ends the session on malformed/
+oversize/version-mismatch frames. The MCP client owns its spawned server
+child (kill + reap on cancel/timeout/poison, `kill_on_drop`, `Drop`
+backstop), validates JSON-RPC id/version/result-vs-error, and poisons on
+framing violations plus bounded notification frame/byte floods. It replaces
+poisoned clients on the next invoke, tears down via `stop()`, and surfaces `AgentError::Cancelled`
+on cancellation. The broker reads through a mandatory allocation-bounded
+workspace primitive and serves at most a 256 KiB prefix
+(`BROKER_FS_READ_MAX_BYTES`) with `byte_len`/`truncated` metadata. Non-empty
+process effects are rejected before base64 decode or staging; decoded-effect
+budgets become relevant only if PLAT authority proof re-enables them.
+Regressions cover outbound oversize before any byte
+is written, cumulative per-call bytes, same-write multi-frame/stale-id,
+partial/malformed frames, oversized service requests, notification flood,
+broker truncation and MCP
+cancel-after-spawn with tree termination and fresh-connection replacement.
+**Additional containment 2026-08-13:** process capability responses carrying
+non-empty `WireEffect`s now fail closed before staging until a typed actual-
+intent proof can be checked against the lease. Composite effects no longer
+report `NotApplied` after earlier members landed: they report applied with a
+durability/recovery failure and clean every unattempted preparation. Runtime
+sets a recovery fence for durability-failed/unknown receipts, refuses further
+same-turn tool dispatch, and rejects later commands until restore. Local
+shell/process/session readers use bounded byte fragments (4,000-byte channel
+items), cap each output artifact at 8 MiB while continuing to drain, and expose
+truncation counters. Artifact locators are capped identity strings
+(`artifact://v1/<run>/<owner>/<digest>`); paging, `artifact.read`, the output
+broker and CompletionRecord admission reject cross-run, path-shaped, draft
+(for completion) and digest-mismatched refs.
+
+**Residual:** parse-time decoded JSON DOM budgets, RFC 8785 JCS, explicit
+`legacy.invoke-output.v1` negotiation and the shared adapter fault matrix
+are landed (`PLAT-04`). Adapter envelope migration onto Platform DTOs remains
+`PLAT-07`. General artifact-range transport for very large bodies remains
+later work. Current adapters still lack the
+operation/attempt/scope/deadline fields defined by the landed `PLAT-02`
+envelope. Error paths kill
+owned children synchronously, but
+uniform "kill then await reap before return" belongs to the supervisor/session
+contract in `PLAT-05/06` (MCP already does it explicitly).
+
+`PLAT-02` has now added the pure common envelope/identity/error semantics in
+`agent-platform-protocol`, with strict IDs, exact profiles, explicit response
+carrier, monotonic deadlines, bounded causality and retry/effect-state
+validation. `PLAT-03a1-a4` have also landed the persistent Core-owned
+authority epoch: Runtime requests CAS advances and keeps a mirror; Core rejects
+stale dispatch/commit; cancellation advances the fence before any await or
+cleanup. Core additionally owns a bounded in-memory operation registry that
+binds argument/effect identity, prevents duplicate dispatch/commit, preserves
+unresolved operations and exposes found/expired-or-possibly-seen/unseen
+in-process queries. The bounded seen filter is deliberately fail-closed, so a
+collision can reject a fresh ID until journal-backed compaction exists.
+Runtime remains the sole orchestrator. PLAT-03a3 now persists epoch and full
+operation transitions journal-first behind an exclusive checksummed `sync_all`
+barrier and strictly recovers them across restart. Only a structurally
+incomplete final fragment is repaired; complete-frame corruption fails closed,
+and writes stop before bounded limits could poison the next startup. Unix
+creation synchronizes parent directories; Windows retains an explicit
+power-loss directory-entry limitation. PLAT-03a4 preallocates a stable Core
+`EffectId`, propagates exact operation/digest/effect identity into builtin
+workspace mutations, persists strict prepare/commit/rollback evidence, and
+reconciles it against current files at startup. Proven states terminalize;
+partial, corrupt, unmanaged or ambiguous effects remain unresolved behind a
+`RecoveryRequired` mutation fence. Generic shell/process spawn/exit recovery
+is landed; out-of-process capability/MCP invoke recovery is landed.
+RuntimeCheckpoint v4 now cross-checks a stable durable Core
+WAL prefix before restore and never rewinds authority. Typed query/cancel
+routes, the authorized transport-independent router, WAL-first acceptance
+publication and the RuntimeActor-owned exact-current-tool seam are landed.
+WAL compaction is landed (exact-tip ancestors; discarded prefixes fail closed).
+In-process authenticated operation-control session installation is landed.
+Framed JSON-lines operation-control over an inherited-pipe analogue is landed.
+Out-of-process capability/MCP invoke recovery is landed (reserved/dispatch/ack
+journal; in-flight keys refuse a second send). HTTP/gRPC brokers are still
+absent, so
+PLAT-03 remains partial and makes no general crash exactly-once or malicious
+same-process Runtime claim. `PLAT-04` common-contract proof is landed
+(JCS, legacy negotiation, shared adapter fault matrix). Adapter envelope
+migration remains `PLAT-07`. Named
+pipes/Unix sockets are not a fix for this defect and
+remain a measured, later transport choice.
 
 ### CORE-02 — Event-journal enqueue is not a durable turn commit
 
@@ -668,10 +824,27 @@ Implemented:
    `failed_barrier_blocks_turn_completed_and_marks_recovery_required` (no
    TurnCompleted broadcast, `TurnCommitFailed` phase `turn_completed_event`,
    `RecoveryRequired` emitted, turn frame dropped).
+   The runtime also persists `recovery_required = true`; the regressions issue
+   another user message and require `AgentError::RecoveryRequired`, proving
+   the signal is an enforcement fence rather than an informational event.
 
 Acceptance: a subscriber observes `TurnCompleted` only after a flush barrier
 has covered every mandatory state write; a failed barrier surfaces
 `TurnCommitFailed`/`RecoveryRequired` and never broadcasts `TurnCompleted`.
+
+Cancellation uses a separate contract: `TurnCancelled` is durably appended
+and returned as a typed `TurnCancelAck`, but it never advances the successful
+`TurnCompleted` recovery marker. If that cancellation barrier fails, the
+operation is already fenced, the caller receives `RecoveryRequired`, and
+ordinary mutation stays blocked until restore. This closes the prior bug in
+which a cancelled turn could be replayed as a successful commit.
+
+Live `ModelDelta` envelopes do not punch holes in that recovery trace. They
+are broadcast-only, repeat the durable cursor of the opening `ModelStarted`,
+and never advance the journal sequence; persisted events therefore remain
+contiguous from 1 through cancellation and `RunCompleted`. Regressions cover
+both a completed streaming turn and streamed cancellation followed by
+shutdown.
 
 Residual — **closed 2026-08-11 (crash-recovery replay)**. The recovery
 machinery now re-reads the trace to rebuild state after a barrier failure.
@@ -711,6 +884,29 @@ exercised with a real full volume (the barrier contract and the recovery
 machinery are closed; the volume-level exercise stays an ops concern).
 
 ## P1 — confirmed defects and hardening
+
+### TOOL-01 — `search.grep` never observes its cancellation token
+
+Confirmed 2026-08-14. `SearchGrepTool::execute` receives the runtime's
+`CancellationToken` as `_cancel` and never checks it: the file walk (up to
+`MAX_FILES_SCANNED = 5_000` files), the per-file reads (up to 2 MiB each)
+and the regex scan all run to completion even after the turn/operation is
+cancelled. The scan is bounded, so this is wasted work and cancellation
+latency, not an unbounded hang — a cancelled turn must not keep paying
+for a dead query. Fix: check the token between
+files (and periodically inside large files), return the partial result as
+an explicitly cancelled outcome, and add a regression that cancels
+mid-scan.
+
+**Closed 2026-08-14.** `search.grep` checks the request token before the
+walk, between files, and every 256 lines inside a file; `walk_files`
+accepts an optional token so the shared scanner can stop without changing
+`code.symbols`. A cancelled scan returns `Ok(ToolOutcome::Value)` with
+`ok: false` and `metadata.cancelled`, keeping any hits already found —
+`Err(Cancelled)` would be stripped by Core into an empty
+`tool_error_output`. Cancelled scans do not write a paging artifact.
+Regressions: `grep_honors_preexisting_cancellation` and
+`grep_stops_mid_scan_and_returns_partial_hits`.
 
 ### CTX-06 — Full GC/storage operation semantics
 
@@ -842,6 +1038,18 @@ every other transition. Regressions:
 transitions the engine returned and the closed scope id matches) and
 `tool_scope_close_failure_is_published_as_an_error` (a failing close
 surfaces an `Error` naming the close instead of being swallowed).
+
+**Cancellation/shutdown cleanup bound closed 2026-08-13.** Cancellation
+installs the Core-owned epoch fence before awaiting scope cleanup. Tool-frame
+closes now have bounded per-scope and total deadlines; a timeout emits the
+error, raises `RecoveryRequired`, and refuses to return a durable cancellation
+acknowledgement. A cancelled tool operation remains an explicit pending-cleanup
+root, blocking normal mutation. `Stop` consumes its late completion under a
+hard deadline and routes any `PreparedEffect` through stale rollback before
+Core shutdown; it reports `RecoveryRequired` rather than silently dropping an
+unresolved effect. Regressions:
+`cancellation_bounds_a_hanging_tool_scope_close_and_fences_mutation` and
+`stop_drains_a_cancelled_tool_before_dropping_its_prepared_effect`.
 
 **Task-summary focus identity closed 2026-08-10.** The summary item built
 for a `TaskCompleted` ingest inherited whatever identity happened to be
@@ -1005,21 +1213,31 @@ freeze/generation handshake: `RuntimeInstance::checkpoint` reads the
 capability registry generation, captures the actor state, snapshots the
 registry, and retries (bounded) whenever the generation moved — a still-
 moving surface returns `AgentError::Internal` instead of a mixed snapshot.
-The public `RuntimeInstance::checkpoint/restore` also carries host capability
-state; a rejected actor restore leaves activation/load flags untouched.
+Only the public `RuntimeInstance::checkpoint/restore` carries host capability
+state; the actor-only checkpoint command is crate-private so callers cannot
+persist it as a complete snapshot. A rejected actor restore leaves
+activation/load flags untouched.
 
-Live restore now publishes one bounded restore-commit audit event,
-`RuntimeEvent::RuntimeRestored`, carrying checkpoint version, restored and
+Live restore is a two-stage instance commit. The actor first installs
+context/task authority while remaining recovery-fenced; the registry then
+applies a fail-closed activation meet (`Enabled < Disabled < Quarantined`);
+only the final durable audit releases the fence. That bounded
+`RuntimeEvent::RuntimeRestored` carries checkpoint version, restored and
 current run ids, old/restored/effective focus and surface revisions
 (`RestoreRevision`), the rebased task-requirement count plus a capped 16-id
-sample (artifact spill reserved for full detail), and whether capability
-state was applied. If appending this mandatory barrier fails after the
+sample (artifact spill reserved for full detail), and whether any registered
+capability state was actually applied. Unknown snapshot ids report false; an
+old Enabled row cannot lift a live Disabled/Quarantined capability or rebuild
+its surface. If appending this mandatory barrier fails after the
 context + task authority commit, the restored aligned state is kept but
 `recovery_required` is set, the standard `RecoveryRequired` signal is emitted
 when possible, and normal mutation is rejected until a known-good restore —
 the restore is never retried as if nothing changed. Regressions:
 `restore_emits_the_bounded_restore_commit_event`,
-`restore_audit_failure_demands_recovery_and_fences_mutation`.
+`restore_audit_failure_demands_recovery_and_fences_mutation`,
+`prepared_restore_stays_fenced_and_unpublished_until_finalize`,
+`capability_restore_cannot_promote_live_disabled_or_quarantined_authority`,
+and `capability_restore_reports_only_registered_rows_as_applied`.
 **CORE-03 closed.**
 
 ### CORE-04 — Output broker/resource policy is incomplete
@@ -1040,8 +1258,10 @@ before any `ToolOutcome` reaches the actor:
    artifact, the broker stores the full content under
    `.focus-agent/artifacts/<run>/` and returns a bounded head/marker/tail
    preview with the `artifact://` reference — a producer without an
-   artifact no longer loses the truncated middle. A producer's own
-   reference is preserved, not overwritten.
+   artifact no longer loses the truncated middle. A producer's own reference
+   is preserved only when it resolves to a readable artifact in the current
+   run; forged or cross-run locators are removed and oversized content gets a
+   trusted replacement spill.
 3. **Applied to context fetch and provider errors.** `context.fetch` items
    pass through the same broker after the engine answers (large stored
    content spills), and provider/model error text is capped before it
@@ -1060,7 +1280,7 @@ implementation); `agent-core` applies it in `execute_tool` and
 `resolve_engine_query` when the config carries one; `agent-tui` injects it.
 
 Regression coverage: `oversized_content_spills_to_an_artifact_and_keeps_
-both_ends`, `existing_reference_is_preserved_not_overwritten`, `summary_and_
+both_ends`, `existing_current_run_reference_is_preserved_not_overwritten`, `cross_run_or_forged_reference_is_replaced_before_truncation`, `summary_and_
 metadata_are_capped_independently`, `decoded_total_cap_trims_content_when_
 fields_combine_over` (agent-workspace); `output_broker_bounds_tool_results_
 before_the_actor`, `context_fetch_results_are_bounded_after_resolve`,
@@ -1263,7 +1483,7 @@ The final immutable snapshot and bounded, schema-free `ToolSurfacePlanned`
 report carry a monotonic surface revision plus non-colliding catalog /
 task-requirement / anchor / focus / execution-policy source revisions.
 `ModelStarted` is emitted only after successful final packing.
-RuntimeCheckpoint v2 persists task requirements, anchors and counters, never
+RuntimeCheckpoint v4 persists task requirements, anchors and counters, never
 a derived round surface.
 
 On top of the explicit exact-name set, a pure typed-root policy derives
@@ -1333,12 +1553,71 @@ authority/demand source put it into consideration.
 
 ## P2 — policy quality and evaluation
 
+### EVAL-01 — M15 live evidence is diagnostic, not yet auditable acceptance
+
+Confirmed 2026-08-14:
+
+- live cells aggregate broadcast events in memory, print to stdout and delete
+  their temporary workspaces; there is no per-cell manifest, trace, final diff
+  or hidden-verification artifact from which the report can be rebuilt;
+- broadcast lag is ignored and missing provider usage is indistinguishable
+  from a measured zero, so an aggregate can be silently incomplete;
+- timeout, round-cap and runtime errors abort the comparison instead of
+  becoming intent-to-treat cell outcomes;
+- arm order is fixed append → rolling → dynamic; provider time/load drift is
+  not counterbalanced;
+- the stated 30×3 / −5 pp gate has no frozen paired estimator, clustering,
+  one-sided interval, infrastructure-failure rule or power calculation;
+- current hidden checks are mostly static file-content assertions, and B uses
+  a scripted summarizer rather than a model-backed bounded compactor;
+- replay Resident `peak` samples pre-model previews rather than every heap
+  mutation; report that scope explicitly and never claim an all-time peak.
+
+Required closure:
+
+1. write one versioned, bounded evidence bundle per intended cell containing
+   provenance/config hashes, complete gap-checked events, usage completeness,
+   final workspace diff/hash, executable hidden-test evidence and a
+   machine-readable summary; generate report tables from these bundles;
+   **Partial 2026-08-14 (EVAL-01.1).** Live `--compare-live*` now writes
+   `agent-eval.cell.v1` under `target/eval-evidence/<unix-secs>/` (or
+   `--evidence-dir`): manifest, gap-checked events.jsonl (`ModelDelta`
+   omitted; seq check skips those repeats), usage-incomplete and broadcast-lag
+   flags, workspace sha256, verify.json, tool histogram, pair.json.
+   Failed cells remain in the pair. `--show-evidence` rebuilds the table.
+   Not yet: executable hidden-test artifacts, or
+   rebuild of the 2026-08-14 `recall_after_fix` round-inflation (those
+   workspaces were deleted). Manifests now carry `git_dirty_sha256`.
+2. freeze at least 300 independent heterogeneous coding tasks before the run,
+   counterbalance arm order, and record every intended cell including task,
+   infrastructure, timeout and censored outcomes; do not invent one-line
+   stand-ins;
+3. pre-register a task-clustered paired binary analysis and power simulation;
+   three repeats measure within-task variance and are not independent tasks;
+   **Partial 2026-08-14 (EVAL-01.2).** `agent-eval --preregister` /
+   `--analyze-evidence` freeze the estimand (task-level C−A), Student-t
+   one-sided 95% LCL, ITT failure rule, and a 5000-sim table (961/238/49
+   passes at Δ=0/−0.05/−0.10). That table shows the historical 30×3 is
+   underpowered for −5 pp under A ⟂ C | task. Live arm order is now
+   shuffled per fixture×repeat and recorded in `pair.json`.
+   **Partial 2026-08-14 (EVAL-01.3).** Same model, seed and margin; gate n
+   is 300×3 (4048/258/0). `SUITE_FROZEN=false`; do not collect acceptance
+   cells.
+4. report intent-to-treat end-to-end tokens/rounds/tools/store/retrieval/
+   latency. Live C's extra rounds are a treatment effect to explain, not data
+   to discard; both-pass cost may appear only as a secondary diagnostic;
+5. use executable hidden build/tests and a model-backed bounded compaction B.
+
+Until closure, M15, V2, learned/vector policy and PLAT-08 evidence gates stay
+closed. M12/M13 remain independent trusted-execution blockers.
+
 - terminal semantic checks should precede pinned retention;
 - replace weak `SharesEntities` pseudo-dependencies with typed edges;
 - add store corruption/reconcile and lifecycle growth-slope metrics;
 - [x] fact comparison replays cost and coverage on independent fresh engines;
-- replace the fixed-marker rolling baseline with real compaction and account
-  for actor, compactor, recall, store, tool-schema and wall-time cost;
+- replace the scripted rolling summarizer with a model-backed bounded
+  compactor and account for actor, compactor, recall, store, tool-schema and
+  wall-time cost;
 - audit process parity whenever `ContextEngine` gains a method;
 - compare dynamic, rolling and append-only engines on these scenarios:
 
@@ -1367,23 +1646,46 @@ savings.
 
 ## Suggested independent Agent work packages
 
-1. **Task authority/completion:** CTX-10 contracts, checkpoint, root transfer
-   and fault tests; do not combine with scoring changes. **Done** — closed
-   with `CTX-10` (`b7a1330` → `110fd6c`).
-2. **Context properties:** residency × lifecycle tests for CTX-01/02/03
-   before policy changes.
-3. **Store integrity:** CTX-04/05 plus crash injection/reconcile; no scoring
-   edits.
-4. **Context/runtime consistency:** CTX-06 operation gate plus CORE-03
-   cross-plane capture and live-restore rebase audit transaction.
-5. **Materializer:** remaining CTX-07/08 packing, candidate-cost and immediate
-   tool-signal work; no store edits.
-6. **Trusted effect + sandbox:** CORE-01/06/07/08 in M12 -> M14 order.
-7. **Durability:** CORE-02 plus recovery replay, isolated from policy.
-8. **Prompt/resource boundary:** CORE-04/05 with adversarial evals.
-9. **Tool-surface hardening:** CORE-09 per-row demand provenance and per-tool
-   capability lifecycle; do not fold in the complete
-   TaskAnchor/CompletionRecord package.
+Closed CTX/CORE repair packages remain documented above; do not reopen them
+as new work. The independent queues that are still actionable are:
+
+1. **Context target:** fix the measured `long_refactor` current-file miss
+   without disabling turn-boundary GC or regrowing Resident bytes, then pursue
+   TaskAnchorView/root projection, sourced EpisodeOutcome, bounded incremental GC and M15 lifecycle/cost
+   measurements. The `ContextCatalog` directory and search indexes landed
+   2026-08-14; graded access signals (`CTX-GC-11`) landed 2026-08-14.
+   Context + Tool discovery (`CTX-DISC-01..03`, `TOOLS-10`) landed
+   2026-08-14 as an internal planner behind `context.manage` /
+   `capability.manage` (no public `runtime.search`). Retrieval metrics
+   (search recall/latency, found-after-forgotten, access-stamp
+   distribution) landed 2026-08-14 on the event stream plus
+   `agent-eval --retrieval`. Live paired coding harness
+   (`--compare-live` / `--compare-live-all`) landed 2026-08-14; the
+   30×3 non-inferiority gate is still open. Typed user-input envelope (`CTX-EVENT-01..03`) landed 2026-08-14:
+   bounded `UserMessageAccepted` preview, optional `user-input` artifact,
+   1-slot in-memory queue, `InterruptCommitted` after `TurnCancelled`,
+   `Consumed`/`Archived` on successful turns, and `body_ref` replay when a
+   workspace is supplied. Dialogue `proposal` is still `None`. Keep
+   policy changes separate from store ownership/fault work.
+2. **Trusted execution:** CORE-01 plus the M12/M13 generic-process admission,
+   recovery and OS confinement residuals.
+3. **Protocol/recovery:** CORE-10/PLAT-00 containment, the PLAT-01 narrow
+   CorePort/dependency boundary and the pure PLAT-02 semantic contract are
+   done, and PLAT-03a1-a4's Core-owned epoch, bounded operation identity/state,
+   stale/duplicate-work fence, authority journal and builtin workspace
+   reconciliation and checkpoint-v4 authority cross-check are landed. Typed
+   query/cancel DTOs, authorized transport-independent router, WAL-first
+   acceptance publisher and actor seam are also landed. WAL compaction is
+   landed. Out-of-process capability/MCP invoke recovery is landed; a future
+   HTTP broker must reuse the reserved/dispatch/ack barrier. PLAT-04
+   common-contract proof is landed; adapter envelope migration is PLAT-07.
+   Do not confuse workspace-local recovery
+   with general crash exactly-once or a non-bypassable same-process
+   security boundary, and do not combine semantic recovery work with a
+   transport swap.
+4. **Real evaluation:** close EVAL-01 first, then run paired, repeated coding
+   workloads with executable hidden tests, complete token/tool/store/manager/
+   latency cost and the predeclared non-inferiority gate (M15).
 
 Do not run packages editing the same crate concurrently unless file ownership
 is explicitly partitioned.

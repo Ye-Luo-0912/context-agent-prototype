@@ -6,16 +6,20 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
-use agent_capability_process::ProcessCapabilityAdapter;
+use agent_capability_process::{McpCapabilityAdapter, McpServerDecl, ProcessCapabilityAdapter};
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, Capability, CapabilityInvocationContext,
-    CapabilityKind, CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
-    CapabilityTransport, Effect, EffectDurability, EffectReceipt, ToolCall, ToolRisk, ToolSpec,
-    WORKSPACE_WRITE, WorkspaceHandle,
+    AgentError, AgentResult, BoundedRead, CancellationToken, Capability,
+    CapabilityInvocationContext, CapabilityKind, CapabilityLifecycle, CapabilityManifest,
+    CapabilityOutcome, CapabilityStatus, CapabilityTransport, Effect, EffectDurability,
+    EffectReceipt, ToolCall, ToolRisk, ToolSpec, WORKSPACE_WRITE, WorkspaceHandle,
 };
+use agent_platform_protocol::{ActiveFeatures, FEATURE_LEGACY_INVOKE_OUTPUT};
 use agent_process::ProcessHostConfig;
 use serde_json::json;
 
@@ -59,13 +63,13 @@ fn write_manifest_with_program(program: &str) -> CapabilityManifest {
     manifest
 }
 
-/// A test double for the confined workspace handle: a real temp directory
-/// whose `prepare_write` returns an effect that writes on commit. The
-/// wire-effect integration test asserts the staged mutation lands exactly
-/// like a builtin tool's `PreparedEffect` — the double only stands in for
-/// the runtime's journaled handle, the adapter path is the code under test.
+/// A test double for the confined workspace handle. Tests may attach a
+/// counter to prove a rejected process wire effect never reached
+/// `prepare_write`; the returned effect remains useful for ordinary handle
+/// tests outside the quarantined process path.
 struct TestWorkspace {
     root: std::path::PathBuf,
+    prepare_calls: Option<Arc<AtomicUsize>>,
 }
 
 #[async_trait::async_trait]
@@ -82,15 +86,102 @@ impl WorkspaceHandle for TestWorkspace {
         std::fs::read(self.root.join(relative)).map_err(|e| AgentError::Io(e.to_string()))
     }
 
+    async fn read_bounded(&self, relative: &str, max_bytes: usize) -> AgentResult<BoundedRead> {
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(self.root.join(relative))
+            .map_err(|e| AgentError::Io(e.to_string()))?;
+        let byte_len = file
+            .metadata()
+            .map_err(|e| AgentError::Io(e.to_string()))?
+            .len();
+        let mut content = Vec::new();
+        file.by_ref()
+            .take(max_bytes as u64)
+            .read_to_end(&mut content)
+            .map_err(|e| AgentError::Io(e.to_string()))?;
+        Ok(BoundedRead {
+            content,
+            byte_len,
+            truncated: byte_len > max_bytes as u64,
+        })
+    }
+
     async fn write(&self, relative: &str, content: &[u8]) -> AgentResult<()> {
         std::fs::write(self.root.join(relative), content).map_err(|e| AgentError::Io(e.to_string()))
     }
 
     async fn prepare_write(&self, relative: &str, content: &[u8]) -> AgentResult<Box<dyn Effect>> {
+        if let Some(calls) = &self.prepare_calls {
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(Box::new(TestWriteEffect {
             path: self.root.join(relative),
             content: content.to_vec(),
         }))
+    }
+}
+
+/// A broker test double that fails if the unbounded compatibility API is
+/// called. This proves the process boundary selects the bounded primitive,
+/// rather than merely checking that its returned JSON happens to be short.
+struct BoundedOnlyWorkspace {
+    root: std::path::PathBuf,
+    bounded_reads: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl WorkspaceHandle for BoundedOnlyWorkspace {
+    fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    async fn resolve(&self, relative: &str) -> AgentResult<std::path::PathBuf> {
+        Ok(self.root.join(relative))
+    }
+
+    async fn read(&self, _relative: &str) -> AgentResult<Vec<u8>> {
+        Err(AgentError::InvalidRequest(
+            "unbounded read must not be called by the broker".into(),
+        ))
+    }
+
+    async fn read_bounded(&self, relative: &str, max_bytes: usize) -> AgentResult<BoundedRead> {
+        self.bounded_reads.fetch_add(1, Ordering::Relaxed);
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(self.root.join(relative))
+            .map_err(|e| AgentError::Io(e.to_string()))?;
+        let byte_len = file
+            .metadata()
+            .map_err(|e| AgentError::Io(e.to_string()))?
+            .len();
+        let mut content = Vec::new();
+        file.by_ref()
+            .take(max_bytes as u64)
+            .read_to_end(&mut content)
+            .map_err(|e| AgentError::Io(e.to_string()))?;
+        Ok(BoundedRead {
+            content,
+            byte_len,
+            truncated: byte_len > max_bytes as u64,
+        })
+    }
+
+    async fn write(&self, _relative: &str, _content: &[u8]) -> AgentResult<()> {
+        Err(AgentError::InvalidRequest(
+            "test workspace is read-only".into(),
+        ))
+    }
+
+    async fn prepare_write(
+        &self,
+        _relative: &str,
+        _content: &[u8],
+    ) -> AgentResult<Box<dyn Effect>> {
+        Err(AgentError::InvalidRequest(
+            "test workspace is read-only".into(),
+        ))
     }
 }
 
@@ -134,6 +225,9 @@ async fn process_capability_round_trips_an_invoke_over_the_host() {
             startup_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             max_frame_bytes: 1024 * 1024,
+            max_call_bytes: 4 * 1024 * 1024,
+            max_system_answer_bytes: 512 * 1024,
+            offered_features: Default::default(),
             sandbox: Default::default(),
         },
     ));
@@ -148,7 +242,9 @@ async fn process_capability_round_trips_an_invoke_over_the_host() {
     let output = capability
         .invoke(
             ToolCall {
-                id: "c1".into(),
+                // The mock deliberately reports the legacy canned id `c1`;
+                // the trusted adapter must bind the output to this request.
+                id: "requested-call".into(),
                 name: "process-demo.invoke".into(),
                 arguments: json!({}),
             },
@@ -166,7 +262,7 @@ async fn process_capability_round_trips_an_invoke_over_the_host() {
         other => panic!("the wire only carries plain values, got: {other:?}"),
     };
     assert!(output.ok);
-    assert_eq!(output.call_id, "c1");
+    assert_eq!(output.call_id, "requested-call");
     assert!(
         output.model_content.contains("process capability handled"),
         "the child's ToolOutput must cross the boundary: {}",
@@ -187,6 +283,9 @@ async fn cancellation_aborts_a_long_running_invoke_and_kills_the_child() {
             startup_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
             max_frame_bytes: 1024 * 1024,
+            max_call_bytes: 4 * 1024 * 1024,
+            max_system_answer_bytes: 512 * 1024,
+            offered_features: Default::default(),
             sandbox: Default::default(),
         },
     ));
@@ -274,6 +373,9 @@ async fn cancellation_terminates_the_child_process() {
             startup_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
             max_frame_bytes: 1024 * 1024,
+            max_call_bytes: 4 * 1024 * 1024,
+            max_system_answer_bytes: 512 * 1024,
+            offered_features: Default::default(),
             sandbox: Default::default(),
         },
     ));
@@ -338,6 +440,123 @@ async fn cancellation_terminates_the_child_process() {
 }
 
 #[tokio::test]
+async fn mcp_cancel_after_spawn_terminates_the_server_tree() {
+    // The MCP adapter owns its server child for the whole connection: a
+    // cancelled invoke must kill and reap the tree (the heartbeat thread
+    // inside the server stops), and the next invoke must come back through
+    // a fresh connection — the poisoned client is replaced, never reused.
+    let dir = tempfile::tempdir().unwrap();
+    let heartbeat = dir.path().join("mcp-heartbeat.txt");
+    let adapter = McpCapabilityAdapter::connect(
+        McpServerDecl {
+            id: "mock-mcp".into(),
+            version: "1.0.0".into(),
+            name: "mock mcp".into(),
+            summary: "mock server for tests".into(),
+            program: common::locate_mcp_mock_server()
+                .expect("mcp_mock_server built")
+                .to_string_lossy()
+                .into_owned(),
+            args: Vec::new(),
+            permissions: vec!["workspace:read".into()],
+        },
+        ToolRisk::ReadOnly,
+        Duration::from_secs(10),
+        1024 * 1024,
+    )
+    .await
+    .expect("connect + discover succeeds");
+
+    // `mock.echo` with a `heartbeat` path spawns a counter thread inside
+    // the server child the moment the request arrives; `hang: true` then
+    // never answers, so only the runtime's cancel token can end the call.
+    // Start the hanging invoke as a task, poll until the counter visibly
+    // advances (the server is live and processing the request), then
+    // cancel.
+    let capability: Arc<dyn Capability> = Arc::new(adapter);
+    let cancel = CancellationToken::new();
+    let invoke_cancel = cancel.clone();
+    let capability_for_invoke = capability.clone();
+    let heartbeat_for_invoke = heartbeat.clone();
+    let invoke_task = tokio::spawn(async move {
+        capability_for_invoke
+            .invoke(
+                ToolCall {
+                    id: "c20".into(),
+                    name: "mock.echo".into(),
+                    arguments: json!({
+                        "heartbeat": heartbeat_for_invoke.to_string_lossy(),
+                        "hang": true,
+                    }),
+                },
+                CapabilityInvocationContext {
+                    granted_permissions: vec!["workspace:read".into()],
+                    workspace: None,
+                    artifacts: None,
+                    cancel: invoke_cancel,
+                },
+            )
+            .await
+    });
+
+    let baseline = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+    let mut saw_advance = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if std::fs::read_to_string(&heartbeat).unwrap_or_default() != baseline {
+            saw_advance = true;
+            break;
+        }
+    }
+    assert!(
+        saw_advance,
+        "the heartbeat must advance while the MCP server is alive"
+    );
+
+    cancel.cancel();
+    let result = invoke_task.await.unwrap();
+    assert!(
+        matches!(result, Err(agent_contracts::AgentError::Cancelled)),
+        "a cancelled MCP invoke must surface Cancelled, got {result:?}"
+    );
+
+    // The server tree is dead: the heartbeat must freeze.
+    let frozen = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        std::fs::read_to_string(&heartbeat).unwrap_or_default(),
+        frozen,
+        "the MCP server tree must be terminated after cancellation — the heartbeat stopped"
+    );
+
+    // The poisoned client is replaced on the next invoke: a fresh server
+    // tree connects and serves again, so a cancelled capability is not a
+    // dead capability.
+    let outcome = capability
+        .invoke(
+            ToolCall {
+                id: "c21".into(),
+                name: "mock.add".into(),
+                arguments: json!({"a": 1, "b": 2}),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec!["workspace:read".into()],
+                workspace: None,
+                artifacts: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("a fresh connection must replace the poisoned one");
+    match outcome {
+        CapabilityOutcome::Value(output) => assert_eq!(output.model_content, "3"),
+        other => panic!("mock.add must return a plain value, got {other:?}"),
+    }
+    capability.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn strict_sandbox_scrubs_parent_secrets_across_the_wire() {
     // The adapter's production sandbox (the `from_manifest` shape) drops
     // every unlisted parent variable and runs the child in a dedicated
@@ -362,6 +581,9 @@ async fn strict_sandbox_scrubs_parent_secrets_across_the_wire() {
             startup_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             max_frame_bytes: 1024 * 1024,
+            max_call_bytes: 4 * 1024 * 1024,
+            max_system_answer_bytes: 512 * 1024,
+            offered_features: Default::default(),
             sandbox: agent_process::ProcessSandbox {
                 // The same strict shape `from_manifest` builds: only the
                 // non-secret platform essentials are inherited, and the
@@ -427,6 +649,9 @@ async fn granted_permissions_reach_the_child_intact() {
             startup_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             max_frame_bytes: 1024 * 1024,
+            max_call_bytes: 4 * 1024 * 1024,
+            max_system_answer_bytes: 512 * 1024,
+            offered_features: Default::default(),
             sandbox: Default::default(),
         },
     ));
@@ -524,6 +749,9 @@ async fn invoke_before_start_fails_with_a_clear_error() {
             startup_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             max_frame_bytes: 1024 * 1024,
+            max_call_bytes: 4 * 1024 * 1024,
+            max_system_answer_bytes: 512 * 1024,
+            offered_features: Default::default(),
             sandbox: Default::default(),
         },
     );
@@ -549,13 +777,14 @@ async fn invoke_before_start_fails_with_a_clear_error() {
 }
 
 #[tokio::test]
-async fn staged_wire_write_returns_an_effect_request() {
-    // The mock declares a workspace-write wire effect; the adapter must
-    // validate the grant, stage it through the confined handle, and hand
-    // the runtime an `EffectRequest` — the child never mutates anything
-    // itself, it declares intent. Nothing lands until the runtime commits
-    // the effect behind the generation fence.
+async fn nonempty_wire_effects_fail_closed_before_workspace_mutation() {
+    // The current process wire effect has no host-verifiable canonical
+    // actual intent. Even a write-capable invocation with a confined handle
+    // must therefore fail before `prepare_write`, leaving existing workspace
+    // state byte-for-byte unchanged.
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("staged.txt"), "original content").unwrap();
+    let prepare_calls = Arc::new(AtomicUsize::new(0));
     let program = common::locate_mock_host().expect("mock_host built");
     let capability: Arc<dyn Capability> = Arc::new(ProcessCapabilityAdapter::with_config(
         write_manifest_with_program(&program.to_string_lossy()),
@@ -566,6 +795,9 @@ async fn staged_wire_write_returns_an_effect_request() {
             startup_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             max_frame_bytes: 1024 * 1024,
+            max_call_bytes: 4 * 1024 * 1024,
+            max_system_answer_bytes: 512 * 1024,
+            offered_features: Default::default(),
             sandbox: Default::default(),
         },
     ));
@@ -573,8 +805,9 @@ async fn staged_wire_write_returns_an_effect_request() {
 
     let workspace: Arc<dyn WorkspaceHandle> = Arc::new(TestWorkspace {
         root: dir.path().to_path_buf(),
+        prepare_calls: Some(prepare_calls.clone()),
     });
-    let outcome = capability
+    let result = capability
         .invoke(
             ToolCall {
                 id: "c6".into(),
@@ -593,50 +826,31 @@ async fn staged_wire_write_returns_an_effect_request() {
                 cancel: CancellationToken::new(),
             },
         )
-        .await
-        .unwrap();
-    let (output, effect) = match outcome {
-        CapabilityOutcome::EffectRequest { output, effect } => (output, effect),
-        other => panic!("expected an EffectRequest, got {other:?}"),
-    };
-    assert!(output.ok);
+        .await;
+    let error = result.expect_err("a non-empty process wire effect must be quarantined");
+    let message = error.to_string();
     assert!(
-        output.model_content.contains("process capability handled"),
-        "the child's ToolOutput must cross the boundary: {}",
-        output.model_content
+        message.contains("process wire effects are disabled")
+            && message.contains("no workspace mutation was staged"),
+        "the refusal must name the temporary safety gate and its no-mutation result: {message}"
     );
-
-    // The mutation is staged, not applied: the file must not exist until
-    // the runtime commits the effect.
-    assert!(
-        !dir.path().join("staged.txt").exists(),
-        "the wire effect must be staged, never applied by the child or the adapter"
-    );
-    let receipt = effect.commit().await;
-    assert!(
-        matches!(
-            &receipt,
-            EffectReceipt::Applied {
-                durability: EffectDurability::Durable,
-                ..
-            }
-        ),
-        "the staged effect commits durably: {receipt:?}"
+    assert_eq!(
+        prepare_calls.load(Ordering::SeqCst),
+        0,
+        "the adapter must reject before asking the workspace to stage anything"
     );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("staged.txt")).unwrap(),
-        "staged content",
-        "the staged bytes must land exactly as declared"
+        "original content",
+        "a rejected wire effect must not replace existing workspace state"
     );
     capability.stop().await.unwrap();
 }
 
 #[tokio::test]
-async fn wire_write_without_the_grant_is_refused() {
-    // The child declared a write intent, but this invocation was not
-    // granted `workspace:write`: the adapter must refuse before anything
-    // is staged. Declared permission sets are enforced, never assumed —
-    // an over-granted effect must not reach the workspace handle.
+async fn wire_effect_quarantine_precedes_legacy_grant_matching() {
+    // Wire-effect quarantine precedes legacy permission matching: an
+    // ungranted child gets the same fail-closed result and no staging path.
     let program = common::locate_mock_host().expect("mock_host built");
     let capability: Arc<dyn Capability> = Arc::new(ProcessCapabilityAdapter::with_config(
         write_manifest_with_program(&program.to_string_lossy()),
@@ -647,6 +861,9 @@ async fn wire_write_without_the_grant_is_refused() {
             startup_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             max_frame_bytes: 1024 * 1024,
+            max_call_bytes: 4 * 1024 * 1024,
+            max_system_answer_bytes: 512 * 1024,
+            offered_features: Default::default(),
             sandbox: Default::default(),
         },
     ));
@@ -673,17 +890,17 @@ async fn wire_write_without_the_grant_is_refused() {
         .await;
     let message = result.unwrap_err().to_string();
     assert!(
-        message.contains("without 'workspace:write' permission"),
-        "the refusal must name the missing grant: {message}"
+        message.contains("process wire effects are disabled")
+            && message.contains("no workspace mutation was staged"),
+        "the refusal must name the wire-effect quarantine: {message}"
     );
     capability.stop().await.unwrap();
 }
 
 #[tokio::test]
-async fn wire_write_without_a_workspace_handle_is_refused() {
-    // Even with the permission string present, a capability that never
-    // received a confined workspace handle cannot stage a write — the
-    // handle is the enforcement, not the permission string.
+async fn wire_effect_quarantine_does_not_require_a_workspace_handle() {
+    // A permission word without a workspace handle also cannot reach a
+    // staging branch; the temporary wire-effect quarantine is unconditional.
     let program = common::locate_mock_host().expect("mock_host built");
     let capability: Arc<dyn Capability> = Arc::new(ProcessCapabilityAdapter::with_config(
         write_manifest_with_program(&program.to_string_lossy()),
@@ -694,6 +911,9 @@ async fn wire_write_without_a_workspace_handle_is_refused() {
             startup_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             max_frame_bytes: 1024 * 1024,
+            max_call_bytes: 4 * 1024 * 1024,
+            max_system_answer_bytes: 512 * 1024,
+            offered_features: Default::default(),
             sandbox: Default::default(),
         },
     ));
@@ -720,8 +940,9 @@ async fn wire_write_without_a_workspace_handle_is_refused() {
         .await;
     let message = result.unwrap_err().to_string();
     assert!(
-        message.contains("no workspace handle"),
-        "the refusal must name the missing handle: {message}"
+        message.contains("process wire effects are disabled")
+            && message.contains("no workspace mutation was staged"),
+        "the refusal must name the wire-effect quarantine: {message}"
     );
     capability.stop().await.unwrap();
 }
@@ -740,6 +961,9 @@ async fn started_readonly_capability() -> Arc<dyn Capability> {
             startup_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             max_frame_bytes: 1024 * 1024,
+            max_call_bytes: 4 * 1024 * 1024,
+            max_system_answer_bytes: 512 * 1024,
+            offered_features: Default::default(),
             sandbox: Default::default(),
         },
     ));
@@ -784,6 +1008,7 @@ async fn brokered_fs_read_serves_files_inside_the_workspace() {
     std::fs::write(dir.path().join("notes.txt"), "hello broker").unwrap();
     let workspace: Arc<dyn WorkspaceHandle> = Arc::new(TestWorkspace {
         root: dir.path().to_path_buf(),
+        prepare_calls: None,
     });
 
     let capability = started_readonly_capability().await;
@@ -796,10 +1021,55 @@ async fn brokered_fs_read_serves_files_inside_the_workspace() {
 }
 
 #[tokio::test]
+async fn brokered_fs_read_is_bounded_for_large_files() {
+    // The control plane is not a file transport: a file bigger than the
+    // broker's read bound must come back as the bounded head of the file,
+    // with the truncation metadata naming the original size — never a full
+    // base64 copy through the JSON pipe.
+    let dir = tempfile::tempdir().unwrap();
+    let size = agent_capability_process::BROKER_FS_READ_MAX_BYTES + 48 * 1024;
+    let content = vec![b'a'; size];
+    std::fs::write(dir.path().join("big.bin"), &content).unwrap();
+    let workspace = Arc::new(BoundedOnlyWorkspace {
+        root: dir.path().to_path_buf(),
+        bounded_reads: AtomicUsize::new(0),
+    });
+    let workspace_handle: Arc<dyn WorkspaceHandle> = workspace.clone();
+
+    let capability = started_readonly_capability().await;
+    let model_content = invoke_broker_read(&capability, &workspace_handle, "big.bin").await;
+    let payload = model_content
+        .strip_prefix("FS_READ:")
+        .expect("the mock must report a served read");
+    let (payload, meta) = payload.split_once('\n').unwrap_or((payload, ""));
+    assert_eq!(
+        payload.len(),
+        agent_capability_process::BROKER_FS_READ_MAX_BYTES,
+        "the broker must serve only the bounded head of the file"
+    );
+    assert_eq!(
+        payload.as_bytes(),
+        &content[..agent_capability_process::BROKER_FS_READ_MAX_BYTES],
+        "the served prefix must be the file's head, not an arbitrary slice"
+    );
+    assert!(
+        meta.contains(&format!("byte_len={size}")) && meta.contains("truncated=true"),
+        "the truncation metadata must name the original size: {meta}"
+    );
+    assert_eq!(
+        workspace.bounded_reads.load(Ordering::Relaxed),
+        1,
+        "the broker must use exactly one bounded read and never call full read"
+    );
+    capability.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn brokered_fs_read_refuses_absolute_and_escaping_paths() {
     let dir = tempfile::tempdir().unwrap();
     let workspace: Arc<dyn WorkspaceHandle> = Arc::new(TestWorkspace {
         root: dir.path().to_path_buf(),
+        prepare_calls: None,
     });
 
     let capability = started_readonly_capability().await;
@@ -825,6 +1095,7 @@ async fn brokered_fs_read_without_the_grant_is_refused() {
     std::fs::write(dir.path().join("secret.txt"), "top secret").unwrap();
     let workspace: Arc<dyn WorkspaceHandle> = Arc::new(TestWorkspace {
         root: dir.path().to_path_buf(),
+        prepare_calls: None,
     });
 
     let capability = started_readonly_capability().await;
@@ -1070,5 +1341,88 @@ async fn a_system_request_flood_poisons_and_kills_the_connection() {
         message.contains("poisoned"),
         "the flood must poison the connection: {message}"
     );
+    capability.stop().await.unwrap();
+}
+
+fn mock_process_config(program: &str) -> ProcessHostConfig {
+    ProcessHostConfig {
+        program: program.to_string(),
+        args: vec!["--serve".into()],
+        env: vec![("MOCK_MARKER".into(), "1".into())],
+        startup_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(5),
+        max_frame_bytes: 1024 * 1024,
+        max_call_bytes: 4 * 1024 * 1024,
+        max_system_answer_bytes: 512 * 1024,
+        offered_features: Default::default(),
+        sandbox: Default::default(),
+    }
+}
+
+fn invoke_ctx() -> CapabilityInvocationContext {
+    CapabilityInvocationContext {
+        granted_permissions: vec!["workspace:read".into()],
+        workspace: None,
+        artifacts: None,
+        cancel: CancellationToken::new(),
+    }
+}
+
+#[tokio::test]
+async fn plain_tool_output_is_rejected_without_legacy_negotiation() {
+    let program = common::locate_mock_host().expect("mock_host built");
+    let program = program.to_string_lossy().into_owned();
+    let capability: Arc<dyn Capability> = Arc::new(ProcessCapabilityAdapter::with_config(
+        manifest_with_program(&program),
+        mock_process_config(&program),
+    ));
+    capability.start().await.unwrap();
+    let error = capability
+        .invoke(
+            ToolCall {
+                id: "requested-call".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({ "legacy_plain": true }),
+            },
+            invoke_ctx(),
+        )
+        .await
+        .expect_err("plain ToolOutput must stay closed without negotiation");
+    assert!(
+        error.to_string().contains("legacy.invoke-output.v1"),
+        "refusal must name the feature: {error}"
+    );
+    capability.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn plain_tool_output_is_accepted_after_legacy_negotiation() {
+    let program = common::locate_mock_host().expect("mock_host built");
+    let program = program.to_string_lossy().into_owned();
+    let mut config = mock_process_config(&program);
+    config.offered_features =
+        ActiveFeatures::new(vec![FEATURE_LEGACY_INVOKE_OUTPUT.into()]).expect("known feature");
+    let capability: Arc<dyn Capability> = Arc::new(ProcessCapabilityAdapter::with_config(
+        manifest_with_program(&program),
+        config,
+    ));
+    capability.start().await.unwrap();
+    let output = capability
+        .invoke(
+            ToolCall {
+                id: "requested-call".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({ "legacy_plain": true }),
+            },
+            invoke_ctx(),
+        )
+        .await
+        .unwrap();
+    let output = match output {
+        CapabilityOutcome::Value(output) => output,
+        other => panic!("expected a value outcome, got: {other:?}"),
+    };
+    assert_eq!(output.call_id, "requested-call");
+    assert_eq!(output.tool_name, "process-demo.invoke");
     capability.stop().await.unwrap();
 }

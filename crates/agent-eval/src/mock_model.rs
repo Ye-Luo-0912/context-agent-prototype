@@ -1,15 +1,13 @@
 //! A scripted model transport for deterministic harness runs.
 //!
-//! The live M15 evaluation needs a provider that accepts tool calls; the
-//! current endpoint rejects them. This transport is the deterministic
-//! stand-in: the Nth model request returns the Nth scripted tool call, and
-//! once the script is exhausted the model answers with a fixed completion
-//! message. That drives the *real* tool surface through the *real* runtime
-//! (workspace confinement, prepared effects, generation fence, cost
-//! accounting), so the harness itself is proven end to end without a
-//! provider. It is deliberately not a model-quality test.
+//! CI fixture runs must not depend on a live provider. This transport is
+//! the stand-in: the Nth model request returns the Nth scripted tool call,
+//! and once the script is exhausted the model answers with a fixed
+//! completion message. That drives the *real* tool surface through the
+//! *real* runtime (workspace confinement, prepared effects, generation
+//! fence, cost accounting). It is deliberately not a model-quality test.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use agent_contracts::{
     AgentResult, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, ModelUsage,
@@ -22,6 +20,10 @@ pub struct ScriptedModel {
     steps: Vec<ToolCall>,
     done: String,
     requests: AtomicUsize,
+    /// 每个 tool 之后先回一条无 tool 的 completion，结束当前 turn。
+    /// 多轮 live 题的脚本化对照用：一轮用户输入对应一次工具。
+    one_tool_per_turn: bool,
+    emit_done_next: AtomicBool,
 }
 
 impl ScriptedModel {
@@ -30,7 +32,14 @@ impl ScriptedModel {
             steps,
             done: done.into(),
             requests: AtomicUsize::new(0),
+            one_tool_per_turn: false,
+            emit_done_next: AtomicBool::new(false),
         }
+    }
+
+    pub fn one_tool_per_turn(mut self) -> Self {
+        self.one_tool_per_turn = true;
+        self
     }
 }
 
@@ -46,58 +55,65 @@ impl ModelTransport for ScriptedModel {
     }
 
     async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        let input_tokens = price_request(&request);
+        if self.one_tool_per_turn && self.emit_done_next.swap(false, Ordering::SeqCst) {
+            return Ok(done_output(&self.done, input_tokens));
+        }
         let index = self.requests.fetch_add(1, Ordering::SeqCst);
-        // Report the input the scripted model "saw": the messages (content
-        // plus serialized tool calls) and the tool schemas of this request,
-        // priced with the same estimator the engines use. This makes the
-        // fixture path's ModelUsed accounting real, so a cross-engine
-        // comparison can measure how much context each engine feeds a
-        // request without a provider.
-        let input_tokens = request
-            .messages
-            .iter()
-            .map(|message| {
-                tokens::approx_tokens(&message.content)
-                    + message
-                        .tool_calls
-                        .iter()
-                        .map(|call| {
-                            tokens::approx_tokens(&call.name)
-                                + tokens::approx_tokens(&call.arguments.to_string())
-                        })
-                        .sum::<usize>()
-            })
-            .sum::<usize>()
-            + request
-                .tools
-                .iter()
-                .map(|spec| {
-                    tokens::approx_tokens(&spec.name)
-                        + tokens::approx_tokens(&spec.description)
-                        + tokens::approx_tokens(&spec.input_schema.to_string())
-                })
-                .sum::<usize>();
-        let usage = ModelUsage {
-            input_tokens: Some(input_tokens as u64),
-            output_tokens: Some(if index < self.steps.len() {
-                tokens::approx_tokens(&self.steps[index].arguments.to_string()) as u64
-            } else {
-                tokens::approx_tokens(&self.done) as u64
-            }),
-        };
         if let Some(call) = self.steps.get(index) {
+            if self.one_tool_per_turn {
+                self.emit_done_next.store(true, Ordering::SeqCst);
+            }
             Ok(ModelOutput {
                 content: String::new(),
                 tool_calls: vec![call.clone()],
-                usage,
+                usage: ModelUsage {
+                    input_tokens: Some(input_tokens),
+                    output_tokens: Some(tokens::approx_tokens(&call.arguments.to_string()) as u64),
+                },
             })
         } else {
-            Ok(ModelOutput {
-                content: self.done.clone(),
-                tool_calls: Vec::new(),
-                usage,
-            })
+            Ok(done_output(&self.done, input_tokens))
         }
+    }
+}
+
+fn price_request(request: &ModelRequest) -> u64 {
+    let tokens = request
+        .messages
+        .iter()
+        .map(|message| {
+            tokens::approx_tokens(&message.content)
+                + message
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        tokens::approx_tokens(&call.name)
+                            + tokens::approx_tokens(&call.arguments.to_string())
+                    })
+                    .sum::<usize>()
+        })
+        .sum::<usize>()
+        + request
+            .tools
+            .iter()
+            .map(|spec| {
+                tokens::approx_tokens(&spec.name)
+                    + tokens::approx_tokens(&spec.description)
+                    + tokens::approx_tokens(&spec.input_schema.to_string())
+            })
+            .sum::<usize>();
+    tokens as u64
+}
+
+fn done_output(done: &str, input_tokens: u64) -> ModelOutput {
+    ModelOutput {
+        content: done.to_string(),
+        tool_calls: Vec::new(),
+        usage: ModelUsage {
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(tokens::approx_tokens(done) as u64),
+        },
     }
 }
 
@@ -130,5 +146,40 @@ mod tests {
         let second = model.complete(request).await.unwrap();
         assert_eq!(second.content, "done");
         assert!(second.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_tool_per_turn_inserts_a_done_between_steps() {
+        let model = ScriptedModel::new(
+            vec![
+                ToolCall {
+                    id: "c1".into(),
+                    name: "fs.read".into(),
+                    arguments: json!({"path": "a"}),
+                },
+                ToolCall {
+                    id: "c2".into(),
+                    name: "fs.write".into(),
+                    arguments: json!({"path": "b"}),
+                },
+            ],
+            "done",
+        )
+        .one_tool_per_turn();
+        let request = ModelRequest {
+            messages: Vec::new(),
+            tools: Vec::new(),
+            metadata: serde_json::Value::Null,
+            cancel: agent_contracts::CancellationToken::new(),
+        };
+        let first = model.complete(request.clone()).await.unwrap();
+        assert_eq!(first.tool_calls[0].name, "fs.read");
+        let after_first = model.complete(request.clone()).await.unwrap();
+        assert_eq!(after_first.content, "done");
+        assert!(after_first.tool_calls.is_empty());
+        let second = model.complete(request.clone()).await.unwrap();
+        assert_eq!(second.tool_calls[0].name, "fs.write");
+        let after_second = model.complete(request).await.unwrap();
+        assert_eq!(after_second.content, "done");
     }
 }

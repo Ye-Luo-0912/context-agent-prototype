@@ -110,6 +110,7 @@ pub(crate) fn apply_admit(
         state.items.push(item);
         state.pending_ingest_transitions.push(transition);
         state.admits_this_turn += 1;
+        state.access_admits = state.access_admits.saturating_add(1);
         return None;
     }
 
@@ -144,6 +145,7 @@ pub(crate) fn apply_admit(
         state.items.push(item);
         state.pending_ingest_transitions.push(transition);
         state.admits_this_turn += 1;
+        state.access_admits = state.access_admits.saturating_add(1);
         return None;
     }
 

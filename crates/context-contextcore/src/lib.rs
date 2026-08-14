@@ -15,4 +15,7 @@ mod adapter;
 mod wire;
 
 pub use adapter::{ContextServiceAdapter, ContextServiceConfig, ServiceEngine, connect_engine};
-pub use wire::{PROTOCOL_VERSION, ServiceOp, ServiceRequest, ServiceResponse};
+pub use wire::{
+    DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES, MIN_CONTEXT_SERVICE_MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    ServiceOp, ServiceRequest, ServiceResponse,
+};

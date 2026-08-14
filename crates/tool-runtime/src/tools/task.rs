@@ -9,9 +9,9 @@
 //! task table); this tool only names *what* the model wants completed.
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, CompletionProposal, MAX_COMPLETION_ARTIFACTS,
-    MAX_COMPLETION_REF_CHARS, MAX_COMPLETION_SUMMARY_CHARS, RunId, RuntimeDirective, ToolOutcome,
-    ToolOutput, ToolRisk, ToolSpec,
+    AgentError, AgentResult, ArtifactLocator, CancellationToken, CompletionProposal,
+    MAX_COMPLETION_ARTIFACTS, MAX_COMPLETION_REF_CHARS, MAX_COMPLETION_SUMMARY_CHARS, RunId,
+    RuntimeDirective, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -58,6 +58,7 @@ impl Tool for TaskCompleteTool {
         _run_id: RunId,
         call_id: &str,
         arguments: Value,
+        _effect_context: Option<agent_contracts::OperationEffectContext>,
         _cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let args: CompleteArgs = serde_json::from_value(arguments)
@@ -82,11 +83,7 @@ impl Tool for TaskCompleteTool {
             )));
         }
         for artifact in &args.artifacts {
-            if !artifact.starts_with("artifact://") {
-                return Err(AgentError::InvalidRequest(format!(
-                    "completion artifacts must be artifact:// references: {artifact:?}"
-                )));
-            }
+            ArtifactLocator::parse_sealed(artifact)?;
             if artifact.chars().count() > MAX_COMPLETION_REF_CHARS {
                 return Err(AgentError::InvalidRequest(format!(
                     "completion artifact ref is limited to {MAX_COMPLETION_REF_CHARS} chars"
@@ -125,7 +122,7 @@ impl Tool for TaskCompleteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{CancellationToken, ToolExecutionRequest};
+    use agent_contracts::{CancellationToken, ContentDigest, ToolExecutionRequest};
     use serde_json::json;
 
     fn request(run_id: RunId, args: Value) -> ToolExecutionRequest {
@@ -136,6 +133,7 @@ mod tests {
                 name: "task.complete".into(),
                 arguments: args,
             },
+            effect_context: None,
             cancel: CancellationToken::new(),
         }
     }
@@ -151,13 +149,16 @@ mod tests {
     async fn packages_a_bounded_completion_proposal() {
         let tool = TaskCompleteTool::new();
         let run_id = RunId::new();
+        let evidence = ArtifactLocator::sealed(run_id, "grep", ContentDigest::sha256_bytes(b"out"))
+            .unwrap()
+            .to_string();
         let request = request(
             run_id,
-            json!({"summary": "task done", "artifacts": ["artifact://.focus-agent/artifacts/r1/out.txt"]}),
+            json!({"summary": "task done", "artifacts": [evidence]}),
         );
         let (output, directive) = {
             let outcome = tool
-                .execute(run_id, "c", request.call.arguments, request.cancel)
+                .execute(run_id, "c", request.call.arguments, None, request.cancel)
                 .await
                 .unwrap();
             directive(outcome)
@@ -180,6 +181,7 @@ mod tests {
                 run_id,
                 "c",
                 request(run_id, json!({"summary": "   "})).call.arguments,
+                None,
                 CancellationToken::new(),
             )
             .await;
@@ -195,6 +197,7 @@ mod tests {
                 )
                 .call
                 .arguments,
+                None,
                 CancellationToken::new(),
             )
             .await;
@@ -210,6 +213,7 @@ mod tests {
                 )
                 .call
                 .arguments,
+                None,
                 CancellationToken::new(),
             )
             .await;
@@ -224,6 +228,7 @@ mod tests {
                     json!({"summary": "done", "artifacts": (0..=MAX_COMPLETION_ARTIFACTS).map(|i| format!("artifact://a/{i}")).collect::<Vec<_>>()}),
                 )
                 .call.arguments,
+                None,
                 CancellationToken::new(),
             )
             .await;

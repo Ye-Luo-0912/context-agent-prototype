@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use agent_contracts::{
-    AgentError, AttentionState, ContextAction, ContextConsumptionAck, ContextEngine, ContextHints,
-    ContextIngress, ContextItem, ContextItemId, ContextKind, ContextMaintenanceTrigger,
-    ContextQuery, ContextResidency, ContextRetention, ContextScope, ContextSearchQuery, CoreLabel,
-    DependencyEdge, DependencyKind, FocusState, Label, LifecycleLabel, MaterializedContext,
-    OperationId, ScopeId, ScopeKind, ScopeState, SemanticState, TaskId, ToolOutput, TurnId,
+    AccessSignal, AgentError, AttentionState, ContextAction, ContextConsumptionAck, ContextEngine,
+    ContextHints, ContextIngress, ContextItem, ContextItemId, ContextKind,
+    ContextMaintenanceTrigger, ContextQuery, ContextResidency, ContextRetention, ContextScope,
+    ContextSearchQuery, CoreLabel, DependencyEdge, DependencyKind, FocusState, Label,
+    LifecycleLabel, MaterializedContext, OperationId, ScopeId, ScopeKind, ScopeState,
+    SemanticState, TaskId, ToolOutput, TurnId,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -40,6 +41,33 @@ async fn open_focus(engine: &SimpleContextEngine, goal: &str) -> TaskId {
         .await
         .unwrap();
     task_id
+}
+
+#[tokio::test]
+async fn diagnostics_report_resident_heap_bytes() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "count bytes").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "abcdefghij".into(),
+        })
+        .await
+        .unwrap();
+    let expected: usize = engine
+        .state
+        .lock()
+        .await
+        .items
+        .iter()
+        .map(|item| item.content.len())
+        .sum();
+    let diagnostics = engine.diagnostics().await.unwrap();
+    assert_eq!(
+        diagnostics.resident_items,
+        engine.state.lock().await.items.len()
+    );
+    assert_eq!(diagnostics.resident_bytes, expected);
+    assert!(diagnostics.resident_bytes >= 10);
 }
 
 #[tokio::test]
@@ -1515,6 +1543,7 @@ async fn max_selected_items_hint_caps_the_working_set() {
             budget_tokens: 8192,
             hints: ContextHints {
                 max_selected_items: Some(2),
+                anchor_roots: Vec::new(),
             },
         })
         .await
@@ -2331,6 +2360,7 @@ async fn external_retrieval_searches_inspects_and_fetches() {
             kind: Some(ContextKind::Note),
             scope: None,
             task_id: None,
+            label: None,
             limit: 0,
         })
         .await
@@ -2345,12 +2375,39 @@ async fn external_retrieval_searches_inspects_and_fetches() {
             kind: None,
             scope: None,
             task_id: Some(task_a),
+            label: None,
             limit: 0,
         })
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].item_id, item_a_id);
+
+    // Label is a catalog index dimension, not a residual scan predicate.
+    let hits = engine
+        .search_external(ContextSearchQuery {
+            query: String::new(),
+            label: Some("decision".into()),
+            limit: 0,
+            ..ContextSearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "label=decision must hit the tagged ref");
+    assert_eq!(hits[0].item_id, item_a_id);
+
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(state.catalog.len(), 2, "two stored ids, one directory");
+        assert_eq!(
+            state.catalog.location(item_a_id),
+            Some(crate::index::catalog::CatalogLocation::Stored)
+        );
+        assert_eq!(
+            state.catalog.location(item_b_id),
+            Some(crate::index::catalog::CatalogLocation::Stored)
+        );
+    }
 
     // Inspect: metadata without a store read.
     let inspected = engine
@@ -2383,6 +2440,12 @@ async fn external_retrieval_searches_inspects_and_fetches() {
             .expect("entry survives the fetch");
         assert_eq!(entry.last_access_tick, state.event_seq);
         assert_eq!(entry.last_access_gc_epoch, Some(state.gc_epoch));
+        assert_eq!(
+            entry.last_access_signal,
+            AccessSignal::Fetch,
+            "fetch 读到 body，信号必须强于 search/inspect"
+        );
+        assert_eq!(entry.search_reinforce_count, 0);
     }
 
     // The item stays externalized: fetch is a read, not a reactivation. The
@@ -2454,13 +2517,25 @@ async fn search_hits_stamp_a_bounded_recency_reinforcement() {
                 Some(state.gc_epoch),
                 "命中（tick {tick}）必须锚定当前 GC 世代"
             );
+            assert_eq!(
+                entry.last_access_signal,
+                AccessSignal::SearchHit,
+                "命中（tick {tick}）必须记为最弱 search 信号"
+            );
+            assert_eq!(entry.search_reinforce_count, 1);
         } else {
             assert_eq!(
                 entry.last_access_tick, tick,
                 "超出强化上限的命中（tick {tick}）必须保持原时钟"
             );
+            assert_eq!(entry.last_access_signal, AccessSignal::None);
+            assert_eq!(entry.search_reinforce_count, 0);
         }
     }
+    assert_eq!(
+        state.access_search_hits, 8,
+        "diagnostics 计的是落地的 search 戳，不是描述符行数"
+    );
 }
 
 #[tokio::test]
@@ -2553,6 +2628,259 @@ async fn search_reinforcement_delays_cold_to_external_aging() {
         b.residency,
         ContextResidency::External,
         "未被强化的条目按 ttl 正常老化"
+    );
+}
+
+#[tokio::test]
+async fn identical_search_query_budget_blocks_a_second_stamp_in_the_same_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let item_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &SimpleContextConfig::default(),
+            "item finding".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.5,
+            None,
+        );
+        item.id = ContextItemId::new();
+        let reference = crate::store::externalize(dir.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item, reference, 0, 0, None,
+        ));
+        item.id
+    };
+
+    engine
+        .search_external(ContextSearchQuery::new("item", 8))
+        .await
+        .unwrap();
+    let first_tick = {
+        let state = engine.state.lock().await;
+        state.external.get(item_id).unwrap().last_access_tick
+    };
+
+    // Pin 推进 event_seq，但不结束用户回合，相同查询预算不得重置。
+    engine
+        .ingest(ContextIngress::Pin {
+            content: "keep the budget".into(),
+            kind: ContextKind::Constraint,
+        })
+        .await
+        .unwrap();
+    engine
+        .search_external(ContextSearchQuery::new("item", 8))
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    let entry = state.external.get(item_id).unwrap();
+    assert_eq!(
+        entry.last_access_tick, first_tick,
+        "identical query must not restamp recency inside one turn"
+    );
+    assert_eq!(entry.last_access_signal, AccessSignal::SearchHit);
+}
+
+#[tokio::test]
+async fn search_hit_cools_down_inside_the_same_event_seq() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let item_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &SimpleContextConfig::default(),
+            "alpha finding".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.5,
+            None,
+        );
+        item.id = ContextItemId::new();
+        let reference = crate::store::externalize(dir.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item, reference, 0, 0, None,
+        ));
+        item.id
+    };
+
+    engine
+        .search_external(ContextSearchQuery::new("alpha", 8))
+        .await
+        .unwrap();
+    let first = {
+        let state = engine.state.lock().await;
+        let entry = state.external.get(item_id).unwrap();
+        (entry.last_access_tick, entry.search_reinforce_count)
+    };
+
+    engine
+        .search_external(ContextSearchQuery::new("finding", 8))
+        .await
+        .unwrap();
+    let state = engine.state.lock().await;
+    let entry = state.external.get(item_id).unwrap();
+    assert_eq!(
+        entry.last_access_tick, first.0,
+        "a second search in the same event_seq must cool down per item"
+    );
+    assert_eq!(entry.search_reinforce_count, first.1);
+}
+
+#[tokio::test]
+async fn inspect_outranks_search_and_resets_saturation() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let item_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &SimpleContextConfig::default(),
+            "alpha finding".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.5,
+            None,
+        );
+        item.id = ContextItemId::new();
+        let reference = crate::store::externalize(dir.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item, reference, 0, 0, None,
+        ));
+        item.id
+    };
+
+    engine
+        .search_external(ContextSearchQuery::new("alpha", 8))
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        let entry = state.external.get(item_id).unwrap();
+        assert_eq!(entry.last_access_signal, AccessSignal::SearchHit);
+        assert_eq!(entry.search_reinforce_count, 1);
+    }
+
+    let inspected = engine.inspect_external(item_id).await.unwrap().unwrap();
+    assert_eq!(inspected.last_access_signal, AccessSignal::Inspect);
+    assert_eq!(
+        inspected.search_reinforce_count, 0,
+        "inspect must reset search saturation so a later stronger path can delay aging"
+    );
+
+    engine
+        .ingest(ContextIngress::Pin {
+            content: "advance seq".into(),
+            kind: ContextKind::Constraint,
+        })
+        .await
+        .unwrap();
+    engine
+        .search_external(ContextSearchQuery::new("alpha", 8))
+        .await
+        .unwrap();
+    let state = engine.state.lock().await;
+    let entry = state.external.get(item_id).unwrap();
+    assert_eq!(
+        entry.last_access_signal,
+        AccessSignal::Inspect,
+        "search must not overwrite a stronger inspect signal"
+    );
+}
+
+#[tokio::test]
+async fn search_saturation_cannot_pin_cold_entries_across_gc_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_external_ttl_generations: 2,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let (id_a, id_b) = {
+        let mut state = engine.state.lock().await;
+        let config = SimpleContextConfig::default();
+        let mut seed = |content: &str, tick: u64| {
+            let mut item = crate::item::make_item(
+                &state,
+                &config,
+                content.to_string(),
+                ContextKind::Note,
+                ContextScope::Task,
+                ContextRetention::Working,
+                0.5,
+                None,
+            );
+            item.id = ContextItemId::new();
+            let reference = crate::store::externalize(dir.path(), &item).unwrap();
+            state.external.push(crate::store::to_external_entry(
+                &item, reference, tick, 0, None,
+            ));
+            item.id
+        };
+        (seed("alpha finding", 0), seed("beta finding", 1))
+    };
+
+    engine.gc().await.unwrap();
+    engine
+        .search_external(ContextSearchQuery::new("alpha", 8))
+        .await
+        .unwrap();
+    engine.gc().await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(
+            state.external.get(id_a).unwrap().residency,
+            ContextResidency::Cold,
+            "the first search still delays aging once (CTX-GC-10)"
+        );
+        assert_eq!(
+            state.external.get(id_b).unwrap().residency,
+            ContextResidency::External
+        );
+    }
+
+    // 新回合重置相同查询预算，但条目已饱和：search 不得再刷新 gc_epoch。
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "keep looking".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .search_external(ContextSearchQuery::new("alpha", 8))
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(
+            state.external.get(id_a).unwrap().last_access_gc_epoch,
+            Some(1),
+            "saturated search must not refresh the Cold aging anchor"
+        );
+    }
+
+    engine.gc().await.unwrap();
+    let state = engine.state.lock().await;
+    assert_eq!(
+        state.external.get(id_a).unwrap().residency,
+        ContextResidency::External,
+        "search must not become a hidden pin API"
     );
 }
 
@@ -2749,14 +3077,28 @@ async fn consumption_ack_stamps_an_external_descriptor_without_reactivating_it()
             .collect::<Vec<_>>(),
         vec![item_id]
     );
-    let before = engine.inspect_external(item_id).await.unwrap().unwrap();
-    assert_eq!(before.last_access_tick, 0, "preview must not stamp access");
+    let before_tick = {
+        let state = engine.state.lock().await;
+        state
+            .external
+            .get(item_id)
+            .expect("descriptor is stored")
+            .last_access_tick
+    };
+    assert_eq!(before_tick, 0, "preview must not stamp access");
 
     acknowledge_all(&engine, &preview).await;
 
     let after = engine.inspect_external(item_id).await.unwrap().unwrap();
-    assert!(after.last_access_tick > before.last_access_tick);
+    assert!(after.last_access_tick > before_tick);
     assert_eq!(after.last_access_gc_epoch, Some(0));
+    assert_eq!(
+        after.last_access_signal,
+        AccessSignal::ConsumptionAck,
+        "inspect after ack must not downgrade the strongest signal"
+    );
+    assert_eq!(after.access_count, 1);
+    assert_eq!(after.last_selected_turn, after.last_access_turn);
     // The acknowledged descriptor stays in the logical catalog, but only as
     // an external projection — acknowledging must not page its body back
     // into the resident heap.
@@ -3060,6 +3402,11 @@ async fn fetch_external_recovers_the_exact_original_content() {
         report.externalized >= 1,
         "buffer overflow must externalize: {report:?}"
     );
+    assert_eq!(
+        report.externalized_ids.len(),
+        report.externalized,
+        "found-after-forgotten 必须能按 id 对齐本次外置"
+    );
 
     // Find one externalized ref through the retrieval surface, then pull
     // its full content back across the store boundary.
@@ -3069,6 +3416,7 @@ async fn fetch_external_recovers_the_exact_original_content() {
             kind: None,
             scope: None,
             task_id: None,
+            label: None,
             limit: 16,
         })
         .await
@@ -3264,8 +3612,10 @@ async fn long_task_10k_turns_keeps_the_working_set_episode_bounded() {
         "document the deployment runbook",
     ];
     let mut max_resident = 0usize;
+    let mut max_resident_bytes = 0usize;
     let mut early_ordinary_id = None;
     let mut resident_at_2000 = 0usize;
+    let mut resident_bytes_at_2000 = 0usize;
     for turn in 1..=10_000u64 {
         let content = if turn <= 9_000 {
             format!(
@@ -3294,10 +3644,15 @@ async fn long_task_10k_turns_keeps_the_working_set_episode_bounded() {
             .unwrap();
         if turn % 50 == 0 {
             engine.gc().await.unwrap();
-            let resident = engine.state.lock().await.items.len();
+            let state = engine.state.lock().await;
+            let resident = state.items.len();
+            let resident_bytes: usize = state.items.iter().map(|item| item.content.len()).sum();
+            drop(state);
             max_resident = max_resident.max(resident);
+            max_resident_bytes = max_resident_bytes.max(resident_bytes);
             if turn == 2_000 {
                 resident_at_2000 = resident;
+                resident_bytes_at_2000 = resident_bytes;
             }
         }
         // Record the turn-100 ordinary message while it is still resident
@@ -3329,6 +3684,26 @@ async fn long_task_10k_turns_keeps_the_working_set_episode_bounded() {
     assert!(
         resident_at_10000 <= resident_at_2000.saturating_add(20),
         "the working set must not grow with turn count: {resident_at_2000} -> {resident_at_10000}"
+    );
+    // 3. Resident *bytes* flatten too: a smaller item count must not hide
+    // a growing heap. Same 20% growth allowance as the count check, plus
+    // a small absolute slack for variable message length.
+    let resident_bytes_at_10000: usize = engine
+        .state
+        .lock()
+        .await
+        .items
+        .iter()
+        .map(|item| item.content.len())
+        .sum();
+    assert!(
+        max_resident_bytes < 80_000,
+        "resident heap bytes must stay bounded, peak was {max_resident_bytes}"
+    );
+    let byte_slack = resident_bytes_at_2000 / 5 + 4_096;
+    assert!(
+        resident_bytes_at_10000 <= resident_bytes_at_2000.saturating_add(byte_slack),
+        "resident bytes must not grow with turn count: {resident_bytes_at_2000} -> {resident_bytes_at_10000}"
     );
 
     // 2. Stale ordinary dialogue leaves Resident.
@@ -4389,6 +4764,7 @@ async fn admit_externalized_item_preserves_identity_and_produces_one_transition(
             kind: None,
             scope: None,
             task_id: None,
+            label: None,
             limit: 16,
         })
         .await
@@ -4577,6 +4953,7 @@ async fn admit_refused_for_terminal_semantic_item() {
             kind: None,
             scope: None,
             task_id: None,
+            label: None,
             limit: 16,
         })
         .await
@@ -4839,6 +5216,7 @@ async fn admit_of_a_disappeared_store_blob_is_a_silent_no_op() {
             kind: None,
             scope: None,
             task_id: None,
+            label: None,
             limit: 16,
         })
         .await
@@ -5261,6 +5639,7 @@ async fn reconcile_store_converges_a_crash_injected_directory() {
             kind: None,
             scope: None,
             task_id: None,
+            label: None,
             limit: 16,
         })
         .await
@@ -6865,5 +7244,394 @@ async fn working_set_signal_extends_hot_entities_without_creating_a_body() {
         state.items.len(),
         items_before,
         "a working-set signal must not create an item"
+    );
+}
+
+#[tokio::test]
+async fn anchor_roots_directive_replaces_the_root_set_and_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let claim = |item_ref: &str| agent_contracts::AnchorRootClaim {
+        item_ref: item_ref.to_string(),
+        strength: agent_contracts::AnchorRootStrength::ResidentRequired,
+        source_field_id: "working_refs".into(),
+    };
+
+    // 推送一组根声明：整组替换（不是逐条增删），engine 只镜像投影。
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::AnchorRoots {
+                roots: vec![claim("context://run/abc"), claim("AuthService.rs")],
+            },
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(state.anchor_roots.len(), 2);
+        assert_eq!(state.anchor_roots[0].item_ref, "context://run/abc");
+        assert_eq!(state.anchor_roots[1].source_field_id, "working_refs");
+    }
+
+    // 再推送会替换整组，而不是合并。
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::AnchorRoots {
+                roots: vec![claim("CacheStore.rs")],
+            },
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(state.anchor_roots.len(), 1, "整组替换，不是合并");
+    }
+
+    // 超出上限的推送被拒绝，且不改变现有根集。
+    let too_many: Vec<_> = (0..=agent_contracts::MAX_ANCHOR_ROOT_CLAIMS)
+        .map(|i| claim(&format!("item-{i}")))
+        .collect();
+    let error = engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::AnchorRoots { roots: too_many },
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("exceed the cap"),
+        "超限必须拒绝：{error}"
+    );
+    let state = engine.state.lock().await;
+    assert_eq!(state.anchor_roots.len(), 1, "被拒绝的推送必须保持原根集");
+}
+
+#[tokio::test]
+async fn anchor_root_claims_protect_items_from_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let target_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "protected decision record".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.2,
+            Some("tool-capture".into()),
+        );
+        item.id = ContextItemId::new();
+        item.attention = AttentionState::Archived;
+        // 世代已到上限：无声明时 GC 会把它 evict（基线对照）。
+        item.gc_generation = 3;
+        let id = item.id;
+        state.items.push(item);
+        id
+    };
+    // 基线：无声明时，这个已冷却的低分条目会被 GC evict。
+    let baseline = engine.gc().await.unwrap();
+    assert!(
+        baseline.evicted >= 1,
+        "无声明时该条目必须是 eviction 候选：{baseline:?}"
+    );
+    let state = engine.state.lock().await;
+    assert!(
+        !state.items.iter().any(|i| i.id == target_id),
+        "无声明时条目已离开 heap"
+    );
+    drop(state);
+
+    // 推送 ResidentRequired 声明，下一次 GC 把它召回并保护在 heap。
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::AnchorRoots {
+                roots: vec![agent_contracts::AnchorRootClaim {
+                    item_ref: target_id.to_string(),
+                    strength: agent_contracts::AnchorRootStrength::ResidentRequired,
+                    source_field_id: "working_refs".into(),
+                }],
+            },
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.anchor_roots_protected >= 1,
+        "报告必须说明声明保护的条目数：{report:?}"
+    );
+    let state = engine.state.lock().await;
+    let resident = state
+        .items
+        .iter()
+        .find(|i| i.id == target_id)
+        .expect("声明保护的条目必须回到 resident heap");
+    assert_eq!(
+        resident.attention,
+        AttentionState::Active,
+        "召回重置 attention"
+    );
+}
+
+#[tokio::test]
+async fn anchor_root_claims_reactivate_evicted_items_from_the_warm_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let target_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "evicted working finding".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.3,
+            Some("tool-capture".into()),
+        );
+        item.id = ContextItemId::new();
+        item.evicted_at_tick = Some(1);
+        item.residency = agent_contracts::ContextResidency::Warm;
+        let id = item.id;
+        state.eviction_buffer.push(item);
+        id
+    };
+    // 无声明时，buffer 里的低分条目留在 buffer。
+    engine.gc().await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            !state.items.iter().any(|i| i.id == target_id),
+            "无声明时 buffer 条目不被召回"
+        );
+    }
+
+    // 推送 PromptRequired 声明（同样要求 resident），下一次 GC 从 buffer
+    // 召回并给出可解释的 reason。
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::AnchorRoots {
+                roots: vec![agent_contracts::AnchorRootClaim {
+                    item_ref: target_id.to_string(),
+                    strength: agent_contracts::AnchorRootStrength::PromptRequired,
+                    source_field_id: "open_loops".into(),
+                }],
+            },
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.reactivations.iter().any(|r| r.item_id == target_id),
+        "声明指向的 buffer 条目必须被召回：{report:?}"
+    );
+    let state = engine.state.lock().await;
+    assert!(
+        state.items.iter().any(|i| i.id == target_id),
+        "条目必须回到 resident heap"
+    );
+}
+
+#[tokio::test]
+async fn anchor_root_claims_never_resurrect_terminal_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let target_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "superseded decision".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.5,
+            Some("tool-capture".into()),
+        );
+        item.id = ContextItemId::new();
+        item.semantic = SemanticState::Tombstoned;
+        let id = item.id;
+        state.eviction_buffer.push(item);
+        id
+    };
+    // 即使声明要求 resident，terminal 语义也是终态：不复活。
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::AnchorRoots {
+                roots: vec![agent_contracts::AnchorRootClaim {
+                    item_ref: target_id.to_string(),
+                    strength: agent_contracts::AnchorRootStrength::ResidentRequired,
+                    source_field_id: "working_refs".into(),
+                }],
+            },
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        !report.reactivations.iter().any(|r| r.item_id == target_id),
+        "terminal 条目永不复活：{report:?}"
+    );
+    let state = engine.state.lock().await;
+    assert!(
+        !state.items.iter().any(|i| i.id == target_id),
+        "terminal 条目必须留在 buffer"
+    );
+}
+
+#[tokio::test]
+async fn prompt_required_anchor_roots_force_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let target_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "required constraint note".into(),
+            ContextKind::Note,
+            ContextScope::Session,
+            ContextRetention::Working,
+            0.1,
+            None,
+        );
+        item.id = ContextItemId::new();
+        item.attention = AttentionState::Archived;
+        let id = item.id;
+        state.items.push(item);
+        id
+    };
+    // 基线：低分 Archived 条目不在候选里（session scope 无 active
+    // scope 匹配、非 hot），materialize 不选中它。
+    let baseline = engine
+        .materialize(agent_contracts::ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 4096,
+            hints: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !baseline.items.iter().any(|m| m.item_id == target_id),
+        "无声明时低分条目不被选中"
+    );
+
+    // PromptRequired 声明强制它进帧。
+    let materialized = engine
+        .materialize(agent_contracts::ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 4096,
+            hints: agent_contracts::ContextHints {
+                max_selected_items: None,
+                anchor_roots: vec![agent_contracts::AnchorRootClaim {
+                    item_ref: target_id.to_string(),
+                    strength: agent_contracts::AnchorRootStrength::PromptRequired,
+                    source_field_id: "constraints".into(),
+                }],
+            },
+        })
+        .await
+        .unwrap();
+    let selected = materialized
+        .items
+        .iter()
+        .find(|m| m.item_id == target_id)
+        .expect("PromptRequired 声明必须强制条目进帧");
+    assert_eq!(
+        selected.retention,
+        ContextRetention::Working,
+        "进帧的是同一个条目"
+    );
+}
+
+#[tokio::test]
+async fn storage_required_anchor_roots_protect_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 1,
+        storage_ttl_ticks: 1,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    // 构造一个已 dead 的外部条目（Working retention，TTL 过期即可删）。
+    let seed_dead = |state: &mut crate::engine::State, tick: u64| {
+        let mut item = crate::item::make_item(
+            state,
+            &engine.config,
+            "retired evidence blob".into(),
+            ContextKind::Note,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.4,
+            None,
+        );
+        item.id = ContextItemId::new();
+        item.semantic = SemanticState::VerifiedFixed { by: None };
+        let reference = crate::store::externalize(dir.path(), &item).unwrap();
+        state.external.push(crate::store::to_external_entry(
+            &item, reference, tick, 1, None,
+        ));
+        item.id
+    };
+
+    // 场景 A：无声明时，dead 条目按 TTL 被 storage GC 删除。
+    let unprotected_id = {
+        let mut state = engine.state.lock().await;
+        seed_dead(&mut state, 0)
+    };
+    let baseline = engine.storage_gc().await.unwrap();
+    assert!(
+        baseline.deleted >= 1,
+        "无声明时 dead 条目必须可删除：{baseline:?}"
+    );
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            !state.external.iter().any(|e| e.item_id == unprotected_id),
+            "无声明的 dead 条目已被删除"
+        );
+    }
+
+    // 场景 B：推送 StorageRequired 声明，storage GC 保留同一种条目。
+    let protected_id = {
+        let mut state = engine.state.lock().await;
+        seed_dead(&mut state, 1)
+    };
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::AnchorRoots {
+                roots: vec![agent_contracts::AnchorRootClaim {
+                    item_ref: protected_id.to_string(),
+                    strength: agent_contracts::AnchorRootStrength::StorageRequired,
+                    source_field_id: "evidence_refs".into(),
+                }],
+            },
+        })
+        .await
+        .unwrap();
+    let report = engine.storage_gc().await.unwrap();
+    assert!(
+        report.anchor_roots_protected >= 1,
+        "报告必须说明声明保护的 store 条目：{report:?}"
+    );
+    let state = engine.state.lock().await;
+    assert!(
+        state.external.iter().any(|e| e.item_id == protected_id),
+        "StorageRequired 声明指向的条目必须保留"
     );
 }

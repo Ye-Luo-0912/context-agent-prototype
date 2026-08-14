@@ -1,5 +1,13 @@
+use std::collections::{HashMap, HashSet};
+
+use agent_contracts::{ContextItem, ContextItemId, ContextKind, TaskId};
+
 /// Cap for the hot-entity set, matching `extract_entities`'s per-text cap.
 pub(crate) const MAX_HOT_ENTITIES: usize = 24;
+
+/// 当前任务里保留「每个文件最新正文」的路径数上限。这是驻留界，不是
+/// 打分阈值：循环重构只动少数文件，整堆日志仍按 ephemeral 消费淘汰。
+pub(crate) const MAX_RECENT_FILE_BODIES: usize = 8;
 
 /// Entity extraction shared across the crate (hot-set maintenance, dependency
 /// linking, supersession, scoring). "Entity" is a cheap, explicit signature: a
@@ -34,6 +42,76 @@ pub(crate) fn entities_match(left: &[String], right: &[String]) -> bool {
             .iter()
             .any(|prior| prior.contains(entity) || entity.contains(prior))
     })
+}
+
+/// 看起来像文件路径：含 `/` `\`，或 `stem.ext` 短扩展名；`Module::path`
+/// 不算（那是符号，不是文件正文）。
+pub(crate) fn is_file_path_entity(entity: &str) -> bool {
+    if entity.contains("::") {
+        return false;
+    }
+    if entity.contains('/') || entity.contains('\\') {
+        return true;
+    }
+    let Some((stem, ext)) = entity.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && (1..=8).contains(&ext.len())
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// `fs.read` / replay `read_snippet` 的正文：首行是单独的路径（可带尾部
+/// `:`）。「tests passed in AuthService.rs」这种日志只是提到文件，不是
+/// 文件正文，必须返回 `None`，否则成功日志会被当成 latest-file 根留下。
+pub(crate) fn primary_file_path(content: &str) -> Option<&str> {
+    let head = content.lines().next()?.trim();
+    let path = head.strip_suffix(':').unwrap_or(head).trim();
+    if path.is_empty() || path.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if is_file_path_entity(path) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// 当前任务里每个最近文件路径的最新成功观察。同一路径的旧正文会被更新的
+/// 读覆盖；超过 [`MAX_RECENT_FILE_BODIES`] 的更早路径不入选。没有焦点时
+/// 返回空集——文件正文根只服务活跃任务，避免跨任务污染。
+pub(crate) fn latest_file_body_ids<'a>(
+    items: impl IntoIterator<Item = &'a ContextItem>,
+    active_task: Option<TaskId>,
+) -> HashSet<ContextItemId> {
+    let Some(task) = active_task else {
+        return HashSet::new();
+    };
+    let mut latest: HashMap<&str, (u64, ContextItemId)> = HashMap::new();
+    for item in items {
+        if item.task_id != Some(task)
+            || item.kind != ContextKind::ToolObservation
+            || !item.semantic.is_live()
+        {
+            continue;
+        }
+        let Some(path) = primary_file_path(&item.content) else {
+            continue;
+        };
+        match latest.get(path) {
+            Some((tick, _)) if *tick >= item.created_tick => {}
+            _ => {
+                latest.insert(path, (item.created_tick, item.id));
+            }
+        }
+    }
+    let mut ranked: Vec<(u64, ContextItemId)> = latest.into_values().collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0));
+    ranked
+        .into_iter()
+        .take(MAX_RECENT_FILE_BODIES)
+        .map(|(_, id)| id)
+        .collect()
 }
 
 /// Merge tool-touched entities into the hot set: most recent first,
@@ -100,5 +178,28 @@ mod tests {
         let many = (0..40).map(|i| format!("f{i}.rs")).collect();
         merge_hot_entities(&mut hot, many);
         assert_eq!(hot.len(), MAX_HOT_ENTITIES);
+    }
+
+    #[test]
+    fn primary_file_path_accepts_read_snippet_and_rejects_logs() {
+        assert_eq!(
+            primary_file_path("src/auth/login.rs:\nfn handle_21() {}"),
+            Some("src/auth/login.rs")
+        );
+        assert_eq!(
+            primary_file_path("AuthService.rs\nfn run() {}"),
+            Some("AuthService.rs")
+        );
+        assert_eq!(
+            primary_file_path("tests passed in AuthService.rs"),
+            None,
+            "a log that mentions a file is not the file body"
+        );
+        assert_eq!(
+            primary_file_path("FAIL [0000] worker-42 INFO module=core::auth"),
+            None
+        );
+        assert!(!is_file_path_entity("Session::start"));
+        assert!(is_file_path_entity("src/auth/session.rs"));
     }
 }

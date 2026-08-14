@@ -2,15 +2,16 @@
 //!
 //! Each scenario is a deterministic scripted `RuntimeEventEnvelope` sequence
 //! mirroring the kernel's event pattern (user message -> maintain -> model
-//! rounds with tool results -> assistant reply -> maintain). The replay harness
-//! replays every scenario through the three context engines and compares
-//! token cost, over-budget turns and lifecycle churn.
+//! rounds with tool results -> assistant reply -> maintain -> full GC ->
+//! TurnCompleted). Full GC is required: without it C only archives
+//! attention and the Resident heap stays as large as append-only. The
+//! replay harness compares token cost, over-budget turns and context churn.
 
 use std::sync::Arc;
 
 use agent_contracts::{
-    ContextDiagnostics, ContextEngine, ContextMaintenanceReport, ContextMaintenanceTrigger, RunId,
-    RuntimeEvent, RuntimeEventEnvelope, TaskId, ToolOutput,
+    ContextDiagnostics, ContextEngine, ContextGcReport, ContextMaintenanceReport,
+    ContextMaintenanceTrigger, RunId, RuntimeEvent, RuntimeEventEnvelope, TaskId, ToolOutput,
 };
 use context_baselines::{AppendOnlyEngine, RollingConfig, RollingSummaryEngine};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
@@ -83,18 +84,20 @@ pub fn render_comparison(scenario: &Scenario, results: &[(&str, ReplayOutcome)])
         scenario.name, scenario.description
     ));
     out.push_str(&format!(
-        "  {:18} {:>13} {:>12} {:>11} {:>6} {:>10} {:>9}\n",
+        "  {:18} {:>13} {:>12} {:>11} {:>6} {:>10} {:>9} {:>10} {:>10}\n",
         "engine",
         "in_tok_total",
         "in_tok_max",
         "over_budget",
         "churn",
         "final_total",
-        "final_active"
+        "final_active",
+        "res_bytes",
+        "peak_bytes"
     ));
     for (label, outcome) in results {
         out.push_str(&format!(
-            "  {:18} {:>13} {:>12} {:>11} {:>6} {:>10} {:>9}\n",
+            "  {:18} {:>13} {:>12} {:>11} {:>6} {:>10} {:>9} {:>10} {:>10}\n",
             label,
             outcome.input_tokens_total,
             outcome.input_tokens_max,
@@ -102,6 +105,8 @@ pub fn render_comparison(scenario: &Scenario, results: &[(&str, ReplayOutcome)])
             outcome.transitions_total,
             outcome.final_diagnostics.total_items,
             outcome.final_diagnostics.active_items,
+            outcome.final_diagnostics.resident_bytes,
+            outcome.peak_resident_bytes,
         ));
     }
     out
@@ -156,9 +161,7 @@ impl Script {
 
     /// One user turn: user message, tool rounds, then a final assistant reply.
     fn turn(&mut self, user: &str, tools: &[ToolOutput]) {
-        self.push(RuntimeEvent::UserMessageAccepted {
-            content: user.into(),
-        });
+        self.push(RuntimeEvent::user_message_accepted(user));
         self.push(RuntimeEvent::ContextMaintained {
             trigger: ContextMaintenanceTrigger::UserInput,
             report: dummy_report(),
@@ -180,6 +183,12 @@ impl Script {
         self.push(RuntimeEvent::ContextMaintained {
             trigger: ContextMaintenanceTrigger::AfterModel,
             report: dummy_report(),
+        });
+        // 对齐 RuntimeActor 回合提交：AfterModel 维护之后、TurnCompleted
+        // 之前跑一次 full GC。不发这条事件时 C 只归档注意力，Resident 堆
+        // 会和 append-only 一样大。
+        self.push(RuntimeEvent::ContextGc {
+            report: ContextGcReport::default(),
         });
         self.push(RuntimeEvent::TurnCompleted);
     }
@@ -215,6 +224,10 @@ impl Script {
         self.push(RuntimeEvent::ContextMaintained {
             trigger: ContextMaintenanceTrigger::TaskCompleted,
             report: dummy_report(),
+        });
+        // 对齐完成后的 compact：已完成任务的工作集离开 Resident 堆。
+        self.push(RuntimeEvent::ContextGc {
+            report: ContextGcReport::default(),
         });
     }
 
@@ -466,11 +479,42 @@ mod tests {
             let turns = scenario
                 .events
                 .iter()
-                .filter(|e| matches!(e.event, RuntimeEvent::UserMessageAccepted { .. }))
+                .filter(|e| match &e.event {
+                    RuntimeEvent::UserMessageAccepted { input } => input.is_applied(),
+                    _ => false,
+                })
                 .count();
             assert!(
                 turns >= 6,
                 "{} should have many turns, got {turns}",
+                scenario.name
+            );
+        }
+    }
+
+    #[test]
+    fn scenario_turns_emit_full_gc_before_turn_completed() {
+        for scenario in all_scenarios() {
+            let mut last_was_gc = false;
+            let mut turn_completed = 0usize;
+            for envelope in &scenario.events {
+                match &envelope.event {
+                    RuntimeEvent::TurnCompleted => {
+                        assert!(
+                            last_was_gc,
+                            "{}: TurnCompleted must follow ContextGc (runtime turn commit)",
+                            scenario.name
+                        );
+                        turn_completed += 1;
+                        last_was_gc = false;
+                    }
+                    RuntimeEvent::ContextGc { .. } => last_was_gc = true,
+                    _ => last_was_gc = false,
+                }
+            }
+            assert!(
+                turn_completed >= 6,
+                "{} should complete many turns, got {turn_completed}",
                 scenario.name
             );
         }
@@ -542,6 +586,21 @@ mod tests {
                 dynamic.input_tokens_max,
                 append.input_tokens_max
             );
+            // Replay 必须跑回合边界 full GC，否则 C 只归档注意力、Resident
+            // 堆和 A 一样大。堆字节（不是 prompt token）必须明显低于 A。
+            assert!(
+                dynamic.final_diagnostics.resident_bytes
+                    < append.final_diagnostics.resident_bytes / 2,
+                "{name}: dynamic resident_bytes {} must be below half of append-only {}",
+                dynamic.final_diagnostics.resident_bytes,
+                append.final_diagnostics.resident_bytes
+            );
+            assert!(
+                dynamic.peak_resident_bytes < append.peak_resident_bytes / 2,
+                "{name}: dynamic peak_resident_bytes {} must be below half of append-only {}",
+                dynamic.peak_resident_bytes,
+                append.peak_resident_bytes
+            );
         }
     }
 
@@ -571,13 +630,20 @@ mod tests {
             append.final_diagnostics.active_items, append.final_diagnostics.total_items,
             "append-only keeps everything active"
         );
+        let catalog_archived = dynamic
+            .items
+            .iter()
+            .filter(|item| item.attention == agent_contracts::AttentionState::Archived)
+            .count();
         assert!(
-            dynamic.final_diagnostics.archived_items > 0,
-            "dynamic engine should archive completed-task detail"
+            catalog_archived > 0 || dynamic.gc_evictions > 0,
+            "dynamic engine should archive completed-task detail (catalog archived={catalog_archived}, gc_evictions={})",
+            dynamic.gc_evictions
         );
         assert!(
-            dynamic.final_diagnostics.active_items < dynamic.final_diagnostics.total_items,
-            "dynamic working set should not keep all history active"
+            dynamic.final_diagnostics.active_items < dynamic.final_diagnostics.total_items
+                || dynamic.final_diagnostics.warm_items + dynamic.final_diagnostics.cold_items > 0,
+            "completed-task bodies must leave Active Resident, not just change attention on the heap"
         );
     }
 
@@ -636,11 +702,21 @@ mod tests {
             p4.input_tokens_total,
             v0.input_tokens_total
         );
+        let p4_archived = p4
+            .items
+            .iter()
+            .filter(|item| item.attention == agent_contracts::AttentionState::Archived)
+            .count();
+        let v0_archived = v0
+            .items
+            .iter()
+            .filter(|item| item.attention == agent_contracts::AttentionState::Archived)
+            .count();
         assert!(
-            p4.final_diagnostics.archived_items > v0.final_diagnostics.archived_items,
-            "superseded decisions must be archived: P4={} v0={}",
-            p4.final_diagnostics.archived_items,
-            v0.final_diagnostics.archived_items
+            p4_archived > v0_archived || p4.gc_evictions > v0.gc_evictions,
+            "superseded decisions must leave Active Resident: P4 archived={p4_archived} evict={} v0 archived={v0_archived} evict={}",
+            p4.gc_evictions,
+            v0.gc_evictions
         );
         let supersessions = p4
             .items

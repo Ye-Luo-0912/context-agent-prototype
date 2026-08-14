@@ -408,7 +408,9 @@ async fn run_ui(
                         continue;
                     }
                     if trimmed == "/cancel" {
-                        handle.cancel_turn().await;
+                        if let Err(error) = handle.cancel_turn().await {
+                            app.push_system(format!("cancel failed: {error}"));
+                        }
                         continue;
                     }
 

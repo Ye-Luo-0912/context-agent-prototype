@@ -18,15 +18,12 @@ use agent_workspace::Workspace;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
-    process::Command,
-    sync::mpsc,
-    time::Duration,
-};
+use tokio::{io::BufWriter, process::Command, sync::mpsc, time::Duration};
 
 use super::Tool;
-use super::stream::{MODEL_OUTPUT_CHARS, StreamLine, record_line, tail_chars};
+use super::stream::{
+    MAX_ARTIFACT_BYTES, StreamCapture, StreamChunk, spawn_stderr_reader, spawn_stdout_reader,
+};
 
 const MAX_TIMEOUT_MS: u64 = 120_000;
 const MAX_ARGV: usize = 64;
@@ -67,7 +64,7 @@ impl Tool for ProcessRunTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "process.run".into(),
-            description: "Run a program with an explicit argv (no shell), optionally in a workspace-relative cwd with explicit env overrides. Output streams to an artifact; only a bounded tail reaches the model. Timeout/cancel kill the whole process tree.".into(),
+            description: "Run a program with an explicit argv (no shell), optionally in a workspace-relative cwd with explicit env overrides. A bounded output prefix streams to an artifact; only a bounded tail reaches the model. Timeout/cancel kill the whole process tree.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["argv"],
@@ -94,6 +91,7 @@ impl Tool for ProcessRunTool {
         run_id: RunId,
         call_id: &str,
         arguments: Value,
+        effect_context: Option<agent_contracts::OperationEffectContext>,
         cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let args: ProcessArgs = serde_json::from_value(arguments)
@@ -161,43 +159,33 @@ impl Tool for ProcessRunTool {
         let mut child = command
             .spawn()
             .map_err(|e| AgentError::Tool(format!("spawn {}: {e}", args.argv[0])))?;
+        let pid = match super::persist_spawned_process(&self.workspace, &effect_context, &child) {
+            Ok(pid) => pid,
+            Err(error) => {
+                super::abandon_spawned_process(&mut child);
+                let _ = child.kill().await;
+                return Err(error);
+            }
+        };
 
-        let (artifact_ref, artifact_file) = self
-            .workspace
-            .create_artifact(run_id, "process", "log")
-            .await?;
-        let mut artifact = BufWriter::new(artifact_file);
+        let mut artifact = BufWriter::new(
+            self.workspace
+                .create_artifact(run_id, "process", "log")
+                .await?,
+        );
 
-        // Two reader tasks push (bounded) lines into one channel; the main
-        // loop selects on lines, cancellation, and the timeout.
-        let (line_tx, mut line_rx) = mpsc::channel::<StreamLine>(512);
+        // Two fixed-buffer readers push bounded line fragments into one
+        // bounded channel; a missing newline can never grow an allocation.
+        let (line_tx, mut line_rx) = mpsc::channel::<StreamChunk>(512);
         if let Some(stdout) = child.stdout.take() {
-            let tx = line_tx.clone();
-            let mut lines = BufReader::new(stdout).lines();
-            tokio::spawn(async move {
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx.send(StreamLine::Stdout(line)).await.is_err() {
-                        break;
-                    }
-                }
-            });
+            spawn_stdout_reader(stdout, line_tx.clone());
         }
         if let Some(stderr) = child.stderr.take() {
-            let tx = line_tx.clone();
-            let mut lines = BufReader::new(stderr).lines();
-            tokio::spawn(async move {
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx.send(StreamLine::Stderr(line)).await.is_err() {
-                        break;
-                    }
-                }
-            });
+            spawn_stderr_reader(stderr, line_tx.clone());
         }
         drop(line_tx);
 
-        let mut tail = std::collections::VecDeque::with_capacity(super::stream::BUFFER_LINES + 1);
-        let mut total_lines = 0usize;
-        let mut total_chars = 0usize;
+        let mut capture = StreamCapture::new();
 
         let deadline = tokio::time::sleep(Duration::from_millis(timeout_ms));
         tokio::pin!(deadline);
@@ -234,11 +222,8 @@ impl Tool for ProcessRunTool {
                 _ = &mut grace, if grace_started => break,
                 line = line_rx.recv() => {
                     match line {
-                        Some(StreamLine::Stdout(line)) => {
-                            record_line(&line, &mut tail, &mut artifact, &mut total_lines, &mut total_chars).await?;
-                        }
-                        Some(StreamLine::Stderr(line)) => {
-                            record_line(&line, &mut tail, &mut artifact, &mut total_lines, &mut total_chars).await?;
+                        Some(line) => {
+                            capture.record(line, &mut artifact).await?;
                         }
                         None => {
                             if exited.is_none() {
@@ -258,20 +243,18 @@ impl Tool for ProcessRunTool {
                     .map_err(|e| AgentError::Tool(format!("wait: {e}")))?,
             );
         }
-        artifact
-            .flush()
-            .await
-            .map_err(|e| AgentError::Io(format!("flush artifact: {e}")))?;
+        super::persist_process_exit(
+            &self.workspace,
+            pid,
+            exited.as_ref().and_then(|status| status.code()),
+        )?;
+        let artifact_ref = self.workspace.seal_buffered_artifact(artifact).await?;
 
-        let omitted = total_lines.saturating_sub(tail.len());
-        let mut model_content = tail.iter().cloned().collect::<Vec<_>>().join("\n");
-        if model_content.chars().count() > MODEL_OUTPUT_CHARS {
-            model_content = tail_chars(&model_content, MODEL_OUTPUT_CHARS);
-        }
-        if omitted > 0 {
-            model_content =
-                format!("[{total_lines} lines total; {omitted} omitted]\n{model_content}");
-        }
+        let model_content = capture.model_tail();
+        let total_lines = capture.total_lines();
+        let total_bytes = capture.total_bytes();
+        let artifact_bytes = capture.artifact_bytes();
+        let artifact_truncated = capture.artifact_truncated();
 
         let exit_code = exited.as_ref().and_then(|status| status.code());
         let ok = outcome == "completed" && exited.as_ref().is_some_and(|s| s.success());
@@ -287,21 +270,38 @@ impl Tool for ProcessRunTool {
             .unwrap_or(&cwd)
             .to_string_lossy()
             .replace('\\', "/");
+        let artifact_note = if artifact_truncated {
+            format!(
+                "Artifact capture truncated at {MAX_ARTIFACT_BYTES} bytes; remaining output was drained but not stored. Captured prefix: {artifact_ref}"
+            )
+        } else {
+            format!("Full output: {artifact_ref}")
+        };
+        let truncation_summary = if artifact_truncated {
+            ", artifact truncated"
+        } else {
+            ""
+        };
 
         Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
             tool_name: "process.run".into(),
             ok,
             summary: format!(
-                "process {outcome} (exit={exit_text}, {total_lines} lines, ~{} KB in artifact)",
-                total_chars / 1024
+                "process {outcome} (exit={exit_text}, {total_lines} lines, ~{} KB output, ~{} KB captured{truncation_summary})",
+                total_bytes / 1024,
+                artifact_bytes / 1024,
             ),
-            model_content: format!("{model_content}\n\nFull output: {artifact_ref}"),
+            model_content: format!("{model_content}\n\n{artifact_note}"),
             artifact_ref: Some(artifact_ref),
             metadata: json!({
                 "exit_code": exit_code,
                 "timeout_ms": timeout_ms,
                 "lines": total_lines,
+                "output_bytes": total_bytes,
+                "artifact_bytes": artifact_bytes,
+                "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
+                "artifact_truncated": artifact_truncated,
                 "outcome": outcome,
                 "cwd": if cwd_text.is_empty() { "." } else { &cwd_text },
             }),
@@ -349,10 +349,11 @@ mod tests {
                 name: "process.run".into(),
                 arguments: json!({"argv": echo_argv("argv no shell")}),
             },
+            effect_context: None,
             cancel: CancellationToken::new(),
         };
         let output = tool
-            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .execute(run_id, "c", request.call.arguments, None, request.cancel)
             .await
             .unwrap();
         let output = value(output);
@@ -395,10 +396,11 @@ mod tests {
                     "timeout_ms": 15000
                 }),
             },
+            effect_context: None,
             cancel: CancellationToken::new(),
         };
         let output = tool
-            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .execute(run_id, "c", request.call.arguments, None, request.cancel)
             .await
             .unwrap();
         let output = value(output);
@@ -424,10 +426,11 @@ mod tests {
                 name: "process.run".into(),
                 arguments: json!({"argv": echo_argv("x"), "cwd": "../escape"}),
             },
+            effect_context: None,
             cancel: CancellationToken::new(),
         };
         let result = tool
-            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .execute(run_id, "c", request.call.arguments, None, request.cancel)
             .await;
         assert!(
             result.is_err(),
@@ -460,6 +463,7 @@ mod tests {
                     RunId::new(),
                     "c",
                     json!({"argv": argv, "timeout_ms": 60000}),
+                    None,
                     cancel_for_task,
                 )
                 .await

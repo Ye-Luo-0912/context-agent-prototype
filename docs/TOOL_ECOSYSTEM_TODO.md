@@ -1,6 +1,6 @@
 # Modular Runtime and Tool Ecosystem TODO
 
-Status: code-grounded discussion draft, 2026-08-10
+Status: code-grounded discussion draft, 2026-08-13
 
 This document records the proposed modular boundary, builtin coding-agent
 interface, extension taxonomy, and evaluation plan. It is deliberately
@@ -19,39 +19,63 @@ known to be insufficient, and `[ ]` means open.
 The project should be modular, but "modular" must not mean that every module
 is equally trusted or may call every other module.
 
-The intended shape is:
+The intended shape combines the **landed PLAT-01 CorePort**, **PLAT-02
+semantic contract** and **PLAT-03a1-a4 persistent authority plus builtin
+workspace recovery** with the
+remaining recovery/adapter/SDK/supervision work (`PLAT-03..07`):
 
 ```text
-Composition root / product host
-  provider adapters, UI, storage choice, concrete context implementation
-                              |
-                              v
-Trusted Core ----------------------------------------------- stable
-  permission policy | effect commit | sandbox authority | budgets
-  durable audit/checkpoint | capability authority | runtime integrity
-                              |
-                              v
-Evolvable Runtime ------------------------------------------ one orchestrator
-  RuntimeActor | TaskAnchor | Episode/Focus | prompt assembly
-  context/tool materialization | capability scheduling | multi-agent policy
-                              |
-                 +------------+-------------+
-                 |                          |
-                 v                          v
-Builtin ACI ------------------------  Extension plane -------- untrusted by default
-  small coding primitives             process capabilities / MCP adapters
-  runtime control surfaces            skills / hooks / packaged plugins
-                 |                          |
-                 +-----------+--------------+
-                             v
-                  typed result / EffectRequest
+UI / API / user ingress
+          |
+          v
+Platform = agent-runtime ----------------------------------- evolvable
+  sole RuntimeActor | TaskAnchor / Episode / Focus
+  context/tool scheduling | target unified process/extension lifecycle
+          | CorePort                     ^ Platform Protocol
+          v                              |
+Trusted Core --------------------   Tools / Skills / child Agents /
+  grants | leases | effects         MCP / Context services / adapters
+  hard bounds | durable audit       (never direct Core clients)
+          |
+          v
+  brokered workspace / process / network / artifact resources
+
+agent-compose / product host = bootloader only, never another orchestrator
 ```
 
 There remains exactly one turn/task orchestrator: `RuntimeActor`. An
 extension can provide a capability, observation, workflow, or lifecycle
 interceptor; it cannot create a second task state machine, mutate the
 ContextEngine directly, append arbitrary prompt messages, or commit an
-effect outside the Core.
+  mediated effect outside the Core. Generic process execution remains an
+  explicit non-transactional exception until M12/M13 close it.
+
+Current V1 is one operator-trusted address space. PLAT-01 is landed:
+`RuntimeServices` retains only `Arc<dyn CorePort>` as its Core facade; its
+scheduling fields and methods, the concrete `RuntimeActor`, `CoreAuthority`,
+and Core event/approval/effect/output components are private. Capability/plugin
+admission and state primitives remain explicit public Core contracts used by
+their registries. `RuntimeServices` constructors and `spawn_runtime` remain
+public trusted-composition seams. Effect commit requests carry
+run/turn/operation/generation/lease identity, and Core validates its run and
+issued lease. Core now also owns a monotonic authority epoch;
+Runtime requests CAS advances and retains only a mirror, while Core rejects
+stale dispatch and commit. Cancellation advances the fence before any await or
+cleanup. A dependency conformance test enforces the production graph. The
+landed bounded in-memory Core registry additionally binds a canonical argument
+digest and Core-issued effect id to each operation, prevents same-process
+duplicate dispatch/commit, retains every unresolved operation and distinguishes
+recent/expired/unseen queries. PLAT-03a3 persists epoch and full operation
+transitions journal-first behind a checksummed `sync_all` barrier. PLAT-03a4
+preallocates the Core `EffectId`, journals exact builtin workspace mutation
+evidence and reconciles it at startup; unresolved, unmanaged or ambiguous
+effects raise the `RecoveryRequired` mutation fence. Generic shell/process
+spawn/exit recovery is landed; out-of-process capability/MCP invoke recovery
+is landed, and protocol
+process ownership remains split across adapters. PLAT-02 defines the common semantic
+contract, but existing adapters do not yet carry it and the SDK is not
+implemented. These are structural and same-process stale-work constraints, not
+crash exactly-once or an unbypassable same-process security boundary.
 
 The builtin tool set is part of the agent-computer interface (ACI), not just
 an incidental collection of helpers. It must be designed and benchmarked as
@@ -62,9 +86,9 @@ failure semantics directly change model performance.
 
 ### Ring 0: Trusted Core
 
-The Core is intentionally small, stable, and unavailable to model-authored
-extensions. It owns mechanisms whose compromise invalidates every higher
-layer:
+The target Core is intentionally small, stable, and unavailable to
+model-authored extensions. It must own mechanisms whose compromise invalidates
+every higher layer:
 
 - permission and standing-grant evaluation;
 - effect preparation/commit/rollback and generation fences;
@@ -75,15 +99,28 @@ layer:
   resource enforcement;
 - runtime integrity and the non-bypassable policy envelope.
 
+Today Core centralizes these mediated paths behind the landed `CorePort`, owns
+the persistent authority epoch/operation journal, and reconciles exact builtin
+workspace evidence at startup. Its authority registries are stateful; "turn-
+stateless" means no TaskManager, turn loop or prompt frame, not no state.
+`PLAT-03` now has strict query/cancel DTOs, an authorized
+transport-independent router, WAL-first acceptance publication and an
+actor-owned control seam. In-process authenticated operation-control session
+installation is landed. Framed JSON-lines operation-control over an
+inherited-pipe analogue (`FramedProtocolSession` + the authenticated adapter)
+is landed; Named Pipe/UDS remain PLAT-08. Out-of-process capability/MCP
+invoke recovery is landed. A future HTTP/gRPC broker must reuse the same
+reserved/dispatch/ack barrier and must not add a second orchestrator.
+
 Core policy must derive authority from the operation and granted handles,
 not trust a tool's self-declared risk label. An extension may request less
 authority; it can never grant itself more authority.
 
-### Ring 1: Evolvable Runtime
+### Ring 1: Evolvable Platform / Runtime
 
 `agent-runtime` remains the only orchestrator and owns adaptive policy:
 
-- the actor turn state machine and operation generations;
+- the actor turn state machine, lifecycle transitions and Core-epoch mirror;
 - TaskAnchor, Episode, Focus, open loops, and CompletionRecord transitions;
 - context maintenance/materialization and prompt assembly;
 - active tool-surface selection, scheduling, and lifecycle safe points;
@@ -110,7 +147,9 @@ not permission bypass.
 ### Ring 3: Extension ecosystem
 
 External capability code runs out of process or behind another enforceable
-adapter boundary. It receives scoped handles and returns typed values,
+adapter boundary. Trusted in-process capabilities may receive permission-
+scoped `WorkspaceHandle`/`ArtifactHandle` views; isolated code receives
+brokered operations and refs. It returns typed values,
 artifacts, or an `EffectRequest`; it never receives raw runtime/context/core
 objects.
 
@@ -127,6 +166,107 @@ operator-trusted adapters, not capabilities the model can discover and load
 mid-turn. The current typed `ModuleHost` plane should be documented and
 named accordingly so "module" does not imply an untrusted plugin may replace
 the approval policy, journal, or ContextEngine.
+
+## Agent OS platform contract and transport
+
+The module boundary follows an OS-like rule:
+
+> Extensions request Platform services; Platform consults Core authority.
+> Extensions never import, connect to, or receive handles to Core.
+
+This is not a microservice mandate. Split a component behind wire protocol
+when it is untrusted, independently versioned, written in another language,
+long-lived outside the run, or needs crash/sandbox isolation. Keep trusted
+hot-path implementations in-process when direct typed calls give better
+latency and transaction boundaries.
+
+### CorePort versus Platform Protocol
+
+- **CorePort (landed in `PLAT-01`)** is the narrow authority interface from
+  the sole RuntimeActor to Core: events, approval, bounded tool execution,
+  context acknowledgement/query, checkpoint/restore, and effect
+  commit/rollback. Commit requests carry run/turn/operation/generation/lease
+  identity; Core validates run, its issued lease and its independently owned
+  current authority epoch. Runtime requests CAS advances and keeps only
+  a mirror. V1 keeps it in-process. A future hardened Core
+  process is evidence-gated by the Self-Iteration threat model and must not
+  gain a TaskManager or turn loop.
+- **Platform Protocol semantics (landed in `PLAT-02`)** define the stable
+  envelope/identity/error contract for Tools, executable Skill workers, hooks,
+  child Agents, MCP servers and isolated context/model adapters. It has typed
+  namespaces over one bounded envelope; it is not a generic event bus and
+  does not pretend every resource is a Tool.
+- **Platform SDK (planned by `PLAT-07`)** exposes the least-authority client surface over that
+  protocol. Extension packages depend on the SDK/protocol, not
+  `agent-core`, `agent-runtime` internals, raw `ContextEngine`, workspace or
+  journal objects.
+
+The common envelope must distinguish physical delivery from logical work:
+
+```text
+protocol/version/features/schema_digest
+message_id / request_id
+call_id / operation_id / attempt / effect_id
+run_id / task_id / turn_id / scope_id
+deadline_remaining / causation_id / correlation_id / trace context
+authority lease id + generation (opaque/minimal; never a new grant)
+bounded typed payload or artifact ref
+```
+
+`request_id` pairs one exchange; `call_id` identifies the model call;
+`operation_id` survives retry/reconnect; `effect_id` identifies one proposed
+world mutation; trace ids are observability only. Reusing one `operation_id`
+with a different argument digest is a protocol violation.
+
+### Reliability and permission invariants
+
+Do not promise transport-level exactly-once. Messages may repeat. The landed
+bounded registry is linked to the builtin workspace mutation journal; other
+effect kinds need equivalent durable evidence. The landed query/cancel DTOs,
+authorized router, WAL-first acceptance event and actor seam preserve
+`ExpiredOrPossiblySeen` and exact Core truth; concrete authenticated adapters
+still need to consume that seam.
+Only a broker with a durable idempotency
+barrier may promise at-most-one commit. Ambiguous or unmanaged crash windows
+remain unresolved behind `RecoveryRequired` and must never be blindly replayed
+under a new id.
+Terminal invocation/effect states are monotonic, cancellation is a request
+plus generation fence, and late results cannot commit.
+
+Effective authority is always an intersection:
+
+```text
+manifest request
+  ∩ installed Core grant
+  ∩ run/task policy and resource scope
+  ∩ short-lived invocation lease
+  ∩ effect-specific commit decision
+```
+
+OS peer identity, process ownership and transport ACL only admit a connection.
+They never grant an operation. The target trusted boundary canonicalizes
+call/tool/artifact identity from the request and registered record, validates
+bounded arguments/result envelopes, and does not trust producer-returned
+identity or self-declared risk. Full JSON-schema/output-schema support is not
+part of the current contract and must not introduce an unbounded validator.
+
+### One protocol, selectable transports
+
+| Boundary | Default |
+| --- | --- |
+| Trusted same-process implementation | direct trait / actor message |
+| Platform-owned one-to-one child | inherited anonymous pipes; dedicated protocol handles |
+| Persistent/reconnectable local service | Windows Named Pipe / Unix Domain Socket with ACL/peer checks |
+| Remote/ecosystem integration | MCP, HTTP or gRPC adapter terminating at Platform |
+| Large/binary output | immutable artifact/ref, never inline control data |
+
+The current stdio backend is already an OS anonymous-pipe channel. Named
+Pipe/UDS are for independent lifecycle, reconnection and peer admission, not
+an assumed performance win. Standard output/error remain bounded logs; the
+protocol should eventually use dedicated handles. JSON remains acceptable
+until measurement proves codec cost material; length framing, binary codecs,
+streaming and multiplexing are later transport choices, not prerequisites for
+the authority contract.
 
 ## Extension taxonomy
 
@@ -152,22 +292,23 @@ The repository is already partially aligned with this architecture.
 | Area | Status | Code-grounded assessment |
 | --- | --- | --- |
 | Contract-first dependencies | [x] | `agent-contracts` defines `ContextEngine`, `ToolDispatcher`, capability, effect, model, and event contracts. Concrete context/tool implementations are composed outside `agent-runtime`. |
-| Single orchestrator | [x] | `RuntimeActor` owns turn state; `agent-core` remains a stateless facade. Preserve this boundary. |
+| Single orchestrator | [x] | `RuntimeActor` owns turn state; `agent-core` remains turn-stateless. Preserve this boundary. |
+| Narrow Core boundary | [x] PLAT-01 + [~] PLAT-03 | `RuntimeServices` holds only `Arc<dyn CorePort>` as its Core facade; its scheduling state/methods and the concrete actor/Core implementations are private. Capability/plugin admission/state remain explicit Core primitives. Core owns the epoch and bounded registry; composition injects the persistent authority journal and builtin workspace reconciler. Exact workspace evidence is reconciled on restart, and RuntimeCheckpoint v4 validates a stable WAL-prefix marker; unmanaged or ambiguous effects remain fenced. Runtime requests CAS advances and remains the sole orchestrator. `agent-conformance` enforces forbidden production dependency paths. The authorized transport-independent operation router, WAL-first acceptance publication, WAL compaction, generic process spawn/exit recovery, in-process authenticated operation-control sessions, framed JSON-lines operation-control over an inherited-pipe analogue and out-of-process capability/MCP invoke recovery are landed; Named Pipe/UDS remain PLAT-08. PLAT-04 common-contract proof is landed; adapter envelope migration remains PLAT-07. |
 | Typed composition modules | [x] / needs naming | `agent-runtime/src/host.rs` publishes context/model/tool/approval/event/artifact services through a typed registry. This is a trusted composition plane, not the boundary for arbitrary model-authored plugins. |
-| Dynamic capability catalog | [x] / lifecycle gap | `CapabilityRegistry` validates/caches declared tool schemas, prevents name shadowing, tracks activation/maturity, and merges them through one dispatcher. Lifecycle is per tool: loading one tool never surfaces its siblings (process start/stop stays owner-level). Dynamic capabilities still do not participate in builtin idle cooling/GC. |
-| Bounded active tool surface | [x] | Bounded task-owned exact-tool requirements, `MustSurface`/`PreferSurface`/`KeepReady`, the runtime-owned `RoundSurfacePlan`, bounded selection/omission/block reports with per-row provenance, source revisions, and a monotonic round `surface_revision` are implemented and verified. A typed-root policy derives family roots from the TaskAnchor/focus/active-call state at BeforeModel. RuntimeCheckpoint v2 persists requirements, anchors and counters rather than a derived snapshot. |
-| Builtin effect staging | [x] baseline | `fs.write` and `edit.replace` return `PreparedEffect`; the runtime generation fence decides commit/rollback. |
-| Generic shell effects | [~] confirmed blocker | `shell.exec` starts a shell in the real workspace and returns `Value`; commands may mutate before any prepared-effect fence. Sandboxing, standing policy, process-tree cleanup, and effect observability must make this escape hatch safe (`CORE-06`/`CORE-08`). |
-| External effect enforcement | [~] confirmed blocker | Process capabilities currently execute inside the child and return a value, so side effects can bypass the effect fence. Keep the `CORE-01` defect in `AUDIT_TODO.md` authoritative. |
-| Extension sandbox | [~] confirmed blocker | The process host has framing/deadlines and limited environment/rlimits, but no complete brokered filesystem/network boundary and no reliable process-tree kill on every platform (`CORE-06`/`CORE-07`). |
-| Permission model | [~] too coarse | `ToolSpec` has only `ReadOnly`, `WorkspaceWrite`, and `ProcessExecution`; capability permissions are strings and a capability can understate real behavior. Standing grants now narrow approval at the gate (`CORE-08`), but capability-declared permissions remain coarse strings. |
-| Output contract | [~] partial | Builtins generally bound output and spill artifacts; the kernel-level trusted output broker caps every model-facing field and spills oversized content once (`CORE-04`), `ToolSpec` declares a per-tool output budget that the broker enforces (clamped to the global hard cap), and the actor keeps a last-line guard. Process capability output/stderr still needs one enforced path. |
-| File/navigation tools | [~] useful baseline | `fs.list`, ranged `fs.read`, `search.grep`, `fs.write`, exact `edit.replace`, and multi-file `edit.patch` with file-revision preconditions (`base_revision`, SHA-256 `revision` from `fs.read`) cover basic work. Missing: glob/multi-read, binary/media metadata, symbol/diagnostic navigation, and stronger cancellation on search/read. |
+| Dynamic capability catalog | [x] / lifecycle split remains | `CapabilityRegistry` validates/caches declared tool schemas, prevents name shadowing, tracks activation/maturity, and merges them through one dispatcher. Lifecycle and idle cooling are per tool, so loading one tool never surfaces siblings; owner process start/stop is separate. Invocation/effect lifecycle still needs its own typed axis. |
+| Bounded active tool surface | [x] | Bounded task-owned exact-tool requirements, `MustSurface`/`PreferSurface`/`KeepReady`, the runtime-owned `RoundSurfacePlan`, bounded selection/omission/block reports with per-row provenance, source revisions, and a monotonic round `surface_revision` are implemented and verified. A typed-root policy derives family roots from the TaskAnchor/focus/active-call state at BeforeModel. RuntimeCheckpoint v4 persists requirements, anchors and counters rather than a derived snapshot, and references Core authority through a verified WAL-prefix marker. |
+| Builtin effect staging | [x] baseline | `fs.write` and `edit.replace` return `PreparedEffect`; Runtime validates its epoch mirror and Core independently validates the authority epoch before commit/rollback. |
+| Generic shell effects | [~] controlled escape hatch | `shell.exec` can mutate the real workspace and cannot become a rollback-able prepared effect for an arbitrary command. It is therefore separately permissioned, bounded, whole-tree cancelled and audited; standing grants are intent-constrained. M13 OS confinement and the real-workload evaluation gate remain mandatory before autonomous use. |
+| External effect enforcement | [~] fail-closed containment / M13 residual | Non-empty process `WireEffect`s are rejected before staging until actual intent can be bound to PLAT operation/effect identity and proved within the lease. Empty-effect/value responses remain usable and request-owned output identity is canonicalized. Direct child syscalls are not protocol effects: Linux write confinement is landed, but direct reads, sockets and cross-platform OS enforcement remain the `CORE-01`/M13 residual. |
+| Extension sandbox | [~] M13 residual | Env scrub, private cwd, bounded stderr, deadlines, whole-process-tree termination, Windows Job quotas, Unix rlimits, brokered filesystem reads, deny-by-default brokered network and Linux Landlock write confinement are implemented. Direct sockets/reads, cross-platform write confinement and I/O/disk limits remain open. |
+| Permission model | [~] bounded baseline | Registration validates the known permission vocabulary, derives minimum risk, and Core stores the accepted grant rather than trusting a live manifest. Standing grants narrow concrete effect intent. The vocabulary remains coarse and the landed PLAT-02 identity/error vocabulary is not yet the recoverable per-operation Platform authority of `PLAT-03/04`. |
+| Output contract | [x] model boundary / protocol caps closed | The trusted output broker caps model-facing fields when wired and the actor keeps a last-line guard; process streams use bounded fragments and an 8 MiB per-invocation/session artifact cap while draining overflow. Process responses take `call_id`/`tool_name` from the trusted request. `PLAT-00` caps every outbound/control/decoded frame and constrains large broker values (256 KiB bounded reads with truncation metadata). Artifact refs are capped identity locators (`artifact://v1/<run>/<owner>/<digest>`); live captures use an explicit draft until seal. Parse-time decoded JSON DOM budgets are landed. Remaining `PLAT-04` work is landed (JCS, legacy negotiation, shared fault matrix). Adapter envelope migration remains `PLAT-07`. |
+| File/navigation tools | [~] useful baseline | `fs.list`, ranged `fs.read`, `search.grep`, `fs.write`, exact `edit.replace`, multi-file `edit.patch`, `artifact.read`, `code.symbols`, and `code.diagnostics` cover the bounded baseline. `search.grep` observes cancellation mid-walk/mid-scan and returns partial hits as an explicit cancelled `ToolOutput`. Glob/multi-read, binary/media metadata, and read-tool cancellation remain optional gaps. |
 | Process tools | [~] useful baseline | `shell.exec` has timeout, bounded tail, and artifact output. `process.run` runs an explicit argv with workspace-relative cwd, env overrides and whole-tree kill on timeout/cancel; `process.session` adds start/poll/stop for long-running processes. The raw shell string remains a controlled fallback. |
 | VCS tools | [~] minimal | `git.status` and `git.diff` are confined, bounded, and read-only. `log/show/blame` and structured change review are absent; commit/push must remain higher-risk effects. |
-| Runtime control | [~] partial | `context.manage` and `capability.manage` are merged bounded control surfaces. There is no typed TaskAnchor/open-loop control, artifact fetch surface, or task completion proposal. |
-| Completion semantics | [ ] missing | The final answer is a normal AssistantMessage and `/done` accepts unrelated free text. `CTX-10` defines the required TaskAnchor-to-CompletionRecord root transfer. |
-| Tool-system evaluation | [ ] missing | Unit tests verify individual tools and bounds, but there is no ACI-level comparison against shell-only/current/redesigned surfaces on real coding tasks. |
+| Runtime control | [x] bounded baseline | `context.manage`, `capability.manage`, typed TaskAnchor patches, `task.complete`, and `artifact.read` exist. Federated resource discovery and managed-child controls are the next experimental surfaces. |
+| Completion semantics | [x] typed baseline | `task.complete` commits a task-owned `CompletionRecord` whose ref/digest identify the bounded completion summary; with artifact storage wired, the complete assistant response is retained separately by artifact ref. Completion transfers roots atomically. A raw-body digest and typed EpisodeOutcome remain context work. |
+| Tool-system evaluation | [~] live paired harness | The conformance harness and A/B/C/D scripted coding fixtures compare shell-only/current/redesigned surfaces and hidden outcomes. `--compare-live` runs those fixtures through a real tool-capable model. M15 remains open: no 300×3 non-inferiority result with total cost/latency. |
 
 ## Incremental Core migration
 
@@ -211,8 +352,15 @@ Runtime decides what task step happens next and what fits inside that limit.
 
 - Event timing remains Runtime-owned; Core assigns identity, persists,
   barriers, and broadcasts.
-- The operation generation remains Actor-owned; Core validates that the
-  supplied authorization lease is current before commit.
+- **Current PLAT-03 boundary:** a1-a4 provide Core-owned epoch/operation/effect
+  identity, journal-first persistence and exact builtin workspace recovery;
+  generic shell/process spawn/exit recovery is landed; out-of-process
+  capability/MCP invoke recovery is landed. Unmanaged HTTP/gRPC brokers still
+  fail closed. RuntimeCheckpoint v4 now
+  validates a stable authority-WAL prefix before restore without rewinding
+  Core. Typed query/cancel routes and the exact-current-tool RuntimeActor seam
+  are landed; remaining payload/conformance work is in the authoritative
+  `PLAT-04` work item below. Task/turn scheduling never moves into Core.
 - TaskAnchor, Episode, Focus, CompletionRecord, PromptAssembler, context/tool
   selection and model packing never move into Core.
 - Core owns hard resource ceilings; Runtime owns adaptive packing within the
@@ -243,6 +391,11 @@ These are trusted runtime operations, not ecosystem capabilities:
   durable commit create the CompletionRecord;
 - `artifact.fetch` (proposed): bounded range/excerpt access to an artifact by
   stable reference without copying it into a new observation.
+- `runtime.search` (proposed experiment): federated read-only discovery across
+  provider-owned Context/Tool descriptors before widening to other resource
+  kinds; resolving a result never implies admission, loading, or invocation;
+- `agent.manage` (future, evidence-gated): bounded discovery, assignment,
+  wait/status/cancel, and handoff collection for Runtime-owned child workers.
 
 TaskAnchor must also update automatically from trusted runtime events. These
 controls must not turn long tasks into a sequence of user confirmations.
@@ -322,6 +475,11 @@ surface. Discover and load them through the capability catalog, under the
 task's authority envelope.
 
 ## Tool contract v2
+
+This contract is the `tool/effect` namespace of Platform Protocol, not a
+second wire protocol. Platform-level ids, recovery, framing and transport are
+owned by `PLAT-02..08`; this section owns tool registration, effect intent,
+lease, receipt and output semantics.
 
 The current `ToolSpec { name, description, input_schema, risk }` is too weak
 for a safe modular ecosystem. Model-visible schema and host-only enforcement
@@ -411,7 +569,7 @@ Authorization uses two checks but only one policy decision/user interaction:
 2. standing policy/AuthorityGate -> short-lived AuthorityLease
 3. prepare using only lease-scoped handles and Core staging; target world unchanged
 4. canonicalize actual targets and prove actual intent is within the lease
-5. actor checks generation/cancellation; Core commits or rolls back
+5. actor checks its epoch mirror/cancellation; Core independently checks its authority epoch and commits or rolls back
 6. emit EffectReceipt; OutputBroker bounds/spills the final result
 ```
 
@@ -453,26 +611,26 @@ marketplace, output schema, or learned tool selection in this migration.
 
 ### Delivery boundary of the current slice
 
-This section describes the target architecture, but the current implementation
-boundary is narrower and must remain visible in status reports:
+This section records the original TaskToolRequirements slice. The current
+implementation has since extended it with complete TaskAnchor and completion
+semantics; keep the original slice boundary visible for test ownership:
 
 | Status | Delivered boundary |
 | --- | --- |
 | Implemented in the working tree | `TaskToolRequirementSet` is owned by `TaskRecord`, bounded to 32 exact tool names, canonicalized, revisioned and replaced through whole-set CAS. Stale writers and completed-task mutation are rejected; equivalent replacements do not churn the revision. `TaskInfo` exposes revision/count and live restore uses a per-process high-water mark so an older checkpoint cannot create a CAS ABA. |
-| Implemented in the working tree | Contracts define `MustSurface`, `PreferSurface`, `KeepReady`, bounded selected/omitted/blocked decisions, source revisions, and a schema-free `ToolSurfacePlanReport`. RuntimeCheckpoint v2 persists task requirements plus focus/surface counters and explicitly rejects v1 rather than silently treating missing authority as empty. |
+| Implemented in the working tree | Contracts define `MustSurface`, `PreferSurface`, `KeepReady`, bounded selected/omitted/blocked decisions, source revisions, and a schema-free `ToolSurfacePlanReport`. RuntimeCheckpoint v4 persists task requirements, TaskAnchor and focus/surface counters and cross-checks Core authority; older versions are explicitly rejected rather than silently treating missing authority as empty. |
 | Implemented and verified | Runtime-owned `RoundSurfacePlan` is the sole schema-budget projection. Actor tests cover task-demand lifecycle refresh, missing/over-budget Must refusal before provider start, KeepReady prompt exclusion, provider-budget degradation and recovery, one final immutable snapshot, bounded `ToolSurfacePlanned`, `ModelStarted` ordering, monotonic revisions, atomic builtin capture, capability surface-gate serialization, composite common-cut capture, and checkpoint/suspend/restore reconstruction. Full workspace tests and strict Clippy pass. |
-| Still future | Process/schema warmth separation (dynamic capabilities do not cool on builtin idle ticks), structured completion controls, CompletionRecord root transfer, and task/episode/operation requirement lifetimes. |
+| Implemented after the first slice | Per-tool capability cooling without sibling surfacing, full TaskAnchor tool roots, structured completion controls, and CompletionRecord root transfer. Typed EpisodeOutcome and distinct invocation/effect lifecycle remain future. |
 
 This closes the **TaskToolRequirements/round-surface** slice: typed tool-root
 derivation, per-tool capability lifecycle and per-row provenance are verified.
 
-Final review leaves two tool-surface hardening items. Their authoritative issue
-descriptions live in `AUDIT_TODO.md` (`CORE-03`, `CORE-09`) rather
-than being assigned duplicate defects here:
+Final review closed the two first-slice hardening items through `CORE-03` and
+`CORE-09`:
 
-- live restore's high-water rebase needs a bounded typed commit event; an
-  event/barrier failure after restored state becomes visible must fence normal
-  mutation as recovery-required;
+- live restore now keeps the actor recovery-fenced while the host applies a
+  fail-closed capability-state meet, then durably emits bounded
+  `RuntimeRestored`; barrier failure keeps the fence;
 - every selected/omitted row carries per-row provenance
   (`TaskRequirement` / `DispatcherRequired` / `CatalogLoadedOptional` /
   `Unknown` for legacy rows), so a task-authored `PreferSurface` is no longer
@@ -658,17 +816,14 @@ Safety revocation is the exception to snapshot stability: a capability
 quarantined after snapshot capture must still be refused at invocation and
 reported as `RevokedAfterSnapshot`.
 
-RuntimeCheckpoint v2 stores the current task-owned requirement sets, focus
+RuntimeCheckpoint stores the current task-owned requirement sets, focus
 revision and last allocated surface revision, while the host checkpoint keeps
 the existing admission/activation flags. It does not restore `Active` or a
-derived per-round snapshot. Version 1 is explicitly rejected in this prototype
-rather than silently manufacturing an empty requirement authority. The future
-complete checkpoint must additionally store TaskAnchor requirements/durable
-leases and must never let an old activation override a newer quarantine.
-Live-restore revision rebasing is implemented, but its commit is not yet
-represented by a bounded typed `RuntimeRestored`/`TaskRequirementsRebased`
-event. `AUDIT_TODO.md` CORE-03 owns the required audit barrier and
-recovery-required failure semantics.
+derived per-round snapshot. Version 1 is explicitly rejected rather than
+silently manufacturing empty authority. RuntimeCheckpoint v4 includes the
+complete TaskAnchor; two-stage live restore rebases revisions, never lets an
+old Enabled snapshot lift a live Disabled/Quarantined capability, and releases
+the recovery fence only after durable `RuntimeRestored`.
 
 Required properties:
 
@@ -683,18 +838,80 @@ Required properties:
 - **Snapshot consistency verified:** builtin same-lock capture, capability
   surface-gate serialization and composite common-cut retry keep specs aligned
   with their recorded source generations under concurrent mutation.
-- **First-slice hardening still open:** every selected/omitted row
+- **First-slice hardening verified:** every selected/omitted row
   differentiates task demand from dispatcher/catalog fallback provenance;
-  live restore rebase is durably audited.
+  live restore rebase and capability application are durably audited/fenced.
 - **Adjacent context accounting verified:** final actor packing and successful
   model completion commit an exact bounded consumption acknowledgement;
   trimmed or unsuccessful projections are not reinforced.
-- **Still future:** loading one external-capability tool does not mark/surface
-  siblings; task switch/resume reconstructs complete TaskAnchor + Episode
-  demand; completion failure retains roots and successful CompletionRecord
-  commit releases them; model-frame consumption must drive typed episode/
-  evidence promotion and root release instead of relying only on the current
-  next-model-round tool-scope close heuristic.
+- **Implemented adjacent lifecycle:** external capability tools now cool and
+  load per tool without surfacing siblings; TaskAnchor tool roots, task
+  switch/resume reconstruction, CompletionRecord root transfer, and exact
+  model-frame consumption acknowledgement are present.
+- **Still future:** split catalog residency from invocation state, extend
+  acknowledgement into typed Episode/evidence promotion, and replace the
+  remaining next-model-round tool-scope close heuristic with explicit
+  obligation/root-transfer semantics.
+
+## Discovery and managed execution lifecycles
+
+The model may use one tool-like control plane to discover tools, context,
+artifacts, tasks, skills, capabilities, and managed collaborators. That does
+not make all resources tools internally. The shared abstraction is a bounded
+descriptor, typed reference, revision, policy envelope, and observable
+lifecycle; each provider retains its own authority and execution protocol.
+
+User input follows the same event/fence/consumption machinery but is not a
+`ToolOutput`. It has user authority to steer, interrupt, constrain, or cancel
+the active task. A tool or child-agent result is evidence/advice and may only
+propose a state patch. The detailed event contract lives in
+`CONTEXT_RUNTIME_TODO.md` (`CTX-EVENT-01..03`).
+
+### Keep lifecycle axes separate
+
+The current catalog already supports
+`Available -> Loaded -> Active -> Warm -> Unloaded`, and dynamic capability
+processes separately track `Stopped/Starting/Started/Stopping/Failed`.
+`Active` currently also describes a call in flight. The target should stop
+using one value for schema visibility and execution ownership:
+
+| Axis | Purpose | Target states |
+| --- | --- | --- |
+| Descriptor/schema | Discovery, prompt-surface cost, idle GC | Registered/Available, Loaded, Warm, Unloaded, Retired; quarantine remains Core policy |
+| Invocation/effect | One call, approval, cancellation, commit | Prepared, PendingApproval, Running, Committing, Completed, Failed, Cancelled, Stale |
+| Hosted process/session | Reusable external resource | Stopped, Starting, Ready, Busy, Stopping, Failed |
+| Managed child Agent | Delegated asynchronous work | Allocated, Starting, Running, Waiting, Completed, Failed, Cancelled, Expired, Collected |
+
+GC may cool schemas, stop idle hosts, and archive collected child evidence,
+but it must never sweep an active invocation or child lease. Active execution,
+TaskAnchor demand, pending effects, and parent open-loop claims are typed
+roots; cancellation first fences effects and only then releases resources.
+
+### Child Agent as a tool-like model interface
+
+Expose a small bounded `agent.manage`-style interface rather than injecting
+every specialist into the prompt:
+
+```text
+search / inspect
+spawn(AssignmentCard, budget, permission subset, deadline)
+send(child_ref, bounded message or evidence refs)
+wait / status / cancel / collect
+```
+
+The main model chooses assignments and coordination, but the sole
+`RuntimeActor` owns child handles, budgets, cancellation generations, event
+ordering, permission narrowing, and parent-state commits. A child cannot
+grant itself permissions, write the parent's TaskAnchor, commit a parent
+CompletionRecord, load arbitrary capabilities, or modify evaluation/Core
+policy. Its full result is stored once as an artifact; the parent receives a
+bounded `HandoffCard` plus exact refs and decides what to admit.
+
+This is orchestration through a tool-like ABI, not a second orchestrator. The
+first implementation must be a scoped child execution service behind Runtime
+and the existing effect/sandbox fences. Broad autonomous multi-agent use
+remains disabled until the real evaluation gate demonstrates benefit over
+spending the same token/time budget on the single main actor.
 
 ## Autonomy without approval fatigue
 
@@ -785,9 +1002,9 @@ together with TaskAnchor and continuous context GC.
 - [x] **MOD-01** Confirm the four trust rings and the rule that there is one
   orchestrator.
   **Verified 2026-08-12.** The four rings are (1) the trusted core
-  (`agent-core`: stateless `CoreAuthority` seams — events, approval,
-  effects, output — plus the admission/state authorities; owns no turn
-  state, the agent can never modify it), (2) the runtime orchestrator
+  (`agent-core`: turn-stateless `CoreAuthority` seams — events, approval,
+  effects, output — plus stateful admission/state authorities; owns no turn
+  state), (2) the runtime orchestrator
   (`agent-runtime`: `RuntimeActor` owns the turn state machine, task
   manager, scope lifecycle, prompt assembly and effect fence;
   `RuntimeServices` owns scheduling), (3) the trusted composition plane
@@ -894,15 +1111,23 @@ together with TaskAnchor and continuous context GC.
 
 ### Gate 2: close correctness/security blockers
 
-- [x] **CORE-GATE-01** Close `CORE-01`, `CORE-04`, `CORE-06`, `CORE-07`, `CORE-08`, and `CORE-09` from
+- [~] **CORE-GATE-01** Close `CORE-01`, `CORE-04`, `CORE-06`, `CORE-07`,
+  `CORE-08`, `CORE-09`, and `CORE-10` from
   `AUDIT_TODO.md`; external process capabilities remain disabled by default
   until the actual effect/sandbox path passes adversarial tests.
-  **Closed 2026-08-11.** All six dependencies are closed (process-boundary
-  parity, output broker, cancellation/sandbox, confined directory-handle
-  operations, standing grants, and the round-surface slice); external
-  (out-of-process) capabilities still enter `Disabled` at registration and
-  stay off the surface until an explicit enable, so the default remains
-  safe while the M12 wire-level effect broker is finalized.
+  **Five dependencies and CORE-01's protocol-effect slice are closed.** The
+  output broker, cancellation, confined directory-handle operations, standing
+  grants, round-surface planning and wire effect fence are landed. CORE-01
+  remains open for M13's direct-OS read/network and cross-platform
+  confinement residual; CORE-10's current-wire framing, MCP ownership/
+  cancellation and broker-value containment are closed (`PLAT-00`,
+  2026-08-13); artifact locators are owner/digest identity strings.
+  Parse-time decoded JSON DOM budgets, RFC 8785 JCS, explicit
+  `legacy.invoke-output.v1` negotiation and the shared adapter fault matrix
+  landed 2026-08-14 (`PLAT-04`). Adapter envelope migration remains `PLAT-07`.
+  External capabilities
+  still enter `Disabled` and stay off the surface until explicit enable;
+  autonomous admission remains gated on M13/M15 and `PLAT-00..04`.
 - [x] **MOD-03** Separate trusted composition registration from dynamic capability
   registration in names, docs, and authority checks.
   **Verified 2026-08-11.** Names: `ServiceRegistry::register` (typed service,
@@ -933,7 +1158,8 @@ together with TaskAnchor and continuous context GC.
   instead of re-interpreting `AgentResult` + a boolean),
   `EffectAuthority` (every staged effect of every path — builtin,
   capability, wire broker — commits or rolls back through this one seam;
-  the actor still decides live-vs-stale behind the generation fence) and
+  Runtime checks its mirror and Core now independently rejects a stale
+  authority epoch) and
   `OutputAuthority` (the only path from producer output to a model-facing
   `ToolOutput`; absent a broker it passes through and the runtime last-line
   guard remains the backstop). The actor's two effect call sites route
@@ -1133,7 +1359,8 @@ together with TaskAnchor and continuous context GC.
 - [x] **TOOLS-08P** Validate the TaskToolRequirements/round-surface first
   slice: bounded TaskRecord CAS, Must/Prefer/KeepReady packing and degradation,
   lifecycle refresh, bounded decision events, one final snapshot, runtime
-  surface revision, and RuntimeCheckpoint v2. This item does not include the
+  surface revision, and the requirement slice now carried by RuntimeCheckpoint
+  v3. This historical item did not include the
   complete TaskAnchor or completion transaction.
 - [x] **TOOLS-08** Add TaskAnchor-driven tool roots and structured completion controls with the
   `CTX-10` CompletionRecord transaction and GC root transfer. The active
@@ -1209,6 +1436,263 @@ together with TaskAnchor and continuous context GC.
   are catalog-optional: loaded on demand through `capability.manage`, never
   always-on, and they obey the same envelope, confinement and spill rules as
   every tool. No embeddings, no vector storage, no index.
+
+### Gate 3.5: Platform protocol, discovery and managed workers
+
+Complete tasks in the order shown. `PLAT-00..04` are the immediate boundary
+and reliability gate; changing local transport before them is explicitly out
+of order.
+
+- [x] **PLAT-00 — P0a: contain the current wire boundaries before redesign.**
+  Fix the existing codecs and ownership now: hard-cap host→child requests,
+  broker answers, frames and exchange totals; cap known decoded large fields;
+  reject oversize while
+  reading in ProcessHost, context-service and MCP; split frames independently
+  of OS read chunking and treat EOF fragments correctly; retain/kill/poison
+  MCP children on cancel/timeout;
+  bound notification/stderr floods; canonicalize returned call/tool identity;
+  and prevent a valid current `ProcessInvokeResponse` (including an empty
+  effect list) from falling through to the legacy decoder. Large
+  file/result bodies become range or artifact refs. This may land in parallel
+  with PLAT-01 and must not wait for a new transport.
+  **2026-08-13:** the wire boundaries are contained. One shared bounded frame
+  codec (`agent-process::frame`) caps outbound frames before a byte is written
+  and enforces the in-flight bound incrementally on read; ProcessHost,
+  context-service and MCP all fail closed on oversize/partial/malformed/
+  version/id/envelope faults and poison + kill owned child trees. The codec
+  preserves multiple frames delivered by one OS read; session state and
+  unpredictable request ids reject pre-sent/stale logical responses.
+  `ProcessHost` adds a cumulative per-call byte budget and a control-plane
+  answer cap; the MCP client owns its server child (kill-on-cancel/timeout/
+  poison, reap, `stop()` teardown, poisoned-client replacement, notification-
+  flood cap) and surfaces `Cancelled` on cancellation; the broker serves large
+  `fs.read` results through an allocation-bounded workspace read as a 256 KiB
+  prefix with `byte_len`/`truncated` metadata, never full-read-then-truncate.
+  Process effects have count/path/per-effect/aggregate decoded-byte caps before
+  base64 decode and staging. Current and legacy process-
+  capability responses canonicalize `call_id`/`tool_name` from the request,
+  and an empty-effects current envelope no longer falls into shape-guessing.
+  Regressions cover outbound oversize, cumulative/broker flood, same-write
+  frames plus stale-id rejection, partial EOF, oversized service requests,
+  notification flood and cancel-after-spawn. A follow-up containment slice
+  fails closed on process `WireEffect`s until actual-intent proof exists,
+  reports partial composites truthfully with a recovery fence, bounds local
+  process output/artifact capture, and binds artifact reads/broker/completion
+  refs to the current run. **PLAT-04 landed 2026-08-14:** RFC 8785 JCS
+  argument digests, explicit `legacy.invoke-output.v1` handshake (plain
+  `ToolOutput` default-deny), parse-time JSON DOM budgets, artifact
+  owner/digest locators, and the shared process/context/MCP fault matrix
+  in `agent-conformance`. Adapter envelope migration remains `PLAT-07`.
+  General artifact-range transport for very large bodies remains later work.
+
+- [x] **PLAT-01 — P0: freeze the Agent OS boundary.** The narrow in-process
+  `CorePort` is landed. `RuntimeServices` retains only the trait object as its
+  Core facade while its fields/scheduling methods, concrete `RuntimeActor`,
+  concrete Core and event/approval/effect/output handles are private;
+  capability/plugin admission/state remain explicit Core primitives. Public constructors and
+  `spawn_runtime` remain trusted composition seams. Effect commit/rollback
+  requests carry run/turn/operation/generation/lease identity and authority
+  rejection is typed. `agent-conformance` checks forbidden production paths,
+  bottom-layer contracts and concrete-implementation composition roots.
+  Commit authority rejection is typed; rollback remains best-effort cleanup
+  with identity errors surfaced. This slice deliberately does not claim an
+  unbypassable security boundary. At PLAT-01 landing, V1 trusted same-process
+   Runtime and Core lacked both an independent current epoch and a recoverable
+   operation ledger. PLAT-03a1-a4 have since closed the epoch, bounded
+   identity/state, journal-first persistence, builtin workspace reconciliation
+   and authority-prefix checkpoint validation; unmanaged effects and the
+   isolation threat model remain.
+- [x] **PLAT-02 — P0: specify the transport-independent envelope.** The new
+  bottom-layer `agent-platform-protocol` crate separates
+  `message_id`, physical `request_id`, model `call_id`, logical
+  `operation_id`, attempt and `effect_id`; carry run/task/turn/scope,
+  remaining deadline, version/features/schema digest and bounded causality.
+  It adds exact negotiated profiles, strict typed/non-nil IDs, explicit
+  success/error responses, structured protocol/domain errors with validated
+  retry/effect-state dispositions, monotonic remaining deadlines, bounded
+  one-hop causality and stateless validators. Ping/pong is liveness only,
+  never authority or session state. Core envelope fields fail closed on
+  unknown input. Digest helpers intentionally hash caller-supplied semantic
+  bytes; RFC 8785 JCS and explicit legacy negotiation landed `PLAT-04`;
+  adapter envelope migration remains `PLAT-07`; external operation
+  routing/admission and
+  unmanaged-effect semantics remain `PLAT-03`, while the Core-local ledger,
+  query and workspace reconciliation are landed.
+- [~] **PLAT-03 — P0: make retry and recovery honest.** **a1-a4 landed
+  2026-08-13:** Core owns an `AtomicU64` authority epoch, recovered and advanced
+  by the production journal;
+  Runtime requests compare-and-swap advances and keeps only a mirror. Core
+  rejects stale tool dispatch before and after approval and independently
+  rejects stale effect commit. Cancellation advances the Core fence before
+  any await or cleanup and records an exact-identity terminal reservation, so
+  cancellation that wins the admission race still prevents dispatch. Runtime
+  remains the only task/turn orchestrator. Core
+  now also owns a bounded operation registry keyed by typed
+  operation identity + canonical Rust argument digest; it assigns `EffectId`,
+  binds leases to operation+digest, refuses conflicting reuse, prevents exact
+  duplicate dispatch/commit, never evicts unresolved state, and reports
+  found/expired-or-possibly-seen/unseen through its in-process query. Its
+  bounded seen filter is fail-closed (false positives refuse work).
+  **a3 landed 2026-08-13:** a contracts-only `OperationJournal` is injected by
+  composition; Core persists and `sync_all`-barriers epoch/full-operation
+  transitions before publishing memory state. Recovery validates bounded,
+  checksummed contiguous records, repairs only a structurally incomplete final
+  fragment and otherwise fails closed; writes stop before recovery/file limits
+  can poison the next startup. Startup durably advances the recovered epoch
+  before exposure. Unix synchronizes newly created parent directories; Windows
+  synchronizes the journal file but retains an explicit power-loss
+  directory-entry limitation.
+  **a4 landed 2026-08-13:** Core preallocates a stable `EffectId` before every
+  side-effecting dispatch and passes exact operation/digest/effect identity into
+  builtin workspace mutations. Their bounded, exclusively locked, checksummed
+  journal durably records prepare/commit/rollback evidence. Startup reconciles
+  that evidence with current file hashes: proven not-applied/applied states are
+  terminalized; partial, corrupt, unmanaged or ambiguous states remain
+  unresolved and raise `RecoveryRequired`. Generic shell/process spawn/exit
+  recovery is landed; out-of-process capability/MCP invoke recovery is landed.
+  **Checkpoint v4 landed 2026-08-13:** checkpoints carry a stable authority
+  journal lineage/generation/prefix/digest marker; restore validates it as an
+  ancestor before mutation and advances rather than rewinds the live epoch.
+  Markerless ephemeral checkpoints are same-run only.
+  **Operation control slice landed 2026-08-13:** the protocol crate defines
+  bounded query/cancel routes whose success bodies preserve exact Core truth;
+  `RuntimeHandle` serializes query and exact-current-tool cancellation through
+  `RuntimeActor`. Query remains available behind recovery. Core arbitrates
+  cancellation and terminalization under one authority transition: a won
+  cancel persists its epoch fence plus `CancelledBeforeCommit` before the
+  durable `TurnCancelled` barrier completes; a terminal/commit race that won
+  first returns unchanged Core truth, and partial WAL failure fences both
+  layers. That cancellation terminal proves only that a
+  Core-mediated commit did not start; it cannot undo mutations an approved
+  non-transactional child already performed. Requests omit `effect_id` and
+  treat the returned Core snapshot as effect truth. This trusted seam performs no
+  external transport authentication by itself. The Platform router now calls
+  a trusted connection-scoped authorizer, canonicalizes Core truth and
+  forwards only through `RuntimeActor`; Core upgrades its one-shot admission
+  permit to a distinct dispatch permit only after `OperationAccepted` and
+  `ToolStarted` publish successfully.   **WAL compaction landed 2026-08-13:** `FileOperationJournal::compact`
+  folds epoch plus current snapshots into a new generation, retains every
+  operation identity, stores the pre-compact tip in a bounded ancestor
+  list, and fail-closes discarded mid-generation prefixes. Empty journals
+  are a no-op; callers cannot append `Compacted`. CorePort exposes
+  `compact_authority_journal`. **Process spawn/exit recovery landed 2026-08-13:**
+  `shell.exec` / `process.run` / `process.session` persist spawn then wait
+  in `.focus-agent/authority/process-effects.jsonl`. Startup maps
+  never-spawned process tools to `NotApplied`, a durable wait to
+  `CompletedValue` (Executing only), and missing-exit crash windows to
+  `Ambiguous`. Leftover trees are signalled only when the OS create-time
+  token still matches. This does not roll back child mutations and does not
+  cover HTTP/gRPC brokers. **Authenticated operation-control session landed 2026-08-14:**
+  trusted composition installs a bounded grant; `AuthenticatedOperationControlAdapter`
+  binds it to one connection, stamps `authority_ref` from that session, and
+  forwards query/cancel through the existing router. Peer-supplied refs cannot
+  escalate, revoked sessions are denied, and oversize/malformed frames never
+  enter the actor. Framed JSON-lines operation-control over an inherited-pipe
+  analogue landed 2026-08-14: `FramedProtocolSession` reuses the shared
+  `read_frame`/`encode_frame_bytes` codec, poisons on inbound framing errors,
+  and leaves the connection usable when an outbound encode is rejected before
+  any byte is written. The authenticated adapter still consumes one frame
+  body and never owns the pipe; local transport identity is not a Core grant.
+  Named Pipe/UDS remain PLAT-08.
+  **Remote invoke recovery landed 2026-08-14:** effectful capability/MCP
+  invokes persist reserved (operation-id idempotency key) then dispatched
+  before the child call, then ack. Never-sent work is `NotApplied`, a
+  durable Completed/Failed ack is `CompletedValue`, dispatched-without-ack
+  is `Ambiguous`, and an in-flight key refuses a second send. `Staged`
+  acks without matching workspace evidence stay ambiguous. A future HTTP
+  broker must reuse these persist APIs; peer mutations are never rolled
+  back. Only
+  brokers with a durable idempotency barrier may claim at-most-one commit;
+  every other ambiguous crash window returns `OutcomeUnknown`, never blind
+  replay. The current persisted authority is not crash exactly-once and cannot
+  police a malicious Runtime in the same address space.
+- [x] **PLAT-04 — P0: migrate and prove the common contract.** After PLAT-00
+  containment and PLAT-02 semantics, bounded argument/result envelopes,
+  artifact scheme/run/owner/digest locators (live captures stay drafts until
+  seal), parse-time decoded JSON DOM budgets, RFC 8785 JCS
+  (`ArgumentDigest::from_json`), and explicit `legacy.invoke-output.v1`
+  handshake negotiation are landed. Plain `ToolOutput` is default-deny unless
+  that feature is crossed at ping. One conformance/fault matrix over
+  process, context and MCP adapters covers duplicate/stale-id, effect-disconnect,
+  cancel-late, crash/reconnect, version/schema mismatch,
+  malformed/multi-frame/truncated/oversize frames, JSON DOM bombs and
+  broker/notification flood (`crates/agent-conformance/tests/adapter_fault_matrix.rs`).
+  Stale generation remains Core/Platform (`agent-runtime` tests); isolated
+  adapters do not depend on `agent-core`/`agent-runtime`. Adapter envelope
+  migration onto Platform DTOs remains `PLAT-07`. This slice does not start
+  PLAT-05/06/08 or invent an HTTP broker.
+- [ ] **PLAT-05 — P1: separate supervision, transport and protocol.** Refactor
+  the currently split adapter-owned process control into
+  `ProcessSupervisor` and `DuplexTransport` on top of the landed bounded
+  `FramedProtocolSession`; preserve current owned-child kill-tree/poison
+  behavior and keep inherited anonymous pipes as the first backend. The same
+  conformance fixtures must exercise direct and pipe adapters.
+- [ ] **PLAT-06 — P1: lifecycle and backpressure.** Add peer/host epoch,
+  Ready/Degraded/NotServing/Quarantined health, bounded restart/circuit
+  breaking, deadline propagation, cancellation acknowledgement and
+  coalescible bounded progress. Keep single-inflight until measurement or
+  managed-worker workloads justify multiplexing; connection state is never
+  task or authority state.
+- [ ] **PLAT-07 — P1: publish the Platform SDK and adapters.** Extract stable
+  wire DTOs/SDK after the protocol passes conformance; map process/context/
+  MCP and future WASI/remote transports into it. A Skill package depends on
+  this contract, but only its executable Tool/Hook/worker is a protocol peer.
+  MCP interoperability and OS identity never replace Core authority.
+- [ ] **PLAT-08 — P2: add local-service transports only after benchmarks.**
+  Implement Windows Named Pipe and Unix Domain Socket for persistent,
+  independently started or reconnectable services, with restrictive ACLs /
+  owner-only socket paths and peer identity checks. Compare CPU, p50/p95
+  latency, throughput and peak memory against the anonymous-pipe backend;
+  do not migrate Platform-owned one-to-one children without evidence.
+
+Dependency order:
+
+```text
+PLAT-00 [done] -> PLAT-01 [done] -> PLAT-02 [done]
+   -> PLAT-03 [partial: a1-a4 + workspace/process/remote-invoke recovery + checkpoint v4 + compaction + in-process session auth + framed inherited-pipe analogue done]
+   -> PLAT-04 [done]
+   -> PLAT-05 -> PLAT-06
+   -> PLAT-07 -> TOOLS-10/11/12 -> AGENT-01/02
+   -> deployment need + transport measurements -> PLAT-08
+   -> M13 closed + M15 evidence -> AGENT-03
+```
+
+- [x] **TOOLS-10** Introduce a bounded, read-only federated resource
+  descriptor/ref contract. Prototype Context + Tool discovery behind current
+  providers before deciding whether one `runtime.search` model surface should
+  replace `context.manage`/`capability.manage` search operations. Depends on
+  the current containment plus bounded Platform envelope/identity rules in
+  `PLAT-00..04`.
+  **Landed 2026-08-14 (Context + Tool prototype).** Shared planner and
+  `ResourceDescriptor` live in `agent-contracts`; `capability.manage search`
+  indexes name/description/owner/state/risk (case-insensitive, residual scan
+  if no token hits) instead of case-sensitive name-contains. Search does not
+  load tools and is `TransientNoPersist`. Decision: no public `runtime.search`
+  yet. Remaining: Artifact/Task/Agent/Skill/Event providers (`TOOLS-11/12`
+  still own lifecycle split and metrics).
+- [ ] **TOOLS-11** Split descriptor/schema lifecycle from invocation/effect
+  lifecycle. Preserve current catalog cooling behavior, add typed invocation
+  states/reasons, and prove an active call cannot be unloaded, cancelled late,
+  or committed after its authority generation changed.
+- [ ] **TOOLS-12** Extend lifecycle metrics with discovery hit/miss reason,
+  schema residency/cold-start cost, invocation wait/run/commit latency,
+  cancellation cleanup, host reuse, and per-task root reasons.
+- [ ] **AGENT-01** Define bounded `AssignmentCard`, `HandoffCard`, child ref,
+  budget/deadline, permission-subset, and event/checkpoint contracts. The main
+  TaskAnchor and CompletionRecord remain parent Runtime authority. Specify
+  only after `PLAT-00..04`; do not invent a separate child-Agent wire.
+- [ ] **AGENT-02** Specify `agent.manage` search/inspect/spawn/send/wait/
+  status/cancel/collect and the managed-child lifecycle. Return bounded
+  summaries plus artifact/evidence refs; never concatenate child transcripts
+  into the parent prompt.
+- [ ] **AGENT-03** Implement only after the remaining sandbox and M15 real
+  evaluation gates: effect-fenced cancellation, scoped context/tool surface,
+  crash/restart reconciliation, parent root transfer, and strict aggregate
+  token/process/time limits.
+- [ ] **EVAL-AGENT-01** Compare one actor versus one actor + bounded children
+  under the same total token/time/tool budget. Require better task success or
+  latency, complete handoff provenance, zero authority escalation/stale
+  effects, and bounded coordinator overhead before enabling by default.
 
 ### Gate 4: extension packaging
 

@@ -7,6 +7,7 @@ name = "agent-capability-process"
 version = "0.1.0"
 dependencies = [
  "agent-contracts",
+ "agent-platform-protocol",
  "agent-process",
  "async-trait",
  "base64",
@@ -39,8 +40,14 @@ dependencies = [
 name = "agent-conformance"
 version = "0.1.0"
 dependencies = [
+ "agent-capability-process",
+ "agent-context-service",
  "agent-contracts",
+ "agent-platform-protocol",
+ "agent-process",
  "agent-workspace",
+ "context-baselines",
+ "context-contextcore",
  "serde_json",
  "tempfile",
  "tokio",
@@ -52,6 +59,7 @@ name = "agent-context-service"
 version = "0.1.0"
 dependencies = [
  "agent-contracts",
+ "agent-platform-protocol",
  "agent-process",
  "context-baselines",
  "context-contextcore",
@@ -66,8 +74,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "ryu",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.19",
  "tokio",
  "uuid",
@@ -100,10 +110,22 @@ dependencies = [
  "context-baselines",
  "context-simple",
  "provider-openai",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tool-runtime",
+]
+
+[[package]]
+name = "agent-platform-protocol"
+version = "0.1.0"
+dependencies = [
+ "agent-contracts",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -111,12 +133,14 @@ name = "agent-process"
 version = "0.1.0"
 dependencies = [
  "agent-contracts",
+ "agent-platform-protocol",
  "async-trait",
  "base64",
  "libc",
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
  "windows-sys 0.59.0",
 ]
 
@@ -125,10 +149,12 @@ name = "agent-replay"
 version = "0.1.0"
 dependencies = [
  "agent-contracts",
+ "agent-workspace",
  "anyhow",
  "context-baselines",
  "context-simple",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -138,6 +164,8 @@ version = "0.1.0"
 dependencies = [
  "agent-contracts",
  "agent-core",
+ "agent-platform-protocol",
+ "agent-storage",
  "agent-workspace",
  "async-trait",
  "context-simple",
@@ -155,7 +183,10 @@ version = "0.1.0"
 dependencies = [
  "agent-contracts",
  "async-trait",
+ "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
 ]
 
@@ -184,10 +215,12 @@ name = "agent-workspace"
 version = "0.1.0"
 dependencies = [
  "agent-contracts",
+ "agent-process",
  "async-trait",
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "uuid",

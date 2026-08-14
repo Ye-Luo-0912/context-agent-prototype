@@ -6,16 +6,22 @@
 //! A future real ContextCore runtime only has to speak the same protocol —
 //! nothing on the agent side changes. The protocol handling lives in
 //! `agent_context_service::handle`; this binary is only the stdio loop.
+//!
+//! The session uses the same bounded frame codec as the `ProcessHost` client,
+//! symmetric in both directions. The implementation lives in the library so
+//! every failure mode can be tested without relying on OS pipe packetization.
 
-use agent_context_service::{build_engine, handle};
+use agent_context_service::{build_engine, serve_session};
 use agent_contracts::ContextEngine;
-use agent_process::PROTOCOL_VERSION;
-use context_contextcore::{ServiceOp, ServiceRequest, ServiceResponse};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use context_contextcore::{
+    DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES, MIN_CONTEXT_SERVICE_MAX_FRAME_BYTES,
+};
+use tokio::io::{BufReader, BufWriter};
 
 fn usage() -> ! {
     eprintln!(
         "usage: agent-context-service --engine <dynamic|append|rolling> [--store-dir <path>]\n\
+         \x20      [--max-frame-bytes <bytes>]\n\
          \n\
          Speaks the context-contextcore wire protocol on stdin/stdout.\n"
     );
@@ -26,6 +32,7 @@ fn usage() -> ! {
 async fn main() {
     let mut engine = None;
     let mut store_dir = None;
+    let mut max_frame_bytes = DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -41,6 +48,12 @@ async fn main() {
                 };
                 store_dir = Some(std::path::PathBuf::from(value));
             }
+            "--max-frame-bytes" => {
+                let Some(value) = args.next() else {
+                    usage();
+                };
+                max_frame_bytes = value.parse().expect("--max-frame-bytes must be a number");
+            }
             other => {
                 eprintln!("unknown argument: {other}");
                 usage();
@@ -48,63 +61,20 @@ async fn main() {
         }
     }
     let engine_name = engine.expect("--engine is required");
+    if !(MIN_CONTEXT_SERVICE_MAX_FRAME_BYTES..=DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES)
+        .contains(&max_frame_bytes)
+    {
+        eprintln!(
+            "--max-frame-bytes must be in {MIN_CONTEXT_SERVICE_MAX_FRAME_BYTES}..={DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES}"
+        );
+        std::process::exit(2);
+    }
     let engine = build_engine(&engine_name, store_dir);
     let engine: &dyn ContextEngine = engine.as_ref();
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdin = BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
     let mut writer = BufWriter::new(stdout);
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let request: ServiceRequest = match serde_json::from_str(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                let response = ServiceResponse::error(0, format!("bad request: {error}"));
-                let _ = writer
-                    .write_all(serde_json::to_string(&response).unwrap().as_bytes())
-                    .await;
-                let _ = writer.write_all(b"\n").await;
-                let _ = writer.flush().await;
-                continue;
-            }
-        };
-        let id = request.id;
-        if request.version != PROTOCOL_VERSION {
-            let response = ServiceResponse::error(
-                id,
-                format!(
-                    "protocol version mismatch: client {}, service {PROTOCOL_VERSION}",
-                    request.version
-                ),
-            );
-            let _ = writer
-                .write_all(serde_json::to_string(&response).unwrap().as_bytes())
-                .await;
-            let _ = writer.write_all(b"\n").await;
-            let _ = writer.flush().await;
-            continue;
-        }
-        let shutdown = matches!(request.op, ServiceOp::Shutdown);
-        let result = handle(request.op, engine).await;
-        let response = match result {
-            Ok(value) => ServiceResponse::ok(id, value),
-            Err(error) => ServiceResponse::error(id, error.to_string()),
-        };
-        if writer
-            .write_all(serde_json::to_string(&response).unwrap().as_bytes())
-            .await
-            .is_err()
-        {
-            break; // client is gone
-        }
-        if writer.write_all(b"\n").await.is_err() {
-            break;
-        }
-        if writer.flush().await.is_err() {
-            break;
-        }
-        if shutdown {
-            break;
-        }
-    }
+    let _ = serve_session(&mut stdin, &mut writer, engine, max_frame_bytes).await;
 }

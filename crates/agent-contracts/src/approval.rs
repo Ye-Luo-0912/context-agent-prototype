@@ -96,9 +96,15 @@ pub enum ShadowVerdict {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorityLease {
     pub lease_id: String,
-    /// Actor-owned operation generation the lease is valid for. The commit
-    /// path validates the supplied lease is current before commit (stale
-    /// generation => rollback, never commit).
+    /// Exact logical operation this authority was minted for. A lease from
+    /// a sibling operation in the same epoch is never interchangeable.
+    pub operation_id: crate::OperationId,
+    /// Digest of the validated semantic arguments approved for that
+    /// operation. This prevents same-name/same-epoch lease substitution.
+    pub argument_digest: crate::ArgumentDigest,
+    /// Core-owned process-lifetime authority epoch the lease is valid for.
+    /// Runtime requests monotonic advances, while Core independently checks
+    /// the current value again before commit (stale epoch => rollback).
     pub operation_generation: u64,
     /// The approved concrete intent (upper bound).
     pub intent: EffectIntent,
@@ -114,8 +120,17 @@ impl AuthorityLease {
     /// the operation generation must match and the lease must not have
     /// expired. This is the commit-time gate — a lease that fails it
     /// rolls the staged effect back instead of committing.
-    pub fn valid_at(&self, now_ms: u64, generation: u64) -> bool {
-        self.operation_generation == generation && now_ms <= self.expires_at_ms
+    pub fn valid_at(
+        &self,
+        now_ms: u64,
+        generation: u64,
+        operation_id: crate::OperationId,
+        argument_digest: crate::ArgumentDigest,
+    ) -> bool {
+        self.operation_generation == generation
+            && self.operation_id == operation_id
+            && self.argument_digest == argument_digest
+            && now_ms <= self.expires_at_ms
     }
 }
 
@@ -142,6 +157,8 @@ mod tests {
     fn authority_lease_round_trips_and_validates_its_window() {
         let lease = AuthorityLease {
             lease_id: "lease-1".into(),
+            operation_id: crate::OperationId::new(),
+            argument_digest: crate::ArgumentDigest::sha256_bytes(b"args"),
             operation_generation: 7,
             intent: EffectIntent::WorkspaceWrite {
                 path: "src/main.rs".into(),
@@ -160,14 +177,15 @@ mod tests {
         assert_eq!(back, lease);
 
         // Current generation, inside the window: authorizes.
-        assert!(lease.valid_at(1_500, 7));
+        assert!(lease.valid_at(1_500, 7, lease.operation_id, lease.argument_digest));
         // Boundary: at the expiry instant the lease still authorizes.
-        assert!(lease.valid_at(2_000, 7));
+        assert!(lease.valid_at(2_000, 7, lease.operation_id, lease.argument_digest));
         // After expiry the lease refuses — commit must roll back.
-        assert!(!lease.valid_at(2_001, 7));
+        assert!(!lease.valid_at(2_001, 7, lease.operation_id, lease.argument_digest));
         // A different operation generation refuses even inside the window.
-        assert!(!lease.valid_at(1_500, 8));
+        assert!(!lease.valid_at(1_500, 8, lease.operation_id, lease.argument_digest));
         // A stale generation after expiry refuses on both axes.
-        assert!(!lease.valid_at(3_000, 9));
+        assert!(!lease.valid_at(3_000, 9, lease.operation_id, lease.argument_digest));
+        assert!(!lease.valid_at(1_500, 7, crate::OperationId::new(), lease.argument_digest));
     }
 }

@@ -114,9 +114,9 @@ fn render_focus(focus: &FocusState) -> String {
 mod tests {
     use super::*;
     use agent_contracts::{
-        AttentionState, ContextItemId, ContextKind, ContextMapView, ContextRef, ContextResidency,
-        ContextRetention, ContextScope, ExternalizedContext, MaterializedContext, MaterializedItem,
-        ModelRole, SemanticState,
+        AccessSignal, AttentionState, ContextItemId, ContextKind, ContextMapView, ContextRef,
+        ContextResidency, ContextRetention, ContextScope, ExternalizedContext, MaterializedContext,
+        MaterializedItem, ModelRole, SemanticState,
     };
 
     fn materialized_with(
@@ -183,6 +183,8 @@ mod tests {
             last_access_turn: 0,
             last_selected_turn: 0,
             access_count: 0,
+            last_access_signal: AccessSignal::None,
+            search_reinforce_count: 0,
             gc_generation: 0,
             evicted_at_tick: None,
         }

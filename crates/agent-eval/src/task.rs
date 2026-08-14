@@ -1,14 +1,13 @@
 //! The eval task: a no-tools constraint-retention workload.
 //!
-//! The provider endpoint used by the live harness (`pinaic`, model
-//! `gpt-5.6-luna`) does not accept a `tools` array on the wire (any request
-//! with tools fails upstream), so the live task cannot be a tool-using
-//! coding task. It is instead a *context-retention* task, which is exactly
-//! the dynamic working set's acceptance scenario: the first turn states
-//! five constraints, several turns of unrelated high-volume noise follow,
-//! and the final turn asks for the constraints. A model can only answer
-//! from what its context frame retained — append-only keeps everything
-//! (and pays for it), the dynamic engine must have kept the facts in view.
+//! Default `agent-eval` still uses an empty tool surface so the comparison
+//! measures context retention only: the first turn states five constraints,
+//! noise turns follow, and the last turn asks for the facts. The 2026-08-10
+//! note that pinaic / `gpt-5.6-luna` rejected any `tools` array was a
+//! misdiagnosis: the relay accepts function calling, but OpenAI-legal names
+//! are `^[a-zA-Z0-9_-]+$`, so Core ids like `fs.list` 400'd.
+//! `provider-openai` now maps `.` / `:` on the wire. Coding live runs belong
+//! on `--fixture-live`, not this task.
 
 pub const CONSTRAINT_TURNS: usize = 20;
 

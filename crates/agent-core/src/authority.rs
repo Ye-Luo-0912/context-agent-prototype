@@ -31,6 +31,10 @@ pub struct EventAuthority {
     journal: Option<Arc<dyn EventJournal>>,
     event_tx: broadcast::Sender<RuntimeEventEnvelope>,
     seq: Arc<AtomicU64>,
+    /// Serializes mint -> journal append -> sequence commit. A rejected
+    /// append must not consume a durable cursor, and another emitter cannot
+    /// reuse the candidate sequence until that outcome is known.
+    emit_gate: tokio::sync::Mutex<()>,
 }
 
 impl EventAuthority {
@@ -43,13 +47,8 @@ impl EventAuthority {
             journal,
             event_tx,
             seq,
+            emit_gate: tokio::sync::Mutex::new(()),
         }
-    }
-
-    /// A live subscriber (the TUI, the eval harness). The broadcast sender
-    /// is unbounded; lagging receivers drop old envelopes.
-    pub fn subscribe(&self) -> broadcast::Receiver<RuntimeEventEnvelope> {
-        self.event_tx.subscribe()
     }
 
     /// The broadcast sender behind `subscribe`, for live event sinks.
@@ -57,19 +56,19 @@ impl EventAuthority {
         self.event_tx.clone()
     }
 
-    /// The shared sequence counter, so live deltas and journaled events
-    /// keep one consistent envelope order.
-    pub fn seq(&self) -> Arc<AtomicU64> {
-        self.seq.clone()
+    /// Current durable journal cursor. This is a read-only snapshot for the
+    /// live model sink: a `ModelDelta` repeats the cursor of its preceding
+    /// `ModelStarted` instead of consuming a journal sequence number.
+    pub fn sequence_cursor(&self) -> u64 {
+        self.seq.load(Ordering::Acquire)
     }
 
-    /// Mint one envelope: the next monotonic sequence for this run and a
-    /// wall-clock timestamp. Sequencing is relaxed (ordering is enforced by
-    /// the caller's await order, not by the counter itself).
-    pub fn envelope(&self, run_id: RunId, event: RuntimeEvent) -> RuntimeEventEnvelope {
+    /// Mint a candidate envelope. The caller commits its sequence only after
+    /// journal append succeeds.
+    fn envelope(&self, run_id: RunId, event: RuntimeEvent) -> RuntimeEventEnvelope {
         RuntimeEventEnvelope {
             run_id,
-            seq: self.seq.fetch_add(1, Ordering::Relaxed) + 1,
+            seq: self.seq.load(Ordering::Acquire) + 1,
             timestamp_ms: now_ms(),
             event,
         }
@@ -78,10 +77,12 @@ impl EventAuthority {
     /// Journal + broadcast one runtime event. A journal failure is surfaced
     /// (the caller fences the turn); a broadcast with no listeners is not.
     pub async fn emit(&self, run_id: RunId, event: RuntimeEvent) -> AgentResult<()> {
+        let _emit = self.emit_gate.lock().await;
         let envelope = self.envelope(run_id, event);
         if let Some(journal) = &self.journal {
             journal.append(&envelope).await?;
         }
+        self.seq.store(envelope.seq, Ordering::Release);
         let _ = self.event_tx.send(envelope);
         Ok(())
     }
@@ -95,10 +96,17 @@ impl EventAuthority {
     /// broadcasts nothing — the caller fences the turn instead of claiming
     /// a commit that never landed.
     pub async fn emit_durable(&self, run_id: RunId, event: RuntimeEvent) -> AgentResult<()> {
+        let _emit = self.emit_gate.lock().await;
         let envelope = self.envelope(run_id, event);
         if let Some(journal) = &self.journal {
             journal.append(&envelope).await?;
+            // The append accepted this cursor. Commit it before the barrier:
+            // if flush fails, retrying the same sequence could duplicate an
+            // already queued/persisted envelope.
+            self.seq.store(envelope.seq, Ordering::Release);
             journal.flush().await?;
+        } else {
+            self.seq.store(envelope.seq, Ordering::Release);
         }
         let _ = self.event_tx.send(envelope);
         Ok(())
@@ -197,8 +205,10 @@ impl ApprovalAuthority {
 /// receipt (`NotApplied` leaves the world unchanged,
 /// `Applied`+`DurabilityFailed` means the effect landed but its record did
 /// not, `Unknown` means the applied state can never be learned back).
-/// Every staged effect of every path — builtin, capability, wire broker —
-/// commits through this one seam.
+/// Every effect that has actually been staged by a trusted in-process path
+/// commits through this one seam. Process-capability `WireEffect`s currently
+/// fail closed before staging; PLAT-03/04 must bind their actual intent to a
+/// recoverable operation/effect identity before that path can use this seam.
 pub struct EffectAuthority;
 
 impl EffectAuthority {
@@ -272,7 +282,7 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingJournal {
-        appended: std::sync::Mutex<Vec<RuntimeEvent>>,
+        appended: std::sync::Mutex<Vec<RuntimeEventEnvelope>>,
         flushed: AtomicUsize,
         fail_append: bool,
     }
@@ -292,7 +302,7 @@ mod tests {
             if self.fail_append {
                 return Err(AgentError::Internal("journal append failed".into()));
             }
-            self.appended.lock().unwrap().push(envelope.event.clone());
+            self.appended.lock().unwrap().push(envelope.clone());
             Ok(())
         }
         async fn flush(&self) -> AgentResult<()> {
@@ -430,9 +440,11 @@ mod tests {
 
         let appended = journal.appended.lock().unwrap();
         assert_eq!(appended.len(), 2);
-        assert!(matches!(appended[0], RuntimeEvent::RunStarted));
-        assert!(matches!(appended[1], RuntimeEvent::TurnCompleted));
-        assert_eq!(authority.seq().load(Ordering::SeqCst), 2);
+        assert!(matches!(appended[0].event, RuntimeEvent::RunStarted));
+        assert!(matches!(appended[1].event, RuntimeEvent::TurnCompleted));
+        assert_eq!(appended[0].seq, 1);
+        assert_eq!(appended[1].seq, 2);
+        assert_eq!(authority.sequence_cursor(), 2);
     }
 
     #[tokio::test]
@@ -471,6 +483,46 @@ mod tests {
                 .is_err(),
             "nothing may be broadcast after a failed barrier"
         );
+    }
+
+    struct FailOnceJournal {
+        failed: std::sync::atomic::AtomicBool,
+        appended: std::sync::Mutex<Vec<RuntimeEventEnvelope>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EventJournal for FailOnceJournal {
+        async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+            if !self.failed.swap(true, Ordering::SeqCst) {
+                return Err(AgentError::Storage("first append rejected".into()));
+            }
+            self.appended.lock().unwrap().push(envelope.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_append_does_not_consume_the_durable_sequence() {
+        let journal = Arc::new(FailOnceJournal {
+            failed: std::sync::atomic::AtomicBool::new(false),
+            appended: std::sync::Mutex::new(Vec::new()),
+        });
+        let (tx, _) = broadcast::channel(16);
+        let seq = Arc::new(AtomicU64::new(0));
+        let authority = EventAuthority::new(Some(journal.clone()), tx, seq);
+        let run = run();
+
+        assert!(authority.emit(run, RuntimeEvent::RunStarted).await.is_err());
+        authority
+            .emit(run, RuntimeEvent::RecoveryRequired)
+            .await
+            .unwrap();
+
+        let appended = journal.appended.lock().unwrap();
+        assert_eq!(appended.len(), 1);
+        assert_eq!(appended[0].seq, 1);
+        assert!(matches!(appended[0].event, RuntimeEvent::RecoveryRequired));
+        assert_eq!(authority.sequence_cursor(), 1);
     }
 
     // --- ApprovalAuthority ---

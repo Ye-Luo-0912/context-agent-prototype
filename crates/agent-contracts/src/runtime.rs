@@ -8,6 +8,37 @@ use crate::{
     OperationId, RunId, ScopeId, TaskId, ToolCall, ToolDispatcher, ToolOutput, TurnId,
 };
 
+/// Why the runtime terminated a turn without committing a model result.
+/// This is a closed, bounded vocabulary so recovery and UI consumers never
+/// infer cancellation semantics from a warning string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCancellationReason {
+    /// An operator/client explicitly requested cancellation.
+    Requested,
+    /// The active model/tool operation itself reported cancellation.
+    OperationCancelled,
+    /// Ordered runtime shutdown cancelled the still-active turn.
+    Shutdown,
+}
+
+/// Durable acknowledgement returned by `RuntimeHandle::cancel_turn`.
+/// `Cancelled` means the turn was fenced and its `TurnCancelled` event passed
+/// the journal barrier. A barrier failure is returned as `RecoveryRequired`
+/// instead of manufacturing this acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TurnCancelAck {
+    NoActiveTurn,
+    Cancelled {
+        turn_id: TurnId,
+        task_id: Option<TaskId>,
+        operation_id: Option<OperationId>,
+        cancelled_generation: u64,
+        effective_generation: u64,
+    },
+}
+
 /// What a long-running operation produced. The actor compares the identity
 /// (run/turn/operation/generation) with the current state and drops results
 /// that belong to a superseded turn instead of letting them race in.

@@ -39,3 +39,6 @@ id_type!(ContextItemId);
 id_type!(ScopeId);
 id_type!(TurnId);
 id_type!(OperationId);
+id_type!(EffectId);
+id_type!(AuthorityJournalId);
+id_type!(RuntimeInputId);

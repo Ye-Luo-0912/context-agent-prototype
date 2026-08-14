@@ -17,14 +17,16 @@ use agent_contracts::{
     ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
     ContextQuery, ContextScope, ContextStateTransition, Effect, EffectDurability, EffectReceipt,
     EventJournal, MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink, ModelMessage,
-    ModelOutput, ModelRequest, ModelRole, ModelTransport, OperationId, RuntimeEvent,
+    ModelOutput, ModelRequest, ModelRole, ModelTransport, OperationId, RunId, RuntimeEvent,
     RuntimeEventEnvelope, ScopeId, ScopeKind, TaskId, ToolCall, ToolDispatcher,
-    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec, TurnCancelAck,
+    TurnCancellationReason,
 };
 
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{
-    CapabilityAwareDispatcher, CapabilityRegistry, RuntimeHandle, RuntimeServices, spawn_runtime,
+    CapabilityAwareDispatcher, CapabilityRegistry, ModuleHost, RuntimeHandle, RuntimeInstance,
+    RuntimeServices, spawn_runtime,
 };
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -140,6 +142,37 @@ impl ModelTransport for HangingModel {
     async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
         request.cancel.cancelled().await;
         Err(agent_contracts::AgentError::Cancelled)
+    }
+}
+
+/// Emits one live-only delta, then stays in-flight until cancellation.
+#[derive(Debug)]
+struct StreamingHangingModel;
+
+#[async_trait::async_trait]
+impl ModelTransport for StreamingHangingModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            streaming: true,
+            ..ModelCapabilities::default()
+        }
+    }
+
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        unreachable!("streaming model should be driven through complete_stream")
+    }
+
+    async fn complete_stream(
+        &self,
+        request: ModelRequest,
+        sink: &dyn ModelEventSink,
+    ) -> AgentResult<ModelOutput> {
+        sink.on_chunk(ModelChunk::TextDelta {
+            delta: "partial".into(),
+        })
+        .await?;
+        request.cancel.cancelled().await;
+        Err(AgentError::Cancelled)
     }
 }
 
@@ -280,17 +313,49 @@ impl ToolDispatcher for OkToolDispatcher {
     }
 }
 
+#[derive(Debug)]
+struct CountingToolDispatcher {
+    executions: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ToolDispatcher for CountingToolDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        OkToolDispatcher.specs()
+    }
+
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        OkToolDispatcher.execute(request).await
+    }
+}
+
 async fn spawn_with(
     model: Arc<dyn ModelTransport>,
     context: Arc<dyn ContextEngine>,
     tools: Arc<dyn ToolDispatcher>,
+) -> RuntimeHandle {
+    spawn_with_approval(
+        model,
+        context,
+        tools,
+        Arc::new(PolicyApprovalGate::read_only()),
+    )
+    .await
+}
+
+async fn spawn_with_approval(
+    model: Arc<dyn ModelTransport>,
+    context: Arc<dyn ContextEngine>,
+    tools: Arc<dyn ToolDispatcher>,
+    approval: Arc<dyn agent_contracts::ApprovalGate>,
 ) -> RuntimeHandle {
     let kernel = Arc::new(RuntimeServices::new(
         CoreAuthorityConfig::default(),
         context,
         model,
         tools,
-        Arc::new(PolicyApprovalGate::read_only()),
+        approval,
         None,
     ));
     let (handle, _task) = spawn_runtime(kernel);
@@ -298,24 +363,54 @@ async fn spawn_with(
     handle
 }
 
+#[derive(Debug, Default)]
+struct SequenceJournal {
+    envelopes: std::sync::Mutex<Vec<RuntimeEventEnvelope>>,
+}
+
+#[async_trait::async_trait]
+impl EventJournal for SequenceJournal {
+    async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+        self.envelopes.lock().unwrap().push(envelope.clone());
+        Ok(())
+    }
+}
+
+async fn spawn_with_journal(
+    model: Arc<dyn ModelTransport>,
+    journal: Arc<dyn EventJournal>,
+) -> RuntimeHandle {
+    let services = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model,
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        Some(journal),
+    ));
+    let (handle, _task) = spawn_runtime(services);
+    handle.start().await.unwrap();
+    handle
+}
+
 #[tokio::test]
 async fn actor_streams_model_deltas_to_subscribers() {
-    let handle = spawn_with(
-        Arc::new(StreamingModel),
-        Arc::new(TestContextEngine),
-        Arc::new(TestToolDispatcher),
-    )
-    .await;
+    let journal = Arc::new(SequenceJournal::default());
+    let handle = spawn_with_journal(Arc::new(StreamingModel), journal.clone()).await;
     let mut events = handle.subscribe();
     handle.user_message("hello".into()).await.unwrap();
 
     let mut deltas = Vec::new();
+    let mut delta_cursors = Vec::new();
+    let mut model_started_cursor = None;
     let mut final_content = None;
     let mut turn_completed = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
+            let cursor = envelope.seq;
             match envelope.event {
+                RuntimeEvent::ModelStarted { .. } => model_started_cursor = Some(cursor),
                 RuntimeEvent::ModelDelta {
                     delta,
                     operation_id,
@@ -325,6 +420,7 @@ async fn actor_streams_model_deltas_to_subscribers() {
                     // the fence identity is present, not defaulted.
                     assert!(operation_id != OperationId::default());
                     deltas.push(delta);
+                    delta_cursors.push(cursor);
                 }
                 RuntimeEvent::AssistantMessage { content } => final_content = Some(content),
                 RuntimeEvent::TurnCompleted => turn_completed = true,
@@ -339,7 +435,90 @@ async fn actor_streams_model_deltas_to_subscribers() {
 
     assert!(turn_completed, "the turn must complete");
     assert_eq!(deltas, vec!["Hello ".to_string(), "world".to_string()]);
+    assert_eq!(
+        delta_cursors,
+        vec![model_started_cursor.unwrap(); 2],
+        "live deltas repeat their opening durable cursor; their operation identity is the fence"
+    );
     assert_eq!(final_content.as_deref(), Some("Hello world"));
+
+    handle.stop().await.unwrap();
+    let durable = journal.envelopes.lock().unwrap();
+    assert!(
+        durable
+            .iter()
+            .all(|envelope| !matches!(envelope.event, RuntimeEvent::ModelDelta { .. })),
+        "streaming deltas are live-only and must never enter the recovery trace"
+    );
+    for (expected, envelope) in (1u64..).zip(durable.iter()) {
+        assert_eq!(
+            envelope.seq, expected,
+            "live-only deltas must not consume durable journal sequence numbers"
+        );
+    }
+    assert!(
+        matches!(
+            durable.last().map(|envelope| &envelope.event),
+            Some(RuntimeEvent::RunCompleted)
+        ),
+        "the contiguous healthy trace must include terminal shutdown"
+    );
+}
+
+#[tokio::test]
+async fn streamed_cancellation_and_shutdown_leave_a_contiguous_recovery_trace() {
+    let journal = Arc::new(SequenceJournal::default());
+    let handle = spawn_with_journal(Arc::new(StreamingHangingModel), journal.clone()).await;
+    let mut events = handle.subscribe();
+    handle
+        .user_message("cancel after streaming".into())
+        .await
+        .unwrap();
+
+    let (model_started_cursor, delta_cursor): (u64, u64) =
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut started = None;
+            loop {
+                let envelope = events.recv().await.unwrap();
+                match envelope.event {
+                    RuntimeEvent::ModelStarted { .. } => started = Some(envelope.seq),
+                    RuntimeEvent::ModelDelta { .. } => {
+                        break (
+                            started.expect("ModelStarted precedes its deltas"),
+                            envelope.seq,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("stream never started");
+
+    handle.cancel_turn().await.unwrap();
+    handle.stop().await.unwrap();
+
+    let durable = journal.envelopes.lock().unwrap();
+    assert_eq!(delta_cursor, model_started_cursor);
+    assert!(
+        durable
+            .iter()
+            .any(|envelope| matches!(envelope.event, RuntimeEvent::TurnCancelled { .. }))
+    );
+    assert!(
+        durable
+            .iter()
+            .any(|envelope| matches!(envelope.event, RuntimeEvent::RunCompleted))
+    );
+    assert!(
+        durable
+            .iter()
+            .all(|envelope| !matches!(envelope.event, RuntimeEvent::TurnCompleted)),
+        "cancellation must not become a successful commit marker"
+    );
+    for (expected, envelope) in (1u64..).zip(durable.iter()) {
+        assert_eq!(envelope.seq, expected);
+    }
 }
 
 /// Returns one plain text answer with a fixed provider usage report.
@@ -414,28 +593,50 @@ async fn actor_cancels_hanging_model_cleanly() {
 
     // Give the model round time to start and block inside the model call.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    handle.cancel_turn().await;
+    let acknowledgement = handle.cancel_turn().await.unwrap();
 
-    let mut saw_cancel_warning = false;
+    let (ack_turn_id, ack_generation) = match acknowledgement {
+        TurnCancelAck::Cancelled {
+            turn_id,
+            effective_generation,
+            ..
+        } => (turn_id, effective_generation),
+        TurnCancelAck::NoActiveTurn => panic!("the hanging turn must still be active"),
+    };
+    let mut cancelled_event = None;
     let mut turn_completed = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
             match envelope.event {
-                RuntimeEvent::Warning { message } if message == "turn cancelled" => {
-                    saw_cancel_warning = true
-                }
+                RuntimeEvent::TurnCancelled {
+                    turn_id,
+                    effective_generation,
+                    reason,
+                    ..
+                } => cancelled_event = Some((turn_id, effective_generation, reason)),
                 RuntimeEvent::TurnCompleted => turn_completed = true,
                 _ => {}
             }
         }
-        if turn_completed && saw_cancel_warning {
+        if cancelled_event.is_some() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(saw_cancel_warning, "expected a turn-cancelled warning");
-    assert!(turn_completed, "UI must return to idle after cancellation");
+    assert_eq!(
+        cancelled_event,
+        Some((
+            ack_turn_id,
+            ack_generation,
+            TurnCancellationReason::Requested
+        )),
+        "the durable event and caller acknowledgement must describe the same cancellation"
+    );
+    assert!(
+        !turn_completed,
+        "cancellation must never masquerade as a successful turn commit"
+    );
 }
 
 #[tokio::test]
@@ -649,6 +850,169 @@ async fn tool_scope_opens_at_tool_start_and_closes_when_consumed() {
     );
 }
 
+#[tokio::test]
+async fn tool_operation_identity_is_published_after_core_admission_before_tool_start() {
+    let handle = spawn_with(
+        Arc::new(TwoRoundToolModel::default()),
+        Arc::new(TestContextEngine),
+        Arc::new(OkToolDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("go".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut accepted = None;
+    let mut accepted_position = None;
+    let mut started_position = None;
+    let mut position = 0_usize;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(envelope) = tokio::time::timeout(Duration::from_millis(50), events.recv()).await {
+            position += 1;
+            match envelope.unwrap().event {
+                RuntimeEvent::OperationAccepted { snapshot } => {
+                    assert!(matches!(
+                        snapshot.state,
+                        agent_contracts::OperationState::Accepted
+                    ));
+                    accepted_position = Some(position);
+                    accepted = Some(snapshot);
+                }
+                RuntimeEvent::ToolStarted { .. } => started_position = Some(position),
+                RuntimeEvent::TurnCompleted => break,
+                _ => {}
+            }
+        }
+    }
+    let snapshot = accepted.expect("tool operation must publish its WAL-backed identity");
+    assert_eq!(snapshot.identity.call_id, "call-1");
+    assert_eq!(snapshot.identity.tool_name, "fs.read");
+    assert!(snapshot.identity.scope_id.is_some());
+    assert!(
+        accepted_position < started_position,
+        "OperationAccepted must precede ToolStarted"
+    );
+    let queried = handle
+        .query_operation(snapshot.identity.operation_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        queried,
+        agent_contracts::OperationQueryResult::Found { snapshot: retained }
+            if retained.identity == snapshot.identity
+    ));
+}
+
+#[derive(Debug, Default)]
+struct FailOperationAcceptedJournal {
+    accepted: std::sync::Mutex<Option<agent_contracts::OperationSnapshot>>,
+    persisted_sequences: std::sync::Mutex<Vec<u64>>,
+}
+
+#[async_trait::async_trait]
+impl EventJournal for FailOperationAcceptedJournal {
+    async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+        if let RuntimeEvent::OperationAccepted { snapshot } = &envelope.event {
+            *self.accepted.lock().unwrap() = Some((**snapshot).clone());
+            return Err(AgentError::Storage(
+                "simulated operation-accepted journal failure".into(),
+            ));
+        }
+        self.persisted_sequences.lock().unwrap().push(envelope.seq);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn operation_accepted_audit_failure_closes_scope_without_dispatch() {
+    let context = Arc::new(ScopeRecordingEngine::default());
+    let executions = Arc::new(AtomicUsize::new(0));
+    let journal = Arc::new(FailOperationAcceptedJournal::default());
+    let services = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        context.clone(),
+        Arc::new(TwoRoundToolModel::default()),
+        Arc::new(CountingToolDispatcher {
+            executions: executions.clone(),
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        Some(journal.clone()),
+    ));
+    let (handle, _task) = spawn_runtime(services);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle.user_message("go".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_failure = false;
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if matches!(
+                envelope.event,
+                RuntimeEvent::Error { ref message }
+                    if message.contains("simulated operation-accepted journal failure")
+            ) {
+                saw_failure = true;
+            }
+        }
+        if saw_failure && !context.closes.lock().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        saw_failure,
+        "the failed discovery event must remain observable"
+    );
+    let opens = context.opens.lock().await;
+    assert_eq!(opens.len(), 1, "one attempted tool must open one scope");
+    let tool_scope = opens[0].1;
+    drop(opens);
+    assert_eq!(
+        context.closes.lock().await.as_slice(),
+        &[tool_scope],
+        "the admitted-but-undispatched tool scope must be closed"
+    );
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "dropping the one-shot permit must prevent tool dispatch"
+    );
+
+    let accepted = journal
+        .accepted
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the failing journal must observe the admitted snapshot");
+    let query = handle
+        .query_operation(accepted.identity.operation_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        query,
+        agent_contracts::OperationQueryResult::Found { snapshot }
+            if matches!(
+                snapshot.state,
+                agent_contracts::OperationState::Terminal {
+                    terminal: agent_contracts::OperationTerminal::CancelledBeforeCommit,
+                    ..
+                }
+            )
+    ));
+    assert!(matches!(
+        handle.user_message("must remain fenced".into()).await,
+        Err(AgentError::RecoveryRequired(_))
+    ));
+    let persisted = journal.persisted_sequences.lock().unwrap();
+    assert_eq!(
+        persisted.as_slice(),
+        &(1..=u64::try_from(persisted.len()).unwrap()).collect::<Vec<_>>(),
+        "a rejected event append must not leave a durable sequence gap"
+    );
+}
+
 /// A context engine that records the scopes the actor closes and returns a
 /// fixed promotion transition from `close_scope`, so the test can assert
 /// that the runtime publishes the close as an auditable event instead of
@@ -742,6 +1106,54 @@ impl ContextEngine for FailingCloseScopeEngine {
     }
     async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
         Err(AgentError::Context("simulated close failure".into()))
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
+    }
+}
+
+/// A context engine that never completes tool-scope closure. Cancellation
+/// must bound this untrusted/replaceable engine call instead of holding the
+/// actor and its cancellation acknowledgement forever.
+#[derive(Debug, Default)]
+struct HangingCloseScopeEngine;
+
+#[async_trait::async_trait]
+impl ContextEngine for HangingCloseScopeEngine {
+    async fn ingest(&self, _ingress: ContextIngress) -> AgentResult<()> {
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            materialization_id: 0,
+            focus: None,
+            items: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
+            selected: Vec::new(),
+            approx_tokens: 0,
+            diagnostics: ContextDiagnostics::default(),
+        })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        std::future::pending().await
     }
     async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
         Ok(ContextDiagnostics::default())
@@ -1436,7 +1848,7 @@ impl agent_contracts::Effect for FlagEffect {
     }
 }
 
-/// A dispatcher whose (read-only) tool stages a `FlagEffect` instead of
+/// A dispatcher whose mutating tool stages a `FlagEffect` instead of
 /// returning a plain value. `release` lets a test hold the execution open.
 struct EffectToolDispatcher {
     committed: Arc<AtomicUsize>,
@@ -1451,7 +1863,7 @@ impl ToolDispatcher for EffectToolDispatcher {
             name: "fs.read".into(),
             description: "stages an effect".into(),
             input_schema: json!({"type": "object"}),
-            risk: agent_contracts::ToolRisk::ReadOnly,
+            risk: agent_contracts::ToolRisk::WorkspaceWrite,
             output_budget: None,
         }]
     }
@@ -1481,7 +1893,7 @@ impl ToolDispatcher for EffectToolDispatcher {
 async fn committed_effect_lands_after_the_generation_fence() {
     let committed = Arc::new(AtomicUsize::new(0));
     let rolled_back = Arc::new(AtomicUsize::new(0));
-    let handle = spawn_with(
+    let handle = spawn_with_approval(
         Arc::new(TwoRoundToolModel::default()),
         Arc::new(TestContextEngine),
         Arc::new(EffectToolDispatcher {
@@ -1489,6 +1901,7 @@ async fn committed_effect_lands_after_the_generation_fence() {
             rolled_back: rolled_back.clone(),
             release: None,
         }),
+        Arc::new(PolicyApprovalGate::permissive()),
     )
     .await;
     let mut events = handle.subscribe();
@@ -1516,7 +1929,7 @@ async fn stale_tool_rolls_back_its_prepared_effect() {
     let committed = Arc::new(AtomicUsize::new(0));
     let rolled_back = Arc::new(AtomicUsize::new(0));
     let release = Arc::new(tokio::sync::Notify::new());
-    let handle = spawn_with(
+    let handle = spawn_with_approval(
         Arc::new(TwoRoundToolModel::default()),
         Arc::new(TestContextEngine),
         Arc::new(EffectToolDispatcher {
@@ -1524,13 +1937,14 @@ async fn stale_tool_rolls_back_its_prepared_effect() {
             rolled_back: rolled_back.clone(),
             release: Some(release.clone()),
         }),
+        Arc::new(PolicyApprovalGate::permissive()),
     )
     .await;
     handle.user_message("go".into()).await.unwrap();
 
     // Give the tool operation time to start and block inside execute.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    handle.cancel_turn().await;
+    handle.cancel_turn().await.unwrap();
 
     // The tool finishes after the cancel: the generation fence has moved, so
     // the actor must roll the prepared effect back instead of committing it.
@@ -1549,6 +1963,105 @@ async fn stale_tool_rolls_back_its_prepared_effect() {
         0,
         "stale effect must never commit"
     );
+}
+
+#[tokio::test]
+async fn stop_drains_a_cancelled_tool_before_dropping_its_prepared_effect() {
+    let committed = Arc::new(AtomicUsize::new(0));
+    let rolled_back = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handle = spawn_with_approval(
+        Arc::new(TwoRoundToolModel::default()),
+        Arc::new(TestContextEngine),
+        Arc::new(EffectToolDispatcher {
+            committed: committed.clone(),
+            rolled_back: rolled_back.clone(),
+            release: Some(release.clone()),
+        }),
+        Arc::new(PolicyApprovalGate::permissive()),
+    )
+    .await;
+    handle.user_message("go".into()).await.unwrap();
+
+    // Cancellation durably fences the operation but deliberately does not
+    // wait for arbitrary tool code. The following Stop must remember that
+    // pending cleanup and keep consuming operation completions.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.cancel_turn().await.unwrap();
+    let stop_handle = handle.clone();
+    let stop = tokio::spawn(async move { stop_handle.stop().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !stop.is_finished(),
+        "Stop must wait for the cancelled tool's explicit cleanup result"
+    );
+
+    // The tool returns a PreparedEffect only after cancellation. The actor
+    // must route that late completion through the stale rollback path before
+    // ending the run, rather than dropping the boxed effect with the channel.
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), stop)
+        .await
+        .expect("Stop must finish once the cancelled tool returns")
+        .expect("the actor task must not panic")
+        .expect("shutdown cleanup must succeed");
+    assert_eq!(rolled_back.load(Ordering::SeqCst), 1);
+    assert_eq!(committed.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cancellation_bounds_a_hanging_tool_scope_close_and_fences_mutation() {
+    let committed = Arc::new(AtomicUsize::new(0));
+    let rolled_back = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handle = spawn_with_approval(
+        Arc::new(TwoRoundToolModel::default()),
+        Arc::new(HangingCloseScopeEngine),
+        Arc::new(EffectToolDispatcher {
+            committed: committed.clone(),
+            rolled_back: rolled_back.clone(),
+            release: Some(release.clone()),
+        }),
+        Arc::new(PolicyApprovalGate::permissive()),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("go".into()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let error = tokio::time::timeout(Duration::from_secs(4), handle.cancel_turn())
+        .await
+        .expect("a replaceable context engine cannot block cancellation forever")
+        .expect_err("a timed-out scope close must not acknowledge cancellation as durable");
+    assert!(matches!(error, AgentError::RecoveryRequired(_)));
+    let mutation_error = handle
+        .user_message("must wait for recovery".into())
+        .await
+        .expect_err("scope cleanup uncertainty must fence later mutation");
+    assert!(matches!(mutation_error, AgentError::RecoveryRequired(_)));
+
+    let mut saw_recovery = false;
+    while let Ok(envelope) = events.try_recv() {
+        saw_recovery |= matches!(envelope.event, RuntimeEvent::RecoveryRequired);
+    }
+    assert!(
+        saw_recovery,
+        "the bounded cleanup failure must be observable"
+    );
+
+    // Release the still-running tool so its late PreparedEffect is explicitly
+    // rolled back; Stop then has no unresolved operation to abandon.
+    release.notify_one();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while rolled_back.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the late prepared effect was not rolled back"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(committed.load(Ordering::SeqCst), 0);
+    handle.stop().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,13 +2090,13 @@ impl StagingCapability {
                 summary: "stages an effect".into(),
                 status: CapabilityStatus::Experimental,
                 provides: vec![agent_contracts::CapabilityKind::Tool],
-                permissions: Vec::new(),
+                permissions: vec!["workspace:write".into()],
                 requires: Vec::new(),
                 tools: vec![ToolSpec {
                     name: "cap.stage".into(),
                     description: "stages an effect".into(),
                     input_schema: json!({"type": "object"}),
-                    risk: ToolRisk::ReadOnly,
+                    risk: ToolRisk::WorkspaceWrite,
                     output_budget: None,
                 }],
                 lifecycle: CapabilityLifecycle::Lazy,
@@ -1677,10 +2190,11 @@ async fn spawn_with_staging_capability(capability: StagingCapability) -> Runtime
         Arc::new(TestToolDispatcher),
         registry,
     ));
-    spawn_with(
+    spawn_with_approval(
         Arc::new(CapabilityToolModel::default()),
         Arc::new(TestContextEngine),
         dispatcher,
+        Arc::new(PolicyApprovalGate::permissive()),
     )
     .await
 }
@@ -1734,7 +2248,7 @@ async fn stale_capability_effect_rolls_back() {
 
     // Give the capability invocation time to start and block inside invoke.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    handle.cancel_turn().await;
+    handle.cancel_turn().await.unwrap();
 
     // The capability finishes after the cancel: the generation fence has
     // moved, so the actor must roll its staged effect back — a cancelled
@@ -1757,36 +2271,45 @@ async fn stale_capability_effect_rolls_back() {
 }
 
 // ---------------------------------------------------------------------------
-// Commit failure classification: `NotApplied` tells the model nothing
-// happened; `AppliedButDurabilityFailed` tells it the world DID change but
-// the record did not — a degraded/recovery state, never a silent swallow.
+// Commit receipt classification: `NotApplied` tells the model nothing
+// happened; durability failure and `Unknown` fence later mutation because
+// the world cannot safely be used as the base for more work.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-enum CommitFailure {
+enum CommitResult {
+    Durable,
     NotApplied,
     AppliedButDurabilityFailed,
+    Unknown,
 }
 
-/// An effect whose commit always fails with the given structured error.
-struct FailingEffect {
-    failure: CommitFailure,
+/// An effect that returns the selected structured receipt.
+struct ReceiptEffect {
+    result: CommitResult,
     rolled_back: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
-impl Effect for FailingEffect {
+impl Effect for ReceiptEffect {
     fn describe(&self) -> String {
-        "failing test effect".into()
+        "receipt test effect".into()
     }
     async fn commit(self: Box<Self>) -> EffectReceipt {
-        match self.failure {
-            CommitFailure::NotApplied => EffectReceipt::NotApplied {
+        match self.result {
+            CommitResult::Durable => EffectReceipt::Applied {
+                durability: EffectDurability::Durable,
+                evidence: Some("durable-test-effect".into()),
+            },
+            CommitResult::NotApplied => EffectReceipt::NotApplied {
                 error: "simulated disk failure".into(),
             },
-            CommitFailure::AppliedButDurabilityFailed => EffectReceipt::Applied {
+            CommitResult::AppliedButDurabilityFailed => EffectReceipt::Applied {
                 durability: EffectDurability::DurabilityFailed("simulated journal failure".into()),
                 evidence: None,
+            },
+            CommitResult::Unknown => EffectReceipt::Unknown {
+                error: "simulated remote timeout".into(),
             },
         }
     }
@@ -1795,24 +2318,28 @@ impl Effect for FailingEffect {
     }
 }
 
-/// A dispatcher whose (read-only) tool stages a `FailingEffect`.
-struct FailingEffectDispatcher {
-    failure: CommitFailure,
+/// A dispatcher whose mutating tool stages a `ReceiptEffect`.
+struct ReceiptEffectDispatcher {
+    result: CommitResult,
     rolled_back: Arc<AtomicUsize>,
+    execute_count: Option<Arc<AtomicUsize>>,
 }
 
 #[async_trait::async_trait]
-impl ToolDispatcher for FailingEffectDispatcher {
+impl ToolDispatcher for ReceiptEffectDispatcher {
     fn specs(&self) -> Vec<ToolSpec> {
         vec![ToolSpec {
             name: "fs.read".into(),
             description: "stages a failing effect".into(),
             input_schema: json!({"type": "object"}),
-            risk: ToolRisk::ReadOnly,
+            risk: ToolRisk::WorkspaceWrite,
             output_budget: None,
         }]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        if let Some(count) = &self.execute_count {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(ToolOutcome::PreparedEffect {
             output: ToolOutput {
                 call_id: request.call.id,
@@ -1823,8 +2350,8 @@ impl ToolDispatcher for FailingEffectDispatcher {
                 artifact_ref: None,
                 metadata: json!({}),
             },
-            effect: Box::new(FailingEffect {
-                failure: self.failure,
+            effect: Box::new(ReceiptEffect {
+                result: self.result,
                 rolled_back: self.rolled_back.clone(),
             }),
         })
@@ -1832,16 +2359,20 @@ impl ToolDispatcher for FailingEffectDispatcher {
 }
 
 /// Wait for the tool's finished output (the model-visible result) and the
-/// turn completion, returning the finished output.
-async fn run_failing_effect_turn(failure: CommitFailure) -> (ToolOutput, Vec<String>) {
+/// turn completion, returning the handle and observed recovery signal.
+async fn run_effect_receipt_turn(
+    result: CommitResult,
+) -> (RuntimeHandle, ToolOutput, Vec<String>, bool) {
     let rolled_back = Arc::new(AtomicUsize::new(0));
-    let handle = spawn_with(
+    let handle = spawn_with_approval(
         Arc::new(TwoRoundToolModel::default()),
         Arc::new(TestContextEngine),
-        Arc::new(FailingEffectDispatcher {
-            failure,
+        Arc::new(ReceiptEffectDispatcher {
+            result,
             rolled_back: rolled_back.clone(),
+            execute_count: None,
         }),
+        Arc::new(PolicyApprovalGate::permissive()),
     )
     .await;
     let mut events = handle.subscribe();
@@ -1850,12 +2381,14 @@ async fn run_failing_effect_turn(failure: CommitFailure) -> (ToolOutput, Vec<Str
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let mut finished = None;
     let mut warnings = Vec::new();
+    let mut recovery_required = false;
     let mut completed = false;
     while tokio::time::Instant::now() < deadline {
         while let Ok(envelope) = events.try_recv() {
             match envelope.event {
                 RuntimeEvent::ToolFinished { output } => finished = Some(output),
                 RuntimeEvent::Warning { message } => warnings.push(message),
+                RuntimeEvent::RecoveryRequired => recovery_required = true,
                 RuntimeEvent::TurnCompleted => completed = true,
                 _ => {}
             }
@@ -1869,14 +2402,40 @@ async fn run_failing_effect_turn(failure: CommitFailure) -> (ToolOutput, Vec<Str
     assert_eq!(
         rolled_back.load(Ordering::SeqCst),
         0,
-        "a failed commit is not a stale operation; nothing to roll back"
+        "a current-generation commit receipt must not enter the stale rollback path"
     );
-    (finished.expect("the tool must finish"), warnings)
+    (
+        handle,
+        finished.expect("the tool must finish"),
+        warnings,
+        recovery_required,
+    )
+}
+
+async fn assert_normal_mutation_is_fenced(handle: &RuntimeHandle) {
+    let next_message = handle
+        .user_message("must wait for recovery".into())
+        .await
+        .expect_err("an uncertain effect result must fence the next user turn");
+    assert!(
+        matches!(next_message, AgentError::RecoveryRequired(_)),
+        "the next user message must require recovery: {next_message}"
+    );
+
+    let next_task_mutation = handle
+        .set_focus("must also wait for recovery".into())
+        .await
+        .expect_err("an uncertain effect result must fence task mutation");
+    assert!(
+        matches!(next_task_mutation, AgentError::RecoveryRequired(_)),
+        "task mutation must require recovery: {next_task_mutation}"
+    );
 }
 
 #[tokio::test]
 async fn not_applied_commit_failure_reports_nothing_happened() {
-    let (finished, _) = run_failing_effect_turn(CommitFailure::NotApplied).await;
+    let (handle, finished, _, recovery_required) =
+        run_effect_receipt_turn(CommitResult::NotApplied).await;
     assert!(
         !finished.ok,
         "the failed effect must surface as a failed result"
@@ -1886,12 +2445,21 @@ async fn not_applied_commit_failure_reports_nothing_happened() {
         "the model must be told nothing happened, got: {}",
         finished.model_content
     );
+    assert!(
+        !recovery_required,
+        "a definite NotApplied receipt must not poison the runtime"
+    );
+    handle
+        .set_focus("ordinary work may continue".into())
+        .await
+        .expect("NotApplied leaves a safe base for task mutation");
+    handle.stop().await.unwrap();
 }
 
 #[tokio::test]
 async fn applied_but_durability_failure_surfaces_a_recovery_state() {
-    let (finished, warnings) =
-        run_failing_effect_turn(CommitFailure::AppliedButDurabilityFailed).await;
+    let (handle, finished, warnings, recovery_required) =
+        run_effect_receipt_turn(CommitResult::AppliedButDurabilityFailed).await;
     assert!(
         !finished.ok,
         "the durability failure must surface as a failed result"
@@ -1904,9 +2472,142 @@ async fn applied_but_durability_failure_surfaces_a_recovery_state() {
     assert!(
         warnings
             .iter()
-            .any(|message| message.contains("applied but its journal record failed")),
+            .any(|message| message.contains("applied but recovery is required")),
         "the runtime must surface a degraded/recovery warning, got: {warnings:?}"
     );
+    assert!(
+        recovery_required,
+        "the runtime must publish its recovery-required state"
+    );
+    assert_normal_mutation_is_fenced(&handle).await;
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn unknown_effect_state_surfaces_truth_and_fences_later_mutation() {
+    let (handle, finished, warnings, recovery_required) =
+        run_effect_receipt_turn(CommitResult::Unknown).await;
+    assert!(!finished.ok, "an unknown applied state is not success");
+    assert!(
+        finished
+            .model_content
+            .contains("may or may not have been applied"),
+        "the model must receive the uncertain world state: {}",
+        finished.model_content
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|message| message.contains("effect applied state unknown")),
+        "the runtime must surface an unknown-state warning, got: {warnings:?}"
+    );
+    assert!(recovery_required, "unknown state must demand recovery");
+    assert_normal_mutation_is_fenced(&handle).await;
+    handle.stop().await.unwrap();
+}
+
+#[derive(Debug, Default)]
+struct RetryAfterUnknownModel {
+    rounds: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for RetryAfterUnknownModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let tool_calls = match round {
+            0 => vec![ToolCall {
+                id: "uncertain".into(),
+                name: "fs.read".into(),
+                arguments: json!({"path": "x"}),
+            }],
+            1 => vec![ToolCall {
+                id: "must-be-refused".into(),
+                name: "fs.read".into(),
+                arguments: json!({"path": "y"}),
+            }],
+            _ => Vec::new(),
+        };
+        Ok(ModelOutput {
+            content: if tool_calls.is_empty() {
+                "stopped after recovery refusal".into()
+            } else {
+                String::new()
+            },
+            tool_calls,
+            usage: Default::default(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn recovery_state_refuses_another_tool_in_the_same_turn() {
+    let execute_count = Arc::new(AtomicUsize::new(0));
+    let handle = spawn_with_approval(
+        Arc::new(RetryAfterUnknownModel::default()),
+        Arc::new(TestContextEngine),
+        Arc::new(ReceiptEffectDispatcher {
+            result: CommitResult::Unknown,
+            rolled_back: Arc::new(AtomicUsize::new(0)),
+            execute_count: Some(execute_count.clone()),
+        }),
+        Arc::new(PolicyApprovalGate::permissive()),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("go".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut refused = None;
+    let mut completed = false;
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::ToolFinished { output } if output.call_id == "must-be-refused" => {
+                    refused = Some(output)
+                }
+                RuntimeEvent::TurnCompleted => completed = true,
+                _ => {}
+            }
+        }
+        if completed && refused.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let refused = refused.expect("the second call must receive a typed refusal");
+    assert!(!refused.ok);
+    assert_eq!(refused.metadata["executed"], false);
+    assert_eq!(refused.metadata["code"], "runtime.recovery_required");
+    assert_eq!(
+        execute_count.load(Ordering::SeqCst),
+        1,
+        "only the first uncertain effect may reach the dispatcher"
+    );
+    assert!(completed, "the model must still be able to close the turn");
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn durable_effect_success_does_not_fence_later_mutation() {
+    let (handle, finished, warnings, recovery_required) =
+        run_effect_receipt_turn(CommitResult::Durable).await;
+    assert!(finished.ok, "a durable commit keeps the successful output");
+    assert!(warnings.is_empty(), "durable success needs no warning");
+    assert!(
+        !recovery_required,
+        "durable success must not demand recovery"
+    );
+    handle
+        .set_focus("ordinary work may continue".into())
+        .await
+        .expect("durable success leaves task mutation enabled");
+    handle.stop().await.unwrap();
 }
 
 /// A context engine whose `AssistantMessage` ingest always fails: the
@@ -2028,6 +2729,15 @@ async fn failed_turn_commit_emits_turn_commit_failed_and_recovery_required() {
     assert!(
         !turn_completed,
         "a turn whose commit failed must never emit TurnCompleted"
+    );
+
+    let next = handle
+        .user_message("must not run before recovery".into())
+        .await
+        .expect_err("a failed mandatory turn commit must fence later mutation");
+    assert!(
+        matches!(next, agent_contracts::AgentError::RecoveryRequired(_)),
+        "the runtime must require a known-good restore after a failed turn commit: {next}"
     );
 }
 
@@ -2394,7 +3104,7 @@ impl ModelTransport for CompletionProposalModel {
                 tool_calls: vec![ToolCall {
                     id: "call-1".into(),
                     name: "task.complete".into(),
-                    arguments: json!({"summary": self.summary, "artifacts": ["artifact://.focus-agent/artifacts/r1/out.txt"]}),
+                    arguments: json!({"summary": self.summary, "artifacts": []}),
                 }],
                 usage: Default::default(),
             })
@@ -2411,7 +3121,9 @@ impl ModelTransport for CompletionProposalModel {
 /// Serves `task.complete` by attaching the typed completion directive,
 /// exactly like the real tool.
 #[derive(Debug)]
-struct CompletionToolDispatcher;
+struct CompletionToolDispatcher {
+    workspace: Option<agent_workspace::Workspace>,
+}
 
 #[async_trait::async_trait]
 impl ToolDispatcher for CompletionToolDispatcher {
@@ -2429,7 +3141,7 @@ impl ToolDispatcher for CompletionToolDispatcher {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        let artifacts: Vec<String> = request.call.arguments["artifacts"]
+        let mut artifacts: Vec<String> = request.call.arguments["artifacts"]
             .as_array()
             .map(|items| {
                 items
@@ -2438,6 +3150,13 @@ impl ToolDispatcher for CompletionToolDispatcher {
                     .collect()
             })
             .unwrap_or_default();
+        if let Some(workspace) = &self.workspace {
+            artifacts.push(
+                workspace
+                    .write_artifact(request.run_id, "completion", "txt", b"completion evidence")
+                    .await?,
+            );
+        }
         Ok(ToolOutcome::RuntimeDirective {
             output: ToolOutput {
                 call_id: request.call.id,
@@ -2457,15 +3176,24 @@ impl ToolDispatcher for CompletionToolDispatcher {
 
 #[tokio::test]
 async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
-    let handle = spawn_with(
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
         Arc::new(CompletionProposalModel {
             summary: "the task is done",
             rounds: AtomicUsize::new(0),
         }),
-        Arc::new(TestContextEngine),
-        Arc::new(CompletionToolDispatcher),
+        Arc::new(CompletionToolDispatcher {
+            workspace: Some((*workspace).clone()),
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
     )
-    .await;
+    .with_artifact_workspace(workspace);
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
     let mut events = handle.subscribe();
     handle.start().await.unwrap();
     handle.user_message("finish the work".into()).await.unwrap();
@@ -2498,7 +3226,7 @@ async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
 
     // The typed record is durable in the checkpoint, with the proposal's
     // artifact ref attached — the CTX-10 transaction end to end.
-    let checkpoint = handle.checkpoint().await.unwrap();
+    let checkpoint = instance.checkpoint().await.unwrap();
     let record = checkpoint
         .tasks
         .completed
@@ -2507,15 +3235,24 @@ async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
         .expect("a completed task owns exactly one CompletionRecord");
     assert_eq!(record.anchor_revision, anchor_revision);
     assert_eq!(record.summary, "the task is done");
-    assert_eq!(
-        record.artifacts,
-        vec!["artifact://.focus-agent/artifacts/r1/out.txt"]
+    assert_eq!(record.artifacts.len(), 2);
+    assert!(
+        record
+            .artifacts
+            .iter()
+            .any(|reference| reference.contains("/completion/"))
+    );
+    assert!(
+        record
+            .artifacts
+            .iter()
+            .any(|reference| reference.contains("/assistant-response/"))
     );
     assert!(
         record.final_output_digest.is_some(),
         "the final output digest must be retained"
     );
-    handle.stop().await.unwrap();
+    instance.shutdown().await.unwrap();
 }
 // ---------------------------------------------------------------------------
 
@@ -2560,34 +3297,44 @@ async fn final_assistant_response_is_persisted_in_full_before_contextitem_trunca
     // Far beyond the default ContextItem cap (16,000 chars): only an
     // untruncated artifact preserves the raw output.
     let content_len = 40_000;
-    let mut services = Arc::new(RuntimeServices::new(
+    let services = RuntimeServices::new(
         CoreAuthorityConfig::default(),
         Arc::new(TestContextEngine),
         Arc::new(LongResponseModel(content_len)),
         Arc::new(TestToolDispatcher),
         Arc::new(PolicyApprovalGate::read_only()),
         None,
-    ));
-    Arc::get_mut(&mut services).unwrap().artifact_workspace = Some(workspace.clone());
-    let (handle, _task) = spawn_runtime(services);
+    )
+    .with_artifact_workspace(workspace.clone());
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
     handle.start().await.unwrap();
+    let mut events = handle.subscribe();
     handle
         .user_message("write the report".into())
         .await
         .unwrap();
 
-    // Wait until the assistant-response artifact appears (one per final
-    // response) and read it back.
-    let artifacts_dir = workspace.state_dir().join("artifacts");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut artifacts: Vec<std::path::PathBuf> = Vec::new();
-    while tokio::time::Instant::now() < deadline {
-        artifacts = collect_txt_files(&artifacts_dir);
-        if !artifacts.is_empty() {
-            break;
+    // The file is created before it is populated, so path existence is not
+    // a publication barrier. `TurnCompleted` is emitted only after the
+    // pinned artifact handle has been fully written and flushed.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(envelope) if matches!(envelope.event, RuntimeEvent::TurnCompleted) => break,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("runtime event stream closed before TurnCompleted")
+                }
+            }
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    })
+    .await
+    .expect("the turn must complete before reading its raw evidence");
+
+    // Read the single published assistant-response artifact back.
+    let artifacts_dir = workspace.state_dir().join("artifacts");
+    let artifacts = collect_txt_files(&artifacts_dir);
     assert_eq!(
         artifacts.len(),
         1,
@@ -2608,7 +3355,11 @@ fn collect_txt_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 out.extend(collect_txt_files(&path));
-            } else if path.extension().is_some_and(|ext| ext == "txt") {
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !name.starts_with('.'))
+            {
                 out.push(path);
             }
         }
@@ -2662,19 +3413,20 @@ async fn completion_record_attaches_the_raw_final_response_artifact() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
     let content_len = 40_000;
-    let mut services = Arc::new(RuntimeServices::new(
+    let services = RuntimeServices::new(
         CoreAuthorityConfig::default(),
         Arc::new(TestContextEngine),
         Arc::new(CompletingLongModel {
             rounds: AtomicUsize::new(0),
             content_len,
         }),
-        Arc::new(CompletionToolDispatcher),
+        Arc::new(CompletionToolDispatcher { workspace: None }),
         Arc::new(PolicyApprovalGate::read_only()),
         None,
-    ));
-    Arc::get_mut(&mut services).unwrap().artifact_workspace = Some(workspace.clone());
-    let (handle, _task) = spawn_runtime(services);
+    )
+    .with_artifact_workspace(workspace.clone());
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
     handle.start().await.unwrap();
     handle.user_message("finish the work".into()).await.unwrap();
 
@@ -2700,7 +3452,7 @@ async fn completion_record_attaches_the_raw_final_response_artifact() {
 
     // The CompletionRecord carries exactly one raw-evidence ref, naming the
     // assistant-response artifact.
-    let checkpoint = handle.checkpoint().await.unwrap();
+    let checkpoint = instance.checkpoint().await.unwrap();
     let record = checkpoint
         .tasks
         .completed
@@ -2737,5 +3489,345 @@ async fn completion_record_attaches_the_raw_final_response_artifact() {
             || raw_refs[0].contains("assistant-response"),
         "the attached ref must name the assistant-response artifact"
     );
-    handle.stop().await.unwrap();
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn completion_proposal_cannot_attach_a_cross_run_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    let foreign_ref = workspace
+        .write_artifact(RunId::new(), "foreign", "txt", b"foreign evidence")
+        .await
+        .unwrap();
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(CompletionProposalModel {
+            summary: "must not commit",
+            rounds: AtomicUsize::new(0),
+        }),
+        Arc::new(FixedCompletionToolDispatcher {
+            artifact: foreign_ref,
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    )
+    .with_artifact_workspace(workspace);
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
+    handle.start().await.unwrap();
+    handle.user_message("finish".into()).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert!(
+        checkpoint.tasks.completed.is_empty(),
+        "a foreign-run evidence ref must not enter a CompletionRecord"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[derive(Debug)]
+struct FixedCompletionToolDispatcher {
+    artifact: String,
+}
+
+#[async_trait::async_trait]
+impl ToolDispatcher for FixedCompletionToolDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        CompletionToolDispatcher { workspace: None }.specs()
+    }
+
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        let summary = request.call.arguments["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        Ok(ToolOutcome::RuntimeDirective {
+            output: ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "completion proposed".into(),
+                model_content: "completion proposed".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            directive: agent_contracts::RuntimeDirective::CompleteTask(
+                agent_contracts::CompletionProposal {
+                    summary,
+                    artifacts: vec![self.artifact.clone()],
+                },
+            ),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct BulkCompletionToolDispatcher {
+    workspace: agent_workspace::Workspace,
+    unique_artifacts: usize,
+    duplicate_first: bool,
+}
+
+#[async_trait::async_trait]
+impl ToolDispatcher for BulkCompletionToolDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        CompletionToolDispatcher { workspace: None }.specs()
+    }
+
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        let mut artifacts = Vec::new();
+        for index in 0..self.unique_artifacts {
+            artifacts.push(
+                self.workspace
+                    .write_artifact(
+                        request.run_id,
+                        &format!("proposal-{index:02}"),
+                        "txt",
+                        format!("evidence {index}").as_bytes(),
+                    )
+                    .await?,
+            );
+        }
+        if self.duplicate_first && !artifacts.is_empty() {
+            artifacts.insert(1, artifacts[0].clone());
+        }
+        Ok(ToolOutcome::RuntimeDirective {
+            output: ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "completion proposed".into(),
+                model_content: "completion proposed".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            directive: agent_contracts::RuntimeDirective::CompleteTask(
+                agent_contracts::CompletionProposal {
+                    summary: "complete with evidence".into(),
+                    artifacts,
+                },
+            ),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct DirectoryCompletionToolDispatcher {
+    workspace: agent_workspace::Workspace,
+}
+
+#[async_trait::async_trait]
+impl ToolDispatcher for DirectoryCompletionToolDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        CompletionToolDispatcher { workspace: None }.specs()
+    }
+
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        // Materialize the run directory, then try to smuggle that directory
+        // into the proposal as though it were an artifact file.
+        self.workspace
+            .write_artifact(request.run_id, "seed", "txt", b"seed")
+            .await?;
+        let directory = format!("artifact://.focus-agent/artifacts/{}", request.run_id);
+        Ok(ToolOutcome::RuntimeDirective {
+            output: ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "completion proposed".into(),
+                model_content: "completion proposed".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            directive: agent_contracts::RuntimeDirective::CompleteTask(
+                agent_contracts::CompletionProposal {
+                    summary: "must not commit".into(),
+                    artifacts: vec![directory],
+                },
+            ),
+        })
+    }
+}
+
+async fn wait_for_completed_record(
+    instance: &RuntimeInstance,
+    events: &mut tokio::sync::broadcast::Receiver<RuntimeEventEnvelope>,
+) -> agent_runtime::checkpoint::RuntimeCheckpoint {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            && matches!(envelope.event, RuntimeEvent::TaskCompleted { .. })
+        {
+            return instance.checkpoint().await.unwrap();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "completion did not commit before deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn completion_artifacts_keep_raw_evidence_first_and_cap_the_merged_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(CompletionProposalModel {
+            summary: "ignored by dispatcher",
+            rounds: AtomicUsize::new(0),
+        }),
+        Arc::new(BulkCompletionToolDispatcher {
+            workspace: (*workspace).clone(),
+            unique_artifacts: agent_contracts::MAX_COMPLETION_ARTIFACTS,
+            duplicate_first: false,
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    )
+    .with_artifact_workspace(workspace);
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut events = instance.handle().subscribe();
+    instance.start().await.unwrap();
+    instance
+        .handle()
+        .user_message("finish with many artifacts".into())
+        .await
+        .unwrap();
+
+    let checkpoint = wait_for_completed_record(&instance, &mut events).await;
+    let artifacts = &checkpoint.tasks.completed[0].artifacts;
+    assert_eq!(artifacts.len(), agent_contracts::MAX_COMPLETION_ARTIFACTS);
+    assert!(artifacts[0].contains("assistant-response"));
+    assert!(artifacts[1].contains("proposal-00"));
+    assert!(artifacts.iter().any(|item| item.contains("proposal-30")));
+    assert!(!artifacts.iter().any(|item| item.contains("proposal-31")));
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn completion_artifacts_are_normalized_and_stably_deduplicated() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(CompletionProposalModel {
+            summary: "ignored by dispatcher",
+            rounds: AtomicUsize::new(0),
+        }),
+        Arc::new(BulkCompletionToolDispatcher {
+            workspace: (*workspace).clone(),
+            unique_artifacts: 1,
+            duplicate_first: true,
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    )
+    .with_artifact_workspace(workspace);
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let mut events = instance.handle().subscribe();
+    instance.start().await.unwrap();
+    instance
+        .handle()
+        .user_message("finish with duplicate artifacts".into())
+        .await
+        .unwrap();
+
+    let checkpoint = wait_for_completed_record(&instance, &mut events).await;
+    let artifacts = &checkpoint.tasks.completed[0].artifacts;
+    assert_eq!(artifacts.len(), 2, "raw evidence plus one unique proposal");
+    assert!(artifacts[0].contains("assistant-response"));
+    assert!(artifacts[1].contains("proposal-00"));
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn completion_safe_point_rejects_a_current_run_directory_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(CompletionProposalModel {
+            summary: "must not commit",
+            rounds: AtomicUsize::new(0),
+        }),
+        Arc::new(DirectoryCompletionToolDispatcher {
+            workspace: (*workspace).clone(),
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    )
+    .with_artifact_workspace(workspace);
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    instance.start().await.unwrap();
+    instance
+        .handle()
+        .user_message("finish with a directory".into())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        instance
+            .checkpoint()
+            .await
+            .unwrap()
+            .tasks
+            .completed
+            .is_empty()
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn focus_switch_clears_previous_tasks_raw_assistant_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(PlainModel),
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    )
+    .with_artifact_workspace(workspace);
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    instance.start().await.unwrap();
+    handle.user_message("task A work".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            && matches!(envelope.event, RuntimeEvent::TurnCompleted)
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+    }
+
+    handle.set_focus("task B".into()).await.unwrap();
+    handle
+        .complete_current_task("task B complete".into())
+        .await
+        .unwrap();
+    let checkpoint = instance.checkpoint().await.unwrap();
+    let record = checkpoint.tasks.completed.last().unwrap();
+    assert_eq!(record.summary, "task B complete");
+    assert!(
+        record.artifacts.is_empty(),
+        "task B must not inherit task A's raw assistant artifact: {:?}",
+        record.artifacts
+    );
+    instance.shutdown().await.unwrap();
 }

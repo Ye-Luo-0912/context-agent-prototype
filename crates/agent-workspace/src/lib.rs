@@ -1,18 +1,32 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use agent_contracts::{AgentError, AgentResult, Effect, EffectDurability, EffectReceipt, RunId};
+use agent_contracts::{
+    AgentError, AgentResult, ContentDigest, Effect, EffectDurability, EffectReceipt,
+    OperationEffectContext, RunId, artifact_owner_from_prefix,
+};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio::io::AsyncWrite;
 use uuid::Uuid;
 
 mod broker;
 mod confined;
 mod handles;
+mod journal;
+mod process_journal;
+mod remote_journal;
 
+pub use agent_contracts::{ArtifactLocator, MAX_ARTIFACT_REFERENCE_BYTES};
 pub use broker::WorkspaceOutputBroker;
 pub use confined::{ConfinedDir, ConfinedFile};
 pub use handles::{ArtifactStoreHandle, ConfinedWorkspaceHandle};
+pub use journal::WorkspaceEffectRecovery;
+pub use remote_journal::RemoteEffectAck;
 
 /// One record in the workspace change journal (`.focus-agent/changes.jsonl`).
 ///
@@ -67,13 +81,146 @@ fn content_hash(bytes: &[u8]) -> String {
     format!("{:016x}", hash)
 }
 
-fn artifact_ref(root: &Path, path: &Path) -> String {
-    let relative = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/");
-    format!("artifact://{relative}")
+/// 身份定位符到仓库内相对路径。URI 本身不再泄露 `.focus-agent` 路径。
+fn locator_relative_path(locator: &ArtifactLocator) -> PathBuf {
+    let mut path = PathBuf::from(".focus-agent");
+    path.push("artifacts");
+    path.push(locator.run_id().to_string());
+    path.push(locator.owner());
+    if let Some(digest) = locator.digest() {
+        path.push(digest.to_string());
+    } else {
+        path.push(format!(
+            ".tmp-{}",
+            locator
+                .staging_id()
+                .expect("draft locators always carry a staging id")
+        ));
+    }
+    path
+}
+
+/// 流式写入中的暂存制品。`locator()` 是 draft 身份；写完后必须 `seal_artifact`
+/// 才得到带内容 digest 的不可变定位符。
+pub struct ArtifactDraft {
+    file: tokio::fs::File,
+    hasher: Sha256,
+    run_id: RunId,
+    owner: String,
+    staging_id: Uuid,
+    staging_name: String,
+}
+
+impl ArtifactDraft {
+    /// 仍在增长的 draft 定位符。完成写入前不得当作 completion 证据。
+    pub fn locator(&self) -> ArtifactLocator {
+        ArtifactLocator::draft(self.run_id, self.owner.clone(), self.staging_id)
+            .expect("draft owner was validated at create")
+    }
+}
+
+impl AsyncWrite for ArtifactDraft {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.file).poll_write(cx, buf) {
+            Poll::Ready(Ok(n)) => {
+                this.hasher.update(&buf[..n]);
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().file).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().file).poll_shutdown(cx)
+    }
+}
+
+/// 用同一个 pinned handle 流式哈希再 seek 回去，避免 TOCTOU 换文件。
+async fn verify_sealed_digest(
+    confined: ConfinedFile,
+    expected: ContentDigest,
+) -> AgentResult<ConfinedFile> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let display = confined.display().to_path_buf();
+    let mut file = confined.into_tokio();
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| AgentError::Io(format!("hash artifact '{}': {e}", display.display())))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let actual = ContentDigest::from_bytes(hasher.finalize().into());
+    if actual != expected {
+        return Err(AgentError::InvalidRequest(format!(
+            "artifact content digest mismatch for {}",
+            display.display()
+        )));
+    }
+    file.seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(|e| AgentError::Io(format!("rewind artifact '{}': {e}", display.display())))?;
+    let std_file = file.try_into_std().map_err(|_| {
+        AgentError::Io(format!(
+            "artifact handle still busy after digest verify: {}",
+            display.display()
+        ))
+    })?;
+    Ok(ConfinedFile::new(std_file, display))
+}
+
+/// Open a child directory under a pinned parent, creating it relative to the
+/// same handle when absent. A concurrent legitimate creator is harmless; a
+/// pre-planted link/reparse point is refused by the subsequent open.
+fn open_or_create_child_dir(
+    parent: &ConfinedDir,
+    name: &std::ffi::OsStr,
+    label: &str,
+) -> AgentResult<ConfinedDir> {
+    match parent.open_child_dir(name) {
+        Ok(child) => return Ok(child),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(confined_io_error(
+                &format!("open {label} dir"),
+                &parent.display().join(name),
+                error,
+            ));
+        }
+    }
+    match parent.create_child_dir(name) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(confined_io_error(
+                &format!("create {label} dir"),
+                &parent.display().join(name),
+                error,
+            ));
+        }
+    }
+    parent.open_child_dir(name).map_err(|error| {
+        confined_io_error(
+            &format!("open {label} dir"),
+            &parent.display().join(name),
+            error,
+        )
+    })
 }
 
 /// `fs::canonicalize` returns verbatim (`\\?\`) prefixed paths on Windows;
@@ -96,6 +243,9 @@ fn normalize_canonical(path: PathBuf) -> PathBuf {
 pub struct Workspace {
     root: PathBuf,
     state_dir: PathBuf,
+    effect_journal: Arc<journal::WorkspaceEffectJournal>,
+    process_journal: Arc<process_journal::ProcessEffectJournal>,
+    remote_journal: Arc<remote_journal::RemoteEffectJournal>,
 }
 
 impl Workspace {
@@ -140,10 +290,63 @@ impl Workspace {
                 requested_state_dir.display()
             )));
         }
-        fs::create_dir_all(state_dir.join("artifacts"))
-            .await
-            .map_err(|e| AgentError::Io(format!("create state artifacts dir: {e}")))?;
-        Ok(Self { root, state_dir })
+        // Pin the runtime-state path before creating anything underneath it.
+        // A path-based `create_dir_all(.focus-agent/artifacts)` could be
+        // redirected if `.focus-agent` or `artifacts` were swapped for a
+        // symlink/junction after the canonicalization above.
+        let root_dir = ConfinedDir::open_root(&root)
+            .map_err(|e| AgentError::Io(format!("open workspace root handle: {e}")))?;
+        let state_handle = root_dir
+            .open_child_dir(std::ffi::OsStr::new(".focus-agent"))
+            .map_err(|e| confined_io_error("open runtime state dir", &state_dir, e))?;
+        open_or_create_child_dir(
+            &state_handle,
+            std::ffi::OsStr::new("artifacts"),
+            "artifacts",
+        )?;
+        let authority_existed = state_handle
+            .open_child_dir(std::ffi::OsStr::new("authority"))
+            .is_ok();
+        let authority = open_or_create_child_dir(
+            &state_handle,
+            std::ffi::OsStr::new("authority"),
+            "authority",
+        )?;
+        if !authority_existed {
+            state_handle.sync_all().map_err(|error| {
+                AgentError::Storage(format!("sync authority parent directory: {error}"))
+            })?;
+        }
+        let effect_journal = Arc::new(journal::WorkspaceEffectJournal::open(authority)?);
+        let process_authority = state_handle
+            .open_child_dir(std::ffi::OsStr::new("authority"))
+            .map_err(|error| {
+                confined_io_error(
+                    "reopen authority dir for process journal",
+                    &state_dir.join("authority"),
+                    error,
+                )
+            })?;
+        let process_journal = Arc::new(process_journal::ProcessEffectJournal::open(
+            process_authority,
+        )?);
+        let remote_authority = state_handle
+            .open_child_dir(std::ffi::OsStr::new("authority"))
+            .map_err(|error| {
+                confined_io_error(
+                    "reopen authority dir for remote journal",
+                    &state_dir.join("authority"),
+                    error,
+                )
+            })?;
+        let remote_journal = Arc::new(remote_journal::RemoteEffectJournal::open(remote_authority)?);
+        Ok(Self {
+            root,
+            state_dir,
+            effect_journal,
+            process_journal,
+            remote_journal,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -152,6 +355,56 @@ impl Workspace {
 
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
+    }
+
+    /// Reconcile one exact Core-issued operation/effect identity against the
+    /// strict workspace authority journal and current files.
+    pub fn reconcile_effect(
+        &self,
+        context: &OperationEffectContext,
+    ) -> AgentResult<WorkspaceEffectRecovery> {
+        journal::reconcile_workspace_effect(self, context)
+    }
+
+    /// 在子进程 PID 可用后立刻记下 spawn，作为恢复证据。
+    pub fn record_process_spawn(
+        &self,
+        context: &OperationEffectContext,
+        pid: u32,
+    ) -> AgentResult<()> {
+        self.process_journal.record_spawned(context, pid)
+    }
+
+    /// 记下 wait 到的退出。没有对应 spawn 时是空操作，便于测试直调工具。
+    pub fn record_process_exit(&self, pid: u32, exit_code: Option<i32>) -> AgentResult<()> {
+        self.process_journal.record_exited(pid, exit_code)
+    }
+
+    /// 发送前先落下远程预约。带幂等键时，未应答的同一键不得再发。
+    pub fn record_remote_reserved(
+        &self,
+        context: &OperationEffectContext,
+        idempotency_key: Option<&str>,
+    ) -> AgentResult<()> {
+        self.remote_journal
+            .record_reserved(context, idempotency_key)
+    }
+
+    /// 在字节离开本机之前记下 dispatched。崩溃后只能视为可能已发出。
+    pub fn record_remote_dispatched(
+        &self,
+        effect_id: agent_contracts::EffectId,
+    ) -> AgentResult<()> {
+        self.remote_journal.record_dispatched(effect_id)
+    }
+
+    /// 记下对端应答。没有这条记录的 dispatched 调用恢复为 Ambiguous。
+    pub fn record_remote_acked(
+        &self,
+        effect_id: agent_contracts::EffectId,
+        ack: RemoteEffectAck,
+    ) -> AgentResult<()> {
+        self.remote_journal.record_acked(effect_id, ack)
     }
 
     /// Resolve a user-provided path without allowing absolute paths or `..`
@@ -192,32 +445,47 @@ impl Workspace {
         Ok(path)
     }
 
-    /// Validate an `artifact://` reference and return the cleaned
-    /// workspace-relative path, confined to the run artifact store
-    /// (`.focus-agent/artifacts/`). Non-artifact schemes, query/fragment
-    /// components, `..` traversal and any target outside the artifact store
-    /// are refused. The caller opens the returned path through
-    /// `confined_open_read`, so the final read is still pinned against link
-    /// swaps — this check only decides *which* files may be reached.
-    pub fn artifact_relative_path(&self, reference: &str) -> AgentResult<PathBuf> {
-        let relative = reference.strip_prefix("artifact://").ok_or_else(|| {
-            AgentError::InvalidRequest(format!(
-                "artifact references must start with artifact://: {reference:?}"
+    /// 校验身份定位符并返回仓库内相对路径，且必须属于 `run_id`。
+    ///
+    /// 最终打开仍走 `confined_open_read`。路径形 `artifact://.focus-agent/...`
+    /// 不再被接受；sealed 定位符在打开时核验内容 digest。
+    pub fn artifact_relative_path_for_run(
+        &self,
+        reference: &str,
+        run_id: RunId,
+    ) -> AgentResult<PathBuf> {
+        let locator = ArtifactLocator::parse(reference)?;
+        locator.ensure_run(run_id)?;
+        Ok(locator_relative_path(&locator))
+    }
+
+    /// 打开当前 run 的制品。sealed 定位符会对流式哈希结果与 URI digest
+    /// 比对；draft 只确认仍是普通文件。返回的字符串永远是规范身份拼写。
+    pub async fn open_artifact_for_run(
+        &self,
+        reference: &str,
+        run_id: RunId,
+    ) -> AgentResult<(String, ConfinedFile)> {
+        let locator = ArtifactLocator::parse(reference)?;
+        locator.ensure_run(run_id)?;
+        let relative = locator_relative_path(&locator);
+        let confined = self.confined_open_read(&relative).await?;
+        let metadata = confined.metadata().map_err(|e| {
+            AgentError::Io(format!(
+                "inspect artifact '{}': {e}",
+                confined.display().display()
             ))
         })?;
-        if relative.contains('#') || relative.contains('?') {
+        if !metadata.is_file() {
             return Err(AgentError::InvalidRequest(format!(
-                "artifact references cannot carry query/fragment components: {reference:?}"
+                "artifact reference is not a regular file: {reference:?}"
             )));
         }
-        let clean = clean_relative(Path::new(relative))?;
-        let artifacts_root = self.state_dir.join("artifacts");
-        if !self.root.join(&clean).starts_with(&artifacts_root) {
-            return Err(AgentError::InvalidRequest(format!(
-                "artifact reference outside the run artifact store: {reference:?}"
-            )));
+        if let Some(expected) = locator.digest() {
+            let confined = verify_sealed_digest(confined, expected).await?;
+            return Ok((locator.to_string(), confined));
         }
-        Ok(clean)
+        Ok((locator.to_string(), confined))
     }
 
     async fn confine(&self, clean: PathBuf) -> AgentResult<PathBuf> {
@@ -377,10 +645,12 @@ impl Workspace {
         let parent = self.confined_parent(parent_rel).await?;
 
         let mut bytes_before = 0u64;
+        let mut target_existed = false;
         let mut before_hash = content_hash(&[]);
         let mut old_content = None;
         match parent.open_existing(target_name) {
             Ok(file) => {
+                target_existed = true;
                 let meta = file
                     .metadata()
                     .map_err(|e| AgentError::Io(format!("metadata {}: {e}", target.display())))?;
@@ -392,15 +662,32 @@ impl Workspace {
                     // is bounded: big files get a hash but no journal copy.
                     // The read goes through the pinned handle, so a swap
                     // cannot change which object is hashed.
-                    use std::io::Read;
                     let mut file = file;
-                    let mut bytes = Vec::new();
-                    file.read_to_end(&mut bytes)
-                        .map_err(|e| AgentError::Io(format!("read {}: {e}", target.display())))?;
-                    before_hash = content_hash(&bytes);
-                    if bytes.len() as u64 <= CHANGE_CAPTURE_LIMIT as u64 {
-                        old_content = String::from_utf8(bytes).ok();
+                    use std::io::Read;
+                    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+                    let mut captured = if meta.len() <= CHANGE_CAPTURE_LIMIT as u64 {
+                        Some(Vec::with_capacity(meta.len() as usize))
+                    } else {
+                        None
+                    };
+                    let mut buffer = [0_u8; 64 * 1024];
+                    loop {
+                        let read = file.read(&mut buffer).map_err(|e| {
+                            AgentError::Io(format!("read {}: {e}", target.display()))
+                        })?;
+                        if read == 0 {
+                            break;
+                        }
+                        for byte in &buffer[..read] {
+                            hash ^= u64::from(*byte);
+                            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                        }
+                        if let Some(bytes) = &mut captured {
+                            bytes.extend_from_slice(&buffer[..read]);
+                        }
                     }
+                    before_hash = format!("{hash:016x}");
+                    old_content = captured.and_then(|bytes| String::from_utf8(bytes).ok());
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -416,6 +703,7 @@ impl Workspace {
             tool: tool.to_string(),
             action: action.to_string(),
             bytes_before,
+            target_existed,
             before_hash,
             old_content,
             tx_id: Uuid::new_v4().to_string(),
@@ -426,130 +714,108 @@ impl Workspace {
         &self,
         run_id: RunId,
         prefix: &str,
-        extension: &str,
+        _extension: &str,
         bytes: &[u8],
     ) -> AgentResult<String> {
-        let run_dir = self.state_dir.join("artifacts").join(run_id.to_string());
-        fs::create_dir_all(&run_dir)
-            .await
-            .map_err(|e| AgentError::Io(format!("create artifact dir: {e}")))?;
+        use tokio::io::AsyncWriteExt;
 
-        let safe_prefix: String = prefix
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .take(48)
-            .collect();
-        let safe_ext: String = extension
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .take(12)
-            .collect();
-        let filename = if safe_ext.is_empty() {
-            format!("{}-{}", safe_prefix, Uuid::new_v4())
-        } else {
-            format!("{}-{}.{}", safe_prefix, Uuid::new_v4(), safe_ext)
-        };
-        let path = run_dir.join(filename);
-        fs::write(&path, bytes)
+        let mut draft = self.create_artifact(run_id, prefix, _extension).await?;
+        draft
+            .write_all(bytes)
             .await
             .map_err(|e| AgentError::Io(format!("write artifact: {e}")))?;
-
-        Ok(artifact_ref(&self.root, &path))
+        self.seal_artifact(draft).await
     }
 
-    /// Open a new artifact file for incremental appends (streaming process
-    /// output). Returns the artifact reference and the open file.
+    /// 打开仅用于写入的暂存文件。返回的 draft 在 `seal_artifact` 之前
+    /// 不得作为不可变证据进入 completion。
     pub async fn create_artifact(
         &self,
         run_id: RunId,
         prefix: &str,
-        extension: &str,
-    ) -> AgentResult<(String, tokio::fs::File)> {
-        let run_dir = self.state_dir.join("artifacts").join(run_id.to_string());
-        fs::create_dir_all(&run_dir)
-            .await
-            .map_err(|e| AgentError::Io(format!("create artifact dir: {e}")))?;
-
-        let safe_prefix: String = prefix
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .take(48)
-            .collect();
-        let safe_ext: String = extension
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .take(12)
-            .collect();
-        let filename = if safe_ext.is_empty() {
-            format!("{}-{}", safe_prefix, Uuid::new_v4())
-        } else {
-            format!("{}-{}.{}", safe_prefix, Uuid::new_v4(), safe_ext)
-        };
-        let path = run_dir.join(filename);
-        let mut options = tokio::fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        let file = options
-            .open(&path)
-            .await
-            .map_err(|e| AgentError::Io(format!("create artifact: {e}")))?;
-        Ok((artifact_ref(&self.root, &path), file))
+        _extension: &str,
+    ) -> AgentResult<ArtifactDraft> {
+        let owner = artifact_owner_from_prefix(prefix)?;
+        let staging_id = Uuid::new_v4();
+        let staging_name = format!(".tmp-{staging_id}");
+        let owner_dir = self.artifact_owner_dir(run_id, &owner)?;
+        let path = owner_dir.display().join(&staging_name);
+        let file = owner_dir
+            .create_new_file(std::ffi::OsStr::new(&staging_name))
+            .map_err(|e| confined_io_error("create artifact", &path, e))?;
+        Ok(ArtifactDraft {
+            file: tokio::fs::File::from_std(file),
+            hasher: Sha256::new(),
+            run_id,
+            owner,
+            staging_id,
+            staging_name,
+        })
     }
 
-    /// Create an artifact and return its model-facing reference *and* its
-    /// filesystem path, so a caller that must append to the file across
-    /// tool calls (a process session's poll loop) can reopen it by path.
-    pub async fn create_artifact_path(
-        &self,
-        run_id: RunId,
-        prefix: &str,
-        extension: &str,
-    ) -> AgentResult<(String, std::path::PathBuf)> {
-        let run_dir = self.state_dir.join("artifacts").join(run_id.to_string());
-        fs::create_dir_all(&run_dir)
-            .await
-            .map_err(|e| AgentError::Io(format!("create artifact dir: {e}")))?;
+    /// 把 draft 封成 owner/digest 身份：按写入哈希重命名，不再重读整文件。
+    pub async fn seal_artifact(&self, mut draft: ArtifactDraft) -> AgentResult<String> {
+        use tokio::io::AsyncWriteExt;
 
-        let safe_prefix: String = prefix
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .take(48)
-            .collect();
-        let safe_ext: String = extension
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .take(12)
-            .collect();
-        let filename = if safe_ext.is_empty() {
-            format!("{}-{}", safe_prefix, Uuid::new_v4())
-        } else {
-            format!("{}-{}.{}", safe_prefix, Uuid::new_v4(), safe_ext)
-        };
-        let path = run_dir.join(filename);
-        tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
+        draft
+            .flush()
             .await
-            .map_err(|e| AgentError::Io(format!("create artifact: {e}")))?;
-        Ok((artifact_ref(&self.root, &path), path))
+            .map_err(|e| AgentError::Io(format!("flush artifact: {e}")))?;
+        let hasher = std::mem::replace(&mut draft.hasher, Sha256::new());
+        let digest = ContentDigest::from_bytes(hasher.finalize().into());
+        let locator = ArtifactLocator::sealed(draft.run_id, draft.owner.clone(), digest)?;
+        let std_file = draft
+            .file
+            .try_into_std()
+            .map_err(|_| AgentError::Io("artifact handle still busy at seal".into()))?;
+        let owner_dir = self.artifact_owner_dir(draft.run_id, &draft.owner)?;
+        let digest_name = std::ffi::OsString::from(digest.to_string());
+        let staging_name = std::ffi::OsString::from(&draft.staging_name);
+        owner_dir
+            .replace_file(&std_file, &staging_name, &digest_name)
+            .map_err(|e| {
+                confined_io_error("seal artifact", &owner_dir.display().join(&digest_name), e)
+            })?;
+        Ok(locator.to_string())
+    }
+
+    /// 刷新 BufWriter 后再封口，给 shell/process 流式写入复用。
+    pub async fn seal_buffered_artifact(
+        &self,
+        mut artifact: tokio::io::BufWriter<ArtifactDraft>,
+    ) -> AgentResult<String> {
+        use tokio::io::AsyncWriteExt;
+
+        artifact
+            .flush()
+            .await
+            .map_err(|e| AgentError::Io(format!("flush artifact: {e}")))?;
+        // Tokio's BufWriter::into_inner returns the writer directly after flush.
+        self.seal_artifact(artifact.into_inner()).await
+    }
+
+    /// Pin `.focus-agent/artifacts/<run>` and create the run directory
+    /// relative to its already-open parent when needed. No path component is
+    /// followed as a symlink/junction, and the returned handle remains the
+    /// authority for the subsequent exclusive file creation.
+    fn artifact_run_dir(&self, run_id: RunId) -> AgentResult<ConfinedDir> {
+        let root = ConfinedDir::open_root(&self.root)
+            .map_err(|e| AgentError::Io(format!("open workspace root handle: {e}")))?;
+        let state = root
+            .open_child_dir(std::ffi::OsStr::new(".focus-agent"))
+            .map_err(|e| confined_io_error("open runtime state dir", &self.state_dir, e))?;
+        let artifacts =
+            open_or_create_child_dir(&state, std::ffi::OsStr::new("artifacts"), "artifacts")?;
+        open_or_create_child_dir(
+            &artifacts,
+            std::ffi::OsStr::new(&run_id.to_string()),
+            "artifact run",
+        )
+    }
+
+    fn artifact_owner_dir(&self, run_id: RunId, owner: &str) -> AgentResult<ConfinedDir> {
+        let run_dir = self.artifact_run_dir(run_id)?;
+        open_or_create_child_dir(&run_dir, std::ffi::OsStr::new(owner), "artifact owner")
     }
 
     /// Append a mutation record to the workspace change journal
@@ -603,6 +869,7 @@ pub struct MutationTransaction {
     tool: String,
     action: String,
     bytes_before: u64,
+    target_existed: bool,
     /// Content hash of the real file at prepare time (computed even when the
     /// backup copy is truncated — recovery integrity must not depend on the
     /// capture limit).
@@ -615,7 +882,24 @@ impl MutationTransaction {
     /// Stage `content`: write the temporary file and record
     /// `MutationPrepared`. The target is not touched. Returns the prepared
     /// mutation the runtime commits or rolls back.
-    pub async fn prepare(mut self, content: &[u8]) -> AgentResult<PreparedMutation> {
+    pub async fn prepare(self, content: &[u8]) -> AgentResult<PreparedMutation> {
+        self.prepare_inner(content, None).await
+    }
+
+    pub async fn prepare_with_effect_context(
+        self,
+        content: &[u8],
+        context: OperationEffectContext,
+    ) -> AgentResult<PreparedMutation> {
+        context.validate().map_err(AgentError::InvalidRequest)?;
+        self.prepare_inner(content, Some(context)).await
+    }
+
+    async fn prepare_inner(
+        mut self,
+        content: &[u8],
+        effect_context: Option<OperationEffectContext>,
+    ) -> AgentResult<PreparedMutation> {
         // The parent is already confined (with missing components created
         // through the pinned handle chain); the staged file is created
         // exclusively under that handle, so a link swap cannot redirect it.
@@ -637,6 +921,12 @@ impl MutationTransaction {
             let _ = self.parent.remove_file(&temp_name);
             return Err(AgentError::Io(format!("flush temp file: {e}")));
         }
+        if let Err(e) = file.sync_all() {
+            let _ = self.parent.remove_file(&temp_name);
+            return Err(AgentError::Io(format!("sync temp file: {e}")));
+        }
+
+        let after_hash = content_hash(content);
 
         let record = ChangeRecord::MutationPrepared {
             tx_id: self.tx_id.clone(),
@@ -646,13 +936,30 @@ impl MutationTransaction {
             action: self.action.clone(),
             bytes_before: self.bytes_before,
             bytes_after: content.len() as u64,
-            before_hash: self.before_hash,
-            after_hash: content_hash(content),
+            before_hash: self.before_hash.clone(),
+            after_hash: after_hash.clone(),
             old_content: self.old_content.take(),
         };
         if let Err(e) = self.workspace.record_change(record).await {
             let _ = self.parent.remove_file(&temp_name);
             return Err(e);
+        }
+        if let Some(context) = &effect_context
+            && let Err(error) =
+                self.workspace
+                    .effect_journal
+                    .append_prepared(journal::PreparedEvidence {
+                        tx_id: self.tx_id.clone(),
+                        context: context.clone(),
+                        relative_target: self.relative.clone(),
+                        temp_name: temp_name.to_string_lossy().into_owned(),
+                        target_existed: self.target_existed,
+                        before_hash: self.before_hash,
+                        after_hash,
+                    })
+        {
+            let _ = self.parent.remove_file(&temp_name);
+            return Err(error);
         }
 
         Ok(PreparedMutation {
@@ -663,6 +970,7 @@ impl MutationTransaction {
             tx_id: self.tx_id,
             temp_name: Some(temp_name),
             temp_file: Some(file),
+            effect_context,
             finished: false,
         })
     }
@@ -707,6 +1015,7 @@ pub struct PreparedMutation {
     /// renames through the handle); Unix renames by name under the pinned
     /// directory.
     temp_file: Option<std::fs::File>,
+    effect_context: Option<OperationEffectContext>,
     finished: bool,
 }
 
@@ -714,6 +1023,13 @@ impl PreparedMutation {
     /// The journal transaction id of this staged mutation.
     pub fn tx_id(&self) -> &str {
         &self.tx_id
+    }
+
+    #[cfg(test)]
+    fn simulate_process_exit(mut self) {
+        // Test-only crash seam: preserve the staged file and authority
+        // record while releasing all in-process handles/locks.
+        self.finished = true;
     }
 
     /// Atomically replace the target and record `MutationCommitted`. On
@@ -742,8 +1058,9 @@ impl PreparedMutation {
             .parent
             .replace_file(from, &temp_name, &self.target_name)
         {
-            let _ = self.parent.remove_file(&temp_name);
-            self.record_rolled_back(format!("commit failed: {e}")).await;
+            if self.cleanup_staged(&temp_name) {
+                self.record_rolled_back(format!("commit failed: {e}")).await;
+            }
             return EffectReceipt::NotApplied {
                 error: confined_io_error("commit", &self.target, e).to_string(),
             };
@@ -751,6 +1068,22 @@ impl PreparedMutation {
         // The target changed; from here on any failure is a durability
         // problem, not a "did not apply" one.
         self.finished = true;
+        if let Err(error) = self.parent.sync_all() {
+            return EffectReceipt::Applied {
+                durability: EffectDurability::DurabilityFailed(format!(
+                    "sync committed mutation parent: {error}"
+                )),
+                evidence: Some(self.tx_id.clone()),
+            };
+        }
+        if self.effect_context.is_some()
+            && let Err(error) = self.workspace.effect_journal.append_committed(&self.tx_id)
+        {
+            return EffectReceipt::Applied {
+                durability: EffectDurability::DurabilityFailed(error.to_string()),
+                evidence: Some(self.tx_id.clone()),
+            };
+        }
         let record = ChangeRecord::MutationCommitted {
             tx_id: self.tx_id.clone(),
             timestamp_ms: now_ms(),
@@ -773,14 +1106,31 @@ impl PreparedMutation {
     /// `Drop` impl — a stale or cancelled mutation must never leak temp
     /// files.
     pub async fn rollback(mut self, reason: &str) {
-        if let Some(temp_name) = self.temp_name.take() {
-            let _ = self.parent.remove_file(&temp_name);
-        }
+        let cleaned = self
+            .temp_name
+            .take()
+            .is_none_or(|temp_name| self.cleanup_staged(&temp_name));
         self.finished = true;
-        self.record_rolled_back(reason.to_string()).await;
+        if cleaned {
+            self.record_rolled_back(reason.to_string()).await;
+        }
+    }
+
+    fn cleanup_staged(&self, temp_name: &std::ffi::OsStr) -> bool {
+        match self.parent.remove_file(temp_name) {
+            Ok(()) => self.parent.sync_all().is_ok(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        }
     }
 
     async fn record_rolled_back(&self, reason: String) {
+        if self.effect_context.is_some() {
+            let _ = self
+                .workspace
+                .effect_journal
+                .append_rolled_back(&self.tx_id);
+        }
         let record = ChangeRecord::MutationRolledBack {
             tx_id: self.tx_id.clone(),
             timestamp_ms: now_ms(),
@@ -794,8 +1144,9 @@ impl Drop for PreparedMutation {
     fn drop(&mut self) {
         if !self.finished
             && let Some(temp_name) = &self.temp_name
+            && self.parent.remove_file(temp_name).is_ok()
         {
-            let _ = self.parent.remove_file(temp_name);
+            let _ = self.parent.sync_all();
         }
     }
 }
@@ -980,6 +1331,36 @@ mod tests {
         assert!(
             !outside.path().join("artifacts").exists(),
             "open must validate the state-dir target before creating children"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_write_rejects_a_replaced_artifact_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let artifacts = workspace.state_dir().join("artifacts");
+        fs::remove_dir(&artifacts).await.unwrap();
+        if !try_make_link(&artifacts, outside.path()) {
+            return;
+        }
+
+        let result = workspace
+            .write_artifact(RunId::new(), "escape", "txt", b"must stay confined")
+            .await;
+        assert!(
+            result.is_err(),
+            "a replaced artifact directory must be rejected, not followed"
+        );
+        assert!(
+            fs::read_dir(outside.path())
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none(),
+            "artifact bytes must never land through the replacement link"
         );
     }
 
@@ -1506,23 +1887,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artifact_relative_path_resolves_only_run_artifacts() {
+    async fn artifact_relative_path_resolves_only_current_run_identity_locators() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let run_id = RunId::new();
+        let reference = workspace
+            .write_artifact(run_id, "fs-list", "txt", b"one\n")
+            .await
+            .unwrap();
+        let locator = ArtifactLocator::parse(&reference).unwrap();
+        assert!(locator.is_sealed());
+        assert_eq!(locator.owner(), "fs-list");
+        assert_eq!(locator.run_id(), run_id);
 
         let valid = workspace
-            .artifact_relative_path(&format!(
-                "artifact://.focus-agent/artifacts/{run_id}/fs-list-abc.txt"
-            ))
-            .expect("a genuine artifact reference must resolve");
+            .artifact_relative_path_for_run(&reference, run_id)
+            .expect("a genuine sealed artifact reference must resolve");
         assert_eq!(
             valid,
-            std::path::PathBuf::from(format!(".focus-agent/artifacts/{run_id}/fs-list-abc.txt"))
+            std::path::PathBuf::from(format!(
+                ".focus-agent/artifacts/{run_id}/fs-list/{}",
+                locator.digest().unwrap()
+            ))
         );
 
-        // Non-artifact schemes, query/fragment components and traversal are
-        // all refused before any file is touched.
+        // 路径形 URI、query/fragment、穿越和异 run 在解析阶段拒绝。
         for bad in [
             "https://example.com/x",
             "artifact://.focus-agent/artifacts/x/y.txt?page=2",
@@ -1530,20 +1919,88 @@ mod tests {
             "artifact://.focus-agent/artifacts/../secret.txt",
             "artifact://C:/Windows/system32/notepad.exe",
             "artifact:///etc/passwd",
+            "artifact://src/main.rs",
         ] {
             assert!(
-                workspace.artifact_relative_path(bad).is_err(),
+                workspace
+                    .artifact_relative_path_for_run(bad, run_id)
+                    .is_err(),
                 "must refuse {bad:?}"
             );
         }
 
-        // A reference outside the artifact store (even though it is a valid
-        // workspace file) is not an artifact.
+        let other_run = RunId::new();
+        let cross_run = workspace
+            .write_artifact(other_run, "fs-list", "txt", b"other\n")
+            .await
+            .unwrap();
         assert!(
             workspace
-                .artifact_relative_path("artifact://src/main.rs")
+                .artifact_relative_path_for_run(&cross_run, run_id)
                 .is_err(),
-            "workspace files are not artifacts"
+            "a run must not read another run's artifacts"
         );
+    }
+
+    #[tokio::test]
+    async fn sealed_artifact_open_rejects_a_tampered_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let reference = workspace
+            .write_artifact(run_id, "grep", "txt", b"trusted body")
+            .await
+            .unwrap();
+        let relative = workspace
+            .artifact_relative_path_for_run(&reference, run_id)
+            .unwrap();
+        tokio::fs::write(workspace.root().join(&relative), b"forged body")
+            .await
+            .unwrap();
+        let error = match workspace.open_artifact_for_run(&reference, run_id).await {
+            Ok(_) => panic!("a digest mismatch must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, AgentError::InvalidRequest(ref message) if message.contains("digest mismatch")),
+            "mismatch must be a typed invalid request, got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_locator_reads_before_seal_and_identity_after() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let mut draft = workspace
+            .create_artifact(run_id, "shell", "log")
+            .await
+            .unwrap();
+        let draft_ref = draft.locator().to_string();
+        draft.write_all(b"partial").await.unwrap();
+        let (normalized, _file) = workspace
+            .open_artifact_for_run(&draft_ref, run_id)
+            .await
+            .expect("a live draft must be readable");
+        assert_eq!(normalized, draft_ref);
+        assert!(!ArtifactLocator::parse(&draft_ref).unwrap().is_sealed());
+
+        let sealed = workspace.seal_artifact(draft).await.unwrap();
+        assert!(ArtifactLocator::parse(&sealed).unwrap().is_sealed());
+        assert!(
+            workspace
+                .open_artifact_for_run(&draft_ref, run_id)
+                .await
+                .is_err(),
+            "sealing must retire the draft locator"
+        );
+        let (_normalized, file) = workspace
+            .open_artifact_for_run(&sealed, run_id)
+            .await
+            .unwrap();
+        let bytes = tokio::fs::read(file.display()).await.unwrap();
+        assert_eq!(bytes, b"partial");
     }
 }

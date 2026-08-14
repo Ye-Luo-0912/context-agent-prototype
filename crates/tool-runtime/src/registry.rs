@@ -15,8 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use agent_contracts::{
-    AgentError, AgentResult, ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolOutcome,
-    ToolOutput, ToolRisk, ToolSpec, ToolSurfaceSnapshot,
+    AgentError, AgentResult, ResourceDescriptor, ToolCatalogEntry, ToolDispatcher,
+    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec, ToolSurfaceSnapshot,
+    search_tool_catalog,
 };
 use agent_workspace::Workspace;
 use serde::Deserialize;
@@ -214,6 +215,7 @@ impl BuiltinToolDispatcher {
                 state: entry.state,
                 owner: "builtin".to_string(),
                 description: entry.tool.spec().description.clone(),
+                risk: entry.tool.spec().risk,
             })
             .collect();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -272,7 +274,7 @@ impl BuiltinToolDispatcher {
                     "properties": {
                         "op": {"type": "string", "enum": ["search", "inspect", "load", "unload"]},
                         "name": {"type": "string", "description": "Tool name for inspect/load/unload"},
-                        "query": {"type": "string", "description": "search: optional name filter"},
+                        "query": {"type": "string", "description": "search: optional case-insensitive filter over name, description, owner, state, and risk"},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "search: max rows in the model-facing page (default 20)"},
                         "cursor": {"type": "string", "description": "search: last tool name of the previous page"}
                     }
@@ -374,6 +376,7 @@ impl ToolDispatcher for BuiltinToolDispatcher {
     }
 
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        request.validate().map_err(AgentError::InvalidRequest)?;
         let name = request.call.name.clone();
         match name.as_str() {
             CAPABILITY_MANAGE => self.run_manage(request).await.map(ToolOutcome::Value),
@@ -384,6 +387,17 @@ impl ToolDispatcher for BuiltinToolDispatcher {
                     let entry = catalog.get_mut(&name).ok_or_else(|| {
                         AgentError::Tool(format!("unknown tool: {name} (see capability.search)"))
                     })?;
+                    let effectful = entry.tool.spec().risk != ToolRisk::ReadOnly;
+                    if effectful != request.effect_context.is_some() {
+                        return Err(AgentError::InvalidRequest(format!(
+                            "tool '{name}' {} a Core-issued effect context",
+                            if effectful {
+                                "requires"
+                            } else {
+                                "must not receive"
+                            }
+                        )));
+                    }
                     entry.state = ToolLifecycle::Active;
                     entry.last_used_tick = tick;
                     entry.tool.clone()
@@ -393,6 +407,7 @@ impl ToolDispatcher for BuiltinToolDispatcher {
                         request.run_id,
                         &request.call.id,
                         request.call.arguments,
+                        request.effect_context,
                         request.cancel,
                     )
                     .await;
@@ -418,10 +433,9 @@ impl BuiltinToolDispatcher {
             .limit
             .unwrap_or(agent_contracts::CAPABILITY_SEARCH_DEFAULT_LIMIT)
             .clamp(1, agent_contracts::CAPABILITY_SEARCH_MAX_LIMIT);
-        let mut entries = self.catalog();
-        if let Some(query) = args.query.as_deref() {
-            entries.retain(|entry| entry.name.contains(query));
-        }
+        // 描述符索引检索：name/description/owner/state/risk，大小写不敏感。
+        // 先取全部命中再按 cursor 分页，避免索引 limit 把后续页裁掉。
+        let mut entries = search_tool_catalog(&self.catalog(), args.query.as_deref(), usize::MAX);
         let active = entries
             .iter()
             .filter(|entry| entry.state.in_surface())
@@ -466,10 +480,13 @@ impl BuiltinToolDispatcher {
             },
             artifact_ref,
             metadata: json!({
+                "op": "search",
+                "kind": "tool",
                 "total": total,
                 "active": active,
                 "returned": page.len(),
                 "has_more": has_more,
+                "descriptors": page.iter().map(|entry| ResourceDescriptor::from_tool(entry, None)).collect::<Vec<_>>(),
             }),
         })
     }
@@ -514,6 +531,8 @@ impl BuiltinToolDispatcher {
         name: String,
     ) -> AgentResult<ToolOutput> {
         let Some(spec) = self.inspect_tool(&name) else {
+            let mut metadata = agent_contracts::DiscoveryMiss::NotFound.to_metadata();
+            metadata["op"] = json!("inspect");
             return Ok(ToolOutput {
                 call_id: request.call.id,
                 tool_name: CAPABILITY_MANAGE.into(),
@@ -521,7 +540,7 @@ impl BuiltinToolDispatcher {
                 summary: format!("unknown tool: {name}"),
                 model_content: format!("unknown tool: {name}"),
                 artifact_ref: None,
-                metadata: json!({}),
+                metadata,
             });
         };
         let state = self
@@ -540,7 +559,7 @@ impl BuiltinToolDispatcher {
                 spec.name, state, spec.description, spec.input_schema
             ),
             artifact_ref: None,
-            metadata: json!({"name": spec.name, "owner": "builtin", "state": state}),
+            metadata: json!({"op": "inspect", "name": spec.name, "owner": "builtin", "state": state}),
         })
     }
 
@@ -599,15 +618,34 @@ mod tests {
         }
     }
 
-    /// Open a throwaway workspace. The catalog only touches the disk on real
-    /// tool execution, which these tests never trigger.
-    async fn open_workspace() -> Workspace {
+    /// Open a throwaway workspace whose directory outlives the returned
+    /// dispatcher. Paging tests do execute artifact writes, so dropping the
+    /// `TempDir` here would leave a dangling Workspace path.
+    async fn open_workspace() -> (Workspace, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        Workspace::open(dir.path()).await.unwrap()
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        (workspace, dir)
     }
 
-    async fn dispatcher() -> BuiltinToolDispatcher {
-        BuiltinToolDispatcher::new(open_workspace().await)
+    struct TestDispatcher {
+        inner: BuiltinToolDispatcher,
+        _dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestDispatcher {
+        type Target = BuiltinToolDispatcher;
+
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+
+    async fn dispatcher() -> TestDispatcher {
+        let (workspace, dir) = open_workspace().await;
+        TestDispatcher {
+            inner: BuiltinToolDispatcher::new(workspace),
+            _dir: dir,
+        }
     }
 
     fn request(name: &str, arguments: Value) -> ToolExecutionRequest {
@@ -618,6 +656,7 @@ mod tests {
                 name: name.into(),
                 arguments,
             },
+            effect_context: None,
             cancel: CancellationToken::new(),
         }
     }
@@ -755,10 +794,12 @@ mod tests {
                 kind,
                 scope,
                 task_id,
+                label,
             } => {
                 assert_eq!(query, "AuthService");
                 assert_eq!(limit, 8);
                 assert!(kind.is_none() && scope.is_none() && task_id.is_none());
+                assert!(label.is_none());
             }
             other => panic!("expected SearchExternal, got {other:?}"),
         }
@@ -860,7 +901,7 @@ mod tests {
 
     #[tokio::test]
     async fn idle_tools_cool_and_unload() {
-        let workspace = open_workspace().await;
+        let (workspace, _dir) = open_workspace().await;
         let dispatcher = BuiltinToolDispatcher::with_config(
             workspace,
             ToolLifecycleConfig {
@@ -891,7 +932,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_roots_protect_required_tools_from_idle_gc() {
-        let workspace = open_workspace().await;
+        let (workspace, _dir) = open_workspace().await;
         let dispatcher = BuiltinToolDispatcher::with_config(
             workspace,
             ToolLifecycleConfig {
@@ -970,6 +1011,58 @@ mod tests {
             .await
             .unwrap_err();
         assert!(bad.to_string().contains("unknown op"), "{bad}");
+    }
+
+    #[tokio::test]
+    async fn capability_search_matches_description_case_insensitively_and_does_not_load() {
+        let dispatcher = dispatcher().await;
+        let before = surface(&dispatcher);
+        let search = dispatcher
+            .execute(request(
+                CAPABILITY_MANAGE,
+                json!({"op": "search", "query": "status --short"}),
+            ))
+            .await
+            .unwrap();
+        let search = value(search);
+        assert!(search.ok);
+        assert!(
+            search.model_content.contains("git.status"),
+            "descriptor search must match description text: {}",
+            search.model_content
+        );
+        assert_eq!(
+            search.metadata["op"], "search",
+            "search results must be tagged for transient disposition"
+        );
+        assert!(search.metadata["descriptors"].is_array());
+        assert_eq!(
+            surface(&dispatcher),
+            before,
+            "search must not load or admit a tool"
+        );
+
+        let by_name = dispatcher
+            .execute(request(
+                CAPABILITY_MANAGE,
+                json!({"op": "search", "query": "GIT.STATUS"}),
+            ))
+            .await
+            .unwrap();
+        let by_name = value(by_name);
+        assert!(by_name.model_content.contains("git.status"));
+
+        let unknown = dispatcher
+            .execute(request(
+                CAPABILITY_MANAGE,
+                json!({"op": "inspect", "name": "no.such.tool"}),
+            ))
+            .await
+            .unwrap();
+        let unknown = value(unknown);
+        assert!(!unknown.ok);
+        assert_eq!(unknown.metadata["miss"], "not_found");
+        assert_eq!(unknown.metadata["op"], "inspect");
     }
 
     #[tokio::test]

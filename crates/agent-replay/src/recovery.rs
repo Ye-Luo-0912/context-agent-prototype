@@ -2,7 +2,8 @@
 //! context-engine state and locate the durability barrier after a failed
 //! turn commit.
 //!
-//! The runtime's `TurnCompleted` barrier is the durability contract: events
+//! The runtime's `TurnCompleted` barrier is the successful-turn durability
+//! contract: events
 //! at or before the last successful `TurnCompleted` are durably committed,
 //! and a failed barrier (`TurnCommitFailed` + `RecoveryRequired`) means the
 //! turn did *not* commit — the runtime drops the turn frame and fences
@@ -107,6 +108,10 @@ pub fn analyze_barrier(events: &[RuntimeEventEnvelope]) -> RecoveryBarrier {
     for envelope in events {
         match &envelope.event {
             RuntimeEvent::TurnCompleted => last_committed_seq = envelope.seq,
+            // TurnCancelled has its own durable audit barrier, but it
+            // explicitly means that no model/context turn commit occurred.
+            // It must never advance the successful-commit recovery marker.
+            RuntimeEvent::TurnCancelled { .. } => {}
             RuntimeEvent::TurnCommitFailed { phase, message } if failure.is_none() => {
                 failure = Some(RecoveryFailure {
                     seq: envelope.seq,
@@ -263,7 +268,7 @@ fn compare_diagnostics(
     left: &ContextDiagnostics,
     right: &ContextDiagnostics,
 ) -> (bool, Option<String>) {
-    let pairs: [(&str, usize, usize); 17] = [
+    let pairs: [(&str, usize, usize); 18] = [
         ("total_items", left.total_items, right.total_items),
         ("active_items", left.active_items, right.active_items),
         ("cooling_items", left.cooling_items, right.cooling_items),
@@ -274,6 +279,7 @@ fn compare_diagnostics(
             right.tombstoned_items,
         ),
         ("resident_items", left.resident_items, right.resident_items),
+        ("resident_bytes", left.resident_bytes, right.resident_bytes),
         ("warm_items", left.warm_items, right.warm_items),
         ("cold_items", left.cold_items, right.cold_items),
         ("external_items", left.external_items, right.external_items),
@@ -371,12 +377,13 @@ pub fn render_recovery_report(report: &RecoveryReport) -> String {
     }
     let diagnostics = &report.rebuilt_diagnostics;
     out.push_str(&format!(
-        "rebuilt context: total={} active={} cooling={} archived={} resident={} warm={} cold={} external={} | turn={} event_seq={}\n",
+        "rebuilt context: total={} active={} cooling={} archived={} resident={} bytes={} warm={} cold={} external={} | turn={} event_seq={}\n",
         diagnostics.total_items,
         diagnostics.active_items,
         diagnostics.cooling_items,
         diagnostics.archived_items,
         diagnostics.resident_items,
+        diagnostics.resident_bytes,
         diagnostics.warm_items,
         diagnostics.cold_items,
         diagnostics.external_items,
@@ -391,7 +398,7 @@ mod tests {
     use super::*;
     use agent_contracts::{
         ContextConsumptionAck, ContextMaintenanceReport, ContextMaintenanceTrigger,
-        ContextSelection, OperationId, TaskId, ToolOutput, TurnId,
+        ContextSelection, OperationId, TaskId, ToolOutput, TurnCancellationReason, TurnId,
     };
     use serde_json::json;
 
@@ -467,9 +474,7 @@ mod tests {
         events.push(envelope(
             run,
             seq,
-            RuntimeEvent::UserMessageAccepted {
-                content: "fix AuthService.rs".into(),
-            },
+            RuntimeEvent::user_message_accepted("fix AuthService.rs"),
         ));
         seq += 1;
         events.push(envelope(
@@ -516,9 +521,7 @@ mod tests {
         events.push(envelope(
             run,
             seq,
-            RuntimeEvent::UserMessageAccepted {
-                content: "verify".into(),
-            },
+            RuntimeEvent::user_message_accepted("verify"),
         ));
         seq += 1;
         events.push(prepared_event(run, seq));
@@ -563,9 +566,7 @@ mod tests {
         events.push(envelope(
             run,
             last + 1,
-            RuntimeEvent::UserMessageAccepted {
-                content: "third turn".into(),
-            },
+            RuntimeEvent::user_message_accepted("third turn"),
         ));
         let failed_seq = last + 2;
         events.push(envelope(
@@ -605,6 +606,38 @@ mod tests {
         assert_eq!(failure.phase, "turn_completed_event");
         assert_eq!(barrier.events_after_failure, 2);
         assert!(report.seq_contiguous);
+    }
+
+    #[test]
+    fn cancelled_turn_does_not_advance_the_successful_commit_barrier() {
+        let run = RunId::new();
+        let mut events = happy_trace(run);
+        let last_committed = events.last().unwrap().seq;
+        let cancelled_turn = TurnId::new();
+        events.push(envelope(
+            run,
+            last_committed + 1,
+            RuntimeEvent::user_message_accepted("cancel this"),
+        ));
+        events.push(envelope(
+            run,
+            last_committed + 2,
+            RuntimeEvent::TurnCancelled {
+                turn_id: cancelled_turn,
+                task_id: None,
+                operation_id: Some(OperationId::new()),
+                cancelled_generation: 7,
+                effective_generation: 8,
+                reason: TurnCancellationReason::Requested,
+            },
+        ));
+
+        let barrier = analyze_barrier(&events);
+        assert_eq!(
+            barrier.last_committed_seq, last_committed,
+            "a durable cancellation is an audit fact, not a successful model/context commit"
+        );
+        assert_eq!(barrier.failure, None);
     }
 
     #[tokio::test]

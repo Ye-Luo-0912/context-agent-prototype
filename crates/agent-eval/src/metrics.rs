@@ -8,8 +8,10 @@
 //! aggregated here deterministically, so the accounting logic is tested
 //! without a model and reused by the live harness.
 
-use agent_contracts::{RuntimeEvent, RuntimeEventEnvelope};
-use std::collections::HashSet;
+use agent_contracts::{
+    CAPABILITY_MANAGE, CONTEXT_MANAGE, ContextItemId, RuntimeEvent, RuntimeEventEnvelope,
+};
+use std::collections::{HashMap, HashSet};
 
 /// Deterministic per-run measurements aggregated from the event stream.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -24,7 +26,7 @@ pub struct RunMetrics {
     pub schema_tokens_total: u64,
     /// Model rounds that produced a surface plan.
     pub rounds: u64,
-    /// User turns (`UserMessageAccepted`).
+    /// User turns (`UserMessageAccepted` with Applied lifecycle).
     pub turns: u64,
     /// Tool calls (`ToolStarted`).
     pub tool_calls: u64,
@@ -67,6 +69,10 @@ pub struct RunMetrics {
     pub final_warm_items: u64,
     pub final_cold_items: u64,
     pub final_external_items: u64,
+    /// Last preview's Resident heap body bytes (`ContextDiagnostics.resident_bytes`).
+    pub final_resident_bytes: u64,
+    /// Max Resident heap body bytes seen across previews.
+    pub peak_resident_bytes: u64,
     /// Cumulative store I/O from full-GC passes (`ContextGc`): bytes
     /// written (externalization), bytes read back (recall), and items
     /// recalled from the store.
@@ -78,6 +84,34 @@ pub struct RunMetrics {
     /// rendering overhead). 0 when no preview carried a timestamp.
     pub materialize_ms_p50: u64,
     pub materialize_ms_p95: u64,
+
+    // Retrieval（M15 / CTX-DISC）：从事件流计 search/inspect/fetch，
+    // 并用 GC 外置/驱逐 id 与后续命中做 found-after-forgotten 连接。
+    /// `context.manage` / `capability.manage` search calls.
+    pub search_calls: u64,
+    /// Descriptor rows returned by those searches.
+    pub search_hits: u64,
+    /// Searches that returned zero descriptors.
+    pub search_empty: u64,
+    pub search_miss_not_found: u64,
+    pub search_miss_evidence_absent: u64,
+    pub search_miss_provider_unavailable: u64,
+    /// Search latency from `ToolStarted`→`ToolFinished` envelope timestamps.
+    pub search_ms_p50: u64,
+    pub search_ms_p95: u64,
+    pub inspect_calls: u64,
+    pub fetch_calls: u64,
+    pub admit_calls: u64,
+    /// Unique ids evicted or externalized this run.
+    pub forgotten_items: u64,
+    /// Forgotten ids later seen in a search/inspect/fetch/admit/reactivation.
+    pub recovered_items: u64,
+    /// Final diagnostics snapshot of graded access stamps.
+    pub access_search_hits: u64,
+    pub access_inspects: u64,
+    pub access_fetches: u64,
+    pub access_admits: u64,
+    pub access_consumption_acks: u64,
 }
 
 /// Aggregate one run's envelopes. The caller filters to a single run.
@@ -85,10 +119,14 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     let mut metrics = RunMetrics::default();
     let mut read_paths: HashSet<String> = HashSet::new();
     let mut materialize_ms_samples: Vec<u64> = Vec::new();
+    let mut search_ms_samples: Vec<u64> = Vec::new();
+    let mut open_calls: HashMap<String, OpenManageCall> = HashMap::new();
+    let mut forgotten: HashSet<ContextItemId> = HashSet::new();
+    let mut recovered: HashSet<ContextItemId> = HashSet::new();
 
     for envelope in events {
         match &envelope.event {
-            RuntimeEvent::UserMessageAccepted { .. } => metrics.turns += 1,
+            RuntimeEvent::UserMessageAccepted { input } if input.is_applied() => metrics.turns += 1,
             RuntimeEvent::ToolStarted { call } => {
                 metrics.tool_calls += 1;
                 if call.name == "fs.read"
@@ -96,6 +134,27 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     && !read_paths.insert(path.to_string())
                 {
                     metrics.repeated_fs_reads += 1;
+                }
+                if let Some(op) = manage_op(&call.name, &call.arguments) {
+                    match op.as_str() {
+                        "inspect" => metrics.inspect_calls += 1,
+                        "fetch" => metrics.fetch_calls += 1,
+                        "admit" => metrics.admit_calls += 1,
+                        "search" => metrics.search_calls += 1,
+                        _ => {}
+                    }
+                    open_calls.insert(
+                        call.id.clone(),
+                        OpenManageCall {
+                            started_ms: envelope.timestamp_ms,
+                            op,
+                            item_id: call
+                                .arguments
+                                .get("item_id")
+                                .and_then(|value| value.as_str())
+                                .and_then(|raw| raw.parse().ok()),
+                        },
+                    );
                 }
             }
             RuntimeEvent::ToolFinished { output } => {
@@ -106,9 +165,58 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     metrics.artifact_spills += 1;
                 }
                 metrics.output_chars_total += output.model_content.chars().count() as u64;
+                let open = open_calls.remove(&output.call_id);
+                let op = output
+                    .metadata
+                    .get("op")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                    .or_else(|| open.as_ref().map(|call| call.op.clone()));
+                if is_manage_tool(&output.tool_name) && op.as_deref() == Some("search") {
+                    if open.is_none() {
+                        metrics.search_calls += 1;
+                    }
+                    let hits = output
+                        .metadata
+                        .get("descriptors")
+                        .and_then(|value| value.as_array())
+                        .map(|rows| rows.len() as u64)
+                        .unwrap_or(0);
+                    metrics.search_hits += hits;
+                    if hits == 0 {
+                        metrics.search_empty += 1;
+                    }
+                    if let Some(started) = open.as_ref() {
+                        search_ms_samples
+                            .push(envelope.timestamp_ms.saturating_sub(started.started_ms));
+                    }
+                    for id in descriptor_ids(&output.metadata) {
+                        if forgotten.contains(&id) {
+                            recovered.insert(id);
+                        }
+                    }
+                }
+                if is_manage_tool(&output.tool_name)
+                    && let Some(code) = output.metadata.get("miss").and_then(|value| value.as_str())
+                {
+                    match code {
+                        "not_found" => metrics.search_miss_not_found += 1,
+                        "evidence_absent" => metrics.search_miss_evidence_absent += 1,
+                        "provider_unavailable" => metrics.search_miss_provider_unavailable += 1,
+                        _ => {}
+                    }
+                }
+                if let Some(started) = open.as_ref()
+                    && matches!(started.op.as_str(), "inspect" | "fetch" | "admit")
+                    && let Some(id) = started.item_id
+                    && forgotten.contains(&id)
+                {
+                    recovered.insert(id);
+                }
             }
             RuntimeEvent::ContextMaintained { report, .. } => {
                 metrics.lifecycle_transitions += report.transitions.len() as u64;
+                snapshot_access(&mut metrics, &report.diagnostics);
             }
             RuntimeEvent::ContextGc { report } => {
                 metrics.gc_evictions += report.evicted as u64;
@@ -117,6 +225,18 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 metrics.store_write_bytes_total += report.store_write_bytes;
                 metrics.store_read_bytes_total += report.store_read_bytes;
                 metrics.store_recalled_items_total += report.store_recalled_items;
+                for eviction in &report.evictions {
+                    forgotten.insert(eviction.item_id);
+                }
+                for id in &report.externalized_ids {
+                    forgotten.insert(*id);
+                }
+                for reactivation in &report.reactivations {
+                    if forgotten.contains(&reactivation.item_id) {
+                        recovered.insert(reactivation.item_id);
+                    }
+                }
+                snapshot_access(&mut metrics, &report.diagnostics);
             }
             RuntimeEvent::ToolSurfacePlanned { report } => {
                 metrics.rounds += 1;
@@ -144,13 +264,16 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 if *materialize_ms > 0 {
                     materialize_ms_samples.push(*materialize_ms);
                 }
-                // The last preview's diagnostics are the run's final
-                // residency snapshot (Resident/Warm/Cold/External counts).
                 metrics.final_total_items = diagnostics.total_items as u64;
                 metrics.final_resident_items = diagnostics.resident_items as u64;
                 metrics.final_warm_items = diagnostics.warm_items as u64;
                 metrics.final_cold_items = diagnostics.cold_items as u64;
                 metrics.final_external_items = diagnostics.external_items as u64;
+                metrics.final_resident_bytes = diagnostics.resident_bytes as u64;
+                metrics.peak_resident_bytes = metrics
+                    .peak_resident_bytes
+                    .max(diagnostics.resident_bytes as u64);
+                snapshot_access(&mut metrics, diagnostics);
             }
             _ => {}
         }
@@ -160,7 +283,62 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
         metrics.materialize_ms_p50 = percentile(&materialize_ms_samples, 50);
         metrics.materialize_ms_p95 = percentile(&materialize_ms_samples, 95);
     }
+    if !search_ms_samples.is_empty() {
+        search_ms_samples.sort_unstable();
+        metrics.search_ms_p50 = percentile(&search_ms_samples, 50);
+        metrics.search_ms_p95 = percentile(&search_ms_samples, 95);
+    }
+    metrics.forgotten_items = forgotten.len() as u64;
+    metrics.recovered_items = recovered.len() as u64;
     metrics
+}
+
+struct OpenManageCall {
+    started_ms: u64,
+    op: String,
+    item_id: Option<ContextItemId>,
+}
+
+fn is_manage_tool(name: &str) -> bool {
+    name == CONTEXT_MANAGE || name == CAPABILITY_MANAGE
+}
+
+fn manage_op(tool_name: &str, arguments: &serde_json::Value) -> Option<String> {
+    if !is_manage_tool(tool_name) {
+        return None;
+    }
+    arguments
+        .get("op")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+/// 从 discovery 描述符卡抽出可解析的 context item id。
+/// tool 名不会通过 `ContextItemId` 解析，因此不会误计为 recovered。
+fn descriptor_ids(metadata: &serde_json::Value) -> Vec<ContextItemId> {
+    let Some(rows) = metadata
+        .get("descriptors")
+        .and_then(|value| value.as_array())
+    else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| {
+            row.get("ref")
+                .and_then(|value| value.get("id"))
+                .and_then(|value| value.as_str())
+                .and_then(|raw| raw.parse().ok())
+        })
+        .collect()
+}
+
+/// 以最后一次 diagnostics 快照覆盖分级戳计数（累计值，不是增量）。
+fn snapshot_access(metrics: &mut RunMetrics, diagnostics: &agent_contracts::ContextDiagnostics) {
+    metrics.access_search_hits = diagnostics.access_search_hits;
+    metrics.access_inspects = diagnostics.access_inspects;
+    metrics.access_fetches = diagnostics.access_fetches;
+    metrics.access_admits = diagnostics.access_admits;
+    metrics.access_consumption_acks = diagnostics.access_consumption_acks;
 }
 
 /// The nearest-rank percentile of a sorted sample: index
@@ -179,7 +357,12 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          materialize: rounds={} selected_items={} selected_tokens={} active_tokens={}\n\
          materialize_latency: p50={}ms p95={}ms\n\
          residency(final): total={} resident={} warm={} cold={} external={}\n\
+         resident_bytes: final={} peak={}\n\
          store: write_bytes={} read_bytes={} recalled_items={}\n\
+         retrieval: search_calls={} hits={} empty={} miss(not_found/absent/unavailable)={}/{}/{}\n\
+         retrieval_latency: p50={}ms p95={}ms inspect={} fetch={} admit={}\n\
+         recovery: forgotten={} recovered={}\n\
+         access: search_hits={} inspects={} fetches={} admits={} acks={}\n\
          behavior: tool_calls={} failed_outputs={} spills={} output_chars={} repeated_fs_reads={}\n",
         metrics.model_input_tokens,
         metrics.model_output_tokens,
@@ -201,9 +384,29 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.final_warm_items,
         metrics.final_cold_items,
         metrics.final_external_items,
+        metrics.final_resident_bytes,
+        metrics.peak_resident_bytes,
         metrics.store_write_bytes_total,
         metrics.store_read_bytes_total,
         metrics.store_recalled_items_total,
+        metrics.search_calls,
+        metrics.search_hits,
+        metrics.search_empty,
+        metrics.search_miss_not_found,
+        metrics.search_miss_evidence_absent,
+        metrics.search_miss_provider_unavailable,
+        metrics.search_ms_p50,
+        metrics.search_ms_p95,
+        metrics.inspect_calls,
+        metrics.fetch_calls,
+        metrics.admit_calls,
+        metrics.forgotten_items,
+        metrics.recovered_items,
+        metrics.access_search_hits,
+        metrics.access_inspects,
+        metrics.access_fetches,
+        metrics.access_admits,
+        metrics.access_consumption_acks,
         metrics.tool_calls,
         metrics.failed_tool_outputs,
         metrics.artifact_spills,
@@ -218,9 +421,9 @@ mod tests {
     use agent_contracts::{
         AttentionState, ContextDiagnostics, ContextGcReport, ContextItemId, ContextKind,
         ContextMaintenanceReport, ContextMaintenanceTrigger, ContextScope, ContextSelection,
-        ContextStateTransition, RunId, ScoreBreakdown, TaskId, ToolOutput, ToolSurfaceDemand,
-        ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceSelection,
-        ToolSurfaceSourceRevisions, TurnId,
+        ContextStateTransition, InputLifecycle, RunId, RuntimeInputEnvelope, ScoreBreakdown,
+        TaskId, ToolOutput, ToolSurfaceDemand, ToolSurfacePlanReport, ToolSurfacePlanStatus,
+        ToolSurfaceSelection, ToolSurfaceSourceRevisions, TurnId,
     };
     use serde_json::json;
 
@@ -265,9 +468,7 @@ mod tests {
         events.push(envelope(
             run,
             seq,
-            RuntimeEvent::UserMessageAccepted {
-                content: "fix it".into(),
-            },
+            RuntimeEvent::user_message_accepted("fix it"),
         ));
         seq += 1;
         events.push(envelope(
@@ -355,6 +556,7 @@ mod tests {
                     reactivated: 1,
                     externalized: 1,
                     aged_external: 0,
+                    anchor_roots_protected: 1,
                     evictions: Vec::new(),
                     reactivations: Vec::new(),
                     store_blob_delete_errors: 0,
@@ -362,6 +564,7 @@ mod tests {
                     store_read_bytes: 128,
                     store_recalled_items: 2,
                     diagnostics: Default::default(),
+                    externalized_ids: Vec::new(),
                 },
             },
         ));
@@ -414,6 +617,7 @@ mod tests {
                 diagnostics: ContextDiagnostics {
                     total_items: 10,
                     resident_items: 6,
+                    resident_bytes: 1_200,
                     warm_items: 2,
                     cold_items: 1,
                     external_items: 1,
@@ -447,6 +651,7 @@ mod tests {
                 diagnostics: ContextDiagnostics {
                     total_items: 11,
                     resident_items: 7,
+                    resident_bytes: 1_800,
                     warm_items: 2,
                     cold_items: 1,
                     external_items: 1,
@@ -490,6 +695,8 @@ mod tests {
         assert_eq!(metrics.final_warm_items, 2);
         assert_eq!(metrics.final_cold_items, 1);
         assert_eq!(metrics.final_external_items, 1);
+        assert_eq!(metrics.final_resident_bytes, 1_800);
+        assert_eq!(metrics.peak_resident_bytes, 1_800);
         assert_eq!(metrics.store_write_bytes_total, 512);
         assert_eq!(metrics.store_read_bytes_total, 128);
         assert_eq!(metrics.store_recalled_items_total, 2);
@@ -505,8 +712,105 @@ mod tests {
         assert!(
             rendered.contains("residency(final): total=11 resident=7 warm=2 cold=1 external=1")
         );
+        assert!(rendered.contains("resident_bytes: final=1800 peak=1800"));
         assert!(rendered.contains("materialize_latency: p50=20ms p95=20ms"));
         assert!(rendered.contains("store: write_bytes=512 read_bytes=128 recalled_items=2"));
+        assert!(rendered.contains("retrieval: search_calls=0"));
+        assert!(rendered.contains("recovery: forgotten=0 recovered=0"));
+    }
+
+    #[test]
+    fn retrieval_metrics_join_forgotten_ids_and_search_hits() {
+        let run = RunId::new();
+        let forgotten = ContextItemId::new();
+        let call_id = "search-1";
+        let events = vec![
+            RuntimeEventEnvelope {
+                run_id: run,
+                seq: 1,
+                timestamp_ms: 10,
+                event: RuntimeEvent::ToolStarted {
+                    call: agent_contracts::ToolCall {
+                        id: call_id.into(),
+                        name: agent_contracts::CONTEXT_MANAGE.into(),
+                        arguments: json!({"op": "search", "query": "AuthService"}),
+                    },
+                },
+            },
+            RuntimeEventEnvelope {
+                run_id: run,
+                seq: 2,
+                timestamp_ms: 12,
+                event: RuntimeEvent::ContextGc {
+                    report: ContextGcReport {
+                        externalized: 1,
+                        externalized_ids: vec![forgotten],
+                        diagnostics: agent_contracts::ContextDiagnostics {
+                            access_search_hits: 0,
+                            ..Default::default()
+                        },
+                        ..ContextGcReport::default()
+                    },
+                },
+            },
+            RuntimeEventEnvelope {
+                run_id: run,
+                seq: 3,
+                timestamp_ms: 50,
+                event: RuntimeEvent::ToolFinished {
+                    output: ToolOutput {
+                        call_id: call_id.into(),
+                        tool_name: agent_contracts::CONTEXT_MANAGE.into(),
+                        ok: true,
+                        summary: "1 external ref(s) match".into(),
+                        model_content: "hit".into(),
+                        artifact_ref: None,
+                        metadata: json!({
+                            "op": "search",
+                            "kind": "context",
+                            "descriptors": [{
+                                "ref": {
+                                    "version": 1,
+                                    "kind": "context",
+                                    "id": forgotten.to_string()
+                                },
+                                "title": "AuthService",
+                                "summary": "AuthService",
+                                "owner": "context",
+                                "lifecycle": "Cold"
+                            }]
+                        }),
+                    },
+                },
+            },
+        ];
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.search_calls, 1);
+        assert_eq!(metrics.search_hits, 1);
+        assert_eq!(metrics.search_empty, 0);
+        assert_eq!(metrics.search_ms_p50, 40);
+        assert_eq!(metrics.forgotten_items, 1);
+        assert_eq!(metrics.recovered_items, 1);
+        let rendered = render_metrics(&metrics);
+        assert!(rendered.contains("retrieval: search_calls=1 hits=1"));
+        assert!(rendered.contains("recovery: forgotten=1 recovered=1"));
+    }
+
+    #[test]
+    fn rejected_user_input_is_not_a_turn() {
+        let run = RunId::new();
+        let rejected =
+            RuntimeInputEnvelope::from_preview("second").with_lifecycle(InputLifecycle::Rejected);
+        let events = vec![
+            envelope(run, 1, RuntimeEvent::user_message_accepted("first")),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::UserMessageAccepted { input: rejected },
+            ),
+        ];
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.turns, 1);
     }
 
     #[test]

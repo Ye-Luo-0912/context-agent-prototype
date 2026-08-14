@@ -19,13 +19,18 @@ use serde_json::{Value, json};
 use tool_runtime::BuiltinToolDispatcher;
 
 fn request(name: &str, arguments: Value) -> ToolExecutionRequest {
+    request_for_run(RunId::new(), name, arguments)
+}
+
+fn request_for_run(run_id: RunId, name: &str, arguments: Value) -> ToolExecutionRequest {
     ToolExecutionRequest {
-        run_id: RunId::new(),
+        run_id,
         call: ToolCall {
             id: "conformance".into(),
             name: name.into(),
             arguments,
         },
+        effect_context: None,
         cancel: CancellationToken::new(),
     }
 }
@@ -239,7 +244,8 @@ async fn artifact_read_is_bounded_confined_and_references_real_artifacts() {
         .await
         .unwrap();
     let outcome = dispatcher
-        .execute(request(
+        .execute(request_for_run(
+            run_id,
             "artifact.read",
             json!({"reference": reference, "start_line": 2, "end_line": 2}),
         ))
@@ -260,7 +266,11 @@ async fn artifact_read_is_bounded_confined_and_references_real_artifacts() {
         "https://example.com/x",
     ] {
         let outcome = dispatcher
-            .execute(request("artifact.read", json!({"reference": reference})))
+            .execute(request_for_run(
+                run_id,
+                "artifact.read",
+                json!({"reference": reference}),
+            ))
             .await;
         // A structured error is also correct; only a succeeding read (or a
         // failing-but-ok output) is a violation.

@@ -62,9 +62,9 @@ impl ApprovalGate for AllowAllGate {
     }
 }
 
-/// An empty tool surface: the model under test gets no tools, so the wire
-/// request carries `tools: []` (the live endpoint rejects requests with
-/// tools). The task is pure context retention, not tool use.
+/// An empty tool surface: the default live task is context retention, so
+/// the wire request carries `tools: []`. Coding live runs use `--fixture-live`
+/// with the builtin dispatcher; dotted Core ids are mapped by the provider.
 struct NoToolDispatcher;
 
 #[async_trait::async_trait]
@@ -83,20 +83,31 @@ impl ToolDispatcher for NoToolDispatcher {
 /// Build the model transport from `OPENAI_API_KEY` / `OPENAI_BASE_URL` /
 /// `OPENAI_MODEL` (same contract the TUI composition root uses).
 pub(crate) fn build_model() -> anyhow::Result<Arc<dyn ModelTransport>> {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .context("OPENAI_API_KEY is not set — the live eval needs a real model")?;
+    build_model_with_timeout(Duration::from_secs(120))
+}
+
+/// Live coding cells: one tool-using round on a reasoning model can exceed
+/// the retention-smoke HTTP timeout.
+pub(crate) fn build_live_coding_model() -> anyhow::Result<Arc<dyn ModelTransport>> {
+    build_model_with_timeout(Duration::from_secs(300))
+}
+
+fn build_model_with_timeout(timeout: Duration) -> anyhow::Result<Arc<dyn ModelTransport>> {
+    let api_key = crate::envfile::get("OPENAI_API_KEY").context(
+        "OPENAI_API_KEY is not set — put it in eval.env (gitignored) or the process environment",
+    )?;
     if api_key.trim().is_empty() {
-        anyhow::bail!("OPENAI_API_KEY is empty — the live eval needs a real model");
+        anyhow::bail!("OPENAI_API_KEY is empty — put it in eval.env, do not paste it into chat");
     }
-    let base_url = std::env::var("OPENAI_BASE_URL")
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let base_url = crate::envfile::get("OPENAI_BASE_URL")
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let model = crate::envfile::get("OPENAI_MODEL").unwrap_or_else(|| "gpt-4o-mini".to_string());
     let provider = OpenAiProvider::new(OpenAiConfig {
         api_key,
         base_url,
         model,
         max_output_tokens: 4096,
-        timeout: Duration::from_secs(120),
+        timeout,
         send_stream_options: true,
         send_max_tokens: true,
         max_stream_bytes: provider_openai::DEFAULT_MAX_STREAM_BYTES,

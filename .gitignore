@@ -5,3 +5,8 @@
 *.db
 *.db-shm
 *.db-wal
+
+# Local live-eval secrets (copy from eval.env.example).
+eval.env
+.env
+.env.local

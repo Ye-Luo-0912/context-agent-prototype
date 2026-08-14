@@ -68,6 +68,7 @@ impl Tool for FsListTool {
         run_id: RunId,
         call_id: &str,
         arguments: Value,
+        _effect_context: Option<agent_contracts::OperationEffectContext>,
         _cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let args: ListArgs = serde_json::from_value(arguments)
@@ -162,7 +163,7 @@ impl FsListTool {
     /// between pages.
     async fn page_from_snapshot(
         &self,
-        _run_id: RunId,
+        run_id: RunId,
         call_id: &str,
         cursor: &str,
         limit: usize,
@@ -170,7 +171,7 @@ impl FsListTool {
         use super::{parse_cursor, read_snapshot_lines};
 
         let (reference, offset) = parse_cursor(cursor)?;
-        let lines = read_snapshot_lines(&self.workspace, reference).await?;
+        let lines = read_snapshot_lines(&self.workspace, run_id, reference).await?;
         if offset > lines.len() {
             return Err(AgentError::InvalidRequest(format!(
                 "cursor is past the end of the snapshot ({offset} > {} lines)",
@@ -265,6 +266,7 @@ impl Tool for FsReadTool {
         _run_id: RunId,
         call_id: &str,
         arguments: Value,
+        _effect_context: Option<agent_contracts::OperationEffectContext>,
         _cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let args: ReadArgs = serde_json::from_value(arguments)
@@ -342,6 +344,45 @@ impl FsWriteTool {
     pub fn new(workspace: Workspace) -> Self {
         Self { workspace }
     }
+
+    async fn execute_inner(
+        &self,
+        call_id: &str,
+        arguments: Value,
+        effect_context: Option<agent_contracts::OperationEffectContext>,
+    ) -> AgentResult<ToolOutcome> {
+        let args: WriteArgs = serde_json::from_value(arguments)
+            .map_err(|e| AgentError::InvalidRequest(format!("fs.write args: {e}")))?;
+        let path = self.workspace.resolve_mutation(&args.path).await?;
+        let transaction = self
+            .workspace
+            .begin_mutation("fs.write", "write", &args.path)
+            .await?;
+        // Computation is staged, the side effect is not applied yet: the
+        // runtime owns the commit after the generation fence. Production
+        // dispatches attach Core's stable identity; direct legacy tests can
+        // still exercise the transaction primitive without one.
+        let prepared = match effect_context {
+            Some(context) => {
+                transaction
+                    .prepare_with_effect_context(args.content.as_bytes(), context)
+                    .await?
+            }
+            None => transaction.prepare(args.content.as_bytes()).await?,
+        };
+        let effect: Box<dyn Effect> = Box::new(prepared);
+        let relative = display_relative(&self.workspace, &path);
+        let output = ToolOutput {
+            call_id: call_id.into(),
+            tool_name: "fs.write".into(),
+            ok: true,
+            summary: format!("wrote {} bytes to {}", args.content.len(), relative),
+            model_content: format!("file updated: {relative}"),
+            artifact_ref: None,
+            metadata: json!({"bytes": args.content.len()}),
+        };
+        Ok(ToolOutcome::PreparedEffect { output, effect })
+    }
 }
 
 #[derive(Deserialize)]
@@ -374,30 +415,10 @@ impl Tool for FsWriteTool {
         _run_id: RunId,
         call_id: &str,
         arguments: Value,
+        effect_context: Option<agent_contracts::OperationEffectContext>,
         _cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
-        let args: WriteArgs = serde_json::from_value(arguments)
-            .map_err(|e| AgentError::InvalidRequest(format!("fs.write args: {e}")))?;
-        let path = self.workspace.resolve_mutation(&args.path).await?;
-        let transaction = self
-            .workspace
-            .begin_mutation("fs.write", "write", &args.path)
-            .await?;
-        // Computation is staged, the side effect is not applied yet: the
-        // runtime owns the commit after the generation fence.
-        let prepared = transaction.prepare(args.content.as_bytes()).await?;
-        let effect: Box<dyn Effect> = Box::new(prepared);
-        let relative = display_relative(&self.workspace, &path);
-        let output = ToolOutput {
-            call_id: call_id.into(),
-            tool_name: "fs.write".into(),
-            ok: true,
-            summary: format!("wrote {} bytes to {}", args.content.len(), relative),
-            model_content: format!("file updated: {relative}"),
-            artifact_ref: None,
-            metadata: json!({"bytes": args.content.len()}),
-        };
-        Ok(ToolOutcome::PreparedEffect { output, effect })
+        self.execute_inner(call_id, arguments, effect_context).await
     }
 }
 
@@ -429,7 +450,7 @@ mod tests {
                 arguments: json!({"path": path, "content": content}),
             };
             async move {
-                tool.execute(run_id, "c", call.arguments, CancellationToken::new())
+                tool.execute(run_id, "c", call.arguments, None, CancellationToken::new())
                     .await
             }
         };
@@ -505,10 +526,11 @@ mod tests {
                 name: "fs.write".into(),
                 arguments: json!({"path": ".focus-agent/traces.jsonl", "content": "x"}),
             },
+            effect_context: None,
             cancel: CancellationToken::new(),
         };
         let result = tool
-            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .execute(run_id, "c", request.call.arguments, None, request.cancel)
             .await;
         assert!(result.is_err(), "state dir writes must be rejected");
     }
@@ -529,7 +551,7 @@ mod tests {
                 arguments: json!({"path": path}),
             };
             async move {
-                tool.execute(run_id, "c", call.arguments, CancellationToken::new())
+                tool.execute(run_id, "c", call.arguments, None, CancellationToken::new())
                     .await
             }
         };
@@ -594,7 +616,7 @@ mod tests {
                 arguments: args,
             };
             async move {
-                tool.execute(run_id, "c", call.arguments, CancellationToken::new())
+                tool.execute(run_id, "c", call.arguments, None, CancellationToken::new())
                     .await
             }
         };

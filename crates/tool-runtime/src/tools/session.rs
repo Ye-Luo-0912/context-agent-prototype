@@ -8,7 +8,6 @@
 //! individual tool calls that drive it.
 
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -17,18 +16,20 @@ use agent_contracts::{
     ToolRisk, ToolSpec,
 };
 use agent_process::kill_process_tree;
-use agent_workspace::Workspace;
+use agent_workspace::{ArtifactDraft, Workspace};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncWriteExt, BufWriter},
     process::Command,
     sync::{Mutex, mpsc},
 };
 
 use super::Tool;
-use super::stream::{BUFFER_LINES, StreamLine, record_line};
+use super::stream::{
+    MAX_ARTIFACT_BYTES, StreamCapture, StreamChunk, spawn_stderr_reader, spawn_stdout_reader,
+};
 
 const MAX_ARGV: usize = 64;
 const MAX_ARG_CHARS: usize = 16_384;
@@ -51,33 +52,24 @@ const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// the channel; `poll` drains them into the bounded tail and the artifact.
 pub(crate) struct ProcessSession {
     child: tokio::process::Child,
-    rx: mpsc::Receiver<StreamLine>,
-    tail: VecDeque<String>,
-    total_lines: usize,
-    total_chars: usize,
+    pid: u32,
+    rx: mpsc::Receiver<StreamChunk>,
+    capture: StreamCapture,
     artifact_ref: String,
-    artifact_path: std::path::PathBuf,
+    /// 同一个 pinned draft 句柄贯穿整个 session；stop 时才封成 digest。
+    artifact: BufWriter<ArtifactDraft>,
 }
 
 impl ProcessSession {
-    async fn drain(
-        &mut self,
-        artifact: &mut BufWriter<tokio::fs::File>,
-    ) -> AgentResult<(usize, bool)> {
+    async fn drain(&mut self) -> AgentResult<(usize, bool)> {
         let mut new_lines = 0usize;
         let mut exited = false;
         loop {
             match self.rx.try_recv() {
-                Ok(StreamLine::Stdout(line)) | Ok(StreamLine::Stderr(line)) => {
-                    record_line(
-                        &line,
-                        &mut self.tail,
-                        artifact,
-                        &mut self.total_lines,
-                        &mut self.total_chars,
-                    )
-                    .await?;
-                    new_lines += 1;
+                Ok(chunk) => {
+                    if self.capture.record(chunk, &mut self.artifact).await? {
+                        new_lines = new_lines.saturating_add(1);
+                    }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -98,16 +90,10 @@ impl ProcessSession {
             // draining, so no output is ever fabricated as complete.
             loop {
                 match tokio::time::timeout(EXIT_DRAIN_TIMEOUT, self.rx.recv()).await {
-                    Ok(Some(StreamLine::Stdout(line))) | Ok(Some(StreamLine::Stderr(line))) => {
-                        record_line(
-                            &line,
-                            &mut self.tail,
-                            artifact,
-                            &mut self.total_lines,
-                            &mut self.total_chars,
-                        )
-                        .await?;
-                        new_lines += 1;
+                    Ok(Some(chunk)) => {
+                        if self.capture.record(chunk, &mut self.artifact).await? {
+                            new_lines = new_lines.saturating_add(1);
+                        }
                     }
                     Ok(None) => break, // all readers at EOF: the tail is complete
                     Err(_) => {
@@ -158,7 +144,7 @@ impl Tool for ProcessSessionTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "process.session".into(),
-            description: "Manage a long-running process session: start (argv, no shell) returns a session id; poll reports status and drains output; stop kills the whole process tree and reaps the session.".into(),
+            description: "Manage a long-running process session: start (argv, no shell) returns a session id; poll reports status and drains output into a bounded tail/artifact prefix; stop kills the whole process tree and reaps the session.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["action"],
@@ -180,12 +166,16 @@ impl Tool for ProcessSessionTool {
         run_id: RunId,
         call_id: &str,
         arguments: Value,
+        effect_context: Option<agent_contracts::OperationEffectContext>,
         cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let args: SessionArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("process.session args: {e}")))?;
         match args.action.as_str() {
-            "start" => self.start(run_id, call_id, args, cancel).await,
+            "start" => {
+                self.start(run_id, call_id, args, effect_context, cancel)
+                    .await
+            }
             "poll" => self.poll(call_id, args).await,
             "stop" => self.stop(call_id, args).await,
             other => Err(AgentError::InvalidRequest(format!(
@@ -201,6 +191,7 @@ impl ProcessSessionTool {
         run_id: RunId,
         call_id: &str,
         args: SessionArgs,
+        effect_context: Option<agent_contracts::OperationEffectContext>,
         _cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         if args.argv.is_empty() {
@@ -266,52 +257,41 @@ impl ProcessSessionTool {
         let mut child = command
             .spawn()
             .map_err(|e| AgentError::Tool(format!("spawn {}: {e}", args.argv[0])))?;
+        let pid = match super::persist_spawned_process(&self.workspace, &effect_context, &child) {
+            Ok(pid) => pid,
+            Err(error) => {
+                super::abandon_spawned_process(&mut child);
+                let _ = child.kill().await;
+                return Err(error);
+            }
+        };
 
-        // The artifact file is created up front so its reference is valid;
-        // the output lands there when `poll` drains the session (which
-        // reopens the file by path and appends).
-        let (artifact_ref, artifact_path) = self
+        // 会话存活期间发布 draft 定位符，stop 时再封口。
+        let draft = self
             .workspace
-            .create_artifact_path(run_id, "process-session", "log")
+            .create_artifact(run_id, "process-session", "log")
             .await?;
+        let artifact_ref = draft.locator().to_string();
 
-        let (line_tx, line_rx) = mpsc::channel::<StreamLine>(512);
+        let (line_tx, line_rx) = mpsc::channel::<StreamChunk>(512);
         if let Some(stdout) = child.stdout.take() {
-            let tx = line_tx.clone();
-            let mut lines = BufReader::new(stdout).lines();
-            tokio::spawn(async move {
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx.send(StreamLine::Stdout(line)).await.is_err() {
-                        break;
-                    }
-                }
-            });
+            spawn_stdout_reader(stdout, line_tx.clone());
         }
         if let Some(stderr) = child.stderr.take() {
-            let tx = line_tx.clone();
-            let mut lines = BufReader::new(stderr).lines();
-            tokio::spawn(async move {
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx.send(StreamLine::Stderr(line)).await.is_err() {
-                        break;
-                    }
-                }
-            });
+            spawn_stderr_reader(stderr, line_tx.clone());
         }
         drop(line_tx);
 
         let session_id = ContextItemId::new().to_string();
-        let pid = child.id().unwrap_or(0);
         self.sessions.lock().await.insert(
             session_id.clone(),
             ProcessSession {
                 child,
+                pid,
                 rx: line_rx,
-                tail: VecDeque::with_capacity(BUFFER_LINES + 1),
-                total_lines: 0,
-                total_chars: 0,
+                capture: StreamCapture::new(),
                 artifact_ref: artifact_ref.clone(),
-                artifact_path,
+                artifact: BufWriter::new(draft),
             },
         );
 
@@ -324,7 +304,15 @@ impl ProcessSessionTool {
                 "session started: {session_id} (pid {pid})\nDrain output with process.session poll.",
             ),
             artifact_ref: Some(artifact_ref),
-            metadata: json!({"action": "start", "session_id": session_id, "pid": pid}),
+            metadata: json!({
+                "action": "start",
+                "session_id": session_id,
+                "pid": pid,
+                "output_bytes": 0,
+                "artifact_bytes": 0,
+                "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
+                "artifact_truncated": false,
+            }),
         }))
     }
 
@@ -339,15 +327,9 @@ impl ProcessSessionTool {
             ))
         })?;
 
-        let artifact_file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&session.artifact_path)
-            .await
-            .map_err(|e| AgentError::Io(format!("open session artifact: {e}")))?;
-        let mut artifact = BufWriter::new(artifact_file);
-        let (new_lines, exited) = session.drain(&mut artifact).await?;
-        artifact
+        let (new_lines, exited) = session.drain().await?;
+        session
+            .artifact
             .flush()
             .await
             .map_err(|e| AgentError::Io(format!("flush session artifact: {e}")))?;
@@ -359,28 +341,42 @@ impl ProcessSessionTool {
                 .await
                 .ok()
                 .and_then(|status| status.code());
+            super::persist_process_exit(&self.workspace, session.pid, code)?;
             ("exited", code)
         } else {
             ("running", None)
         };
-        let tail: Vec<&str> = session.tail.iter().map(String::as_str).collect();
+        let tail = session.capture.model_tail();
+        let total_lines = session.capture.total_lines();
+        let output_bytes = session.capture.total_bytes();
+        let artifact_bytes = session.capture.artifact_bytes();
+        let artifact_truncated = session.capture.artifact_truncated();
+        let truncation_note = if artifact_truncated {
+            format!(
+                "\n\nArtifact capture truncated at {MAX_ARTIFACT_BYTES} bytes; remaining output is still drained but not stored. Captured prefix: {}",
+                session.artifact_ref
+            )
+        } else {
+            String::new()
+        };
+        let truncation_summary = if artifact_truncated {
+            ", artifact truncated"
+        } else {
+            ""
+        };
 
         Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
             tool_name: "process.session".into(),
             ok: true,
             summary: format!(
-                "session {session_id} {status} ({} new line(s), {} total)",
-                new_lines, session.total_lines
+                "session {session_id} {status} ({new_lines} new line(s), {total_lines} total{truncation_summary})",
             ),
             model_content: if new_lines == 0 && tail.is_empty() {
-                format!("session {session_id} {status}; no output yet")
+                format!("session {session_id} {status}; no output yet{truncation_note}")
             } else {
                 format!(
-                    "[session {session_id} {status}; {} new line(s); {} total]\n{}",
-                    new_lines,
-                    session.total_lines,
-                    tail.join("\n")
+                    "[session {session_id} {status}; {new_lines} new line(s); {total_lines} total]\n{tail}{truncation_note}",
                 )
             },
             artifact_ref: Some(session.artifact_ref.clone()),
@@ -390,7 +386,11 @@ impl ProcessSessionTool {
                 "status": status,
                 "exit_code": exit_code,
                 "new_lines": new_lines,
-                "total_lines": session.total_lines,
+                "total_lines": total_lines,
+                "output_bytes": output_bytes,
+                "artifact_bytes": artifact_bytes,
+                "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
+                "artifact_truncated": artifact_truncated,
             }),
         }))
     }
@@ -406,26 +406,54 @@ impl ProcessSessionTool {
             ))
         })?;
 
-        // Kill the whole process tree, not just the direct child.
-        kill_process_tree(session.child.id().unwrap_or(0));
+        kill_process_tree(session.pid);
         let _ = session.child.kill().await;
-        let _ = session.child.wait().await;
+        let exit_code = session
+            .child
+            .wait()
+            .await
+            .ok()
+            .and_then(|status| status.code());
+        super::persist_process_exit(&self.workspace, session.pid, exit_code)?;
+        let artifact_ref = self
+            .workspace
+            .seal_buffered_artifact(session.artifact)
+            .await?;
+
+        let total_lines = session.capture.total_lines();
+        let output_bytes = session.capture.total_bytes();
+        let artifact_bytes = session.capture.artifact_bytes();
+        let artifact_truncated = session.capture.artifact_truncated();
+        let truncation_summary = if artifact_truncated {
+            ", artifact truncated"
+        } else {
+            ""
+        };
 
         Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
             tool_name: "process.session".into(),
             ok: true,
             summary: format!(
-                "session {session_id} stopped ({} total lines)",
-                session.total_lines
+                "session {session_id} stopped ({total_lines} total lines{truncation_summary})",
             ),
-            model_content: format!("session {session_id} stopped"),
-            artifact_ref: Some(session.artifact_ref),
+            model_content: if artifact_truncated {
+                format!(
+                    "session {session_id} stopped; artifact capture was truncated at {MAX_ARTIFACT_BYTES} bytes"
+                )
+            } else {
+                format!("session {session_id} stopped")
+            },
+            artifact_ref: Some(artifact_ref),
             metadata: json!({
                 "action": "stop",
                 "session_id": session_id,
                 "status": "stopped",
-                "total_lines": session.total_lines,
+                "total_lines": total_lines,
+                "output_bytes": output_bytes,
+                "artifact_bytes": artifact_bytes,
+                "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
+                "artifact_truncated": artifact_truncated,
             }),
         }))
     }
@@ -480,6 +508,7 @@ mod tests {
                 run_id,
                 "c",
                 json!({"action": "start", "argv": long_argv()}),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -494,6 +523,7 @@ mod tests {
                 run_id,
                 "c",
                 json!({"action": "poll", "session_id": session_id}),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -507,6 +537,7 @@ mod tests {
                 run_id,
                 "c",
                 json!({"action": "stop", "session_id": session_id}),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -520,6 +551,7 @@ mod tests {
                 run_id,
                 "c",
                 json!({"action": "stop", "session_id": session_id}),
+                None,
                 CancellationToken::new(),
             )
             .await;
@@ -546,6 +578,7 @@ mod tests {
                 run_id,
                 "c",
                 json!({"action": "start", "argv": argv}),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -565,6 +598,7 @@ mod tests {
                     run_id,
                     "c",
                     json!({"action": "poll", "session_id": session_id}),
+                    None,
                     CancellationToken::new(),
                 )
                 .await
@@ -595,6 +629,7 @@ mod tests {
                 run_id,
                 "c",
                 json!({"action": "stop", "session_id": session_id}),
+                None,
                 CancellationToken::new(),
             )
             .await

@@ -3,9 +3,18 @@
 //! `tools/call`. Built as a sibling of the test binaries
 //! (`target/<profile>/mcp_mock_server[.exe]`) so `McpCapabilityAdapter`
 //! tests can spawn it like a real MCP server.
+//!
+//! Two `mock.echo` arguments drive the cancellation tests:
+//! - `heartbeat: "<path>"` starts a background thread rewriting the file
+//!   with an incrementing counter every 50 ms — the only observable
+//!   liveness signal from outside the process, so a test can prove the
+//!   server tree was actually terminated (the counter stops);
+//! - `hang: true` answers nothing and sleeps, so the client must abort via
+//!   its cancel token or request deadline.
 
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
+use std::time::Duration;
 
 fn main() {
     let stdin = std::io::stdin();
@@ -42,10 +51,36 @@ fn main() {
                 let name = request["params"]["name"].as_str().unwrap_or("");
                 let arguments = &request["params"]["arguments"];
                 match name {
-                    "mock.echo" => json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "result": {"content": [{"type": "text", "text": arguments["text"].as_str().unwrap_or("")}]}
-                    }),
+                    "mock.echo" => {
+                        if let Some(path) = arguments.get("heartbeat").and_then(Value::as_str) {
+                            let path = std::path::PathBuf::from(path);
+                            std::thread::spawn(move || {
+                                let mut n: u64 = 0;
+                                loop {
+                                    let _ = std::fs::write(&path, n.to_string());
+                                    n += 1;
+                                    std::thread::sleep(Duration::from_millis(50));
+                                }
+                            });
+                        }
+                        if arguments
+                            .get("hang")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            // Answer nothing: the client must abort via its
+                            // cancel token or request deadline. The heartbeat
+                            // thread (when started) keeps ticking until the
+                            // process tree is killed, which is what the
+                            // cancellation test observes.
+                            std::thread::sleep(Duration::from_secs(3600));
+                            continue;
+                        }
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {"content": [{"type": "text", "text": arguments["text"].as_str().unwrap_or("")}]}
+                        })
+                    }
                     "mock.add" => {
                         let a = arguments["a"].as_f64().unwrap_or(0.0);
                         let b = arguments["b"].as_f64().unwrap_or(0.0);

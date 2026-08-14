@@ -15,10 +15,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_contracts::{
-    AgentError, AgentResult, CONTEXT_MANAGE, ContextEngine, ContextIngress, ContextItemId,
-    ContextKind, ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery, EngineQuery,
-    FocusState, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, RuntimeEvent, TaskId,
-    ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    AgentError, AgentResult, CONTEXT_MANAGE, ContextConsumptionAck, ContextDiagnostics,
+    ContextEngine, ContextGcReport, ContextHints, ContextIngress, ContextItem, ContextItemId,
+    ContextItemSummary, ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger,
+    ContextQuery, ContextSearchQuery, ContextStateTransition, EngineQuery, ExternalizedContext,
+    FocusState, MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport,
+    RuntimeEvent, ScopeId, ScopeKind, StorageGcReport, StoreReconcileReport, TaskId, ToolCall,
+    ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
 };
 
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
@@ -77,6 +80,7 @@ async fn seed_externalized(engine: &SimpleContextEngine) -> (ContextItemId, Stri
             kind: None,
             scope: None,
             task_id: None,
+            label: None,
             limit: 16,
         })
         .await
@@ -183,6 +187,7 @@ impl ToolDispatcher for EngineQueryTools {
                     kind: None,
                     scope: None,
                     task_id: None,
+                    label: None,
                     limit: 16,
                 },
             }),
@@ -260,6 +265,102 @@ impl ToolDispatcher for EngineQueryTools {
             }
             other => Err(AgentError::Tool(format!("unsupported op: {other:?}"))),
         }
+    }
+}
+
+/// 转发到真实引擎并在每次 materialize 时记录 hints——验证 actor 把当前
+/// 任务锚的根声明投影进 materialize 请求（端到端：TaskManager -> actor
+/// 组装 -> ContextQuery.hints -> 引擎）。
+struct CapturingEngine {
+    inner: SimpleContextEngine,
+    hints: Arc<Mutex<Vec<ContextHints>>>,
+}
+
+impl CapturingEngine {
+    fn new(inner: SimpleContextEngine) -> Self {
+        Self {
+            inner,
+            hints: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ContextEngine for CapturingEngine {
+    async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+        self.inner.ingest(ingress).await
+    }
+    async fn maintain(
+        &self,
+        trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        self.inner.maintain(trigger).await
+    }
+    async fn gc(&self) -> AgentResult<ContextGcReport> {
+        self.inner.gc().await
+    }
+    async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
+        self.hints.lock().unwrap().push(query.hints.clone());
+        self.inner.materialize(query).await
+    }
+    async fn acknowledge_consumption(&self, ack: ContextConsumptionAck) -> AgentResult<()> {
+        self.inner.acknowledge_consumption(ack).await
+    }
+    async fn open_scope(&self, kind: ScopeKind, parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        self.inner.open_scope(kind, parent).await
+    }
+    async fn close_scope(&self, scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        self.inner.close_scope(scope_id).await
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        self.inner.diagnostics().await
+    }
+    async fn storage_gc(&self) -> AgentResult<StorageGcReport> {
+        self.inner.storage_gc().await
+    }
+    async fn reconcile_store(&self) -> AgentResult<StoreReconcileReport> {
+        self.inner.reconcile_store().await
+    }
+    async fn inspect(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        self.inner.inspect(limit).await
+    }
+    async fn search_external(
+        &self,
+        query: ContextSearchQuery,
+    ) -> AgentResult<Vec<ExternalizedContext>> {
+        self.inner.search_external(query).await
+    }
+    async fn inspect_external(
+        &self,
+        item_id: ContextItemId,
+    ) -> AgentResult<Option<ExternalizedContext>> {
+        self.inner.inspect_external(item_id).await
+    }
+    async fn fetch_external(&self, item_id: ContextItemId) -> AgentResult<Option<ContextItem>> {
+        self.inner.fetch_external(item_id).await
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        self.inner.checkpoint().await
+    }
+    async fn restore(&self, data: serde_json::Value) -> AgentResult<()> {
+        self.inner.restore(data).await
+    }
+}
+
+/// 每轮返回空回复（无工具调用），让 turn 正常完成。
+struct PlainModel;
+
+#[async_trait::async_trait]
+impl ModelTransport for PlainModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        Ok(ModelOutput {
+            content: "ok".into(),
+            tool_calls: Vec::new(),
+            usage: Default::default(),
+        })
     }
 }
 
@@ -655,4 +756,106 @@ async fn admit_and_derive_through_the_runtime_never_duplicate_observations() {
         tool_observations, 2,
         "only the two seeded steps may be ToolObservations, got {summaries:?}"
     );
+}
+
+#[tokio::test]
+async fn task_anchor_roots_are_projected_into_materialization_hints() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(CapturingEngine::new(SimpleContextEngine::new(
+        SimpleContextConfig {
+            context_store_dir: Some(dir.path().to_path_buf()),
+            ..SimpleContextConfig::default()
+        },
+    )));
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        engine.clone(),
+        Arc::new(PlainModel),
+        Arc::new(EngineQueryTools),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _runtime_task) = spawn_runtime(kernel);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+
+    // 第一轮：actor auto-create task，锚尚无声明 → materialize hints 的
+    // anchor_roots 投影为空。
+    handle
+        .user_message("start the auth refactor".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut completed = false;
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if matches!(envelope.event, RuntimeEvent::TurnCompleted) {
+                completed = true;
+            }
+        }
+        if completed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(completed, "the first turn must complete");
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+
+    // 给任务锚加一条 ResidentRequired 声明（item_ref 是任意引用的格式，
+    // 引擎按 id/uri/entity 解析，这里只验证投影本身）。
+    let anchor = agent_runtime::TaskAnchor {
+        original_goal: "start the auth refactor".into(),
+        current_interpretation: "refactor".into(),
+        working_refs: vec![agent_runtime::ContextRootClaim {
+            item_ref: "context://run/target".into(),
+            role: agent_runtime::RootClaimRole::ActiveDecision,
+            strength: agent_runtime::RootClaimStrength::ResidentRequired,
+            source_field_id: "working_refs".into(),
+        }],
+        ..Default::default()
+    };
+    handle.update_task_anchor(task_id, 0, anchor).await.unwrap();
+
+    // 第二轮：materialize 的 hints 必须携带投影后的根声明——任务权威
+    // 从 TaskManager 一路流到 ContextQuery，且未复制锚本身。
+    handle
+        .user_message("continue the refactor".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut completed = false;
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if matches!(envelope.event, RuntimeEvent::TurnCompleted) {
+                completed = true;
+            }
+        }
+        if completed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(completed, "the second turn must complete");
+    handle.stop().await.unwrap();
+
+    let hints = engine.hints.lock().unwrap();
+    assert!(
+        hints.len() >= 2,
+        "两轮 materialize 都应被捕获，got {}",
+        hints.len()
+    );
+    assert!(
+        hints[0].anchor_roots.is_empty(),
+        "无声明时投影必须为空，got {:?}",
+        hints[0].anchor_roots
+    );
+    let last = hints.last().expect("at least one materialize");
+    assert_eq!(last.anchor_roots.len(), 1, "投影携带声明");
+    assert_eq!(last.anchor_roots[0].item_ref, "context://run/target");
+    assert_eq!(
+        last.anchor_roots[0].strength,
+        agent_contracts::AnchorRootStrength::ResidentRequired,
+        "强度原样投影"
+    );
+    assert_eq!(last.anchor_roots[0].source_field_id, "working_refs");
 }

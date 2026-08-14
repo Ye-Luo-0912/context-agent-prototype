@@ -11,8 +11,11 @@
 mod capability_host;
 mod mcp;
 
-pub use capability_host::{ProcessCapabilityAdapter, load_process_capability};
+pub use capability_host::{
+    BROKER_FS_READ_MAX_BYTES, ProcessCapabilityAdapter, load_process_capability,
+};
 pub use mcp::{
+    DEFAULT_MAX_SKIPPED_BYTES_PER_REQUEST, DEFAULT_MAX_SKIPPED_FRAMES_PER_REQUEST,
     DEFAULT_MCP_MAX_FRAME_BYTES, DEFAULT_MCP_REQUEST_TIMEOUT, MAX_MCP_TOOL_TEXT_CHARS,
     MCP_PROTOCOL_VERSION, McpCallResult, McpCapabilityAdapter, McpClient, McpServerDecl,
     McpStdioClient, McpTool,

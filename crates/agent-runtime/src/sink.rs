@@ -2,13 +2,7 @@
 //! journaling them (the final `AssistantMessage` carries the complete content
 //! for replay).
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_contracts::{
     AgentResult, ModelChunk, ModelEventSink, OperationId, RunId, RuntimeEvent,
@@ -19,7 +13,9 @@ use tokio::sync::broadcast;
 #[derive(Clone)]
 pub(crate) struct LiveSink {
     event_tx: broadcast::Sender<RuntimeEventEnvelope>,
-    seq: Arc<AtomicU64>,
+    /// Durable cursor of the `ModelStarted` event that opened this stream.
+    /// Live deltas repeat it; they never allocate journal sequence numbers.
+    journal_cursor: u64,
     run_id: RunId,
     /// The operation this sink belongs to. Every streamed delta carries this
     /// identity so a consumer can drop deltas from a superseded turn.
@@ -31,7 +27,7 @@ pub(crate) struct LiveSink {
 impl LiveSink {
     pub(crate) fn new(
         event_tx: broadcast::Sender<RuntimeEventEnvelope>,
-        seq: Arc<AtomicU64>,
+        journal_cursor: u64,
         run_id: RunId,
         turn_id: TurnId,
         operation_id: OperationId,
@@ -39,7 +35,7 @@ impl LiveSink {
     ) -> Self {
         Self {
             event_tx,
-            seq,
+            journal_cursor,
             run_id,
             turn_id,
             operation_id,
@@ -50,7 +46,7 @@ impl LiveSink {
     fn emit_live(&self, event: RuntimeEvent) {
         let envelope = RuntimeEventEnvelope {
             run_id: self.run_id,
-            seq: self.seq.fetch_add(1, Ordering::Relaxed) + 1,
+            seq: self.journal_cursor,
             timestamp_ms: now_ms(),
             event,
         };

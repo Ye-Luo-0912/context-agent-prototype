@@ -19,10 +19,32 @@ use crate::materializer;
 use crate::scope;
 use crate::store;
 
-/// 每次 `context.search` 调用最多强化 recency 的命中数。被检索到说明
-/// 条目被重新关注，Cold -> External 的老化应延迟；有界防止反复搜索
-/// 无限刷 recency。只动 last_access 时钟，从不覆盖终态语义或根集。
-pub(crate) const SEARCH_REINFORCE_MAX_PER_CALL: usize = 8;
+/// 一条 anchor 根声明的 item_ref 是否匹配给定 id + entity 签名：精确
+/// id、`context://run/<id>` uri，或精确 entity 名。TaskAnchor 声明的是
+/// 引用（不嵌入 body），engine 只按这三类键解析它指向谁。
+pub(crate) fn anchor_ref_matches(item_ref: &str, id: ContextItemId, entities: &[String]) -> bool {
+    item_ref == id.to_string()
+        || item_ref == format!("context://run/{id}")
+        || entities.iter().any(|entity| entity == item_ref)
+}
+
+/// 一条 anchor 根声明是否匹配某个 resident 条目（mark 与 materialize
+/// 共用同一解析，保证 GC 根与强制入帧看到同一目标集）。
+pub(crate) fn anchor_claim_matches_item(
+    claim: &agent_contracts::AnchorRootClaim,
+    item: &ContextItem,
+) -> bool {
+    anchor_ref_matches(&claim.item_ref, item.id, &item.entities)
+}
+
+/// 一条 anchor 根声明是否匹配某个外部映射条目（Cold/External 的召回与
+/// Storage GC 保护共用同一解析）。
+pub(crate) fn anchor_claim_matches_entry(
+    claim: &agent_contracts::AnchorRootClaim,
+    entry: &agent_contracts::ExternalizedContext,
+) -> bool {
+    anchor_ref_matches(&claim.item_ref, entry.item_id, &entry.entities)
+}
 
 #[derive(Debug, Clone)]
 pub struct SimpleContextConfig {
@@ -230,6 +252,11 @@ pub(crate) struct State {
     /// replace) go through `ExternalMap` methods so the indexes cannot drift.
     #[serde(default)]
     pub(crate) external: crate::index::external::ExternalMap,
+    /// Canonical `item_id -> location` directory plus query indexes shared
+    /// by GC recall and `context.search`. Derived from the three body stores
+    /// and skipped in checkpoints; restore rebuilds it.
+    #[serde(skip)]
+    pub(crate) catalog: crate::index::catalog::ContextCatalog,
     /// Counts full GC passes only. External-entry aging (Cold -> External)
     /// and TTLs compare this epoch, never the tick counter — the tick also
     /// advances on ingest/maintain/materialize, so a pass-based TTL must
@@ -246,6 +273,17 @@ pub(crate) struct State {
     pub(crate) gc_externalized_total: u64,
     #[serde(default)]
     pub(crate) gc_storage_deleted_total: u64,
+    /// 分级检索戳累计（进 diagnostics / checkpoint）。
+    #[serde(default)]
+    pub(crate) access_search_hits: u64,
+    #[serde(default)]
+    pub(crate) access_inspects: u64,
+    #[serde(default)]
+    pub(crate) access_fetches: u64,
+    #[serde(default)]
+    pub(crate) access_admits: u64,
+    #[serde(default)]
+    pub(crate) access_consumption_acks: u64,
     /// Directives counted against the per-turn admit cap. Reset by the
     /// next user message (turn boundary); a turn whose admits are refused
     /// keeps the count so the model learns the cap from refusals.
@@ -255,6 +293,17 @@ pub(crate) struct State {
     /// as `admits_this_turn`).
     #[serde(default)]
     pub(crate) derives_this_turn: usize,
+    /// 本回合已对相同检索指纹执行过 search 强化的次数。回合边界清零。
+    /// 不进 checkpoint：恢复后最多再给一次 search 强化，不会变成 pin。
+    #[serde(skip)]
+    pub(crate) search_query_stamps_this_turn: std::collections::HashMap<u64, u32>,
+    /// The active task's typed root claims, projected from its TaskAnchor by
+    /// the runtime via `ContextAction::AnchorRoots`. Consumed by GC
+    /// (`ResidentRequired`/`PromptRequired` protect the heap) and Storage GC
+    /// (`StorageRequired` protects the store). Replacement-only, bounded by
+    /// `MAX_ANCHOR_ROOT_CLAIMS`; the engine never owns task authority.
+    #[serde(default)]
+    pub(crate) anchor_roots: Vec<agent_contracts::AnchorRootClaim>,
     /// Bounded in-engine lifecycle ledger: every item transition on any
     /// axis (attention/semantic/residency/gc) with cause, trigger, turn and
     /// related id. Oldest rows drop past the cap; export to a JSONL
@@ -268,6 +317,37 @@ pub(crate) struct State {
     /// record site only needs `&mut State`.
     #[serde(default)]
     pub(crate) ledger_cap: usize,
+}
+
+impl State {
+    /// Rebuild the catalog when the body stores or event clock moved.
+    /// Search and GC recall consume this directory; callers must sync
+    /// before reading it.
+    pub(crate) fn sync_catalog(&mut self) {
+        self.catalog.sync(
+            &self.items[..],
+            &self.eviction_buffer,
+            &self.external[..],
+            self.event_seq,
+        );
+    }
+
+    /// 活跃任务里每个最近文件的最新成功观察。已完成任务或没有焦点时为空：
+    /// 文件正文根不能把上一个任务的正文带进下一个任务。
+    pub(crate) fn latest_file_body_ids(&self) -> std::collections::HashSet<ContextItemId> {
+        let Some(task) = self.focus.as_ref().map(|focus| focus.task_id) else {
+            return std::collections::HashSet::new();
+        };
+        let completed = self.scopes.iter().any(|scope| {
+            scope.kind == ScopeKind::Task
+                && scope.task_id == Some(task)
+                && scope.state == ScopeState::Closed
+        });
+        if completed {
+            return std::collections::HashSet::new();
+        }
+        entity::latest_file_body_ids(self.items.iter(), Some(task))
+    }
 }
 
 pub struct SimpleContextEngine {
@@ -324,7 +404,8 @@ impl SimpleContextEngine {
 fn has_exactly_one_owner(state: &State, item_id: ContextItemId) -> bool {
     // The heap and external map own unique id indexes; the reversible Warm
     // buffer is bounded by config, so checking all three locations is O(1)
-    // plus a small bounded scan rather than O(total history).
+    // plus a small bounded scan rather than O(total history). The catalog
+    // skips a duplicate on rebuild, so it cannot be the duplicate detector.
     let resident = usize::from(state.items.indexes().get(item_id).is_some());
     let warm = usize::from(state.eviction_buffer.iter().any(|item| item.id == item_id));
     let external = usize::from(state.external.get(item_id).is_some());
@@ -341,31 +422,7 @@ fn stamp_consumed(
     turn: u64,
     gc_epoch: u64,
 ) -> bool {
-    if let Some(index) = state.items.indexes().get(item_id) {
-        let item = &mut state.items.items_mut()[index];
-        item.last_access_tick = now_tick;
-        item.last_access_turn = turn;
-        item.last_selected_turn = turn;
-        item.access_count = item.access_count.saturating_add(1);
-        return true;
-    }
-    if let Some(item) = state
-        .eviction_buffer
-        .iter_mut()
-        .find(|item| item.id == item_id)
-    {
-        item.last_access_tick = now_tick;
-        item.last_access_turn = turn;
-        item.last_selected_turn = turn;
-        item.access_count = item.access_count.saturating_add(1);
-        return true;
-    }
-    if let Some(entry) = state.external.get_mut(item_id) {
-        entry.last_access_tick = now_tick;
-        entry.last_access_gc_epoch = Some(gc_epoch);
-        return true;
-    }
-    false
+    crate::access::stamp_consumed(state, item_id, now_tick, turn, gc_epoch)
 }
 
 #[async_trait::async_trait]
@@ -385,6 +442,7 @@ impl ContextEngine for SimpleContextEngine {
                 // admit/derive caps are per user turn, not per process run.
                 state.admits_this_turn = 0;
                 state.derives_this_turn = 0;
+                state.search_query_stamps_this_turn.clear();
                 // Episode rotation: the working set is bounded by the current
                 // episode plus unresolved semantic state, not by task turns.
                 // A new instruction that is semantically distant from the
@@ -519,6 +577,13 @@ impl ContextEngine for SimpleContextEngine {
                         &mut state,
                         &content,
                         &format!("error verified fixed by successful tool result (round {round})"),
+                        observation_id,
+                    );
+                }
+                if ok {
+                    reachability::queue_file_body_supersessions(
+                        &mut state,
+                        &content,
                         observation_id,
                     );
                 }
@@ -944,20 +1009,12 @@ impl ContextEngine for SimpleContextEngine {
         query: agent_contracts::ContextSearchQuery,
     ) -> AgentResult<Vec<agent_contracts::ExternalizedContext>> {
         let mut state = self.state.lock().await;
-        let hits = crate::store::search_entries(&state.external, &query);
-        // search 命中给条目一个有界的 recency 强化——被检索到说明条目被
-        // 重新关注，Cold -> External 的老化应延迟。有界：每次调用最多
-        // 强化前 SEARCH_REINFORCE_MAX_PER_CALL 个命中，只动 last_access
-        // 时钟；terminal 命中已被 externally_retrievable 过滤，search
-        // 从不覆盖终态语义或 GC 根集（根集由 mark_roots 决定）。
-        let now_tick = state.event_seq;
-        let gc_epoch = state.gc_epoch;
-        for hit in hits.iter().take(SEARCH_REINFORCE_MAX_PER_CALL) {
-            if let Some(entry) = state.external.get_mut(hit.item_id) {
-                entry.last_access_tick = now_tick;
-                entry.last_access_gc_epoch = Some(gc_epoch);
-            }
-        }
+        state.sync_catalog();
+        let hits = crate::store::search_catalog(&state, &query);
+        // search 命中是最弱信号：相同查询本回合只强化一次，单条目同一
+        // event_seq 冷却，饱和后不再推迟 Cold 老化。terminal 命中已被
+        // externally_retrievable 过滤；search 从不覆盖终态语义或 GC 根。
+        crate::access::reinforce_search_hits(&mut state, &hits, &query);
         Ok(hits)
     }
 
@@ -965,12 +1022,18 @@ impl ContextEngine for SimpleContextEngine {
         &self,
         item_id: ContextItemId,
     ) -> AgentResult<Option<agent_contracts::ExternalizedContext>> {
-        let state = self.state.lock().await;
-        Ok(state
+        let mut state = self.state.lock().await;
+        let retrievable = state
             .external
             .get(item_id)
-            .filter(|entry| crate::store::externally_retrievable(entry))
-            .cloned())
+            .is_some_and(crate::store::externally_retrievable);
+        if !retrievable {
+            return Ok(None);
+        }
+        // inspect 是故意读取描述符，强于 search。更强信号（fetch/ack）
+        // 已经写过时 stamp 拒绝降级，返回值仍是当前权威描述符。
+        crate::access::stamp_read(&mut state, item_id, agent_contracts::AccessSignal::Inspect);
+        Ok(state.external.get(item_id).cloned())
     }
 
     async fn fetch_external(&self, item_id: ContextItemId) -> AgentResult<Option<ContextItem>> {
@@ -978,36 +1041,31 @@ impl ContextEngine for SimpleContextEngine {
         // read happens *outside* it — sync store IO must never stall the
         // context hot path.
         let dir = crate::store::store_dir(&self.config);
-        let (retrievable, now_tick, gc_epoch) = {
+        let retrievable = {
             let state = self.state.lock().await;
             // O(1) id-index membership instead of a linear scan: the
             // model's retrieval loop calls this per item.
-            let retrievable = state
+            state
                 .external
                 .get(item_id)
-                .is_some_and(crate::store::externally_retrievable);
-            (retrievable, state.event_seq, state.gc_epoch)
+                .is_some_and(crate::store::externally_retrievable)
         };
         if !retrievable {
             return Ok(None);
         }
         let item = crate::store::read_item_async(&dir, item_id).await;
         if item.is_some() {
-            // A deliberate pull stamps recency and the GC generation on the
-            // entry, so ranking and Cold -> External aging stay honest — the
-            // item was used, it is not an untouched stale reference.
+            // fetch 读到 body，信号强于 inspect/search。更强的 ack 已经
+            // 写过时 stamp 拒绝降级。
             let mut state = self.state.lock().await;
-            if let Some(entry) = state.external.get_mut(item_id) {
-                // Re-check after IO: a concurrent lifecycle transition may
-                // have made the entry terminal while the file was read.
-                if !crate::store::externally_retrievable(entry) {
-                    return Ok(None);
-                }
-                entry.last_access_tick = now_tick;
-                entry.last_access_gc_epoch = Some(gc_epoch);
-            } else {
+            let still_retrievable = state
+                .external
+                .get(item_id)
+                .is_some_and(crate::store::externally_retrievable);
+            if !still_retrievable {
                 return Ok(None);
             }
+            crate::access::stamp_read(&mut state, item_id, agent_contracts::AccessSignal::Fetch);
         }
         Ok(item)
     }
@@ -1027,6 +1085,7 @@ impl ContextEngine for SimpleContextEngine {
         let _gate = self.op_gate.lock().await;
         let mut state = self.state.lock().await;
         *state = checkpoint::deserialize(data)?;
+        state.sync_catalog();
         // Structural validation before the state becomes live: duplicate
         // ids, cross-location ownership, scope ancestry and item scope
         // references must all hold (see checkpoint::validate).
@@ -1142,6 +1201,21 @@ fn apply_directive(
         }
         ContextAction::Derive { item_id, fact, .. } => {
             return crate::directive::apply_derive(state, config, *item_id, fact.clone());
+        }
+        // The anchor-root projection is a bounded whole-set replacement:
+        // task authority stays with the TaskManager, so there is no per-claim
+        // mutation to serialize with — the engine only mirrors the current
+        // projection for its GC and materialization passes.
+        ContextAction::AnchorRoots { roots } => {
+            if roots.len() > agent_contracts::MAX_ANCHOR_ROOT_CLAIMS {
+                return Some(format!(
+                    "anchor roots refused: {} claims exceed the cap of {}",
+                    roots.len(),
+                    agent_contracts::MAX_ANCHOR_ROOT_CLAIMS
+                ));
+            }
+            state.anchor_roots = roots.clone();
+            return None;
         }
         _ => {}
     }
@@ -1267,9 +1341,11 @@ fn apply_directive(
             // The runtime owns the GC pass; `context.collect` never arrives
             // as an ingest directive (the actor calls `ContextEngine::gc`).
             ContextAction::Collect => {}
-            // Admit/Derive are dispatched above and never reach the
-            // in-memory directive loop.
-            ContextAction::Admit { .. } | ContextAction::Derive { .. } => unreachable!(),
+            // Admit/Derive/AnchorRoots are dispatched above and never reach
+            // the in-memory directive loop.
+            ContextAction::Admit { .. }
+            | ContextAction::Derive { .. }
+            | ContextAction::AnchorRoots { .. } => unreachable!(),
         }
     }
     None
@@ -1282,6 +1358,6 @@ fn directive_item_id(action: &ContextAction) -> ContextItemId {
         | ContextAction::Lease { item_id, .. }
         | ContextAction::Admit { item_id, .. }
         | ContextAction::Derive { item_id, .. } => *item_id,
-        ContextAction::Collect => ContextItemId::new(),
+        ContextAction::Collect | ContextAction::AnchorRoots { .. } => ContextItemId::new(),
     }
 }

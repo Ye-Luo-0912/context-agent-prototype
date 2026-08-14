@@ -10,19 +10,44 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_contracts::{
     AgentResult, ApprovalDecision, ApprovalGate, ContextEngine, ContextHints, ContextKind,
     ContextQuery, ModelTransport, RuntimeEvent, RuntimeEventEnvelope, ToolCall, ToolDispatcher,
     ToolSpec, tokens,
 };
+use agent_runtime::RuntimeHandle;
 use context_baselines::{RollingConfig, RollingSummaryEngine, Summarizer};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 use serde_json::json;
 use tokio::sync::broadcast;
 
-use crate::{metrics, mock_model::ScriptedModel, workload};
+use crate::{bundle, metrics, mock_model::ScriptedModel, workload};
+
+/// 脚本化 fixture：事件之间最多等这么久（本机工具面，不该接近这个上限）。
+const SCRIPTED_IDLE: Duration = Duration::from_secs(120);
+/// 真模型一轮（含 reasoning）可能远长于脚本化路径。
+const LIVE_IDLE: Duration = Duration::from_secs(300);
+/// 真模型 tool-loop 上限：这些 fixture 只需几次调用；超出即取消，避免烧钱。
+const LIVE_MAX_MODEL_ROUNDS: u32 = 12;
+
+/// Per-turn wait policy. Live runs use a longer idle and a round cap.
+#[derive(Clone, Copy)]
+struct TurnLimits {
+    idle: Duration,
+    max_model_rounds: Option<u32>,
+}
+
+const SCRIPTED_LIMITS: TurnLimits = TurnLimits {
+    idle: SCRIPTED_IDLE,
+    max_model_rounds: None,
+};
+
+const LIVE_LIMITS: TurnLimits = TurnLimits {
+    idle: LIVE_IDLE,
+    max_model_rounds: Some(LIVE_MAX_MODEL_ROUNDS),
+};
 
 /// Deterministic stand-in for an LLM rolling summary: a bounded digest of
 /// the folded content, so baseline B's summary marker is content-dependent
@@ -45,6 +70,11 @@ pub struct FixtureEval {
     pub fixture_id: &'static str,
     pub passed: bool,
     pub metrics: metrics::RunMetrics,
+    /// Wall time of this harness cell (composition + turns + shutdown).
+    pub wall_ms: u64,
+    /// 回合超时 / round-cap / runtime 错误。有值时 `passed` 为 false，
+    /// 事件仍写入证据包，细胞不从配对里消失。
+    pub error: Option<String>,
 }
 
 /// Approval policy for the harness: everything is allowed, so the effect
@@ -93,6 +123,33 @@ fn scripted_steps(fixture_id: &str) -> Vec<ToolCall> {
             "fs.write",
             json!({"path": "src/calc.py", "content": "def add(a, b):\n    return a + b\n\ndef test_add():\n    assert add(2, 3) == 5\n"}),
         )],
+        "recall_after_fix" => vec![
+            call(
+                "c1",
+                "edit.replace",
+                json!({"path": "src/util.py", "old": "items[i + 1]", "new": "items[i]"}),
+            ),
+            call(
+                "c2",
+                "fs.write",
+                json!({"path": "src/scratch.md", "content": "The office coffee machine is a Breville. The staff kitchen code is 200.\n"}),
+            ),
+            call(
+                "c3",
+                "fs.write",
+                json!({"path": "src/scratch.md", "content": "The office coffee machine is a Breville. The staff kitchen code is 200.\nThe spare HDMI cable is in drawer 3. Standups are at 09:30.\n"}),
+            ),
+            call(
+                "c4",
+                "fs.write",
+                json!({"path": "src/scratch.md", "content": "The office coffee machine is a Breville. The staff kitchen code is 200.\nThe spare HDMI cable is in drawer 3. Standups are at 09:30.\nThe wifi guest password is listed on the fridge. The printer is in room 4B.\n"}),
+            ),
+            call(
+                "c5",
+                "fs.write",
+                json!({"path": "src/main.py", "content": "from util import visit_all\nprint(visit_all([1, 2, 3]))\n"}),
+            ),
+        ],
         other => panic!("no scripted steps for fixture '{other}'"),
     }
 }
@@ -182,49 +239,76 @@ async fn manager_token_cost(engine: &dyn ContextEngine) -> anyhow::Result<u64> {
 
 /// Run one fixture through the append-only, rolling-summary and dynamic
 /// engines on the same multi-turn script and compare the all-module cost.
-/// Each engine gets a fresh scripted model instance (the script counter is
-/// per-instance), so the only difference between the rows is the context
-/// policy.
+/// Each engine gets a **fresh seeded workspace** under `workspace_root/<engine>`
+/// so a later arm cannot inherit an earlier arm's edit.
 pub async fn compare_engines(
     fixture: &workload::CodingFixture,
     workspace_root: &Path,
 ) -> anyhow::Result<Vec<EngineRun>> {
-    let prompts = multi_turn_prompts(fixture);
+    compare_engines_with_model(fixture, workspace_root, None, None).await
+}
+
+/// Live M15 pairing: same three engines and hidden verification as
+/// `--compare-arm`, but each cell is driven by `model` on `live_turns`
+/// (one prompt for the original four; five for `recall_after_fix`).
+/// Rolling still folds with the scripted digest.
+pub async fn compare_engines_live(
+    fixture: &workload::CodingFixture,
+    workspace_root: &Path,
+    model: Arc<dyn ModelTransport>,
+    pair: Option<&bundle::PairSink>,
+) -> anyhow::Result<Vec<EngineRun>> {
+    compare_engines_with_model(fixture, workspace_root, Some(model), pair).await
+}
+
+async fn compare_engines_with_model(
+    fixture: &workload::CodingFixture,
+    workspace_root: &Path,
+    live_model: Option<Arc<dyn ModelTransport>>,
+    pair: Option<&bundle::PairSink>,
+) -> anyhow::Result<Vec<EngineRun>> {
+    let live = live_model.is_some();
+    let prompts = if live || workload::scripted_one_tool_per_turn(fixture) {
+        workload::live_turns(fixture)
+    } else {
+        multi_turn_prompts(fixture)
+    };
     let turns: Vec<&str> = prompts.iter().map(String::as_str).collect();
+    let limits = if live { LIVE_LIMITS } else { SCRIPTED_LIMITS };
+    let repeat = pair.map(|p| p.repeat).unwrap_or(1);
+    let order = if live {
+        crate::analysis::arm_order(fixture.id, repeat)
+    } else {
+        crate::analysis::SCRIPTED_ARM_ORDER
+    };
     let mut runs = Vec::new();
-    for (name, engine) in [
-        (
-            "append",
-            Arc::new(context_baselines::AppendOnlyEngine::new()) as Arc<dyn ContextEngine>,
-        ),
-        (
-            "rolling",
-            // A real rolling baseline on the fixture workload: the default
-            // 9 000-token threshold never folds a five-turn fixture (the
-            // whole run stays near 300 tokens), so the arm would silently
-            // degrade to append-only. These thresholds fold from the
-            // fourth turn onward, so the scripted summarizer actually runs
-            // and its marker cost is measurable.
-            Arc::new(
-                RollingSummaryEngine::with_config(RollingConfig {
-                    summary_threshold_tokens: 200,
-                    keep_most_recent_tokens: 100,
-                })
-                .with_summarizer(Arc::new(ScriptedSummarizer)),
-            ) as Arc<dyn ContextEngine>,
-        ),
-        (
-            "dynamic",
-            Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()))
-                as Arc<dyn ContextEngine>,
-        ),
-    ] {
-        let model: Arc<dyn ModelTransport> = Arc::new(ScriptedModel::new(
-            multi_turn_steps(fixture.id),
-            format!("{}: done", fixture.id),
-        ));
-        let eval =
-            run_fixture_with_engine(fixture, workspace_root, model, engine.clone(), &turns).await?;
+    for name in order {
+        let engine = named_engine(name)?;
+        let root = workspace_root.join(name);
+        std::fs::create_dir_all(&root)?;
+        workload::seed_fixture(fixture, &root);
+        eprintln!("  engine {name}: starting");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        let model: Arc<dyn ModelTransport> = match &live_model {
+            Some(live) => live.clone(),
+            None => Arc::new(scripted_model_for(fixture, /*compare_arm*/ true)),
+        };
+        let eval = run_fixture_with_engine(
+            fixture,
+            &root,
+            model,
+            engine.clone(),
+            &turns,
+            limits,
+            name,
+            pair,
+        )
+        .await?;
+        eprintln!(
+            "  engine {name}: passed={} wall_ms={} model_in={} error={:?}",
+            eval.passed, eval.wall_ms, eval.metrics.model_input_tokens, eval.error
+        );
+        let _ = std::io::Write::flush(&mut std::io::stderr());
         let manager_tokens = manager_token_cost(engine.as_ref()).await?;
         runs.push(EngineRun {
             engine: name,
@@ -232,21 +316,68 @@ pub async fn compare_engines(
             manager_tokens,
         });
     }
+    if let Some(pair) = pair {
+        bundle::write_pair(pair, &order)?;
+    }
     Ok(runs)
+}
+
+fn named_engine(name: &'static str) -> anyhow::Result<Arc<dyn ContextEngine>> {
+    Ok(match name {
+        "append" => Arc::new(context_baselines::AppendOnlyEngine::new()) as Arc<dyn ContextEngine>,
+        "rolling" => {
+            // A real rolling baseline on the fixture workload: the default
+            // 9 000-token threshold never folds a five-turn fixture (the
+            // whole run stays near 300 tokens), so the arm would silently
+            // degrade to append-only. These thresholds fold from the
+            // fourth turn onward, so the scripted summarizer actually runs
+            // and its marker cost is measurable. Live cells keep the same
+            // fold; B is still not a model summarizer.
+            Arc::new(
+                RollingSummaryEngine::with_config(RollingConfig {
+                    summary_threshold_tokens: 200,
+                    keep_most_recent_tokens: 100,
+                })
+                .with_summarizer(Arc::new(ScriptedSummarizer)),
+            ) as Arc<dyn ContextEngine>
+        }
+        "dynamic" => Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()))
+            as Arc<dyn ContextEngine>,
+        other => anyhow::bail!("unknown engine {other}"),
+    })
 }
 
 /// Human-readable comparison table for the cross-engine fixture runs.
 pub fn render_comparison(runs: &[EngineRun]) -> String {
+    render_comparison_header(
+        runs,
+        "fixture cross-engine comparison (same scripted model, same tool surface):",
+    )
+}
+
+/// Live pairing table: real model, `live_turns`, independent workspaces.
+pub fn render_live_comparison(runs: &[EngineRun]) -> String {
+    render_comparison_header(
+        runs,
+        "fixture live comparison (real model, live_turns, independent workspaces):",
+    )
+}
+
+fn render_comparison_header(runs: &[EngineRun], header: &str) -> String {
     let mut out = String::new();
-    out.push_str("fixture cross-engine comparison (same scripted model, same tool surface):\n");
+    out.push_str(header);
+    out.push('\n');
     for run in runs {
         let metrics = &run.eval.metrics;
         out.push_str(&format!(
-            "  {:8} passed={} model_in={:>7} model_out={:>5} schema_tokens={:>6} rounds={} turns={} tool_calls={} lifecycle={} manager_tokens={}\n\
+            "  {:8} passed={} wall_ms={:>7} model_in={:>7} model_out={:>5} schema_tokens={:>6} rounds={} turns={} tool_calls={} lifecycle={} manager_tokens={} error={}\n\
                {:8}   selected_items={} active_tokens={} residency(resident/warm/cold/ext)={}/{}/{}/{}\n\
-               {:8}   materialize(p50/p95)={}ms/{}ms store(w/r/recalled)={}/{}/{}\n",
+               {:8}   resident_bytes final={} peak={}\n\
+               {:8}   materialize(p50/p95)={}ms/{}ms store(w/r/recalled)={}/{}/{}\n\
+               {:8}   retrieval search={}/{} empty={} recovered={}/{} access(search/inspect/fetch/ack)={}/{}/{}/{}\n",
             run.engine,
             run.eval.passed,
+            run.eval.wall_ms,
             metrics.model_input_tokens,
             metrics.model_output_tokens,
             metrics.schema_tokens_total,
@@ -255,6 +386,7 @@ pub fn render_comparison(runs: &[EngineRun]) -> String {
             metrics.tool_calls,
             metrics.lifecycle_transitions,
             run.manager_tokens,
+            run.eval.error.as_deref().unwrap_or("-"),
             "",
             metrics.selected_items_total,
             metrics.active_tokens_total,
@@ -263,14 +395,43 @@ pub fn render_comparison(runs: &[EngineRun]) -> String {
             metrics.final_cold_items,
             metrics.final_external_items,
             "",
+            metrics.final_resident_bytes,
+            metrics.peak_resident_bytes,
+            "",
             metrics.materialize_ms_p50,
             metrics.materialize_ms_p95,
             metrics.store_write_bytes_total,
             metrics.store_read_bytes_total,
             metrics.store_recalled_items_total,
+            "",
+            metrics.search_calls,
+            metrics.search_hits,
+            metrics.search_empty,
+            metrics.recovered_items,
+            metrics.forgotten_items,
+            metrics.access_search_hits,
+            metrics.access_inspects,
+            metrics.access_fetches,
+            metrics.access_consumption_acks,
         ));
     }
     out
+}
+
+/// 脚本化模型：原四题的 `--compare-arm` 仍把多步工具塞进第一轮 tool-loop；
+/// `recall_after_fix` 一轮一工具，对齐 live 的五轮用户输入。
+fn scripted_model_for(fixture: &workload::CodingFixture, compare_arm: bool) -> ScriptedModel {
+    let steps = if compare_arm && !workload::scripted_one_tool_per_turn(fixture) {
+        multi_turn_steps(fixture.id)
+    } else {
+        scripted_steps(fixture.id)
+    };
+    let model = ScriptedModel::new(steps, format!("{}: done", fixture.id));
+    if workload::scripted_one_tool_per_turn(fixture) {
+        model.one_tool_per_turn()
+    } else {
+        model
+    }
 }
 
 /// Run one fixture to completion against the real builtin tool surface with
@@ -279,15 +440,26 @@ pub async fn run_fixture(
     fixture: &workload::CodingFixture,
     workspace_root: &Path,
 ) -> anyhow::Result<FixtureEval> {
-    let model: Arc<dyn ModelTransport> = Arc::new(ScriptedModel::new(
-        scripted_steps(fixture.id),
-        format!("{}: done", fixture.id),
-    ));
-    run_fixture_with_model(fixture, workspace_root, model).await
+    let model: Arc<dyn ModelTransport> = Arc::new(scripted_model_for(fixture, false));
+    let context_engine: Arc<dyn ContextEngine> =
+        Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
+    let prompts = workload::live_turns(fixture);
+    let turns: Vec<&str> = prompts.iter().map(String::as_str).collect();
+    run_fixture_with_engine(
+        fixture,
+        workspace_root,
+        model,
+        context_engine,
+        &turns,
+        SCRIPTED_LIMITS,
+        "dynamic",
+        None,
+    )
+    .await
 }
 
 /// The M15 live path: the same harness with a real model transport. The
-/// model under test sees the fixture description and the real tool surface;
+/// model under test sees `live_turns` and the real tool surface;
 /// the workspace, verification and accounting are identical to the
 /// deterministic run. Requires a provider that accepts tool calls.
 pub async fn run_fixture_with_model(
@@ -297,12 +469,17 @@ pub async fn run_fixture_with_model(
 ) -> anyhow::Result<FixtureEval> {
     let context_engine: Arc<dyn ContextEngine> =
         Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
+    let prompts = workload::live_turns(fixture);
+    let turns: Vec<&str> = prompts.iter().map(String::as_str).collect();
     run_fixture_with_engine(
         fixture,
         workspace_root,
         model,
         context_engine,
-        &[fixture.description],
+        &turns,
+        LIVE_LIMITS,
+        "dynamic",
+        None,
     )
     .await
 }
@@ -313,13 +490,17 @@ pub async fn run_fixture_with_model(
 /// inside one turn the TurnFrame carries the tool protocol, so every engine
 /// sees the same in-turn context. The fixture's hidden verification runs
 /// after the last turn.
-pub async fn run_fixture_with_engine(
+async fn run_fixture_with_engine(
     fixture: &workload::CodingFixture,
     workspace_root: &Path,
     model: Arc<dyn ModelTransport>,
     context_engine: Arc<dyn ContextEngine>,
     turns: &[&str],
+    limits: TurnLimits,
+    engine: &'static str,
+    pair: Option<&bundle::PairSink>,
 ) -> anyhow::Result<FixtureEval> {
+    let started = Instant::now();
     let approval: Arc<dyn ApprovalGate> = Arc::new(AllowAllGate);
 
     let workspace = agent_workspace::Workspace::open(workspace_root).await?;
@@ -362,41 +543,109 @@ pub async fn run_fixture_with_engine(
     let mut events = composed.subscribe();
     composed.instance.start().await?;
 
-    let mut collected: Vec<RuntimeEventEnvelope> = Vec::new();
+    let mut capture = EventCapture::default();
+    let mut error = None;
     for (index, turn) in turns.iter().enumerate() {
         composed.handle().user_message(turn.to_string()).await?;
-        if let Err(reason) = wait_for_turn(&mut events, &mut collected).await {
-            composed.shutdown().await?;
-            return Err(anyhow::anyhow!("turn {} failed: {reason}", index + 1));
+        if let Err(reason) =
+            wait_for_turn(&mut events, &mut capture, composed.handle(), limits).await
+        {
+            error = Some(format!("turn {} failed: {reason}", index + 1));
+            break;
         }
     }
-    let passed = workload::fixture_passes(fixture, workspace_root);
-    composed.shutdown().await?;
+    let passed = error.is_none() && workload::fixture_passes(fixture, workspace_root);
+    let _ = composed.shutdown().await;
 
-    Ok(FixtureEval {
+    let eval = FixtureEval {
         fixture_id: fixture.id,
         passed,
-        metrics: metrics::aggregate_metrics(&collected),
-    })
+        metrics: metrics::aggregate_metrics(&capture.events),
+        wall_ms: started.elapsed().as_millis() as u64,
+        error: error.clone(),
+    };
+    if let Some(pair) = pair {
+        bundle::write_cell(
+            &pair.cell_dir(engine),
+            fixture,
+            engine,
+            pair,
+            &capture.events,
+            &eval.metrics,
+            eval.passed,
+            eval.wall_ms,
+            eval.error.as_deref(),
+            workspace_root,
+            capture.lagged,
+            capture.deltas_omitted,
+        )?;
+    }
+    Ok(eval)
+}
+
+#[derive(Default)]
+struct EventCapture {
+    events: Vec<RuntimeEventEnvelope>,
+    lagged: u64,
+    deltas_omitted: u64,
 }
 
 /// Collect events until the current turn completes, then hand the whole
 /// turn to the metrics aggregator.
 async fn wait_for_turn(
     events: &mut broadcast::Receiver<RuntimeEventEnvelope>,
-    collected: &mut Vec<RuntimeEventEnvelope>,
+    capture: &mut EventCapture,
+    handle: &RuntimeHandle,
+    limits: TurnLimits,
 ) -> Result<(), String> {
+    let mut model_rounds = 0u32;
+    let mut cancelled_for_cap = false;
     loop {
-        match tokio::time::timeout(Duration::from_secs(120), events.recv()).await {
+        match tokio::time::timeout(limits.idle, events.recv()).await {
             Err(_) => return Err("fixture turn timed out".into()),
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                capture.lagged = capture.lagged.saturating_add(skipped);
+                continue;
+            }
             Ok(Err(broadcast::error::RecvError::Closed)) => {
                 return Err("event stream closed".into());
             }
             Ok(Ok(envelope)) => {
-                collected.push(envelope.clone());
+                if matches!(envelope.event, RuntimeEvent::ModelDelta { .. }) {
+                    capture.deltas_omitted = capture.deltas_omitted.saturating_add(1);
+                    continue;
+                }
+                capture.events.push(envelope.clone());
                 match envelope.event {
-                    RuntimeEvent::TurnCompleted => return Ok(()),
+                    RuntimeEvent::ModelStarted { .. } => {
+                        model_rounds = model_rounds.saturating_add(1);
+                        if let Some(max) = limits.max_model_rounds
+                            && model_rounds > max
+                            && !cancelled_for_cap
+                        {
+                            cancelled_for_cap = true;
+                            let _ = handle.cancel_turn().await;
+                        }
+                    }
+                    RuntimeEvent::TurnCompleted => {
+                        if cancelled_for_cap {
+                            return Err(format!(
+                                "live model-round cap ({}) exceeded",
+                                limits.max_model_rounds.unwrap_or(0)
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    RuntimeEvent::TurnCancelled { .. } => {
+                        return Err(if cancelled_for_cap {
+                            format!(
+                                "live model-round cap ({}) exceeded",
+                                limits.max_model_rounds.unwrap_or(0)
+                            )
+                        } else {
+                            "turn cancelled".into()
+                        });
+                    }
                     RuntimeEvent::TurnCommitFailed { message, .. } => {
                         return Err(format!("turn commit failed: {message}"));
                     }
@@ -502,6 +751,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn dynamic_engine_saves_input_tokens_against_append_on_the_fixture_surface() {
         for fixture in &FIXTURES {
+            // 多轮回忆题走 live_turns，不套原四题的「五轮重读 + ≥300 token」断言。
+            if workload::scripted_one_tool_per_turn(fixture) {
+                continue;
+            }
             let dir = tempfile::tempdir().unwrap();
             workload::seed_fixture(fixture, dir.path());
 
@@ -535,6 +788,12 @@ mod tests {
                 assert!(
                     run.eval.metrics.final_total_items >= 1,
                     "engine '{}' must record a residency snapshot on '{}'",
+                    run.engine,
+                    fixture.id
+                );
+                assert!(
+                    run.eval.metrics.peak_resident_bytes > 0,
+                    "engine '{}' must record Resident bytes on '{}'",
                     run.engine,
                     fixture.id
                 );
@@ -588,5 +847,134 @@ mod tests {
                 append.eval.metrics.model_input_tokens
             );
         }
+    }
+
+    /// Later engines must not inherit an earlier engine's edit: each arm
+    /// seeds its own subdirectory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compare_engines_seeds_an_independent_workspace_per_engine() {
+        let fixture = &FIXTURES[0];
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/util.py"), "already broken parent\n").unwrap();
+
+        let runs = compare_engines(fixture, dir.path()).await.unwrap();
+        for run in &runs {
+            assert!(
+                run.eval.passed,
+                "engine '{}' must pass from its own seed, not the poisoned parent",
+                run.engine
+            );
+        }
+        let parent = std::fs::read_to_string(dir.path().join("src/util.py")).unwrap();
+        assert!(
+            parent.contains("already broken parent"),
+            "the parent workspace must stay untouched"
+        );
+    }
+
+    /// `recall_after_fix`：五轮用户输入、一轮一工具，三引擎各自独立 workspace 都过 hidden check。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recall_after_fix_passes_on_all_engines_with_independent_workspaces() {
+        let fixture = FIXTURES
+            .iter()
+            .find(|fixture| fixture.id == "recall_after_fix")
+            .unwrap();
+        assert_eq!(
+            scripted_steps(fixture.id).len(),
+            workload::live_turns(fixture).len()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let runs = compare_engines(fixture, dir.path()).await.unwrap();
+        assert_eq!(runs.len(), 3);
+        for run in &runs {
+            assert!(
+                run.eval.passed,
+                "engine '{}' must pass recall_after_fix",
+                run.engine
+            );
+            assert!(
+                run.eval.metrics.turns >= 5,
+                "engine '{}' must run the five live turns, got {}",
+                run.engine,
+                run.eval.metrics.turns
+            );
+            assert!(
+                run.eval.metrics.tool_calls >= 5,
+                "engine '{}' must emit one tool per live turn, got {}",
+                run.engine,
+                run.eval.metrics.tool_calls
+            );
+            let util = std::fs::read_to_string(dir.path().join(run.engine).join("src/util.py"))
+                .unwrap_or_default();
+            assert!(
+                !util.contains("i + 1"),
+                "engine '{}' must keep the util fix",
+                run.engine
+            );
+            let main = std::fs::read_to_string(dir.path().join(run.engine).join("src/main.py"))
+                .unwrap_or_default();
+            assert!(
+                main.contains("visit_all"),
+                "engine '{}' must write main.py",
+                run.engine
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compare_engines_writes_a_rebuildable_evidence_pair() {
+        let fixture = &FIXTURES[0];
+        let dir = tempfile::tempdir().unwrap();
+        let pair = bundle::PairSink {
+            root: dir.path().join("evidence"),
+            fixture_id: fixture.id.to_string(),
+            repeat: 1,
+            repeats: 1,
+            live: false,
+        };
+        let runs = compare_engines_with_model(fixture, dir.path(), None, Some(&pair))
+            .await
+            .unwrap();
+        assert!(
+            runs.iter()
+                .all(|run| run.eval.passed && run.eval.error.is_none())
+        );
+        let pair_dir = pair.root.join(fixture.id).join("r1");
+        assert!(pair_dir.join("pair.json").is_file());
+        for engine in ["append", "rolling", "dynamic"] {
+            let cell = pair_dir.join(engine);
+            assert!(cell.join("events.jsonl").is_file(), "{engine}");
+            assert!(cell.join("summary.json").is_file(), "{engine}");
+            let summary: bundle::CellSummary =
+                serde_json::from_str(&std::fs::read_to_string(cell.join("summary.json")).unwrap())
+                    .unwrap();
+            assert!(summary.seq_contiguous, "{engine}");
+            assert!(summary.passed, "{engine}");
+        }
+        let pair_doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(pair_dir.join("pair.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            pair_doc["cells"][0]["dir"].as_str(),
+            Some("append"),
+            "pair.json must store portable relative cell dirs"
+        );
+        assert_eq!(
+            pair_doc["analysis_schema"].as_str(),
+            Some(bundle::ANALYSIS_SCHEMA)
+        );
+        assert_eq!(
+            pair_doc["arm_order"].as_array().map(|rows| rows
+                .iter()
+                .filter_map(|row| row.as_str())
+                .collect::<Vec<_>>()),
+            Some(vec!["append", "rolling", "dynamic"])
+        );
+        let shown = bundle::render_evidence(&pair_dir).unwrap();
+        assert!(
+            shown.contains("append") && shown.contains("dynamic"),
+            "{shown}"
+        );
     }
 }

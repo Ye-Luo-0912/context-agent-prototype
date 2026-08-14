@@ -1,15 +1,24 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use agent_contracts::{
-    AgentError, AgentResult, AuthorityLease, CONTEXT_SEARCH_MAX_LIMIT,
-    CONTEXT_SEARCH_MAX_QUERY_CHARS, CancellationToken, ContextConsumptionAck, ContextEngine,
-    ContextMaintenanceTrigger, ContextQuery, ContextSearchQuery, EngineQuery, OutputBroker, RunId,
-    RuntimeEvent, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput,
-    ToolRisk, ToolSurfaceSnapshot, derive_effect_intent,
+    AgentError, AgentResult, ArgumentDigest, AuthorityLease, AuthorityRecoveryStatus,
+    CONTEXT_SEARCH_MAX_LIMIT, CONTEXT_SEARCH_MAX_QUERY_CHARS, CancellationToken,
+    ContextConsumptionAck, ContextEngine, ContextItemId, ContextMaintenanceTrigger, ContextQuery,
+    ContextSearchQuery, DiscoveryMiss, EffectDurability, EffectId, EffectReconciler,
+    EffectReconciliation, EngineQuery, OperationEffectContext, OperationId, OperationQueryResult,
+    OperationSnapshot, OperationState, OperationTerminal, OutputBroker, ResourceDescriptor, RunId,
+    RuntimeEvent, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOperationIdentity,
+    ToolOutcome, ToolOutput, ToolRisk, ToolSurfaceSnapshot, derive_effect_intent,
 };
 
 use crate::authority::{
     ApprovalAuthority, ApprovalVerdict, EffectAuthority, EventAuthority, OutputAuthority,
+};
+use crate::operation::{
+    DEFAULT_OPERATION_REGISTRY_CAPACITY, OperationCancelTransition, OperationRegistry,
 };
 
 /// Default commit-time lease window for one side-effecting tool call (ACI
@@ -17,6 +26,9 @@ use crate::authority::{
 /// Short by design — a tool computation that overruns this window is
 /// rolled back at commit time instead of mutating the world.
 pub const DEFAULT_LEASE_TTL_MS: u64 = 120_000;
+/// Shadow authorization is observational in V1. It must never hold an
+/// accepted operation forever or consume the bounded operation registry.
+const SHADOW_VERDICT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct CoreAuthorityConfig {
@@ -80,8 +92,16 @@ impl Default for CoreAuthorityConfig {
 /// and bounded producer output passes through one named home, so a future
 /// Trusted Core can replace the seam without rewriting the facade or the
 /// actor.
-pub struct CoreAuthority {
+pub(crate) struct CoreAuthority {
     run_id: RunId,
+    /// Process-lifetime authority epoch. Runtime asks Core to advance this
+    /// fence, but cannot choose or restore an older value. The recoverable
+    /// operation journal that persists it across process restarts is PLAT-03a3.
+    authority_epoch: AtomicU64,
+    /// Linearizes epoch changes with operation dispatch/commit admission.
+    /// The guard is never held across an async tool/effect body.
+    authority_gate: Mutex<()>,
+    operations: OperationRegistry,
     config: CoreAuthorityConfig,
     context: Arc<dyn ContextEngine>,
     tools: Arc<dyn ToolDispatcher>,
@@ -92,13 +112,36 @@ pub struct CoreAuthority {
 }
 
 impl CoreAuthority {
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         config: CoreAuthorityConfig,
         context: Arc<dyn ContextEngine>,
         tools: Arc<dyn ToolDispatcher>,
         approval: Arc<dyn agent_contracts::ApprovalGate>,
         journal: Option<Arc<dyn agent_contracts::EventJournal>>,
+        operation_journal: Option<Arc<dyn agent_contracts::OperationJournal>>,
     ) -> Self {
+        Self::try_new(
+            config,
+            context,
+            tools,
+            approval,
+            journal,
+            operation_journal,
+            None,
+        )
+        .expect("in-memory Core construction cannot fail")
+    }
+
+    pub(crate) fn try_new(
+        config: CoreAuthorityConfig,
+        context: Arc<dyn ContextEngine>,
+        tools: Arc<dyn ToolDispatcher>,
+        approval: Arc<dyn agent_contracts::ApprovalGate>,
+        journal: Option<Arc<dyn agent_contracts::EventJournal>>,
+        operation_journal: Option<Arc<dyn agent_contracts::OperationJournal>>,
+        effect_reconciler: Option<Arc<dyn EffectReconciler>>,
+    ) -> AgentResult<Self> {
         let (event_tx, _) = tokio::sync::broadcast::channel(1_024);
         let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let output_broker = config.output_broker.clone();
@@ -109,8 +152,34 @@ impl CoreAuthority {
         } else {
             approval
         };
-        Self {
+        let operation_recovery = match &operation_journal {
+            Some(journal) => journal.recover()?,
+            None => agent_contracts::OperationJournalRecovery::default(),
+        };
+        let recovered_epoch = operation_recovery.authority_epoch;
+        let operations = OperationRegistry::recover(
+            DEFAULT_OPERATION_REGISTRY_CAPACITY,
+            operation_journal.clone(),
+            operation_recovery,
+        )?;
+        let authority_epoch = if operation_journal.is_some() {
+            let next = recovered_epoch.checked_add(1).ok_or_else(|| {
+                AgentError::RecoveryRequired("Core authority epoch is exhausted".into())
+            })?;
+            operations.persist_epoch_advance(recovered_epoch, next)?;
+            next
+        } else {
+            recovered_epoch
+        };
+        // Fence old actors first, then fold only exact, durable effect
+        // evidence. Unknown outcomes remain queryable and install a global
+        // mutation fence; Core never schedules or blindly replays them.
+        reconcile_recovered_operations(&operations, effect_reconciler.as_deref());
+        Ok(Self {
             run_id: RunId::new(),
+            authority_epoch: AtomicU64::new(authority_epoch),
+            authority_gate: Mutex::new(()),
+            operations,
             config,
             context,
             tools,
@@ -118,57 +187,262 @@ impl CoreAuthority {
             approval,
             effect: EffectAuthority,
             output: OutputAuthority::new(output_broker),
-        }
+        })
     }
 
-    pub fn run_id(&self) -> RunId {
+    pub(crate) fn run_id(&self) -> RunId {
         self.run_id
     }
 
-    /// The event authority seam: identity, journaling, barriers.
-    pub fn event(&self) -> &EventAuthority {
-        &self.event
+    pub(crate) fn current_authority_epoch(&self) -> u64 {
+        self.authority_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn recovery_status(&self) -> AuthorityRecoveryStatus {
+        self.operations.recovery_status()
+    }
+
+    pub(crate) fn authority_checkpoint_marker(
+        &self,
+    ) -> AgentResult<Option<agent_contracts::AuthorityCheckpointMarker>> {
+        let _gate = self.authority_gate.lock().expect("authority gate poisoned");
+        self.operations.authority_checkpoint_marker()
+    }
+
+    pub(crate) fn validate_authority_checkpoint_marker(
+        &self,
+        expected: &agent_contracts::AuthorityCheckpointMarker,
+    ) -> AgentResult<()> {
+        let _gate = self.authority_gate.lock().expect("authority gate poisoned");
+        self.operations
+            .validate_authority_checkpoint_marker(expected)
+    }
+
+    pub(crate) fn compact_authority_journal(
+        &self,
+    ) -> AgentResult<Option<agent_contracts::AuthorityCheckpointMarker>> {
+        let _gate = self.authority_gate.lock().expect("authority gate poisoned");
+        self.operations.compact_authority_journal()
+    }
+
+    pub(crate) fn ensure_mutation_allowed(&self) -> AgentResult<()> {
+        self.operations.ensure_mutation_allowed()
+    }
+
+    /// Advance the commit fence exactly once from the caller's observed
+    /// epoch. This is authority state, not a turn scheduler: Runtime remains
+    /// the only component deciding when a lifecycle transition is attempted.
+    pub(crate) fn advance_authority_epoch(&self, expected: u64) -> AgentResult<u64> {
+        let _gate = self.authority_gate.lock().expect("authority gate poisoned");
+        self.ensure_mutation_allowed()?;
+        let next = expected.checked_add(1).ok_or_else(|| {
+            AgentError::RecoveryRequired("Core authority epoch is exhausted".into())
+        })?;
+        let actual = self.current_authority_epoch();
+        if actual != expected {
+            return Err(AgentError::RecoveryRequired(format!(
+                "Core authority epoch mismatch: Runtime expected {expected}, current epoch is {actual}"
+            )));
+        }
+        self.operations.persist_epoch_advance(expected, next)?;
+        self.authority_epoch.store(next, Ordering::Release);
+        Ok(next)
+    }
+
+    pub(crate) fn query_operation(
+        &self,
+        operation_id: OperationId,
+    ) -> agent_contracts::OperationQueryResult {
+        self.operations.query(operation_id)
+    }
+
+    pub(crate) fn finish_value_operation_if_current(
+        &self,
+        expected_epoch: u64,
+        operation_id: OperationId,
+        argument_digest: ArgumentDigest,
+    ) -> AgentResult<()> {
+        let _gate = self.authority_gate.lock().expect("authority gate poisoned");
+        self.ensure_mutation_allowed()?;
+        let current = self.current_authority_epoch();
+        if current != expected_epoch {
+            return Err(AgentError::InvalidRequest(format!(
+                "operation epoch {expected_epoch} is stale; current Core epoch is {current}"
+            )));
+        }
+        self.operations
+            .finish_value(operation_id, argument_digest, expected_epoch)
+    }
+
+    pub(crate) fn cancel_operation(&self, identity: ToolOperationIdentity) -> AgentResult<()> {
+        self.ensure_mutation_allowed()?;
+        self.operations.cancel(identity)
+    }
+
+    pub(crate) fn cancel_operation_and_advance(
+        &self,
+        identity: ToolOperationIdentity,
+        expected_epoch: u64,
+    ) -> AgentResult<crate::port::OperationCancelDisposition> {
+        identity.validate().map_err(AgentError::InvalidRequest)?;
+        let _gate = self.authority_gate.lock().expect("authority gate poisoned");
+        self.ensure_mutation_allowed()?;
+        let actual = self.current_authority_epoch();
+        if actual != expected_epoch {
+            return Err(AgentError::RecoveryRequired(format!(
+                "Core authority epoch mismatch: Runtime expected {expected_epoch}, current epoch is {actual}"
+            )));
+        }
+
+        let next = expected_epoch.checked_add(1).ok_or_else(|| {
+            AgentError::RecoveryRequired("Core authority epoch is exhausted".into())
+        })?;
+        match self
+            .operations
+            .cancel_and_persist_epoch(identity, expected_epoch, next)?
+        {
+            OperationCancelTransition::Cancelled(result) => {
+                self.authority_epoch.store(next, Ordering::Release);
+                Ok(crate::port::OperationCancelDisposition::Cancelled {
+                    effective_epoch: next,
+                    result,
+                })
+            }
+            OperationCancelTransition::AlreadySettled(result) => Ok(
+                crate::port::OperationCancelDisposition::AlreadySettled(result),
+            ),
+        }
+    }
+
+    pub(crate) fn begin_operation_commit(
+        &self,
+        operation_id: OperationId,
+        effect_id: EffectId,
+        argument_digest: ArgumentDigest,
+    ) -> AgentResult<()> {
+        self.ensure_mutation_allowed()?;
+        let agent_contracts::OperationQueryResult::Found { snapshot } =
+            self.operations.query(operation_id)
+        else {
+            return Err(AgentError::InvalidRequest(format!(
+                "unknown or expired operation {operation_id}"
+            )));
+        };
+        if snapshot.identity.argument_digest != argument_digest {
+            return Err(AgentError::InvalidRequest(format!(
+                "operation {operation_id} argument digest does not match admission"
+            )));
+        }
+        self.operations.begin_commit(operation_id, effect_id)
+    }
+
+    pub(crate) fn begin_operation_commit_if_current(
+        &self,
+        expected_epoch: u64,
+        operation_id: OperationId,
+        effect_id: EffectId,
+        argument_digest: ArgumentDigest,
+    ) -> AgentResult<()> {
+        let _gate = self.authority_gate.lock().expect("authority gate poisoned");
+        self.ensure_mutation_allowed()?;
+        let current = self.current_authority_epoch();
+        if current != expected_epoch {
+            return Err(AgentError::InvalidRequest(format!(
+                "operation epoch {expected_epoch} is stale; current Core epoch is {current}"
+            )));
+        }
+        self.begin_operation_commit(operation_id, effect_id, argument_digest)
+    }
+
+    fn mark_operation_executing_if_current(
+        &self,
+        expected_epoch: u64,
+        operation_id: OperationId,
+        effect_id: Option<EffectId>,
+    ) -> AgentResult<()> {
+        let _gate = self.authority_gate.lock().expect("authority gate poisoned");
+        self.ensure_mutation_allowed()?;
+        let current = self.current_authority_epoch();
+        if current != expected_epoch {
+            return Err(AgentError::InvalidRequest(format!(
+                "operation epoch {expected_epoch} is stale; current Core epoch is {current}"
+            )));
+        }
+        self.operations.mark_executing(operation_id, effect_id)
+    }
+
+    pub(crate) fn finish_operation_effect(
+        &self,
+        operation_id: OperationId,
+        receipt: &agent_contracts::EffectReceipt,
+    ) -> AgentResult<()> {
+        self.ensure_mutation_allowed()?;
+        self.operations.finish_effect(operation_id, receipt)
+    }
+
+    pub(crate) fn abort_prepared_operation(
+        &self,
+        operation_id: OperationId,
+        effect_id: EffectId,
+        argument_digest: ArgumentDigest,
+    ) -> AgentResult<()> {
+        self.ensure_mutation_allowed()?;
+        self.operations
+            .abort_prepared(operation_id, effect_id, argument_digest)
+    }
+
+    pub(crate) fn issued_lease_matches(
+        &self,
+        operation_id: OperationId,
+        lease: &AuthorityLease,
+    ) -> bool {
+        self.operations.issued_lease_matches(operation_id, lease)
     }
 
     /// The approval authority seam: policy verdicts.
-    pub fn approval(&self) -> &ApprovalAuthority {
+    pub(crate) fn approval(&self) -> &ApprovalAuthority {
         &self.approval
     }
 
     /// The effect authority seam: commit/rollback of staged effects.
-    pub fn effect(&self) -> &EffectAuthority {
+    pub(crate) fn effect(&self) -> &EffectAuthority {
         &self.effect
     }
 
-    /// The output authority seam: the broker path from producer to model.
-    pub fn output(&self) -> &OutputAuthority {
-        &self.output
-    }
-
-    pub fn subscribe(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<agent_contracts::RuntimeEventEnvelope> {
-        self.event.subscribe()
-    }
-
     /// The broadcast sender behind `subscribe`, for live event sinks.
-    pub fn event_sender(
+    pub(crate) fn event_sender(
         &self,
     ) -> tokio::sync::broadcast::Sender<agent_contracts::RuntimeEventEnvelope> {
         self.event.sender()
     }
 
-    /// The shared sequence counter, so live deltas and journaled events keep
-    /// one consistent envelope order.
-    pub fn seq(&self) -> Arc<std::sync::atomic::AtomicU64> {
-        self.event.seq()
+    /// Current durable journal cursor for a live-only model sink. The sink
+    /// may repeat this value on `ModelDelta`, but cannot advance Core's
+    /// journal sequence.
+    pub(crate) fn event_sequence(&self) -> u64 {
+        self.event.sequence_cursor()
     }
 
-    pub async fn start(&self) -> AgentResult<()> {
-        self.event.emit(self.run_id, RuntimeEvent::RunStarted).await
+    pub(crate) async fn start(&self) -> AgentResult<()> {
+        self.event
+            .emit(self.run_id, RuntimeEvent::RunStarted)
+            .await?;
+        if let AuthorityRecoveryStatus::RecoveryRequired { reason } = self.recovery_status() {
+            let prefix = "Core authority recovery is required: ";
+            let max_reason_bytes =
+                agent_contracts::MAX_OPERATION_DIAGNOSTIC_BYTES.saturating_sub(prefix.len());
+            let reason = bound_utf8(&reason, max_reason_bytes);
+            self.event
+                .warning(self.run_id, format!("{prefix}{reason}"))
+                .await?;
+            self.event
+                .emit(self.run_id, RuntimeEvent::RecoveryRequired)
+                .await?;
+        }
+        Ok(())
     }
 
-    pub async fn stop(&self) -> AgentResult<()> {
+    pub(crate) async fn stop(&self) -> AgentResult<()> {
         self.event
             .emit(self.run_id, RuntimeEvent::RunCompleted)
             .await?;
@@ -176,7 +450,7 @@ impl CoreAuthority {
     }
 
     /// Journal + broadcast one runtime event (the single write path).
-    pub async fn emit_event(&self, event: RuntimeEvent) -> AgentResult<()> {
+    pub(crate) async fn emit_event(&self, event: RuntimeEvent) -> AgentResult<()> {
         self.event.emit(self.run_id, event).await
     }
 
@@ -188,12 +462,12 @@ impl CoreAuthority {
     /// writes before it are durable. A failed barrier returns the error and
     /// broadcasts nothing — the caller fences the turn instead of claiming
     /// a commit that never landed.
-    pub async fn emit_event_durable(&self, event: RuntimeEvent) -> AgentResult<()> {
+    pub(crate) async fn emit_event_durable(&self, event: RuntimeEvent) -> AgentResult<()> {
         self.event.emit_durable(self.run_id, event).await
     }
 
     /// Surface a runtime-level warning through the normal event stream.
-    pub async fn emit_warning(&self, message: String) -> AgentResult<()> {
+    pub(crate) async fn emit_warning(&self, message: String) -> AgentResult<()> {
         self.event.warning(self.run_id, message).await
     }
 
@@ -204,10 +478,11 @@ impl CoreAuthority {
     /// GC, scopes, focus) lives on `RuntimeServices`; this one stays on the
     /// kernel because it is an *authority transaction* — the access stamp
     /// plus its mandatory audit event commit or roll back together.
-    pub async fn acknowledge_context_consumption(
+    pub(crate) async fn acknowledge_context_consumption(
         &self,
         ack: ContextConsumptionAck,
     ) -> AgentResult<()> {
+        self.ensure_mutation_allowed()?;
         ack.validate()?;
         let checkpoint = self.context.checkpoint().await?;
         let result = async {
@@ -226,7 +501,11 @@ impl CoreAuthority {
     /// `output` (call id, tool name) is preserved; only the content is
     /// replaced. Errors become a failed output so the model learns the
     /// query did not land.
-    pub async fn resolve_engine_query(&self, output: ToolOutput, query: EngineQuery) -> ToolOutput {
+    pub(crate) async fn resolve_engine_query(
+        &self,
+        output: ToolOutput,
+        query: EngineQuery,
+    ) -> ToolOutput {
         let mut output = output;
         match query {
             EngineQuery::SearchExternal {
@@ -234,6 +513,7 @@ impl CoreAuthority {
                 kind,
                 scope,
                 task_id,
+                label,
                 limit,
             } => {
                 // 查询上限在执行期强制，而不只依赖 JSON schema：恶意或过期的
@@ -246,12 +526,14 @@ impl CoreAuthority {
                 // 空结果需要区分"确实没有外部化证据"（无过滤）与"当前过滤条件下
                 // 未命中"（带过滤）：前者提示模型放弃检索，后者提示证据可能
                 // 存在于别的过滤条件下，值得换个条件重试。
-                let has_filter = kind.is_some() || scope.is_some() || task_id.is_some();
+                let has_filter =
+                    kind.is_some() || scope.is_some() || task_id.is_some() || label.is_some();
                 let search = ContextSearchQuery {
                     query,
                     kind,
                     scope,
                     task_id,
+                    label,
                     limit,
                 };
                 match self.context.search_external(search).await {
@@ -263,6 +545,11 @@ impl CoreAuthority {
                         } else {
                             "context.search: no externalized items match the query.".into()
                         };
+                        output.metadata = serde_json::json!({
+                            "op": "search",
+                            "kind": "context",
+                            "descriptors": [],
+                        });
                     }
                     Ok(hits) => {
                         output.ok = true;
@@ -302,11 +589,23 @@ impl CoreAuthority {
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
+                        output.metadata = serde_json::json!({
+                            "op": "search",
+                            "kind": "context",
+                            "descriptors": hits
+                                .iter()
+                                .map(ResourceDescriptor::from_context)
+                                .collect::<Vec<_>>(),
+                        });
                     }
                     Err(error) => {
                         output.ok = false;
                         output.summary = "context.search failed".into();
                         output.model_content = format!("context.search failed: {error}");
+                        output.metadata = DiscoveryMiss::ProviderUnavailable {
+                            reason: error.to_string(),
+                        }
+                        .to_metadata();
                     }
                 }
             }
@@ -342,17 +641,34 @@ impl CoreAuthority {
                             },
                             entry.entities.join(", "),
                         );
+                        output.metadata = serde_json::json!({
+                            "op": "inspect",
+                            "kind": "context",
+                            "descriptor": ResourceDescriptor::from_context(&entry),
+                        });
                     }
                     Ok(None) => {
+                        let miss = context_inspect_miss(self.context.as_ref(), item_id).await;
                         output.ok = true;
                         output.summary = "no such external ref".into();
-                        output.model_content =
-                            format!("context.inspect: no externalized item with id {item_id}.");
+                        output.model_content = match &miss {
+                            DiscoveryMiss::EvidenceAbsent { reason } => format!(
+                                "context.inspect: item {item_id} is not current evidence ({reason})."
+                            ),
+                            _ => {
+                                format!("context.inspect: no externalized item with id {item_id}.")
+                            }
+                        };
+                        output.metadata = miss.to_metadata();
                     }
                     Err(error) => {
                         output.ok = false;
                         output.summary = "context.inspect failed".into();
                         output.model_content = format!("context.inspect failed: {error}");
+                        output.metadata = DiscoveryMiss::ProviderUnavailable {
+                            reason: error.to_string(),
+                        }
+                        .to_metadata();
                     }
                 }
             }
@@ -373,16 +689,27 @@ impl CoreAuthority {
                         );
                     }
                     Ok(None) => {
+                        let miss = context_inspect_miss(self.context.as_ref(), item_id).await;
                         output.ok = true;
                         output.summary = "no such external ref".into();
-                        output.model_content = format!(
-                            "context.fetch: no externalized item with id {item_id} (it may have been deleted by storage GC)."
-                        );
+                        output.model_content = match &miss {
+                            DiscoveryMiss::EvidenceAbsent { reason } => format!(
+                                "context.fetch: item {item_id} is not current evidence ({reason})."
+                            ),
+                            _ => format!(
+                                "context.fetch: no externalized item with id {item_id} (it may have been deleted by storage GC)."
+                            ),
+                        };
+                        output.metadata = miss.to_metadata();
                     }
                     Err(error) => {
                         output.ok = false;
                         output.summary = "context.fetch failed".into();
                         output.model_content = format!("context.fetch failed: {error}");
+                        output.metadata = DiscoveryMiss::ProviderUnavailable {
+                            reason: error.to_string(),
+                        }
+                        .to_metadata();
                     }
                 }
             }
@@ -395,37 +722,232 @@ impl CoreAuthority {
         self.output.bound(self.run_id, None, output).await
     }
 
-    /// Execute one tool call: validate it against the round's tool surface
-    /// snapshot (the same surface the model saw and the budget used), run
-    /// approval, mint the commit-time authority lease for side-effecting
-    /// calls, dispatch. Emits nothing — ToolStarted/ToolFinished are
-    /// committed by the actor. Returns the tool outcome (a plain value or
-    /// a staged effect the actor commits/rolls back after the generation
-    /// fence) plus the lease, when one was minted.
-    pub async fn execute_tool(
+    /// Validate and durably register one logical tool operation. The Core
+    /// authority gate keeps the current epoch stable through the WAL-first
+    /// `Accepted` append. Only that newly appended record receives a linear
+    /// dispatch permit; an exact retry can observe existing truth but cannot
+    /// dispatch twice.
+    pub(crate) fn admit_tool_operation(
         &self,
+        identity: ToolOperationIdentity,
+        call: &ToolCall,
+        generation: u64,
+    ) -> AgentResult<crate::port::ToolOperationAdmission> {
+        identity.validate().map_err(AgentError::InvalidRequest)?;
+        let _gate = self.authority_gate.lock().expect("authority gate poisoned");
+        self.ensure_mutation_allowed()?;
+        let current_epoch = self.current_authority_epoch();
+        if identity.run_id != self.run_id
+            || identity.generation != generation
+            || identity.call_id != call.id
+            || identity.tool_name != call.name
+            || identity.argument_digest != ArgumentDigest::from_json(&call.arguments)
+        {
+            return Err(AgentError::InvalidRequest(
+                "tool admission rejected: operation identity does not match the request".into(),
+            ));
+        }
+        if generation != current_epoch {
+            // Idempotent observation remains available after the epoch has
+            // advanced, but a stale generation can never append a new
+            // Accepted record. The snapshot is intentionally read-only and
+            // carries no dispatch permit.
+            if let OperationQueryResult::Found { snapshot } =
+                self.operations.query(identity.operation_id)
+            {
+                if snapshot.identity == identity {
+                    return Ok(crate::port::ToolOperationAdmission::AlreadyKnown { snapshot });
+                }
+                return Err(AgentError::InvalidRequest(format!(
+                    "operation {} was reused with a different identity or argument digest",
+                    identity.operation_id
+                )));
+            }
+            return Err(AgentError::InvalidRequest(format!(
+                "tool admission rejected by the Core authority fence: operation epoch {generation}, current epoch {current_epoch}"
+            )));
+        }
+        match self.operations.accept(identity.clone())? {
+            crate::operation::OperationAdmission::Accepted => {
+                let snapshot = OperationSnapshot {
+                    identity: identity.clone(),
+                    state: OperationState::Accepted,
+                };
+                Ok(crate::port::ToolOperationAdmission::Accepted {
+                    snapshot: Box::new(snapshot),
+                    permit: crate::port::AdmittedToolPermit { identity },
+                })
+            }
+            crate::operation::OperationAdmission::Duplicate(snapshot) => {
+                Ok(crate::port::ToolOperationAdmission::AlreadyKnown { snapshot })
+            }
+        }
+    }
+
+    /// Consume one Core-issued admission permit and publish the two lifecycle
+    /// events that must precede dispatch. Returning a distinct linear permit
+    /// makes the ordering part of the public CorePort type contract rather
+    /// than a convention trusted callers can accidentally bypass.
+    pub(crate) async fn publish_tool_operation(
+        &self,
+        permit: crate::port::AdmittedToolPermit,
+        call: &ToolCall,
+    ) -> AgentResult<crate::port::PublishedToolPermit> {
+        let identity = permit.identity;
+        if identity.run_id != self.run_id
+            || identity.call_id != call.id
+            || identity.tool_name != call.name
+            || identity.argument_digest != ArgumentDigest::from_json(&call.arguments)
+        {
+            let error = AgentError::InvalidRequest(
+                "tool publication rejected: call does not match the admitted identity".into(),
+            );
+            return Err(self.cancel_after_publication_failure(
+                &identity,
+                "tool-publication preflight",
+                error,
+            ));
+        }
+        let snapshot = match self.operations.query(identity.operation_id) {
+            OperationQueryResult::Found { snapshot }
+                if snapshot.identity == identity && snapshot.state == OperationState::Accepted =>
+            {
+                snapshot
+            }
+            other => {
+                return Err(AgentError::RecoveryRequired(format!(
+                    "tool publication rejected: admitted operation {} is no longer exactly Accepted ({other:?})",
+                    identity.operation_id
+                )));
+            }
+        };
+        if let Err(error) = self
+            .emit_event(RuntimeEvent::OperationAccepted { snapshot })
+            .await
+        {
+            return Err(self.cancel_after_publication_failure(
+                &identity,
+                "OperationAccepted",
+                error,
+            ));
+        }
+        if let Err(error) = self
+            .emit_event(RuntimeEvent::ToolStarted { call: call.clone() })
+            .await
+        {
+            return Err(self.cancel_after_publication_failure(&identity, "ToolStarted", error));
+        }
+        Ok(crate::port::PublishedToolPermit { identity })
+    }
+
+    fn cancel_after_publication_failure(
+        &self,
+        identity: &ToolOperationIdentity,
+        event: &str,
+        event_error: AgentError,
+    ) -> AgentError {
+        match self.cancel_operation(identity.clone()) {
+            Ok(()) => event_error,
+            Err(cancel_error) => AgentError::RecoveryRequired(format!(
+                "{event} publication failed for operation {}, and Core could not durably terminalize the undispatched operation: event={event_error}; cancellation={cancel_error}",
+                identity.operation_id
+            )),
+        }
+    }
+
+    /// Consume one Core-issued publication permit, validate the call against
+    /// the round's tool surface (the same surface the model saw and the
+    /// budget used), run approval, mint any commit-time authority lease, and
+    /// dispatch. Emits nothing — Runtime commits lifecycle events.
+    pub(crate) async fn execute_published_tool(
+        &self,
+        permit: crate::port::PublishedToolPermit,
         call: ToolCall,
         cancel: CancellationToken,
         surface: &ToolSurfaceSnapshot,
-        generation: u64,
-    ) -> (ToolOutcome, Option<AuthorityLease>) {
+    ) -> crate::port::CoreToolExecution {
+        let identity = permit.identity;
+        let generation = identity.generation;
+        let argument_digest = identity.argument_digest;
+        let refused = |outcome| crate::port::CoreToolExecution {
+            outcome,
+            lease: None,
+            effect_id: None,
+            argument_digest,
+            value_completion_pending: false,
+        };
+        if let Err(error) = self.ensure_mutation_allowed() {
+            return refused(ToolOutcome::Value(tool_error_output(
+                &call,
+                error.to_string(),
+            )));
+        }
+        if identity.run_id != self.run_id
+            || identity.call_id != call.id
+            || identity.tool_name != call.name
+            || identity.argument_digest != ArgumentDigest::from_json(&call.arguments)
+        {
+            let message =
+                "tool dispatch rejected: operation identity does not match the admitted request"
+                    .to_string();
+            if let Err(error) = self
+                .operations
+                .finish_refused(identity.operation_id, &message)
+            {
+                return refused(ToolOutcome::Value(tool_error_output(
+                    &call,
+                    error.to_string(),
+                )));
+            }
+            return refused(ToolOutcome::Value(tool_error_output(&call, message)));
+        }
+        let current_epoch = self.current_authority_epoch();
+        if generation != current_epoch {
+            let _ = self.operations.cancel(identity.clone());
+            return refused(ToolOutcome::Value(tool_error_output(
+                &call,
+                format!(
+                    "tool dispatch rejected by the Core authority fence: operation epoch {generation}, current epoch {current_epoch}"
+                ),
+            )));
+        }
         let spec = surface
             .specs
             .iter()
             .find(|spec| spec.name == call.name)
             .cloned();
         let Some(spec) = spec else {
-            return (
-                ToolOutcome::Value(tool_error_output(
+            let message = tool_not_on_surface_message(&call, surface);
+            if let Err(error) = self
+                .operations
+                .finish_refused(identity.operation_id, &message)
+            {
+                return refused(ToolOutcome::Value(tool_error_output(
                     &call,
-                    tool_not_on_surface_message(&call, surface),
-                )),
-                None,
-            );
+                    error.to_string(),
+                )));
+            }
+            return refused(ToolOutcome::Value(tool_error_output(&call, message)));
         };
 
         let verdict = self.approval.authorize(&call, &spec, &cancel).await;
         let legacy_allowed = matches!(verdict, ApprovalVerdict::Allowed);
+
+        match verdict {
+            ApprovalVerdict::Allowed => {}
+            ApprovalVerdict::Denied(message) | ApprovalVerdict::Failed(message) => {
+                if let Err(error) = self
+                    .operations
+                    .finish_refused(identity.operation_id, &message)
+                {
+                    return refused(ToolOutcome::Value(tool_error_output(
+                        &call,
+                        error.to_string(),
+                    )));
+                }
+                return refused(ToolOutcome::Value(tool_error_output(&call, message)));
+            }
+        }
 
         // Shadow mode (ACI v2 step 4): the v2 intent-derived verdict is
         // computed once and reused for the audit event and the lease's
@@ -433,7 +955,28 @@ impl CoreAuthority {
         // Best-effort observability: a failed journal append must not turn
         // a granted call into an error.
         let shadow = if self.approval.has_shadow() {
-            self.approval.shadow_verdict(&call, &spec).await
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = self.operations.cancel(identity.clone());
+                    return refused(ToolOutcome::Value(tool_error_output(
+                        &call,
+                        "tool dispatch cancelled while evaluating shadow authorization".into(),
+                    )));
+                }
+                result = tokio::time::timeout(
+                    SHADOW_VERDICT_TIMEOUT,
+                    self.approval.shadow_verdict(&call, &spec),
+                ) => match result {
+                    Ok(shadow) => shadow,
+                    Err(_) => {
+                        let _ = self.emit_warning(format!(
+                            "shadow authorization for {} exceeded {:?}; legacy approval remains authoritative",
+                            call.name, SHADOW_VERDICT_TIMEOUT,
+                        )).await;
+                        None
+                    }
+                }
+            }
         } else {
             None
         };
@@ -447,11 +990,19 @@ impl CoreAuthority {
                 .await;
         }
 
-        match verdict {
-            ApprovalVerdict::Allowed => {}
-            ApprovalVerdict::Denied(message) | ApprovalVerdict::Failed(message) => {
-                return (ToolOutcome::Value(tool_error_output(&call, message)), None);
-            }
+        // Approval can await user or policy work while Runtime concurrently
+        // cancels the operation and advances the Core-owned epoch. Recheck at
+        // the last common point before lease minting and dispatch so an
+        // operation cancelled during approval never starts afterward.
+        let current_epoch = self.current_authority_epoch();
+        if generation != current_epoch {
+            let _ = self.operations.cancel(identity.clone());
+            return refused(ToolOutcome::Value(tool_error_output(
+                &call,
+                format!(
+                    "tool dispatch rejected after approval because operation epoch {generation} is stale; current Core epoch is {current_epoch}"
+                ),
+            )));
         }
 
         // Mint the short-lived authority lease (ACI v2 §6) for
@@ -473,6 +1024,8 @@ impl CoreAuthority {
             let ttl = self.config.lease_ttl_ms.unwrap_or(DEFAULT_LEASE_TTL_MS);
             let lease = AuthorityLease {
                 lease_id: format!("lease-{}", RunId::new()),
+                operation_id: identity.operation_id,
+                argument_digest: identity.argument_digest,
                 operation_generation: generation,
                 intent: derive_effect_intent(&call, &spec),
                 grant_id,
@@ -480,6 +1033,37 @@ impl CoreAuthority {
                 issued_at_ms,
                 expires_at_ms: issued_at_ms.saturating_add(ttl),
             };
+            if let Err(error) = self
+                .operations
+                .record_lease(identity.operation_id, lease.clone())
+            {
+                return refused(ToolOutcome::Value(tool_error_output(
+                    &call,
+                    error.to_string(),
+                )));
+            }
+            Some(lease)
+        } else {
+            None
+        };
+
+        // Reserve the recovery identity before a side-effecting tool starts.
+        // The Executing transition is WAL-first, so a broker can durably bind
+        // staged evidence to the same id even if Core crashes before Prepared.
+        let reserved_effect_id = (spec.risk != ToolRisk::ReadOnly).then(EffectId::new);
+        if let Err(error) = self.mark_operation_executing_if_current(
+            generation,
+            identity.operation_id,
+            reserved_effect_id,
+        ) {
+            let _ = self.operations.cancel(identity.clone());
+            return refused(ToolOutcome::Value(tool_error_output(
+                &call,
+                error.to_string(),
+            )));
+        }
+
+        if let Some(lease) = &lease {
             let _ = self
                 .emit_event(RuntimeEvent::LeaseIssued {
                     lease_id: lease.lease_id.clone(),
@@ -488,22 +1072,62 @@ impl CoreAuthority {
                     expires_at_ms: lease.expires_at_ms,
                 })
                 .await;
-            Some(lease)
-        } else {
-            None
-        };
+        }
 
-        let outcome = match self
-            .tools
-            .execute(ToolExecutionRequest {
-                run_id: self.run_id,
-                call: call.clone(),
-                cancel,
-            })
-            .await
-        {
+        let request = ToolExecutionRequest {
+            run_id: self.run_id,
+            call: call.clone(),
+            effect_context: reserved_effect_id.map(|effect_id| OperationEffectContext {
+                identity: identity.clone(),
+                effect_id,
+            }),
+            cancel,
+        };
+        if let Err(error) = request.validate() {
+            let _ = self.operations.cancel(identity.clone());
+            return refused(ToolOutcome::Value(tool_error_output(
+                &call,
+                format!("tool dispatch rejected: {error}"),
+            )));
+        }
+        let outcome = match self.tools.execute(request).await {
             Ok(outcome) => outcome,
             Err(error) => ToolOutcome::Value(tool_error_output(&call, error.to_string())),
+        };
+
+        let (outcome, effect_id, value_completion_pending) = match outcome {
+            ToolOutcome::PreparedEffect { output, effect } => {
+                let prepared = reserved_effect_id
+                    .ok_or_else(|| {
+                        AgentError::InvalidRequest(
+                            "read-only operation unexpectedly returned a prepared effect".into(),
+                        )
+                    })
+                    .and_then(|effect_id| {
+                        self.operations
+                            .mark_prepared(identity.operation_id, effect_id)
+                            .map(|()| effect_id)
+                    });
+                match prepared {
+                    Ok(effect_id) => (
+                        ToolOutcome::PreparedEffect { output, effect },
+                        Some(effect_id),
+                        false,
+                    ),
+                    Err(error) => {
+                        effect
+                            .rollback(&format!("operation registry rejected preparation: {error}"))
+                            .await;
+                        let _ = self.operations.cancel(identity.clone());
+                        (
+                            ToolOutcome::Value(tool_error_output(&call, error.to_string())),
+                            None,
+                            false,
+                        )
+                    }
+                }
+            }
+            outcome => (outcome, None, true),
         };
 
         // Trusted output authority: bound every model-facing field and spill
@@ -531,16 +1155,68 @@ impl CoreAuthority {
                 query,
             },
         };
-        (outcome, lease)
+        crate::port::CoreToolExecution {
+            outcome,
+            lease,
+            effect_id,
+            argument_digest,
+            value_completion_pending,
+        }
     }
 
-    pub async fn emit_diagnostics(&self) -> AgentResult<()> {
+    /// Test-only composition of WAL-first admission and admitted execution.
+    /// Production callers use `CorePort`'s split methods so no public facade
+    /// can dispatch without first publishing the accepted identity.
+    #[cfg(test)]
+    pub(crate) async fn execute_tool(
+        &self,
+        identity: ToolOperationIdentity,
+        call: ToolCall,
+        cancel: CancellationToken,
+        surface: &ToolSurfaceSnapshot,
+        generation: u64,
+    ) -> crate::port::CoreToolExecution {
+        let argument_digest = identity.argument_digest;
+        let refused = |message: String| crate::port::CoreToolExecution {
+            outcome: ToolOutcome::Value(tool_error_output(&call, message)),
+            lease: None,
+            effect_id: None,
+            argument_digest,
+            value_completion_pending: false,
+        };
+        match self.admit_tool_operation(identity, &call, generation) {
+            Ok(crate::port::ToolOperationAdmission::Accepted { permit, .. }) => {
+                let permit = match self.publish_tool_operation(permit, &call).await {
+                    Ok(permit) => permit,
+                    Err(error) => return refused(error.to_string()),
+                };
+                self.execute_published_tool(permit, call, cancel, surface)
+                    .await
+            }
+            Ok(crate::port::ToolOperationAdmission::AlreadyKnown { snapshot }) => refused(format!(
+                "tool dispatch rejected: operation {} is already {:?}",
+                snapshot.identity.operation_id, snapshot.state
+            )),
+            Err(error) => refused(error.to_string()),
+        }
+    }
+
+    pub(crate) async fn emit_diagnostics(&self) -> AgentResult<()> {
         let diagnostics = self.context.diagnostics().await?;
         self.emit_event(RuntimeEvent::Diagnostics { diagnostics })
             .await
     }
 
-    pub async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+    pub(crate) async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        // A fenced Core remains inspectable. Context maintenance is a
+        // mutation, so recovery-mode checkpoints snapshot the current engine
+        // exactly as-is and publish no maintenance claim.
+        if matches!(
+            self.recovery_status(),
+            AuthorityRecoveryStatus::RecoveryRequired { .. }
+        ) {
+            return self.context.checkpoint().await;
+        }
         let report = self
             .context
             .maintain(ContextMaintenanceTrigger::Checkpoint)
@@ -558,11 +1234,12 @@ impl CoreAuthority {
     /// partially mutate, so this uses the same snapshot rollback as focus
     /// transitions. The materialized focus is the contract-level authority
     /// check; callers cannot assume opaque context JSON has a matching task.
-    pub async fn restore(
+    pub(crate) async fn restore(
         &self,
         data: serde_json::Value,
         expected_task_id: Option<TaskId>,
     ) -> AgentResult<()> {
+        self.ensure_mutation_allowed()?;
         let checkpoint = self.context.checkpoint().await?;
         let verification_restore = data.clone();
         let restored = async {
@@ -574,6 +1251,7 @@ impl CoreAuthority {
                     budget_tokens: 0,
                     hints: agent_contracts::ContextHints {
                         max_selected_items: Some(0),
+                        ..Default::default()
                     },
                 })
                 .await?
@@ -619,6 +1297,177 @@ impl CoreAuthority {
     }
 }
 
+/// Fold restart evidence after the durable epoch fence is published. This is
+/// a finite pass over Core's bounded operation registry. It never invokes an
+/// effect body and never retries a mutation.
+fn reconcile_recovered_operations(
+    operations: &OperationRegistry,
+    reconciler: Option<&dyn EffectReconciler>,
+) {
+    for snapshot in operations.recovered_snapshots() {
+        let effect_id = match snapshot.state {
+            OperationState::Terminal {
+                terminal:
+                    OperationTerminal::OutcomeUnknown { ref error }
+                    | OperationTerminal::Applied {
+                        durability: EffectDurability::DurabilityFailed(ref error),
+                        ..
+                    },
+                ..
+            } => {
+                operations.require_recovery(format!(
+                    "operation {} recovered terminal truth that still requires recovery: {error}",
+                    snapshot.identity.operation_id
+                ));
+                continue;
+            }
+            OperationState::Terminal { .. } => continue,
+            OperationState::Accepted | OperationState::Executing { effect_id: None } => {
+                if let Err(error) = operations.recover_terminal(
+                    snapshot.identity.operation_id,
+                    &snapshot.state,
+                    None,
+                    OperationTerminal::CancelledBeforeCommit,
+                ) {
+                    operations.require_recovery(format!(
+                        "startup could not terminalize operation {} before commit: {error}",
+                        snapshot.identity.operation_id
+                    ));
+                    // A WAL failure is sticky. Do not consult or append any
+                    // later recovery result after authority persistence has
+                    // stopped accepting transitions.
+                    break;
+                }
+                continue;
+            }
+            OperationState::Executing {
+                effect_id: Some(effect_id),
+            }
+            | OperationState::Prepared { effect_id }
+            | OperationState::CommitStarted { effect_id } => effect_id,
+        };
+        if !reconcile_recovered_effect(operations, reconciler, snapshot, effect_id) {
+            break;
+        }
+    }
+    if let Some(reconciler) = reconciler {
+        if let Err(error) = reconciler.recover_orphans() {
+            operations.require_recovery(format!(
+                "startup could not contain leftover process trees: {error}"
+            ));
+        }
+    }
+}
+
+fn reconcile_recovered_effect(
+    operations: &OperationRegistry,
+    reconciler: Option<&dyn EffectReconciler>,
+    snapshot: OperationSnapshot,
+    effect_id: EffectId,
+) -> bool {
+    let operation_id = snapshot.identity.operation_id;
+    let Some(reconciler) = reconciler else {
+        operations.require_recovery(format!(
+            "operation {operation_id} has unresolved effect {effect_id} and no recovery adapter"
+        ));
+        return true;
+    };
+    let context = OperationEffectContext {
+        identity: snapshot.identity.clone(),
+        effect_id,
+    };
+    let result = match reconciler.reconcile(&context) {
+        Ok(result) => {
+            if let Err(error) = result.validate() {
+                operations.require_recovery(format!(
+                    "operation {operation_id} effect reconciliation returned invalid evidence: {error}"
+                ));
+                return true;
+            }
+            result
+        }
+        Err(error) => {
+            operations.require_recovery(format!(
+                "operation {operation_id} effect reconciliation failed: {error}"
+            ));
+            return true;
+        }
+    };
+    let (terminal, keep_fenced) = match result {
+        EffectReconciliation::NotManaged => {
+            operations.require_recovery(format!(
+                "operation {operation_id} effect {effect_id} is not managed by the configured recovery adapter"
+            ));
+            return true;
+        }
+        EffectReconciliation::Ambiguous { reason } => {
+            operations.require_recovery(format!(
+                "operation {operation_id} effect {effect_id} is ambiguous: {reason}"
+            ));
+            return true;
+        }
+        EffectReconciliation::NotApplied { evidence } => {
+            let error = match evidence {
+                Some(evidence) => {
+                    format!("startup reconciliation proved the effect was not applied ({evidence})")
+                }
+                None => "startup reconciliation proved the effect was not applied".into(),
+            };
+            (OperationTerminal::NotApplied { error }, false)
+        }
+        EffectReconciliation::Applied {
+            durability,
+            evidence,
+        } => {
+            let early_application = matches!(
+                snapshot.state,
+                OperationState::Executing { .. } | OperationState::Prepared { .. }
+            );
+            let reconciler_reported_durability_failure =
+                matches!(durability, EffectDurability::DurabilityFailed(_));
+            let durability = if early_application {
+                EffectDurability::DurabilityFailed(
+                    "recovery evidence shows the effect applied before Core durably recorded CommitStarted"
+                        .into(),
+                )
+            } else {
+                durability
+            };
+            (
+                OperationTerminal::Applied {
+                    durability,
+                    evidence,
+                },
+                early_application || reconciler_reported_durability_failure,
+            )
+        }
+        EffectReconciliation::CompletedValue { evidence: _ } => {
+            if !matches!(snapshot.state, OperationState::Executing { .. }) {
+                operations.require_recovery(format!(
+                    "operation {operation_id} effect {effect_id} reported CompletedValue from {:?}; that settlement is only valid from Executing for non-transactional process or remote tools",
+                    snapshot.state
+                ));
+                return true;
+            }
+            (OperationTerminal::CompletedValue, false)
+        }
+    };
+    if let Err(error) =
+        operations.recover_terminal(operation_id, &snapshot.state, Some(effect_id), terminal)
+    {
+        operations.require_recovery(format!(
+            "operation {operation_id} reconciliation could not be recorded: {error}"
+        ));
+        return false;
+    }
+    if keep_fenced {
+        operations.require_recovery(format!(
+            "operation {operation_id} effect {effect_id} applied before the Core commit boundary"
+        ));
+    }
+    true
+}
+
 fn tool_error_output(call: &ToolCall, message: String) -> ToolOutput {
     ToolOutput {
         call_id: call.id.clone(),
@@ -629,6 +1478,14 @@ fn tool_error_output(call: &ToolCall, message: String) -> ToolOutput {
         artifact_ref: None,
         metadata: serde_json::Value::Null,
     }
+}
+
+fn bound_utf8(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 /// Explain a rejected call strictly from the immutable surface the model
@@ -665,15 +1522,43 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// Classify an inspect/fetch miss: a catalog peek that still shows a
+/// terminal semantic is `evidence_absent`; a missing id is `not_found`.
+/// Provider errors stay `provider_unavailable`. Inspect-by-id does not
+/// take a revision yet, so `stale_revision` is not produced here.
+async fn context_inspect_miss(
+    context: &dyn ContextEngine,
+    item_id: ContextItemId,
+) -> DiscoveryMiss {
+    match context.inspect(usize::MAX).await {
+        Ok(summaries) => {
+            if let Some(item) = summaries
+                .iter()
+                .find(|item| item.id == item_id && item.semantic.is_dead())
+            {
+                DiscoveryMiss::EvidenceAbsent {
+                    reason: format!("{:?}", item.semantic),
+                }
+            } else {
+                DiscoveryMiss::NotFound
+            }
+        }
+        Err(error) => DiscoveryMiss::ProviderUnavailable {
+            reason: error.to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_contracts::{
-        ApprovalDecision, ApprovalGate, AttentionState, ContextDiagnostics, ContextIngress,
-        ContextItem, ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
-        ContextRef, ContextResidency, ContextRetention, ContextScope, ContextStateTransition,
-        ExternalizedContext, MaterializedContext, ScopeId, ScopeKind, SemanticState, ToolRisk,
-        ToolSpec, ToolSurfaceDemand, ToolSurfaceOmission, ToolSurfaceOmissionReason,
+        AccessSignal, ApprovalDecision, ApprovalGate, AttentionState, ContextDiagnostics,
+        ContextIngress, ContextItem, ContextItemId, ContextItemSummary, ContextKind,
+        ContextMaintenanceReport, ContextRef, ContextResidency, ContextRetention, ContextScope,
+        ContextStateTransition, ExternalizedContext, MaterializedContext, ScopeId, ScopeKind,
+        SemanticState, ToolRisk, ToolSpec, ToolSurfaceDemand, ToolSurfaceOmission,
+        ToolSurfaceOmissionReason, TurnId,
     };
 
     fn call(name: &str) -> ToolCall {
@@ -681,6 +1566,24 @@ mod tests {
             id: "call-1".into(),
             name: name.into(),
             arguments: serde_json::json!({}),
+        }
+    }
+
+    fn operation_identity(
+        kernel: &CoreAuthority,
+        call: &ToolCall,
+        generation: u64,
+    ) -> ToolOperationIdentity {
+        ToolOperationIdentity {
+            run_id: kernel.run_id(),
+            task_id: None,
+            turn_id: TurnId::new(),
+            scope_id: None,
+            operation_id: OperationId::new(),
+            generation,
+            call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            argument_digest: ArgumentDigest::from_json(&call.arguments),
         }
     }
 
@@ -796,12 +1699,15 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct RecordingEngine {
         searched_limits: std::sync::Mutex<Vec<usize>>,
         searched_queries: std::sync::Mutex<Vec<String>>,
         search_hits: std::sync::Mutex<Vec<ExternalizedContext>>,
         inspect_external_entry: std::sync::Mutex<Option<ExternalizedContext>>,
+        inspect_summaries: std::sync::Mutex<Vec<ContextItemSummary>>,
         fetched: std::sync::Mutex<Option<ContextItem>>,
+        search_error: std::sync::Mutex<Option<String>>,
     }
 
     #[async_trait::async_trait]
@@ -835,12 +1741,15 @@ mod tests {
             unimplemented!()
         }
         async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
-            Ok(Vec::new())
+            Ok(self.inspect_summaries.lock().unwrap().clone())
         }
         async fn search_external(
             &self,
             query: ContextSearchQuery,
         ) -> AgentResult<Vec<ExternalizedContext>> {
+            if let Some(reason) = self.search_error.lock().unwrap().clone() {
+                return Err(AgentError::Context(reason));
+            }
             self.searched_limits.lock().unwrap().push(query.limit);
             self.searched_queries
                 .lock()
@@ -913,6 +1822,7 @@ mod tests {
             dispatcher,
             Arc::new(AllowAllApproval),
             None,
+            None,
         ))
     }
 
@@ -954,6 +1864,8 @@ mod tests {
             last_access_turn: 0,
             last_selected_turn: 0,
             access_count: 0,
+            last_access_signal: AccessSignal::None,
+            search_reinforce_count: 0,
             gc_generation: 0,
             evicted_at_tick: None,
         }
@@ -992,19 +1904,25 @@ mod tests {
                 searched_queries: Default::default(),
                 search_hits: Default::default(),
                 inspect_external_entry: Default::default(),
+                inspect_summaries: Default::default(),
+                search_error: Default::default(),
                 fetched: Default::default(),
             }),
             dispatcher,
             Some(broker.clone()),
         );
-        let (outcome, lease) = kernel
+        let tool_call = call("big.tool");
+        let generation = kernel.current_authority_epoch();
+        let execution = kernel
             .execute_tool(
-                call("big.tool"),
+                operation_identity(&kernel, &tool_call, generation),
+                tool_call,
                 CancellationToken::new(),
                 &surface_with("big.tool"),
-                0,
+                generation,
             )
             .await;
+        let crate::port::CoreToolExecution { outcome, lease, .. } = execution;
         assert!(
             lease.is_none(),
             "a read-only call carries no commit-time lease"
@@ -1042,19 +1960,25 @@ mod tests {
                 searched_queries: Default::default(),
                 search_hits: Default::default(),
                 inspect_external_entry: Default::default(),
+                inspect_summaries: Default::default(),
+                search_error: Default::default(),
                 fetched: Default::default(),
             }),
             dispatcher,
             None,
         );
-        let (outcome, lease) = kernel
+        let tool_call = call("big.tool");
+        let generation = kernel.current_authority_epoch();
+        let execution = kernel
             .execute_tool(
-                call("big.tool"),
+                operation_identity(&kernel, &tool_call, generation),
+                tool_call,
                 CancellationToken::new(),
                 &surface_with("big.tool"),
-                0,
+                generation,
             )
             .await;
+        let crate::port::CoreToolExecution { outcome, lease, .. } = execution;
         assert!(
             lease.is_none(),
             "a read-only call carries no commit-time lease"
@@ -1073,6 +1997,8 @@ mod tests {
             searched_queries: Default::default(),
             search_hits: Default::default(),
             inspect_external_entry: Default::default(),
+            inspect_summaries: Default::default(),
+            search_error: Default::default(),
             fetched: std::sync::Mutex::new(Some(test_item("big".repeat(200_000)))),
         });
         let kernel = test_kernel(
@@ -1132,6 +2058,8 @@ mod tests {
             searched_queries: Default::default(),
             search_hits: Default::default(),
             inspect_external_entry: Default::default(),
+            inspect_summaries: Default::default(),
+            search_error: Default::default(),
             fetched: Default::default(),
         });
         let kernel = test_kernel(
@@ -1166,6 +2094,7 @@ mod tests {
                     kind: None,
                     scope: None,
                     task_id: None,
+                    label: None,
                     limit: 1_000_000,
                 },
             )
@@ -1181,6 +2110,8 @@ mod tests {
             searched_queries: Default::default(),
             search_hits: Default::default(),
             inspect_external_entry: Default::default(),
+            inspect_summaries: Default::default(),
+            search_error: Default::default(),
             fetched: Default::default(),
         });
         let kernel = test_kernel(
@@ -1215,6 +2146,7 @@ mod tests {
                     kind: None,
                     scope: None,
                     task_id: None,
+                    label: None,
                     limit: 0,
                 },
             )
@@ -1236,6 +2168,8 @@ mod tests {
             searched_queries: Default::default(),
             search_hits: Default::default(),
             inspect_external_entry: Default::default(),
+            inspect_summaries: Default::default(),
+            search_error: Default::default(),
             fetched: Default::default(),
         });
         let kernel = test_kernel(
@@ -1270,6 +2204,7 @@ mod tests {
                     kind: None,
                     scope: None,
                     task_id: None,
+                    label: None,
                     limit: 10,
                 },
             )
@@ -1292,6 +2227,8 @@ mod tests {
             searched_queries: Default::default(),
             search_hits: Default::default(),
             inspect_external_entry: Default::default(),
+            inspect_summaries: Default::default(),
+            search_error: Default::default(),
             fetched: Default::default(),
         });
         let kernel = test_kernel(
@@ -1326,6 +2263,7 @@ mod tests {
                     kind: None,
                     scope: None,
                     task_id: None,
+                    label: None,
                     limit: 10,
                 },
             )
@@ -1344,6 +2282,7 @@ mod tests {
                     kind: Some(ContextKind::Note),
                     scope: None,
                     task_id: None,
+                    label: None,
                     limit: 10,
                 },
             )
@@ -1366,6 +2305,8 @@ mod tests {
                 external_entry(None),
             ]),
             inspect_external_entry: Default::default(),
+            inspect_summaries: Default::default(),
+            search_error: Default::default(),
             fetched: Default::default(),
         });
         let kernel = test_kernel(
@@ -1399,6 +2340,7 @@ mod tests {
                     kind: None,
                     scope: None,
                     task_id: None,
+                    label: None,
                     limit: 10,
                 },
             )
@@ -1412,6 +2354,13 @@ mod tests {
             output.model_content.contains("source=-"),
             "a hit without a source must render the dash placeholder"
         );
+        assert_eq!(output.metadata["op"], "search");
+        assert_eq!(output.metadata["kind"], "context");
+        assert_eq!(
+            output.metadata["descriptors"].as_array().map(|a| a.len()),
+            Some(2),
+            "search hits must carry bounded ResourceDescriptors"
+        );
     }
 
     #[tokio::test]
@@ -1424,6 +2373,8 @@ mod tests {
             inspect_external_entry: std::sync::Mutex::new(Some(external_entry(Some(
                 "tool-session",
             )))),
+            inspect_summaries: Default::default(),
+            search_error: Default::default(),
             fetched: Default::default(),
         });
         let kernel = test_kernel(
@@ -1462,6 +2413,112 @@ mod tests {
             "inspect must render the source authority: {}",
             output.model_content
         );
+        assert_eq!(output.metadata["op"], "inspect");
+        assert_eq!(output.metadata["kind"], "context");
+    }
+
+    fn placeholder_output() -> ToolOutput {
+        ToolOutput {
+            call_id: "c1".into(),
+            tool_name: "context.manage".into(),
+            ok: true,
+            summary: "placeholder".into(),
+            model_content: "placeholder".into(),
+            artifact_ref: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    fn query_kernel(engine: Arc<RecordingEngine>) -> Arc<CoreAuthority> {
+        test_kernel(
+            engine,
+            Arc::new(BigOutputDispatcher {
+                output: placeholder_output(),
+            }),
+            None,
+        )
+    }
+
+    fn dead_summary(id: ContextItemId) -> ContextItemSummary {
+        ContextItemSummary {
+            id,
+            kind: ContextKind::Note,
+            scope: ContextScope::Task,
+            scope_id: None,
+            attention: AttentionState::Archived,
+            semantic: SemanticState::Tombstoned,
+            importance: 0.0,
+            relevance: 0.0,
+            created_tick: 0,
+            created_turn: 0,
+            last_access_turn: 0,
+            last_selected_turn: 0,
+            access_count: 0,
+            dependencies: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
+            source: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_unknown_is_not_found() {
+        let kernel = query_kernel(Arc::new(RecordingEngine::default()));
+        let output = kernel
+            .resolve_engine_query(
+                placeholder_output(),
+                EngineQuery::InspectExternal {
+                    item_id: ContextItemId::new(),
+                },
+            )
+            .await;
+        assert!(output.ok);
+        assert_eq!(output.metadata["miss"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn inspect_terminal_item_is_evidence_absent() {
+        let item_id = ContextItemId::new();
+        let kernel = query_kernel(Arc::new(RecordingEngine {
+            inspect_summaries: std::sync::Mutex::new(vec![dead_summary(item_id)]),
+            ..Default::default()
+        }));
+        let output = kernel
+            .resolve_engine_query(
+                placeholder_output(),
+                EngineQuery::InspectExternal { item_id },
+            )
+            .await;
+        assert!(output.ok);
+        assert_eq!(output.metadata["miss"], "evidence_absent");
+        assert!(
+            output.model_content.contains("not current evidence"),
+            "{}",
+            output.model_content
+        );
+    }
+
+    #[tokio::test]
+    async fn search_provider_error_is_unavailable() {
+        let kernel = query_kernel(Arc::new(RecordingEngine {
+            search_error: std::sync::Mutex::new(Some("index offline".into())),
+            ..Default::default()
+        }));
+        let output = kernel
+            .resolve_engine_query(
+                placeholder_output(),
+                EngineQuery::SearchExternal {
+                    query: "x".into(),
+                    kind: None,
+                    scope: None,
+                    task_id: None,
+                    label: None,
+                    limit: 10,
+                },
+            )
+            .await;
+        assert!(!output.ok);
+        assert_eq!(output.metadata["miss"], "provider_unavailable");
     }
 
     #[tokio::test]
@@ -1474,6 +2531,8 @@ mod tests {
             searched_queries: Default::default(),
             search_hits: Default::default(),
             inspect_external_entry: Default::default(),
+            inspect_summaries: Default::default(),
+            search_error: Default::default(),
             fetched: std::sync::Mutex::new(Some(item)),
         });
         let kernel = test_kernel(
@@ -1547,6 +2606,8 @@ mod tests {
                 searched_queries: Default::default(),
                 search_hits: Default::default(),
                 inspect_external_entry: Default::default(),
+                inspect_summaries: Default::default(),
+                search_error: Default::default(),
                 fetched: Default::default(),
             }),
             Arc::new(BigOutputDispatcher {
@@ -1562,17 +2623,22 @@ mod tests {
             }),
             Arc::new(AllowAllApproval),
             None,
+            None,
         ));
-        let mut events = kernel.subscribe();
+        let mut events = kernel.event_sender().subscribe();
 
-        let (outcome, lease) = kernel
+        let tool_call = call("big.tool");
+        let generation = kernel.current_authority_epoch();
+        let execution = kernel
             .execute_tool(
-                call("big.tool"),
+                operation_identity(&kernel, &tool_call, generation),
+                tool_call,
                 CancellationToken::new(),
                 &surface_with("big.tool"),
-                0,
+                generation,
             )
             .await;
+        let crate::port::CoreToolExecution { outcome, lease, .. } = execution;
         assert!(
             lease.is_none(),
             "a read-only call carries no commit-time lease"
@@ -1582,19 +2648,26 @@ mod tests {
             "the legacy gate still runs and the call executes"
         );
 
-        // The shadow comparison is published for the allowed call.
-        let envelope = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
-            .await
-            .expect("a ShadowDecision event must be published")
-            .expect("stream open");
-        let RuntimeEvent::ShadowDecision {
-            call_name,
-            legacy_allowed,
-            shadow,
-        } = envelope.event
-        else {
-            panic!("expected ShadowDecision, got {:?}", envelope.event);
-        };
+        // Admission publication now precedes every execution lifecycle row;
+        // scan the bounded prefix for the shadow comparison under test.
+        let mut decision = None;
+        for _ in 0..4 {
+            let envelope = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .expect("a ShadowDecision event must be published")
+                .expect("stream open");
+            if let RuntimeEvent::ShadowDecision {
+                call_name,
+                legacy_allowed,
+                shadow,
+            } = envelope.event
+            {
+                decision = Some((call_name, legacy_allowed, shadow));
+                break;
+            }
+        }
+        let (call_name, legacy_allowed, shadow) =
+            decision.expect("the bounded execution prefix must contain ShadowDecision");
         assert_eq!(call_name, "big.tool");
         assert!(legacy_allowed, "the legacy AllowAll gate allowed the call");
         assert!(
@@ -1637,6 +2710,8 @@ mod tests {
                 searched_queries: Default::default(),
                 search_hits: Default::default(),
                 inspect_external_entry: Default::default(),
+                inspect_summaries: Default::default(),
+                search_error: Default::default(),
                 fetched: Default::default(),
             }),
             Arc::new(EchoDispatcher {
@@ -1652,8 +2727,9 @@ mod tests {
             }),
             Arc::new(AllowAllApproval),
             None,
+            None,
         ));
-        let mut events = kernel.subscribe();
+        let mut events = kernel.event_sender().subscribe();
 
         let surface = ToolSurfaceSnapshot {
             specs: vec![ToolSpec {
@@ -1670,13 +2746,21 @@ mod tests {
             name: "fs.write".into(),
             arguments: serde_json::json!({"path": "src/main.rs", "content": "fn main() {}"}),
         };
-        let (outcome, lease) = kernel
-            .execute_tool(write_call, CancellationToken::new(), &surface, 5)
+        let generation = kernel.current_authority_epoch();
+        let execution = kernel
+            .execute_tool(
+                operation_identity(&kernel, &write_call, generation),
+                write_call,
+                CancellationToken::new(),
+                &surface,
+                generation,
+            )
             .await;
+        let crate::port::CoreToolExecution { outcome, lease, .. } = execution;
         assert!(matches!(outcome, ToolOutcome::Value(_)));
         let lease = lease.expect("a side-effecting call must mint a lease");
         assert_eq!(
-            lease.operation_generation, 5,
+            lease.operation_generation, generation,
             "the lease is bound to the operation generation"
         );
         assert_eq!(
@@ -1719,6 +2803,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_tool_rejects_a_stale_authority_epoch_before_dispatch() {
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct CountingTools(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl ToolDispatcher for CountingTools {
+            fn specs(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: "count.tool".into(),
+                    description: "count dispatches".into(),
+                    input_schema: serde_json::json!({}),
+                    risk: ToolRisk::ReadOnly,
+                    output_budget: None,
+                }]
+            }
+
+            async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ToolOutcome::Value(ToolOutput {
+                    call_id: request.call.id,
+                    tool_name: request.call.name,
+                    ok: true,
+                    summary: "executed".into(),
+                    model_content: "executed".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                }))
+            }
+        }
+
+        let kernel = CoreAuthority::new(
+            CoreAuthorityConfig::default(),
+            Arc::new(RecordingEngine {
+                searched_limits: Default::default(),
+                searched_queries: Default::default(),
+                search_hits: Default::default(),
+                inspect_external_entry: Default::default(),
+                inspect_summaries: Default::default(),
+                search_error: Default::default(),
+                fetched: Default::default(),
+            }),
+            Arc::new(CountingTools(executions.clone())),
+            Arc::new(AllowAllApproval),
+            None,
+            None,
+        );
+        let stale = kernel.current_authority_epoch();
+        kernel.advance_authority_epoch(stale).unwrap();
+        let surface = ToolSurfaceSnapshot {
+            specs: kernel.tools.specs(),
+            ..ToolSurfaceSnapshot::default()
+        };
+        let tool_call = ToolCall {
+            id: "stale-call".into(),
+            name: "count.tool".into(),
+            arguments: serde_json::json!({}),
+        };
+        let execution = kernel
+            .execute_tool(
+                operation_identity(&kernel, &tool_call, stale),
+                tool_call,
+                CancellationToken::new(),
+                &surface,
+                stale,
+            )
+            .await;
+        let crate::port::CoreToolExecution { outcome, lease, .. } = execution;
+        assert!(lease.is_none());
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("stale dispatch must return a bounded value error")
+        };
+        assert!(!output.ok);
+        assert!(output.model_content.contains("authority fence"));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_rechecks_epoch_after_awaiting_approval() {
+        struct BlockingApproval {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl ApprovalGate for BlockingApproval {
+            async fn authorize(
+                &self,
+                _call: &ToolCall,
+                _spec: &ToolSpec,
+                _cancel: &CancellationToken,
+            ) -> AgentResult<ApprovalDecision> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(ApprovalDecision::Allow)
+            }
+        }
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct CountingTools(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl ToolDispatcher for CountingTools {
+            fn specs(&self) -> Vec<ToolSpec> {
+                vec![ToolSpec {
+                    name: "count.tool".into(),
+                    description: "count dispatches".into(),
+                    input_schema: serde_json::json!({}),
+                    risk: ToolRisk::ReadOnly,
+                    output_budget: None,
+                }]
+            }
+            async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ToolOutcome::Value(tool_error_output(
+                    &request.call,
+                    "executed".into(),
+                )))
+            }
+        }
+
+        let kernel = Arc::new(CoreAuthority::new(
+            CoreAuthorityConfig::default(),
+            Arc::new(RecordingEngine {
+                searched_limits: Default::default(),
+                searched_queries: Default::default(),
+                search_hits: Default::default(),
+                inspect_external_entry: Default::default(),
+                inspect_summaries: Default::default(),
+                search_error: Default::default(),
+                fetched: Default::default(),
+            }),
+            Arc::new(CountingTools(executions.clone())),
+            Arc::new(BlockingApproval {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            None,
+            None,
+        ));
+        let generation = kernel.current_authority_epoch();
+        let surface = ToolSurfaceSnapshot {
+            specs: kernel.tools.specs(),
+            ..ToolSurfaceSnapshot::default()
+        };
+        let running = {
+            let kernel = kernel.clone();
+            tokio::spawn(async move {
+                let tool_call = ToolCall {
+                    id: "approval-race".into(),
+                    name: "count.tool".into(),
+                    arguments: serde_json::json!({}),
+                };
+                kernel
+                    .execute_tool(
+                        operation_identity(&kernel, &tool_call, generation),
+                        tool_call,
+                        CancellationToken::new(),
+                        &surface,
+                        generation,
+                    )
+                    .await
+            })
+        };
+        entered.notified().await;
+        kernel.advance_authority_epoch(generation).unwrap();
+        release.notify_one();
+        let crate::port::CoreToolExecution { outcome, lease, .. } = running.await.unwrap();
+        assert!(lease.is_none());
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("stale post-approval dispatch must be a value error")
+        };
+        assert!(output.model_content.contains("stale"));
+    }
+
+    #[tokio::test]
     async fn lease_is_minted_even_when_the_shadow_gate_denies() {
         // Shadow is observational: the legacy gate allowed the call, so it
         // executes and mints a lease. The lease records that no v2 grant
@@ -1736,6 +2995,8 @@ mod tests {
                 searched_queries: Default::default(),
                 search_hits: Default::default(),
                 inspect_external_entry: Default::default(),
+                inspect_summaries: Default::default(),
+                search_error: Default::default(),
                 fetched: Default::default(),
             }),
             Arc::new(EchoDispatcher {
@@ -1751,6 +3012,7 @@ mod tests {
             }),
             Arc::new(AllowAllApproval),
             None,
+            None,
         ));
 
         let surface = ToolSurfaceSnapshot {
@@ -1763,18 +3025,22 @@ mod tests {
             }],
             ..ToolSurfaceSnapshot::default()
         };
-        let (_, lease) = kernel
+        let tool_call = ToolCall {
+            id: "c1".into(),
+            name: "shell.exec".into(),
+            arguments: serde_json::json!({"command": "cargo test"}),
+        };
+        let generation = kernel.current_authority_epoch();
+        let execution = kernel
             .execute_tool(
-                ToolCall {
-                    id: "c1".into(),
-                    name: "shell.exec".into(),
-                    arguments: serde_json::json!({"command": "cargo test"}),
-                },
+                operation_identity(&kernel, &tool_call, generation),
+                tool_call,
                 CancellationToken::new(),
                 &surface,
-                1,
+                generation,
             )
             .await;
+        let crate::port::CoreToolExecution { lease, .. } = execution;
         let lease = lease.expect("a side-effecting call mints a lease");
         assert_eq!(
             lease.grant_id, None,

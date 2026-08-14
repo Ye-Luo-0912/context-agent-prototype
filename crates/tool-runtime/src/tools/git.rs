@@ -211,6 +211,7 @@ impl Tool for GitStatusTool {
         run_id: RunId,
         call_id: &str,
         _arguments: Value,
+        _effect_context: Option<agent_contracts::OperationEffectContext>,
         cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let output = run_git(
@@ -251,6 +252,7 @@ impl Tool for GitDiffTool {
         run_id: RunId,
         call_id: &str,
         arguments: Value,
+        _effect_context: Option<agent_contracts::OperationEffectContext>,
         cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let args: DiffArgs = serde_json::from_value(arguments)
@@ -317,6 +319,7 @@ mod tests {
                 RunId::new(),
                 "diff-call",
                 json!({"path": "--output=leak.patch"}),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -338,6 +341,7 @@ mod tests {
                 RunId::new(),
                 "diff-call",
                 json!({"path": "../outside.txt"}),
+                None,
                 CancellationToken::new(),
             )
             .await;
@@ -353,7 +357,7 @@ mod tests {
         cancel.cancel();
 
         let result = tool
-            .execute(RunId::new(), "status-call", json!({}), cancel)
+            .execute(RunId::new(), "status-call", json!({}), None, cancel)
             .await;
         assert!(matches!(result, Err(AgentError::Cancelled)));
     }

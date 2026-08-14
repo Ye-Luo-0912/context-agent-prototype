@@ -137,16 +137,30 @@ pub(crate) async fn read_item_async(dir: &Path, item_id: ContextItemId) -> Optio
 }
 
 /// Deterministic search over externalized refs — no vectors, no store
-/// reads. Filters on the indexed dimensions of the map (entity signature,
-/// kind, scope, task), ranks entity matches above recency, and caps the
-/// answer. The full content stays in the store; the model decides what to
-/// fetch after seeing the refs.
-///
-/// Bounded by construction: only the `limit` best matches are kept while
-/// streaming, so memory stays O(limit) even when the store is large — a
-/// model-driven search must not cost proportional to logical history size.
-pub(crate) fn search_entries(
-    entries: &[ExternalizedContext],
+/// reads. Candidate generation prefers the catalog indexes (kind/scope/
+/// task/label/entity keys); a free-text needle that hits none of those
+/// keys residual-scans summaries/uris so coverage stays the same as the
+/// previous full-history walk. Ranking is unchanged: entity matches first,
+/// then recency, bounded to `limit`.
+pub(crate) fn search_catalog(
+    state: &State,
+    query: &agent_contracts::ContextSearchQuery,
+) -> Vec<ExternalizedContext> {
+    match state.catalog.stored_search_ids(query) {
+        Some(ids) => {
+            let entries: Vec<&ExternalizedContext> = ids
+                .iter()
+                .filter_map(|id| state.external.get(*id))
+                .collect();
+            search_entries(entries, query)
+        }
+        None => search_entries(state.external.iter(), query),
+    }
+}
+
+/// Rank and cap an iterator of map entries. Memory stays O(limit).
+pub(crate) fn search_entries<'a>(
+    entries: impl IntoIterator<Item = &'a ExternalizedContext>,
     query: &agent_contracts::ContextSearchQuery,
 ) -> Vec<ExternalizedContext> {
     let needle = query.query.to_lowercase();
@@ -181,6 +195,16 @@ pub(crate) fn search_entries(
             && entry.task_id != Some(task)
         {
             continue;
+        }
+        if let Some(label) = query.label.as_deref() {
+            let needle = label.to_lowercase();
+            if !entry
+                .tags
+                .iter()
+                .any(|tag| tag.as_str().to_lowercase() == needle)
+            {
+                continue;
+            }
         }
         let entity_match = entry
             .entities
@@ -303,6 +327,10 @@ pub(crate) fn to_external_entry(
         last_access_turn: item.last_access_turn,
         last_selected_turn: item.last_selected_turn,
         access_count: item.access_count,
+        // 外部化开一段新的 stored 生命：search 饱和从 0 计。驻留期的
+        // ack 已经写在 last_selected_turn / access_count 上。
+        last_access_signal: agent_contracts::AccessSignal::None,
+        search_reinforce_count: 0,
         gc_generation: item.gc_generation,
         evicted_at_tick: item.evicted_at_tick,
     }
@@ -427,10 +455,21 @@ pub(crate) fn plan_storage_gc(
         }
     }
 
+    let mut anchor_roots_protected = 0usize;
     let candidates = state
         .external
         .iter()
         .filter_map(|entry| {
+            // TaskAnchor 的 StorageRequired 声明：活跃任务声称这条证据
+            // 必须永久保留，storage GC 不把它列入候选（任务权威 > TTL）。
+            let claimed = state.anchor_roots.iter().any(|claim| {
+                claim.strength == agent_contracts::AnchorRootStrength::StorageRequired
+                    && crate::engine::anchor_claim_matches_entry(claim, entry)
+            });
+            if claimed {
+                anchor_roots_protected += 1;
+                return None;
+            }
             storage_candidate(
                 entry,
                 now_tick,
@@ -440,12 +479,18 @@ pub(crate) fn plan_storage_gc(
             .map(|reason| (entry.item_id, reason))
         })
         .collect();
-    StorageGcPlan { candidates }
+    StorageGcPlan {
+        candidates,
+        anchor_roots_protected,
+    }
 }
 
 /// The Storage GC plan: which entries to delete and why (for the report).
 pub(crate) struct StorageGcPlan {
     pub(crate) candidates: Vec<(ContextItemId, String)>,
+    /// Entries kept this pass because a `StorageRequired` anchor root
+    /// claim protects them.
+    pub(crate) anchor_roots_protected: usize,
 }
 
 /// Phase 2 (no lock held): remove the planned store files. Real IO errors
@@ -531,6 +576,7 @@ pub(crate) fn commit_storage_gc(
     // The map re-indexes the survivors in one step (take/replace pair).
     state.external.replace_all(kept);
     report.scanned = state.external.len() + report.deleted;
+    report.anchor_roots_protected = plan.anchor_roots_protected;
     report
 }
 

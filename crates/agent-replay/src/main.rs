@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use agent_replay::{
     ReplayConfig, compare_config, recovery_replay_file, render_comparison, render_recovery_report,
@@ -7,7 +8,7 @@ use agent_replay::{
 
 fn usage() -> ! {
     eprintln!(
-        "usage: agent-replay <trace.jsonl> [--system-prompt <text>] [--budget <tokens>]\n\
+        "usage: agent-replay <trace.jsonl> [--system-prompt <text>] [--budget <tokens>] [--workspace <dir>]\n\
          \n\
          Replays a context lifecycle from a JSONL event journal produced by the\n\
          runtime (one RuntimeEventEnvelope per line) and prints a per-item report:\n\
@@ -63,9 +64,14 @@ async fn main() -> anyhow::Result<()> {
             usage();
         }
         let config = compare_config();
-        for scenario in &selected {
-            let results = agent_replay::compare_scenario(scenario, &config).await?;
-            print!("{}", render_comparison(scenario, &results));
+        for scenario in selected {
+            let config = config.clone();
+            let run = scenario.clone();
+            let results =
+                tokio::spawn(async move { agent_replay::compare_scenario(&run, &config).await })
+                    .await
+                    .map_err(|error| anyhow::anyhow!("replay compare worker: {error}"))??;
+            print!("{}", render_comparison(&scenario, &results));
         }
         return Ok(());
     }
@@ -91,6 +97,13 @@ async fn main() -> anyhow::Result<()> {
                         usage();
                     };
                     config.budget_tokens = tokens;
+                }
+                "--workspace" => {
+                    let Some(value) = args.next() else {
+                        usage();
+                    };
+                    let workspace = agent_workspace::Workspace::open(&value).await?;
+                    config.artifact_workspace = Some(Arc::new(workspace));
                 }
                 other => {
                     eprintln!("unknown argument: {other}");
@@ -118,11 +131,16 @@ async fn main() -> anyhow::Result<()> {
             usage();
         }
         let config = compare_config();
-        for scenario in &selected {
-            let results = agent_replay::compare_facts(scenario, &config).await?;
+        for scenario in selected {
+            let config = config.clone();
+            let run = scenario.clone();
+            let results =
+                tokio::spawn(async move { agent_replay::compare_facts(&run, &config).await })
+                    .await
+                    .map_err(|error| anyhow::anyhow!("replay facts worker: {error}"))??;
             print!(
                 "{}",
-                agent_replay::render_fact_comparison(scenario, &results)
+                agent_replay::render_fact_comparison(&scenario, &results)
             );
         }
         return Ok(());
@@ -146,6 +164,13 @@ async fn main() -> anyhow::Result<()> {
                     usage();
                 };
                 config.budget_tokens = tokens;
+            }
+            "--workspace" => {
+                let Some(value) = args.next() else {
+                    usage();
+                };
+                let workspace = agent_workspace::Workspace::open(&value).await?;
+                config.artifact_workspace = Some(Arc::new(workspace));
             }
             other => {
                 eprintln!("unknown argument: {other}");

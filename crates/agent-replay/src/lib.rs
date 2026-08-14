@@ -30,8 +30,8 @@ use std::{
 use agent_contracts::{
     AttentionState, ContextConsumptionAck, ContextDiagnostics, ContextEngine, ContextHints,
     ContextIngress, ContextItemId, ContextItemSummary, ContextKind, ContextQuery, ContextSelection,
-    FocusState, MaterializedContext, MaterializedItem, OperationId, RuntimeEvent,
-    RuntimeEventEnvelope, TurnId, tokens,
+    FocusState, MaterializedContext, MaterializedItem, OperationId, RunId, RuntimeEvent,
+    RuntimeEventEnvelope, RuntimeInputEnvelope, TurnId, USER_INPUT_REPLAY_MAX_BYTES, tokens,
 };
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 
@@ -47,10 +47,12 @@ pub use scenarios::{
     Scenario, all_scenarios, compare_config, compare_scenario, engine_variants, render_comparison,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ReplayConfig {
     pub system_prompt: String,
     pub budget_tokens: usize,
+    /// 有 `body_ref` 的长用户消息从这里读全文。缺省时短 preview 仍可回放。
+    pub artifact_workspace: Option<Arc<agent_workspace::Workspace>>,
 }
 
 impl Default for ReplayConfig {
@@ -63,7 +65,21 @@ impl Default for ReplayConfig {
             )
             .to_string(),
             budget_tokens: 24_000,
+            artifact_workspace: None,
         }
+    }
+}
+
+impl std::fmt::Debug for ReplayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplayConfig")
+            .field("system_prompt", &self.system_prompt)
+            .field("budget_tokens", &self.budget_tokens)
+            .field(
+                "artifact_workspace",
+                &self.artifact_workspace.as_ref().map(|_| "<workspace>"),
+            )
+            .finish()
     }
 }
 
@@ -110,6 +126,46 @@ pub struct ReplayOutcome {
     /// are part of the lifecycle story, not an error).
     pub gc_evictions: usize,
     pub gc_reactivations: usize,
+    /// 各次 materialize 时 Resident 堆正文的峰值字节（不是 selected/prompt）。
+    pub peak_resident_bytes: usize,
+}
+
+async fn resolve_user_message_body(
+    input: &RuntimeInputEnvelope,
+    run_id: RunId,
+    workspace: Option<&agent_workspace::Workspace>,
+) -> anyhow::Result<String> {
+    let Some(body_ref) = input.body_ref.as_deref() else {
+        return Ok(input.preview.clone());
+    };
+    let Some(workspace) = workspace else {
+        anyhow::ensure!(
+            input.preview_covers_body(),
+            "replay cannot resolve truncated user input {body_ref} without an artifact workspace"
+        );
+        return Ok(input.preview.clone());
+    };
+    let (_normalized, file) = workspace
+        .open_artifact_for_run(body_ref, run_id)
+        .await
+        .map_err(|error| anyhow::anyhow!("read user-input artifact {body_ref}: {error}"))?;
+    let mut file = file.into_tokio();
+    let mut bytes = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut file, &mut bytes).await?;
+    anyhow::ensure!(
+        bytes.len() <= USER_INPUT_REPLAY_MAX_BYTES,
+        "user-input artifact {body_ref} exceeds the replay cap of {USER_INPUT_REPLAY_MAX_BYTES} bytes"
+    );
+    if input.bytes > 0 {
+        anyhow::ensure!(
+            bytes.len() as u64 == input.bytes,
+            "user-input artifact {body_ref} size {} != recorded {}",
+            bytes.len(),
+            input.bytes
+        );
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| anyhow::anyhow!("user-input artifact {body_ref} is not utf-8: {error}"))
 }
 
 /// Replay a slice of envelopes through the dynamic working-set engine.
@@ -161,6 +217,7 @@ pub(crate) async fn run_engine_observing(
     let mut transitions_total = 0usize;
     let mut gc_evictions = 0usize;
     let mut gc_reactivations = 0usize;
+    let mut peak_resident_bytes = 0usize;
     // New traces distinguish a preview from a successful provider
     // consumption. A whole-trace feature check keeps old JSONL journals and
     // synthetic benchmark scenarios replayable without inventing ack events.
@@ -172,13 +229,21 @@ pub(crate) async fn run_engine_observing(
     for envelope in events {
         events_consumed += 1;
         match &envelope.event {
-            RuntimeEvent::UserMessageAccepted { content } => {
+            RuntimeEvent::UserMessageAccepted { input } => {
+                if !input.is_applied() {
+                    // Queued / Rejected / Consumed / Archived / Interrupt 不重复 ingest。
+                    continue;
+                }
                 current_turn += 1;
-                current_input = content.clone();
+                let body = resolve_user_message_body(
+                    input,
+                    envelope.run_id,
+                    config.artifact_workspace.as_deref(),
+                )
+                .await?;
+                current_input = body.clone();
                 engine
-                    .ingest(ContextIngress::UserMessage {
-                        content: content.clone(),
-                    })
+                    .ingest(ContextIngress::UserMessage { content: body })
                     .await?;
             }
             RuntimeEvent::FocusChanged { task_id, goal } => {
@@ -241,23 +306,16 @@ pub(crate) async fn run_engine_observing(
                 }
             }
             RuntimeEvent::ContextPrepared { selected, .. } => {
-                let materialized = engine
-                    .materialize(ContextQuery {
-                        current_input: current_input.clone(),
-                        budget_tokens: config.budget_tokens,
-                        hints: ContextHints::default(),
-                    })
-                    .await?;
+                let snapshot =
+                    prepare_replay_snapshot(engine.as_ref(), &current_input, config).await?;
                 snapshot_builds += 1;
-                // The materialized share plus the runtime-owned system prompt
-                // is what the model request actually pays for.
-                let input_tokens =
-                    tokens::approx_tokens(&config.system_prompt) + materialized.approx_tokens;
-                input_tokens_total += input_tokens;
-                input_tokens_max = input_tokens_max.max(input_tokens);
-                if input_tokens > config.budget_tokens {
+                input_tokens_total += snapshot.input_tokens;
+                input_tokens_max = input_tokens_max.max(snapshot.input_tokens);
+                if snapshot.input_tokens > config.budget_tokens {
                     over_budget_snapshots += 1;
                 }
+                peak_resident_bytes = peak_resident_bytes.max(snapshot.resident_bytes);
+                let materialized = snapshot.materialized;
                 if has_explicit_consumption {
                     // Runtime ids are random and cannot be replayed directly.
                     // ContextPrepared carries the final selection metadata in
@@ -368,6 +426,36 @@ pub(crate) async fn run_engine_observing(
         transitions_total,
         gc_evictions,
         gc_reactivations,
+        peak_resident_bytes,
+    })
+}
+
+/// 把 materialize + Resident 字节采样拆出 `run_engine_observing`，避免
+/// Windows 上 `#[tokio::main]` 在 1MiB 主线程栈上把巨大 state machine 撑爆。
+struct PreparedSnapshot {
+    materialized: MaterializedContext,
+    input_tokens: usize,
+    resident_bytes: usize,
+}
+
+async fn prepare_replay_snapshot(
+    engine: &dyn ContextEngine,
+    current_input: &str,
+    config: &ReplayConfig,
+) -> anyhow::Result<PreparedSnapshot> {
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: current_input.to_string(),
+            budget_tokens: config.budget_tokens,
+            hints: ContextHints::default(),
+        })
+        .await?;
+    let input_tokens = tokens::approx_tokens(&config.system_prompt) + materialized.approx_tokens;
+    let resident_bytes = engine.diagnostics().await?.resident_bytes;
+    Ok(PreparedSnapshot {
+        materialized,
+        input_tokens,
+        resident_bytes,
     })
 }
 
@@ -462,7 +550,7 @@ pub fn render_report(outcome: &ReplayOutcome) -> String {
     ));
     let diagnostics = &outcome.final_diagnostics;
     out.push_str(&format!(
-        "final context: total={} active={} cooling={} archived={} dropped={} active~{} tok | resident={} evicted={} gc(evict={} react={})\n\n",
+        "final context: total={} active={} cooling={} archived={} dropped={} active~{} tok | resident={} bytes={} peak_bytes={} evicted={} gc(evict={} react={})\n\n",
         diagnostics.total_items,
         diagnostics.active_items,
         diagnostics.cooling_items,
@@ -470,6 +558,8 @@ pub fn render_report(outcome: &ReplayOutcome) -> String {
         diagnostics.tombstoned_items,
         diagnostics.approx_active_tokens,
         diagnostics.resident_items,
+        diagnostics.resident_bytes,
+        outcome.peak_resident_bytes,
         diagnostics.warm_items,
         outcome.gc_evictions,
         outcome.gc_reactivations,
@@ -619,9 +709,7 @@ mod tests {
             envelope(
                 run,
                 3,
-                RuntimeEvent::UserMessageAccepted {
-                    content: "fix AuthService.rs".into(),
-                },
+                RuntimeEvent::user_message_accepted("fix AuthService.rs"),
             ),
             envelope(
                 run,
@@ -674,13 +762,7 @@ mod tests {
             envelope(run, 10, RuntimeEvent::TurnCompleted),
             // Turn 2: the assistant message from turn 1 becomes prior working
             // context and is consumed by this turn's model request.
-            envelope(
-                run,
-                11,
-                RuntimeEvent::UserMessageAccepted {
-                    content: "continue".into(),
-                },
-            ),
+            envelope(run, 11, RuntimeEvent::user_message_accepted("continue")),
             envelope(
                 run,
                 12,
@@ -780,13 +862,7 @@ mod tests {
                     content: "constraint beta".into(),
                 },
             ),
-            envelope(
-                run,
-                3,
-                RuntimeEvent::UserMessageAccepted {
-                    content: "continue".into(),
-                },
-            ),
+            envelope(run, 3, RuntimeEvent::user_message_accepted("continue")),
             envelope(
                 run,
                 4,
@@ -851,13 +927,7 @@ mod tests {
                     content: "preview only constraint".into(),
                 },
             ),
-            envelope(
-                run,
-                2,
-                RuntimeEvent::UserMessageAccepted {
-                    content: "continue".into(),
-                },
-            ),
+            envelope(run, 2, RuntimeEvent::user_message_accepted("continue")),
             envelope(
                 run,
                 3,
@@ -918,13 +988,7 @@ mod tests {
                     goal: "task one".into(),
                 },
             ),
-            envelope(
-                run,
-                2,
-                RuntimeEvent::UserMessageAccepted {
-                    content: "task one".into(),
-                },
-            ),
+            envelope(run, 2, RuntimeEvent::user_message_accepted("task one")),
             envelope(
                 run,
                 3,
@@ -965,13 +1029,7 @@ mod tests {
                     report: dummy_report(),
                 },
             ),
-            envelope(
-                run,
-                8,
-                RuntimeEvent::UserMessageAccepted {
-                    content: "task two".into(),
-                },
-            ),
+            envelope(run, 8, RuntimeEvent::user_message_accepted("task two")),
             envelope(
                 run,
                 9,
@@ -1053,13 +1111,7 @@ mod tests {
         let run = RunId::new();
         let events = vec![
             // Turn 1: first attempt fails.
-            envelope(
-                run,
-                1,
-                RuntimeEvent::UserMessageAccepted {
-                    content: "run tests".into(),
-                },
-            ),
+            envelope(run, 1, RuntimeEvent::user_message_accepted("run tests")),
             envelope(
                 run,
                 2,
@@ -1127,13 +1179,7 @@ mod tests {
             envelope(run, 10, RuntimeEvent::TurnCompleted),
             // Turn 2: retry passes on the same entity — the error is verified
             // and archived; the successful observation stays ephemeral.
-            envelope(
-                run,
-                11,
-                RuntimeEvent::UserMessageAccepted {
-                    content: "retry".into(),
-                },
-            ),
+            envelope(run, 11, RuntimeEvent::user_message_accepted("retry")),
             envelope(
                 run,
                 12,
@@ -1250,21 +1296,13 @@ mod tests {
         let other = RunId::new();
         let mut events = vec![
             envelope(run, 1, RuntimeEvent::RunStarted),
-            envelope(
-                run,
-                2,
-                RuntimeEvent::UserMessageAccepted {
-                    content: "hello".into(),
-                },
-            ),
+            envelope(run, 2, RuntimeEvent::user_message_accepted("hello")),
             envelope(run, 3, RuntimeEvent::TurnCompleted),
         ];
         events.push(envelope(
             other,
             1,
-            RuntimeEvent::UserMessageAccepted {
-                content: "other run".into(),
-            },
+            RuntimeEvent::user_message_accepted("other run"),
         ));
 
         let jsonl: String = events
@@ -1280,5 +1318,89 @@ mod tests {
 
         assert_eq!(outcome.turns, 1);
         assert_eq!(outcome.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replay_reads_truncated_user_input_from_body_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+        let run = RunId::new();
+        let body = "unique-replay-body-".to_string() + &"y".repeat(400);
+        let body_ref = workspace
+            .write_artifact(
+                run,
+                agent_contracts::USER_INPUT_ARTIFACT_OWNER,
+                "txt",
+                body.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let input = RuntimeInputEnvelope::user_dialogue(
+            body.clone(),
+            None,
+            None,
+            None,
+            Some(body_ref),
+            None,
+        );
+        assert!(
+            input.preview.len() < body.len(),
+            "the journal preview must be truncated"
+        );
+        assert_eq!(
+            resolve_user_message_body(&input, run, Some(workspace.as_ref()))
+                .await
+                .unwrap(),
+            body
+        );
+        assert!(
+            resolve_user_message_body(&input, run, None).await.is_err(),
+            "truncated body_ref without a workspace must fail closed"
+        );
+        let events = vec![
+            envelope(run, 1, RuntimeEvent::RunStarted),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::FocusChanged {
+                    task_id: TaskId::new(),
+                    goal: "task".into(),
+                },
+            ),
+            envelope(
+                run,
+                3,
+                RuntimeEvent::UserMessageAccepted {
+                    input: input.clone(),
+                },
+            ),
+            envelope(
+                run,
+                4,
+                RuntimeEvent::ContextMaintained {
+                    trigger: ContextMaintenanceTrigger::UserInput,
+                    report: dummy_report(),
+                },
+            ),
+        ];
+        let config = ReplayConfig {
+            artifact_workspace: Some(workspace),
+            ..ReplayConfig::default()
+        };
+        let outcome = replay_events(&events, &config).await.unwrap();
+        assert_eq!(outcome.turns, 1);
+        assert!(
+            outcome
+                .items
+                .iter()
+                .any(|item| item.kind == ContextKind::UserMessage),
+            "replay must ingest the user message from body_ref"
+        );
+        assert!(
+            replay_events(&events, &ReplayConfig::default())
+                .await
+                .is_err(),
+            "truncated body_ref without a workspace must fail closed"
+        );
     }
 }

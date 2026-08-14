@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::{
     AgentError, AgentResult, CancellationToken, ContextAction, ContextItemId, ContextKind,
-    ContextScope, RunId, TaskId, TurnId,
+    ContextScope, EffectId, RunId, TaskId, ToolOperationIdentity, TurnId,
 };
 
 /// Hard cap on the model-facing `model_content` of a tool result (chars).
@@ -50,11 +50,24 @@ pub trait OutputBroker: Send + Sync {
     async fn bound(&self, run_id: RunId, budget: Option<usize>, output: ToolOutput) -> ToolOutput;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub enum ToolRisk {
+    #[default]
     ReadOnly,
     WorkspaceWrite,
     ProcessExecution,
+}
+
+impl ToolRisk {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::WorkspaceWrite => "workspace_write",
+            Self::ProcessExecution => "process_execution",
+        }
+    }
 }
 
 /// The normalized side effect one tool call intends to perform, derived from
@@ -189,14 +202,59 @@ pub enum ToolResultDisposition {
     AccessEventOnly,
 }
 
+/// Core-issued recovery identity attached only to a side-effecting dispatch.
+///
+/// This is evidence metadata, not an authority grant: committing still
+/// requires the matching Core-held lease and current authority epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationEffectContext {
+    pub identity: ToolOperationIdentity,
+    pub effect_id: EffectId,
+}
+
+impl OperationEffectContext {
+    pub fn validate(&self) -> Result<(), String> {
+        self.identity.validate()?;
+        if self.effect_id.0.is_nil() {
+            return Err("operation effect context contains a nil effect id".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolExecutionRequest {
     pub run_id: RunId,
     pub call: ToolCall,
+    /// Stable identity for a side-effecting operation, issued and persisted
+    /// by Core before dispatch. Legacy/read-only calls carry `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_context: Option<OperationEffectContext>,
     /// Cooperative cancellation handle for this execution (kill long-running
     /// processes, abort expensive searches). Not serialized.
     #[serde(skip)]
     pub cancel: CancellationToken,
+}
+
+impl ToolExecutionRequest {
+    /// Validate all duplicated request identity before a dispatcher trusts it
+    /// as recovery evidence. Tool risk remains policy-owned and is therefore
+    /// intentionally not inferred here.
+    pub fn validate(&self) -> Result<(), String> {
+        let Some(context) = &self.effect_context else {
+            return Ok(());
+        };
+        context.validate()?;
+        if context.identity.run_id != self.run_id
+            || context.identity.call_id != self.call.id
+            || context.identity.tool_name != self.call.name
+            || context.identity.argument_digest
+                != crate::ArgumentDigest::from_json(&self.call.arguments)
+        {
+            return Err("operation effect context does not match the tool request".into());
+        }
+        Ok(())
+    }
 }
 
 /// A side effect a tool prepared but did not yet apply.
@@ -215,9 +273,10 @@ pub trait Effect: Send + Sync {
     /// Apply the prepared effect (atomic rename, outbox send, ...) and
     /// return the ACI v2 receipt: what happened to the world, how durably
     /// it is recorded, and the evidence reference. `NotApplied` leaves the
-    /// world unchanged; `Applied` with `DurabilityFailed` means the effect
-    /// landed but its record could not be persisted — the runtime must
-    /// treat that as a degraded/recovery state, never as "nothing
+    /// world unchanged; `Applied` with `DurabilityFailed` means something
+    /// landed but the operation is not durably complete (for example, a
+    /// journal failure or a partial sequential composite) — the runtime
+    /// must treat that as a degraded/recovery state, never as "nothing
     /// happened"; `Unknown` is for remote operations whose applied state
     /// can never be learned back.
     async fn commit(self: Box<Self>) -> EffectReceipt;
@@ -226,21 +285,25 @@ pub trait Effect: Send + Sync {
 }
 
 /// How durably an applied effect is recorded.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EffectDurability {
     /// Fully recorded; the world and the journal agree.
     Durable,
-    /// The effect landed but its record could not be persisted; the world
-    /// and the journal disagree. Recovery is required.
+    /// The effect landed but the operation cannot be treated as durably
+    /// complete. This includes a failed journal write and a sequential
+    /// composite that stopped after an earlier sub-effect had already
+    /// landed. Recovery is required.
     DurabilityFailed(String),
 }
 
 /// The outcome of committing a staged effect (ACI v2, compatibility order
 /// step 5): what happened to the world, how durably it is recorded, and
-/// the evidence reference. `EffectCommitError` semantics are preserved —
-/// `NotApplied` and `AppliedButDurabilityFailed` map one-to-one — so the
-/// journal format and the model-facing messages stay the same; the receipt
-/// just carries them in one typed, serializable, evidence-bearing shape.
+/// the evidence reference. Single-effect `EffectCommitError` semantics are
+/// preserved: `NotApplied` and `AppliedButDurabilityFailed` map one-to-one.
+/// A sequential composite may also synthesize `DurabilityFailed` when it
+/// cannot truthfully report `NotApplied` after an earlier child landed.
+/// The receipt carries those states in one typed, serializable,
+/// evidence-bearing shape.
 /// Errors travel as message strings (receipts are result envelopes for
 /// events and logs, not error objects).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,7 +333,7 @@ impl EffectReceipt {
             Self::Applied {
                 durability: EffectDurability::DurabilityFailed(error),
                 ..
-            } => format!("effect applied but its journal record failed: {error}"),
+            } => format!("effect applied but recovery is required: {error}"),
             Self::Unknown { error } => format!("effect applied state unknown: {error}"),
         }
     }
@@ -290,14 +353,17 @@ impl From<EffectCommitError> for EffectReceipt {
     }
 }
 
-/// Several effects committed in order as one operation. Used by the
-/// process-capability adapter when a child declares more than one wire
-/// effect: each is staged through its own confined handle, and this
-/// composite commits them one after the other behind the generation fence.
+/// Several trusted, already-prepared effects committed in order as one
+/// operation. Multi-file builtin edits use this today. Process wire effects
+/// remain fail-closed until their actual intent can be proved against the
+/// invocation lease; if that path is later re-enabled it may reuse this
+/// composite only after every child effect is safely staged.
 /// Each sub-effect is itself atomic; a mid-list failure stops the rest and
-/// reports the failing receipt — effects already committed stay committed
-/// (they are separate atomic operations, not one transaction), and their
-/// evidence references are aggregated into the final receipt.
+/// rolls back every unattempted preparation. Effects already committed stay
+/// committed (they are separate atomic operations, not one transaction), so
+/// the aggregate reports `Applied` plus `DurabilityFailed` whenever a later
+/// `NotApplied`/`Unknown` receipt follows an earlier application. Evidence
+/// references are aggregated under a hard bound for recovery.
 #[async_trait::async_trait]
 impl Effect for Vec<Box<dyn Effect>> {
     fn describe(&self) -> String {
@@ -305,39 +371,78 @@ impl Effect for Vec<Box<dyn Effect>> {
     }
 
     async fn commit(self: Box<Self>) -> EffectReceipt {
-        let mut evidence: Vec<String> = Vec::new();
-        for effect in (*self).into_iter() {
+        let mut effects = (*self).into_iter();
+        let mut evidence = CompositeEvidence::default();
+        let mut applied_count = 0usize;
+        while let Some(effect) = effects.next() {
             match effect.commit().await {
                 EffectReceipt::Applied {
                     durability: EffectDurability::Durable,
                     evidence: Some(id),
                 } => {
+                    applied_count += 1;
                     evidence.push(id);
                 }
                 EffectReceipt::Applied {
                     durability: EffectDurability::Durable,
                     evidence: None,
-                } => {}
-                receipt => {
-                    // The failing effect stops the list. Its own receipt
-                    // carries its error; the already-committed evidence is
-                    // attached so recovery knows what landed.
-                    return match receipt {
-                        EffectReceipt::Applied {
-                            durability,
-                            evidence: own,
-                        } => EffectReceipt::Applied {
-                            durability,
-                            evidence: Some(evidence_ids(own, &evidence)),
-                        },
-                        other => other,
+                } => {
+                    applied_count += 1;
+                }
+                EffectReceipt::Applied {
+                    durability: EffectDurability::DurabilityFailed(error),
+                    evidence: own,
+                } => {
+                    evidence.push_optional(own);
+                    rollback_remaining(
+                        effects,
+                        "composite commit stopped after an applied sub-effect required recovery",
+                    )
+                    .await;
+                    return EffectReceipt::Applied {
+                        durability: EffectDurability::DurabilityFailed(error),
+                        evidence: Some(evidence.finish()),
+                    };
+                }
+                EffectReceipt::NotApplied { error } => {
+                    rollback_remaining(
+                        effects,
+                        "composite commit stopped after a sub-effect was not applied",
+                    )
+                    .await;
+                    if applied_count == 0 {
+                        return EffectReceipt::NotApplied { error };
+                    }
+                    return EffectReceipt::Applied {
+                        durability: EffectDurability::DurabilityFailed(format!(
+                            "composite partially applied: {applied_count} earlier sub-effect(s) \
+                             landed before a later sub-effect was not applied ({error})"
+                        )),
+                        evidence: Some(evidence.finish()),
+                    };
+                }
+                EffectReceipt::Unknown { error } => {
+                    rollback_remaining(
+                        effects,
+                        "composite commit stopped after a sub-effect returned an unknown state",
+                    )
+                    .await;
+                    if applied_count == 0 {
+                        return EffectReceipt::Unknown { error };
+                    }
+                    return EffectReceipt::Applied {
+                        durability: EffectDurability::DurabilityFailed(format!(
+                            "composite partially applied: {applied_count} earlier sub-effect(s) \
+                             definitely landed and a later sub-effect has unknown state ({error})"
+                        )),
+                        evidence: Some(evidence.finish()),
                     };
                 }
             }
         }
         EffectReceipt::Applied {
             durability: EffectDurability::Durable,
-            evidence: Some(evidence.join(",")),
+            evidence: Some(evidence.finish()),
         }
     }
 
@@ -348,14 +453,72 @@ impl Effect for Vec<Box<dyn Effect>> {
     }
 }
 
-/// Combine a sub-effect's own evidence with the already-committed evidence
-/// of earlier sub-effects.
-fn evidence_ids(own: Option<String>, committed: &[String]) -> String {
-    let mut ids: Vec<String> = committed.to_vec();
-    if let Some(id) = own {
-        ids.push(id);
+const MAX_COMPOSITE_EVIDENCE_CHARS: usize = 2_000;
+const COMPOSITE_EVIDENCE_TRUNCATED: &str = "...[evidence truncated]";
+
+/// A child can supply an arbitrary evidence string. Keep the aggregate
+/// receipt bounded even when a composite contains many children or a child
+/// returns an unexpectedly large reference.
+#[derive(Default)]
+struct CompositeEvidence {
+    value: String,
+    chars: usize,
+    truncated: bool,
+}
+
+impl CompositeEvidence {
+    fn push_optional(&mut self, value: Option<String>) {
+        if let Some(value) = value {
+            self.push(value);
+        }
     }
-    ids.join(",")
+
+    fn push(&mut self, value: String) {
+        if value.is_empty() || self.truncated {
+            return;
+        }
+        if !self.value.is_empty() {
+            if self.chars == MAX_COMPOSITE_EVIDENCE_CHARS {
+                self.mark_truncated();
+                return;
+            }
+            self.value.push(',');
+            self.chars += 1;
+        }
+        for ch in value.chars() {
+            if self.chars == MAX_COMPOSITE_EVIDENCE_CHARS {
+                self.mark_truncated();
+                return;
+            }
+            self.value.push(ch);
+            self.chars += 1;
+        }
+    }
+
+    fn mark_truncated(&mut self) {
+        if self.truncated {
+            return;
+        }
+        let marker_chars = COMPOSITE_EVIDENCE_TRUNCATED.chars().count();
+        let retained_chars = MAX_COMPOSITE_EVIDENCE_CHARS.saturating_sub(marker_chars);
+        while self.chars > retained_chars {
+            self.value.pop();
+            self.chars -= 1;
+        }
+        self.value.push_str(COMPOSITE_EVIDENCE_TRUNCATED);
+        self.chars += marker_chars;
+        self.truncated = true;
+    }
+
+    fn finish(self) -> String {
+        self.value
+    }
+}
+
+async fn rollback_remaining(effects: std::vec::IntoIter<Box<dyn Effect>>, reason: &str) {
+    for effect in effects {
+        effect.rollback(reason).await;
+    }
 }
 
 /// Why an effect commit failed. The distinction is load-bearing: after a
@@ -462,12 +625,13 @@ pub enum ToolOutcome {
 #[derive(Debug, Clone)]
 pub enum EngineQuery {
     /// Deterministic search over externalized refs (entity/kind/scope/task
-    /// filters + recency). `limit` caps the answer.
+    /// /label filters + recency). `limit` caps the answer.
     SearchExternal {
         query: String,
         kind: Option<ContextKind>,
         scope: Option<ContextScope>,
         task_id: Option<TaskId>,
+        label: Option<String>,
         limit: usize,
     },
     /// Metadata of one externalized entry by item id (no store read).
@@ -752,6 +916,9 @@ pub struct ToolCatalogEntry {
     /// Who owns the tool: `builtin` or the capability id (e.g. `ext:github`).
     pub owner: String,
     pub description: String,
+    /// Declared risk class; searchable via the provider-owned catalog index.
+    #[serde(default)]
+    pub risk: ToolRisk,
 }
 
 /// Always-visible control tools of the unified catalog: the model can
@@ -888,31 +1055,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn operation_effect_context_must_match_the_dispatch_request() {
+        let run_id = RunId::new();
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "fs.write".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs", "content": "x"}),
+        };
+        let context = OperationEffectContext {
+            identity: ToolOperationIdentity {
+                run_id,
+                task_id: None,
+                turn_id: TurnId::new(),
+                scope_id: None,
+                operation_id: crate::OperationId::new(),
+                generation: 1,
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest: crate::ArgumentDigest::from_json(&call.arguments),
+            },
+            effect_id: EffectId::new(),
+        };
+        let request = ToolExecutionRequest {
+            run_id,
+            call: call.clone(),
+            effect_context: Some(context.clone()),
+            cancel: CancellationToken::new(),
+        };
+        assert!(request.validate().is_ok());
+
+        let mut mismatched = request.clone();
+        mismatched.call.arguments = serde_json::json!({"path": "src/lib.rs", "content": "y"});
+        assert_eq!(
+            mismatched.validate().unwrap_err(),
+            "operation effect context does not match the tool request"
+        );
+
+        let mut nil_effect = context;
+        nil_effect.effect_id = EffectId(uuid::Uuid::nil());
+        assert_eq!(
+            nil_effect.validate().unwrap_err(),
+            "operation effect context contains a nil effect id"
+        );
+    }
+
+    #[test]
+    fn legacy_serialized_tool_request_defaults_to_no_effect_context() {
+        let request: ToolExecutionRequest = serde_json::from_value(serde_json::json!({
+            "run_id": RunId::new(),
+            "call": {"id": "call-1", "name": "fs.read", "arguments": {}}
+        }))
+        .unwrap();
+        assert!(request.effect_context.is_none());
+        assert!(request.validate().is_ok());
+    }
+
     /// Records whether it was committed or rolled back, optionally failing
     /// its own commit — the observable trace for the composite semantics.
+    #[derive(Clone, Copy)]
+    enum RecordingCommit {
+        Durable,
+        NotApplied,
+        DurabilityFailed,
+        Unknown,
+    }
+
     struct RecordingEffect {
-        label: &'static str,
+        label: String,
         commits: Arc<AtomicUsize>,
         rollbacks: Arc<AtomicUsize>,
-        fail_commit: bool,
+        result: RecordingCommit,
     }
 
     #[async_trait::async_trait]
     impl Effect for RecordingEffect {
         fn describe(&self) -> String {
-            self.label.into()
+            self.label.clone()
         }
         async fn commit(self: Box<Self>) -> EffectReceipt {
             self.commits.fetch_add(1, Ordering::SeqCst);
-            if self.fail_commit {
-                EffectReceipt::NotApplied {
-                    error: "boom".into(),
-                }
-            } else {
-                EffectReceipt::Applied {
+            match self.result {
+                RecordingCommit::Durable => EffectReceipt::Applied {
                     durability: EffectDurability::Durable,
-                    evidence: Some(self.label.into()),
-                }
+                    evidence: Some(self.label),
+                },
+                RecordingCommit::NotApplied => EffectReceipt::NotApplied {
+                    error: "boom".into(),
+                },
+                RecordingCommit::DurabilityFailed => EffectReceipt::Applied {
+                    durability: EffectDurability::DurabilityFailed("journal unavailable".into()),
+                    evidence: Some(self.label),
+                },
+                RecordingCommit::Unknown => EffectReceipt::Unknown {
+                    error: "timeout".into(),
+                },
             }
         }
         async fn rollback(self: Box<Self>, _reason: &str) {
@@ -930,22 +1167,22 @@ mod tests {
         let rollbacks = Arc::new(AtomicUsize::new(0));
         let effect = composite(vec![
             Box::new(RecordingEffect {
-                label: "a",
+                label: "a".into(),
                 commits: commits.clone(),
                 rollbacks: rollbacks.clone(),
-                fail_commit: false,
+                result: RecordingCommit::Durable,
             }),
             Box::new(RecordingEffect {
-                label: "b",
+                label: "b".into(),
                 commits: commits.clone(),
                 rollbacks: rollbacks.clone(),
-                fail_commit: false,
+                result: RecordingCommit::Durable,
             }),
             Box::new(RecordingEffect {
-                label: "c",
+                label: "c".into(),
                 commits: commits.clone(),
                 rollbacks: rollbacks.clone(),
-                fail_commit: false,
+                result: RecordingCommit::Durable,
             }),
         ]);
         let receipt = effect.commit().await;
@@ -964,40 +1201,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn composite_effect_stops_at_the_first_failure() {
-        // A mid-list failure must stop the rest and report `NotApplied`:
-        // effects already committed stay committed (they are separate
-        // atomic operations), but nothing after the failure runs — a
-        // cancelled operation cannot keep mutating the world.
+    async fn composite_effect_reports_partial_application_and_cleans_the_remainder() {
+        // Once `a` lands, `b` cannot make the aggregate claim that nothing
+        // happened. `c` must not commit and its preparation must be cleaned.
         let ca = Arc::new(AtomicUsize::new(0));
         let cb = Arc::new(AtomicUsize::new(0));
         let cc = Arc::new(AtomicUsize::new(0));
         let rollbacks = Arc::new(AtomicUsize::new(0));
         let effect = composite(vec![
             Box::new(RecordingEffect {
-                label: "a",
+                label: "a".into(),
                 commits: ca.clone(),
                 rollbacks: rollbacks.clone(),
-                fail_commit: false,
+                result: RecordingCommit::Durable,
             }),
             Box::new(RecordingEffect {
-                label: "b",
+                label: "b".into(),
                 commits: cb.clone(),
                 rollbacks: rollbacks.clone(),
-                fail_commit: true,
+                result: RecordingCommit::NotApplied,
             }),
             Box::new(RecordingEffect {
-                label: "c",
+                label: "c".into(),
                 commits: cc.clone(),
                 rollbacks: rollbacks.clone(),
-                fail_commit: false,
+                result: RecordingCommit::Durable,
             }),
         ]);
         let receipt = effect.commit().await;
-        assert!(
-            matches!(receipt, EffectReceipt::NotApplied { .. }),
-            "the composite must report the failed sub-effect: {receipt:?}"
-        );
+        match receipt {
+            EffectReceipt::Applied {
+                durability: EffectDurability::DurabilityFailed(error),
+                evidence,
+            } => {
+                assert!(error.contains("composite partially applied"));
+                assert_eq!(evidence.as_deref(), Some("a"));
+            }
+            other => panic!("the composite must report the application truth: {other:?}"),
+        }
         assert_eq!(ca.load(Ordering::SeqCst), 1, "'a' committed first");
         assert_eq!(cb.load(Ordering::SeqCst), 1, "'b' attempted and failed");
         assert_eq!(
@@ -1005,7 +1246,161 @@ mod tests {
             0,
             "'c' must never run after the failure"
         );
-        assert_eq!(rollbacks.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            rollbacks.load(Ordering::SeqCst),
+            1,
+            "the unattempted 'c' preparation must be cleaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_effect_preserves_not_applied_when_nothing_landed() {
+        let first_commits = Arc::new(AtomicUsize::new(0));
+        let later_commits = Arc::new(AtomicUsize::new(0));
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let effect = composite(vec![
+            Box::new(RecordingEffect {
+                label: "a".into(),
+                commits: first_commits.clone(),
+                rollbacks: rollbacks.clone(),
+                result: RecordingCommit::NotApplied,
+            }),
+            Box::new(RecordingEffect {
+                label: "b".into(),
+                commits: later_commits.clone(),
+                rollbacks: rollbacks.clone(),
+                result: RecordingCommit::Durable,
+            }),
+        ]);
+
+        assert!(matches!(
+            effect.commit().await,
+            EffectReceipt::NotApplied { error } if error == "boom"
+        ));
+        assert_eq!(first_commits.load(Ordering::SeqCst), 1);
+        assert_eq!(later_commits.load(Ordering::SeqCst), 0);
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn composite_effect_preserves_unknown_when_nothing_definitely_landed() {
+        let commits = Arc::new(AtomicUsize::new(0));
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let effect = composite(vec![
+            Box::new(RecordingEffect {
+                label: "a".into(),
+                commits: commits.clone(),
+                rollbacks: rollbacks.clone(),
+                result: RecordingCommit::Unknown,
+            }),
+            Box::new(RecordingEffect {
+                label: "b".into(),
+                commits: commits.clone(),
+                rollbacks: rollbacks.clone(),
+                result: RecordingCommit::Durable,
+            }),
+        ]);
+
+        assert!(matches!(
+            effect.commit().await,
+            EffectReceipt::Unknown { error } if error == "timeout"
+        ));
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn composite_effect_reports_definite_partial_application_before_unknown() {
+        let commits = Arc::new(AtomicUsize::new(0));
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let effect = composite(vec![
+            Box::new(RecordingEffect {
+                label: "a".into(),
+                commits: commits.clone(),
+                rollbacks: rollbacks.clone(),
+                result: RecordingCommit::Durable,
+            }),
+            Box::new(RecordingEffect {
+                label: "b".into(),
+                commits: commits.clone(),
+                rollbacks: rollbacks.clone(),
+                result: RecordingCommit::Unknown,
+            }),
+            Box::new(RecordingEffect {
+                label: "c".into(),
+                commits: commits.clone(),
+                rollbacks: rollbacks.clone(),
+                result: RecordingCommit::Durable,
+            }),
+        ]);
+
+        assert!(matches!(
+            effect.commit().await,
+            EffectReceipt::Applied {
+                durability: EffectDurability::DurabilityFailed(error),
+                evidence: Some(evidence),
+            } if error.contains("definitely landed") && evidence == "a"
+        ));
+        assert_eq!(commits.load(Ordering::SeqCst), 2);
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn composite_effect_aggregates_evidence_for_a_durability_failure() {
+        let commits = Arc::new(AtomicUsize::new(0));
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let effect = composite(vec![
+            Box::new(RecordingEffect {
+                label: "a".into(),
+                commits: commits.clone(),
+                rollbacks: rollbacks.clone(),
+                result: RecordingCommit::Durable,
+            }),
+            Box::new(RecordingEffect {
+                label: "b".into(),
+                commits: commits.clone(),
+                rollbacks: rollbacks.clone(),
+                result: RecordingCommit::DurabilityFailed,
+            }),
+            Box::new(RecordingEffect {
+                label: "c".into(),
+                commits: commits.clone(),
+                rollbacks: rollbacks.clone(),
+                result: RecordingCommit::Durable,
+            }),
+        ]);
+
+        assert!(matches!(
+            effect.commit().await,
+            EffectReceipt::Applied {
+                durability: EffectDurability::DurabilityFailed(error),
+                evidence: Some(evidence),
+            } if error == "journal unavailable" && evidence == "a,b"
+        ));
+        assert_eq!(commits.load(Ordering::SeqCst), 2);
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn composite_effect_bounds_aggregated_evidence() {
+        let commits = Arc::new(AtomicUsize::new(0));
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let effect = composite(vec![Box::new(RecordingEffect {
+            label: "界".repeat(MAX_COMPOSITE_EVIDENCE_CHARS + 10),
+            commits,
+            rollbacks,
+            result: RecordingCommit::Durable,
+        })]);
+
+        let EffectReceipt::Applied {
+            evidence: Some(evidence),
+            ..
+        } = effect.commit().await
+        else {
+            panic!("a durable child must produce an applied aggregate");
+        };
+        assert_eq!(evidence.chars().count(), MAX_COMPOSITE_EVIDENCE_CHARS);
+        assert!(evidence.ends_with(COMPOSITE_EVIDENCE_TRUNCATED));
     }
 
     #[tokio::test]
@@ -1014,16 +1409,16 @@ mod tests {
         let rollbacks = Arc::new(AtomicUsize::new(0));
         let effect = composite(vec![
             Box::new(RecordingEffect {
-                label: "a",
+                label: "a".into(),
                 commits: commits.clone(),
                 rollbacks: rollbacks.clone(),
-                fail_commit: false,
+                result: RecordingCommit::Durable,
             }),
             Box::new(RecordingEffect {
-                label: "b",
+                label: "b".into(),
                 commits: commits.clone(),
                 rollbacks: rollbacks.clone(),
-                fail_commit: false,
+                result: RecordingCommit::Durable,
             }),
         ]);
         effect.rollback("superseded").await;

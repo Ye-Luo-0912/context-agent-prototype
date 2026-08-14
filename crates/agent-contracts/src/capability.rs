@@ -20,6 +20,22 @@ use crate::{
     ToolOutput, ToolSpec,
 };
 
+/// A prefix read whose allocation is bounded before I/O begins.
+///
+/// `byte_len` is the size reported by the already-open file handle when the
+/// read started. `truncated` records whether that observed size exceeded the
+/// requested bound. As with any file read, concurrent mutation can make the
+/// observed size differ from the bytes available while the read runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedRead {
+    /// The file prefix, never larger than the caller's requested bound.
+    pub content: Vec<u8>,
+    /// Size reported by metadata on the pinned file handle before reading.
+    pub byte_len: u64,
+    /// Whether `byte_len` exceeded the caller's requested bound.
+    pub truncated: bool,
+}
+
 /// When a capability's service is started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CapabilityLifecycle {
@@ -248,6 +264,11 @@ pub trait WorkspaceHandle: Send + Sync {
     /// Read a file, confined like `resolve`.
     async fn read(&self, relative: &str) -> AgentResult<Vec<u8>>;
 
+    /// Read at most `max_bytes` from the start of a file, confined like
+    /// `resolve`. Implementations must apply the bound while reading; they
+    /// must never implement this as a full `read` followed by truncation.
+    async fn read_bounded(&self, relative: &str, max_bytes: usize) -> AgentResult<BoundedRead>;
+
     /// Write a file through the runtime's journaled, atomic mutation
     /// transaction, confined like `resolve`.
     async fn write(&self, relative: &str, content: &[u8]) -> AgentResult<()>;
@@ -335,8 +356,8 @@ pub enum WireEffect {
 
 /// The wire response of a process-capability `invoke`: the bounded output
 /// plus the structured effects the child asks the runtime to commit.
-/// Backward compatible — a plain `ToolOutput` value is still accepted by
-/// the adapter as a response with no effects.
+/// A plain `ToolOutput` is accepted only after `legacy.invoke-output.v1`
+/// is crossed at ping; the current shape is `{output, effects}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessInvokeResponse {
     pub output: ToolOutput,

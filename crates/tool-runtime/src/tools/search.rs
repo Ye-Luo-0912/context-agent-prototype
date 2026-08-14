@@ -20,6 +20,8 @@ use super::{Tool, display_relative, walk_files};
 const MAX_FILES_SCANNED: usize = 5_000;
 const MAX_BYTES_PER_FILE: u64 = 2 * 1024 * 1024;
 const MODEL_HITS: usize = 100;
+/// 大文件内每隔这么多行检查一次取消，避免整份 2 MiB 扫完才停。
+const CANCEL_CHECK_LINES: usize = 256;
 
 pub struct SearchGrepTool {
     workspace: Workspace,
@@ -54,6 +56,42 @@ fn default_limit() -> usize {
     200
 }
 
+/// 扫描中途取消时保留已命中行。必须走 `Ok(Value)`：内核把工具 `Err`
+/// 收成无 hits 的 `tool_error_output`，`Err(Cancelled)` 会丢掉部分结果。
+fn cancelled_outcome(
+    call_id: &str,
+    pattern: &str,
+    hits: Vec<String>,
+    scanned_files: usize,
+) -> ToolOutcome {
+    let model_hits: Vec<String> = hits.iter().take(MODEL_HITS).cloned().collect();
+    ToolOutcome::Value(ToolOutput {
+        call_id: call_id.into(),
+        tool_name: "search.grep".into(),
+        ok: false,
+        summary: format!(
+            "cancelled after {} hits for /{}/ across {} files",
+            hits.len(),
+            pattern,
+            scanned_files
+        ),
+        model_content: if model_hits.is_empty() {
+            "cancelled".into()
+        } else {
+            model_hits.join("\n")
+        },
+        artifact_ref: None,
+        metadata: json!({
+            "cancelled": true,
+            "hits": hits.len(),
+            "files_scanned": scanned_files,
+            "returned": model_hits.len(),
+            "has_more": false,
+            "cursor": serde_json::Value::Null,
+        }),
+    })
+}
+
 #[async_trait]
 impl Tool for SearchGrepTool {
     fn spec(&self) -> ToolSpec {
@@ -80,10 +118,15 @@ impl Tool for SearchGrepTool {
         run_id: RunId,
         call_id: &str,
         arguments: Value,
-        _cancel: CancellationToken,
+        _effect_context: Option<agent_contracts::OperationEffectContext>,
+        cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let args: GrepArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("search.grep args: {e}")))?;
+        // 已取消则立刻交还显式 cancelled outcome，避免再付 walk/scan 成本。
+        if cancel.is_cancelled() {
+            return Ok(cancelled_outcome(call_id, &args.pattern, Vec::new(), 0));
+        }
         if let Some(cursor) = args.cursor.as_deref() {
             return self.page_from_snapshot(run_id, call_id, cursor).await;
         }
@@ -93,7 +136,10 @@ impl Tool for SearchGrepTool {
 
         let mut files = Vec::new();
         let mut budget = MAX_FILES_SCANNED;
-        walk_files(&root, &mut files, &mut budget).await?;
+        walk_files(&root, &mut files, &mut budget, Some(&cancel)).await?;
+        if cancel.is_cancelled() {
+            return Ok(cancelled_outcome(call_id, &args.pattern, Vec::new(), 0));
+        }
         files.sort();
 
         let limit = args.limit.clamp(1, 1_000);
@@ -101,6 +147,14 @@ impl Tool for SearchGrepTool {
         let mut scanned_files = 0usize;
 
         'files: for file in files {
+            if cancel.is_cancelled() {
+                return Ok(cancelled_outcome(
+                    call_id,
+                    &args.pattern,
+                    hits,
+                    scanned_files,
+                ));
+            }
             let metadata = match fs::metadata(&file).await {
                 Ok(metadata) => metadata,
                 Err(_) => continue,
@@ -114,6 +168,26 @@ impl Tool for SearchGrepTool {
             };
             let relative = display_relative(&self.workspace, &file);
             for (index, line) in text.lines().enumerate() {
+                // 先扫一段再查 token：刚读完的文件至少能留下已匹配行。
+                if index > 0 && index % CANCEL_CHECK_LINES == 0 {
+                    if cancel.is_cancelled() {
+                        return Ok(cancelled_outcome(
+                            call_id,
+                            &args.pattern,
+                            hits,
+                            scanned_files,
+                        ));
+                    }
+                    tokio::task::yield_now().await;
+                    if cancel.is_cancelled() {
+                        return Ok(cancelled_outcome(
+                            call_id,
+                            &args.pattern,
+                            hits,
+                            scanned_files,
+                        ));
+                    }
+                }
                 if regex.is_match(line) {
                     hits.push(format!("{relative}:{}: {}", index + 1, line.trim_end()));
                     if hits.len() >= limit {
@@ -183,14 +257,14 @@ impl SearchGrepTool {
     /// gaps.
     async fn page_from_snapshot(
         &self,
-        _run_id: RunId,
+        run_id: RunId,
         call_id: &str,
         cursor: &str,
     ) -> AgentResult<ToolOutcome> {
         use super::{parse_cursor, read_snapshot_lines};
 
         let (reference, offset) = parse_cursor(cursor)?;
-        let lines = read_snapshot_lines(&self.workspace, reference).await?;
+        let lines = read_snapshot_lines(&self.workspace, run_id, reference).await?;
         if offset > lines.len() {
             return Err(AgentError::InvalidRequest(format!(
                 "cursor is past the end of the snapshot ({offset} > {} lines)",
@@ -271,6 +345,7 @@ mod tests {
                 name: "search.grep".into(),
                 arguments: args,
             },
+            effect_context: None,
             cancel: CancellationToken::new(),
         }
     }
@@ -289,7 +364,7 @@ mod tests {
         let run_id = RunId::new();
         let request = request(run_id, json!({"pattern": "auth"}));
         let output = tool
-            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .execute(run_id, "c", request.call.arguments, None, request.cancel)
             .await
             .unwrap();
         let output = value(output);
@@ -321,7 +396,7 @@ mod tests {
         let run_id = RunId::new();
         let request = request(run_id, json!({"pattern": "match_", "limit": 300}));
         let output = tool
-            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .execute(run_id, "c", request.call.arguments, None, request.cancel)
             .await
             .unwrap();
         let output = value(output);
@@ -356,7 +431,7 @@ mod tests {
                 arguments: args,
             };
             async move {
-                tool.execute(run_id, "c", call.arguments, CancellationToken::new())
+                tool.execute(run_id, "c", call.arguments, None, CancellationToken::new())
                     .await
             }
         };
@@ -409,5 +484,81 @@ mod tests {
         // A malformed cursor is a clean error.
         let bad = grep(json!({"pattern": "match_", "limit": 300, "cursor": "not-a-cursor"})).await;
         assert!(bad.is_err(), "malformed cursors must error");
+    }
+
+    #[tokio::test]
+    async fn grep_honors_preexisting_cancellation() {
+        let (workspace, _dir) = temp_workspace().await;
+        write(workspace.root(), "src/a.rs", "needle\n").await;
+
+        let tool = SearchGrepTool::new(workspace);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let output = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"pattern": "needle"}),
+                None,
+                cancel,
+            )
+            .await
+            .unwrap();
+        let output = value(output);
+        assert!(!output.ok);
+        assert_eq!(output.metadata["cancelled"], true);
+        assert_eq!(output.metadata["hits"], 0);
+        assert_eq!(output.metadata["files_scanned"], 0);
+        assert_eq!(output.model_content, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn grep_stops_mid_scan_and_returns_partial_hits() {
+        let (workspace, _dir) = temp_workspace().await;
+        let root = workspace.root().to_path_buf();
+        // 每文件少量命中、大量非命中行：不会先撞上 1000-hit limit，
+        // 取消必须靠打断 walk/scan，而不是“扫完了”。
+        const FILE_COUNT: usize = 80;
+        let mut body = String::from("needle unique\n");
+        for _ in 0..1_200 {
+            body.push_str("padding line that does not match\n");
+        }
+        for n in 0..FILE_COUNT {
+            write(&root, &format!("src/f{n:03}.txt"), &body).await;
+        }
+
+        let tool = SearchGrepTool::new(workspace);
+        let cancel = CancellationToken::new();
+        let fire = cancel.clone();
+        let join = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            fire.cancel();
+        });
+
+        let output = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"pattern": "needle", "limit": 1_000}),
+                None,
+                cancel,
+            )
+            .await
+            .unwrap();
+        join.join().unwrap();
+        let output = value(output);
+        assert!(!output.ok, "cancelled grep must not report ok");
+        assert_eq!(output.metadata["cancelled"], true);
+        let scanned = output.metadata["files_scanned"].as_u64().unwrap();
+        assert!(
+            scanned < FILE_COUNT as u64,
+            "must stop before scanning every file: scanned={scanned}"
+        );
+        assert!(
+            output.summary.contains("cancelled"),
+            "summary must name cancellation: {}",
+            output.summary
+        );
     }
 }

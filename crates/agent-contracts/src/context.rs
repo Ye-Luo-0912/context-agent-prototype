@@ -7,7 +7,7 @@ use crate::{
     AgentError, AgentResult, ContextItemId, Label, OperationId, ScopeId, TaskId, ToolOutput, TurnId,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ContextKind {
     Goal,
     Constraint,
@@ -21,7 +21,7 @@ pub enum ContextKind {
     Note,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ContextScope {
     Message,
     Turn,
@@ -42,7 +42,7 @@ pub enum ContextRetention {
 /// working set. Owned by the per-event residency machine (`maintain`), not
 /// by GC. Semantic death lives in `SemanticState`, physical placement in
 /// `ContextResidency` — attention alone never means an item is gone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AttentionState {
     Active,
     Cooling,
@@ -77,6 +77,44 @@ pub enum SemanticState {
     Tombstoned,
 }
 
+/// 分级检索访问信号（`CTX-GC-11`）。
+///
+/// search 是最弱的在线相关性证据；inspect/fetch 是更强的故意读取；
+/// `admit` 是显式驻留动作；consumption ack 是最强的在线信号。弱信号
+/// 不得覆盖强信号，search 循环也不得把 Cold 条目钉死。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessSignal {
+    /// 从未打过戳，或来自分级落地前的 checkpoint。
+    #[default]
+    None,
+    /// `context.search` 命中。最弱：更强信号出现前最多一次 Cold 老化延迟，
+    /// 且受单条目冷却和相同查询预算约束。
+    SearchHit,
+    /// `inspect_external` 读了描述符（无 body IO）。
+    Inspect,
+    /// `fetch_external` 读了 store 中的 body。
+    Fetch,
+    /// `context.admit` 把条目重新拉进 working set。
+    Admit,
+    /// 模型在打包后的帧里真正消费了该条目（`ContextConsumptionAck`）。
+    ConsumptionAck,
+}
+
+impl AccessSignal {
+    /// 显式、可解释的等级。fetch 观察到 body，因此强于只读描述符的 inspect。
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::SearchHit => 1,
+            Self::Inspect => 2,
+            Self::Fetch => 3,
+            Self::Admit => 4,
+            Self::ConsumptionAck => 5,
+        }
+    }
+}
+
 impl SemanticState {
     /// Live items can be recalled by attention or GC.
     pub fn is_live(self) -> bool {
@@ -98,7 +136,7 @@ impl SemanticState {
 /// `ContextRef` stays visible); `External` means the entry has aged out of
 /// the working set entirely and only the store retains it. This is the GC
 /// dimension, orthogonal to `AttentionState` and `SemanticState`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum ContextResidency {
     #[default]
     Resident,
@@ -457,6 +495,13 @@ pub enum ContextAction {
         fact: String,
         reason: String,
     },
+    /// Replace the whole anchor-root projection (`task.anchor` roots →
+    /// context policy). The runtime pushes this whenever the active task's
+    /// anchor moves (patch/update/focus change) and before a GC pass, so
+    /// GC and materialization see the current root set without the engine
+    /// ever owning task authority. Not per-claim add/remove: the anchor is
+    /// CAS authority, and this is a bounded replacement of its projection.
+    AnchorRoots { roots: Vec<AnchorRootClaim> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -481,11 +526,54 @@ pub struct ContextQuery {
 
 /// Runtime knobs for one materialization. Kept open so later policy work can
 /// add per-request guidance without breaking the contract.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextHints {
     /// Hard cap on how many items the engine may select. Dependency
     /// expansion still respects it; `None` means the budget alone decides.
     pub max_selected_items: Option<usize>,
+    /// The active task's typed root claims, projected from its TaskAnchor
+    /// by the runtime. `PromptRequired` claims force their item into the
+    /// model frame; the engine never sees the anchor itself (task authority
+    /// stays with the TaskManager). Bounded by `MAX_ANCHOR_ROOT_CLAIMS`;
+    /// terminal semantic state is never resurrected by a claim.
+    #[serde(default)]
+    pub anchor_roots: Vec<AnchorRootClaim>,
+}
+
+/// Hard cap on the anchor-root projection the runtime pushes into one
+/// materialization or GC pass. The model cannot grow the root set without
+/// bound through anchor patches.
+pub const MAX_ANCHOR_ROOT_CLAIMS: usize = 64;
+
+/// One typed root claim projected from a `TaskAnchor` into the context
+/// policy. The ref names a context item id, `context://run/<id>` uri, or an
+/// exact entity signature; the strength says how strongly the policy must
+/// hold it. The anchor itself lives with the runtime — this is a bounded
+/// projection, never a copy of task authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AnchorRootClaim {
+    /// The referenced item: an item id string, a `context://run/<id>` uri,
+    /// or an exact entity signature.
+    pub item_ref: String,
+    /// How strongly the context policy must hold the claim.
+    pub strength: AnchorRootStrength,
+    /// Which anchor field the claim came from (provenance/audit).
+    pub source_field_id: String,
+}
+
+/// How strongly the context policy must hold one anchor root claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorRootStrength {
+    /// The item must be in the model prompt for this task.
+    PromptRequired,
+    /// The item must stay resident in the working set (a GC root).
+    ResidentRequired,
+    /// The item must survive in storage (never permanently deleted).
+    StorageRequired,
+    /// The item is recallable on demand; no residency guarantee.
+    Recallable,
 }
 
 /// Hard bound on full working-set item ids carried by one consumption
@@ -656,6 +744,10 @@ pub struct ContextDiagnostics {
     /// GC dimension: items currently in the model-visible heap.
     #[serde(default)]
     pub resident_items: usize,
+    /// UTF-8 bytes of Resident heap bodies. Item counts hide large vs small
+    /// entries; this is the boundedness axis prompt size cannot substitute.
+    #[serde(default)]
+    pub resident_bytes: usize,
     /// GC dimension: items sitting in the reversible eviction buffer.
     #[serde(default)]
     pub warm_items: usize,
@@ -678,6 +770,19 @@ pub struct ContextDiagnostics {
     pub gc_externalized_total: u64,
     #[serde(default)]
     pub gc_storage_deleted_total: u64,
+    /// Cumulative graded retrieval stamps this run (`CTX-GC-11` / M15).
+    /// Search-hit is the weakest; consumption ack the strongest. These
+    /// count applied stamps, not descriptor rows returned.
+    #[serde(default)]
+    pub access_search_hits: u64,
+    #[serde(default)]
+    pub access_inspects: u64,
+    #[serde(default)]
+    pub access_fetches: u64,
+    #[serde(default)]
+    pub access_admits: u64,
+    #[serde(default)]
+    pub access_consumption_acks: u64,
 }
 
 /// One structured entry of the materialized working set. The engine returns
@@ -794,10 +899,18 @@ pub struct ContextGcReport {
     /// a `ContextRef`, visible through the lightweight context map.
     #[serde(default)]
     pub externalized: usize,
+    /// Item ids externalized this pass. Bounded by `externalized`; used by
+    /// M15 found-after-forgotten accounting. Empty on pre-field reports.
+    #[serde(default)]
+    pub externalized_ids: Vec<ContextItemId>,
     /// Warm -> Cold aging in the other direction: externalized entries that
     /// became `External` this pass (only the store retains them).
     #[serde(default)]
     pub aged_external: usize,
+    /// Resident items this pass kept in the heap by an anchor root claim
+    /// (the working set slice the active task's TaskAnchor protects).
+    #[serde(default)]
+    pub anchor_roots_protected: usize,
     #[serde(default)]
     pub evictions: Vec<ContextEviction>,
     #[serde(default)]
@@ -934,6 +1047,14 @@ pub struct ExternalizedContext {
     pub last_selected_turn: u64,
     #[serde(default)]
     pub access_count: u32,
+    /// 最近一次刷新访问时钟的信号等级。弱信号不得覆盖强信号；旧
+    /// checkpoint 缺省为 `None`。
+    #[serde(default)]
+    pub last_access_signal: AccessSignal,
+    /// 自上次更强信号以来，search 已刷新 Cold 老化锚点的次数。饱和后
+    /// search 只能动 ranking 时钟，不能再推迟 Cold -> External。
+    #[serde(default)]
+    pub search_reinforce_count: u32,
     /// 外部化时的 GC 世代，随条目保留（recall 后从原世代继续，而非清零）。
     #[serde(default)]
     pub gc_generation: u32,
@@ -1029,13 +1150,15 @@ impl<'de> Deserialize<'de> for ContextMapView {
     }
 }
 
-/// Deterministic search over the external context map — no vectors. The
-/// indexed dimensions of the map (entity signature, kind, scope, task,
-/// label, recency) are enough to bring a ref back on demand.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Deterministic search over the external context map — no vectors.
+/// Implemented dimensions: free-text over entity signatures, summary and
+/// uri; kind/scope/task/label filters; recency-aware ranking. Candidate
+/// generation uses the engine's `ContextCatalog` indexes (not a full-history
+/// scan) when a filter or an entity/label key can bound the set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextSearchQuery {
     /// Free-text query matched (case-insensitively) against entity
-    /// signatures and the entry summary.
+    /// signatures, the entry summary and the ref uri.
     pub query: String,
     /// Optional kind filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1046,6 +1169,11 @@ pub struct ContextSearchQuery {
     /// Optional task filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<TaskId>,
+    /// Optional label filter, matched case-insensitively against
+    /// `ExternalizedContext::tags` (`Label::as_str`). This is a real
+    /// catalog index dimension, not a residual scan predicate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// Cap on returned refs. `0` means the engine default (16).
     pub limit: usize,
 }
@@ -1057,6 +1185,7 @@ impl ContextSearchQuery {
             kind: None,
             scope: None,
             task_id: None,
+            label: None,
             limit,
         }
     }
@@ -1071,6 +1200,11 @@ impl ContextSearchQuery {
 pub struct StorageGcReport {
     pub scanned: usize,
     pub deleted: usize,
+    /// Entries kept this pass because an anchor root claim (`StorageRequired`)
+    /// protects them — the active task's evidence must never be permanently
+    /// deleted while the claim stands.
+    #[serde(default)]
+    pub anchor_roots_protected: usize,
     /// Store entries that could not be touched because the filesystem
     /// returned a real error (permission, disk). Those entries are *kept* —
     /// an IO failure must never be mistaken for "the file is already gone".
@@ -1220,7 +1354,7 @@ pub trait ContextEngine: Send + Sync {
     async fn inspect(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>>;
 
     /// Deterministic search over externalized refs: matches the query
-    /// against entity signatures, kind/scope/task filters and recency,
+    /// against entity signatures, kind/scope/task/label filters and recency,
     /// capped at `query.limit`. The default implementation returns nothing,
     /// so engines without an external store (baselines, adapters) keep
     /// working unchanged.
@@ -1299,6 +1433,8 @@ mod tests {
             last_access_turn: 0,
             last_selected_turn: 0,
             access_count: 0,
+            last_access_signal: AccessSignal::None,
+            search_reinforce_count: 0,
             gc_generation: 0,
             evicted_at_tick: None,
         }
@@ -1343,6 +1479,8 @@ mod tests {
         assert_eq!(entry.last_access_turn, 0);
         assert_eq!(entry.last_selected_turn, 0);
         assert_eq!(entry.access_count, 0);
+        assert_eq!(entry.last_access_signal, AccessSignal::None);
+        assert_eq!(entry.search_reinforce_count, 0);
         assert_eq!(entry.gc_generation, 0);
         assert_eq!(entry.evicted_at_tick, None);
         assert_eq!(entry.source, None);

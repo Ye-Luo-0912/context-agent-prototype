@@ -13,6 +13,7 @@
 use std::time::Duration;
 
 use agent_contracts::ToolOutput;
+use agent_platform_protocol::{ActiveFeatures, FEATURE_LEGACY_INVOKE_OUTPUT};
 use agent_process::PROTOCOL_VERSION;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -124,7 +125,7 @@ async fn server_loop() {
         };
         let id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
         match request.get("op").and_then(Value::as_str).unwrap_or("") {
-            "ping" => reply(&mut writer, id, json!("pong")).await,
+            "ping" => reply_ping(&mut writer, id, &request).await,
             "cwd" => {
                 // Echo the child's working directory (sandbox test: the
                 // child must run in the dedicated cwd, not the parent's).
@@ -289,7 +290,21 @@ async fn server_loop() {
                                 content,
                             )
                             .unwrap_or_default();
-                            format!("{}:{}", probe.ok_prefix(), String::from_utf8_lossy(&bytes))
+                            // The broker's read metadata rides along so the
+                            // parent-side test can assert the bound: how many
+                            // bytes the file had, and whether the served
+                            // prefix was truncated to the broker's cap.
+                            let byte_len =
+                                value.get("byte_len").and_then(Value::as_u64).unwrap_or(0);
+                            let truncated = value
+                                .get("truncated")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            format!(
+                                "{}:{}\nFS_META:byte_len={byte_len},truncated={truncated}",
+                                probe.ok_prefix(),
+                                String::from_utf8_lossy(&bytes)
+                            )
                         }
                         (_, _, Some(error)) => format!("{}:{error}", probe.refused_prefix()),
                         _ => format!("{}:malformed system answer", probe.refused_prefix()),
@@ -310,6 +325,14 @@ async fn server_loop() {
                     .and_then(|call| call.get("arguments"))
                     .and_then(|args| args.get("stage_write"))
                     .and_then(Value::as_object);
+                // 当前信封是 `{output, effects}`。纯 ToolOutput 只在调用方
+                // 显式要 `legacy_plain` 时返回，供握手协商测试使用。
+                let legacy_plain = request
+                    .get("call")
+                    .and_then(|call| call.get("arguments"))
+                    .and_then(|args| args.get("legacy_plain"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let value = match stage_write {
                     Some(spec) => {
                         let path = spec
@@ -336,7 +359,8 @@ async fn server_loop() {
                             }],
                         })
                     }
-                    None => output,
+                    None if legacy_plain => output,
+                    None => json!({ "output": output, "effects": [] }),
                 };
                 reply(&mut writer, id, value).await;
             }
@@ -348,6 +372,133 @@ async fn server_loop() {
                 let _ = writer.write_all(payload.as_bytes()).await;
                 let _ = writer.flush().await;
                 tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            "big_ok" => {
+                // Answer with a large but frame-legal response (well below
+                // the default frame cap): a per-call cumulative byte bound
+                // must still trip when request + response exceed it.
+                let response = json!({
+                    "id": id,
+                    "version": PROTOCOL_VERSION,
+                    "ok": true,
+                    "value": { "payload": "x".repeat(64 * 1024) },
+                });
+                let _ = writer
+                    .write_all(serde_json::to_string(&response).unwrap().as_bytes())
+                    .await;
+                let _ = writer.write_all(b"\n").await;
+                let _ = writer.flush().await;
+            }
+            "coalesced" => {
+                // Send the current response plus a guessed next response in
+                // one write. A byte-stream codec must preserve both frames;
+                // the session rejects the guessed request identity when the
+                // next real call uses an unpredictable host-owned id.
+                let first = json!({
+                    "id": id,
+                    "version": PROTOCOL_VERSION,
+                    "ok": true,
+                    "value": "first",
+                });
+                let second = json!({
+                    "id": id + 1,
+                    "version": PROTOCOL_VERSION,
+                    "ok": true,
+                    "value": "second",
+                });
+                let mut line = serde_json::to_string(&first).unwrap();
+                line.push('\n');
+                line.push_str(&serde_json::to_string(&second).unwrap());
+                line.push('\n');
+                let _ = writer.write_all(line.as_bytes()).await;
+                let _ = writer.flush().await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            "partial_eof" => {
+                // Write half a frame (no terminating newline) and exit: the
+                // client must fail closed on the partial frame instead of
+                // accepting it, and the session must end.
+                let _ = writer
+                    .write_all(
+                        format!(
+                            "{{\"id\":{id},\"version\":{PROTOCOL_VERSION},\"ok\":true,\"value\":"
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                let _ = writer.flush().await;
+                return;
+            }
+            "malformed" => {
+                // A complete line that is not JSON: the client must treat
+                // the unparseable frame as a framing violation and poison +
+                // terminate, never keep the connection alive with unknown
+                // framing state.
+                let _ = writer.write_all(b"this is not json\n").await;
+                let _ = writer.flush().await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            "json_bomb" => {
+                // 编码长度远小于默认 1 MiB 帧帽，但空对象数组会撑爆解码节点预算。
+                let mut line =
+                    format!("{{\"id\":{id},\"version\":{PROTOCOL_VERSION},\"ok\":true,\"value\":[");
+                for index in 0..70_000 {
+                    if index > 0 {
+                        line.push(',');
+                    }
+                    line.push_str("{}");
+                }
+                line.push_str("]}\n");
+                let _ = writer.write_all(line.as_bytes()).await;
+                let _ = writer.flush().await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            "invalid_utf8" => {
+                // A newline-terminated frame that is not UTF-8. JSON is
+                // UTF-8 by contract; the client must poison rather than
+                // lossy-decode or reuse the session.
+                let _ = writer.write_all(&[0xff, b'\n']).await;
+                let _ = writer.flush().await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            "bad_id" => {
+                let response = json!({
+                    "id": id + 1,
+                    "version": PROTOCOL_VERSION,
+                    "ok": true,
+                    "value": "wrong request",
+                });
+                write_raw_response(&mut writer, &response).await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            "bad_version" => {
+                let response = json!({
+                    "id": id,
+                    "version": PROTOCOL_VERSION + 1,
+                    "ok": true,
+                    "value": "wrong protocol",
+                });
+                write_raw_response(&mut writer, &response).await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            "bad_ok" => {
+                let response = json!({
+                    "id": id,
+                    "version": PROTOCOL_VERSION,
+                    "ok": "yes",
+                    "value": "not a typed envelope",
+                });
+                write_raw_response(&mut writer, &response).await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            "domain_error" => {
+                let response = json!({
+                    "id": id,
+                    "version": PROTOCOL_VERSION,
+                    "ok": false,
+                    "error": "expected domain failure",
+                });
+                write_raw_response(&mut writer, &response).await;
             }
             "silent" => {
                 // Never answer: the client's request deadline must fire and
@@ -394,6 +545,32 @@ async fn system_round_trip(
     }
 }
 
+/// ping 始终声明本 mock 支持的遗留特性。宿主提供集为空时交集仍为空，
+/// 子端不能单方面打开未提供的项。
+async fn reply_ping(writer: &mut BufWriter<tokio::io::Stdout>, id: u64, request: &Value) {
+    let mut response = json!({
+        "id": id,
+        "version": PROTOCOL_VERSION,
+        "ok": true,
+        "value": "pong",
+    });
+    let features = if std::env::var("MOCK_BAD_FEATURES").ok().as_deref() == Some("1") {
+        json!(["z.v1", "a.v1"])
+    } else {
+        let supported =
+            ActiveFeatures::new(vec![FEATURE_LEGACY_INVOKE_OUTPUT.into()]).expect("known feature");
+        // 请求带了 features 时按提供 ∩ 支持回显；未带时仍声明支持集，
+        // 让空提供集的宿主证明交集为空。
+        let advertised = match ActiveFeatures::from_json_value(request.get("features")) {
+            Ok(offered) if !offered.is_empty() => offered.intersect(&supported),
+            _ => supported,
+        };
+        json!(advertised.as_slice())
+    };
+    response["features"] = features;
+    write_raw_response(writer, &response).await;
+}
+
 async fn reply(writer: &mut BufWriter<tokio::io::Stdout>, id: u64, value: Value) {
     let response = json!({
         "id": id,
@@ -401,8 +578,12 @@ async fn reply(writer: &mut BufWriter<tokio::io::Stdout>, id: u64, value: Value)
         "ok": true,
         "value": value,
     });
+    write_raw_response(writer, &response).await;
+}
+
+async fn write_raw_response(writer: &mut BufWriter<tokio::io::Stdout>, response: &Value) {
     let _ = writer
-        .write_all(serde_json::to_string(&response).unwrap().as_bytes())
+        .write_all(serde_json::to_string(response).unwrap().as_bytes())
         .await;
     let _ = writer.write_all(b"\n").await;
     let _ = writer.flush().await;

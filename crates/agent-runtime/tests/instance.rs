@@ -2,6 +2,8 @@
 //! and the actor task, and `shutdown` runs the ordered teardown while
 //! aggregating errors instead of swallowing them.
 
+use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,9 +20,10 @@ use agent_contracts::{
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{
-    CapabilityId, ContextRootClaim, Module, ModuleHost, RootClaimRole, RootClaimStrength,
-    RuntimeInstance, RuntimeServices, ServiceRegistry, TaskAnchor,
+    AuthorityRecoveryServices, CapabilityId, ContextRootClaim, Module, ModuleHost, RootClaimRole,
+    RootClaimStrength, RuntimeInstance, RuntimeServices, ServiceRegistry, TaskAnchor,
 };
+use agent_storage::FileOperationJournal;
 
 /// Build an instance over the real reference engine, so the checkpoint test
 /// exercises items, scopes and focus — not a stub that trivially roundtrips.
@@ -36,6 +39,31 @@ async fn simple_instance() -> (RuntimeInstance, Arc<context_simple::SimpleContex
         Arc::new(PolicyApprovalGate::read_only()),
         None,
     );
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    instance.start().await.unwrap();
+    (instance, context)
+}
+
+/// Build the same test composition with production-shaped durable Core
+/// authority. Reopening the same journal after shutdown exercises a real
+/// cross-process checkpoint lineage rather than weakening ephemeral rules.
+async fn durable_simple_instance(
+    journal_path: &Path,
+) -> (RuntimeInstance, Arc<context_simple::SimpleContextEngine>) {
+    let context = Arc::new(context_simple::SimpleContextEngine::new(
+        context_simple::SimpleContextConfig::default(),
+    ));
+    let operation_journal = Arc::new(FileOperationJournal::open(journal_path).unwrap().0);
+    let services = RuntimeServices::try_new(
+        CoreAuthorityConfig::default(),
+        context.clone(),
+        Arc::new(QuietModel),
+        Arc::new(EmptyTools),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+        AuthorityRecoveryServices::new(operation_journal, None),
+    )
+    .unwrap();
     let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
     instance.start().await.unwrap();
     (instance, context)
@@ -466,7 +494,9 @@ async fn shutdown_with_no_turn_is_a_clean_noop_path() {
 
 #[tokio::test]
 async fn runtime_checkpoint_roundtrips_tasks_context_and_capabilities() {
-    let (instance, _context) = simple_instance().await;
+    let temp = tempfile::tempdir().unwrap();
+    let journal_path = temp.path().join("authority").join("operations.jsonl");
+    let (instance, _context) = durable_simple_instance(&journal_path).await;
     let mut events = instance.handle().subscribe();
 
     // Two tasks, one with a real turn, so the task table and the context
@@ -515,10 +545,16 @@ async fn runtime_checkpoint_roundtrips_tasks_context_and_capabilities() {
     let decoded: agent_runtime::RuntimeCheckpoint = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(decoded.tasks.tasks.len(), 2);
     assert_eq!(decoded.version, agent_runtime::RUNTIME_CHECKPOINT_VERSION);
+    assert!(
+        decoded.authority.is_some(),
+        "a durable composition must capture its Core authority marker"
+    );
 
     // Restore into a fresh runtime: tasks come back, and the engine carries
-    // the restored items and scopes.
-    let (fresh, fresh_context) = simple_instance().await;
+    // the restored items and scopes. Shut down the old owner first so the
+    // authority journal's exclusive writer lock transfers cleanly.
+    instance.shutdown().await.unwrap();
+    let (fresh, fresh_context) = durable_simple_instance(&journal_path).await;
     fresh.restore(decoded).await.unwrap();
     let tasks = fresh.handle().list_tasks().await.unwrap();
     assert_eq!(tasks.len(), 2, "restore must bring the task table back");
@@ -556,6 +592,91 @@ async fn runtime_checkpoint_roundtrips_tasks_context_and_capabilities() {
         "restore must align the context focus with the runtime's current task"
     );
     fresh.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn ephemeral_checkpoint_cannot_restore_across_core_instances() {
+    let (source, _context) = simple_instance().await;
+    let checkpoint = source.checkpoint().await.unwrap();
+    assert!(checkpoint.authority.is_none());
+
+    let (fresh, _context) = simple_instance().await;
+    let before = fresh.handle().list_tasks().await.unwrap();
+    let error = fresh.restore(checkpoint).await.unwrap_err();
+    assert!(
+        error.to_string().contains("ephemeral checkpoint")
+            && error.to_string().contains("cannot restore"),
+        "cross-Core ephemeral restore must fail before mutation: {error}"
+    );
+    assert_eq!(fresh.handle().list_tasks().await.unwrap(), before);
+
+    fresh.shutdown().await.unwrap();
+    source.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn tampered_authority_marker_is_rejected_before_runtime_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal_path = temp.path().join("authority").join("operations.jsonl");
+    let (instance, _context) = durable_simple_instance(&journal_path).await;
+    instance
+        .handle()
+        .set_focus("live task must survive rejected restore".into())
+        .await
+        .unwrap();
+    let before = instance.checkpoint().await.unwrap();
+    let mut tampered = before.clone();
+    tampered.tasks.tasks[0].goal = "must never become visible".into();
+    tampered
+        .authority
+        .as_mut()
+        .expect("durable checkpoint carries authority")
+        .state_digest = agent_contracts::AuthorityStateDigest::sha256_bytes(b"tampered");
+
+    let error = instance.restore(tampered).await.unwrap_err();
+    assert!(
+        error.to_string().contains("authority checkpoint marker"),
+        "authority mismatch must be explicit: {error}"
+    );
+    let after = instance.checkpoint().await.unwrap();
+    assert_eq!(after.tasks.tasks[0].goal, before.tasks.tasks[0].goal);
+    assert_eq!(after.focus_revision, before.focus_revision);
+    assert_eq!(after.last_surface_revision, before.last_surface_revision);
+    assert_eq!(
+        after.authority, before.authority,
+        "validation must not bump Core"
+    );
+
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn durable_checkpoint_marker_remains_valid_after_later_epoch_transitions() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal_path = temp.path().join("authority").join("operations.jsonl");
+    let (instance, _context) = durable_simple_instance(&journal_path).await;
+    instance
+        .handle()
+        .set_focus("checkpoint ancestor".into())
+        .await
+        .unwrap();
+    let checkpoint = instance.checkpoint().await.unwrap();
+    let checkpoint_marker = checkpoint.authority.clone().unwrap();
+
+    instance.handle().suspend_task().await.unwrap();
+    let advanced = instance.checkpoint().await.unwrap().authority.unwrap();
+    assert!(advanced.last_seq > checkpoint_marker.last_seq);
+    assert!(advanced.authority_epoch > checkpoint_marker.authority_epoch);
+
+    instance.restore(checkpoint).await.unwrap();
+    let restored = instance.checkpoint().await.unwrap();
+    assert_eq!(restored.current_task_id, restored.tasks.active);
+    assert_eq!(restored.tasks.tasks[0].goal, "checkpoint ancestor");
+    assert!(
+        restored.authority.unwrap().last_seq > advanced.last_seq,
+        "restore advances live authority; it never rewinds to the checkpoint cursor"
+    );
+
     instance.shutdown().await.unwrap();
 }
 
@@ -688,6 +809,122 @@ async fn rejected_actor_restore_does_not_change_capability_flags() {
     instance.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn restore_event_reports_only_capabilities_registered_in_the_live_host() {
+    let (instance, _context) = simple_instance().await;
+    let mut events = instance.handle().subscribe();
+    let mut checkpoint = instance.checkpoint().await.unwrap();
+    checkpoint
+        .capabilities
+        .push(agent_runtime::CapabilitySnapshot {
+            id: "missing-from-live-host".into(),
+            activation: CapabilityActivation::Enabled,
+            loaded: true,
+            loaded_tools: vec!["missing.tool".into()],
+        });
+
+    instance.restore(checkpoint).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let applied = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "restore event was not published");
+        let envelope = tokio::time::timeout(remaining, events.recv())
+            .await
+            .expect("restore event timeout")
+            .expect("restore event channel closed");
+        if let RuntimeEvent::RuntimeRestored {
+            capabilities_applied,
+            ..
+        } = envelope.event
+        {
+            break capabilities_applied;
+        }
+    };
+    assert!(
+        !applied,
+        "an unknown-only checkpoint capability set must not be reported as applied"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_full_restores_are_serialized_across_all_state_planes() {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let journal = Arc::new(BlockingFirstRestoreJournal::new(entered_tx, release_rx));
+    let instance = Arc::new(RuntimeInstance::spawn(
+        ModuleHost::new(),
+        RuntimeServices::new(
+            CoreAuthorityConfig::default(),
+            Arc::new(TestContextEngine),
+            Arc::new(QuietModel),
+            Arc::new(EmptyTools),
+            Arc::new(PolicyApprovalGate::read_only()),
+            Some(journal.clone()),
+        ),
+    ));
+    let checkpoint_a = agent_runtime::RuntimeCheckpoint {
+        version: agent_runtime::RUNTIME_CHECKPOINT_VERSION,
+        run_metadata: agent_runtime::RunMetadata {
+            run_id: instance.handle().run_id(),
+            created_at_ms: 0,
+        },
+        tasks: agent_runtime::TaskManagerSnapshot {
+            tasks: Vec::new(),
+            active: None,
+            completed: Vec::new(),
+        },
+        current_task_id: None,
+        focus_revision: 0,
+        last_surface_revision: 0,
+        context: serde_json::Value::Null,
+        capabilities: Vec::new(),
+        authority: None,
+    };
+    let mut checkpoint_b = checkpoint_a.clone();
+    checkpoint_b.focus_revision = 41;
+
+    let first_instance = instance.clone();
+    let first = tokio::spawn(async move { first_instance.restore(checkpoint_a).await });
+    tokio::time::timeout(Duration::from_secs(2), entered_rx)
+        .await
+        .expect("first restore did not reach its durable finalize barrier")
+        .expect("first restore dropped the barrier signal");
+
+    let second_instance = instance.clone();
+    let second = tokio::spawn(async move { second_instance.restore(checkpoint_b).await });
+
+    // If the full transaction were not gated, B could prepare while A is
+    // blocked at finalize, replacing A's pending token and eventually
+    // allowing a late capability-plane write after B unfenced the actor.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !second.is_finished(),
+        "the second full restore crossed the first restore transaction"
+    );
+
+    release_tx.send(()).expect("release first restore barrier");
+    tokio::time::timeout(Duration::from_secs(2), first)
+        .await
+        .expect("first restore did not finish")
+        .expect("first restore task panicked")
+        .expect("first restore failed");
+    tokio::time::timeout(Duration::from_secs(2), second)
+        .await
+        .expect("second restore did not finish")
+        .expect("second restore task panicked")
+        .expect("second restore failed");
+
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert!(
+        checkpoint.focus_revision > 41,
+        "the second restore must commit after the first, not interleave with it"
+    );
+    let instance = Arc::try_unwrap(instance).unwrap_or_else(|_| panic!("test leaked instance"));
+    instance.shutdown().await.unwrap();
+}
+
 #[derive(Debug)]
 struct FailRestoreEventJournal;
 
@@ -698,6 +935,50 @@ impl EventJournal for FailRestoreEventJournal {
             return Err(agent_contracts::AgentError::Storage(
                 "simulated restore-commit journal failure".into(),
             ));
+        }
+        Ok(())
+    }
+}
+
+/// Holds the first restore's durability barrier so a second caller can try
+/// to enter `RuntimeInstance::restore`. The instance-level gate must keep the
+/// second prepare out until this barrier is released.
+#[derive(Debug)]
+struct BlockingFirstRestoreJournal {
+    restore_flushes: std::sync::atomic::AtomicUsize,
+    first_entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release_first: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl BlockingFirstRestoreJournal {
+    fn new(
+        first_entered: tokio::sync::oneshot::Sender<()>,
+        release_first: tokio::sync::oneshot::Receiver<()>,
+    ) -> Self {
+        Self {
+            restore_flushes: std::sync::atomic::AtomicUsize::new(0),
+            first_entered: Mutex::new(Some(first_entered)),
+            release_first: tokio::sync::Mutex::new(Some(release_first)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl EventJournal for BlockingFirstRestoreJournal {
+    async fn append(&self, _envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+        Ok(())
+    }
+
+    async fn flush(&self) -> AgentResult<()> {
+        // `start()` only appends; the first flush therefore belongs to the
+        // first RuntimeRestored durability barrier.
+        if self.restore_flushes.fetch_add(1, Ordering::SeqCst) == 0 {
+            if let Some(entered) = self.first_entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            if let Some(release) = self.release_first.lock().await.take() {
+                let _ = release.await;
+            }
         }
         Ok(())
     }
@@ -825,7 +1106,7 @@ async fn restore_audit_failure_demands_recovery_and_fences_mutation() {
         .set_focus("original task".into())
         .await
         .unwrap();
-    let checkpoint = source.checkpoint().await.unwrap();
+    let mut checkpoint = source.checkpoint().await.unwrap();
 
     // The actor with a journal that refuses the restore-commit record.
     let failing = RuntimeInstance::spawn(
@@ -845,6 +1126,11 @@ async fn restore_audit_failure_demands_recovery_and_fences_mutation() {
         ),
     );
     failing.start().await.unwrap();
+    // This test isolates the final event-journal barrier. With no durable
+    // operation journal, an ephemeral checkpoint is valid only inside the
+    // same live run, so align its provenance with this deliberately bare
+    // test Core before exercising the later audit failure.
+    checkpoint.run_metadata.run_id = failing.handle().run_id();
     let mut events = failing.handle().subscribe();
 
     let error = failing.restore(checkpoint).await.unwrap_err();
@@ -1201,6 +1487,7 @@ async fn context_manage_admit_routes_end_to_end() {
             kind: None,
             scope: None,
             task_id: None,
+            label: None,
             limit: 16,
         })
         .await

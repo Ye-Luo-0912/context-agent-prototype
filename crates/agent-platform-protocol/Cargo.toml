@@ -1,0 +1,12 @@
+[package]
+name = "agent-platform-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Transport-independent Platform protocol contracts for the context-agent runtime"
+
+[dependencies]
+agent-contracts.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

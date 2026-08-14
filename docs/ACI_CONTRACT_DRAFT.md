@@ -249,10 +249,11 @@ mutation path:
 
 - a capability/builtin **computes**, Core **executes** behind the
   generation fence;
-- `WireEffect` (today: `WorkspaceWrite { path, content_b64 }`) is the
-  process-boundary serialization of an `EffectRequest`; v2 may add
-  `WorkspacePatch`, `ProcessRun`, `NetworkRequest` variants, each still
-  staged through confined handles and committed by Core only.
+- `WireEffect` (candidate shape: `WorkspaceWrite { path, content_b64 }`) is
+  the intended process-boundary serialization of an `EffectRequest`. The
+  current adapter rejects non-empty lists before staging; PLAT-03/04 must
+  bind operation/effect/argument identity and prove actual intent is within
+  the lease before v2 re-enables it or adds further effect variants.
 
 ### 3.3 Six-step authorization flow (unchanged, now concrete)
 
@@ -505,9 +506,10 @@ only pins the field conversions each step must preserve:
    `Unknown` is the new never-blindly-retry branch for remote effects).
    `EffectCommitError` remains as the internal error space and converts
    one-to-one into receipts; the journal format is unchanged.
-6. **Disable direct capability mutation, add IPC EffectRequest** — the
-   `WorkspaceHandle::write` direct path is removed; process children submit
-   `WireEffect` (already the shape) and receive `EffectReceipt` over IPC.
+6. **Disable direct capability mutation, then add a proved IPC EffectRequest**
+   — the direct write path is blocked and non-empty process `WireEffect`s are
+   currently refused. Re-enable them only after PLAT identity/actual-intent
+   proof and receipt recovery are wired end to end.
 7. **Sandboxed shell/process, read-only then mutating MCP adapters** — last.
 
 Explicitly out of scope for this migration (unchanged from the TODO): no

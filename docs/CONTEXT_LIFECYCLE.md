@@ -215,7 +215,15 @@ focus is always established through `set_focus(task_id, goal)` → a
 `FocusChanged` ingest. The engine never mints a `TaskId` — when the first
 normal user message arrives with no active task, the runtime auto-creates
 an *implicit* task, sets focus to it, and only then ingests the message, so
-the message lands in a real task scope. A `UserMessage` that still arrives
+the message lands in a real task scope. Live runtime (`CTX-EVENT`,
+2026-08-14) persists the exact body as a `user-input` artifact when a
+workspace is wired, ingests the full `UserMessage`, then emits
+`UserMessageAccepted` with a 240-char preview. `/focus` `/done` `/cancel`
+stay direct commands. A second message while a turn is running occupies
+one in-memory `Queued` slot and applies after that turn ends; a third
+is `Rejected`. `/cancel` emits `InterruptCommitted` after `TurnCancelled`.
+A successful turn publishes `Consumed` then `Archived` on the same input
+id. Journal replay of `body_ref` traces needs a workspace. A `UserMessage` that still arrives
 with no focus (engine used directly) is a session-level message: it falls
 back to the session scope and stays selectable, but no focus is invented.
 Later user messages update the current query while keeping the task goal. A
@@ -456,9 +464,12 @@ body currently sits (Resident / Warm / Stored):
   the task's entities lingered in the hot set and kept the finished
   dialogue rooted forever.)
 
-The structural target remains a single `ContextCatalog` record per
-`item_id` carrying identity + lifecycle metadata + `body_location`; see
-`docs/AUDIT_TODO.md` CTX-02.
+The catalog directory is a single `item_id -> location` record per id
+(Resident / Warm / Stored) with shared query indexes (id / task / scope /
+kind / entity / label / residency / attention). Authority metadata stays
+on the body; GC moves location. `context.search` generates candidates from
+those indexes; a free-text needle that hits no entity/label key still
+residual-scans summaries/uris. See `docs/AUDIT_TODO.md` CTX-02.
 
 ### Retrieval results are transient; admit and derive move items deliberately (CTX-03)
 
@@ -699,10 +710,17 @@ got marked while the roots' actual evidence was swept. The implementation
 now matches: `queue = roots; pop id; mark item[id].dependencies; push them`.)
 The root set is also tightened — **the active task is a scope boundary, not
 a root**: an item does not survive because its `task_id` matches the active
-task. Roots are only pinned items, the current focus scope, open loops,
-durable task constraints, hot entities and explicit references (plus a
-bounded `+8` transitive slice of their dependency edges). Old turns of a
-long task therefore cool and evict like any other working-set item.
+task. Roots are pinned items, the current focus scope, open loops,
+durable task constraints, hot entities, explicit references, and the
+**latest successful observation of each recent file path in the active
+task** (capped at 8 paths; identified by a path-only first line as in
+`fs.read`, not by a log that merely mentions a file). Same-path rereads
+supersede the previous body (semantic death, so hot-entity recall cannot
+bring stale file text back). A completed or switched-away task drops those
+file-body roots, so pagination detail does not contaminate a later CSV
+task. Plus a bounded `+8` transitive slice of their dependency edges.
+Old turns of a long task therefore cool and evict like any other
+working-set item.
 
 ### Eviction is reversible all the way down: ContextStore
 
@@ -766,6 +784,25 @@ very observation it targets (and before the next model round sees it):
   by `apply_directive`: `gc_hint` sets/clears `keep_alive`, `tag` pushes a
   deduped `Label::extension(tag)`, `lease` stamps `lease_until_turn =
   turn + min(turns, max_lease_turns)`.
+
+Since V1-M10 the actor also pushes the active task's **anchor root
+projection** before every GC/Storage GC pass and inside every
+materialization: `ContextAction::AnchorRoots { roots }` replaces the whole
+projection (bounded by `MAX_ANCHOR_ROOT_CLAIMS`), and
+`ContextHints.anchor_roots` carries the same projection on materialize.
+The claims come from `TaskAnchor.working_refs` / `evidence_refs`
+(`anchor_root_claims`), so task authority stays with the TaskManager — the
+engine only ever sees a bounded projection, never the anchor. Semantics by
+strength: `PromptRequired` forces the target into the model frame;
+`ResidentRequired` protects (or recalls) the target in the working set —
+GC marks it a root and reactivates it from the warm buffer or the cold
+store; `StorageRequired` keeps the target's store entry out of Storage GC.
+Claims resolve by item id, `context://run/<id>` uri, or exact entity
+signature, and semantic death is terminal — a claim never resurrects a
+superseded/verified-fixed/tombstoned item. The completion boundary
+force-clears the projection, so a finished task's records stop being
+rooted; the GC report carries `anchor_roots_protected` and the Storage GC
+report `anchor_roots_protected` for the same reason.
 
 Producing a `RuntimeDirective` requires the `runtime:context-control`
 permission in the capability manifest; a tool without it gets its directive
@@ -852,8 +889,21 @@ CTX-07.
 External descriptors participate in the same consumption commit as inline
 items. Merely previewing a ref does not update it; a successful acknowledged
 frame stamps `last_access_tick`/`last_access_gc_epoch` without fetching or
-reactivating the body. `fetch_external` remains a separate deliberate read
-and records its own access.
+reactivating the body. Retrieval access is graded (`CTX-GC-11`): a search
+hit is the weakest signal (at most one Cold-aging delay, per-item cooldown,
+and one identical-query stamp per turn), `inspect`/`fetch` are stronger
+deliberate reads, `admit` is an explicit residency move, and the
+consumption ack is the strongest online evidence. A weaker signal never
+overwrites a stronger one. `fetch_external` remains a separate deliberate
+read and records its own access.
+
+Search returns bounded `ResourceDescriptor` cards (`CTX-DISC-01..03`). It
+never admits a body or loads a tool; inspect/fetch/admit/load stay
+explicit follow-ups. Misses distinguish `not_found`, `evidence_absent`,
+and `provider_unavailable`. There is no public `runtime.search` surface.
+`agent-eval` joins `ContextGcReport.externalized_ids` to later search
+hits to report found-after-forgotten; that is instrumentation, not a
+policy change.
 
 Cold recall pre-filters in memory instead of reading the disk:
 `ExternalizedContext` keeps the item's entity signature (`entities`),
@@ -1072,8 +1122,9 @@ answer exactly:
 - **Consumption commit**: `ContextConsumed` carries the bounded
   `ContextConsumptionAck` with turn/operation/model-round/materialization
   identities plus exact full-item and external-ref ids. Only this event's
-  transaction bumps `access_count`/`last_access_turn` (or external access
-  stamps). No event means no reinforcement.
+  transaction bumps `access_count`/`last_selected_turn`. Search/inspect/fetch
+  may stamp a weaker recency/`gc_epoch` clock (`CTX-GC-11`) without counting
+  as consumption. No ack means no consumption reinforcement.
 - **Transitions**: every `ContextMaintained` event carries
   `report.transitions: Vec<ContextStateTransition>` with `item_id`, `kind`,
   `scope`, `from`, `to`, `turn`, and a human-readable `reason`

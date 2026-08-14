@@ -121,7 +121,7 @@
         "max_file_bytes": 4194304,
         "max_files": 16,
         "max_hunks": 64,
-        "note": "base_revision mismatch refuses the edit (file changed since it was read); hunks apply in order and each old must match exactly once unless occurrence is given; all files commit as one composite effect, a failure rolls back the already-applied files; old content captured to the change journal"
+        "note": "base_revision mismatch refuses the edit (file changed since it was read); hunks apply in order and each old must match exactly once unless occurrence is given; each file commit is atomic, but a multi-file composite commits sequentially and is not a cross-file transaction; a later failure cleans unattempted preparations and reports any partial application as recovery-required; old content captured to the change journal"
       },
       "effects": ["write:workspace", "journal:changes.jsonl"],
       "context_disposition": "PersistObservation",

@@ -4,7 +4,7 @@ use agent_contracts::{
 };
 
 use crate::engine::State;
-use crate::index::entity::{entities_match, extract_entities};
+use crate::index::entity::{entities_match, extract_entities, primary_file_path};
 
 /// A user message reads as a decision when it carries a directive verb
 /// ("use X", "switch to Y", "revert", "drop Z", ...). Explicit, keyword
@@ -140,6 +140,54 @@ pub(crate) fn queue_error_verifications(
             state
                 .pending_verifications
                 .push((entry.item_id, by_id, reason.to_string()));
+        }
+    }
+}
+
+/// 同一文件路径的更新成功观察覆盖旧正文：语义死亡，热实体也不能把过期
+/// 文件内容召回工作集。按首行路径精确匹配，不用实体子串（`Session::start`
+/// 会把三个文件缠在一起）。
+pub(crate) fn queue_file_body_supersessions(
+    state: &mut State,
+    content: &str,
+    by_id: ContextItemId,
+) {
+    let Some(path) = primary_file_path(content).map(str::to_owned) else {
+        return;
+    };
+    let reason = format!("superseded by a newer observation of {path}");
+    let is_same_file = |item: &ContextItem| -> bool {
+        item.id != by_id
+            && item.kind == ContextKind::ToolObservation
+            && !item.semantic.is_dead()
+            && !is_excluded(item)
+            && primary_file_path(&item.content) == Some(path.as_str())
+    };
+    for item in &mut state.items {
+        if is_same_file(item) {
+            state
+                .pending_supersessions
+                .push((item.id, by_id, reason.clone()));
+        }
+    }
+    for item in &mut state.eviction_buffer {
+        if is_same_file(item) {
+            state
+                .pending_supersessions
+                .push((item.id, by_id, reason.clone()));
+        }
+    }
+    for entry in &state.external {
+        if entry.item_id == by_id
+            || entry.kind != ContextKind::ToolObservation
+            || entry.semantic.is_dead()
+        {
+            continue;
+        }
+        if entry.entities.iter().any(|entity| entity == &path) {
+            state
+                .pending_supersessions
+                .push((entry.item_id, by_id, reason.clone()));
         }
     }
 }

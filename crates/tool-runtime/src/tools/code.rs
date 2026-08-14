@@ -384,6 +384,7 @@ impl Tool for CodeSymbolsTool {
         run_id: RunId,
         call_id: &str,
         arguments: Value,
+        _effect_context: Option<agent_contracts::OperationEffectContext>,
         _cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let args: SymbolsArgs = serde_json::from_value(arguments)
@@ -396,7 +397,7 @@ impl Tool for CodeSymbolsTool {
 
         let mut files = Vec::new();
         let mut budget = MAX_FILES_SCANNED;
-        walk_files(&root, &mut files, &mut budget).await?;
+        walk_files(&root, &mut files, &mut budget, None).await?;
         files.sort();
 
         let query = args.query;
@@ -507,14 +508,14 @@ impl CodeSymbolsTool {
     /// like the first page.
     async fn page_from_snapshot(
         &self,
-        _run_id: RunId,
+        run_id: RunId,
         call_id: &str,
         cursor: &str,
     ) -> AgentResult<ToolOutcome> {
         use super::{parse_cursor, read_snapshot_lines};
 
         let (reference, offset) = parse_cursor(cursor)?;
-        let lines = read_snapshot_lines(&self.workspace, reference).await?;
+        let lines = read_snapshot_lines(&self.workspace, run_id, reference).await?;
         if offset > lines.len() {
             return Err(AgentError::InvalidRequest(format!(
                 "cursor is past the end of the snapshot ({offset} > {} lines)",
@@ -633,6 +634,7 @@ impl Tool for CodeDiagnosticsTool {
         _run_id: RunId,
         call_id: &str,
         arguments: Value,
+        _effect_context: Option<agent_contracts::OperationEffectContext>,
         _cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let mut args: DiagnosticsArgs = serde_json::from_value(arguments)
@@ -817,6 +819,7 @@ mod tests {
                 name: name.into(),
                 arguments: args,
             },
+            effect_context: None,
             cancel: CancellationToken::new(),
         }
     }
@@ -825,7 +828,7 @@ mod tests {
         let tool = CodeSymbolsTool::new(workspace.clone());
         let request = request(run_id, "code.symbols", args);
         let outcome = tool
-            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .execute(run_id, "c", request.call.arguments, None, request.cancel)
             .await
             .unwrap();
         value(outcome)
@@ -1008,7 +1011,7 @@ mod tests {
                 arguments: args,
             };
             async move {
-                tool.execute(run_id, "c", call.arguments, CancellationToken::new())
+                tool.execute(run_id, "c", call.arguments, None, CancellationToken::new())
                     .await
             }
         };
@@ -1052,7 +1055,7 @@ mod tests {
         let tool = CodeDiagnosticsTool::new(workspace.clone());
         let request = request(run_id, "code.diagnostics", args);
         let outcome = tool
-            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .execute(run_id, "c", request.call.arguments, None, request.cancel)
             .await
             .unwrap();
         value(outcome)

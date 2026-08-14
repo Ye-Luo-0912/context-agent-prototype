@@ -98,9 +98,11 @@ pub(crate) fn run_minor(
     // iterator borrows `state`, then applied after the loop (`record` needs
     // `&mut State`).
     let mut ledger_rows: Vec<(ContextItemId, LifecycleAxis, String, String, String)> = Vec::new();
+    let latest_file_bodies = state.latest_file_body_ids();
     for item in &mut state.items {
         let old_attention = item.attention;
         let old_semantic = item.semantic;
+        let latest_file_body = latest_file_bodies.contains(&item.id);
         let outcome = next_residency(
             item,
             config,
@@ -109,6 +111,7 @@ pub(crate) fn run_minor(
             turn,
             focus.as_ref(),
             &hot_entities,
+            latest_file_body,
         );
         item.attention = outcome.attention;
         item.relevance = outcome.relevance;

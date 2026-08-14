@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/agent-contracts",
+    "crates/agent-platform-protocol",
     "crates/context-simple",
     "crates/context-baselines",
     "crates/context-contextcore",
@@ -28,6 +29,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 agent-contracts = { path = "crates/agent-contracts" }
+agent-platform-protocol = { path = "crates/agent-platform-protocol" }
 context-simple = { path = "crates/context-simple" }
 context-baselines = { path = "crates/context-baselines" }
 context-contextcore = { path = "crates/context-contextcore" }

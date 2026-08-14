@@ -101,7 +101,9 @@ Run real coding tasks without coupling the kernel to one vendor.
 - one provider adapter: `provider-openai` (OpenAI-compatible SSE; also covers
   DeepSeek/Qwen/Moonshot/GLM via `base_url`);
 - streaming model output/events: `complete_stream` + `ModelEventSink` +
-  `ModelChunk`; live `RuntimeEvent::ModelDelta` (not journaled);
+  `ModelChunk`; live `RuntimeEvent::ModelDelta` (not journaled and does not
+  consume durable sequence numbers; it repeats the opening `ModelStarted`
+  cursor);
 - cancellation: `CancellationToken` on `ModelRequest`, `cancel_current_turn()`,
   clean turn end on cancel;
 - provider capability declaration: `ModelCapabilities`;
@@ -183,7 +185,8 @@ Become useful for real repository work while preserving context isolation.
 
 - medium repository can be inspected without loading a full tree or full
   files: satisfied — `search.grep` walks bounded files with per-file byte
-  caps and ignores generated/vendor directories;
+  caps, ignores generated/vendor directories, and stops a cancelled scan
+  with an explicit partial `ToolOutput`;
 - large build/test logs remain artifacts: satisfied — `shell.exec` streams
   to an artifact and hands the model a bounded tail; `git.diff`/`git.status`
   spill to artifacts when truncated;
@@ -511,8 +514,9 @@ Acceptance:
   spawned kernel calls directly is gone (the TUI now drives the handle);
 - long-running work (a turn) runs as a spawned operation reporting back an
   `OperationResult` tagged with run/turn/task/scope/operation ids and a
-  generation. The actor drops results whose generation moved on (cancel,
-  stop) instead of letting them race into the new state — observable as a
+  generation. The actor drops results whose epoch mirror moved on (cancel,
+  stop), while Core independently rejects stale dispatch/commit, instead of
+  letting them race into the new state — observable as a
   `stale turn result dropped` warning;
 - the actor stays responsive while a turn runs (it selects on both the
   command channel and the completion channel), so `/cancel` is processed
@@ -611,19 +615,25 @@ Consequences:
 
 - model rounds and tool calls are real `Operation`s — `OperationOutcome::
   ModelOutput` and `::ToolOutput` are now used, not just `Completed`;
-- only the actor commits: a stale result (cancel, generation bump) is
+- only the actor commits runtime state: a stale result (cancel, epoch bump) is
   dropped before it can touch the context, the turn frame or the event
   stream; the previously unavoidable side effects of "the whole kernel
   turn already finished" are gone;
-- `CoreAuthority` is a stateless executor/helper (context/model/tool
+- `CoreAuthority` is a turn-stateless executor/helper (context/model/tool
   primitives + event plumbing + journal); its `turn_lock`/`turn_cancel`
   and the `TurnFrame` ownership are gone — execution ownership is no
   longer duplicated;
 - the actor owns the `TurnFrame` (execution stack) across model/tool
   operations, so the M1 invariant (turn frame is never scored or evicted
   mid-turn) is enforced by construction;
-- cancellation is committed by the actor immediately (Warning + TurnCompleted),
-  and the in-flight operation's late result is dropped as stale.
+- cancellation fences the operation immediately, then durably publishes the
+  distinct `TurnCancelled` terminal event and returns a typed
+  `TurnCancelAck`; it never reuses the successful `TurnCompleted` commit
+  marker. A failed cancellation barrier raises the recovery fence, and the
+  in-flight operation's late result is dropped as stale. Tool-scope cleanup is
+  bounded; timeout raises `RecoveryRequired`, and a cancelled tool remains a
+  pending-cleanup root that blocks normal mutation until its late
+  `PreparedEffect` has been explicitly rolled back.
 
 Acceptance:
 
@@ -823,8 +833,10 @@ while the tiny one is always selected first.
 
 Shutdown is no longer a best-effort sequence owned by the caller:
 
-- the actor's `Stop` arm runs a real `shutdown()` (cancel the turn, then
-  `kernel.stop()` — journal flush + `RunCompleted`) and **replies with
+- the actor's `Stop` arm runs a real `shutdown()` (cancel the turn, boundedly
+  drain any cancelled tool completion so a late `PreparedEffect` takes the
+  stale rollback path, then `kernel.stop()` — journal flush + `RunCompleted`)
+  and **replies with
   the kernel stop result** instead of swallowing it;
 - the `rx.recv() -> None` path (every caller handle dropped) runs the
   same teardown instead of returning silently, so durability work never
@@ -835,6 +847,8 @@ Shutdown is no longer a best-effort sequence owned by the caller:
 
 ```text
 cancel any turn
+  → boundedly drain cancelled-tool cleanup
+    (late PreparedEffect → rollback; timeout → RecoveryRequired)
   → stop the actor (kernel stop: flush journal, emit RunCompleted)
   → stop the module host (reverse registration order)
   → join the actor task
@@ -849,7 +863,10 @@ Acceptance: an actor test drops every handle (keeping only a broadcast
 subscriber) and asserts `RunCompleted` still fires; `RuntimeInstance`
 tests assert the module lifecycle brackets the run (`start` ... `stop`),
 that `shutdown` aggregates a failing module stop into its error, and
-that shutdown never hangs when the actor was never started.
+that shutdown never hangs when the actor was never started. A tool-operation
+regression additionally holds execution across cancellation, returns a late
+`PreparedEffect`, and requires `Stop` to wait for and roll it back before the
+run ends.
 
 ## V1-P5: string tags become typed labels ✅ (implemented)
 
@@ -984,10 +1001,10 @@ acceptance:
   `call_with_cancel` — a cancel (user `/cancel`, superseded operation)
   poisons the connection and kills the whole process tree immediately
   instead of waiting for the request deadline. Absolute filesystem/network
-  access and cross-platform quotas remain M12/M13 blockers; process-wire
-  effects landed with the `CORE-01` wire broker (a child stages structured
-  `WireEffect`s the adapter validates and the core commits behind the
-  generation fence); the type name is not milestone acceptance.
+  access and cross-platform quotas remain M12/M13 blockers. Non-empty
+  process `WireEffect`s now fail closed before staging until actual intent is
+  bound to PLAT operation/effect identity and proved within the lease; the
+  type name is not milestone acceptance.
 - **The context store is a retrieval loop, not a black hole.** The store
   path is injected at the composition root
   (`workspace.state_dir()/context-store`); the leaked CWD-guessed copy was
@@ -1041,7 +1058,7 @@ stopped trusting declarations:
   membership alone (they come back via retention, affinity or dependency),
   matching the GC mark phase's closed-scope boundary.
 
-## V1-M10 Runtime Consistency 🟡 (transaction baseline implemented)
+## V1-M10 Runtime Consistency ✅ (transaction and restore fence implemented)
 
 Several important consistency gaps are closed:
 
@@ -1081,12 +1098,12 @@ The transaction baseline is covered end to end: the actor assigns the task
 id, the engine carries the same one
 (`runtime_task_id_matches_the_context_task_id`), failed focus/task changes
 roll context back, and restore validates task/context alignment
-(`runtime_checkpoint_roundtrips_tasks_context_and_capabilities`). The full
-milestone remains open: `RuntimeInstance::checkpoint` still captures actor
-state and the shared capability registry in two steps, public actor-only
-checkpoint APIs can omit host state, and live-restore revision rebasing has
-no mandatory typed audit/barrier. These are `CORE-03`; do not infer the
-global "never split-brain" acceptance from the happy-path round trip.
+(`runtime_checkpoint_roundtrips_tasks_context_and_capabilities`). The former
+cross-plane restore gap is closed by a two-stage instance transaction: actor
+task/context state stays recovery-fenced while the capability registry applies
+a fail-closed activation meet; only a durable `RuntimeRestored` barrier releases
+the fence. A failed barrier and every failed mandatory turn commit keep later
+mutation fenced. Unknown capability ids do not count as applied (`CORE-03`).
 
 Performance P1 landed ahead of the milestones below: the external map
 owns its id/entity indexes (`ExternalMap`, O(1) inspect/fetch lookups,
@@ -1109,34 +1126,87 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 
 ## Code-grounded milestone status and ordered route
 
-> **2026-08-10 code audit.** A milestone is complete only when its named
+> **2026-08-13 code audit.** A milestone is complete only when its named
 > acceptance holds, not merely when one implementation path exists. Detailed
 > defects remain authoritative in [`docs/AUDIT_TODO.md`](AUDIT_TODO.md);
 > context/tool design work remains in the two dedicated TODOs.
 
 | Milestone | Status at this code state | Acceptance gap |
 | --- | --- | --- |
-| M10 Runtime Consistency | ✅ | Cross-plane checkpoint capture and live-restore audit/recovery are closed (`CORE-03`), the GC/storage/checkpoint/restore operation protocol is closed (`CTX-06`), the task authority/completion contract is closed (`CTX-10`: TaskAnchor, CompletionRecord, atomic root transfer, storage-root outcomes), and the standing recovery-replay path is closed (`CORE-02` residual: `agent-replay --recover` locates the durability barrier and failure phase, checks envelope-sequence integrity, rebuilds the context-engine state from the trace, and proves checkpoint restore + tail replay equals the full rebuild). M10's named acceptance (runtime and context never drift into a task/state split-brain) is exercised by the invariant suite plus the engine-level restore-consistency proof. |
+| M10 Runtime Consistency | ✅ | Checkpoint capture and two-stage live restore are recovery-fenced (`CORE-03`): capability activation is fail-closed and applied before `RuntimeRestored` releases the actor; mandatory turn-commit failure persists the same fence. GC/storage operations (`CTX-06`), TaskAnchor/CompletionRecord root transfer (`CTX-10`) and recovery replay (`CORE-02`) have fault coverage. |
 | M11 Context Recall | ✅ narrow retrieval baseline | Search/inspect/fetch, transient results, bounded external view and service parity work. Canonical catalog ownership and complete cross-residency semantics remain context-runtime work rather than reasons to call recall itself absent. TaskAnchor/Completion roots are now implemented (`CTX-10`). |
-| M12 Effect Runtime | ✅ | In-process prepared effects and process-capability wire effects commit behind the generation fence (`CORE-01`), a cancelled operation kills its whole process tree (`CORE-06`: shell/git/capability share one tree-kill) and cleans up every pending approval entry, provider streams are byte-capped, and Windows Job-Object quotas are kernel-enforced. The standing-grant `TaskExecutionPolicy` (CORE-08) is M14 approval-policy work, not an M12 gap. |
+| M12 Effect Runtime | 🟡 staged-effect baseline | Trusted prepared effects commit behind the Core-owned authority-epoch/lease fence (`CORE-01`); stale dispatch and commit are rejected, and cancellation advances the fence before awaiting cleanup. Non-empty process-capability wire effects currently fail closed before staging pending PLAT actual-intent/recovery proof, and cancellation kills owned process trees (`CORE-06`). Generic `shell.exec` / `process.run` execute before completion and may already mutate the world, so they remain bounded, separately authorized non-transactional exceptions—not proof that every side effect uses one commit path. |
 | M13 Extension Sandbox | 🟡 partial | Env scrub, private cwd, bounded stderr, process-tree cancellation, Windows Job-Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE), Unix rlimits (CPU/process) and directory-handle-relative workspace opens with reparse substitution rejected at open time (`CORE-07`) are enforced. Mid-invoke filesystem access is now brokered: a child's `fs.read` system request is answered only under the invocation's `workspace:read` grant, only through a confined workspace handle, and only for relative non-escaping paths (absolute/rooted and `..` paths refused before the handle is consulted); network is explicitly deny-by-default (no network permission word exists; recognized network ops get a named refusal). OS-level *write* filtering is now kernel-enforced on Linux (landlock, `MOD-06`): a confined child may create/modify/destroy filesystem state only under its configured write roots, irrevocably and inherited by every descendant, verified on a real kernel. OS-level *network* filtering (sockets) remains the residual gap (`CORE-01` open). |
-| M14 Resource Policy | ✅ | Schema/context quotas, risk/permission validation and final output guards exist; the narrow standing `TaskExecutionPolicy` is landed (`CORE-08`: effect + target + constraint + expiry grants, revocable, zero-responder deny/skip); the kernel-level trusted output broker is landed (`CORE-04`: capped fields, one-time artifact spill, execution-enforced query limits); a declared per-tool output budget on `ToolSpec` is enforced by the broker (clamped to the global hard cap); approval is now effect-derived: `EffectIntent` (contract type) is derived from the validated arguments and standing grants match the concrete intent (path, content bytes, command prefix) instead of re-parsing raw arguments; commit-time resource enforcement is landed (`AuthorityLease`: every side-effecting call mints a short-lived lease at approval, and the actor refuses to commit a staged effect whose lease expired or whose operation generation moved — rollback, never commit); and every meta-tool surface is bounded by logical history size, not by it: diagnostics answers in O(1) (Cold/External counts), `inspect` and `search` keep only their limit of rows while streaming (memory O(limit)), and the ledger is capped. The acceptance — the LLM cannot exhaust runtime resources through meta-tools — is met. |
-| M15 Real Evaluation | 🧪 instrumentation/smoke only | Replay is a policy proxy and the live run is a no-tool constraint-retention task. The A/B/C/D evaluation inputs (four tool-surface arms + four coding fixtures with hidden verification, `agent-eval --fixtures`), the all-module cost-accounting aggregation (`agent-eval --metrics`), a deterministic fixture runner (`agent-eval --fixture <id>`, scripted model driving the real builtin tool surface end to end), a live fixture path (`agent-eval --fixture-live <id>`, real provider when `OPENAI_API_KEY` is set), and a cross-engine fixture comparison (`agent-eval --compare-arm <id>`, append-only / rolling-summary / dynamic on the same five-turn scripted model and the same real tool surface: every engine passes the hidden verification and dynamic feeds the model measurably fewer input tokens) are landed; there is still no paired real coding workload run with a real model, or a non-inferiority result. |
-| V2 Self-Iteration | 🔒 blocked | Registry maturity and sandboxed self-checks are foundations only. Autonomous generation/promotion stays disabled until M10 and M12-M15 acceptance gates close. |
+| M14 Resource Policy | ✅ | Schema/context quotas, risk/permission validation and final output guards exist; the narrow standing `TaskExecutionPolicy` is landed (`CORE-08`: effect + target + constraint + expiry grants, revocable, zero-responder deny/skip); the kernel-level trusted output broker is landed (`CORE-04`: capped fields, one-time artifact spill, execution-enforced query limits); a declared per-tool output budget on `ToolSpec` is enforced by the broker (clamped to the global hard cap); approval is now effect-derived: `EffectIntent` (contract type) is derived from the validated arguments and standing grants match the concrete intent (path, content bytes, command prefix) instead of re-parsing raw arguments; commit-time resource enforcement is landed (`AuthorityLease`: every side-effecting call mints a short-lived lease at approval, and Core refuses stale-epoch or expired-lease commits — rollback, never commit); and every meta-tool surface is bounded by logical history size, not by it: diagnostics answers in O(1) (Cold/External counts), `inspect` and `search` keep only their limit of rows while streaming (memory O(limit)), and the ledger is capped. The acceptance — the LLM cannot exhaust runtime resources through meta-tools — is met. |
+| M15 Real Evaluation | 🧪 live paired harness landed; gate open | Replay is a policy proxy. Default live `agent-eval` is still the no-tool retention smoke. `--compare-live` is the live paired coding harness, not a 300×3 result. Replay scenarios emit turn-boundary `ContextGc` like the actor: C Resident bytes on heavy traces are a fraction of A (`long_refactor` 69 332 → 4 298). Active-task latest-file-body policy makes `long_refactor` required facts **4/4**; scoring stays frozen. Live cells now write versioned evidence bundles (EVAL-01.1). EVAL-01.2 freezes the clustered C−A estimator; EVAL-01.3 re-freezes the gate at 300×3 / −5 pp (historical 30×3 is underpowered, ~19% at Δ=0). The 300-task suite and model-backed B are still missing. The non-inferiority gate remains open. |
+| V2 Self-Iteration | 🔒 blocked | Registry maturity and sandboxed self-checks are foundations only. Autonomous generation/promotion stays disabled until M12/M13/M15 close and the `PLAT-00..04` containment/protocol/recovery boundary is proven. |
 
-The intended order remains M10 → M11 → M12 → M13 → M14 → M15 → V2.
-M14 has now closed; the M15 harness that landed early is acceptable
+The milestone dependency remains M10 → M11 → M12 → M13 → M14 → M15 → V2;
+the active implementation order is refined below because M10/M11/M14 and the
+staged-effect slice of M12 are closed. The M15 harness that landed early is acceptable
 defensive/instrumentation work, but it does not advance the M15
 completion gate.
+PLAT-00 wire containment, PLAT-01 structural Core boundary, PLAT-02's pure
+semantic protocol contract and PLAT-03a1-a4's Core authority plus builtin
+workspace recovery are now landed.
+PLAT-01 exposes only a narrow in-process `CorePort` to private runtime
+scheduling state, hides the concrete Core/actor implementations, and pins the
+production dependency graph with conformance tests. PLAT-03a1 adds a Core-owned
+atomic epoch: Runtime requests CAS advances, Core rejects stale dispatch and
+commit, and cancellation advances the fence before any await. PLAT-03a2 adds
+typed argument/effect identity plus a bounded in-memory operation registry:
+same-process duplicates do not execute/commit twice, identity conflicts fail
+closed, unresolved operations are never evicted, and CorePort can query
+found/fail-closed-possibly-seen/unseen state. Cancellation writes an
+exact-identity terminal reservation before cleanup; even a pre-admission cancel
+prevents the delayed operation from dispatching. The bounded seen-ID filter may
+reject a fresh random ID on collision and eventually saturates; metrics and
+compaction remain open. PLAT-03a3 now adds an independent authority journal:
+Core synchronously persists epoch and full operation snapshots before publishing
+memory state, and strict restart folding repairs only a structurally incomplete
+final fragment while rejecting complete-frame sequence/checksum/identity/state
+corruption. Writes stop before bounded recovery/file limits could make the next
+startup unrecoverable. PLAT-03a4 preallocates each side-effecting call's stable
+`EffectId`, propagates its exact operation/digest/effect identity into builtin
+workspace mutations, and records prepare/commit/rollback evidence in a second
+strict journal. Startup reconciles that evidence against current file hashes;
+proven states are terminalized, while partial, corrupt, unmanaged or ambiguous
+effects remain unresolved and fence mutation with `RecoveryRequired`. Generic
+shell/process spawn/exit recovery is landed (never-spawned `NotApplied`,
+durable wait `CompletedValue`, crash-without-exit `Ambiguous`; leftover
+trees are killed only on matching OS identity). Out-of-process
+capability/MCP invoke recovery is landed (reserved/dispatch/ack journal;
+in-flight idempotency keys refuse a second send). A future HTTP broker
+must reuse that barrier; peer mutations are not rolled back. Process recovery cannot roll back child mutations. Unix synchronizes newly
+created parent directories; Windows synchronizes files but retains an explicit
+power-loss directory-entry limitation. The workspace-local recovery slice is
+closed. RuntimeCheckpoint v4 now validates a stable Core WAL prefix marker
+before restore and only advances the live epoch. Typed query/cancel protocol
+routes plus RuntimeActor-owned query and exact-current-tool cancellation are
+landed. Core atomically arbitrates cancellation against terminalization: a won
+cancel persists its epoch fence and exact terminal before the distinct
+turn-cancel barrier, while an already-settled race returns unchanged truth;
+partial WAL failure fences Core and Runtime. The permission-checking
+transport-independent Platform router and WAL-first acceptance publication
+are landed; WAL compaction is landed (generation fold + exact-tip
+ancestors). In-process authenticated operation-control session installation
+is landed. Framed JSON-lines operation-control over an inherited-pipe
+analogue is landed; out-of-process capability/MCP invoke recovery is
+landed. A future HTTP broker must reuse the reserved/dispatch/ack barrier,
+and
+V1 still trusts Runtime in the same address space. PLAT-03 therefore remains
+partial; neither general crash exactly-once nor a non-bypassable malicious-
+Runtime boundary is claimed.
 The context target discovered during audit — authoritative TaskAnchor,
-episode outcomes, exact completion output and GC root transfer — is now
-implemented (`CTX-10`): the runtime owns a bounded versioned anchor and one
+typed completion and GC root transfer — has an implemented baseline
+(`CTX-10`): the runtime owns a bounded versioned anchor and one
 immutable `CompletionRecord` per completed task, completion is an atomic
 root transfer with fault injection coverage, and completed-task records are
-storage roots so 1,000 completions stay bounded. Exact raw final-response
-retention (before ContextItem truncation) and a typed `EpisodeOutcome` per
-rotated episode remain the residual context work; they must be validated
-before M15 can claim long-task success.
+   storage roots so 1,000 completions stay bounded. The completion ref/digest
+   identify the bounded summary; when artifact storage is wired, the full
+   assistant response is written before ContextItem truncation and attached
+   separately. A raw-body digest and typed `EpisodeOutcome` per rotated episode
+   remain before M15 can claim long-task success.
 
 The detailed milestone notes below retain implementation landing order, not
 the required gate order; the numbered list and table above are authoritative.
@@ -1154,13 +1224,13 @@ the required gate order; the numbered list and table above are authoritative.
    information can be pulled back on demand without polluting the prompt.
    ✅ Narrow retrieval baseline implemented; broader lifecycle/catalog work
    stays in the context queue.
-3. **V1-M12 Effect Runtime** — every capability routes side effects through
+3. **V1-M12 Effect Runtime** — every brokerable capability side effect routes through
    one unified EffectRequest/Effect commit. Acceptance: a cancelled
-   operation produces no avoidable stale mutation. ✅ The process-wire path
-   (`CORE-01` wire broker), the direct-shell escape path and approval
-   timeout/cancel cleanup (`CORE-06`) are closed, and Windows Job-Object
-   quotas are kernel-enforced; the standing-grant `TaskExecutionPolicy`
-   stays with M14 (`CORE-08`).
+   operation produces no avoidable stale mutation. 🟡 The prepared/process-
+   wire path and approval timeout/cancel cleanup are closed. Generic shell and
+   process execution is non-rollbackable: killing future work cannot undo
+   writes made before cancellation. Close M12 with a typed admission/recovery
+   contract plus M13 confinement, or move those mutations through brokers.
 4. **V1-M13 Extension Sandbox** — process sandbox, env scrub, brokered
    FS/network, cancel. Acceptance: experimental code cannot exceed the
    permissions granted to it. 🟡 Host hardening plus Windows Job-Object
@@ -1177,31 +1247,32 @@ the required gate order; the numbered list and table above are authoritative.
 5. **V1-M14 Resource Policy** — tool schema budget (the per-round surface
    bound landed in Performance P1), context hint quota,
    RiskClass, PermissionSet. Acceptance: the LLM cannot exhaust runtime
-   resources through meta-tools. 🟡 Model-facing bounds exist, the narrow
+   resources through meta-tools. ✅ Model-facing bounds exist, the narrow
    standing `TaskExecutionPolicy` (`CORE-08`) is landed, the kernel-level
    trusted output broker is landed (`CORE-04`), and a declared per-tool
    output budget/spill policy on `ToolSpec` is enforced by the broker
    (clamped to the global hard cap, spill at the declared limit);
    commit-time resource enforcement is landed (`AuthorityLease`):
    `execute_tool` mints a short-lived lease for every side-effecting call
-   (operation generation + derived intent + covering grant + TTL), and
-   the actor refuses to commit a staged effect whose lease expired or
-   whose generation moved — the effect is rolled back and the model sees
-   a failed tool result. What keeps M14 partial: typed `PermissionSet`
-   and the v2 `AuthorityGate` (shadow only today) remain future policy
-   work.
+   (operation epoch + derived intent + covering grant + TTL), and Core refuses
+   a staged effect whose lease expired or whose authority epoch moved — the
+   effect is rolled back and the model sees
+   a failed tool result. The named M14 acceptance is closed; further typed
+   policy evolution belongs to Platform Protocol/M13 hardening rather than
+   reopening this milestone.
 6. **V1-M15 Real Evaluation** — coding workload A/B/C + lifecycle metrics.
    Acceptance: the dynamic runtime saves tokens without lowering task
    success rate. 🧪 The deterministic fixture harness and the
    cross-engine comparison are landed (`agent-eval --fixture <id>` /
-   `--fixture-live <id>` / `--compare-arm <id>`): on the same real
-   builtin tool surface and the same five-turn scripted model, every
-   engine passes the fixture's hidden verification while dynamic feeds
-   the model measurably fewer input tokens than append-only and
-   rolling-summary (measured on `fix_off_by_one`: append 12 849, rolling
-   12 913, dynamic 11 862 model input tokens; dynamic is the only engine
-   that performs lifecycle maintenance). A real coding non-inferiority
-   result with a tool-capable provider remains unmeasured.
+   `--fixture-live <id>` / `--compare-arm <id>` / `--compare-live <id>`):
+   on the same real builtin tool surface and the same five-turn scripted
+   model, every engine passes the fixture's hidden verification while
+   dynamic feeds the model measurably fewer input tokens than append-only
+   and rolling-summary (current scripted `fix_off_by_one`: append 13 761,
+   rolling 13 407, dynamic 12 744 model input tokens; dynamic is the only
+   engine that performs lifecycle maintenance). `--compare-live` is the
+   real-model pairing harness; durable per-cell evidence, an independently
+   frozen task suite and a 300×3 non-inferiority result remain unmeasured.
 7. **V2 Self-Iteration** — generate → sandbox → test → replay → evaluate →
    canary → stable. The LLM grows capabilities, but cannot modify the
    evaluation or permission Core. 🔒 Blocked; only prerequisite scaffolding
@@ -1213,50 +1284,216 @@ letting the LLM grow capabilities autonomously.
 
 ### Next optimization order (do not start with smarter scoring)
 
-1. **Finish state authority (M10).** Serialize or revision-fence context GC,
+There are two coordinated lanes below. The trusted-execution critical path
+starts at item 3 (`PLAT-00`) and must stay ahead of external/managed workers;
+the context-objective lane in item 2 may proceed in parallel, but it cannot
+be used to declare the Platform or sandbox gates complete.
+
+1. **State authority (M10, complete).** Serialize or revision-fence context GC,
    storage GC, checkpoint and restore; capture actor + capability state as one
    snapshot; make restore rebasing a bounded durable event/recovery
    transaction. **Done:** operation gate (`CTX-06`), freeze-handshake
    checkpoint + restore-commit audit (`CORE-03`).
-2. **Finish the context target (M10/M11).** Fix the episode-local turn counter;
-   introduce the runtime-owned TaskAnchor and immutable CompletionRecord;
-   retain the exact final output/evidence through a completion root transfer;
-   then move lifecycle metadata into one canonical catalog. Historical
+2. **Continue the context target after M10/M11.** Move lifecycle metadata
+   into one canonical catalog, project the implemented TaskAnchor into prompt
+   and GC roots, and add sourced EpisodeOutcome cards. Historical
    content has left the System role (`CORE-05`): observations render as
    low-authority `user` messages, so retrieved history cannot gain system
    precedence. **Done:** TaskAnchor,
    `CompletionRecord`, atomic completion root transfer and verifiable
-   final-output digest (`CTX-10`); the System-role split (`CORE-05`); the
+   completion-summary digest (`CTX-10`); the System-role split (`CORE-05`); the
    episode-local turn counter (rotation resets it, and GC ages ordinary
    dialogue out of the open episode, so a long episode stays bounded without
    rotating every message); catalog-owned aging/protection semantics across
    body locations (warm-buffer TTL/staleness clock, protection fields on
    stored entries). The authority/body split (`ContextCatalog`, one
-   `item_id -> ContextRecord`) remains.
-3. **Close trusted execution (M12/M13).** Extend process IPC with typed
-   prepared effects, broker or confine direct shell/process mutation, and add
-   real filesystem/network/resource isolation with adversarial cancel/escape
-   tests.
-4. **Complete bounded policy (M14).** Put every producer behind one output
-   broker. The narrow, revocable `TaskExecutionPolicy` is landed (`CORE-08`):
+   `item_id -> location` directory plus query indexes) is landed
+   (2026-08-14); bodies remain in the three stores. `TaskAnchorView` and
+   sourced EpisodeOutcome remain.
+3. **Contain current protocol boundaries (`PLAT-00`, P0a).** Before designing
+   a new envelope, fix current codecs, bidirectional frame/exchange caps,
+   known decoded-large-field caps, and MCP child ownership/cancellation.
+   Request-owned `call_id`/`tool_name` canonicalization and the empty-effect
+   response bug are included; large current broker values use bounded reads.
+   Typed artifact ownership is now an identity locator; explicit
+   `legacy.invoke-output.v1` negotiation is landed (`PLAT-04`). This precedes
+   transport changes.
+   **Contained 2026-08-13:** shared allocation-bounded frame reads, symmetric
+   writes, sticky session poison, host-owned unpredictable correlation ids,
+   bounded Context service sessions, MCP child/cancel/JSON-RPC/notification
+   handling, allocation-bounded broker reads and bounded process effects are
+   landed. Artifact owner/digest identity locators are landed
+   (`artifact://v1/<run>/<owner>/<digest>`, with explicit drafts until seal),
+   parse-time decoded JSON DOM budgets are landed, RFC 8785 JCS
+   canonicalization, explicit legacy negotiation and the shared adapter
+   fault matrix are landed (`PLAT-04`). Adapter envelope migration onto
+   Platform DTOs remains `PLAT-07`.
+   Therefore PLAT-00 containment is not evidence that the Platform Protocol
+   itself is complete.
+4. **Close the remaining trusted-execution boundary (M12/M13).** Trusted
+   in-process staged effects are implemented; non-empty process wire effects
+   deliberately fail closed pending PLAT actual-intent proof. Finish that
+   authority/recovery contract plus OS-level network isolation,
+   cross-platform confinement and the generic shell/process non-transactional
+   effect contract with adversarial escape/recovery tests.
+5. **Finish remaining PLAT-03 recovery (`PLAT-03` partial; `PLAT-04` landed) on the
+   landed PLAT-01/02 + PLAT-03a1-a4 boundary.** PLAT-01 formalized Platform=`RuntimeActor`, made the
+   concrete actor/Core internals private behind a narrow `CorePort`, and added
+   dependency conformance. PLAT-02 now supplies stable physical/logical/effect
+   identity, exact profiles, bounded causality/deadlines, explicit result/error
+   envelopes and retry/effect-state semantics without changing adapters.
+   PLAT-03a1-a4 now supply the Core-owned epoch, stale dispatch/commit fence,
+   bounded operation identity/state registry, journal-first persistence and
+   exact builtin workspace reconciliation, plus RuntimeCheckpoint v4's
+   authority-prefix cross-check. Query/cancel DTOs, the authorized
+   transport-independent Platform router, WAL-first `OperationAccepted`
+   publication and the actor-owned control seam are now landed. WAL
+   compaction now folds a generation and keeps exact-tip ancestors.
+   Generic shell/process spawn/exit recovery is landed. In-process
+   authenticated operation-control session/grant installation is landed.
+   Framed JSON-lines operation-control over an inherited-pipe analogue is
+   landed (`FramedProtocolSession`; local transport identity is not a Core
+   grant). Out-of-process capability/MCP invoke recovery is landed. Artifact
+   owner/digest identity locators are landed. Parse-time decoded JSON DOM
+   budgets, RFC 8785 JCS, explicit `legacy.invoke-output.v1` negotiation and
+   the shared adapter fault matrix are landed (`PLAT-04`). Adapter envelope
+   migration onto Platform DTOs remains `PLAT-07`. This is protocol
+   correctness and may proceed beside the M13 residual; it must precede any
+   transport replacement or managed child execution. Same-process trusted
+   composition remains legal and is not an isolation claim.
+6. **Extract transport/lifecycle seams (`PLAT-05..06`).** Split process
+   supervision and duplex transport on top of the landed
+   `FramedProtocolSession` while retaining
+   anonymous-pipe stdio as the first backend; add health, epochs, bounded
+   restart, cancellation acknowledgement and backpressure.
+7. **Publish the transport-neutral Platform SDK (`PLAT-07`).** Extract stable
+   wire DTOs and extension-facing clients only after protocol conformance;
+   migrate process/context/MCP adapters before discovery and managed-Agent
+   contracts build on the SDK.
+8. **Preserve the bounded-policy gate (M14, complete).** Keep the trusted
+   output broker wired at production composition roots and retain the actor's
+   last-line guard. The narrow, revocable `TaskExecutionPolicy` is landed (`CORE-08`):
    unattended builds/tests inside a granted scope no longer prompt per call
    while broader effects remain denied; effect-derived resource policy is
    landed (`EffectIntent` + `AuthorityLease`).
-5. **Optimize measured context work.** Give external refs a token budget,
+9. **Optimize measured context work.** Give external refs a token budget,
    pack by fit before top-K exclusion, and avoid O(total-history)
-   external/session candidate scans. Diagnostics already counts the logical
-   catalog in O(1) and `inspect` is memory-bounded by its limit (not by
-   history size). **Resident/candidate/selected counts and tokens are now
+   external/session candidate scans. **Landed 2026-08-14 for
+   `context.search`:** `ContextCatalog` indexes (kind/scope/task/label/
+   entity) generate candidates; ranking stays a bounded heap. A summary/uri
+   needle that hits no key still residual-scans. GC hot-entity recall uses
+   the same catalog entity buckets. **Graded access signals (`CTX-GC-11`)
+   landed 2026-08-14:** search is the weakest stamp (one Cold-aging delay,
+   cooldown, identical-query budget); inspect/fetch/ack are strictly
+   stronger and search cannot pin Cold entries. Diagnostics already counts
+   the logical catalog in O(1) and `inspect` is memory-bounded by its limit
+   (not by history size). **Resident/candidate/selected counts and tokens are now
    recorded** (2026-08-12): `agent-eval` aggregates materialize rounds,
    selected items/tokens, active tokens and the final
    Resident/Warm/Cold/External snapshot per run, printed by
    `--compare-arm`/`--metrics` — on the deterministic fixtures the dynamic
    engine feeds the model ~1 200 active tokens per round baseline vs ~380
-   dynamic. Record Resident *bytes*, materialize p50/p95 latency and store
-   I/O before changing scoring weights.
-6. **Run the real gate (M15).** Compare append-only, actual compaction and
-   dynamic GC on paired coding tasks, with hidden tests and total token/tool/
-   store/latency cost. Only then consider learned/vector recall or V2.
+   dynamic. **Resident bytes landed 2026-08-14** (`ContextDiagnostics.resident_bytes`,
+   eval last/max pre-model samples, replay final/preview-peak
+   `res_bytes`/`peak_bytes`). After synthetic scenarios gained the actor's
+   turn-boundary `ContextGc`, C's Resident heap falls to a fraction of A; the
+   earlier ≈A result was a replay-parity gap. Active-task latest-file-body
+   policy (2026-08-14) keeps `fn handle_21()` in view on `long_refactor`
+   (4/4 required) without regrowing Resident bytes or leaking forbidden
+   facts. Scoring stays frozen. Materialize p50/p95 and store I/O are recorded.
+10. **Run the real gate (M15).** First make the experiment auditable: every
+   intended cell writes a versioned manifest, complete gap-checked event
+   trace, usage-completeness status, final workspace diff/hash, hidden-test
+   evidence and machine-readable summary. **EVAL-01.1 (2026-08-14):** live
+   `--compare-live*` persists `agent-eval.cell.v1` bundles and failed cells
+   stay in the pair; `--show-evidence` rebuilds the table. **EVAL-01.2
+   (2026-08-14):** `--preregister` / `--analyze-evidence` freeze the
+   task-clustered C−A t-LCL, ITT rule and historical 30×3 power table; live
+   arm order is shuffled per fixture×repeat. **EVAL-01.3 (2026-08-14):**
+   the gate is 300 tasks × 3 repeats / −5 pp (4048/5000 ≈ 81% at Δ=0 under
+   A ⟂ C | task); historical 30×3 stays in the spec as the underpowered
+   proposal (~19% at Δ=0). Still open: freeze at least 300 independent
+   coding tasks; treat repeats as within-task clusters. Do not invent
+   tasks. Compare append-only, model-backed bounded compaction and dynamic
+   GC with executable hidden tests and intent-to-treat
+   token/tool/store/retrieval/latency cost. Live differences in model/tool
+   rounds are part of the treatment effect, not a reason to discard cost.
+   Include transport CPU/p50/p95/throughput/peak-memory measurements; only
+   after that separate evidence may `PLAT-08` add Named Pipe/UDS for
+   persistent services. Only after M15 may learned/vector recall or V2
+   advance.
+
+### Next design package: Platform Protocol, events, discovery, and managed Agents
+
+This package may be specified and prototyped now, but its implementation order
+must preserve the trusted-runtime gates above:
+
+1. **Build protocol semantics on the contained Agent OS boundary.** Complete
+   the `PLAT-03/04` residuals described in priority item 5 above, then expose
+   the landed authority/recovery semantics through the Platform contract.
+   External Tools, executable Skill
+   workers, hooks, child Agents and isolated adapters depend on
+   Platform SDK/protocol and never Core; logical operations remain recoverable
+   across retry, cancellation, crash and version/schema mismatch.
+2. **Typed runtime input.** Treat user input as a special external event that
+   shares ids, causality, revision fences, consumption acknowledgement, and GC
+   with other observations. Preserve user-only authority to steer/cancel/
+   constrain; never deserialize it as an ordinary tool result.
+   **First bite landed 2026-08-14 (`CTX-EVENT-01..03`):**
+   dialogue uses `RuntimeInputEnvelope`; `/focus` `/done` `/cancel` stay
+   direct commands; `UserMessageAccepted` is a 240-char preview plus
+   optional `user-input` artifact. A busy turn accepts one in-memory
+   `Queued` dialogue (overflow `Rejected`). Cancel emits
+   `InterruptCommitted` after `TurnCancelled`. Successful turns publish
+   `Consumed` then `Archived`. Replay reads `body_ref` when a workspace is
+   supplied. Dialogue `proposal` remains `None`; the queue is not
+   crash-durable.
+3. **Read-only federated discovery.** Add one bounded descriptor/ref protocol
+   over existing Context + Tool providers first. `search` only finds;
+   `inspect/resolve` reads; `admit/surface/invoke` remain explicit operations
+   owned by their current authorities. Pair it with graded access signals
+   (`CTX-GC-11`, landed 2026-08-14): a search hit is weaker relevance
+   evidence than an inspect/fetch read, `admit` is an explicit residency
+   action, and the consumption ack stays the strongest online signal —
+   with repeated-search budgets so discovery cannot become a hidden pin
+   API.
+   **Context + Tool prototype landed 2026-08-14 (`CTX-DISC-01..03`,
+   `TOOLS-10`):** shared internal planner behind `context.manage` /
+   `capability.manage`; no public `runtime.search`. Capability search is
+   descriptor-indexed. Search/inspect on the tool catalog are transient.
+   Artifact/Task/Agent/Skill/Event providers, inspect revision, and
+   `denied` remain open.
+   The more aggressively GC forgets, the better search recall/latency must
+   be; M15 therefore measures search recall, latency and post-GC recovery
+   success alongside token cost.
+   **Retrieval instrumentation landed 2026-08-14:** `RunMetrics` plus
+   `agent-eval --retrieval` (engine-only found-after-forgotten). The paired
+   real-model coding gate is still open.
+4. **Lifecycle separation.** Split schema/catalog residency, invocation/effect
+   state, hosted-process state, and managed-child state. Existing tool GC is
+   retained; active calls, pending effects, and child assignments become
+   typed roots rather than overloaded `ToolLifecycle::Active` values.
+5. **Managed child contract.** Present subagents to the main model through a
+   bounded tool-like `agent.manage` ABI, while the sole RuntimeActor owns
+   assignment, budgets, permission narrowing, cancellation, waiting,
+   checkpoint/recovery, and parent root transfer.
+6. **SDK precedes ecosystem; transport follows deployment and evidence.**
+   Extract the transport-neutral Platform SDK (`PLAT-07`) after protocol
+   conformance, then let discovery/managed-Agent contracts depend on it.
+   After `PLAT-05..06`, retain
+   inherited anonymous pipes for Platform-owned children; add Windows Named
+   Pipe/Unix Domain Socket only for persistent/reconnectable local services
+   through `PLAT-08` and only after measurements. One protocol does not mean
+   one transport.
+7. **Evidence gate before enablement.** Child execution waits for remaining
+   M13 isolation and M15 paired evaluation. Compare against giving the same
+   total token/time budget to the main actor; do not assume multi-agent is
+   automatically more efficient.
+
+Authoritative tasks: `CTX-DISC-01..03`, `CTX-EVENT-01..03`, and `CTX-GC-11`
+in [`CONTEXT_RUNTIME_TODO.md`](CONTEXT_RUNTIME_TODO.md), plus `PLAT-00..08`,
+`TOOLS-10..12`, `AGENT-01..03`, and `EVAL-AGENT-01` in
+[`TOOL_ECOSYSTEM_TODO.md`](TOOL_ECOSYSTEM_TODO.md).
 
 This order preserves the original research goal: continuous GC stays active
 throughout a long task, but correctness, authority and evidence retention are
@@ -1424,8 +1661,8 @@ Effect-derived resource policy is landed: approval derives `EffectIntent`
 from the validated arguments, standing grants match the concrete intent
 (path, content bytes, command prefix) instead of re-parsing raw arguments,
 and commit-time enforcement mints a short-lived `AuthorityLease` per
-side-effecting call — the actor refuses to commit a staged effect whose
-lease expired or whose operation generation moved (rollback, never commit).
+side-effecting call — Core refuses to commit a staged effect whose lease
+expired or whose authority epoch moved (rollback, never commit).
 The kernel-level trusted output broker is landed
 (`CORE-04`): every model-facing tool field is capped, oversized content
 spills to an artifact once (no more lost truncated middle), and
@@ -1445,9 +1682,11 @@ network requests are permission-gated at the adapter. See
 
 ## V1-M15 Real Evaluation 🧪 (replay, fixture harness and live smoke)
 
-The evaluation infrastructure has useful deterministic policy comparisons
-and a real-tool-surface fixture harness, but the named real-coding
-acceptance (a paired run with a real tool-capable model) is not complete.
+The evaluation infrastructure has useful deterministic policy comparisons,
+and real-model paired smoke runs have exercised the real tool surface. The
+named real-coding acceptance is still incomplete because the sample is tiny,
+the cells are not preserved as independently auditable evidence, and no
+predeclared non-inferiority interval has been computed.
 
 - **Harness.** `agent-replay` replays each scripted workload through the
   three engines (A append-only / B rolling-summary / C dynamic) under a
@@ -1456,36 +1695,46 @@ acceptance (a paired run with a real tool-capable model) is not complete.
   It exercises the production context engines, but its token number is a
   policy proxy: it does not price the complete provider request, TurnFrame,
   tool schemas, compactor/recall/store work or wall time.
-- **Real-tool-surface fixture harness (`agent-eval`).** Four coding
+- **Real-tool-surface fixture harness (`agent-eval`).** Coding
   fixtures (`fix_off_by_one`, `implement_stub`, `rename_symbol`,
-  `add_test`) with seed workspaces and hidden file-content verification
+  `add_test`, plus the five-turn `recall_after_fix` diagnostic) with seed workspaces and hidden file-content verification
   run end to end through the real runtime: the real builtin tool surface,
-  prepared-effect commit behind the generation fence, the all-module cost
+  prepared-effect commit behind the Core-owned authority-epoch fence, event-derived cost
   accounting, and the hidden check. `--fixture <id>` drives the surface
   with a scripted model that reports usage priced from the request it saw
   (so the fixture path's `ModelUsed` accounting is real); `--fixture-live
   <id>` swaps in a real provider (`OPENAI_API_KEY`) for the same harness.
-- **Cross-engine comparison (`--compare-arm <id>`).** The M15 acceptance
-  — dynamic saves tokens without lowering task success — is exercised
+- **Cross-engine comparison (`--compare-arm <id>`).** The deterministic M15
+  CI proxy — dynamic saves same-script tokens without losing hidden-check
+  success — is exercised
   deterministically on the real tool surface: one fixture runs through
   append-only, rolling-summary and dynamic on the same five-turn scripted
   model. Every engine passes the hidden verification; dynamic feeds the
-  model measurably fewer input tokens than either baseline (measured on
-  `fix_off_by_one`: append 12 849, rolling 12 913, dynamic 11 862 model
+  model measurably fewer input tokens than either baseline (current scripted
+  `fix_off_by_one`: append 13 761, rolling 13 407, dynamic 12 744 model
   input tokens over eight model rounds), and it is the only engine that
   performs lifecycle maintenance. The gap is a bounded fraction of the
   total because tool schemas and the system prompt dominate the per-round
   fixed cost — the same phenomenon the live measurement reports. Asserted
   directionally with a noise floor in
   `dynamic_engine_saves_input_tokens_against_append_on_the_fixture_surface`.
+- **Retrieval metrics (2026-08-14).** `RunMetrics` now counts
+  search/inspect/fetch/admit, miss reasons, search latency, found-after-
+  forgotten (GC `externalized_ids` joined to later search hits), and
+  graded access-stamp totals. `--compare-arm` prints those rows.
+  `agent-eval --retrieval` is an engine-only catalog baseline (GC then
+  search). This is instrumentation, not the paired real-model coding gate.
 - **Token saving is measured, not asserted.** On the heavy scenarios the
-  dynamic engine costs a small fraction of append-only (budget 12 K):
-  `long_refactor` 622,560 → 64,014 input tokens total (peak 17,425 →
-  1,085), `test_fix_loop` 403,352 → 56,430, `high_volume_irrelevant_output`
-  469,568 → 33,328; B bounds the peak but still pays ~9× C's cost.
-  C never exceeds the budget (A blows past it 13–22 times). The
-  superseded-decisions scenario, where P3 measured a C penalty, now
-  costs C 4,469 vs 7,054 — the P4 supersession rules closed that gap.
+  dynamic engine costs a small fraction of append-only (budget 12 K),
+  **with turn-boundary full GC in the replay script** (2026-08-14; the
+  live actor already did this, synthetic scenarios had omitted
+  `ContextGc`):
+  `long_refactor` 622,560 → 70,104 input tokens total (peak 17,425 →
+  1,170), `test_fix_loop` 403,352 → 58,398, `high_volume_irrelevant_output`
+  469,568 → 128,228. Resident heap bytes now follow: `long_refactor`
+  69,332 → 4,298. B still folds history; C moves archived bodies to Warm
+  without deleting them. C never exceeds the budget (A blows past it
+  13–22 times). The superseded-decisions scenario costs C 5,197 vs 7,054.
 - **Fact-retention proxy.** The
   `dynamic_saves_tokens_without_losing_failure_facts` test asserts, on
   `long_refactor` and `test_fix_loop`, that C's input-token total stays
@@ -1500,9 +1749,11 @@ acceptance (a paired run with a real tool-capable model) is not complete.
   140,365 → 16,949).
 
 Preliminary result: the dynamic policy saves estimated context tokens and
-usually reduces stale-fact leakage in the scripted traces. Acceptance remains
-open until paired real coding tasks verify repository outcomes and count all
-provider, tool, context, compaction, store and wall-time costs.
+usually reduces stale-fact leakage in the scripted traces, while the turn-23
+`long_refactor` miss is a concrete policy defect. Acceptance remains open
+until paired real coding tasks preserve auditable per-cell evidence, verify
+repository outcomes, count all provider/tool/context/compaction/store and
+wall-time costs, and pass the predeclared clustered non-inferiority analysis.
 
 ### Live measurement (real model, `agent-eval`)
 
@@ -1512,14 +1763,21 @@ runtime and an OpenAI-compatible provider via
 provider usage** through the new `RuntimeEvent::ModelUsed` (emitted at
 turn commit with the round's reported input/output tokens).
 
-- The first live workload is a *constraint-retention* task — the live
-  endpoint used for the measurement (pinaic, model `gpt-5.6-luna`)
-  rejects requests that carry a `tools` array, so the task cannot use
-  tools; instead it is exactly the dynamic working set's acceptance
-  scenario: five constraints stated up front, eighteen turns of
-  unrelated noise, then a question only answerable from what the
-  context frame retained. This is a useful long-context smoke, but it is not
-  a coding workload and does not exercise tool/effect/sandbox behavior.
+- The first live workload is a *constraint-retention* task. The 2026-08-10
+  write-up said the pinaic `gpt-5.6-luna` endpoint rejected a `tools`
+  array; re-probed 2026-08-14, the same relay accepts function calling
+  (including streaming and `max_tokens`). What 400'd was the Core id
+  `fs.list`: OpenAI requires `^[a-zA-Z0-9_-]+$`. `provider-openai` now
+  maps `.` / `:` to `_` on the wire and restores Core ids inbound.
+  Default `agent-eval` remains the no-tool retention smoke. `--compare-live`
+  / `--compare-live-all` is the live paired coding harness (fresh workspace
+  per engine, hidden verify, wall time, round cap). It has not produced a
+  durable, replayable result bundle or a 300×3 non-inferiority result. The
+  retention task is: five constraints
+  stated up front,
+  eighteen turns of unrelated noise, then a question only answerable from
+  what the context frame retained. Useful long-context smoke, not a coding
+  workload.
 - Measured (2026-08-10, 20 turns, real model): all three engines pass
   (A/B/C each answer both facts correctly), and C costs **22% less
   input tokens than A** (133,249 vs 170,240; B 169,778). The gap is
@@ -1555,15 +1813,11 @@ Measured on the seven scenarios (budget 12 K):
 - **Required facts stay in view in C.** The previous failure in every
   fix round (`test_fix_loop` 15/15), the final decision through
   implementation (`superseded_decisions` 9/9), the active task's file
-  (`completed_then_unrelated` 9/9) and the pinned constraint in every
-  turn of every engine (15/15).
-- **Honest negative.** On `long_refactor`, C loses the last step's file
-  content out of view on 2 of 4 window turns (the final fix still sees
-  the previous failure — that required fact holds), while A/B keep it.
-  This is a real incorrect-eviction signal — in a long refactor that
-  cycles files, the most recent content of a non-current file leaves
-  the working set too early. It is the documented input for the next
-  non-vector policy iteration, not a hidden pass.
+  (`completed_then_unrelated` 9/9), the pinned constraint in every
+  turn of every engine (15/15), and `long_refactor` required **4/4**
+  (`fn handle_21()` on turns 22–24 and the last failure on turn 23).
+  Re-measured 2026-08-14 after the active-task latest-file-body root.
+  Scoring frozen; turn-boundary GC still on. Forbidden facts still 0 on C.
 
 The proxy makes required/forbidden-fact visibility, stale-instruction leakage
 and some incorrect-eviction signals CI-runnable. It does not measure
@@ -1607,13 +1861,17 @@ the effect/sandbox gates:
   work. It does not prove containment against absolute filesystem/network
   access and therefore is not yet the trusted "test" leg.
 
-Blocked remainder: close M10 and M12-M15, then build the autonomous
+Blocked remainder: close M13 and M15 plus the Platform Protocol reliability
+gate, then build the autonomous
 generate→compile→register→canary→stable loop. The agent must never be able to
 modify the evaluation, permission or promotion Core.
 
-## V1-M12 Effect Runtime ⛔ (in-process prepared-effect slice only)
+## V1-M12 Effect Runtime 🟡 (historical staged-effect landing notes)
 
-The contracts and in-process prepared-effect path exist:
+The contracts and prepared-effect path are recorded here for history. The
+process-wire broker and cancellation cleanup close the staged-effect slice;
+generic shell/process execution remains the non-transactional residual shown
+in the authoritative table above:
 
 - **The intended contract is one channel.** `Effect` (commit/rollback, structured
   `EffectCommitError`), `ToolOutcome::PreparedEffect` for builtin tools and
@@ -1622,9 +1880,11 @@ The contracts and in-process prepared-effect path exist:
   `PreparedEffect`, so the actor treats both identically. Capabilities
   stage via `WorkspaceHandle::prepare_write` (journaled mutation
   transaction) — the capability computes, the core executes.
-- **The fence is one place.** `on_operation_completed` validates the
-  operation against the generation fence: a stale completion (cancelled or
-  superseded) rolls the staged effect back, a live one commits it. A
+- **The fence has one authority owner.** `on_operation_completed` validates
+  the operation against Runtime's epoch mirror, and Core independently checks
+  its authority epoch before committing: a stale completion
+  (cancelled or superseded) rolls the staged effect back, a live one commits
+  it. Cancellation advances the Core fence before awaiting cleanup, so a
   cancelled operation cannot commit that staged mutation.
 - **Commit failures are classified, not swallowed.** `NotApplied` tells
   the model nothing happened; `AppliedButDurabilityFailed` surfaces a
@@ -1638,14 +1898,16 @@ The contracts and in-process prepared-effect path exist:
   deletes the staging file, durability-failure semantics) is covered by
   `agent-workspace`'s own tests.
 
-The milestone is not complete. `ProcessCapabilityAdapter::invoke` decodes a
-`ToolOutput` and returns `CapabilityOutcome::Value`; its own comment states
-that child effects have already happened and staged-effect transport is
-future work. `shell.exec` likewise executes directly in the real workspace
-and returns a value. Cancellation can stop later work, but cannot roll back a
-mutation already performed. M12 closes only when these paths are brokered as
-typed prepared effects (or are explicitly confined to a non-mutating
-authority) and adversarial stale/cancel tests pass.
+Process capabilities may declare structured wire effects, but non-empty
+effects are currently rejected before staging until actual intent can be
+bound to PLAT operation/effect identity and proved within the lease.
+Direct process/shell paths are bounded and cancel their owned process trees,
+but side effects made before cancellation are neither staged nor rollbackable.
+M12 therefore remains partial until that exception has an explicit authority,
+recovery and isolation contract (or is brokered). Platform Protocol must also
+thread the landed PLAT-02 operation/effect identity into existing receipts and
+mutation journals (`PLAT-03/04`) without promising general transport
+exactly-once.
 
 ## V1-M11 Context Recall ✅ (narrow retrieval baseline)
 
@@ -1709,6 +1971,7 @@ refs-only while it is external:
 - neural attention/selection;
 - cross-session long-term memory;
 - graph retrieval;
-- multi-agent work.
+- broad autonomous multi-agent execution (contracts and bounded prototypes
+  may be developed earlier, but default enablement remains evidence-gated).
 
 These belong after the dynamic-lifecycle baseline is measurable.

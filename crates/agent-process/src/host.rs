@@ -12,11 +12,12 @@
 use std::io::ErrorKind;
 use std::sync::{
     Arc,
-    atomic::{AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicU32, Ordering},
 };
 use std::time::Duration;
 
 use agent_contracts::{AgentError, AgentResult};
+use agent_platform_protocol::{ActiveFeatures, JsonDecodeBudget, decode_value};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -107,10 +108,25 @@ pub struct ProcessHostConfig {
     pub startup_timeout: Duration,
     /// Deadline for every request after the handshake.
     pub request_timeout: Duration,
-    /// Hard cap on one response frame.
+    /// Hard cap on one frame in *both* directions: a response frame read
+    /// from the child is rejected while reading, and a request/system
+    /// answer frame written by the host is rejected before a byte is
+    /// written (the connection stays usable).
     pub max_frame_bytes: usize,
+    /// Hard cap on the total bytes exchanged in ONE call (request frame +
+    /// every system frame and answer + the response frame). A child that
+    /// dribbles many bounded frames can no longer move unbounded data per
+    /// call; exceeding it poisons and terminates the session.
+    pub max_call_bytes: usize,
+    /// Cap on one broker answer's decoded value. The broker is trusted and
+    /// itself bounded (see the capability adapter's fs.read range), so an
+    /// over-cap answer degrades to a bounded `system_ok: false` answer to
+    /// the child instead of growing the control plane without limit.
+    pub max_system_answer_bytes: usize,
     /// The child's execution boundary (env, cwd, resource limits).
     pub sandbox: ProcessSandbox,
+    /// 本端在 ping 中提供的特性。对端不能扩充；交集写入 [`ProcessHost::negotiated_features`]。
+    pub offered_features: ActiveFeatures,
 }
 
 /// A live child process speaking JSON-lines on stdio. Strict ping-pong:
@@ -122,7 +138,11 @@ pub struct ProcessHost {
     child: Mutex<Child>,
     config: ProcessHostConfig,
     io: Mutex<HostIo>,
-    next_id: AtomicU64,
+    /// Sticky first session fault, independent of the IO mutex. Timeout and
+    /// cancellation paths must fence every later call even while the
+    /// cancelled exchange still owns the async IO guard.
+    poisoned: std::sync::Mutex<Option<String>>,
+    next_id: AtomicU32,
     /// The child's pid, kept outside the child lock so a cancellation can
     /// kill the process *tree* (process group / taskkill) without touching
     /// the io lock.
@@ -140,6 +160,8 @@ pub struct ProcessHost {
     /// inherited. The tail is surfaced on errors so a failing child says
     /// *why* without ever buffering unbounded stderr in the parent.
     stderr_tail: Arc<Mutex<std::collections::VecDeque<u8>>>,
+    /// ping 握手交叉后的特性。缺省为空：历史纯 ToolOutput 默认关闭。
+    negotiated_features: ActiveFeatures,
 }
 
 struct HostIo {
@@ -323,7 +345,7 @@ impl ProcessHost {
             });
         }
 
-        let host = Self {
+        let mut host = Self {
             child: Mutex::new(child),
             config,
             io: Mutex::new(HostIo {
@@ -331,15 +353,21 @@ impl ProcessHost {
                 stdout: BufReader::new(stdout),
                 poisoned: None,
             }),
-            next_id: AtomicU64::new(1),
+            poisoned: std::sync::Mutex::new(None),
+            next_id: AtomicU32::new(1),
             pid: AtomicU32::new(pid),
             #[cfg(windows)]
             job: Mutex::new(job),
             stderr_tail,
+            negotiated_features: ActiveFeatures::default(),
         };
-        timeout(
+        let mut ping = json!({ "op": "ping" });
+        if !host.config.offered_features.is_empty() {
+            ping["features"] = json!(host.config.offered_features.as_slice());
+        }
+        let response = timeout(
             host.config.startup_timeout,
-            host.call_unbounded(json!({ "op": "ping" })),
+            host.exchange_response(ping, None),
         )
         .await
         .map_err(|_| {
@@ -350,7 +378,25 @@ impl ProcessHost {
             ))
         })?
         .map_err(|e| AgentError::Context(format!("process handshake: {e}")))?;
+        let advertised =
+            ActiveFeatures::from_json_value(response.get("features")).map_err(|error| {
+                host.poison(format!("handshake features: {error}"));
+                AgentError::Context(format!(
+                    "process '{}' handshake features: {error}",
+                    host.config.program
+                ))
+            })?;
+        host.negotiated_features = host.config.offered_features.intersect(&advertised);
         Ok(host)
+    }
+
+    /// 握手交叉后的特性。子端不能单方面打开未提供的项。
+    pub fn negotiated_features(&self) -> &ActiveFeatures {
+        &self.negotiated_features
+    }
+
+    pub fn allows_feature(&self, feature: &str) -> bool {
+        self.negotiated_features.contains(feature)
     }
 
     /// One framed call with the per-request deadline. A timeout poisons the
@@ -450,7 +496,35 @@ impl ProcessHost {
     /// the exchange continues. Without a broker the first frame is the
     /// response, exactly as before — a system frame with no broker to
     /// answer it poisons the connection instead of being misparsed.
+    ///
+    /// Every direction is bounded: the request and the system answers are
+    /// capped before a byte is written (`encode_frame`), response frames are
+    /// capped while reading, and the total bytes moved by one call are
+    /// capped by `max_call_bytes`. Every framing violation — oversize,
+    /// partial EOF, non-UTF-8 or unparseable frames —
+    /// poisons the connection and terminates the child tree, so a
+    /// half-consumed exchange can never corrupt a later request/response
+    /// pair.
     async fn exchange(&self, op: Value, broker: Option<&dyn SystemBroker>) -> AgentResult<Value> {
+        Ok(self
+            .exchange_response(op, broker)
+            .await?
+            .get("value")
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+
+    async fn exchange_response(
+        &self,
+        op: Value,
+        broker: Option<&dyn SystemBroker>,
+    ) -> AgentResult<Value> {
+        if let Some(reason) = self.poison_reason() {
+            return Err(AgentError::Context(format!(
+                "process '{}' connection poisoned: {reason}",
+                self.config.program
+            )));
+        }
         let mut io = self.io.lock().await;
         if let Some(reason) = &io.poisoned {
             return Err(AgentError::Context(format!(
@@ -458,76 +532,81 @@ impl ProcessHost {
                 self.config.program
             )));
         }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let sequence = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if sequence == u32::MAX {
+            return Err(self.frame_violation(&mut io, "request id space exhausted".into()));
+        }
+        // UUID v4 supplies an unpredictable per-request correlation id.
+        // The child cannot pre-send the next response merely by observing
+        // earlier ids; the low sequence bits remain useful in diagnostics.
+        let random = uuid::Uuid::new_v4().as_u128() as u64;
+        let id = (random & 0xffff_ffff_0000_0000) | u64::from(sequence);
         let mut request = Map::new();
         request.insert("id".into(), json!(id));
         request.insert("version".into(), json!(PROTOCOL_VERSION));
-        if let Value::Object(fields) = op {
+        if let Value::Object(mut fields) = op {
+            // Caller operations are payload only. Transport identity and
+            // version are host-owned and cannot be overwritten by an
+            // adapter-provided JSON object.
+            fields.remove("id");
+            fields.remove("version");
             request.extend(fields);
         }
-        let line = serde_json::to_string(&Value::Object(request))
-            .map_err(|e| AgentError::Context(format!("serialize request: {e}")))?;
+        // Outbound cap: the request is rejected *before* any byte is
+        // written, so an over-cap call can never leave a half-written frame
+        // on the pipe and the connection stays usable.
+        let request_line =
+            crate::frame::encode_frame(&Value::Object(request), self.config.max_frame_bytes)?;
+        let mut exchanged = request_line.len();
 
-        // Write the frame: line + newline + flush. Any failure poisons the
-        // connection (the child may have read a partial frame).
-        if let Err(e) = io.stdin.write_all(line.as_bytes()).await {
-            return Err(self.io_error(&mut io, "write", e));
-        }
-        if let Err(e) = io.stdin.write_all(b"\n").await {
+        // Write the frame, then the newline, then flush. Any failure poisons
+        // the connection (the child may have read a partial frame).
+        if let Err(e) = io.stdin.write_all(&request_line).await {
             return Err(self.io_error(&mut io, "write", e));
         }
         if let Err(e) = io.stdin.flush().await {
             return Err(self.io_error(&mut io, "write", e));
         }
 
-        // Bounded frame read loop: never buffer more than
-        // `max_frame_bytes + 1` bytes per frame, so a child that streams
-        // megabytes without a newline is rejected while reading instead of
-        // grown into memory first and checked after. EOF without a newline
-        // is treated as a crash.
+        // Bounded frame read loop. Every frame is read incrementally with
+        // the in-flight cap (oversize is rejected while reading, never
+        // buffered in full), and any framing violation ends the session.
         let mut system_calls = 0usize;
         loop {
-            let mut frame: Vec<u8> = Vec::with_capacity(256);
-            let limit = self.config.max_frame_bytes + 1;
-            let mut scratch = [0u8; 1024];
-            let mut read = 0usize;
-            loop {
-                if frame.len() >= limit {
-                    io.poisoned = Some("response frame exceeded the byte limit".into());
-                    return Err(AgentError::Context(format!(
-                        "process '{}' response frame exceeds the {} byte limit",
-                        self.config.program, self.config.max_frame_bytes
-                    )));
-                }
-                let want = (limit - frame.len()).min(scratch.len());
-                let n = match io.stdout.read(&mut scratch[..want]).await {
-                    Ok(n) => n,
-                    Err(e) => return Err(self.io_error(&mut io, "read", e)),
+            let frame =
+                match crate::frame::read_frame(&mut io.stdout, self.config.max_frame_bytes).await {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        return Err(self.frame_violation(&mut io, error.to_string()));
+                    }
                 };
-                if n == 0 {
-                    break; // EOF
+            exchanged = match exchanged.checked_add(frame.len() + 1) {
+                Some(total) => total,
+                None => {
+                    return Err(
+                        self.frame_violation(&mut io, "call byte accounting overflowed".into())
+                    );
                 }
-                read += n;
-                frame.extend_from_slice(&scratch[..n]);
-                if frame.last() == Some(&b'\n') {
-                    break;
-                }
-            }
-            if read == 0 {
-                io.poisoned = Some("child closed its stdout".into());
-                return Err(AgentError::Context(format!(
-                    "process '{}' closed its stdout (did it crash?)",
-                    self.config.program
-                )));
+            };
+            if exchanged > self.config.max_call_bytes {
+                return Err(self.frame_violation(
+                    &mut io,
+                    format!(
+                        "call exchanged {exchanged} bytes, above the {} byte per-call bound",
+                        self.config.max_call_bytes
+                    ),
+                ));
             }
 
-            // The frame may lack the trailing newline when the limit cut it
-            // off; trim before parsing so the size check above is the only
-            // limit.
-            let text = String::from_utf8(frame)
-                .map_err(|e| AgentError::Context(format!("response is not UTF-8: {e}")))?;
-            let response: Value = serde_json::from_str(text.trim_end())
-                .map_err(|e| AgentError::Context(format!("parse response: {e} (line: {text})")))?;
+            // 帧必须是一份合法 JSON。解析失败（含 UTF-8 / DOM 预算）说明
+            // 组帧已不可信，会话毒化并杀掉子树，而不是猜测剩余字节。
+            let budget = JsonDecodeBudget::for_frame_bytes(self.config.max_frame_bytes);
+            let response: Value = match decode_value(&frame, &budget) {
+                Ok(response) => response,
+                Err(error) => {
+                    return Err(self.frame_violation(&mut io, format!("parse response: {error}")));
+                }
+            };
 
             if response.get("system").and_then(Value::as_str).is_some() {
                 // A system request from the child. Without a broker there is
@@ -537,39 +616,62 @@ impl ProcessHost {
                 // child cannot grow the parent's time budget by spamming
                 // system frames instead of answering.
                 let Some(broker) = broker else {
-                    let reason = "child sent a system request with no broker installed".into();
-                    io.poisoned = Some(reason);
-                    // Fail closed: a child asking for undeclared access is
-                    // terminated, not just refused — it cannot retry the
-                    // request against a live connection.
-                    self.kill_tree();
-                    return Err(AgentError::Context(format!(
-                        "process '{}' sent a system request but no broker is installed; connection poisoned",
-                        self.config.program
-                    )));
+                    return Err(self.frame_violation(
+                        &mut io,
+                        "child sent a system request with no broker installed".into(),
+                    ));
                 };
                 system_calls += 1;
                 if system_calls > MAX_SYSTEM_REQUESTS_PER_CALL {
-                    let reason = format!(
-                        "too many system requests in one call (>{MAX_SYSTEM_REQUESTS_PER_CALL})"
-                    );
-                    io.poisoned = Some(reason);
-                    self.kill_tree();
-                    return Err(AgentError::Context(format!(
-                        "process '{}' exceeded {MAX_SYSTEM_REQUESTS_PER_CALL} system requests in one call; connection poisoned",
-                        self.config.program
-                    )));
+                    return Err(self.frame_violation(
+                        &mut io,
+                        format!(
+                            "too many system requests in one call (>{MAX_SYSTEM_REQUESTS_PER_CALL})"
+                        ),
+                    ));
                 }
                 let answer = match broker.handle(response).await {
                     Ok(value) => json!({ "system_ok": true, "value": value }),
                     Err(error) => json!({ "system_ok": false, "error": error.to_string() }),
                 };
-                let line = serde_json::to_string(&answer)
+                // Control-plane bound: a broker value above the system
+                // answer cap degrades to a refusal (the broker is trusted
+                // and bounded, this is a backstop) — it never crosses the
+                // wire in full. An answer that cannot even fit one frame is
+                // a hard framing violation.
+                let encoded = serde_json::to_string(&answer)
                     .map_err(|e| AgentError::Context(format!("serialize system answer: {e}")))?;
-                if let Err(e) = io.stdin.write_all(line.as_bytes()).await {
-                    return Err(self.io_error(&mut io, "write", e));
+                let answer = if encoded.len() > self.config.max_system_answer_bytes {
+                    json!({
+                        "system_ok": false,
+                        "error": format!(
+                            "system answer exceeds the {} byte control-plane bound",
+                            self.config.max_system_answer_bytes
+                        ),
+                    })
+                } else {
+                    answer
+                };
+                let answer_line = crate::frame::encode_frame(&answer, self.config.max_frame_bytes)
+                    .map_err(|e| self.frame_violation(&mut io, e.to_string()))?;
+                exchanged = match exchanged.checked_add(answer_line.len()) {
+                    Some(total) => total,
+                    None => {
+                        return Err(
+                            self.frame_violation(&mut io, "call byte accounting overflowed".into())
+                        );
+                    }
+                };
+                if exchanged > self.config.max_call_bytes {
+                    return Err(self.frame_violation(
+                        &mut io,
+                        format!(
+                            "call exchanged {exchanged} bytes, above the {} byte per-call bound",
+                            self.config.max_call_bytes
+                        ),
+                    ));
                 }
-                if let Err(e) = io.stdin.write_all(b"\n").await {
+                if let Err(e) = io.stdin.write_all(&answer_line).await {
                     return Err(self.io_error(&mut io, "write", e));
                 }
                 if let Err(e) = io.stdin.flush().await {
@@ -580,31 +682,47 @@ impl ProcessHost {
 
             // The final response: identity + protocol version + error flag.
             if response.get("id").and_then(Value::as_u64) != Some(id) {
-                io.poisoned = Some(format!(
-                    "response id mismatch: got {:?}, expected {id}",
-                    response.get("id")
+                return Err(self.frame_violation(
+                    &mut io,
+                    format!(
+                        "response id mismatch: got {:?}, expected {id}",
+                        response.get("id")
+                    ),
                 ));
-                return Err(AgentError::Context(format!(
-                    "process '{}' response id mismatch; connection poisoned",
-                    self.config.program
-                )));
             }
             if response.get("version").and_then(Value::as_u64) != Some(PROTOCOL_VERSION as u64) {
-                io.poisoned = Some("protocol version mismatch".into());
-                return Err(AgentError::Context(format!(
-                    "process '{}' protocol version mismatch; connection poisoned",
-                    self.config.program
-                )));
+                return Err(self.frame_violation(&mut io, "protocol version mismatch".into()));
             }
-            if response.get("ok").and_then(Value::as_bool) == Some(false) {
-                let error = response
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown child error");
-                return Err(AgentError::Context(format!("process error: {error}")));
+            match response.get("ok").and_then(Value::as_bool) {
+                Some(true) => {}
+                Some(false) => {
+                    let error = response
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown child error");
+                    return Err(AgentError::Context(format!("process error: {error}")));
+                }
+                None => {
+                    return Err(self
+                        .frame_violation(&mut io, "response field 'ok' must be a boolean".into()));
+                }
             }
-            return Ok(response.get("value").cloned().unwrap_or(Value::Null));
+            return Ok(response);
         }
+    }
+
+    /// A framing violation: the connection can no longer be trusted (the
+    /// reader may hold a half-consumed frame or a wrong response for a
+    /// later request), so it is poisoned *and* the child tree is terminated
+    /// — fail closed, never guessed past.
+    fn frame_violation(&self, io: &mut HostIo, reason: String) -> AgentError {
+        let reason = self.record_poison(reason);
+        io.poisoned.get_or_insert_with(|| reason.clone());
+        self.kill_tree();
+        AgentError::Context(format!(
+            "process '{}' {reason}; connection poisoned and terminated",
+            self.config.program
+        ))
     }
 
     /// Ask the child to exit gracefully, then reap it. The host is consumed,
@@ -616,7 +734,12 @@ impl ProcessHost {
     }
 
     fn io_error(&self, io: &mut HostIo, stage: &str, e: std::io::Error) -> AgentError {
-        io.poisoned = Some(format!("{stage} failed: {e}"));
+        let reason = self.record_poison(format!("{stage} failed: {e}"));
+        io.poisoned.get_or_insert(reason);
+        // A failed write/flush may have delivered only a prefix of the
+        // request. The peer's framing state is therefore unknown, so the
+        // owned child tree must not remain alive and continue side effects.
+        self.kill_tree();
         if e.kind() == ErrorKind::BrokenPipe || e.kind() == ErrorKind::UnexpectedEof {
             AgentError::Context(format!(
                 "process '{}' connection closed: {e}",
@@ -640,10 +763,23 @@ impl ProcessHost {
     /// `try_lock` so this can be called from a timeout/cancel path without
     /// deadlocking on a guard that the cancelled future still holds.
     fn poison(&self, reason: String) {
+        let reason = self.record_poison(reason);
         if let Ok(mut io) = self.io.try_lock() {
-            io.poisoned = Some(reason);
+            io.poisoned.get_or_insert(reason);
         }
         self.kill_tree();
+    }
+
+    fn record_poison(&self, reason: String) -> String {
+        let mut poisoned = self.poisoned.lock().unwrap_or_else(|e| e.into_inner());
+        poisoned.get_or_insert(reason).clone()
+    }
+
+    fn poison_reason(&self) -> Option<String> {
+        self.poisoned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Kill the child and every descendant. A cancelled or timed-out call
@@ -723,6 +859,19 @@ pub fn kill_process_tree(pid: u32) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
+        // taskkill 可能被沙箱挡住或不在 PATH 里；根 PID 再用
+        // TerminateProcess 钉死，避免恢复路径把仍存活的孩子当成成功。
+        unsafe {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+            };
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !handle.is_null() {
+                let _ = TerminateProcess(handle, 1);
+                let _ = CloseHandle(handle);
+            }
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {}
@@ -1014,6 +1163,9 @@ mod tests {
             startup_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             max_frame_bytes: 1024 * 1024,
+            max_call_bytes: 4 * 1024 * 1024,
+            max_system_answer_bytes: 512 * 1024,
+            offered_features: Default::default(),
             sandbox: ProcessSandbox {
                 env_whitelist: Some(vec![
                     "PATH".into(),

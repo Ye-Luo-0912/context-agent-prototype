@@ -21,10 +21,11 @@ use agent_contracts::{
 };
 use agent_core::CoreAuthorityConfig;
 use agent_runtime::{
-    ApprovalModule, ArtifactModule, CapabilityAwareDispatcher, ContextModule, EventModule,
-    ModelModule, ModuleHost, RuntimeHandle, RuntimeInstance, RuntimeServices, ToolModule,
+    ApprovalModule, ArtifactModule, AuthorityRecoveryServices, CapabilityAwareDispatcher,
+    ContextModule, EventModule, ModelModule, ModuleHost, RuntimeCheckpoint, RuntimeHandle,
+    RuntimeInstance, RuntimeServices, ToolModule,
 };
-use agent_storage::FileEventJournal;
+use agent_storage::{FileEventJournal, FileOperationJournal};
 use agent_workspace::Workspace;
 use context_baselines::{AppendOnlyEngine, RollingConfig, RollingSummaryEngine};
 use context_contextcore::{ContextServiceConfig, ServiceEngine, connect_engine};
@@ -173,9 +174,17 @@ pub struct ComposedRuntime {
 }
 
 impl ComposedRuntime {
-    /// The actor handle (user messages, focus, task commands, checkpoint).
+    /// The actor handle (user messages, focus and task commands). Complete
+    /// checkpoints are owned by `ComposedRuntime`/`RuntimeInstance`, because
+    /// only they can include the host capability plane.
     pub fn handle(&self) -> &RuntimeHandle {
         self.instance.handle()
+    }
+
+    /// Capture actor/context/capability state plus the durable Core authority
+    /// prefix marker. Operation truth remains in the authority WAL.
+    pub async fn checkpoint(&self) -> AgentResult<RuntimeCheckpoint> {
+        self.instance.checkpoint().await
     }
 
     /// Subscribe to runtime events. Call before `start` to see `RunStarted`.
@@ -240,12 +249,22 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     // The composition seam: every service the run needs is resolved from
     // the host's typed registry and handed to the runtime as one
     // `RuntimeServices`; the kernel is derived inside the runtime.
-    let services = RuntimeServices::from_registry(
+    let operation_journal = Arc::new(
+        FileOperationJournal::open(
+            workspace
+                .state_dir()
+                .join("authority")
+                .join("operations.jsonl"),
+        )?
+        .0,
+    );
+    let services = RuntimeServices::from_registry_with_operation_journal(
         host.registry(),
         CoreAuthorityConfig {
             output_broker,
             ..CoreAuthorityConfig::default()
         },
+        AuthorityRecoveryServices::new(operation_journal, Some(Arc::new(workspace.clone()))),
     )?;
     let instance = RuntimeInstance::spawn(host, services);
     Ok(ComposedRuntime {

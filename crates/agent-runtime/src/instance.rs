@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use agent_contracts::{AgentError, AgentResult};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::checkpoint::RuntimeCheckpoint;
@@ -27,6 +28,12 @@ pub struct RuntimeInstance {
     host: ModuleHost,
     handle: RuntimeHandle,
     task: JoinHandle<()>,
+    /// Serializes the full cross-plane restore transaction. An actor-side
+    /// restore token rejects stale finalization, but it cannot undo a late
+    /// capability-registry write from an older concurrent caller; holding
+    /// this gate across prepare -> capability restore -> finalize prevents
+    /// that split-brain interleaving.
+    restore_gate: Mutex<()>,
 }
 
 impl RuntimeInstance {
@@ -38,7 +45,12 @@ impl RuntimeInstance {
     pub fn spawn(host: ModuleHost, services: RuntimeServices) -> Self {
         let services = Arc::new(services);
         let (handle, task) = crate::actor::spawn_runtime(services);
-        Self { host, handle, task }
+        Self {
+            host,
+            handle,
+            task,
+            restore_gate: Mutex::new(()),
+        }
     }
 
     pub fn handle(&self) -> &RuntimeHandle {
@@ -50,10 +62,11 @@ impl RuntimeInstance {
         self.handle.start().await
     }
 
-    /// A complete runtime checkpoint: the actor's state (task table, current
-    /// task) plus the context engine's checkpoint, plus the dynamic
-    /// capability surface state the host owns. This — not the context
-    /// checkpoint alone — is the snapshot a restart can restore from.
+    /// A cross-plane runtime checkpoint: actor state (task table, current
+    /// task), context state, the host-owned capability surface, and a
+    /// read-only marker for the durable Core authority prefix. Core operation
+    /// truth remains in its WAL; the checkpoint references and verifies it
+    /// rather than copying or rewinding it.
     ///
     /// Capture is a freeze handshake: the capability surface generation is
     /// read before the actor snapshot and re-checked after the capability
@@ -61,6 +74,10 @@ impl RuntimeInstance {
     /// otherwise produce a mixed snapshot (actor state from one moment,
     /// capability flags from another); the mismatch is detected and the
     /// capture retried, bounded, instead of silently shipping a torn view.
+    /// It need not take the full-restore mutex: actor serialization means a
+    /// checkpoint either completes before restore preparation or is refused
+    /// by the pending restore fence, while the generation retry catches a
+    /// capability mutation between the two snapshot planes.
     pub async fn checkpoint(&self) -> AgentResult<RuntimeCheckpoint> {
         let registry = self.host.capability_registry();
         for _ in 0..3 {
@@ -78,16 +95,21 @@ impl RuntimeInstance {
         ))
     }
 
-    /// Restore the whole runtime from a checkpoint. The actor validates and
-    /// transactionally restores context + task authority first; only after
-    /// that succeeds are the infallible capability flags re-applied. A busy,
-    /// malformed or context-incompatible checkpoint therefore cannot
-    /// partially change the capability surface.
+    /// Restore the whole runtime from a checkpoint through a two-phase
+    /// handshake. The actor first validates and transactionally installs
+    /// the Core authority marker before any mutation, then advances the live
+    /// epoch and transactionally installs context + task authority while
+    /// raising its recovery fence. The host applies capability state with a
+    /// fail-closed monotonic meet, and the actor durably publishes the
+    /// resulting commit before clearing the fence. A failed marker or final
+    /// barrier leaves normal mutation blocked instead of exposing a
+    /// half-restored runtime.
     pub async fn restore(&self, checkpoint: RuntimeCheckpoint) -> AgentResult<()> {
+        let _restore = self.restore_gate.lock().await;
         let capabilities = checkpoint.capabilities.clone();
-        self.handle.restore(checkpoint).await?;
-        self.host.capability_registry().restore(&capabilities);
-        Ok(())
+        let restore_id = self.handle.prepare_restore(checkpoint).await?;
+        let applied = self.host.capability_registry().restore(&capabilities);
+        self.handle.finalize_restore(restore_id, applied > 0).await
     }
 
     /// Full ordered shutdown. Every step runs even when an earlier one
@@ -96,7 +118,11 @@ impl RuntimeInstance {
     pub async fn shutdown(mut self) -> AgentResult<()> {
         let mut errors: Vec<String> = Vec::new();
 
-        self.handle.cancel_turn().await;
+        // `Stop` owns cancellation and the bounded drain of any late tool
+        // completion that may still carry a PreparedEffect. Sending a
+        // separate CancelTurn first would clear the turn before Stop sees
+        // it; the actor keeps an explicit pending-cleanup identity, but one
+        // ordered command is the simpler and stronger shutdown contract.
         if let Err(error) = self.handle.stop().await {
             errors.push(format!("runtime stop: {error}"));
         }

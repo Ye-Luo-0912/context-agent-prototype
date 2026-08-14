@@ -4,13 +4,19 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AgentResult, ContextConsumptionAck, ContextDiagnostics, ContextGcReport,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextSelection, ContextStateTransition,
-    OperationId, RunId, ScopeId, StorageGcReport, TaskId, ToolCall, ToolOutput,
-    ToolSurfacePlanReport, ToolSurfaceRequirement, TurnId,
+    OperationId, OperationSnapshot, RunId, RuntimeInputEnvelope, ScopeId, StorageGcReport, TaskId,
+    ToolCall, ToolOutput, ToolSurfacePlanReport, ToolSurfaceRequirement, TurnId,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeEventEnvelope {
     pub run_id: RunId,
+    /// Cursor in the durable event journal for this run. Journaled events
+    /// advance it exactly once and are therefore contiguous from 1.
+    /// `ModelDelta` is live-only: it repeats the cursor of the preceding
+    /// `ModelStarted` and never consumes a durable sequence number. Live
+    /// consumers must use the delta's turn/operation/generation identity as
+    /// its supersession fence, not treat this cursor as a delivery counter.
     pub seq: u64,
     pub timestamp_ms: u64,
     pub event: RuntimeEvent,
@@ -52,8 +58,11 @@ pub enum AnchorPatchKind {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEvent {
     RunStarted,
+    /// 用户输入入账。`input.lifecycle` 区分 Applied（已 ingest）与
+    /// Rejected（忙/非法，未 ingest）。事件名保留兼容；不是“一律成功”。
     UserMessageAccepted {
-        content: String,
+        #[serde(flatten)]
+        input: RuntimeInputEnvelope,
     },
     FocusChanged {
         task_id: TaskId,
@@ -138,6 +147,13 @@ pub enum RuntimeEvent {
     AssistantMessage {
         content: String,
     },
+    /// Core durably admitted one logical tool operation before Runtime made
+    /// it executable. The full bounded snapshot is the discovery identity
+    /// for authorized Platform observers; Core's operation WAL, not this
+    /// event stream, remains the query/recovery authority.
+    OperationAccepted {
+        snapshot: Box<OperationSnapshot>,
+    },
     ToolStarted {
         call: ToolCall,
     },
@@ -188,7 +204,22 @@ pub enum RuntimeEvent {
         #[serde(default)]
         patch_kind: AnchorPatchKind,
     },
+    /// The turn fully committed its model result and every mandatory context
+    /// write behind the durable event barrier. This is the only successful
+    /// turn-commit marker used by crash recovery.
     TurnCompleted,
+    /// The runtime fenced an active turn without committing it. This event
+    /// has its own durability barrier, but it is deliberately not a
+    /// `TurnCompleted`: recovery must never count cancellation as a
+    /// successful model/context commit.
+    TurnCancelled {
+        turn_id: TurnId,
+        task_id: Option<TaskId>,
+        operation_id: Option<OperationId>,
+        cancelled_generation: u64,
+        effective_generation: u64,
+        reason: crate::TurnCancellationReason,
+    },
     /// A mandatory turn-commit step failed: the model answered, but the
     /// runtime did not durably commit the turn (observation ingest,
     /// maintenance, GC or a journal event failed). The turn is NOT
@@ -264,6 +295,15 @@ pub enum RuntimeEvent {
         expires_at_ms: u64,
     },
     RunCompleted,
+}
+
+impl RuntimeEvent {
+    /// 短对话入账：预览即正文。回放场景与旧测试用。
+    pub fn user_message_accepted(body: &str) -> Self {
+        Self::UserMessageAccepted {
+            input: RuntimeInputEnvelope::from_preview(body),
+        }
+    }
 }
 
 #[async_trait]

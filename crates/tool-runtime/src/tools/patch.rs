@@ -37,8 +37,9 @@ impl EditPatchTool {
 #[derive(Deserialize)]
 struct PatchArgs {
     /// Multi-file form: each entry patches one workspace file; the whole
-    /// set commits as one composite effect (all applied, or the already
-    /// applied ones are rolled back).
+    /// set commits as one sequential composite effect. Each file commit is
+    /// atomic, but the set is not a cross-file transaction: a later failure
+    /// can require recovery of files that committed earlier.
     #[serde(default)]
     files: Vec<FilePatch>,
     /// Single-file shortcut (the original shape): `path` + `hunks` on the
@@ -135,7 +136,7 @@ impl Tool for EditPatchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit.patch".into(),
-            description: "Apply exact-match text hunks to one or more workspace files, optionally gated on each file's fs.read `base_revision`; the edit is staged, journaled and committed as one composite effect (all files or the already-applied ones are rolled back).".into(),
+            description: "Apply exact-match text hunks to one or more workspace files, optionally gated on each file's fs.read `base_revision`; edits are staged and journaled, each file commit is atomic, and a partial multi-file commit is reported for recovery.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -196,6 +197,7 @@ impl Tool for EditPatchTool {
         _run_id: RunId,
         call_id: &str,
         arguments: Value,
+        effect_context: Option<agent_contracts::OperationEffectContext>,
         _cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let args: PatchArgs = serde_json::from_value(arguments)
@@ -293,9 +295,9 @@ impl Tool for EditPatchTool {
 
         // Phase 2 — stage the changed files as prepared effects. Nothing
         // lands yet: the composite effect is committed by the runtime
-        // behind the generation fence, and a failed commit rolls back the
-        // already-applied files (journal-backed), so the call is all-or-
-        // rolled-back with the old content preserved as rollback evidence.
+        // behind the generation fence. File commits are sequential, not a
+        // cross-file transaction; a later failure cleans unattempted staged
+        // files and reports the earlier applied files as recovery work.
         let mut effects: Vec<Box<dyn Effect>> = Vec::new();
         let mut file_reports: Vec<Value> = Vec::new();
         let mut changed_any = false;
@@ -322,7 +324,14 @@ impl Tool for EditPatchTool {
                 // The new content is staged and journaled as prepared; the
                 // atomic rename (the side effect) is committed by the
                 // runtime after the generation fence.
-                let prepared = transaction.prepare(patch.updated.as_bytes()).await?;
+                let prepared = match effect_context.clone() {
+                    Some(context) => {
+                        transaction
+                            .prepare_with_effect_context(patch.updated.as_bytes(), context)
+                            .await?
+                    }
+                    None => transaction.prepare(patch.updated.as_bytes()).await?,
+                };
                 effects.push(Box::new(prepared));
             }
         }
@@ -357,8 +366,9 @@ impl Tool for EditPatchTool {
                 artifact_ref: None,
                 metadata: json!({"changed": true, "files": file_reports}),
             },
-            // The composite effect: every changed file commits in order,
-            // and a failure rolls back the already-committed files.
+            // The composite effect commits changed files in order. A
+            // failure cleans the unattempted preparations; already-applied
+            // files remain applied and are reported as requiring recovery.
             effect: Box::new(effects),
         })
     }
@@ -379,6 +389,7 @@ mod tests {
                 name: "edit.patch".into(),
                 arguments: args,
             },
+            effect_context: None,
             cancel: CancellationToken::new(),
         }
     }
@@ -412,7 +423,7 @@ mod tests {
             }),
         );
         let outcome = tool
-            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .execute(run_id, "c", request.call.arguments, None, request.cancel)
             .await
             .unwrap();
         let ToolOutcome::PreparedEffect { output, effect } = outcome else {
@@ -484,6 +495,7 @@ mod tests {
                 )
                 .call
                 .arguments,
+                None,
                 CancellationToken::new(),
             )
             .await;
@@ -517,7 +529,7 @@ mod tests {
             }),
         );
         let outcome = tool
-            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .execute(run_id, "c", request.call.arguments, None, request.cancel)
             .await
             .unwrap();
         let ToolOutcome::PreparedEffect { effect, .. } = outcome else {
@@ -557,6 +569,7 @@ mod tests {
                 )
                 .call
                 .arguments,
+                None,
                 CancellationToken::new(),
             )
             .await;
@@ -576,6 +589,7 @@ mod tests {
                 )
                 .call
                 .arguments,
+                None,
                 CancellationToken::new(),
             )
             .await;
@@ -608,7 +622,7 @@ mod tests {
             }),
         );
         let outcome = tool
-            .execute(run_id, "c", request.call.arguments, request.cancel)
+            .execute(run_id, "c", request.call.arguments, None, request.cancel)
             .await
             .unwrap();
         let ToolOutcome::PreparedEffect { output, effect } = outcome else {
@@ -687,6 +701,7 @@ mod tests {
                 )
                 .call
                 .arguments,
+                None,
                 CancellationToken::new(),
             )
             .await;

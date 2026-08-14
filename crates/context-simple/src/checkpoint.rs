@@ -12,8 +12,10 @@ pub(crate) fn serialize(state: &State) -> AgentResult<Value> {
 
 /// Replace runtime state from a previously exported checkpoint.
 pub(crate) fn deserialize(data: Value) -> AgentResult<State> {
-    serde_json::from_value(data)
-        .map_err(|e| AgentError::Context(format!("checkpoint restore: {e}")))
+    let mut state: State = serde_json::from_value(data)
+        .map_err(|e| AgentError::Context(format!("checkpoint restore: {e}")))?;
+    state.sync_catalog();
+    Ok(state)
 }
 
 /// Structural validation every restore runs before the state becomes live.
@@ -84,6 +86,22 @@ pub(crate) fn validate(state: &State) -> AgentResult<()> {
             )));
         }
     }
+
+    if state.catalog.len() != owners.len() {
+        return Err(violation(format!(
+            "context catalog has {} ids but the body stores own {}",
+            state.catalog.len(),
+            owners.len()
+        )));
+    }
+    for id in owners.keys() {
+        if !state.catalog.contains(*id) {
+            return Err(violation(format!(
+                "item {id} is in a body store but missing from the context catalog"
+            )));
+        }
+    }
+
     Ok(())
 }
 

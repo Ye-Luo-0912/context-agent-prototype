@@ -2,9 +2,9 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use agent_contracts::{
-    AttentionState, CONTEXT_MAP_VIEW_CAP, ContextItem, ContextItemId, ContextMapView, ContextQuery,
-    ContextRetention, ContextSelection, MaterializedContext, MaterializedItem, ScopeId, ScopeKind,
-    ScopeState, ScoreBreakdown,
+    AnchorRootStrength, AttentionState, CONTEXT_MAP_VIEW_CAP, ContextItem, ContextItemId,
+    ContextMapView, ContextQuery, ContextRetention, ContextSelection, MaterializedContext,
+    MaterializedItem, ScopeId, ScopeKind, ScopeState, ScoreBreakdown,
 };
 
 use crate::diagnostics;
@@ -114,6 +114,18 @@ pub(crate) fn materialize(
         .items
         .indexes()
         .candidate_ids(&active_scopes, &state.hot_entities);
+    // 当前任务最近文件的最新正文：工具帧关闭后不再属于 active scopes，
+    // 换文件时热实体也对不上旧路径，必须单独纳入候选，否则 Resident
+    // 根进不了模型帧。
+    let latest_file_bodies = state.latest_file_body_ids();
+    if !latest_file_bodies.is_empty() {
+        let mut seen: HashSet<ContextItemId> = candidate_ids.iter().copied().collect();
+        for id in &latest_file_bodies {
+            if seen.insert(*id) {
+                candidate_ids.push(*id);
+            }
+        }
+    }
     // Substring residual: the candidate index matches entities *exactly*,
     // but the scorer matches substrings (`hot.contains(entity) ||
     // entity.contains(hot)`), so an item whose signature contains the hot
@@ -137,6 +149,31 @@ pub(crate) fn materialize(
             });
             if hot {
                 candidate_ids.push(item.id);
+            }
+        }
+    }
+    // TaskAnchor 投影的 PromptRequired 声明：任务权威要求这些条目进
+    // 模型帧，即使它们不在 active scopes 或热实体集里。与 GC 根共用
+    // 同一匹配解析（anchor_claim_matches_item），terminal 语义仍由
+    // 下面的 live 过滤挡住，声明不复活死条目。
+    let prompt_required_ids: HashSet<ContextItemId> = query
+        .hints
+        .anchor_roots
+        .iter()
+        .filter(|claim| claim.strength == AnchorRootStrength::PromptRequired)
+        .flat_map(|claim| {
+            state
+                .items
+                .iter()
+                .filter(|item| crate::engine::anchor_claim_matches_item(claim, item))
+                .map(|item| item.id)
+        })
+        .collect();
+    if !prompt_required_ids.is_empty() {
+        let mut seen: HashSet<ContextItemId> = candidate_ids.iter().copied().collect();
+        for id in &prompt_required_ids {
+            if seen.insert(*id) {
+                candidate_ids.push(*id);
             }
         }
     }
@@ -209,7 +246,7 @@ pub(crate) fn materialize(
         {
             break;
         }
-        if item.attention == AttentionState::Archived && breakdown.total < config.active_threshold {
+        if archived_below_cutoff(item, breakdown, config, &latest_file_bodies) {
             continue;
         }
         if *tokens > remaining {
@@ -221,7 +258,34 @@ pub(crate) fn materialize(
             item_id: item.id,
             score: breakdown.total,
             approx_tokens: *tokens,
-            reason: selection_reason(item, breakdown),
+            reason: selection_reason(item, breakdown, latest_file_bodies.contains(&item.id)),
+            breakdown: breakdown.clone(),
+        });
+    }
+
+    // Anchor prompt-required 声明：优先级在 pinned 之后、打分候选之前。
+    // 预算仍是硬约束（放不下的条目跳过，帧不豁免），但不再被 Archived
+    // 阈值挡在门外——任务权威要求它进帧，reason 可解释。
+    for (index, breakdown, tokens) in &candidates {
+        let item = &state.items[*index];
+        if !prompt_required_ids.contains(&item.id) || selected_indices.contains(index) {
+            continue;
+        }
+        if let Some(max) = query.hints.max_selected_items
+            && selections.len() >= max
+        {
+            break;
+        }
+        if *tokens > remaining {
+            continue;
+        }
+        remaining -= *tokens;
+        selected_indices.push(*index);
+        selections.push(ContextSelection {
+            item_id: item.id,
+            score: breakdown.total,
+            approx_tokens: *tokens,
+            reason: "anchor root requires it in the prompt".to_string(),
             breakdown: breakdown.clone(),
         });
     }
@@ -237,7 +301,7 @@ pub(crate) fn materialize(
         {
             break;
         }
-        if item.attention == AttentionState::Archived && breakdown.total < config.active_threshold {
+        if archived_below_cutoff(item, &breakdown, config, &latest_file_bodies) {
             continue;
         }
         if tokens > remaining {
@@ -250,7 +314,7 @@ pub(crate) fn materialize(
             item_id: item.id,
             score: breakdown.total,
             approx_tokens: tokens,
-            reason: selection_reason(item, &breakdown),
+            reason: selection_reason(item, &breakdown, latest_file_bodies.contains(&item.id)),
             breakdown,
         });
     }
@@ -290,9 +354,7 @@ pub(crate) fn materialize(
                 }
                 let breakdown =
                     score_item_with_breakdown(dep, focus.as_ref(), &state.hot_entities, turn);
-                if dep.attention == AttentionState::Archived
-                    && breakdown.total < config.active_threshold
-                {
+                if archived_below_cutoff(dep, &breakdown, config, &latest_file_bodies) {
                     continue;
                 }
                 let tokens = approx_tokens(&dep.content);
@@ -494,9 +556,39 @@ fn external_view_key(
     (hot, open_loop, entry.last_access_tick)
 }
 
-fn selection_reason(item: &ContextItem, breakdown: &ScoreBreakdown) -> String {
+fn archived_below_cutoff(
+    item: &ContextItem,
+    breakdown: &ScoreBreakdown,
+    config: &SimpleContextConfig,
+    latest_file_bodies: &HashSet<ContextItemId>,
+) -> bool {
+    item.attention == AttentionState::Archived
+        && breakdown.total < config.active_threshold
+        && !latest_file_bodies.contains(&item.id)
+}
+
+fn selection_reason(
+    item: &ContextItem,
+    breakdown: &ScoreBreakdown,
+    latest_file_body: bool,
+) -> String {
     if item.retention == ContextRetention::Pinned {
         return "explicitly pinned".to_string();
+    }
+    if latest_file_body {
+        return format!(
+            "latest body of a recent file in the active task; working-set score {:.2}; kind={:?}; scope={:?}; importance={:.2} focus={:.2} recency={:.2} access={:.2} scope_bonus={:.2} retention_bonus={:.2} affinity={:.2}",
+            breakdown.total,
+            item.kind,
+            item.scope,
+            breakdown.importance,
+            breakdown.focus_match,
+            breakdown.recency,
+            breakdown.access,
+            breakdown.scope_bonus,
+            breakdown.retention_bonus,
+            breakdown.entity_affinity,
+        );
     }
     format!(
         "working-set score {:.2}; kind={:?}; scope={:?}; importance={:.2} focus={:.2} recency={:.2} access={:.2} scope_bonus={:.2} retention_bonus={:.2} affinity={:.2}",

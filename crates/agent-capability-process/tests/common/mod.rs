@@ -14,3 +14,15 @@ pub fn locate_mock_host() -> Option<PathBuf> {
     let current = std::env::current_exe().ok()?;
     agent_process::probe_siblings(&current, name)
 }
+
+/// Locate the `mcp_mock_server` bin of this crate, built next to the test
+/// binaries, for MCP adapter integration tests.
+pub fn locate_mcp_mock_server() -> Option<PathBuf> {
+    let name = if cfg!(windows) {
+        "mcp_mock_server.exe"
+    } else {
+        "mcp_mock_server"
+    };
+    let current = std::env::current_exe().ok()?;
+    agent_process::probe_siblings(&current, name)
+}

@@ -20,7 +20,8 @@ use agent_contracts::{
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{
-    ModelBudget, RuntimeHandle, RuntimeServices, approx_layer_tokens, spawn_runtime,
+    ModelBudget, ModuleHost, RuntimeHandle, RuntimeInstance, RuntimeServices, approx_layer_tokens,
+    spawn_runtime,
 };
 
 #[derive(Debug)]
@@ -174,12 +175,17 @@ async fn actor_rejects_mutation_commands_while_a_turn_runs() {
 
     let busy = handle.user_message("second".into()).await;
     assert!(
-        busy.is_err(),
-        "a second user message while a turn runs must be rejected"
+        busy.is_ok(),
+        "a second user message while a turn runs is queued"
+    );
+    let overflow = handle.user_message("third".into()).await;
+    assert!(
+        overflow.is_err(),
+        "a third user message while a turn runs and one is queued must be rejected"
     );
     assert!(
-        busy.unwrap_err().to_string().contains("busy"),
-        "the rejection must say the agent is busy"
+        overflow.unwrap_err().to_string().contains("queued"),
+        "the overflow rejection must mention the queue"
     );
     let focus = handle.set_focus("new goal".into()).await;
     assert!(
@@ -194,7 +200,7 @@ async fn actor_rejects_mutation_commands_while_a_turn_runs() {
         "task completion during a turn must be rejected"
     );
 
-    handle.cancel_turn().await;
+    handle.cancel_turn().await.unwrap();
     let result = tokio::time::timeout(Duration::from_secs(2), turn_task)
         .await
         .expect("turn did not stop after cancellation")
@@ -214,7 +220,7 @@ async fn cancel_then_new_turn_drops_stale_completion() {
     let first = tokio::spawn(async move { turn1.user_message("first".into()).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    handle.cancel_turn().await;
+    handle.cancel_turn().await.unwrap();
 
     // The actor clears the busy marker on cancel, so a new turn is accepted
     // immediately; the cancelled turn's late completion must be dropped.
@@ -285,11 +291,15 @@ async fn stop_ends_the_actor_cleanly() {
 #[derive(Debug, Default)]
 struct RecordingContextEngine {
     queries: Mutex<Vec<ContextQuery>>,
+    user_messages: Mutex<Vec<String>>,
 }
 
 #[async_trait::async_trait]
 impl ContextEngine for RecordingContextEngine {
-    async fn ingest(&self, _ingress: ContextIngress) -> AgentResult<()> {
+    async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+        if let ContextIngress::UserMessage { content } = ingress {
+            self.user_messages.lock().unwrap().push(content);
+        }
         Ok(())
     }
     async fn maintain(
@@ -390,8 +400,12 @@ impl ToolDispatcher for OneToolDispatcher {
 #[tokio::test]
 async fn engine_receives_only_the_context_frame_budget() {
     let context = Arc::new(RecordingContextEngine::default());
+    let config = CoreAuthorityConfig::default();
+    let system_tokens = approx_tokens(&config.system_prompt);
+    let tool_specs = OneToolDispatcher.specs();
+    let tools_tokens = approx_layer_tokens(&tool_specs);
     let kernel = Arc::new(RuntimeServices::new(
-        CoreAuthorityConfig::default(),
+        config,
         context.clone(),
         Arc::new(BudgetModel),
         Arc::new(OneToolDispatcher),
@@ -404,9 +418,7 @@ async fn engine_receives_only_the_context_frame_budget() {
 
     // The turn is a single model round; the engine query is recorded before
     // the actor replies, so the budget is observable immediately.
-    let system_tokens = approx_tokens(&kernel.system_prompt());
     let turn_tokens = approx_layer_tokens(&[ModelMessage::user("hello")]);
-    let tools_tokens = approx_layer_tokens(&kernel.tool_specs());
     let expected = ModelBudget::compute(30_000, 2_000, system_tokens, turn_tokens, tools_tokens)
         .context_frame_budget;
 
@@ -428,8 +440,8 @@ async fn dropping_all_handles_still_shuts_down_cleanly() {
     // An independent subscriber survives the handle drop and must still see
     // the teardown events: the actor runs full shutdown when every caller
     // handle is gone instead of returning silently.
-    let mut events = kernel.kernel().subscribe();
     let (handle, task) = spawn_runtime(kernel);
+    let mut events = handle.subscribe();
     handle.start().await.unwrap();
     drop(handle);
 
@@ -1118,6 +1130,7 @@ impl ToolDispatcher for RoundLocalToolDispatcher {
                 state: ToolLifecycle::Loaded,
                 owner: "test".into(),
                 description: "mandatory core reader".into(),
+                risk: agent_contracts::ToolRisk::ReadOnly,
             },
             ToolCatalogEntry {
                 name: "optional.large".into(),
@@ -1128,6 +1141,7 @@ impl ToolDispatcher for RoundLocalToolDispatcher {
                 },
                 owner: "test".into(),
                 description: "large optional schema".into(),
+                risk: agent_contracts::ToolRisk::ReadOnly,
             },
         ]
     }
@@ -1554,15 +1568,16 @@ async fn active_task_tool_demand_reaches_gc_as_roots() {
 async fn checkpoint_restore_rebuilds_surface_from_suspended_task_requirements() {
     let model = Arc::new(VariableWindowModel::new(16_000));
     let tools = Arc::new(RoundLocalToolDispatcher::evicting_on_gc());
-    let kernel = Arc::new(RuntimeServices::new(
+    let services = RuntimeServices::new(
         CoreAuthorityConfig::default(),
         Arc::new(TestContextEngine),
         model,
         tools.clone(),
         Arc::new(PolicyApprovalGate::read_only()),
         None,
-    ));
-    let (handle, _task) = spawn_runtime(kernel);
+    );
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
     let mut surface_events = handle.subscribe();
     let mut turn_events = handle.subscribe();
     handle.start().await.unwrap();
@@ -1585,7 +1600,7 @@ async fn checkpoint_restore_rebuilds_surface_from_suspended_task_requirements() 
     let first = wait_for_ready_surface_and_model_start(&mut surface_events).await;
     wait_for_turn_completed(&mut turn_events).await;
     handle.suspend_task().await.unwrap();
-    let checkpoint = handle.checkpoint().await.unwrap();
+    let checkpoint = instance.checkpoint().await.unwrap();
 
     // Diverge both the task requirements and the issued surface counter.
     handle
@@ -1601,7 +1616,7 @@ async fn checkpoint_restore_rebuilds_surface_from_suspended_task_requirements() 
     // Restoring an older checkpoint must recover requirement revision 1,
     // rebuild the surface rather than reuse a snapshot, and preserve
     // monotonic focus/surface identities from the live process.
-    handle.restore(checkpoint).await.unwrap();
+    instance.restore(checkpoint).await.unwrap();
     assert!(
         handle
             .replace_task_tool_requirements(task_id, 2, Vec::new())
@@ -1631,23 +1646,24 @@ async fn checkpoint_restore_rebuilds_surface_from_suspended_task_requirements() 
         "restoring an older checkpoint must not move the runtime focus epoch backwards"
     );
     assert_eq!(tools.load_calls(), 2);
-    handle.stop().await.unwrap();
+    instance.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn live_restore_cas_high_water_survives_a_checkpoint_that_removes_the_task() {
     let model = Arc::new(VariableWindowModel::new(16_000));
-    let kernel = Arc::new(RuntimeServices::new(
+    let services = RuntimeServices::new(
         CoreAuthorityConfig::default(),
         Arc::new(TestContextEngine),
         model,
         Arc::new(RoundLocalToolDispatcher::new()),
         Arc::new(PolicyApprovalGate::read_only()),
         None,
-    ));
-    let (handle, _task) = spawn_runtime(kernel);
+    );
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
     handle.start().await.unwrap();
-    let empty_checkpoint = handle.checkpoint().await.unwrap();
+    let empty_checkpoint = instance.checkpoint().await.unwrap();
 
     handle
         .set_focus("task that will disappear".into())
@@ -1667,15 +1683,15 @@ async fn live_restore_cas_high_water_survives_a_checkpoint_that_removes_the_task
         .await
         .unwrap();
     handle.suspend_task().await.unwrap();
-    let task_checkpoint = handle.checkpoint().await.unwrap();
+    let task_checkpoint = instance.checkpoint().await.unwrap();
     handle
         .replace_task_tool_requirements(task_id, 1, Vec::new())
         .await
         .unwrap();
 
-    handle.restore(empty_checkpoint).await.unwrap();
+    instance.restore(empty_checkpoint).await.unwrap();
     assert!(handle.list_tasks().await.unwrap().is_empty());
-    handle.restore(task_checkpoint).await.unwrap();
+    instance.restore(task_checkpoint).await.unwrap();
     let restored = handle.list_tasks().await.unwrap();
     assert_eq!(restored[0].tool_requirement_revision, 3);
     assert_eq!(restored[0].tool_requirement_count, 1);
@@ -1686,7 +1702,7 @@ async fn live_restore_cas_high_water_survives_a_checkpoint_that_removes_the_task
             .is_err(),
         "a task disappearing from an intermediate restore must not erase its CAS high-water mark"
     );
-    handle.stop().await.unwrap();
+    instance.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -2230,8 +2246,95 @@ async fn failed_barrier_blocks_turn_completed_and_marks_recovery_required() {
             "TurnCompleted must be appended into the FIFO before the failed flush: {appended:?}"
         );
     }
+    let next = handle
+        .user_message("must wait for recovery".into())
+        .await
+        .expect_err("a failed durability barrier must fence later mutation");
+    assert!(
+        matches!(next, agent_contracts::AgentError::RecoveryRequired(_)),
+        "the runtime must stay fenced after the failed barrier: {next}"
+    );
     // The operator repairs storage before the runtime may run again: with
     // the barrier healthy, stop's own flush succeeds and teardown is clean.
+    journal.fail_flush.store(false, Ordering::SeqCst);
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_cancel_barrier_returns_recovery_required_and_never_claims_completion() {
+    let journal = Arc::new(BarrierJournal::default());
+    let services = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(HangingModel),
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        Some(journal.clone()),
+    ));
+    let (handle, _task) = spawn_runtime(services);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle.user_message("cancel me".into()).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match events.recv().await {
+                Ok(RuntimeEventEnvelope {
+                    event: RuntimeEvent::ModelStarted { .. },
+                    ..
+                }) => break,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("runtime closed before the model operation started")
+                }
+            }
+        }
+    })
+    .await
+    .expect("model operation did not start");
+
+    journal.fail_flush.store(true, Ordering::SeqCst);
+    let error = handle
+        .cancel_turn()
+        .await
+        .expect_err("a failed cancellation barrier must reach the caller");
+    assert!(matches!(
+        error,
+        agent_contracts::AgentError::RecoveryRequired(_)
+    ));
+
+    let mut saw_cancelled = false;
+    let mut saw_completed = false;
+    while let Ok(envelope) = events.try_recv() {
+        saw_cancelled |= matches!(envelope.event, RuntimeEvent::TurnCancelled { .. });
+        saw_completed |= matches!(envelope.event, RuntimeEvent::TurnCompleted);
+    }
+    assert!(
+        !saw_cancelled,
+        "TurnCancelled is broadcast only after its durable barrier passes"
+    );
+    assert!(
+        !saw_completed,
+        "cancellation must never reuse the successful completion marker"
+    );
+    {
+        let appended = journal.appended.lock().unwrap();
+        assert!(
+            appended
+                .iter()
+                .any(|name| name.starts_with("TurnCancelled")),
+            "the cancellation marker must be the event covered by the attempted barrier"
+        );
+    }
+    let next = handle
+        .user_message("must recover first".into())
+        .await
+        .expect_err("failed cancellation persistence must fence later mutation");
+    assert!(matches!(
+        next,
+        agent_contracts::AgentError::RecoveryRequired(_)
+    ));
+
     journal.fail_flush.store(false, Ordering::SeqCst);
     handle.stop().await.unwrap();
 }
@@ -2267,13 +2370,22 @@ async fn output_broker_spills_oversized_tool_output_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Arc::new(Workspace::open(dir.path()).await.unwrap());
     let full_content = format!("BEGIN{}\nEND", "payload".repeat(10_000));
-    let kernel = Arc::new(RuntimeServices::new(
+    let surface = ToolSurfaceSnapshot {
+        specs: vec![ToolSpec {
+            name: "big.tool".into(),
+            description: "oversized".into(),
+            input_schema: serde_json::json!({}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+        }],
+        ..ToolSurfaceSnapshot::default()
+    };
+    let core = agent_core::build_core_port(
         CoreAuthorityConfig {
             output_broker: Some(Arc::new(WorkspaceOutputBroker::new(workspace.clone()))),
             ..CoreAuthorityConfig::default()
         },
         Arc::new(TestContextEngine),
-        Arc::new(StreamingModel),
         Arc::new(BigOutputDispatcher {
             output: ToolOutput {
                 call_id: "c1".into(),
@@ -2287,31 +2399,39 @@ async fn output_broker_spills_oversized_tool_output_end_to_end() {
         }),
         Arc::new(PolicyApprovalGate::read_only()),
         None,
-    ));
-
-    let surface = ToolSurfaceSnapshot {
-        specs: vec![ToolSpec {
-            name: "big.tool".into(),
-            description: "oversized".into(),
-            input_schema: serde_json::json!({}),
-            risk: ToolRisk::ReadOnly,
-            output_budget: None,
-        }],
-        ..ToolSurfaceSnapshot::default()
+    );
+    let run_id = core.run_id();
+    let generation = core.current_authority_epoch();
+    let tool_call = ToolCall {
+        id: "c1".into(),
+        name: "big.tool".into(),
+        arguments: serde_json::json!({}),
     };
-    let (outcome, lease) = kernel
-        .kernel()
-        .execute_tool(
-            ToolCall {
-                id: "c1".into(),
-                name: "big.tool".into(),
-                arguments: serde_json::json!({}),
-            },
-            CancellationToken::new(),
-            &surface,
-            0,
-        )
+    let identity = agent_contracts::ToolOperationIdentity {
+        run_id,
+        task_id: None,
+        turn_id: agent_contracts::TurnId::new(),
+        scope_id: None,
+        operation_id: agent_contracts::OperationId::new(),
+        generation,
+        call_id: tool_call.id.clone(),
+        tool_name: tool_call.name.clone(),
+        argument_digest: agent_contracts::ArgumentDigest::from_json(&tool_call.arguments),
+    };
+    let agent_core::ToolOperationAdmission::Accepted { permit, .. } = core
+        .admit_tool_operation(identity, &tool_call, generation)
+        .expect("test operation admission must succeed")
+    else {
+        panic!("fresh test operation must receive a dispatch permit")
+    };
+    let permit = core
+        .publish_tool_operation(permit, &tool_call)
+        .await
+        .unwrap();
+    let execution = core
+        .execute_published_tool(permit, tool_call, CancellationToken::new(), &surface)
         .await;
+    let agent_core::CoreToolExecution { outcome, lease, .. } = execution;
     assert!(
         lease.is_none(),
         "a read-only call carries no commit-time lease"
@@ -2325,20 +2445,323 @@ async fn output_broker_spills_oversized_tool_output_end_to_end() {
     );
     assert!(output.model_content.contains("output broker truncated"));
     let reference = output.artifact_ref.expect("oversized output must spill");
-    assert!(reference.starts_with("artifact://"));
+    assert!(reference.starts_with("artifact://v1/"));
+    let locator = agent_contracts::ArtifactLocator::parse(&reference).expect("sealed locator");
+    assert_eq!(locator.owner(), "tool-output");
+    assert!(locator.is_sealed());
 
     // The full content was stored once under the run's artifact directory.
-    let run_dir = workspace
+    let path = workspace
         .state_dir()
         .join("artifacts")
-        .join(kernel.kernel().run_id().to_string());
-    let mut found = None;
-    let mut entries = tokio::fs::read_dir(&run_dir).await.unwrap();
-    while let Some(entry) = entries.next_entry().await.unwrap() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("tool-output-") {
-            found = Some(tokio::fs::read_to_string(entry.path()).await.unwrap());
+        .join(run_id.to_string())
+        .join(locator.owner())
+        .join(locator.digest().unwrap().to_string());
+    let stored = tokio::fs::read_to_string(&path).await.unwrap();
+    assert_eq!(stored, full_content);
+}
+
+#[tokio::test]
+async fn user_message_event_is_a_bounded_preview_while_ingest_keeps_the_body() {
+    let context = Arc::new(RecordingContextEngine::default());
+    let kernel = kernel_with(Arc::new(StreamingModel), context.clone());
+    let (handle, _task) = spawn_runtime(kernel);
+    handle.start().await.unwrap();
+    let mut events = handle.subscribe();
+    let body = "unique-user-input-".to_string() + &"x".repeat(400);
+    handle.user_message(body.clone()).await.unwrap();
+
+    let mut accepted = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::UserMessageAccepted { input } = envelope.event {
+                accepted = Some(input);
+            }
         }
+        if accepted.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(found.expect("spilled artifact"), full_content);
+    let input = accepted.expect("UserMessageAccepted");
+    assert_eq!(
+        input.preview.chars().count(),
+        agent_contracts::USER_INPUT_PREVIEW_CHARS
+    );
+    assert!(
+        !input.preview.contains(&body),
+        "the journal must not carry the full body"
+    );
+    assert_eq!(input.bytes, body.len() as u64);
+    assert_eq!(input.kind, agent_contracts::InputKind::Dialogue);
+    assert_eq!(input.lifecycle, agent_contracts::InputLifecycle::Applied);
+    assert_eq!(input.source, agent_contracts::InputSource::User);
+    assert_eq!(
+        input.authority,
+        agent_contracts::InputAuthority::UserSteering
+    );
+    assert!(input.proposal.is_none());
+    assert!(
+        input.body_ref.is_none(),
+        "this kernel has no artifact workspace"
+    );
+    let ingested = context.user_messages.lock().unwrap();
+    assert_eq!(ingested.as_slice(), std::slice::from_ref(&body));
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn focus_and_cancel_commands_do_not_go_through_the_user_message_envelope() {
+    let (handle, _task) = start(Arc::new(StreamingModel)).await;
+    let mut events = handle.subscribe();
+    handle
+        .set_focus("keep the auth service".into())
+        .await
+        .unwrap();
+    handle.cancel_turn().await.unwrap();
+
+    let mut saw_user_message = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if matches!(envelope.event, RuntimeEvent::UserMessageAccepted { .. }) {
+                saw_user_message = true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !saw_user_message,
+        "/focus and /cancel must stay direct RuntimeCommand paths"
+    );
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn user_message_stores_the_exact_body_once_when_a_workspace_is_wired() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace =
+        std::sync::Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    let context = Arc::new(RecordingContextEngine::default());
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        context.clone(),
+        Arc::new(StreamingModel),
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    )
+    .with_artifact_workspace(workspace.clone());
+    let (handle, _task) = spawn_runtime(std::sync::Arc::new(services));
+    handle.start().await.unwrap();
+    let mut events = handle.subscribe();
+    let body = "exact user body for evidence plane";
+    handle.user_message(body.into()).await.unwrap();
+
+    let mut accepted = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::UserMessageAccepted { input } = envelope.event {
+                accepted = Some(input);
+            }
+        }
+        if accepted.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let input = accepted.expect("UserMessageAccepted");
+    let reference = input.body_ref.expect("workspace must seal a body_ref");
+    let locator = agent_contracts::ArtifactLocator::parse(&reference).expect("sealed locator");
+    assert_eq!(locator.owner(), "user-input");
+    assert_eq!(
+        input.digest.as_deref(),
+        locator.digest().map(|d| d.to_string()).as_deref()
+    );
+    let path = workspace
+        .state_dir()
+        .join("artifacts")
+        .join(locator.run_id().to_string())
+        .join(locator.owner())
+        .join(locator.digest().unwrap().to_string());
+    let stored = tokio::fs::read_to_string(&path).await.unwrap();
+    assert_eq!(stored, body);
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn busy_user_message_is_recorded_as_rejected_and_not_ingested() {
+    let context = Arc::new(RecordingContextEngine::default());
+    let kernel = kernel_with(Arc::new(HangingModel), context.clone());
+    let (handle, _task) = spawn_runtime(kernel);
+    handle.start().await.unwrap();
+    let mut events = handle.subscribe();
+
+    let turn = handle.clone();
+    let turn_task = tokio::spawn(async move { turn.user_message("first".into()).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    handle.user_message("second".into()).await.unwrap();
+    let overflow = handle.user_message("third".into()).await;
+    assert!(
+        overflow.unwrap_err().to_string().contains("queued"),
+        "overflow UserMessage still fail-closes"
+    );
+
+    let mut rejected = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::UserMessageAccepted { input } = envelope.event
+                && input.lifecycle == agent_contracts::InputLifecycle::Rejected
+            {
+                rejected = Some(input);
+            }
+        }
+        if rejected.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let input = rejected.expect("overflow UserMessage must leave a Rejected record");
+    assert_eq!(input.preview, "third");
+    assert!(
+        input.turn_id.is_none(),
+        "rejected input never started a turn"
+    );
+    assert!(input.body_ref.is_none(), "rejected input is not sealed");
+    {
+        let ingested = context.user_messages.lock().unwrap();
+        assert_eq!(
+            ingested.as_slice(),
+            &["first".to_string()],
+            "rejected body must not enter context"
+        );
+    }
+
+    handle.cancel_turn().await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), turn_task).await;
+    handle.cancel_turn().await.unwrap();
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn queued_user_message_applies_after_the_busy_turn_is_cancelled() {
+    let context = Arc::new(RecordingContextEngine::default());
+    let kernel = kernel_with(Arc::new(HangingModel), context.clone());
+    let (handle, _task) = spawn_runtime(kernel);
+    handle.start().await.unwrap();
+    let mut events = handle.subscribe();
+
+    let turn = handle.clone();
+    let turn_task = tokio::spawn(async move { turn.user_message("first".into()).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.user_message("second".into()).await.unwrap();
+
+    let mut queued = None;
+    let mut applied_first = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::UserMessageAccepted { input } = envelope.event {
+                if input.lifecycle == agent_contracts::InputLifecycle::Applied
+                    && input.preview == "first"
+                {
+                    applied_first = Some(input);
+                } else if input.lifecycle == agent_contracts::InputLifecycle::Queued {
+                    queued = Some(input);
+                }
+            }
+        }
+        if queued.is_some() && applied_first.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let queued = queued.expect("second UserMessage must be Queued");
+    let applied_first = applied_first.expect("first UserMessage must be Applied");
+    assert_eq!(queued.preview, "second");
+    assert_eq!(queued.causal_parent, applied_first.input_id);
+    assert!(
+        context.user_messages.lock().unwrap().as_slice() == ["first".to_string()],
+        "queued body must not ingest until the busy turn ends"
+    );
+
+    handle.cancel_turn().await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), turn_task).await;
+
+    let mut applied_second = false;
+    let mut interrupted = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::UserMessageAccepted { input } = envelope.event {
+                if input.lifecycle == agent_contracts::InputLifecycle::InterruptCommitted {
+                    interrupted = true;
+                    assert_eq!(input.kind, agent_contracts::InputKind::CancelTurn);
+                    assert_eq!(input.causal_parent, applied_first.input_id);
+                }
+                if input.lifecycle == agent_contracts::InputLifecycle::Applied
+                    && input.preview == "second"
+                {
+                    applied_second = true;
+                    assert_eq!(input.input_id, queued.input_id);
+                }
+            }
+        }
+        if applied_second && interrupted {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(interrupted, "cancel must publish InterruptCommitted");
+    assert!(applied_second, "queued dialogue must apply after cancel");
+    assert!(
+        context
+            .user_messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|body| body == "second"),
+        "drained queue must ingest the queued body"
+    );
+
+    handle.cancel_turn().await.unwrap();
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn applied_user_input_is_consumed_then_archived_when_the_turn_commits() {
+    let (handle, _task) = start(Arc::new(StreamingModel)).await;
+    let mut events = handle.subscribe();
+    handle.user_message("hello".into()).await.unwrap();
+
+    let mut lifecycles = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            if let RuntimeEvent::UserMessageAccepted { input } = envelope.event {
+                lifecycles.push(input.lifecycle);
+            }
+        }
+        if lifecycles.contains(&agent_contracts::InputLifecycle::Archived) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        lifecycles.contains(&agent_contracts::InputLifecycle::Applied),
+        "turn start must publish Applied, got {lifecycles:?}"
+    );
+    assert!(
+        lifecycles.contains(&agent_contracts::InputLifecycle::Consumed),
+        "model consumption must publish Consumed, got {lifecycles:?}"
+    );
+    assert!(
+        lifecycles.contains(&agent_contracts::InputLifecycle::Archived),
+        "TurnCompleted must publish Archived, got {lifecycles:?}"
+    );
+    handle.stop().await.unwrap();
 }

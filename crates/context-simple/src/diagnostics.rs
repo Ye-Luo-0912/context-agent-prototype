@@ -24,6 +24,7 @@ pub(crate) fn compute(state: &State) -> ContextDiagnostics {
         event_seq: state.event_seq,
         tool_round: state.tool_round,
         resident_items: state.items.len(),
+        resident_bytes: 0,
         warm_items: state.eviction_buffer.len(),
         // O(1): the external map maintains its Cold/External counts, so
         // diagnostics never scans a store that grows with logical history.
@@ -33,6 +34,11 @@ pub(crate) fn compute(state: &State) -> ContextDiagnostics {
         gc_reactivated_total: state.gc_reactivated_total,
         gc_externalized_total: state.gc_externalized_total,
         gc_storage_deleted_total: state.gc_storage_deleted_total,
+        access_search_hits: state.access_search_hits,
+        access_inspects: state.access_inspects,
+        access_fetches: state.access_fetches,
+        access_admits: state.access_admits,
+        access_consumption_acks: state.access_consumption_acks,
         ..ContextDiagnostics::default()
     };
 
@@ -46,6 +52,9 @@ pub(crate) fn compute(state: &State) -> ContextDiagnostics {
             diagnostics.tombstoned_items += 1;
         }
 
+        diagnostics.resident_bytes = diagnostics
+            .resident_bytes
+            .saturating_add(item.content.len());
         if item.attention == AttentionState::Active {
             diagnostics.approx_active_tokens += approx_tokens(&item.content);
         }

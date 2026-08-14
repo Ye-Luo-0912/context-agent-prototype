@@ -11,10 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_contracts::{
-    AgentResult, ContextConsumptionAck, ContextEngine, ContextIngress, ContextItemSummary,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, MaterializedContext,
-    ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, OperationId, RuntimeEvent,
-    ToolOutcome, ToolOutput, TurnId,
+    AgentResult, ContextConsumptionAck, ContextEngine, ContextHints, ContextIngress,
+    ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
+    MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, OperationId,
+    RuntimeEvent, ToolOutcome, ToolOutput, TurnId,
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use context_contextcore::{ContextServiceAdapter, ContextServiceConfig, ServiceEngine};
@@ -28,6 +28,18 @@ async fn connect() -> Arc<dyn ContextEngine> {
     .await
     .expect("spawn + handshake with the context service");
     Arc::new(adapter)
+}
+
+#[tokio::test]
+async fn invalid_frame_bound_is_rejected_before_spawning_the_service() {
+    let error = ContextServiceAdapter::connect(&ContextServiceConfig {
+        max_frame_bytes: 1,
+        ..ContextServiceConfig::default()
+    })
+    .await
+    .err()
+    .expect("a sub-minimum frame bound must fail locally");
+    assert!(error.to_string().contains("frame bound"));
 }
 
 /// A unique store outside the workspace. The contract-parity test forces
@@ -370,6 +382,135 @@ async fn missing_service_fails_fast_with_clear_error() {
     );
 }
 
+/// Read one newline-terminated line from the child pipe.
+async fn read_line(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    use tokio::io::AsyncBufReadExt;
+    reader.read_until(b'\n', buf).await
+}
+
+#[tokio::test]
+async fn oversized_request_frames_end_the_session_with_a_bounded_error() {
+    // Symmetric service-side bound: the service reads requests with the
+    // same incremental frame cap the adapter applies to responses. An
+    // over-cap request line must be refused with one bounded error frame
+    // and the session must end — the half-consumed line cannot be trusted,
+    // and a client that cannot speak the framing must not keep the service
+    // alive.
+    let current = std::env::current_exe().unwrap();
+    let program = agent_process::probe_siblings(
+        &current,
+        if cfg!(windows) {
+            "agent-context-service.exe"
+        } else {
+            "agent-context-service"
+        },
+    )
+    .expect("agent-context-service built next to the test profile");
+    let mut child = tokio::process::Command::new(&program)
+        .args(["--engine", "append", "--max-frame-bytes", "4096"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the context service");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap());
+
+    // One request line far over the 4 KiB frame cap. The service may
+    // detect the violation after the first ~4 KiB and end the session
+    // while we are still streaming the rest — a BrokenPipe on the write is
+    // exactly that fail-closed exit, not a failure of this test.
+    use tokio::io::AsyncWriteExt;
+    let mut line = "{\"id\":1,\"version\":1,\"op\":\"diagnostics\",\"pad\":\"".to_string();
+    line.push_str(&"x".repeat(64 * 1024));
+    line.push_str("\"}\n");
+    let write = stdin.write_all(line.as_bytes()).await;
+    let _ = stdin.flush().await;
+    match write {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("writing the oversized line failed: {e}"),
+    }
+
+    // The service answers exactly one bounded error frame...
+    let mut response = Vec::new();
+    let count = tokio::time::timeout(
+        Duration::from_secs(5),
+        read_line(&mut stdout, &mut response),
+    )
+    .await
+    .expect("the service must answer the violation")
+    .expect("read the error frame");
+    assert!(count > 0, "a bounded error frame must be written");
+    assert!(
+        response.len() <= 4096,
+        "the error answer must itself be bounded, got {} bytes",
+        response.len()
+    );
+    let response: serde_json::Value =
+        serde_json::from_slice(&response).expect("the service's answer must be a parseable frame");
+    assert_eq!(response["ok"], false);
+    assert!(
+        response["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("bad request")),
+        "the refusal must name the framing violation: {response}"
+    );
+
+    // ...then the session ends: the next read is EOF, and the process exits.
+    let mut tail = Vec::new();
+    let count = tokio::time::timeout(Duration::from_secs(5), read_line(&mut stdout, &mut tail))
+        .await
+        .expect("the session must end")
+        .expect("read after the error frame");
+    assert_eq!(
+        count, 0,
+        "a framing violation must end the session, not keep the pipe open"
+    );
+    tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("the service process must exit")
+        .expect("wait succeeds");
+}
+
+#[tokio::test]
+async fn adapter_frame_cap_is_enforced_by_the_service_on_responses() {
+    // Every ingest request is individually below the cap, but the resulting
+    // checkpoint is not. This proves the adapter passes its configured cap
+    // into the service process, which must replace the response instead of
+    // serializing an unbounded line.
+    let adapter = ContextServiceAdapter::connect(&ContextServiceConfig {
+        engine: ServiceEngine::Append,
+        max_frame_bytes: 1024,
+        ..ContextServiceConfig::default()
+    })
+    .await
+    .expect("spawn service with a small symmetric frame cap");
+
+    for index in 0..12 {
+        adapter
+            .ingest(ContextIngress::UserMessage {
+                content: format!("bounded checkpoint record {index}: {}", "x".repeat(120)),
+            })
+            .await
+            .expect("each bounded request succeeds");
+    }
+
+    let error = adapter
+        .checkpoint()
+        .await
+        .expect_err("the oversized response must be replaced by an error");
+    assert!(
+        error.to_string().contains("response exceeded frame bound"),
+        "the bounded replacement must surface through the adapter: {error}"
+    );
+    adapter.shutdown().await;
+}
+
 /// Drive every `ContextEngine` contract method through a fixed script and
 /// collect the observable outcome as a normalized JSON snapshot.
 ///
@@ -475,6 +616,7 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
             kind: None,
             scope: None,
             task_id: None,
+            label: None,
             limit: 16,
         })
         .await
@@ -502,6 +644,49 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
     assert_eq!(fetch_external.id, first_id);
     assert!(fetch_external.content.contains("RecallSentinel.rs"));
     let storage_gc = engine.storage_gc().await.unwrap();
+    // Anchor-root projection parity: the directive replaces the root set and
+    // a PromptRequired hint forces the target into the frame — both must
+    // cross the process boundary identically. The target is a just-materialized
+    // item, so it is resident and the force-selection can land.
+    let anchor_target = materialized
+        .items
+        .first()
+        .map(|item| item.item_id)
+        .expect("the materialized frame has at least one item");
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: agent_contracts::ContextAction::AnchorRoots {
+                roots: vec![agent_contracts::AnchorRootClaim {
+                    item_ref: anchor_target.to_string(),
+                    strength: agent_contracts::AnchorRootStrength::ResidentRequired,
+                    source_field_id: "working_refs".into(),
+                }],
+            },
+        })
+        .await
+        .unwrap();
+    let anchored = engine
+        .materialize(ContextQuery {
+            current_input: "anchor parity".into(),
+            budget_tokens: 4096,
+            hints: ContextHints {
+                max_selected_items: Some(16),
+                anchor_roots: vec![agent_contracts::AnchorRootClaim {
+                    item_ref: anchor_target.to_string(),
+                    strength: agent_contracts::AnchorRootStrength::PromptRequired,
+                    source_field_id: "constraints".into(),
+                }],
+            },
+        })
+        .await
+        .unwrap();
+    assert!(
+        anchored
+            .items
+            .iter()
+            .any(|item| item.item_id == anchor_target),
+        "a PromptRequired anchor root must force the target into the frame"
+    );
     let diagnostics = engine.diagnostics().await.unwrap();
     // Checkpoint/restore round-trip as the last step: the restored engine
     // must report the same diagnostics it did before the round-trip.
@@ -521,6 +706,7 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
         "inspect_external": inspect_external,
         "fetch_external": fetch_external,
         "storage_gc": storage_gc,
+        "anchored_item_count": anchored.items.len(),
         "diagnostics": diagnostics,
         "checkpoint": checkpoint,
         "post_restore_diagnostics": post_restore_diagnostics,

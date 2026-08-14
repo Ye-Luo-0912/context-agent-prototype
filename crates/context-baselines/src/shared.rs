@@ -177,6 +177,12 @@ pub(crate) fn active_diagnostics(
         .map(|record| approx_tokens(&record.content))
         .sum::<usize>()
         + summary.map_or(0, |record| approx_tokens(&record.content));
+    // 基线把仍保留的正文都算 Resident：A 随 transcript 涨，B 只留窗口+摘要。
+    let resident_bytes: usize = records
+        .iter()
+        .map(|record| record.content.len())
+        .sum::<usize>()
+        + summary.map_or(0, |record| record.content.len());
     ContextDiagnostics {
         total_items: total,
         active_items: total,
@@ -184,6 +190,8 @@ pub(crate) fn active_diagnostics(
         archived_items: 0,
         tombstoned_items: dropped,
         approx_active_tokens,
+        resident_items: total,
+        resident_bytes,
         ..ContextDiagnostics::default()
     }
 }

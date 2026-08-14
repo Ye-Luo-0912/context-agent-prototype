@@ -22,7 +22,9 @@ use agent_contracts::{
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::wire::ServiceOp;
+use crate::wire::{
+    DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES, MIN_CONTEXT_SERVICE_MAX_FRAME_BYTES, ServiceOp,
+};
 use agent_process::{ProcessHost, ProcessHostConfig, resolve_program};
 
 /// Which engine the spawned service should run. The adapter is agnostic; the
@@ -61,8 +63,8 @@ pub struct ContextServiceConfig {
     /// Deadline for every request after the handshake, so a wedged service
     /// cannot hang a turn.
     pub request_timeout: Duration,
-    /// Hard cap on one response frame, so a broken service cannot grow the
-    /// adapter's memory without bound.
+    /// Hard cap on one request or response payload. The adapter passes the
+    /// same limit to the child so neither side can grow memory without bound.
     pub max_frame_bytes: usize,
 }
 
@@ -74,7 +76,7 @@ impl Default for ContextServiceConfig {
             store_dir: None,
             startup_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
-            max_frame_bytes: 16 * 1024 * 1024,
+            max_frame_bytes: DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES,
         }
     }
 }
@@ -101,6 +103,13 @@ pub struct ContextServiceAdapter {
 impl ContextServiceAdapter {
     /// Spawn the service, handshake, and return a ready adapter.
     pub async fn connect(config: &ContextServiceConfig) -> AgentResult<Self> {
+        if !(MIN_CONTEXT_SERVICE_MAX_FRAME_BYTES..=DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES)
+            .contains(&config.max_frame_bytes)
+        {
+            return Err(AgentError::InvalidRequest(format!(
+                "context service frame bound must be in {MIN_CONTEXT_SERVICE_MAX_FRAME_BYTES}..={DEFAULT_CONTEXT_SERVICE_MAX_FRAME_BYTES} bytes"
+            )));
+        }
         let program = config.resolve_program();
         let mut args = vec!["--engine".into(), config.engine.as_arg().into()];
         // The store must live under the workspace state dir, never a
@@ -109,6 +118,8 @@ impl ContextServiceAdapter {
             args.push("--store-dir".into());
             args.push(dir.to_string_lossy().into_owned());
         }
+        args.push("--max-frame-bytes".into());
+        args.push(config.max_frame_bytes.to_string());
         let host = ProcessHost::connect(ProcessHostConfig {
             program: program.clone(),
             args,
@@ -116,6 +127,13 @@ impl ContextServiceAdapter {
             startup_timeout: config.startup_timeout,
             request_timeout: config.request_timeout,
             max_frame_bytes: config.max_frame_bytes,
+            // Strict ping-pong with no system frames: one call moves at most
+            // a request frame plus the response frame.
+            max_call_bytes: config.max_frame_bytes.saturating_mul(2).saturating_add(2),
+            // No broker is installed for this boundary; the bound is a
+            // placeholder for the shared host's control-plane cap.
+            max_system_answer_bytes: 512 * 1024,
+            offered_features: Default::default(),
             // The context service is the runtime's own trusted sidecar; it
             // keeps the historical inherit-all behavior. The strict sandbox
             // is applied to *capabilities* (see agent-capability-process).

@@ -3,55 +3,72 @@
 //! in tests. A composition root constructs one `RuntimeServices` and hands
 //! it to the runtime; the runtime uses it for *all* scheduling — context
 //! maintenance and focus transactions, model calls, tool lifecycle and
-//! surface scheduling, config access — while the kernel it derives from the
-//! services stays authority-only (events, approval, effects, output, and
-//! the tool-execution wiring that combines them). This is the seam the
-//! incremental Core migration targets: the kernel is *given* its services,
-//! never constructs or schedules them, so a future Core stays a pure
-//! authority.
+//! surface scheduling, config access — while the CorePort it derives from
+//! the services stays authority-only (events, approval, effects, output, and
+//! the tool-execution wiring that combines them). The concrete Core stays
+//! private to `agent-core`; it never constructs or schedules Runtime services.
 
 use std::sync::Arc;
 
 use agent_contracts::{
     AgentError, AgentResult, ApprovalGate, ContextEngine, ContextGcReport, ContextIngress,
     ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
-    ContextStateTransition, EventJournal, FocusState, MaterializedContext, ModelCapabilities,
-    ModelEventSink, ModelOutput, ModelRequest, ModelTransport, ScopeId, ScopeKind, StorageGcReport,
-    TaskId, ToolCatalogEntry, ToolDispatcher, ToolSpec, ToolSurfaceSnapshot,
+    ContextStateTransition, EffectReconciler, EventJournal, FocusState, MaterializedContext,
+    ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest, ModelTransport, ScopeId,
+    ScopeKind, StorageGcReport, TaskId, ToolCatalogEntry, ToolDispatcher, ToolSpec,
+    ToolSurfaceSnapshot,
 };
-use agent_core::{CoreAuthority, CoreAuthorityConfig};
+use agent_core::{CoreAuthorityConfig, CorePort, build_core_port, try_build_core_port};
 use agent_workspace::Workspace;
 
 use crate::host::ServiceRegistry;
 
-/// The concrete implementations one run needs, plus the kernel derived from
+/// The concrete implementations one run needs, plus the CorePort derived from
 /// them. Scheduling — context maintenance, model calls, tool lifecycle —
-/// lives here in the runtime; the kernel is the authority facade
-/// (`services.kernel()`) the actor consults for events, approval, effects,
+/// lives here in the runtime; CorePort is the authority seam
+/// (`services.core_port()`) the actor consults for events, approval, effects,
 /// output and tool-execution wiring.
 pub struct RuntimeServices {
-    kernel: Arc<CoreAuthority>,
-    pub kernel_config: CoreAuthorityConfig,
-    pub context: Arc<dyn ContextEngine>,
-    pub model: Arc<dyn ModelTransport>,
-    pub tools: Arc<dyn ToolDispatcher>,
-    pub approval: Arc<dyn ApprovalGate>,
-    pub journal: Option<Arc<dyn EventJournal>>,
+    core: Arc<dyn CorePort>,
+    kernel_config: CoreAuthorityConfig,
+    context: Arc<dyn ContextEngine>,
+    model: Arc<dyn ModelTransport>,
+    tools: Arc<dyn ToolDispatcher>,
     /// Optional artifact destination (the run's workspace). When set, the
     /// actor persists each final assistant response in full before the
     /// bounded ContextItem is built, so the raw output survives ContextItem
     /// truncation (raw-evidence retention). `None` skips the persistence
     /// (tests and bare compositions).
-    pub artifact_workspace: Option<Arc<Workspace>>,
+    artifact_workspace: Option<Arc<Workspace>>,
+}
+
+/// Trusted, construction-time recovery dependencies for Core authority.
+/// Grouping these prevents the normal scheduling service constructor from
+/// growing one parameter per recovery adapter.
+pub struct AuthorityRecoveryServices {
+    operation_journal: Arc<dyn agent_contracts::OperationJournal>,
+    effect_reconciler: Option<Arc<dyn EffectReconciler>>,
+}
+
+impl AuthorityRecoveryServices {
+    pub fn new(
+        operation_journal: Arc<dyn agent_contracts::OperationJournal>,
+        effect_reconciler: Option<Arc<dyn EffectReconciler>>,
+    ) -> Self {
+        Self {
+            operation_journal,
+            effect_reconciler,
+        }
+    }
 }
 
 impl RuntimeServices {
     /// Build services directly (tests, standalone composition roots). The
-    /// kernel is derived once here, so every caller that later asks for
-    /// `kernel()` shares one authority instance (same run id, sequence and
+    /// CorePort is derived once here, so the actor and handle share one
+    /// authority instance (same run id, sequence and
     /// event channel). The model transport is a *scheduling* service: the
-    /// kernel (authority facade) does not call the provider, so it is not
-    /// part of the kernel's inputs.
+    /// Core authority does not call the provider, so it is not part of
+    /// Core's inputs.
     pub fn new(
         kernel_config: CoreAuthorityConfig,
         context: Arc<dyn ContextEngine>,
@@ -60,23 +77,52 @@ impl RuntimeServices {
         approval: Arc<dyn ApprovalGate>,
         journal: Option<Arc<dyn EventJournal>>,
     ) -> Self {
-        let kernel = Arc::new(CoreAuthority::new(
+        let core = build_core_port(
             kernel_config.clone(),
             context.clone(),
             tools.clone(),
-            approval.clone(),
-            journal.clone(),
-        ));
+            approval,
+            journal,
+        );
         Self {
-            kernel,
+            core,
             kernel_config,
             context,
             model,
             tools,
-            approval,
-            journal,
             artifact_workspace: None,
         }
+    }
+
+    /// Fallible construction for a Core configured with recoverable
+    /// operation authority. Journal recovery and the startup epoch fence
+    /// complete before the services become visible to Runtime.
+    pub fn try_new(
+        kernel_config: CoreAuthorityConfig,
+        context: Arc<dyn ContextEngine>,
+        model: Arc<dyn ModelTransport>,
+        tools: Arc<dyn ToolDispatcher>,
+        approval: Arc<dyn ApprovalGate>,
+        journal: Option<Arc<dyn EventJournal>>,
+        authority_recovery: AuthorityRecoveryServices,
+    ) -> AgentResult<Self> {
+        let core = try_build_core_port(
+            kernel_config.clone(),
+            context.clone(),
+            tools.clone(),
+            approval,
+            journal,
+            Some(authority_recovery.operation_journal),
+            authority_recovery.effect_reconciler,
+        )?;
+        Ok(Self {
+            core,
+            kernel_config,
+            context,
+            model,
+            tools,
+            artifact_workspace: None,
+        })
     }
 
     /// Resolve every service from the module host's typed registry. The
@@ -101,37 +147,72 @@ impl RuntimeServices {
         Ok(services)
     }
 
-    /// The kernel this run uses: the authority facade (events, approval,
-    /// effects, output) plus the tool-execution wiring. Shared by the actor
-    /// and the spawn seam — one instance per run.
-    pub fn kernel(&self) -> Arc<CoreAuthority> {
-        self.kernel.clone()
+    /// Resolve services while installing a recoverable Core authority WAL.
+    /// Recovery and the startup epoch fence must complete before Runtime is
+    /// exposed, so this path is explicitly fallible.
+    pub fn from_registry_with_operation_journal(
+        registry: &ServiceRegistry,
+        kernel_config: CoreAuthorityConfig,
+        authority_recovery: AuthorityRecoveryServices,
+    ) -> AgentResult<Self> {
+        let mut services = Self::try_new(
+            kernel_config,
+            registry.context_service()?,
+            registry.model_provider()?,
+            registry.tool_provider()?,
+            registry.approval_policy()?,
+            registry.event_store()?,
+            authority_recovery,
+        )?;
+        services.artifact_workspace = registry.artifact_store()?;
+        Ok(services)
+    }
+
+    /// Attach the workspace used for exact assistant-response artifacts.
+    ///
+    /// This consuming builder is intended for trusted, direct composition
+    /// roots that do not use [`Self::from_registry`]. Runtime consumers do
+    /// not receive the workspace handle back; only the actor's bounded
+    /// artifact-write path may access it.
+    pub fn with_artifact_workspace(mut self, workspace: Arc<Workspace>) -> Self {
+        self.artifact_workspace = Some(workspace);
+        self
+    }
+
+    pub(crate) fn artifact_workspace(&self) -> Option<&Workspace> {
+        self.artifact_workspace.as_deref()
+    }
+
+    /// Narrow authority port shared by the actor and spawn seam. It exposes
+    /// no concrete Core implementation or component-authority handles.
+    pub(crate) fn core_port(&self) -> Arc<dyn CorePort> {
+        self.core.clone()
     }
 
     // --- configuration (moved out of the kernel) ---
 
-    pub fn system_prompt(&self) -> String {
+    pub(crate) fn system_prompt(&self) -> String {
         self.kernel_config.system_prompt.clone()
     }
 
-    pub fn context_budget_tokens(&self) -> usize {
+    pub(crate) fn context_budget_tokens(&self) -> usize {
         self.kernel_config.context_budget_tokens
     }
 
-    pub fn max_tool_rounds(&self) -> usize {
+    pub(crate) fn max_tool_rounds(&self) -> usize {
         self.kernel_config.max_tool_rounds
     }
 
     // --- model scheduling (moved out of the kernel) ---
 
-    pub fn model_capabilities(&self) -> ModelCapabilities {
+    pub(crate) fn model_capabilities(&self) -> ModelCapabilities {
         self.model.capabilities()
     }
 
     /// One model round: stream the request to the provider. The result is a
     /// value for the actor to validate and commit — nothing is committed
     /// here.
-    pub async fn run_model_round(
+    pub(crate) async fn run_model_round(
         &self,
         request: ModelRequest,
         sink: &dyn ModelEventSink,
@@ -142,11 +223,11 @@ impl RuntimeServices {
     // --- context scheduling (moved out of the kernel) ---
 
     /// Context primitives: the actor decides when they run.
-    pub async fn context_ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+    pub(crate) async fn context_ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
         self.context.ingest(ingress).await
     }
 
-    pub async fn context_maintain(
+    pub(crate) async fn context_maintain(
         &self,
         trigger: ContextMaintenanceTrigger,
     ) -> AgentResult<ContextMaintenanceReport> {
@@ -156,7 +237,7 @@ impl RuntimeServices {
     /// Run a full GC pass (mark roots, sweep, reversible eviction). Called
     /// by the actor at turn boundaries; engines without a GC pass return an
     /// empty report.
-    pub async fn context_gc(&self) -> AgentResult<ContextGcReport> {
+    pub(crate) async fn context_gc(&self) -> AgentResult<ContextGcReport> {
         self.context.gc().await
     }
 
@@ -164,13 +245,13 @@ impl RuntimeServices {
     /// permanently deleted). The runtime schedules it only at explicit
     /// boundaries — task completion, checkpoint — never on the per-model
     /// hot path.
-    pub async fn context_storage_gc(&self) -> AgentResult<StorageGcReport> {
+    pub(crate) async fn context_storage_gc(&self) -> AgentResult<StorageGcReport> {
         self.context.storage_gc().await
     }
 
     /// Materialize the working set for one model request. The result is
     /// structured items; prompt assembly happens in the runtime actor.
-    pub async fn context_materialize(
+    pub(crate) async fn context_materialize(
         &self,
         query: ContextQuery,
     ) -> AgentResult<MaterializedContext> {
@@ -178,7 +259,7 @@ impl RuntimeServices {
     }
 
     /// Open a scope (runtime-driven, e.g. a tool scope at tool start).
-    pub async fn context_open_scope(
+    pub(crate) async fn context_open_scope(
         &self,
         kind: ScopeKind,
         parent: Option<ScopeId>,
@@ -187,14 +268,17 @@ impl RuntimeServices {
     }
 
     /// Close a scope the runtime opened; returns the close transitions.
-    pub async fn context_close_scope(
+    pub(crate) async fn context_close_scope(
         &self,
         scope_id: ScopeId,
     ) -> AgentResult<Vec<ContextStateTransition>> {
         self.context.close_scope(scope_id).await
     }
 
-    pub async fn inspect_context(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+    pub(crate) async fn inspect_context(
+        &self,
+        limit: usize,
+    ) -> AgentResult<Vec<ContextItemSummary>> {
         self.context.inspect(limit).await
     }
 
@@ -202,7 +286,7 @@ impl RuntimeServices {
     /// the runtime's `TaskManager` — re-focusing an existing task resumes
     /// its scopes in the context engine (suspension/resume is keyed on the
     /// task id), while a fresh task id opens a fresh task scope.
-    pub async fn set_focus(
+    pub(crate) async fn set_focus(
         &self,
         task_id: TaskId,
         goal: String,
@@ -225,7 +309,7 @@ impl RuntimeServices {
     /// Suspend the current focus without completing the task: the engine
     /// clears its focus and suspends the active task's scopes, so a later
     /// `set_focus` with the same task id resumes them.
-    pub async fn clear_focus(&self) -> AgentResult<ContextMaintenanceReport> {
+    pub(crate) async fn clear_focus(&self) -> AgentResult<ContextMaintenanceReport> {
         let checkpoint = self.context.checkpoint().await?;
         let transition = async {
             self.context.ingest(ContextIngress::FocusCleared).await?;
@@ -238,7 +322,7 @@ impl RuntimeServices {
             .await
     }
 
-    pub async fn pin(&self, content: String) -> AgentResult<ContextMaintenanceReport> {
+    pub(crate) async fn pin(&self, content: String) -> AgentResult<ContextMaintenanceReport> {
         let checkpoint = self.context.checkpoint().await?;
         let transition = async {
             self.context
@@ -256,7 +340,7 @@ impl RuntimeServices {
             .await
     }
 
-    pub async fn complete_current_task(
+    pub(crate) async fn complete_current_task(
         &self,
         task_id: TaskId,
         summary: String,
@@ -302,15 +386,15 @@ impl RuntimeServices {
 
     // --- tool lifecycle and surface scheduling (moved out of the kernel) ---
 
-    pub fn tool_specs(&self) -> Vec<ToolSpec> {
+    pub(crate) fn tool_specs(&self) -> Vec<ToolSpec> {
         self.tools.specs()
     }
 
-    pub fn tool_snapshot(&self) -> ToolSurfaceSnapshot {
+    pub(crate) fn tool_snapshot(&self) -> ToolSurfaceSnapshot {
         self.tools.snapshot()
     }
 
-    pub fn tool_may_omit_from_round(&self, name: &str) -> bool {
+    pub(crate) fn tool_may_omit_from_round(&self, name: &str) -> bool {
         self.tools.may_omit_from_round(name)
     }
 
@@ -318,20 +402,16 @@ impl RuntimeServices {
     /// names the active task's tool-demand set: those tools are never aged
     /// out by idle GC (TaskAnchor-driven tool roots), so a task that
     /// requires a tool keeps it available across rounds.
-    pub fn tool_gc(&self, roots: &[String]) {
+    pub(crate) fn tool_gc(&self, roots: &[String]) {
         self.tools.gc(roots);
     }
 
-    pub fn tool_catalog(&self) -> Vec<ToolCatalogEntry> {
+    pub(crate) fn tool_catalog(&self) -> Vec<ToolCatalogEntry> {
         self.tools.catalog()
     }
 
-    pub fn tool_load(&self, name: &str) -> AgentResult<()> {
+    pub(crate) fn tool_load(&self, name: &str) -> AgentResult<()> {
         self.tools.load_tool(name)
-    }
-
-    pub fn tool_unload(&self, name: &str) -> AgentResult<()> {
-        self.tools.unload_tool(name)
     }
 }
 
@@ -430,49 +510,45 @@ mod tests {
 
     #[test]
     fn services_share_one_kernel_and_round_trip_the_registry() {
+        let config = CoreAuthorityConfig::default();
+        let expected_system_prompt = config.system_prompt.clone();
+        let expected_context_budget_tokens = config.context_budget_tokens;
+        let context: Arc<dyn ContextEngine> = Arc::new(StubContext);
+        let model: Arc<dyn ModelTransport> = Arc::new(StubModel);
+        let tools: Arc<dyn ToolDispatcher> = Arc::new(StubTools);
+        let approval: Arc<dyn ApprovalGate> = Arc::new(PolicyApprovalGate::read_only());
         let services = RuntimeServices::new(
-            CoreAuthorityConfig::default(),
-            Arc::new(StubContext),
-            Arc::new(StubModel),
-            Arc::new(StubTools),
-            Arc::new(PolicyApprovalGate::read_only()),
+            config,
+            context.clone(),
+            model.clone(),
+            tools.clone(),
+            approval.clone(),
             None,
         );
-        // The kernel is derived once: two `kernel()` calls share one
+        // The Core port is derived once: two clones share one
         // authority instance (same run id), so a subscriber on one sees
         // the other's events.
-        let kernel = services.kernel();
-        assert_eq!(kernel.run_id(), services.kernel().run_id());
-        assert_eq!(
-            services.system_prompt(),
-            services.kernel_config.system_prompt
-        );
+        let core = services.core_port();
+        assert_eq!(core.run_id(), services.core_port().run_id());
+        assert_eq!(services.system_prompt(), expected_system_prompt);
         assert_eq!(
             services.context_budget_tokens(),
-            services.kernel_config.context_budget_tokens
+            expected_context_budget_tokens
         );
 
         // A registry that publishes the same services resolves them back.
         let mut registry = ServiceRegistry::new();
         registry
-            .register(
-                crate::host::CONTEXT_SERVICE,
-                "test",
-                services.context.clone(),
-            )
+            .register(crate::host::CONTEXT_SERVICE, "test", context)
             .unwrap();
         registry
-            .register(crate::host::MODEL_PROVIDER, "test", services.model.clone())
+            .register(crate::host::MODEL_PROVIDER, "test", model)
             .unwrap();
         registry
-            .register(crate::host::TOOL_PROVIDER, "test", services.tools.clone())
+            .register(crate::host::TOOL_PROVIDER, "test", tools)
             .unwrap();
         registry
-            .register(
-                crate::host::APPROVAL_POLICY,
-                "test",
-                services.approval.clone(),
-            )
+            .register(crate::host::APPROVAL_POLICY, "test", approval)
             .unwrap();
         let resolved = RuntimeServices::from_registry(&registry, CoreAuthorityConfig::default())
             .expect("every required service is present");

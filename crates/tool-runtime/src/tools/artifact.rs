@@ -71,9 +71,10 @@ impl Tool for ArtifactReadTool {
 
     async fn execute(
         &self,
-        _run_id: RunId,
+        run_id: RunId,
         call_id: &str,
         arguments: Value,
+        _effect_context: Option<agent_contracts::OperationEffectContext>,
         _cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
         let args: ArtifactReadArgs = serde_json::from_value(arguments)
@@ -90,8 +91,10 @@ impl Tool for ArtifactReadTool {
         // The reference resolves to a cleaned relative path confined to the
         // run artifact store; the open itself goes through the pinned
         // directory-handle descent, so a link swap cannot redirect the read.
-        let relative = self.workspace.artifact_relative_path(&args.reference)?;
-        let confined = self.workspace.confined_open_read(&relative).await?;
+        let (_normalized, confined) = self
+            .workspace
+            .open_artifact_for_run(&args.reference, run_id)
+            .await?;
         let display_path = confined.display().to_path_buf();
 
         // Bounded read: artifacts may be append-only logs that grow between
@@ -174,14 +177,15 @@ mod tests {
         }
     }
 
-    async fn tool_with_artifact() -> (ArtifactReadTool, tempfile::TempDir, String) {
+    async fn tool_with_artifact() -> (ArtifactReadTool, tempfile::TempDir, RunId, String) {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
         let reference = workspace
-            .write_artifact(RunId::new(), "grep", "txt", b"alpha\nbeta\ngamma\ndelta\n")
+            .write_artifact(run_id, "grep", "txt", b"alpha\nbeta\ngamma\ndelta\n")
             .await
             .unwrap();
-        (ArtifactReadTool::new(workspace), dir, reference)
+        (ArtifactReadTool::new(workspace), dir, run_id, reference)
     }
 
     fn request(run_id: RunId, args: Value) -> ToolExecutionRequest {
@@ -192,14 +196,14 @@ mod tests {
                 name: "artifact.read".into(),
                 arguments: args,
             },
+            effect_context: None,
             cancel: CancellationToken::new(),
         }
     }
 
     #[tokio::test]
     async fn reads_a_bounded_range_with_paging_metadata() {
-        let (tool, _dir, reference) = tool_with_artifact().await;
-        let run_id = RunId::new();
+        let (tool, _dir, run_id, reference) = tool_with_artifact().await;
 
         // Default range is lines 1..=200: the whole 4-line artifact.
         let output = tool
@@ -209,6 +213,7 @@ mod tests {
                 request(run_id, json!({"reference": reference}))
                     .call
                     .arguments,
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -231,6 +236,7 @@ mod tests {
                 )
                 .call
                 .arguments,
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -245,8 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_invalid_ranges_and_non_artifact_references() {
-        let (tool, _dir, reference) = tool_with_artifact().await;
-        let run_id = RunId::new();
+        let (tool, _dir, run_id, reference) = tool_with_artifact().await;
 
         let bad_range = tool
             .execute(
@@ -258,6 +263,7 @@ mod tests {
                 )
                 .call
                 .arguments,
+                None,
                 CancellationToken::new(),
             )
             .await;
@@ -273,6 +279,7 @@ mod tests {
                 )
                 .call
                 .arguments,
+                None,
                 CancellationToken::new(),
             )
             .await;
@@ -285,6 +292,7 @@ mod tests {
                 request(run_id, json!({"reference": "artifact://src/main.rs"}))
                     .call
                     .arguments,
+                None,
                 CancellationToken::new(),
             )
             .await;
@@ -300,6 +308,7 @@ mod tests {
                 request(run_id, json!({"reference": "https://example.com/x"}))
                     .call
                     .arguments,
+                None,
                 CancellationToken::new(),
             )
             .await;
@@ -308,20 +317,46 @@ mod tests {
 
     #[tokio::test]
     async fn missing_artifact_is_a_clean_error() {
-        let (tool, _dir, _reference) = tool_with_artifact().await;
-        let run_id = RunId::new();
+        let (tool, _dir, run_id, _reference) = tool_with_artifact().await;
         let output = tool
             .execute(
                 run_id,
                 "c",
                 request(
                     run_id,
-                    json!({"reference": format!("artifact://.focus-agent/artifacts/{run_id}/gone.txt")}),
+                    json!({"reference": format!(
+                        "artifact://v1/{run_id}/grep/0000000000000000000000000000000000000000000000000000000000000000"
+                    )}),
                 )
                 .call.arguments,
+                None,
                 CancellationToken::new(),
             )
             .await;
         assert!(output.is_err(), "a missing artifact must error cleanly");
+    }
+
+    #[tokio::test]
+    async fn refuses_another_runs_artifact() {
+        let (tool, _dir, owner_run, reference) = tool_with_artifact().await;
+        let other_run = RunId::new();
+
+        let output = tool
+            .execute(
+                other_run,
+                "c",
+                request(other_run, json!({"reference": reference}))
+                    .call
+                    .arguments,
+                None,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert_ne!(owner_run, other_run);
+        assert!(
+            output.is_err(),
+            "artifact refs are scoped to their owning run"
+        );
     }
 }

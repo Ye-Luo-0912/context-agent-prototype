@@ -36,6 +36,7 @@ pub(crate) fn next_residency(
     turn: u64,
     focus: Option<&FocusState>,
     hot_entities: &[String],
+    latest_file_body: bool,
 ) -> ResidencyOutcome {
     if item.retention == ContextRetention::Pinned || item.scope == ContextScope::Pinned {
         return ResidencyOutcome {
@@ -52,6 +53,20 @@ pub(crate) fn next_residency(
             semantic: None,
             reason: "semantically dead: excluded from active attention".to_string(),
             relevance: 0.0,
+        };
+    }
+
+    // 当前任务最近文件的最新正文：工具帧关闭后仍要能进工作集。不能走
+    // 「ephemeral 被模型消费即归档」——归档后打分过不了 active 阈值，
+    // 循环重构里换文件的下一回合就会丢掉上一份文件正文。
+    if latest_file_body {
+        return ResidencyOutcome {
+            attention: AttentionState::Active,
+            semantic: None,
+            reason: format!(
+                "latest body of a recent file in the active task; kept through turn {turn}"
+            ),
+            relevance: item.relevance,
         };
     }
 

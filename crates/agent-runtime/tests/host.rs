@@ -99,6 +99,7 @@ impl ToolDispatcher for StubTools {
             state: ToolLifecycle::Available,
             owner: "builtin".into(),
             description: "stub builtin tool".into(),
+            risk: agent_contracts::ToolRisk::ReadOnly,
         }]
     }
     async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -489,14 +490,37 @@ impl Capability for ContextCapturingCapability {
 }
 
 async fn execute(dispatcher: Arc<dyn ToolDispatcher>, tool: &str) -> ToolOutput {
+    let run_id = RunId::new();
+    let call = ToolCall {
+        id: "c1".into(),
+        name: tool.into(),
+        arguments: json!({}),
+    };
+    // This helper deliberately exercises the dispatcher without spawning a
+    // RuntimeActor. Mirror the Core-owned dispatch shape for effectful test
+    // tools; production callers receive this context only after Core has
+    // persisted the operation/effect identity.
+    let effect_context = dispatcher.inspect_tool(tool).and_then(|spec| {
+        (spec.risk != ToolRisk::ReadOnly).then(|| agent_contracts::OperationEffectContext {
+            identity: agent_contracts::ToolOperationIdentity {
+                run_id,
+                task_id: None,
+                turn_id: agent_contracts::TurnId::new(),
+                scope_id: None,
+                operation_id: agent_contracts::OperationId::new(),
+                generation: 1,
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest: agent_contracts::ArgumentDigest::from_json(&call.arguments),
+            },
+            effect_id: agent_contracts::EffectId::new(),
+        })
+    });
     let outcome = dispatcher
         .execute(ToolExecutionRequest {
-            run_id: RunId::new(),
-            call: ToolCall {
-                id: "c1".into(),
-                name: tool.into(),
-                arguments: json!({}),
-            },
+            run_id,
+            call,
+            effect_context,
             cancel: CancellationToken::new(),
         })
         .await
@@ -957,6 +981,7 @@ async fn execute_raw(dispatcher: Arc<dyn ToolDispatcher>, tool: &str) -> String 
                 name: tool.into(),
                 arguments: json!({}),
             },
+            effect_context: None,
             cancel: CancellationToken::new(),
         })
         .await
@@ -1345,6 +1370,7 @@ async fn unified_search_pages_and_spills_to_the_workspace() {
                 name: agent_contracts::CAPABILITY_MANAGE.into(),
                 arguments: json!({"op": "search", "limit": 2}),
             },
+            effect_context: None,
             cancel: CancellationToken::new(),
         })
         .await
@@ -1368,6 +1394,73 @@ async fn unified_search_pages_and_spills_to_the_workspace() {
         output.metadata["total"], 4,
         "fs.read + three capability tools"
     );
+}
+
+#[tokio::test]
+async fn unified_search_matches_description_and_reports_not_found() {
+    let dispatcher = CapabilityAwareDispatcher::new(
+        Arc::new(StubTools),
+        Arc::new(agent_runtime::CapabilityRegistry::new()),
+    );
+    let before: Vec<_> = dispatcher
+        .snapshot()
+        .specs
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
+    let search = dispatcher
+        .execute(ToolExecutionRequest {
+            run_id: RunId::new(),
+            call: ToolCall {
+                id: "c".into(),
+                name: agent_contracts::CAPABILITY_MANAGE.into(),
+                arguments: json!({"op": "search", "query": "STUB BUILTIN"}),
+            },
+            effect_context: None,
+            cancel: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+    let search = match search {
+        ToolOutcome::Value(output) => output,
+        other => panic!("expected value, got {other:?}"),
+    };
+    assert!(search.ok);
+    assert!(
+        search.model_content.contains("fs.read"),
+        "capability search must match description case-insensitively: {}",
+        search.model_content
+    );
+    let after: Vec<_> = dispatcher
+        .snapshot()
+        .specs
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
+    assert_eq!(
+        before, after,
+        "search must not load a tool onto the surface"
+    );
+
+    let inspect = dispatcher
+        .execute(ToolExecutionRequest {
+            run_id: RunId::new(),
+            call: ToolCall {
+                id: "c2".into(),
+                name: agent_contracts::CAPABILITY_MANAGE.into(),
+                arguments: json!({"op": "inspect", "name": "missing.tool"}),
+            },
+            effect_context: None,
+            cancel: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+    let inspect = match inspect {
+        ToolOutcome::Value(output) => output,
+        other => panic!("expected value, got {other:?}"),
+    };
+    assert!(!inspect.ok);
+    assert_eq!(inspect.metadata["miss"], "not_found");
 }
 
 /// A capability whose `start()` is slow on purpose and fails on the first
@@ -1684,6 +1777,10 @@ async fn undeclared_permissions_receive_no_handle() {
         handle.read("granted.txt").await.unwrap(),
         b"granted content"
     );
+    let bounded = handle.read_bounded("granted.txt", 7).await.unwrap();
+    assert_eq!(bounded.content, b"granted");
+    assert_eq!(bounded.byte_len, b"granted content".len() as u64);
+    assert!(bounded.truncated);
 
     // 3. Read-only declared -> a read-only handle: reads work, both write
     //    paths are blocked with an error naming the missing grant.
@@ -1694,6 +1791,15 @@ async fn undeclared_permissions_receive_no_handle() {
         handle.read("granted.txt").await.unwrap(),
         b"granted content",
         "the read-only handle must still read the workspace"
+    );
+    assert_eq!(
+        handle
+            .read_bounded("granted.txt", 1024)
+            .await
+            .unwrap()
+            .content,
+        b"granted content",
+        "the read-only wrapper must preserve bounded-read access"
     );
     let error = handle.write("x.txt", b"x").await.unwrap_err().to_string();
     assert!(
