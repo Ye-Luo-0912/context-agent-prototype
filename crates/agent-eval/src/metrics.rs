@@ -112,7 +112,7 @@ pub struct RunMetrics {
     pub access_fetches: u64,
     pub access_admits: u64,
     pub access_consumption_acks: u64,
-    /// 有界压缩器累计 provider 输入（diagnostics 快照，B 折叠 / C 蒸馏）。
+    /// 有界压缩器累计 provider 输入（ContextMaintained 本轮花费之和）。
     pub compaction_input_tokens: u64,
     pub compaction_output_tokens: u64,
 }
@@ -220,6 +220,13 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             RuntimeEvent::ContextMaintained { report, .. } => {
                 metrics.lifecycle_transitions += report.transitions.len() as u64;
                 snapshot_access(&mut metrics, &report.diagnostics);
+                // 报告字段是本轮花费；diagnostics 快照会被随后的 GC 清零。
+                metrics.compaction_input_tokens = metrics
+                    .compaction_input_tokens
+                    .saturating_add(report.compaction_input_tokens);
+                metrics.compaction_output_tokens = metrics
+                    .compaction_output_tokens
+                    .saturating_add(report.compaction_output_tokens);
             }
             RuntimeEvent::ContextGc { report } => {
                 metrics.gc_evictions += report.evicted as u64;
@@ -342,8 +349,6 @@ fn snapshot_access(metrics: &mut RunMetrics, diagnostics: &agent_contracts::Cont
     metrics.access_fetches = diagnostics.access_fetches;
     metrics.access_admits = diagnostics.access_admits;
     metrics.access_consumption_acks = diagnostics.access_consumption_acks;
-    metrics.compaction_input_tokens = diagnostics.compaction_input_tokens;
-    metrics.compaction_output_tokens = diagnostics.compaction_output_tokens;
 }
 
 /// The nearest-rank percentile of a sorted sample: index
@@ -820,6 +825,43 @@ mod tests {
         ];
         let metrics = aggregate_metrics(&events);
         assert_eq!(metrics.turns, 1);
+    }
+
+    #[test]
+    fn compaction_pass_cost_survives_a_later_zero_gc_snapshot() {
+        let run = RunId::new();
+        let events = vec![
+            envelope(
+                run,
+                1,
+                RuntimeEvent::ContextMaintained {
+                    trigger: ContextMaintenanceTrigger::AfterModel,
+                    report: ContextMaintenanceReport {
+                        compaction_input_tokens: 80,
+                        compaction_output_tokens: 20,
+                        diagnostics: ContextDiagnostics {
+                            compaction_input_tokens: 80,
+                            compaction_output_tokens: 20,
+                            ..ContextDiagnostics::default()
+                        },
+                        ..ContextMaintenanceReport::default()
+                    },
+                },
+            ),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::ContextGc {
+                    report: ContextGcReport {
+                        diagnostics: ContextDiagnostics::default(),
+                        ..ContextGcReport::default()
+                    },
+                },
+            ),
+        ];
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.compaction_input_tokens, 80);
+        assert_eq!(metrics.compaction_output_tokens, 20);
     }
 
     #[test]

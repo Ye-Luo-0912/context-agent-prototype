@@ -354,6 +354,39 @@ fn render_cell(dir: &Path) -> anyhow::Result<String> {
         summary.broadcast_lagged,
         summary.usage_incomplete,
     ));
+    out.push_str(&format!(
+        "           forgotten={} recovered={} reread={} failed={} compact={}/{}\n",
+        summary
+            .metrics
+            .get("forgotten_items")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        summary
+            .metrics
+            .get("recovered_items")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        summary
+            .metrics
+            .get("repeated_fs_reads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        summary
+            .metrics
+            .get("failed_tool_outputs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        summary
+            .metrics
+            .get("compaction_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        summary
+            .metrics
+            .get("compaction_output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+    ));
     if let Some(error) = &summary.error {
         out.push_str(&format!("           error={error}\n"));
     }
@@ -548,6 +581,8 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
         "search_empty": metrics.search_empty,
         "recovered_items": metrics.recovered_items,
         "forgotten_items": metrics.forgotten_items,
+        "compaction_input_tokens": metrics.compaction_input_tokens,
+        "compaction_output_tokens": metrics.compaction_output_tokens,
         "final_resident_bytes": metrics.final_resident_bytes,
         "peak_resident_bytes": metrics.peak_resident_bytes,
         "materialize_rounds": metrics.materialize_rounds,
@@ -713,6 +748,7 @@ mod tests {
         assert_eq!(summary.tools[0].name, "fs.read");
         let shown = render_cell(&cell).unwrap();
         assert!(shown.contains("fs.read"), "{shown}");
+        assert!(shown.contains("compact=0/0"), "{shown}");
         let report: crate::workload::HiddenReport =
             serde_json::from_str(&fs::read_to_string(cell.join("verify.json")).unwrap()).unwrap();
         assert_eq!(report.schema, crate::workload::VERIFY_SCHEMA);

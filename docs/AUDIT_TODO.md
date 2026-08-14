@@ -1652,7 +1652,8 @@ Required closure:
    **Partial 2026-08-15 (EVAL-01.5.p1c).** Catalog-wide search/inspect;
    prompt stuffing (cache/optional/how-to) was removed rather than
    replaced with a longer tutorial. Extra C rounds are still a treatment
-   effect to re-measure; scoring stays frozen.
+   effect; P1 n=1 file-only + recall is collected and leftover extra
+   rounds are mixed, not universal. Scoring stays frozen.
    **Decision 2026-08-15.** Smoke `FIXTURES` stay interpreter-free
    file-content asserts. Executable hidden stays on the suite pack
    (overlay + commands; SWE-bench docker opt-in). Do not bind the cheap
@@ -1670,8 +1671,10 @@ closed. M12/M13 remain independent trusted-execution blockers.
   wall-time cost;
   **Partial 2026-08-15.** Live B/C inject `ModelBackedCompactor`; CI
   rolling keeps `ScriptedCompactor`. Compactor tokens are on diagnostics
-  / `manager_token_cost` / rendered metrics. Actor/recall/store/schema
-  wall-time accounting was already on the event stream.
+  / `manager_token_cost` / rendered metrics. Cell `compact=in/out` now
+  sums `ContextMaintained` per-pass costs so a later zero GC snapshot
+  cannot wipe B fold. Actor/recall/store/schema wall-time accounting
+  was already on the event stream.
 - audit process parity whenever `ContextEngine` gains a method;
 - compare dynamic, rolling and append-only engines on these scenarios:
 

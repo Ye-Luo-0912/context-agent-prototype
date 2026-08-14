@@ -645,8 +645,15 @@ current-file / `handle_21` slice is landed (active-task latest file body,
    is catalog-wide. System prompt and assembler headers are labels/facts,
    not retrieval tutorials. Extra rounds remain a treatment effect to
    re-measure. Smoke fixtures stay file-content; executable hidden stays
-   on the suite pack. Do not retune scoring. Do not amend n. Do not mix
-   P0/P1 ITT tables.
+   on the suite pack. **P1 n=1 rehydration diag (2026-08-15):** 9
+   file-only + recall in `target/eval-evidence/rehydration-diag`. pep616
+   C−A 19/27→15/20 vs 13/16; js-ms-minutes C extra tools gone; recall
+   extra rounds remain (21/25 vs A 15/12). Mixed leftover on the rest
+   (js-ms-negative C 14r vs A 5r; rust-jcs C fewer). Empty-assistant
+   flake on js-ms-minutes B, openai-wire B, rust-grep C. Cell compact
+   harvest now sums `ContextMaintained` pass costs (old cells still
+   show `compact=0/0`). Next: P1 SWE-bench n=1 cohort in a new dir.
+   Do not retune scoring. Do not amend n. Do not mix P0/P1 ITT tables.
 
 Until those artifacts and the predeclared interval exist, the live tables are
 diagnostic observations rather than independently reproducible acceptance

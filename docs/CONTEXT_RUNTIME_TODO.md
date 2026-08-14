@@ -107,7 +107,7 @@ boundedness, and integrity rather than replace it with transcript history.
 | Immediate tool signal | Implemented (`CTX-08`) | Tool commit emits a bounded, body-free `WorkingSetSignal`; discovered entities heat related context before the immediately following model round while the tool body remains in `TurnFrame` until finalization. |
 | Final model-consumption acknowledgement | Implemented (`CTX-07`) | `materialize` returns a non-consuming preview. After final packing, only a successful non-stale ModelOutput commits a bounded `ContextConsumptionAck` with the exact inline/external ids; failure paths do not reinforce. Fit-before-top-K, bounded/charged external refs, and bounded candidate generation are covered; workload cost evaluation remains separate. |
 | Prompt authority separation | Implemented (`CORE-05`) | `PromptAssembler` keeps policy in System, renders selected history/external refs as delimited low-authority User observations, and preserves live file/tool output as Tool-role content. Injection regressions cover all three paths. |
-| Real evaluation | Partial | Unit/property coverage is strong and the 10,000-turn residency regression exists. `agent-eval --compare-live` is the live paired coding harness (real model, independent workspaces, hidden verify). EVAL-01.1 writes per-cell bundles; EVAL-01.1b persists replayable file-content hidden asserts. EVAL-01.2 freezes the clustered C−A estimator; EVAL-01.3 re-freezes the gate at 300×3 / −5 pp (historical 30×3 is underpowered). EVAL-01.4e freezes the 509-task pack; EVAL-01.3b sets `SUITE_FROZEN=true` and declares retrieval secondaries in SPEC (no gate n/margin change). EVAL-01.3c locks the exact 300 acceptance ids and makes token diagnostics honor `cost_eligible`. EVAL-01.5 freezes the 30-task calibration sample; a file-only 9×3 live spend is in `crates/agent-eval/evidence/pilot-30` (`decision=pilot`). EVAL-01.5.p1 splits send vs pack and raises the shared live round cap to 48; remaining P0 SWE-bench (24k/12) is skipped as a floor-effect host. EVAL-01.5.p1b lands the shared model-backed bounded compactor for live B and C `TaskCompleted` distillation (CI keeps the scripted digest). EVAL-01.5.p1c is the retrieval-trust slice (catalog-wide search/inspect, trusted packed-set prompt); extra C rounds are still a treatment effect to re-measure, not closed. Next: executable hidden tests, then a P1 SWE-bench cohort. Do not mix P0/P1 ITT tables. The 300×3 non-inferiority run is still open. |
+| Real evaluation | Partial | Unit/property coverage is strong and the 10,000-turn residency regression exists. `agent-eval --compare-live` is the live paired coding harness (real model, independent workspaces, hidden verify). EVAL-01.1 writes per-cell bundles; EVAL-01.1b persists replayable file-content hidden asserts. EVAL-01.2 freezes the clustered C−A estimator; EVAL-01.3 re-freezes the gate at 300×3 / −5 pp (historical 30×3 is underpowered). EVAL-01.4e freezes the 509-task pack; EVAL-01.3b sets `SUITE_FROZEN=true` and declares retrieval secondaries in SPEC (no gate n/margin change). EVAL-01.3c locks the exact 300 acceptance ids and makes token diagnostics honor `cost_eligible`. EVAL-01.5 freezes the 30-task calibration sample; a file-only 9×3 live spend is in `crates/agent-eval/evidence/pilot-30` (`decision=pilot`). EVAL-01.5.p1 splits send vs pack and raises the shared live round cap to 48; remaining P0 SWE-bench (24k/12) is skipped as a floor-effect host. EVAL-01.5.p1b lands the shared model-backed bounded compactor for live B and C `TaskCompleted` distillation (CI keeps the scripted digest). EVAL-01.5.p1c is the retrieval-trust slice (catalog-wide search/inspect, trusted packed-set prompt); extra C rounds are still a treatment effect. P1 n=1 file-only + recall is collected (`rehydration-diag`); leftover extra rounds are mixed, not gone. Compaction cell harvest now sums `ContextMaintained` pass costs. Next: a P1 SWE-bench n=1 cohort (new dir). Do not mix P0/P1 ITT tables. The 300×3 non-inferiority run is still open. |
 
 This table is the baseline for the work queue below. A checked defect in
 `AUDIT_TODO.md` must not be reopened here under a new name.
@@ -1090,7 +1090,17 @@ Phase 4 below; this list does not duplicate checkbox state):
    EVAL-01.5.p1c:** catalog-wide search/inspect; system prompt and
    assembler headers stay labels/facts, not retrieval tutorials. Smoke
    fixtures stay file-content; executable hidden stays on the suite
-   pack. Next: a P1 SWE-bench cohort. Do not mix P0 and P1 ITT tables.
+   pack. **P1 n=1 rehydration diag (2026-08-15):** 9 file-only +
+   `recall_after_fix` collected in `target/eval-evidence/rehydration-diag`
+   (not the P0 81-cell table). pep616 C extra rounds/tools converged;
+   js-ms-minutes C extra tools gone; recall extra rounds remain (21r/25t
+   vs A 15r/12t). Mixed leftover: js-ms-negative C 14r vs A 5r; rust-jcs
+   C fewer (4r vs A 8r). Empty-assistant flake (`usage_incomplete`, 0
+   tokens): js-ms-minutes B, openai-wire B, rust-grep C — not a compact
+   crash, not C vs A. Catalog search almost unused. Cell `compact=0/0`
+   was a harvest bug (later GC snapshot wiped B fold); metrics now sum
+   `ContextMaintained` per-pass costs. Next: a P1 SWE-bench n=1 cohort
+   in a new evidence dir. Do not mix P0 and P1 ITT tables.
 3. Model-backed bounded compaction B (`EVAL-01` closure item 5): B must
    summarize with a model under a budget, with its compactor cost
    counted; the scripted digest remains a deterministic CI arm only.
@@ -1139,6 +1149,22 @@ Phase 4 below; this list does not duplicate checkbox state):
    empty search copy is a catalog miss, not "no externalized items".
    Extra live rounds remain a treatment effect to re-measure. Do not
    amend SPEC n/margin.
+   **Re-measure 2026-08-15 (n=1, P1 host, not an ITT table).** Evidence
+   in `target/eval-evidence/rehydration-diag`. pep616 C−A rounds/tools
+   19/27 vs 12/11 → 15/20 vs 13/16 (the extreme inflation converged).
+   js-ms C extra tools gone (20→12, both 9 rounds). `recall_after_fix`
+   extra rounds did not disappear (17/21 → 21/25 vs A 15/12); leftover
+   is failed `git.status` / `shell.exec` and extra rereads, and C made
+   zero catalog searches. Empty-assistant flake (`usage_incomplete`, 0
+   tokens): js-ms-minutes B, openai-wire B, rust-grep C — provider miss,
+   not a compact crash. **File-only n=1 slice complete (2026-08-15).**
+   Same dir, remaining 7 plus the first 3: C extra rounds persist on
+   recall and js-ms-negative-parse; gone on openai-wire / itertools /
+   symbols (C≈A); rust-jcs C used fewer rounds. uuid-parity still 0/3
+   (same as P0). Compaction harvest now sums maintenance pass costs so
+   a later zero GC snapshot cannot wipe B fold. Do not re-run file-only
+   into the P0 81-cell table. Next: P1 SWE-bench n=1 cohort (new dir,
+   not `pilot-30`). Do not amend n.
 5. Executable hidden build/test verification for fixtures (`EVAL-01`
    closure item 5, first half).
    **Decision 2026-08-15.** Do not bind the five smoke `FIXTURES` to
@@ -1691,8 +1717,15 @@ current slice above.)
   an end-to-end token-saving claim and does not close M15.
   **Follow-up 2026-08-15 (EVAL-01.5.p1c).** Catalog-wide search/inspect
   landed; prompt stuffing (cache/optional/how-to) was removed rather
-  than replaced with a longer tutorial. Extra rounds are still a
-  treatment effect to re-measure; no new live spend in this slice.
+  than replaced with a longer tutorial.
+  **Re-measure 2026-08-15 (n=1).** pep616 extreme C inflation converged;
+  js-ms C extra tools gone; `recall_after_fix` extra rounds remain
+  (failed probes/rereads, no catalog search). File-only 9 + recall
+  complete under P1 n=1; leftover extra rounds are mixed (recall,
+  js-ms-negative) not universal. Empty-assistant flake on three cells.
+  Next: P1 SWE-bench n=1 cohort. Do not mix with the P0 81-cell table.
+  Extra rounds are still a treatment effect. No scoring change. Does
+  not close M15.
 
 ## Acceptance properties
 
