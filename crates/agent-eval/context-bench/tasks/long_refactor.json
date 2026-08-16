@@ -73,5 +73,11 @@
         "now"
       ]
     }
+  ],
+  "hidden_commands": [
+    {
+      "name": "token_now",
+      "script": "token_now.py"
+    }
   ]
 }

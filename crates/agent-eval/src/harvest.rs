@@ -8,6 +8,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -151,7 +152,28 @@ pub fn instance_id_from_suite_id(suite_id: &str) -> Option<&str> {
 }
 
 pub(crate) fn python_bin() -> String {
-    std::env::var("AGENT_EVAL_PYTHON").unwrap_or_else(|_| "python".into())
+    static PYTHON: OnceLock<String> = OnceLock::new();
+    PYTHON
+        .get_or_init(|| {
+            if let Ok(value) = std::env::var("AGENT_EVAL_PYTHON") {
+                return value;
+            }
+            for candidate in ["python", "python3"] {
+                if Command::new(candidate)
+                    .arg("-c")
+                    .arg("import sys")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|status| status.success())
+                    .unwrap_or(false)
+                {
+                    return candidate.to_string();
+                }
+            }
+            "python".to_string()
+        })
+        .clone()
 }
 
 fn gold_launcher() -> PathBuf {

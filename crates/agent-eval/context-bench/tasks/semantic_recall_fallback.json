@@ -31,15 +31,11 @@
     },
     {
       "op": "user",
-      "text": "Now implement the missing-user policy in load_user."
+      "text": "Now implement the missing-user policy you were given at the start."
     },
     {
       "op": "user",
-      "text": "cached_load must use the same fallback."
-    },
-    {
-      "op": "user",
-      "text": "Final: anonymous fallback, no lookup(id)? propagation."
+      "text": "cached_load should call load_user rather than lookup. Do not invent a second error path."
     }
   ],
   "hidden": [

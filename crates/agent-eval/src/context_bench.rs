@@ -2,8 +2,7 @@
 //!
 //! Asks where the dynamic context runtime helps or hurts a coding agent.
 //! Independent of `agent-eval.analysis.v2` (300×3 ITT stays frozen and parked).
-//! This schema is not yet hash-frozen; freeze after the pack and report fields
-//! are stable under CI smoke.
+//! SPEC and pack digest are hash-frozen; changing either fails CI.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -24,7 +23,7 @@ pub const WAVE1_CELLS: usize = WAVE1_AC_CELLS + WAVE1_ROLLING_CELLS;
 /// Rolling is an attribution baseline, not a primary contrast.
 pub const ROLLING_TASKS: [&str; 3] = ["horizon_long", "semantic_recall", "task_switch"];
 
-/// Pre-registered text. Do not treat the hash as frozen until a later commit.
+/// Pre-registered text. Changing any byte changes `spec_sha256`.
 pub const SPEC: &str = "\
 schema=agent-eval.context-bench.v1
 question=where does the dynamic context runtime help or hurt a coding agent
@@ -38,7 +37,18 @@ resume_point=not implemented; task_switch measures whether suspend/activate is e
 scoring=frozen; do not retune from this bench
 analysis_v2=untouched; 300x3 ITT parked until this bench says C is worth continuing
 live_rounds=48 shared A/B/C; length comes from staged user turns, not a higher C cap
+evidence_identity=task_sha256 covers json+seed+golden+checker; pack_digest covers pack.json+spec+tasks
+provider_tokens=coding_in+coding_out+compactor_in+compactor_out
+report=delta abs and pct; actual rounds; peak and final resident
+hidden_live=missing verifier is preflight fail
+frozen=true
 ";
+
+/// Filled after the deterministic pack self-check is green.
+pub const FROZEN_SPEC_SHA256: &str =
+    "12dc8e22f3a649b619f719f4a18e0cf73486a668aded4912ca93a469b22bc902";
+pub const FROZEN_PACK_DIGEST: &str =
+    "00a6079ee601cd0004060acb168603c80d5d77dc62e77caf1782eccd88e2d38e";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -206,6 +216,8 @@ pub fn wave1_cell_count(pack: &BenchPack) -> usize {
 pub fn render_pack(pack: &BenchPack) -> String {
     let mut out = String::new();
     out.push_str(&format!("schema={SCHEMA}\n"));
+    out.push_str(&format!("spec_sha256={}\n", spec_sha256()));
+    out.push_str(&format!("pack_digest={}\n", pack_digest(pack)));
     out.push_str("decision_instrument=context-bench (not 300x3 ITT, not the 30-task pilot)\n");
     out.push_str(&format!(
         "wave1_cells={} ({} A/C + {} rolling)\n",
@@ -295,7 +307,11 @@ pub fn evaluate_task(pack: &BenchPack, task: &BenchTask, root: &Path) -> HiddenR
             expect_exit: 0,
         };
         let mut result = suite::run_hidden_command(root, &spec);
-        skip_missing_python(&command.name, &mut result);
+        if !result.passed && result.stderr.is_empty() {
+            result.stderr = format!("{} failed", command.name);
+        } else if !result.passed {
+            result.stderr = format!("{}: {}", command.name, result.stderr);
+        }
         commands.push(result);
     }
     let files_pass = assertions.iter().all(|row| row.passed);
@@ -317,16 +333,80 @@ pub fn evaluate_task(pack: &BenchPack, task: &BenchTask, root: &Path) -> HiddenR
     }
 }
 
-pub fn task_sha256(task: &BenchTask) -> String {
+pub fn spec_sha256() -> String {
+    hex_encode(Sha256::digest(SPEC.as_bytes()))
+}
+
+pub fn task_sha256(pack: &BenchPack, task: &BenchTask) -> String {
     let mut hasher = Sha256::new();
     hasher.update(task.id().as_bytes());
-    if let Ok(bytes) = fs::read(&task.path) {
-        hasher.update(&bytes);
+    hasher.update([0]);
+    hash_named(&mut hasher, "task.json", &task.path);
+    hash_tree(
+        &mut hasher,
+        "seed",
+        &pack.root.join("seeds").join(&task.file.seed),
+    );
+    hash_tree(
+        &mut hasher,
+        "golden",
+        &pack.root.join("golden").join(task.id()),
+    );
+    for command in &task.file.hidden_commands {
+        hash_named(
+            &mut hasher,
+            &format!("checks/{}", command.script),
+            &pack.root.join("checks").join(&command.script),
+        );
     }
     hex_encode(hasher.finalize())
 }
 
+pub fn pack_digest(pack: &BenchPack) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(SCHEMA.as_bytes());
+    hasher.update([0]);
+    hasher.update(SPEC.as_bytes());
+    hasher.update([0]);
+    hash_named(&mut hasher, "pack.json", &pack.root.join("pack.json"));
+    for task in &pack.tasks {
+        hasher.update(task.id().as_bytes());
+        hasher.update([0]);
+        hasher.update(task_sha256(pack, task).as_bytes());
+        hasher.update([0]);
+    }
+    hex_encode(hasher.finalize())
+}
+
+pub fn require_python() -> anyhow::Result<()> {
+    let bin = crate::harvest::python_bin();
+    match std::process::Command::new(&bin)
+        .arg("-c")
+        .arg("import sys")
+        .status()
+    {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => anyhow::bail!(
+            "context-bench verifier preflight failed: {bin} exited {status}"
+        ),
+        Err(error) => anyhow::bail!(
+            "context-bench verifier preflight failed: {bin} missing ({error})"
+        ),
+    }
+}
+
 pub fn check_pack(pack: &BenchPack) -> anyhow::Result<String> {
+    require_python()?;
+    if spec_sha256() != FROZEN_SPEC_SHA256 {
+        anyhow::bail!(
+            "SPEC hash {} != frozen {FROZEN_SPEC_SHA256}",
+            spec_sha256()
+        );
+    }
+    let digest = pack_digest(pack);
+    if digest != FROZEN_PACK_DIGEST {
+        anyhow::bail!("pack digest {digest} != frozen {FROZEN_PACK_DIGEST}");
+    }
     let mut out = String::new();
     if wave1_cell_count(pack) != WAVE1_CELLS {
         anyhow::bail!(
@@ -367,23 +447,19 @@ pub fn check_pack(pack: &BenchPack) -> anyhow::Result<String> {
                 misses.join(", ")
             );
         }
-        let commands_skipped = gold.commands.iter().any(python_unavailable)
-            || seeded.commands.iter().any(python_unavailable);
-        if !commands_skipped {
-            if let Some(failed) = gold.commands.iter().find(|row| !row.passed) {
-                anyhow::bail!(
-                    "{} golden hidden command failed exit={:?} stderr={}",
-                    task.id(),
-                    failed.exit,
-                    failed.stderr
-                );
-            }
-            if !seeded.commands.is_empty() && seeded.commands.iter().all(|row| row.passed) {
-                anyhow::bail!(
-                    "{} hidden commands pass on the seed — the command does not test the change",
-                    task.id()
-                );
-            }
+        if let Some(failed) = gold.commands.iter().find(|row| !row.passed) {
+            anyhow::bail!(
+                "{} golden hidden command failed exit={:?} stderr={}",
+                task.id(),
+                failed.exit,
+                failed.stderr
+            );
+        }
+        if !seeded.commands.is_empty() && seeded.commands.iter().all(|row| row.passed) {
+            anyhow::bail!(
+                "{} hidden commands pass on the seed — the command does not test the change",
+                task.id()
+            );
         }
         out.push_str(&format!("ok {}\n", task.id()));
     }
@@ -395,8 +471,10 @@ pub struct CellView {
     pub engine: String,
     pub passed: bool,
     pub input: u64,
+    pub output: u64,
     pub rounds: u64,
     pub resident: u64,
+    pub peak_resident: u64,
     pub forgotten: u64,
     pub recovered: u64,
     pub recovery_search: u64,
@@ -417,8 +495,10 @@ impl CellView {
             engine: engine.to_string(),
             passed,
             input: u("model_input_tokens"),
+            output: u("model_output_tokens"),
             rounds: u("rounds"),
             resident: u("final_resident_bytes"),
+            peak_resident: u("peak_resident_bytes"),
             forgotten: u("forgotten_items"),
             recovered: u("recovered_items"),
             recovery_search: u("recovery_explicit_search"),
@@ -431,6 +511,13 @@ impl CellView {
             search_empty: u("search_empty"),
             failed_tools: u("failed_tool_outputs"),
         }
+    }
+
+    pub fn provider_tokens(&self) -> u64 {
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.compaction_in)
+            .saturating_add(self.compaction_out)
     }
 }
 
@@ -495,16 +582,19 @@ pub fn render_why(task_id: &str, scenario: &str, cells: &[CellView]) -> String {
     out.push_str(&format!("Scenario: {task_id}\n"));
     for cell in cells {
         out.push_str(&format!(
-            "\n{}\n  success      {}\n  input        {}\n  rounds       {}\n  resident     {}\n  forgotten    {}\n  recovered    {}\n  compaction   {}/{}\n",
+            "\n{}\n  success         {}\n  coding          {}/{}\n  compactor       {}/{}\n  provider total  {}\n  actual rounds   {}\n  resident        final={} peak={}\n  forgotten       {}\n  recovered       {}\n",
             cell.engine,
             if cell.passed { "yes" } else { "no" },
             cell.input,
-            cell.rounds,
-            cell.resident,
-            cell.forgotten,
-            cell.recovered,
+            cell.output,
             cell.compaction_in,
             cell.compaction_out,
+            cell.provider_tokens(),
+            cell.rounds,
+            cell.resident,
+            cell.peak_resident,
+            cell.forgotten,
+            cell.recovered,
         ));
         if cell.engine == "dynamic" || cell.engine == "rolling" {
             out.push_str(&format!(
@@ -520,16 +610,12 @@ pub fn render_why(task_id: &str, scenario: &str, cells: &[CellView]) -> String {
         cells.iter().find(|cell| cell.engine == "append"),
         cells.iter().find(|cell| cell.engine == "dynamic"),
     ) {
-        let input_delta = signed_delta(c.input, a.input);
+        let provider_delta = signed_delta(c.provider_tokens(), a.provider_tokens());
         let round_delta = signed_delta(c.rounds, a.rounds);
-        let resident_pct = if a.resident == 0 {
-            "n/a".to_string()
-        } else {
-            let pct = (c.resident as i64 - a.resident as i64) * 100 / a.resident as i64;
-            format!("{pct}%")
-        };
+        let resident_delta = signed_delta(c.resident, a.resident);
+        let peak_delta = signed_delta(c.peak_resident, a.peak_resident);
         out.push_str(&format!(
-            "\ndelta\n  provider cost   {input_delta}\n  rounds           {round_delta}\n  resident         {resident_pct}\n"
+            "\ndelta\n  provider cost     {provider_delta}\n  actual rounds     {round_delta}\n  resident final    {resident_delta}\n  resident peak     {peak_delta}\n"
         ));
         out.push_str(&format!(
             "\nLikely optimization target:\n{}\n",
@@ -571,32 +657,57 @@ pub fn render_why_from_pair(pair_dir: &Path) -> anyhow::Result<String> {
     Ok(render_why(&fixture_id, &scenario, &cells))
 }
 
-fn skip_missing_python(command_name: &str, result: &mut crate::workload::HiddenCommandResult) {
-    if python_unavailable(result) {
-        // File asserts remain the required gate when Python is missing.
-        result.passed = true;
-        result.stderr = format!(
-            "{command_name}: {} (python missing; skipped)",
-            result.stderr
-        );
+fn hash_named(hasher: &mut Sha256, label: &str, path: &Path) {
+    hasher.update(label.as_bytes());
+    hasher.update([0]);
+    if let Ok(bytes) = fs::read(path) {
+        hasher.update(&bytes);
+    }
+    hasher.update([0]);
+}
+
+fn hash_tree(hasher: &mut Sha256, label: &str, root: &Path) {
+    hasher.update(label.as_bytes());
+    hasher.update([0]);
+    let mut files = Vec::new();
+    collect_rel_files(root, root, &mut files);
+    files.sort();
+    for rel in files {
+        hasher.update(rel.as_bytes());
+        hasher.update([0]);
+        if let Ok(bytes) = fs::read(root.join(&rel)) {
+            hasher.update(&bytes);
+        }
+        hasher.update([0]);
     }
 }
 
-fn python_unavailable(result: &crate::workload::HiddenCommandResult) -> bool {
-    if result.stderr.contains("spawn failed") || result.exit == Some(9009) {
-        return true;
+fn collect_rel_files(root: &Path, current: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(current) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rel_files(root, &path, out);
+        } else if path.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push(rel);
+        }
     }
-    let blob = format!("{}{}", result.stdout, result.stderr).to_ascii_lowercase();
-    blob.contains("python was not found") || blob.contains("microsoft store")
 }
 
 fn signed_delta(new: u64, old: u64) -> String {
-    if new >= old {
-        format!("+{}", new - old)
-    } else {
-        let pct = ((old - new) * 100).checked_div(old).unwrap_or(0) as i64;
-        format!("-{pct}%")
+    let abs = new as i64 - old as i64;
+    if old == 0 {
+        return format!("{abs:+}/n/a");
     }
+    let pct = abs * 100 / old as i64;
+    format!("{abs:+} ({pct:+}%)")
 }
 
 fn copy_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
@@ -637,8 +748,10 @@ mod tests {
             engine: engine.into(),
             passed,
             input,
+            output: 0,
             rounds: 10,
             resident,
+            peak_resident: resident,
             forgotten: 0,
             recovered: 0,
             recovery_search: 0,
@@ -670,6 +783,17 @@ mod tests {
         assert!(rendered.contains("horizon_short"));
         assert!(rendered.contains("task_switch_long_b"));
         assert!(rendered.contains("schema=agent-eval.context-bench.v1"));
+        assert!(rendered.contains("spec_sha256="));
+        assert!(rendered.contains("pack_digest="));
+    }
+
+    #[test]
+    fn spec_and_pack_digest_are_frozen() {
+        assert_eq!(spec_sha256(), FROZEN_SPEC_SHA256);
+        let pack = load_pack().expect("context-bench pack");
+        assert_eq!(pack_digest(&pack), FROZEN_PACK_DIGEST);
+        assert_eq!(spec_sha256().len(), 64);
+        assert_eq!(pack_digest(&pack).len(), 64);
     }
 
     #[test]
@@ -708,6 +832,43 @@ mod tests {
         let checks = pack.root.join("checks");
         assert!(checks.join("wire_v1.py").is_file());
         assert!(checks.join("fallback_anonymous.py").is_file());
+        assert!(checks.join("env_wins.py").is_file());
+        assert!(checks.join("index_fix.py").is_file());
+        assert!(checks.join("switch_resume.py").is_file());
+        assert!(checks.join("token_now.py").is_file());
+        let restated = [
+            "decode must still accept",
+            "unversioned ping still decodes",
+            "confirm operator is allowed",
+            "rate_limit is 30",
+            "operator + rate_limit must still",
+            "anonymous fallback, no lookup",
+            "cached_load must use the same fallback",
+        ];
+        for id in [
+            "semantic_recall",
+            "semantic_recall_fallback",
+            "task_switch",
+            "task_switch_long_b",
+        ] {
+            let task = pack.task(id).unwrap();
+            let last = task
+                .file
+                .ops
+                .iter()
+                .rev()
+                .find_map(|op| match op {
+                    TurnOp::User { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap();
+            for needle in restated {
+                assert!(
+                    !last.to_ascii_lowercase().contains(&needle.to_ascii_lowercase()),
+                    "{id} last user turn restates {needle:?}: {last}"
+                );
+            }
+        }
         for task in &pack.tasks {
             let seed = pack.root.join("seeds").join(&task.file.seed);
             let blob = read_tree(&seed);
@@ -810,11 +971,39 @@ mod tests {
             "recovery_auto_reactivation": 3,
             "recovery_workspace_reread": 4,
             "recovery_failed": 1,
+            "model_input_tokens": 2,
+            "model_output_tokens": 40,
+            "compaction_input_tokens": 10,
+            "compaction_output_tokens": 5,
+            "peak_resident_bytes": 900,
         });
         let view = CellView::from_summary("dynamic", true, &metrics);
         assert_eq!(view.recovery_search, 2);
         assert_eq!(view.recovery_reactivate, 3);
         assert_eq!(view.recovery_reread, 4);
         assert_eq!(view.recovery_failed, 1);
+        assert_eq!(view.output, 40);
+        assert_eq!(view.peak_resident, 900);
+        assert_eq!(view.provider_tokens(), 2 + 40 + 10 + 5);
+        assert_eq!(signed_delta(80, 100), "-20 (-20%)");
+        assert_eq!(signed_delta(120, 100), "+20 (+20%)");
+    }
+
+    #[test]
+    fn golden_hidden_commands_reverify_from_report() {
+        let pack = load_pack().expect("context-bench pack");
+        let task = pack.task("semantic_recall").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        seed_task(&pack, task, dir.path()).unwrap();
+        apply_golden(&pack, task, dir.path()).unwrap();
+        let report = evaluate_task(&pack, task, dir.path());
+        assert!(report.passed, "{report:?}");
+        assert_eq!(report.kind, "file_content+command");
+        assert!(crate::workload::reverify_from_report(&report).unwrap());
+        let seed_dir = tempfile::tempdir().unwrap();
+        seed_task(&pack, task, seed_dir.path()).unwrap();
+        let seeded = evaluate_task(&pack, task, seed_dir.path());
+        assert!(!seeded.passed);
+        assert!(!crate::workload::reverify_from_report(&seeded).unwrap());
     }
 }

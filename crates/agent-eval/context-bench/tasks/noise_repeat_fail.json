@@ -41,5 +41,11 @@
         "index out of bounds"
       ]
     }
+  ],
+  "hidden_commands": [
+    {
+      "name": "index_fix",
+      "script": "index_fix.py"
+    }
   ]
 }

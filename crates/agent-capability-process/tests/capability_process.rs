@@ -459,6 +459,7 @@ async fn mcp_cancel_after_spawn_terminates_the_server_tree() {
                 .into_owned(),
             args: Vec::new(),
             permissions: vec!["workspace:read".into()],
+            extra_write_roots: vec![dir.path().to_path_buf()],
         },
         ToolRisk::ReadOnly,
         Duration::from_secs(10),
@@ -467,12 +468,10 @@ async fn mcp_cancel_after_spawn_terminates_the_server_tree() {
     .await
     .expect("connect + discover succeeds");
 
-    // `mock.echo` with a `heartbeat` path spawns a counter thread inside
-    // the server child the moment the request arrives; `hang: true` then
-    // never answers, so only the runtime's cancel token can end the call.
-    // Start the hanging invoke as a task, poll until the counter visibly
-    // advances (the server is live and processing the request), then
-    // cancel.
+    // `mock.echo` with a `heartbeat` path writes READY on the tools/call
+    // thread, then ticks; `hang: true` never answers, so only the runtime's
+    // cancel token can end the call. Wait until READY exists (same 3s
+    // fail-closed bound as before — not a longer timeout), then cancel.
     let capability: Arc<dyn Capability> = Arc::new(adapter);
     let cancel = CancellationToken::new();
     let invoke_cancel = cancel.clone();
@@ -499,19 +498,19 @@ async fn mcp_cancel_after_spawn_terminates_the_server_tree() {
             .await
     });
 
-    let baseline = std::fs::read_to_string(&heartbeat).unwrap_or_default();
-    let mut saw_advance = false;
+    let mut ready = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if std::fs::read_to_string(&heartbeat).unwrap_or_default() != baseline {
-            saw_advance = true;
+        let body = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+        if body == "ready" || body.parse::<u64>().is_ok() {
+            ready = true;
             break;
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
-        saw_advance,
-        "the heartbeat must advance while the MCP server is alive"
+        ready,
+        "MCP invoke never reached READY (heartbeat file missing)"
     );
 
     cancel.cancel();

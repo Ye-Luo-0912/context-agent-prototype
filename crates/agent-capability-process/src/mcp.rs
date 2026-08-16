@@ -54,6 +54,12 @@ pub struct McpServerDecl {
     pub args: Vec<String>,
     /// Declared permissions, from the known-word table.
     pub permissions: Vec<String>,
+    /// Extra landlock write roots on Linux. Production composition leaves
+    /// this empty so the server may mutate only its private cwd. Tests that
+    /// observe an out-of-cwd heartbeat must name that directory explicitly;
+    /// connecting never adds `/tmp` or the parent workspace on its own.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub extra_write_roots: Vec<std::path::PathBuf>,
 }
 
 /// One tool discovered from `tools/list`.
@@ -506,7 +512,8 @@ impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
         // start.
         #[cfg(target_os = "linux")]
         {
-            let roots = vec![private.path().to_path_buf()];
+            let mut roots = vec![private.path().to_path_buf()];
+            roots.extend(decl.extra_write_roots.iter().cloned());
             if !agent_process::landlock::available() {
                 eprintln!(
                     "landlock sandbox skipped: kernel support unavailable \
@@ -1171,6 +1178,7 @@ mod tests {
                 .into_owned(),
             args: Vec::new(),
             permissions: vec!["workspace:read".into()],
+            extra_write_roots: Vec::new(),
         }
     }
 

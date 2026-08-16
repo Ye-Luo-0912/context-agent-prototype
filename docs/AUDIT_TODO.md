@@ -1781,16 +1781,25 @@ Confirmed 2026-08-16:
 
 Landed 2026-08-16:
 
-- schema `agent-eval.context-bench.v1` (independent of analysis.v2; not
-  hash-frozen yet);
+- schema `agent-eval.context-bench.v1` (independent of analysis.v2; pack
+  and SPEC are hash-frozen);
 - 12-task pack under `crates/agent-eval/context-bench/`;
 - `--context-bench` / `--context-bench-run`; rolling only on
   `horizon_long`, `semantic_recall`, `task_switch`;
+- task hash covers JSON + seed + golden + checker; pair.json carries
+  `pack_digest`;
+- provider cost is coding in/out + compactor in/out; why-report deltas
+  are absolute and percent, with actual rounds and peak resident;
+- live missing Python/hidden verifier is a preflight fail, never
+  `passed=true`;
 - recovery metrics split (explicit search / auto reactivation /
   workspace reread / failed);
 - driver `TurnOp` includes Suspend / Activate / Complete.
+  Do not treat `Likely optimization target` as a modification order.
   Do not implement ResumePoint from this item. Do not retune scoring.
-  Do not collect 300×3 cells. Do not run live unless asked.
+  Do not collect 300×3 cells. Wave-1 live is 27 cells (repeats=1);
+  second repeat only for A/C discordant, anomalous cost, or unexplained
+  tasks.
 
 Until closure, M15, V2, learned/vector policy and PLAT-08 evidence gates stay
 closed. M12/M13 remain independent trusted-execution blockers.

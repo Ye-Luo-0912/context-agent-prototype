@@ -34,7 +34,7 @@
     },
     {
       "op": "user",
-      "text": "Back on A: confirm operator is allowed and rate_limit is 30. Do not revert billing."
+      "text": "Resume A and finish whatever auth work is still open. Do not recap the original A spec."
     }
   ],
   "hidden": [
@@ -54,17 +54,16 @@
     },
     {
       "path": "src/billing.rs",
-      "pred": "contains",
-      "needles": [
-        "items[i]"
-      ]
-    },
-    {
-      "path": "src/billing.rs",
       "pred": "not_contains",
       "needles": [
         "items[i + 1]"
       ]
+    }
+  ],
+  "hidden_commands": [
+    {
+      "name": "switch_resume",
+      "script": "switch_resume.py"
     }
   ]
 }

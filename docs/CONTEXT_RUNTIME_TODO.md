@@ -1059,9 +1059,10 @@ in AUDIT; this list does not duplicate checkbox state):
    context helps or hurts a coding agent (horizon, long refactor,
    semantic recall, supersession, task switch, noise). Wave 1 is 12×A/C
    plus rolling only on `horizon_long` / `semantic_recall` /
-   `task_switch` (27 cells at repeats=1). Do not continue the 30-task
+   `task_switch` (27 cells at repeats=1). Pack/SPEC are hash-frozen.
+   Do not continue the 30-task
    pilot or mix P0/P1 ITT tables. analysis.v2 stays frozen. Do not close
-   M15. Do not run `--context-bench-run` unless asked.
+   M15. Wave-1 live is 27 cells after deterministic self-check.
 
 1. Freeze the 300-task suite (`EVAL-01` closure item 2). Heterogeneous
    real coding tasks with executable hidden verification; treat the

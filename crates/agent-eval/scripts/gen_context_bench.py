@@ -460,6 +460,7 @@ sys.exit(0 if "anonymous" in text and "lookup(id)?" not in text else 1)
             target_rounds_lo=15, target_rounds_hi=25,
             expected_edit="verify + now + String expiry error",
             ops=refactor_ops, hidden=refactor_hidden,
+            hidden_commands=[{"name": "token_now", "script": "token_now.py"}],
         ),
         task(
             id="long_refactor_relitigate", scenario="refactor", variant="relitigate",
@@ -488,13 +489,11 @@ sys.exit(0 if "anonymous" in text and "lookup(id)?" not in text else 1)
                 {"op": "user", "text": "Add logging around decode errors without changing the grammar."},
                 {"op": "user", "text": "Clean up any unused notes. Keep Ping working."},
                 {"op": "user", "text": "Now add v2: Msg::Hello(String) with an explicit v:2 envelope."},
-                {"op": "user", "text": "decode must still accept the original unversioned ping body."},
-                {"op": "user", "text": "Final check: v2 Hello exists and unversioned ping still decodes."},
+                {"op": "user", "text": "Ship Hello encode/decode. Leave every existing message path alone; do not recap earlier constraints."},
             ],
             hidden=[
                 hidden("src/protocol.rs", "contains", "Hello"),
                 hidden("src/protocol.rs", "contains", "ping"),
-                hidden("src/protocol.rs", "contains", "decode_v1"),
             ],
             hidden_commands=[{"name": "wire_v1", "script": "wire_v1.py"}],
         ),
@@ -513,9 +512,8 @@ sys.exit(0 if "anonymous" in text and "lookup(id)?" not in text else 1)
                 {"op": "user", "text": "Add a cached_load wrapper that calls load_user."},
                 {"op": "user", "text": "Document nothing. Just keep exploring load_user."},
                 {"op": "user", "text": "Add a comment-free id normalizer that trims whitespace."},
-                {"op": "user", "text": "Now implement the missing-user policy in load_user."},
-                {"op": "user", "text": "cached_load must use the same fallback."},
-                {"op": "user", "text": "Final: anonymous fallback, no lookup(id)? propagation."},
+                {"op": "user", "text": "Now implement the missing-user policy you were given at the start."},
+                {"op": "user", "text": "cached_load should call load_user rather than lookup. Do not invent a second error path."},
             ],
             hidden=[
                 hidden("src/store.rs", "contains", "anonymous"),
@@ -541,6 +539,7 @@ sys.exit(0 if "anonymous" in text and "lookup(id)?" not in text else 1)
                 hidden("src/config.rs", "contains", "APP_PORT"),
                 hidden("src/config.rs", "not_contains", "serde_json"),
             ],
+            hidden_commands=[{"name": "env_wins", "script": "env_wins.py"}],
         ),
         task(
             id="supersession_leak", scenario="supersession", variant="leak",
@@ -557,6 +556,7 @@ sys.exit(0 if "anonymous" in text and "lookup(id)?" not in text else 1)
                 hidden("src/config.rs", "contains", "APP_HOST"),
                 hidden("src/config.rs", "not_contains", "prefer JSON"),
             ],
+            hidden_commands=[{"name": "env_wins", "script": "env_wins.py"}],
         ),
         task(
             id="task_switch", scenario="task_switch", variant="short_b",
@@ -571,14 +571,14 @@ sys.exit(0 if "anonymous" in text and "lookup(id)?" not in text else 1)
                 {"op": "user", "text": "Task B: src/billing.rs total() indexes one past the end. Fix it. Do not change auth."},
                 {"op": "user", "text": "On B: double-check the loop uses items[i]."},
                 {"op": "activate", "slot": "first"},
-                {"op": "user", "text": "Back on A: confirm operator is allowed and rate_limit is 30. Do not revert billing."},
+                {"op": "user", "text": "Resume A and finish whatever auth work is still open. Do not recap the original A spec."},
             ],
             hidden=[
                 hidden("src/auth.rs", "contains", "operator"),
                 hidden("src/auth.rs", "contains", "rate_limit"),
-                hidden("src/billing.rs", "contains", "items[i]"),
                 hidden("src/billing.rs", "not_contains", "items[i + 1]"),
             ],
+            hidden_commands=[{"name": "switch_resume", "script": "switch_resume.py"}],
         ),
         task(
             id="task_switch_long_b", scenario="task_switch", variant="long_b",
@@ -595,13 +595,14 @@ sys.exit(0 if "anonymous" in text and "lookup(id)?" not in text else 1)
                 {"op": "user", "text": "Task B: add a trivial comment-free second loop pass that also uses items[i]."},
                 {"op": "user", "text": "Task B: remove that second pass if it duplicates work; keep the fix."},
                 {"op": "activate", "slot": "first"},
-                {"op": "user", "text": "Resume A: operator + rate_limit must still be present."},
+                {"op": "user", "text": "Pick A back up and complete it. Do not restate the original limits."},
             ],
             hidden=[
                 hidden("src/auth.rs", "contains", "operator"),
                 hidden("src/auth.rs", "contains", "rate_limit"),
                 hidden("src/billing.rs", "not_contains", "items[i + 1]"),
             ],
+            hidden_commands=[{"name": "switch_resume", "script": "switch_resume.py"}],
         ),
         task(
             id="noise_recovery", scenario="noise", variant="once",
@@ -615,10 +616,10 @@ sys.exit(0 if "anonymous" in text and "lookup(id)?" not in text else 1)
                 {"op": "user", "text": "Do not delete dump.rs. Keep the noisy helper."},
             ],
             hidden=[
-                hidden("src/parse.rs", "contains", "items[i]"),
                 hidden("src/parse.rs", "not_contains", "items[i + 1]"),
                 hidden("src/dump.rs", "contains", "unrelated compiler chatter"),
             ],
+            hidden_commands=[{"name": "index_fix", "script": "index_fix.py"}],
         ),
         task(
             id="noise_repeat_fail", scenario="noise", variant="repeat",
@@ -636,6 +637,7 @@ sys.exit(0 if "anonymous" in text and "lookup(id)?" not in text else 1)
                 hidden("src/parse.rs", "not_contains", "items[i + 1]"),
                 hidden("src/dump.rs", "contains", "index out of bounds"),
             ],
+            hidden_commands=[{"name": "index_fix", "script": "index_fix.py"}],
         ),
     ]
 

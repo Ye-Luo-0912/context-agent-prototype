@@ -43,11 +43,7 @@
     },
     {
       "op": "user",
-      "text": "decode must still accept the original unversioned ping body."
-    },
-    {
-      "op": "user",
-      "text": "Final check: v2 Hello exists and unversioned ping still decodes."
+      "text": "Ship Hello encode/decode. Leave every existing message path alone; do not recap earlier constraints."
     }
   ],
   "hidden": [
@@ -63,13 +59,6 @@
       "pred": "contains",
       "needles": [
         "ping"
-      ]
-    },
-    {
-      "path": "src/protocol.rs",
-      "pred": "contains",
-      "needles": [
-        "decode_v1"
       ]
     }
   ],

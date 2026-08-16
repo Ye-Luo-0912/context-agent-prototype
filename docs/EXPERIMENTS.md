@@ -48,8 +48,8 @@ cargo run -p agent-replay -- --compare long_refactor
 # Completion-quality proxy: same comparison plus key-fact coverage
 cargo run -p agent-replay -- --facts
 
-# Context Bench pack + seed/golden self-check (no model). Do not run
-# --context-bench-run unless asked; that is live A/C.
+# Context Bench pack + seed/golden/hidden-command self-check (no model).
+# --context-bench-run is live A/C (27 cells). Python must be present.
 cargo run -p agent-eval -- --context-bench
 ```
 

@@ -54,6 +54,10 @@ fn main() {
                     "mock.echo" => {
                         if let Some(path) = arguments.get("heartbeat").and_then(Value::as_str) {
                             let path = std::path::PathBuf::from(path);
+                            // READY: tools/call has been accepted. Write on this
+                            // thread before hang/ticker so the parent waits on a
+                            // real barrier instead of racing a background write.
+                            let _ = std::fs::write(&path, "ready");
                             std::thread::spawn(move || {
                                 let mut n: u64 = 0;
                                 loop {

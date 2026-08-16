@@ -955,7 +955,16 @@ pub async fn compare_bench_live(
         });
     }
     if let Some(pair) = pair {
-        bundle::write_pair_with_schema(pair, &order, context_bench::SCHEMA)?;
+        bundle::write_pair_doc(
+            pair,
+            &order,
+            context_bench::SCHEMA,
+            &serde_json::json!({
+                "spec_sha256": context_bench::spec_sha256(),
+                "pack_digest": context_bench::pack_digest(pack),
+                "task_sha256": context_bench::task_sha256(pack, task),
+            }),
+        )?;
     }
     Ok(runs)
 }
@@ -992,7 +1001,7 @@ async fn run_bench_with_engine(
         bundle::write_cell_parts(
             &pair.cell_dir(engine),
             task.id(),
-            &context_bench::task_sha256(task),
+            &context_bench::task_sha256(pack, task),
             engine,
             pair,
             &session.events,

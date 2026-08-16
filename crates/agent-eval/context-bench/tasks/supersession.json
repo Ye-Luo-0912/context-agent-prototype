@@ -48,5 +48,11 @@
         "serde_json"
       ]
     }
+  ],
+  "hidden_commands": [
+    {
+      "name": "env_wins",
+      "script": "env_wins.py"
+    }
   ]
 }

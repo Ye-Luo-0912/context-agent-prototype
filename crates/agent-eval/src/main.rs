@@ -582,6 +582,7 @@ async fn run_context_bench_live(
     evidence_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     let pack = context_bench::load_pack()?;
+    context_bench::require_python()?;
     let model = driver::build_live_coding_model()?;
     let evidence_root = evidence_dir.unwrap_or_else(default_evidence_dir);
     std::fs::create_dir_all(&evidence_root)?;

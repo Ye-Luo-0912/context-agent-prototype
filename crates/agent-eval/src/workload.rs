@@ -356,11 +356,15 @@ pub fn reverify_from_report(report: &HiddenReport) -> anyhow::Result<bool> {
         }
         return Ok(report.commands.iter().all(|row| row.passed));
     }
-    if report.kind != "file_content" {
+    let with_commands = report.kind == "file_content+command";
+    if report.kind != "file_content" && !with_commands {
         anyhow::bail!("unsupported hidden kind {}", report.kind);
     }
     if !report.replay_complete || report.files.iter().any(|file| file.truncated) {
         anyhow::bail!("hidden file bodies were truncated; replay is incomplete");
+    }
+    if with_commands && report.commands.is_empty() {
+        anyhow::bail!("hidden command report is incomplete");
     }
     let mut by_path: BTreeMap<&str, &HiddenFileBody> = BTreeMap::new();
     for file in &report.files {
@@ -376,6 +380,9 @@ pub fn reverify_from_report(report: &HiddenReport) -> anyhow::Result<bool> {
         if !ok {
             passed = false;
         }
+    }
+    if with_commands {
+        passed = passed && report.commands.iter().all(|row| row.passed);
     }
     Ok(passed)
 }

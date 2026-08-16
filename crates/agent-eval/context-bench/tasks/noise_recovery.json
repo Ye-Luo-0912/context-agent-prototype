@@ -25,13 +25,6 @@
   "hidden": [
     {
       "path": "src/parse.rs",
-      "pred": "contains",
-      "needles": [
-        "items[i]"
-      ]
-    },
-    {
-      "path": "src/parse.rs",
       "pred": "not_contains",
       "needles": [
         "items[i + 1]"
@@ -43,6 +36,12 @@
       "needles": [
         "unrelated compiler chatter"
       ]
+    }
+  ],
+  "hidden_commands": [
+    {
+      "name": "index_fix",
+      "script": "index_fix.py"
     }
   ]
 }

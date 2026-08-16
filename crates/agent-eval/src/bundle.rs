@@ -273,6 +273,15 @@ pub fn write_pair_with_schema(
     engines: &[&str],
     analysis_schema: &str,
 ) -> anyhow::Result<PathBuf> {
+    write_pair_doc(pair, engines, analysis_schema, &json!({}))
+}
+
+pub fn write_pair_doc(
+    pair: &PairSink,
+    engines: &[&str],
+    analysis_schema: &str,
+    extra: &serde_json::Value,
+) -> anyhow::Result<PathBuf> {
     let dir = pair
         .root
         .join(&pair.fixture_id)
@@ -287,19 +296,22 @@ pub fn write_pair_with_schema(
             })
         })
         .collect();
-    write_json(
-        dir.join("pair.json"),
-        &json!({
-            "schema": PAIR_SCHEMA,
-            "fixture_id": pair.fixture_id,
-            "repeat": pair.repeat,
-            "repeats": pair.repeats,
-            "live": pair.live,
-            "arm_order": engines,
-            "analysis_schema": analysis_schema,
-            "cells": cells,
-        }),
-    )?;
+    let mut doc = json!({
+        "schema": PAIR_SCHEMA,
+        "fixture_id": pair.fixture_id,
+        "repeat": pair.repeat,
+        "repeats": pair.repeats,
+        "live": pair.live,
+        "arm_order": engines,
+        "analysis_schema": analysis_schema,
+        "cells": cells,
+    });
+    if let Some(map) = extra.as_object() {
+        for (key, value) in map {
+            doc[key] = value.clone();
+        }
+    }
+    write_json(dir.join("pair.json"), &doc)?;
     Ok(dir)
 }
 
@@ -622,6 +634,11 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
         "access_consumption_acks": metrics.access_consumption_acks,
         "compaction_input_tokens": metrics.compaction_input_tokens,
         "compaction_output_tokens": metrics.compaction_output_tokens,
+        "provider_tokens_total": metrics
+            .model_input_tokens
+            .saturating_add(metrics.model_output_tokens)
+            .saturating_add(metrics.compaction_input_tokens)
+            .saturating_add(metrics.compaction_output_tokens),
         "final_resident_bytes": metrics.final_resident_bytes,
         "peak_resident_bytes": metrics.peak_resident_bytes,
         "materialize_rounds": metrics.materialize_rounds,
