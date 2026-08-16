@@ -579,6 +579,7 @@ mod tests {
                     store_recalled_items: 2,
                     diagnostics: Default::default(),
                     externalized_ids: Vec::new(),
+                    anchor_root_protections: Vec::new(),
                 },
             },
         ));

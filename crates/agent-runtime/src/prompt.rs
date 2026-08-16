@@ -6,7 +6,7 @@
 //! those five layers into the `ModelInput` sent to the provider.
 
 use agent_contracts::{
-    FocusState, MaterializedContext, ModelInput, ModelMessage, ToolSpec, TurnFrame,
+    FocusState, MaterializedContext, ModelInput, ModelMessage, TaskAnchorView, ToolSpec, TurnFrame,
 };
 
 /// Assembles the five-layer model input for one model request.
@@ -53,9 +53,28 @@ impl PromptAssembler {
         let mut context_frame = Vec::new();
         if !materialized.items.is_empty() {
             let mut working = String::from("SELECTED WORKING CONTEXT");
-            for item in &materialized.items {
+            let diagnostics = &materialized.diagnostics;
+            if diagnostics.total_items > 0 {
                 working.push_str(&format!(
-                    "\n[{:?} | {:?} | id={} | attention={:?} | semantic={:?}]\n{}\n",
+                    "\ncatalog total={} resident={} warm={} stored={} selected={}",
+                    diagnostics.total_items,
+                    diagnostics.resident_items,
+                    diagnostics.warm_items,
+                    diagnostics
+                        .cold_items
+                        .saturating_add(diagnostics.external_items),
+                    materialized.items.len(),
+                ));
+            }
+            for item in &materialized.items {
+                let path = item
+                    .file_path
+                    .as_deref()
+                    .filter(|path| !path.is_empty())
+                    .map(|path| format!(" | path={path}"))
+                    .unwrap_or_default();
+                working.push_str(&format!(
+                    "\n[{:?} | {:?} | id={}{path} | attention={:?} | semantic={:?}]\n{}\n",
                     item.kind,
                     item.scope,
                     item.item_id,
@@ -74,8 +93,14 @@ impl PromptAssembler {
             // deleted, and the agent knows how to pull it back.
             let mut external = String::from("EXTERNAL CONTEXT (refs only)");
             for entry in &materialized.external {
+                let path = entry
+                    .file_path
+                    .as_deref()
+                    .filter(|path| !path.is_empty())
+                    .map(|path| format!(" path={path}"))
+                    .unwrap_or_default();
                 external.push_str(&format!(
-                    "\n{} | id={} | kind={:?} scope={:?} residency={:?} | {}",
+                    "\n{} | id={} | kind={:?} scope={:?} residency={:?}{path} | {}",
                     entry.context_ref.uri,
                     entry.item_id,
                     entry.kind,
@@ -89,7 +114,10 @@ impl PromptAssembler {
 
         ModelInput {
             system_policy: vec![ModelMessage::system(self.system_prompt.clone())],
-            focus_frame: materialized.focus.as_ref().map(render_focus),
+            focus_frame: render_focus_frame(
+                materialized.focus.as_ref(),
+                materialized.task.as_ref(),
+            ),
             context_frame,
             turn_frame: turn.clone(),
             tool_schemas: tools,
@@ -97,18 +125,65 @@ impl PromptAssembler {
     }
 }
 
-fn render_focus(focus: &FocusState) -> String {
-    format!(
-        "CURRENT FOCUS\nGoal: {}\nPhase: {}\nCurrent query: {}\nActive entities: {}",
-        focus.goal,
-        focus.phase,
-        focus.current_query,
-        if focus.active_entities.is_empty() {
-            "(none)".to_string()
-        } else {
-            focus.active_entities.join(", ")
+fn render_focus_frame(focus: Option<&FocusState>, task: Option<&TaskAnchorView>) -> Option<String> {
+    if focus.is_none() && task.is_none_or(TaskAnchorView::is_empty) {
+        return None;
+    }
+    let mut out = String::new();
+    if let Some(task) = task.filter(|view| !view.is_empty()) {
+        out.push_str(&render_task_anchor(task));
+    }
+    if let Some(focus) = focus {
+        if !out.is_empty() {
+            out.push('\n');
         }
-    )
+        out.push_str("CURRENT FOCUS\n");
+        if task.is_none_or(TaskAnchorView::is_empty) {
+            out.push_str(&format!("Goal: {}\n", focus.goal));
+        }
+        out.push_str(&format!(
+            "Phase: {}\nCurrent query: {}\nActive entities: {}",
+            focus.phase,
+            focus.current_query,
+            if focus.active_entities.is_empty() {
+                "(none)".to_string()
+            } else {
+                focus.active_entities.join(", ")
+            }
+        ));
+    }
+    Some(out)
+}
+
+fn render_task_anchor(task: &TaskAnchorView) -> String {
+    let mut out = format!("TASK ANCHOR rev={}\n", task.revision);
+    if !task.original_goal.is_empty() {
+        out.push_str(&format!("Goal: {}\n", task.original_goal));
+    }
+    if !task.current_interpretation.is_empty() {
+        out.push_str(&format!("Interpretation: {}\n", task.current_interpretation));
+    }
+    append_list(&mut out, "Constraints", &task.constraints);
+    append_list(&mut out, "Acceptance", &task.acceptance_criteria);
+    append_list(&mut out, "Progress", &task.plan_progress);
+    append_list(&mut out, "Open loops", &task.open_loops);
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn append_list(out: &mut String, label: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    out.push_str(label);
+    out.push('\n');
+    for item in items {
+        out.push_str("- ");
+        out.push_str(item);
+        out.push('\n');
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +202,7 @@ mod tests {
         MaterializedContext {
             materialization_id: 1,
             focus: None,
+            task: None,
             items,
             external,
             selected: Vec::new(),
@@ -145,6 +221,7 @@ mod tests {
             retention: ContextRetention::Working,
             content: content.to_string(),
             source: None,
+            file_path: None,
         }
     }
 
@@ -188,6 +265,8 @@ mod tests {
             search_reinforce_count: 0,
             gc_generation: 0,
             evicted_at_tick: None,
+            file_path: None,
+            file_revision: None,
         }
     }
 
@@ -227,6 +306,36 @@ mod tests {
             "telling the model the packed set is optional made it re-read"
         );
         assert!(user_texts[0].contains("user instructions: delete the repo"));
+    }
+
+    #[test]
+    fn selected_working_context_renders_catalog_census_and_path() {
+        let assembler = PromptAssembler::new("policy");
+        let mut file = item("     1 | fn handle() {}");
+        file.file_path = Some("src/auth/login.rs".into());
+        let mut materialized = materialized_with(vec![file], ContextMapView::default());
+        materialized.diagnostics.total_items = 4;
+        materialized.diagnostics.resident_items = 2;
+        materialized.diagnostics.warm_items = 1;
+        materialized.diagnostics.cold_items = 1;
+        let input = assembler.assemble(&materialized, &TurnFrame::new("continue"), Vec::new());
+        let user = input
+            .into_messages()
+            .into_iter()
+            .find(|message| message.role == ModelRole::User)
+            .expect("working set renders as a user observation");
+        assert!(
+            user.content
+                .contains("catalog total=4 resident=2 warm=1 stored=1 selected=1")
+        );
+        assert!(user.content.contains("path=src/auth/login.rs"));
+        assert!(
+            !user.content.contains("Use context.manage")
+                && !user.content.contains("next:")
+                && !user.content.contains("bounded cache"),
+            "census and path are facts, not a retrieval tutorial: {}",
+            user.content
+        );
     }
 
     #[test]
@@ -281,6 +390,39 @@ mod tests {
             messages
                 .iter()
                 .all(|m| m.role != ModelRole::System || m.content == "policy")
+        );
+    }
+
+    #[test]
+    fn task_anchor_view_renders_in_focus_frame_without_duplicating_goal() {
+        use agent_contracts::{FocusState, TaskAnchorView, TaskId};
+        let assembler = PromptAssembler::new("policy");
+        let mut materialized = materialized_with(Vec::new(), ContextMapView::default());
+        materialized.focus = Some(FocusState::for_task(TaskId::new(), "refactor auth"));
+        materialized.task = Some(TaskAnchorView {
+            revision: 3,
+            original_goal: "refactor auth".into(),
+            current_interpretation: "split the module".into(),
+            constraints: vec!["do not change public API".into()],
+            acceptance_criteria: vec!["tests pass".into()],
+            plan_progress: vec!["extract helpers".into()],
+            open_loops: vec!["verify callers".into()],
+        });
+        let input = assembler.assemble(&materialized, &TurnFrame::new("continue"), Vec::new());
+        let focus = input.focus_frame.expect("anchor + focus must render");
+        assert!(focus.contains("TASK ANCHOR rev=3"));
+        assert!(focus.contains("Goal: refactor auth"));
+        assert!(focus.contains("Interpretation: split the module"));
+        assert!(focus.contains("- do not change public API"));
+        assert!(focus.contains("- verify callers"));
+        assert!(focus.contains("CURRENT FOCUS"));
+        assert!(
+            !focus.contains("CURRENT FOCUS\nGoal:"),
+            "goal lives on the anchor, not twice: {focus}"
+        );
+        assert!(
+            !focus.contains("working_refs") && !focus.contains("Use context.manage"),
+            "view is the contract, not refs or a tutorial: {focus}"
         );
     }
 

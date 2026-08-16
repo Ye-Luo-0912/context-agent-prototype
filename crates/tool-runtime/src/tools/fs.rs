@@ -325,6 +325,7 @@ impl Tool for FsReadTool {
             model_content: selected,
             artifact_ref: None,
             metadata: json!({
+                "path": display_relative(&self.workspace, &display_path),
                 "line_count": lines.len(),
                 "bytes": metadata.len(),
                 // The content revision (SHA-256 hex): stable for the same
@@ -562,6 +563,11 @@ mod tests {
         };
         let revision_a = output.metadata["revision"].as_str().unwrap().to_string();
         assert_eq!(revision_a.len(), 64, "a full SHA-256 hex revision");
+        assert_eq!(
+            output.metadata["path"].as_str(),
+            Some("notes.txt"),
+            "fs.read must stamp the workspace-relative path; ingest cannot recover it from numbered lines"
+        );
 
         // Same bytes, same revision.
         let second = read("notes.txt").await.unwrap();

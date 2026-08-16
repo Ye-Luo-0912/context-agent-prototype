@@ -77,6 +77,28 @@ pub(crate) fn primary_file_path(content: &str) -> Option<&str> {
     }
 }
 
+/// 文件正文观察的工作区路径：优先结构化 `file_path`，回退到正文首行
+/// （replay `path:\nbody` 夹具）。live `fs.read` 正文是 `     1 | …`，
+/// 没有路径，必须走字段。
+pub(crate) fn observation_file_path(item: &ContextItem) -> Option<&str> {
+    if let Some(path) = item.file_path.as_deref() {
+        let path = path.trim();
+        if !path.is_empty() && is_file_path_entity(path) {
+            return Some(path);
+        }
+    }
+    primary_file_path(&item.content)
+}
+
+/// 把路径写入实体索引，供 catalog search 按路径命中。
+pub(crate) fn index_file_path(entities: &mut Vec<String>, path: &str) {
+    if path.is_empty() || entities.iter().any(|existing| existing == path) {
+        return;
+    }
+    entities.insert(0, path.to_string());
+    entities.truncate(MAX_HOT_ENTITIES);
+}
+
 /// 当前任务里每个最近文件路径的最新成功观察。同一路径的旧正文会被更新的
 /// 读覆盖；超过 [`MAX_RECENT_FILE_BODIES`] 的更早路径不入选。没有焦点时
 /// 返回空集——文件正文根只服务活跃任务，避免跨任务污染。
@@ -92,10 +114,11 @@ pub(crate) fn latest_file_body_ids<'a>(
         if item.task_id != Some(task)
             || item.kind != ContextKind::ToolObservation
             || !item.semantic.is_live()
+            || !is_file_body_observation(item)
         {
             continue;
         }
-        let Some(path) = primary_file_path(&item.content) else {
+        let Some(path) = observation_file_path(item) else {
             continue;
         };
         match latest.get(path) {
@@ -112,6 +135,14 @@ pub(crate) fn latest_file_body_ids<'a>(
         .take(MAX_RECENT_FILE_BODIES)
         .map(|(_, id)| id)
         .collect()
+}
+
+fn is_file_body_observation(item: &ContextItem) -> bool {
+    match item.source.as_deref() {
+        Some("tool:fs.read") => observation_file_path(item).is_some(),
+        Some(_) => false,
+        None => primary_file_path(&item.content).is_some(),
+    }
 }
 
 /// Merge tool-touched entities into the hot set: most recent first,
@@ -201,5 +232,10 @@ mod tests {
         );
         assert!(!is_file_path_entity("Session::start"));
         assert!(is_file_path_entity("src/auth/session.rs"));
+        assert_eq!(
+            primary_file_path("     1 | fn handle_21() {}"),
+            None,
+            "live fs.read numbered lines are not a path header"
+        );
     }
 }

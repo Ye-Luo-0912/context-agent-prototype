@@ -96,7 +96,7 @@ boundedness, and integrity rather than replace it with transcript history.
 | Transient retrieval result | Implemented baseline (`CTX-03`) + capability search/inspect (`CTX-DISC-03`) | `ToolResultDisposition` keeps context search/inspect/fetch and `capability.manage` search/inspect transient in the current `TurnFrame`; load/unload still persist. Runtime E2E and context-service parity verify that context retrieval does not create duplicate observations. |
 | User input envelope | Partial (`CTX-EVENT`) | Dialogue goes through `RuntimeInputEnvelope`. `/focus` `/done` `/cancel` stay direct commands. `UserMessageAccepted` is a 240-char preview; the exact body is sealed as `user-input` when a workspace is wired. Busy dialogue uses a 1-slot in-memory `Queued` (overflow `Rejected`). Cancel publishes `InterruptCommitted` after `TurnCancelled`. Applied → Consumed → Archived on a successful turn. Replay resolves `body_ref` when given a workspace. Dialogue `proposal` is still `None`. |
 | Admission/derivation | Partial | `admit` and `derive` operations, quotas and identity/non-duplication tests exist, but authority/taint, richer provenance, storage-root, and canonical-catalog semantics remain open. Do not infer their full lifecycle contract from the closed transient-retrieval defect. |
-| Task anchor | Implemented baseline (`CTX-10`) | Each `TaskRecord` owns a bounded, versioned `TaskAnchor` (goal interpretation, constraints, acceptance criteria, plan progress, open loops, typed root claims) with whole-set CAS, a bounded `TaskAnchorChanged` audit event, and RuntimeCheckpoint v4 persistence + restore validation. The tool-demand slice (`TaskToolRequirementSet`) remains its own bounded CAS surface. A prompt `TaskAnchorView` and Anchor-derived context GC root set (translating claims into engine roots) remain context-runtime work, not reasons to call the anchor itself absent. |
+| Task anchor | Implemented baseline (`CTX-10`) | Each `TaskRecord` owns a bounded, versioned `TaskAnchor` (goal interpretation, constraints, acceptance criteria, plan progress, open loops, typed root claims) with whole-set CAS, a bounded `TaskAnchorChanged` audit event, and RuntimeCheckpoint v4 persistence + restore validation. The tool-demand slice (`TaskToolRequirementSet`) remains its own bounded CAS surface. A prompt `TaskAnchorView` now flows through materialize into the focus frame; typed claims split prompt/residency/storage and report `anchor_revision + source_field + RootReason`. Active/Suspended downgrade and sourced `EpisodeOutcome` remain. |
 | Structured episode outcome | Partial | Task completion now commits an immutable typed `CompletionRecord` (task id, anchor revision, summary, final-output ref/digest, artifacts) atomically with the status flip (`CTX-10`). Episode rotation still does not derive a typed, sourced `EpisodeOutcome` per rotated focus episode. |
 | Task completion output | Implemented baseline (`CTX-10`) | `/done`/`task.complete` commit one task-owned `CompletionRecord`; `TaskCompleted` carries task/result identity, and completed records are storage rather than residency roots. When an artifact workspace is wired, the actor writes the complete final assistant response before `ContextItem` truncation and attaches its artifact ref to the record. The dedicated `final_output_ref`/digest still identify the bounded completion summary, so richer outcome/evidence fields remain open. |
 | Canonical catalog | Implemented navigation directory | `ContextCatalog` is the `item_id -> location` directory plus task/scope/kind/entity/label/lifecycle indexes. Bodies remain in heap / warm / store; GC moves location, it does not copy authority. Checkpoints serialize the three stores and rebuild the directory. |
@@ -107,7 +107,7 @@ boundedness, and integrity rather than replace it with transcript history.
 | Immediate tool signal | Implemented (`CTX-08`) | Tool commit emits a bounded, body-free `WorkingSetSignal`; discovered entities heat related context before the immediately following model round while the tool body remains in `TurnFrame` until finalization. |
 | Final model-consumption acknowledgement | Implemented (`CTX-07`) | `materialize` returns a non-consuming preview. After final packing, only a successful non-stale ModelOutput commits a bounded `ContextConsumptionAck` with the exact inline/external ids; failure paths do not reinforce. Fit-before-top-K, bounded/charged external refs, and bounded candidate generation are covered; workload cost evaluation remains separate. |
 | Prompt authority separation | Implemented (`CORE-05`) | `PromptAssembler` keeps policy in System, renders selected history/external refs as delimited low-authority User observations, and preserves live file/tool output as Tool-role content. Injection regressions cover all three paths. |
-| Real evaluation | Partial | Unit/property coverage is strong and the 10,000-turn residency regression exists. `agent-eval --compare-live` is the live paired coding harness (real model, independent workspaces, hidden verify). EVAL-01.1 writes per-cell bundles; EVAL-01.1b persists replayable file-content hidden asserts. EVAL-01.2 freezes the clustered C−A estimator; EVAL-01.3 re-freezes the gate at 300×3 / −5 pp (historical 30×3 is underpowered). EVAL-01.4e freezes the 509-task pack; EVAL-01.3b sets `SUITE_FROZEN=true` and declares retrieval secondaries in SPEC (no gate n/margin change). EVAL-01.3c locks the exact 300 acceptance ids and makes token diagnostics honor `cost_eligible`. EVAL-01.5 freezes the 30-task calibration sample; a file-only 9×3 live spend is in `crates/agent-eval/evidence/pilot-30` (`decision=pilot`). EVAL-01.5.p1 splits send vs pack and raises the shared live round cap to 48; remaining P0 SWE-bench (24k/12) is skipped as a floor-effect host. EVAL-01.5.p1b lands the shared model-backed bounded compactor for live B and C `TaskCompleted` distillation (CI keeps the scripted digest). EVAL-01.5.p1c is the retrieval-trust slice (catalog-wide search/inspect, trusted packed-set prompt); extra C rounds are still a treatment effect. P1 n=1 file-only + recall is collected (`rehydration-diag`); leftover extra rounds are mixed, not gone. Compaction cell harvest now sums `ContextMaintained` pass costs. Next: a P1 SWE-bench n=1 cohort (new dir). Do not mix P0/P1 ITT tables. The 300×3 non-inferiority run is still open. |
+| Real evaluation | Partial | Unit/property coverage is strong and the 10,000-turn residency regression exists. `agent-eval --compare-live` is the live paired coding harness (real model, independent workspaces, hidden verify). EVAL-01.1 writes per-cell bundles; EVAL-01.1b persists replayable file-content hidden asserts. EVAL-01.2 freezes the clustered C−A estimator; EVAL-01.3 re-freezes the gate at 300×3 / −5 pp (historical 30×3 is underpowered). EVAL-01.4e freezes the 509-task pack; EVAL-01.3b sets `SUITE_FROZEN=true` and declares retrieval secondaries in SPEC (no gate n/margin change). EVAL-01.3c locks the exact 300 acceptance ids and makes token diagnostics honor `cost_eligible`. EVAL-01.5 freezes the 30-task calibration sample; a file-only 9×3 live spend is in `crates/agent-eval/evidence/pilot-30` (`decision=pilot`). EVAL-01.5.p1 splits send vs pack and raises the shared live round cap to 48; remaining P0 SWE-bench (24k/12) is skipped as a floor-effect host. EVAL-01.5.p1b lands the shared model-backed bounded compactor for live B and C `TaskCompleted` distillation (CI keeps the scripted digest). EVAL-01.5.p1c is the retrieval-trust slice (catalog-wide search/inspect, trusted packed-set prompt); extra C rounds are still a treatment effect. P1 n=1 file-only + recall is collected (`rehydration-diag`); leftover extra rounds are mixed, not gone. Compaction cell harvest now sums `ContextMaintained` pass costs. P1 SWE-bench n=1 (`p1-swebench-diag`, pre-path-stamp): C 3/3 pass, A 0/3 at 48-round cap, B mixed. P1 after-path n=1: js-ms-negative C extra rounds gone this cell; recall extra rounds remain. Do not mix P0/P1 ITT tables. P1 file-only 9×3 on the current binary (`target/eval-evidence/p1-file-only-calibrate`, not `pilot-30`): ITT A=B=C=0.889, `decision=pilot`, analyze ineligible n=9 LCL=0 `degenerate=true`; `uuid-parity-keys` 0/9 hidden `cargo test`. Frozen SWE-bench 21×3 is still missing (after-proxy is n=1). The 300×3 non-inferiority run is still open. |
 
 This table is the baseline for the work queue below. A checked defect in
 `AUDIT_TODO.md` must not be reopened here under a new name.
@@ -122,7 +122,6 @@ have regression coverage. Do not reopen them here under stale baseline text.
 
 The remaining context-runtime gaps are structural or evaluative:
 
-- `TaskAnchorView` plus typed prompt/residency/storage root projection;
 - sourced `EpisodeOutcome` and atomic episode close/root release;
 - bounded incremental minor-GC work and an explicit Storage-GC schedule;
 - uniform immutable evidence/provenance beyond the final-response special path;
@@ -223,7 +222,9 @@ Task
 ### TaskAnchor
 
 The TaskAnchor is the minimum authoritative state that prevents goal drift.
-It carries typed root claims, but projecting them into context GC remains open.
+Typed root claims now project into independent prompt/residency/storage
+roots with `anchor_revision + source_field + RootReason`; Active/Suspended
+downgrade and ResumePoint rehydration remain open.
 It lives with the actor-owned `TaskManager`, not as an ordinary Pinned/Durable
 `ContextItem`: otherwise a replaceable context policy could collect or rewrite
 task authority, and task state would again be duplicated across orchestrators.
@@ -241,7 +242,7 @@ cadences.
 | Implemented | `TaskToolRequirementSet` retains exact-name `MustSurface`/`PreferSurface`/`KeepReady` demand. `RoundSurfacePlan` is the bounded per-round projection; loading remains lifecycle, never activation or permission. |
 | Implemented | Live restore rebases focus/surface/requirement revisions, applies capability state fail-closed, and publishes a bounded durable `RuntimeRestored` event before clearing the recovery fence. |
 | Implemented | Task completion atomically closes context/task authority and commits exactly one immutable typed `CompletionRecord`. With an artifact workspace, the complete final assistant response is persisted before bounded context ingest and its ref is attached to the record. |
-| Still open | A bounded `TaskAnchorView` and translation of typed claims into independent prompt/residency/storage roots; richer provenance and outcome fields; sourced `EpisodeOutcome`; ack/obligation-driven episode root release; canonical catalog ownership. |
+| Still open | Active/Suspended root downgrade and ResumePoint rehydration; sourced `EpisodeOutcome`; ack/obligation-driven episode root release; richer provenance and outcome fields. |
 
 Tool-demand semantics remain intentionally narrow:
 
@@ -357,14 +358,17 @@ is denied/skipped, the agent continues independent safe work, and the task
 finishes `Partial`/`Blocked` with one consolidated boundary report if the
 operation was essential.
 
-The next integration step is for the actor to supply a bounded
-`TaskAnchorView` and typed root claims through a versioned `ContextTaskView` on
-materialization/GC requests. The engine compiles the view but does not own or
-score it. This preserves the invariant that model input is built through
-`ContextEngine::materialize` without making the engine a second task manager.
+The actor now supplies a bounded `TaskAnchorView` plus typed root claims on
+every materialize (`ContextHints.task` / `anchor_roots`). The engine copies
+the view through without owning or scoring it, so model input is still built
+through `ContextEngine::materialize` without making the engine a second task
+manager. A versioned `ContextTaskView` wrapper is not required: the two
+projections already travel together on `ContextHints`.
 
-Target task-state semantics (the current runtime exposes
-`Active | Suspended | Completed` and has not yet landed the full root view):
+The next integration step is Active/Suspended root downgrade and
+ResumePoint rehydration. Target task-state semantics (the current runtime
+exposes `Active | Suspended | Completed` and has not yet landed the full
+root view):
 
 - **Active:** the anchor is a mandatory materialization tier; current
   `working_refs` are online residency roots.
@@ -1040,6 +1044,12 @@ there is no separate, later Search/GC experiment. Declared in SPEC at
 EVAL-01.3b (no gate change). Discovery feature residuals (Artifact/Task/Agent/
 Skill/Event providers) stay out of scope; M15 measures the retrieval
 surface that exists.
+**2026-08-15.** `--analyze-evidence` now prints those secondaries from
+the same cost-eligible A/C pairs (search calls/hits/empty/p50,
+found-after-forgotten, graded-access stamps). They stay out of the LCL
+gate. Old bundles missing latency/access keys read as 0. SPEC n/margin
+unchanged. Phase 2 Active/Suspended root downgrade remains outside this
+slice.
 
 Working order (owning entries stay authoritative: `EVAL-01` in AUDIT,
 Phase 4 below; this list does not duplicate checkbox state):
@@ -1079,7 +1089,14 @@ Phase 4 below; this list does not duplicate checkbox state):
    and evidence ids ≠ frozen acceptance set). Pooled φ(A,C)=0.36 is
    labeled confounded; task-residual corr(A,C)=−0.41 is the power-model
    diagnostic (n=9, noisy). Cost-missing 6/27; cost-eligible paired
-   tokens n=21 (A 54318 / C 56251). **EVAL-01.5.p1:** remaining P0
+   tokens n=21 (A 54318 / C 56251).
+   **2026-08-15.** `--pilot-calibrate --file-only` keeps that 9-task
+   table when the same directory also holds P0 SWE-bench floor cells.
+   Retrieval secondaries on those 21 cost-eligible A/C pairs: search
+   calls 0.2/0.2; C forgotten/recovered 11.3/0.9 vs A 0/0; not in the
+   LCL gate. Access-stamp keys are absent on those older summaries
+   (read as 0). A whole-directory calibrate without `--file-only`
+   mixes P0 SWE-bench zeros into ITT — do not use that table. **EVAL-01.5.p1:** remaining P0
    SWE-bench under send=kernel-fallback 19904 / rounds=12 is skipped
    (floor effect: empty context still overflowed; 12 rounds aborted
    tool loops). Do not mix P0 and P1 ITT tables. P1 shared host:
@@ -1087,8 +1104,12 @@ Phase 4 below; this list does not duplicate checkbox state):
    grows until send, 48 rounds shared. Do not amend n. Do not retune
    scoring. **Done EVAL-01.5.p1b:** model-backed bounded compaction B
    (shared operator with C `TaskCompleted` distillation). **Partial
-   EVAL-01.5.p1c:** catalog-wide search/inspect; system prompt and
-   assembler headers stay labels/facts, not retrieval tutorials. Smoke
+   EVAL-01.5.p1c:** catalog-wide search/inspect; system prompt is a short
+   runtime contract (selected frame ≠ full catalog; context/capability
+   tools); assembler headers stay labels/facts (`path=`, catalog census),
+   not retrieval tutorials. Live `fs.read` stamps `metadata.path` /
+   `revision` onto `ContextItem` so latest-file-body and path search work
+   without parsing numbered lines. Smoke
    fixtures stay file-content; executable hidden stays on the suite
    pack. **P1 n=1 rehydration diag (2026-08-15):** 9 file-only +
    `recall_after_fix` collected in `target/eval-evidence/rehydration-diag`
@@ -1099,8 +1120,207 @@ Phase 4 below; this list does not duplicate checkbox state):
    tokens): js-ms-minutes B, openai-wire B, rust-grep C — not a compact
    crash, not C vs A. Catalog search almost unused. Cell `compact=0/0`
    was a harvest bug (later GC snapshot wiped B fold); metrics now sum
-   `ContextMaintained` per-pass costs. Next: a P1 SWE-bench n=1 cohort
-   in a new evidence dir. Do not mix P0 and P1 ITT tables.
+   `ContextMaintained` per-pass costs. **P1 SWE-bench n=1 (2026-08-15).**
+   Three Django tasks in `target/eval-evidence/p1-swebench-diag` (not
+   `pilot-30`; pre-path-stamp binary). C passed 3/3 (11749 25r/38t
+   `model_in=420258`; 11999 27r/43t `520717`; 12708 24r/55t `679564`).
+   A hit the shared 48-round cap on all three. B: 11749 empty-assistant
+   (`usage_incomplete`, 0 tokens); 11999 1r/0t then docker eval fail;
+   12708 passed 21r/42t. C catalog search stayed 0; forgotten/reread
+   remained. Do not mix with the P0 81-cell table. Do not amend n.
+   **P1 after-path n=1 (2026-08-15).** `target/eval-evidence/p1-after-path`
+   on the path/contract binary. `js-ms-negative-parse`: C extra rounds
+   gone (14r/22t → 9r/17t vs A 11r/18t; C `search=1/2`).
+   `recall_after_fix` via `--compare-live` (not `--pilot-id`): C still
+   21r/30t with catalog search 0, recovered 9/26, reread 7, `git.status`
+   5/5 failed; A verify-failed 16r (scratch notes). Extra rounds remain
+   a treatment effect on recall-class. Do not retune scoring. Do not
+   amend n. Do not mix ITT tables.
+   **P1 after-anchor n=1 (2026-08-15).** `target/eval-evidence/p1-after-anchor`
+   on the TaskAnchorView + path/contract binary. `recall_after_fix`: A/B/C
+   all verify-failed on `scratch.md` `4B` (C also `visit_all`); C 16r/21t
+   search 0, recovered 5/19, reread 5, `git.status` 4/4 failed vs A 13r/10t.
+   `js-ms-negative-parse`: C 10r/14t pass vs A 11r/19t pass, C search 0;
+   B 3r verify-failed (`node --test`). `--analyze-evidence` on the dir:
+   ineligible n=2; retrieval secondaries search calls 0/0; C
+   found-after-forgotten forgotten=15.5 recovered=2.5 (A 0). Extra rounds
+   on recall-class remain. Do not mix ITT tables. Do not amend n.
+   **P1 SWE-bench after-anchor n=1 attempt (2026-08-15).**
+   `target/eval-evidence/p1-swebench-after-anchor` `django-13344`: A/B/C
+   turn-1 HTTP 403 (`permission_error`: Access from this region requires
+   trusted account access); cells kept as ITT `outcome=error` and
+   cost-ineligible. A cheap `fix_off_by_one` probe (`p1-provider-probe`)
+   hit the same 403. Not a coding result. **Cause (2026-08-15):**
+   workspace `reqwest` had `default-features = false` without
+   `system-proxy`, so live eval ignored Windows Internet Settings
+   (`127.0.0.1:7897`) and went direct; curl via that mixed port is 200.
+   Do not mix those 403 cells into an ITT table.
+   **P1 SWE-bench after-proxy n=1 (2026-08-15).** `system-proxy` binary;
+   `target/eval-evidence/p1-swebench-after-proxy` (not the 403 dir).
+   Cheap `fix_off_by_one` probe (`p1-provider-probe-proxy`) A/B/C all
+   passed. `django-13344` gold harness ran (`resolved=0` / `unresolved=1`
+   on every arm): A/B/C `verify_failed`, usage complete, not 403.
+   C 33r/59t `model_in=926950` search 2/3 forgotten 48 recovered 0;
+   B 35r/82t `1174170` compact 14445/814; A 47r/69t `1550204`.
+   `--analyze-evidence`: ineligible n=1; cost-eligible C−A tokens
+   −623254, rounds 47/33; retrieval search A/C 0/2. `git.status` ok
+   (SWE-bench clone is a git repo). Do not mix with P0, `p1-swebench-diag`,
+   or the 403 cells. Do not amend n. Do not retune scoring.
+   **P1 SWE-bench after-proxy n=1 `django-13809` (2026-08-15).** Same dir.
+   B gold passed (43r/64t `model_in=1214260`). A and C hit the shared
+   48-round cap (`outcome=error`, usage complete); C search 0,
+   lifecycle=0. `--analyze-evidence` on 13344+13809: ineligible n=2;
+   ITT A=C=0; cost-eligible tokens A 1573556 / C 1076972; search A/C
+   0/1. Do not mix ITT tables. Do not amend n.
+   **P1 after-proxy `django-14007` (2026-08-15).** Same dir. A 48-round
+   cap; B/C gold `verify_failed` (C 44r/72t `1271989` search 0 forgotten
+   63 recovered 0). `--analyze-evidence` n=3 ineligible; ITT A=C=0;
+   cost-eligible tokens A 1477619.7 / C 1141977.3. Do not mix ITT tables.
+   Do not amend n.
+   **P1 after-proxy `django-14011` (2026-08-15).** Same dir. A/B/C gold
+   `verify_failed` (C 27r/45t `681903` search 0 forgotten 37; A 29r/39t
+   `594658`; B 35r/65t `1288970`). `--analyze-evidence` n=4 ineligible;
+   ITT A=C=0; cost-eligible tokens A 1256879.2 / C 1026958.8. Do not mix
+   ITT tables. Do not amend n.
+   **P1 after-proxy `django-15268` (2026-08-15).** Same dir. B gold passed
+   (46r/61t `1212441`). C 48-round cap (`outcome=error`, lifecycle=0).
+   A mid-run HTTP 401 `INVALID_API_KEY` (`usage_incomplete`, cost-missing).
+   `--analyze-evidence` n=5 ineligible; ITT A=C=0; cost-missing 1/5;
+   cost-eligible still n=4 (15268 A dropped). Do not mix ITT tables.
+   Operator: 401 is relay jitter, not a dead key. Continue frozen ids
+   in the same dir.
+   **P1 after-proxy `django-15503` (2026-08-15).** Same dir. A gold
+   `verify_failed` 20r/32t `493440`. B/C 48-round cap (`outcome=error`;
+   C search 1/0 empty 1, forgotten 0 recovered 0). `--analyze-evidence`
+   n=6 ineligible; ITT A=C=0; cost-missing 1/6; cost-eligible tokens A
+   1104191.4 / C 1062320.8. Do not mix ITT tables. Do not amend n.
+   **P1 after-proxy `django-15695` (2026-08-15).** Same dir. A/B/C gold
+   `verify_failed` (A 38r/78t `1666651`; B 42r `1655407` search 1/1;
+   C 44r `1503592` search 1/1 forgotten 55 recovered 0).
+   `--analyze-evidence` n=7 ineligible; ITT A=C=0; cost-missing 1/7;
+   cost-eligible tokens A 1197934.7 / C 1135866.0. Do not mix ITT
+   tables. Do not amend n.
+   **P1 after-proxy `django-16642` (2026-08-15).** Same dir. A/B/C gold
+   `verify_failed` (A 20r `526493`; B 15r `224632` search 1/2; C 8r
+   `77182` search 1 empty forgotten 14 recovered 0). `--analyze-evidence`
+   n=8 ineligible; ITT A=C=0; cost-missing 1/8; cost-eligible tokens A
+   1102014.4 / C 984625.4. Django ids in this dir are done. Do not mix
+   ITT tables. Do not amend n.
+   **P1 after-proxy `matplotlib-23314` (2026-08-15).** Same dir. A/B/C
+   gold passed (A 32r `773272` search 1/2; B 39r `732591`; C 35r
+   `751527` search 2/14 forgotten 43 recovered 0). First both-pass pair
+   in this dir. `--analyze-evidence` n=9 ineligible; ITT A=C=0 still
+   degenerate (this task A=C=1); cost-missing 1/9; cost-eligible tokens
+   A 1060921.6 / C 955488.1; both-pass n=1 C-A=-21745. Do not mix ITT
+   tables. Do not amend n.
+   **P1 after-proxy `pylint-4551` (2026-08-15).** Same dir. A/B 48-round
+   cap on turn 4 (`outcome=error`; A 101r `4372763`). C gold
+   `verify_failed` 63r `1597882` forgotten 99 **recovered 12** (first
+   non-zero recover in this dir; catalog search 0, access ack 100).
+   `--analyze-evidence` n=10 ineligible; ITT A=C=0; cost-missing 1/10;
+   cost-eligible tokens A 1428904.0 / C 1026865.2; recovered C mean 1.3.
+   Do not mix ITT tables. Do not amend n.
+   **P1 after-proxy `pytest-5787` (2026-08-15).** Same dir. A/B/C gold
+   `verify_failed` (A 32r `1146981`; B 25r `794492`; C 31r `863738`
+   search 1/2 forgotten 30 recovered 0). `--analyze-evidence` n=11
+   ineligible; ITT A=C=0; cost-missing 1/11; cost-eligible tokens A
+   1400711.7 / C 1010552.5. Next `pytest-6202` n=1. Do not mix ITT
+   tables. Do not amend n.
+   **P1 after-proxy `pytest-6202` (2026-08-15).** Same dir. A/B gold
+   passed (A 30r `595044`; B 24r `459627`). C 48-round cap (`outcome=error`,
+   lifecycle=0, forgotten=0). First non-zero ITT pair in this dir:
+   A=1 C=0 d=-1. `--analyze-evidence` n=12 ineligible; primary C-A
+   mean=-0.083 LCL=-0.233 `degenerate=false`; cost-missing 1/12;
+   cost-eligible tokens A 1327469.2 / C 1018846.4. Not a gate. Do not mix
+   ITT tables. Do not amend n.
+   **P1 after-proxy `pytest-7571` (2026-08-15).** Same dir. A/B/C gold
+   passed (A 29r `596468`; B 32r `740270`; C 38r `756640` forgotten 47
+   recovered 0). Second both-pass pair. `--analyze-evidence` n=13
+   ineligible; ITT mean=-0.077 LCL=-0.214 `degenerate=false`;
+   cost-missing 1/13; cost-eligible tokens A 1266552.4 / C 996995.8;
+   both-pass n=2 C-A=+69213.5. Do not mix ITT tables. Do not amend n.
+   **P1 after-proxy `scikit-learn-11310` (2026-08-15).** Same dir. A
+   48-round cap (`2064105`). B gold passed 29r. C gold passed 48r
+   `1328911` forgotten 66 recovered 0 (search 0). First A=0 C=1 pair
+   (d=+1). `--analyze-evidence` n=14 ineligible; ITT mean=0 LCL=-0.186
+   `degenerate=false`; cost-missing 1/14; cost-eligible tokens A
+   1327902.6 / C 1022527.8. Not a gate. Do not mix ITT tables. Do not
+   amend n.
+   **P1 after-proxy `scikit-learn-13496` (2026-08-15).** Same dir. A gold
+   passed 25r `691931`. B/C 48-round cap (C search 1 empty, forgotten 0).
+   Second A=1 C=0 pair (d=-1). `--analyze-evidence` n=15 ineligible; ITT
+   mean=-0.067 LCL=-0.275 `degenerate=false`; cost-missing 1/15;
+   cost-eligible tokens A 1282476.1 / C 1059177.3. Not a gate. Do not mix
+   ITT tables. Do not amend n.
+   **P1 after-proxy `scikit-learn-14894` (2026-08-15).** Same dir. A gold
+   `verify_failed` 7r/7t `28616` (4 turns). B gold passed 53r. C 48-round
+   cap forgotten 0. `--analyze-evidence` n=16 ineligible; ITT mean=-0.062
+   LCL=-0.256 `degenerate=false`; cost-missing 1/16; cost-eligible tokens
+   A 1198885.4 / C 1055563.8. Sklearn ids in this dir are done. Do not
+   mix ITT tables. Do not amend n.
+   **P1 after-proxy `sphinx-8548` (2026-08-15).** Same dir. B gold
+   `verify_failed` 32r. C 2r `verify_failed` forgotten 3 recovered 0.
+   A HTTP 502 `upstream_error` (`usage_incomplete`). `--analyze-evidence`
+   n=17 ineligible; ITT mean=-0.059 LCL=-0.240; cost-missing 2/17
+   (15268 401 + this 502). Treat 502 as relay jitter; continue.
+   Do not mix ITT tables. Do not amend n.
+   **P1 after-proxy `sympy-22914` (2026-08-15).** Same dir. B/C HTTP 429
+   `DAILY_LIMIT_EXCEEDED` (`model_in=0`, `usage_incomplete`). A HTTP 502
+   (`usage_incomplete`). `--analyze-evidence` n=18 ineligible; ITT
+   mean=-0.056 LCL=-0.226; cost-missing 3/18. This is a quota stop, not
+   jitter. Do not start more live cells until the relay daily limit
+   resets. Do not mix ITT tables. Do not amend n.
+   **Retry after quota (2026-08-15).** Operator: continue. Moved the
+   429/502 sympy r1 out of the ITT dir into
+   `target/eval-evidence/p1-swebench-quota-429` so `--pilot-run` can
+   rewrite r1 without mixing a second repeat. Same after-proxy dir.
+   **P1 after-proxy `sympy-22914` retry (2026-08-16).** A/C gold passed
+   (A 17r `278774`; C 11r `151690` forgotten 25 recovered 0). B
+   `verify_failed` 9r. Third both-pass pair. `--analyze-evidence` n=18
+   ineligible; ITT mean=-0.056 LCL=-0.226 `degenerate=false`;
+   cost-missing 2/18; cost-eligible tokens A 1141378.4 / C 999071.7;
+   both-pass n=3 C-A=+3781. Not a gate. Next: backfill `django-11749`
+   n=1 into this dir (diag-only on the old binary). Do not mix ITT
+   tables. Do not amend n.
+   **P1 after-proxy `django-11749` (2026-08-16).** Same dir, not diag.
+   A gold `verify_failed` 6r `46060`. B/C empty-assistant flake
+   (`model_in=0`, `usage_incomplete`, 1r/0t). `--analyze-evidence` n=19
+   ineligible; ITT mean=-0.053 LCL=-0.214; cost-missing 3/19. Do not mix
+   ITT tables. Do not amend n.
+   **P1 after-proxy `django-11999` (2026-08-16).** Same dir, not diag. C
+   gold passed 32r `693668` search 2/2 forgotten 39 recovered 0. A gold
+   `verify_failed` 2r `6009`. B fixture-turn timeout (`usage_incomplete`).
+   Second A=0 C=1 pair (d=+1). `--analyze-evidence` n=20 ineligible; ITT
+   mean=0 LCL=-0.177 `degenerate=false`; cost-missing 3/20; cost-eligible
+   tokens A 1074592.0 / C 981106.8. Not a gate. Next `django-12708` n=1
+   (last frozen SWE-bench missing from this dir). Do not mix ITT tables.
+   Do not amend n.
+   **P1 after-proxy `django-12708` (2026-08-16).** Same dir, not diag.
+   A/B/C gold passed (A 29r `928395`; B 40r `1125479` search 1/2; C 18r
+   `374119` forgotten 31 recovered 0 search 0). Fourth both-pass pair
+   (d=+0). `--analyze-evidence` n=21 ineligible; ITT mean=0 LCL=-0.168
+   `degenerate=false`; cost-missing 3/21; cost-eligible n=18 tokens A
+   1066469.9 / C 947385.2; both-pass n=4 C-A=-135733. Discordant ITT
+   still pytest-6202 / sklearn-13496 d=-1 and sklearn-11310 /
+   django-11999 d=+1. Frozen SWE-bench n=1 in this dir is complete
+   (21/21; still repeats=1, not ~30×3, not 300×3, not an M15 close).
+   Next: working-order item 3 remaining (episode-rotation distillation),
+   then extra-round re-measure — not 30×3. Do not mix ITT tables. Do not
+   amend n.
+   **P1 file-only 9×3 (2026-08-16).** Current binary (git-seed + episode
+   distill) in `target/eval-evidence/p1-file-only-calibrate` (not
+   `pilot-30`, not after-proxy). 9×3×3=81 cells. `--file-only
+   --pilot-calibrate`: `decision=pilot` coverage 9/30 cells 81/270;
+   ITT A=B=C=0.889; diagnostic C−A mean=0 LCL=0 `degenerate=true`
+   (all task diffs 0; residual corr undefined). `--analyze-evidence`
+   ineligible n=9; SPEC hash unchanged. 72 pass / 9 `verify_failed`;
+   `uuid-parity-keys` 0/9 all arms (hidden `cargo test --offline`);
+   other 8 tasks 9/9. Cost-missing 0/27; cost-eligible n=27 tokens A
+   62899.6 / C 69826.4 C−A=+6926.8 rounds 8.9/9.5. Retrieval: search
+   0.1/0.0; C forgotten/recovered 14.7/1.4 vs A 0/0; C access ack 12.4.
+   Not a gate. Not mixed with P0 81-cell or after-proxy n=1. Do not
+   retune scoring. Do not amend n. Remaining item 2: frozen SWE-bench
+   21×3 (after-proxy is n=1).
 3. Model-backed bounded compaction B (`EVAL-01` closure item 5): B must
    summarize with a model under a budget, with its compactor cost
    counted; the scripted digest remains a deterministic CI arm only.
@@ -1124,6 +1344,14 @@ Phase 4 below; this list does not duplicate checkbox state):
    `DerivedFrom` edges; source items stay. Compactor usage is on
    `ContextDiagnostics` and `manager_token_cost`. Do not retune scoring.
    Do not amend SPEC n/margin.
+   **Follow-up 2026-08-16.** Episode-rotation distillation uses the same
+   operator: plan under the lock, compact after it drops, insert an
+   `episode-derived` Durable Summary on the task scope with `DerivedFrom`
+   edges. Raw episode bodies stay. At most one live episode card per task
+   (a later rotation supersedes the previous card). Compact failure falls
+   back to a bounded marker and does not fail the user turn. Without a
+   compactor, rotation stays promote-and-evict. Do not retune scoring.
+   Do not amend SPEC n/margin.
 4. Explain and reduce dynamic's extra live rounds — the measured
    treatment effect. The lever is the just-landed retrieval surface
    (catalog indexes, graded access, discovery descriptors): make recall
@@ -1141,8 +1369,11 @@ Phase 4 below; this list does not duplicate checkbox state):
    turns, successful `fs.read`-shaped observations are ephemeral; the
    latest-file-body-of-active-task policy is the keep-in-view mechanism.
    This slice does not retune scoring and does not hide `git.status`.
-   Changes: `DEFAULT_CODING_AGENT_SYSTEM_PROMPT` is two sentences;
-   assembler headers are labels only; `search_ids` / `search_catalog` /
+   Changes: `DEFAULT_CODING_AGENT_SYSTEM_PROMPT` is a short runtime
+   contract (selected frame is not the full catalog; context tools
+   search/retrieve; capability tools discover/load), not a retrieval
+   tutorial; assembler headers are labels/facts (`path=`, catalog census)
+   only; `search_ids` / `search_catalog` /
    `inspect_external` cover Resident/Warm/Stored; hits carry `residency=`
    as data, not a next-step tutorial; `fetch_external` stays store-only
    and a Resident/Warm id states the body is already in the working set;
@@ -1163,8 +1394,36 @@ Phase 4 below; this list does not duplicate checkbox state):
    symbols (C≈A); rust-jcs C used fewer rounds. uuid-parity still 0/3
    (same as P0). Compaction harvest now sums maintenance pass costs so
    a later zero GC snapshot cannot wipe B fold. Do not re-run file-only
-   into the P0 81-cell table. Next: P1 SWE-bench n=1 cohort (new dir,
-   not `pilot-30`). Do not amend n.
+   into the P0 81-cell table. **P1 SWE-bench n=1 (2026-08-15).** Evidence
+   in `target/eval-evidence/p1-swebench-diag` (pre-path-stamp binary).
+   C passed all three Django cells; A exhausted 48 rounds on all three;
+   B mixed (11749 `usage_incomplete` 0-token; 11999 1r/0t verify fail;
+   12708 pass). C search stayed 0. Not an ITT table.
+   **P1 after-path n=1 (2026-08-15).** `p1-after-path`: js-ms-negative
+   C extra rounds gone (9r vs A 11r, C search 1/2); recall C still 21r/30t
+   search 0 (A verify-failed 16r). Do not amend n.
+   **P1 after-anchor n=1 (2026-08-15).** `p1-after-anchor`: recall A/B/C
+   verify-failed (`4B` notes); C 16r vs A 13r, search 0. js-ms-negative
+   C 10r pass vs A 11r pass, search 0; B hidden fail. Do not amend n.
+   **P1 after-episode-distill n=1 (2026-08-16).** Episode-rotation
+   distill binary; `target/eval-evidence/p1-after-episode-distill` (not
+   after-anchor / after-proxy ITT). `recall_after_fix`: B gold passed
+   15r/14t; A 17r/15t `verify_failed` (scratch missing Breville/200);
+   C 17r/22t `verify_failed` (scratch missing `4B`), catalog search 0,
+   forgotten 18 recovered 5, `git.status` 2/2 failed, access ack 127.
+   C rounds tied A this cell; extra tools remain. `js-ms-negative-parse`:
+   A/B/C all passed (A 6r/8t; B 9r/10t; C 6r/8t forgotten 5 recovered 0
+   search 0). Extra C rounds on js-ms stay gone. n=1 diagnostic; leftover
+   on recall is still notes + failed `git.status`, not catalog search.
+   Do not retune scoring. Do not amend n. Do not mix ITT tables.
+   **Follow-up 2026-08-16.** File-only / smoke eval workspaces now
+   `git init` + seed commit when `.git` is absent, so `git.status` is a
+   real probe. SWE-bench clones already have `.git` and are left alone.
+   Do not hide `git.status`. Do not retune scoring.
+   **P1 file-only 9×3 (2026-08-16).** See item 2 (`p1-file-only-calibrate`).
+   Extra C rounds on that table are small (9.5 vs A 8.9) with ITT tied;
+   leftover n=1 recall cells stay a separate diagnostic. Do not mix ITT
+   tables.
 5. Executable hidden build/test verification for fixtures (`EVAL-01`
    closure item 5, first half).
    **Decision 2026-08-15.** Do not bind the five smoke `FIXTURES` to
@@ -1327,6 +1586,8 @@ current slice above.)
   the same operator on `TaskCompleted` as a sourced distill, not a
   lossy fold. Compactor provider tokens are counted. Episode-rotation
   distillation remains open.
+  **Follow-up 2026-08-16.** Episode rotation now distills with the same
+  operator (`episode-derived` card, sources kept, prior card superseded).
   Manager/derivation cost is counted separately from the input-token gap:
   `manager_token_cost` re-materializes the final state and sums the
   `Summary`/`source == "derived"` items, surfaced as `EngineRun.
@@ -1344,6 +1605,11 @@ current slice above.)
   make `long_refactor` required facts **4/4**; forbidden facts stay 0 on
   C; Resident bytes on heavy scenarios remain a fraction of A. Scoring
   and `active_threshold` / `archive_threshold` were not retuned.
+  **Follow-up 2026-08-15.** Live `fs.read` bodies are numbered lines, so
+  latest-file-body and catalog search use structured `file_path` /
+  `file_revision` from tool metadata. Replay `path:\nbody` remains a
+  fallback. Do not treat `tool:fs.write` / `tool:edit.replace` as file
+  bodies.
 
 - [x] Verify the `TaskToolRequirementSet` first slice:
   actor-serialized whole-set CAS, `MustSurface`/`PreferSurface`/`KeepReady`
@@ -1540,8 +1806,22 @@ current slice above.)
   terminal non-resurrection, prompt-required selection, storage protection),
   the process-boundary parity snapshot (directive + hinted materialize),
   and E2E `task_anchor_roots_are_projected_into_materialization_hints`.
-- [ ] Split mandatory-materialization, online-residency, and storage-retention
+  **Follow-up 2026-08-15.** `ContextHints.task` / `MaterializedContext.task`
+  carry the bounded `TaskAnchorView`; see the split-roots item below.
+- [x] Split mandatory-materialization, online-residency, and storage-retention
   roots; report `anchor_revision + source_field + RootReason` for each root.
+  **Landed 2026-08-15.** `TaskAnchorView` is the bounded prompt projection
+  (goal/interpretation/constraints/criteria/progress/open loops, no raw
+  refs). The runtime copies it through `ContextHints.task` onto
+  `MaterializedContext`; the engine does not score or own it, and the
+  assembler renders it in the focus frame. `AnchorRootClaim` now carries
+  `anchor_revision` + `RootReason` independently of `strength`.
+  `PromptRequired` forces the model frame (and residency only because
+  rendering needs the body); `ResidentRequired` is a GC/recall root and
+  does not force selection; `StorageRequired` forbids permanent deletion
+  and is not a residency root. GC/Storage GC reports list bounded
+  `anchor_root_protections`. Active/Suspended downgrade and replacing the
+  whole Focus subtree as a root remain the next items.
 - [ ] Implement Active/Suspended root downgrade and precise rehydration from
   TaskAnchor/ResumePoint without restoring the old transcript.
 - [ ] After Anchor/root-claim properties pass, replace “entire active Focus
@@ -1602,6 +1882,9 @@ current slice above.)
   C its output is a `derive`d item with provenance, never a lossy fold.
   **Partial 2026-08-15.** `TaskCompleted` distillation is landed when a
   `BoundedCompactor` is injected. Episode-rotation distillation is not.
+  **Follow-up 2026-08-16.** Episode-rotation distillation is landed: same
+  operator, `episode-derived` card with `DerivedFrom`, sources kept, prior
+  card superseded. Compact failure does not fail the user turn.
 - [ ] Add AssignmentCard/HandoffCard after single-agent episode semantics
   pass evaluation.
 - [ ] Define independent storage retention profiles for coding, research,
@@ -1693,7 +1976,9 @@ current slice above.)
   / `--pilot-calibrate`. File-only live 9×3 (81 cells) collected under
   `crates/agent-eval/evidence/pilot-30`; `decision=pilot`, gate ineligible.
   **EVAL-01.5.p1 (2026-08-15).** Remaining P0 SWE-bench skipped; send vs
-  pack split + shared 48-round live cap. Do not mix P0/P1 tables.
+  pack split + shared 48-round live cap. P1 SWE-bench n=1 diagnostic
+  collected under `target/eval-evidence/p1-swebench-diag` (C 3/3, A
+  round-cap, not an ITT table). Do not mix P0/P1 tables.
 
 - [ ] Compare at least:
   - full/sliding transcript;
@@ -1723,9 +2008,30 @@ current slice above.)
   (failed probes/rereads, no catalog search). File-only 9 + recall
   complete under P1 n=1; leftover extra rounds are mixed (recall,
   js-ms-negative) not universal. Empty-assistant flake on three cells.
-  Next: P1 SWE-bench n=1 cohort. Do not mix with the P0 81-cell table.
+  **P1 SWE-bench n=1 (2026-08-15).** `target/eval-evidence/p1-swebench-diag`,
+  pre-path-stamp binary. C 3/3 pass (24–27 rounds); A 0/3 at 48-round
+  cap; B mixed (one `usage_incomplete` flake). C catalog search 0.
+  **P1 after-path n=1 (2026-08-15).** js-ms-negative C extra rounds gone
+  this cell (9r/17t vs A 11r/18t, C search 1/2). `recall_after_fix` C
+  still 21r/30t search 0; leftover is failed `git.status` / rereads.
+  A verify-failed on distractor notes. Do not mix with the P0 81-cell table.
   Extra rounds are still a treatment effect. No scoring change. Does
   not close M15.
+  **P1 after-anchor n=1 (2026-08-15).** `p1-after-anchor` on the
+  TaskAnchorView binary. recall A/B/C verify-failed (`4B`); C 16r vs A
+  13r, search 0. js-ms-negative C 10r pass ≈ A 11r, search 0; B hidden
+  fail. Do not retune scoring. Do not close M15.
+  **P1 after-episode-distill n=1 (2026-08-16).** `p1-after-episode-distill`.
+  recall: B pass 15r; A/C `verify_failed` both 17r (C missing `4B`; A
+  missing Breville/200); C search 0 recovered 5/18. js-ms A/B/C pass
+  (C 6r = A 6r). Extra C rounds on js-ms stay gone; recall leftover is
+  notes + failed `git.status`. Not an ITT table. Do not retune scoring.
+  Do not close M15.
+  **P1 file-only 9×3 (2026-08-16).** `p1-file-only-calibrate`. ITT
+  A=B=C=0.889; `decision=pilot`; analyze ineligible n=9 LCL=0
+  `degenerate=true`. `uuid-parity-keys` 0/9; other 8 9/9. Cost-missing
+  0/27. Not mixed with `pilot-30` or after-proxy. Do not retune scoring.
+  Do not close M15.
 
 ## Acceptance properties
 

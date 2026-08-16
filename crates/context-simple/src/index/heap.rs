@@ -192,6 +192,8 @@ mod tests {
             gc_generation: 0,
             evicted_at_tick: None,
             entities: entities.iter().map(|s| s.to_string()).collect(),
+            file_path: None,
+            file_revision: None,
         }
     }
 

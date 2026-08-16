@@ -660,6 +660,7 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
                     item_ref: anchor_target.to_string(),
                     strength: agent_contracts::AnchorRootStrength::ResidentRequired,
                     source_field_id: "working_refs".into(),
+                    ..Default::default()
                 }],
             },
         })
@@ -675,7 +676,9 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
                     item_ref: anchor_target.to_string(),
                     strength: agent_contracts::AnchorRootStrength::PromptRequired,
                     source_field_id: "constraints".into(),
+                    ..Default::default()
                 }],
+                task: None,
             },
         })
         .await

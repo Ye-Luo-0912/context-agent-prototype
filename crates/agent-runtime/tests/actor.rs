@@ -42,6 +42,7 @@ impl ContextEngine for TestContextEngine {
         Ok(MaterializedContext {
             materialization_id: 0,
             focus: None,
+            task: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
@@ -313,6 +314,7 @@ impl ContextEngine for RecordingContextEngine {
         Ok(MaterializedContext {
             materialization_id: 0,
             focus: None,
+            task: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
@@ -494,6 +496,7 @@ impl ContextEngine for FailingFocusContextEngine {
         Ok(MaterializedContext {
             materialization_id: 0,
             focus: None,
+            task: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
@@ -602,6 +605,7 @@ impl ContextEngine for MutatingThenFailingFocusEngine {
         Ok(MaterializedContext {
             materialization_id: 0,
             focus: self.focus.lock().unwrap().clone(),
+            task: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
@@ -796,6 +800,7 @@ impl ContextEngine for FailingClearFocusContextEngine {
         Ok(MaterializedContext {
             materialization_id: 0,
             focus: None,
+            task: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
@@ -952,12 +957,14 @@ impl ContextEngine for BigContextEngine {
                 retention: ContextRetention::Working,
                 content: format!("{}:{}", "data ".repeat(2400), i),
                 source: None,
+                file_path: None,
             })
             .collect();
         let approx_tokens = self.item_count.saturating_mul(3_000);
         Ok(MaterializedContext {
             materialization_id: 1,
             focus: None,
+            task: None,
             items,
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),

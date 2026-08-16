@@ -93,6 +93,16 @@ pub struct CellRecord {
     pub rounds: u64,
     pub tool_calls: u64,
     pub missing: bool,
+    pub search_calls: u64,
+    pub search_hits: u64,
+    pub search_empty: u64,
+    pub search_ms_p50: u64,
+    pub forgotten_items: u64,
+    pub recovered_items: u64,
+    pub access_search_hits: u64,
+    pub access_inspects: u64,
+    pub access_fetches: u64,
+    pub access_consumption_acks: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +156,34 @@ pub struct CostMissing {
     pub missing_rate: f64,
 }
 
+/// SPEC `retrieval_secondaries`: same cost-eligible A/C pairs as token
+/// diagnostics; not in the primary LCL gate. Missing keys on old bundles
+/// read as 0.
+#[derive(Debug, Clone)]
+pub struct RetrievalSummary {
+    pub pairs: u32,
+    pub mean_a_search_calls: f64,
+    pub mean_c_search_calls: f64,
+    pub mean_a_search_hits: f64,
+    pub mean_c_search_hits: f64,
+    pub mean_a_search_empty: f64,
+    pub mean_c_search_empty: f64,
+    pub mean_a_search_ms_p50: f64,
+    pub mean_c_search_ms_p50: f64,
+    pub mean_a_forgotten: f64,
+    pub mean_c_forgotten: f64,
+    pub mean_a_recovered: f64,
+    pub mean_c_recovered: f64,
+    pub mean_a_access_search: f64,
+    pub mean_c_access_search: f64,
+    pub mean_a_access_inspect: f64,
+    pub mean_c_access_inspect: f64,
+    pub mean_a_access_fetch: f64,
+    pub mean_c_access_fetch: f64,
+    pub mean_a_access_ack: f64,
+    pub mean_c_access_ack: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct GateReport {
     pub spec_sha256: String,
@@ -159,6 +197,7 @@ pub struct GateReport {
     pub cost_eligible_cost: Option<CostSummary>,
     pub both_pass_cost: Option<CostSummary>,
     pub cost_missing: Option<CostMissing>,
+    pub retrieval: Option<RetrievalSummary>,
     pub outcomes: BTreeMap<&'static str, u32>,
 }
 
@@ -323,6 +362,7 @@ pub fn analyze(cells: &[CellRecord]) -> GateReport {
         cost_eligible_cost: cost_summary(cells, false),
         both_pass_cost: cost_summary(cells, true),
         cost_missing: cost_missing(cells),
+        retrieval: retrieval_summary(cells),
         tasks,
         power: power_simulation(),
         outcomes: outcome_histogram(cells),
@@ -478,6 +518,39 @@ pub fn render_report(report: &GateReport) -> String {
     } else {
         out.push_str("both-pass tokens (secondary): no both-pass pairs\n");
     }
+    if let Some(retrieval) = &report.retrieval {
+        out.push_str(&format!(
+            "retrieval secondaries (cost-eligible paired A/C; not in LCL gate): n={}\n\
+             search A/C calls={:.1}/{:.1} hits={:.1}/{:.1} empty={:.1}/{:.1} p50_ms={:.1}/{:.1}\n\
+             found-after-forgotten A/C forgotten={:.1}/{:.1} recovered={:.1}/{:.1}\n\
+             access A/C search/inspect/fetch/ack={:.1}/{:.1}/{:.1}/{:.1} vs {:.1}/{:.1}/{:.1}/{:.1}\n",
+            retrieval.pairs,
+            retrieval.mean_a_search_calls,
+            retrieval.mean_c_search_calls,
+            retrieval.mean_a_search_hits,
+            retrieval.mean_c_search_hits,
+            retrieval.mean_a_search_empty,
+            retrieval.mean_c_search_empty,
+            retrieval.mean_a_search_ms_p50,
+            retrieval.mean_c_search_ms_p50,
+            retrieval.mean_a_forgotten,
+            retrieval.mean_c_forgotten,
+            retrieval.mean_a_recovered,
+            retrieval.mean_c_recovered,
+            retrieval.mean_a_access_search,
+            retrieval.mean_a_access_inspect,
+            retrieval.mean_a_access_fetch,
+            retrieval.mean_a_access_ack,
+            retrieval.mean_c_access_search,
+            retrieval.mean_c_access_inspect,
+            retrieval.mean_c_access_fetch,
+            retrieval.mean_c_access_ack,
+        ));
+    } else {
+        out.push_str(
+            "retrieval secondaries (cost-eligible paired A/C; not in LCL gate): no eligible pairs\n",
+        );
+    }
     out.push_str(&render_power(&report.power));
     out.push_str(
         "this is still not an M15 close: the gate also requires the exact frozen 300 ids and a model-backed B.\n",
@@ -549,6 +622,16 @@ fn load_pair_dir(dir: &Path) -> anyhow::Result<Vec<CellRecord>> {
                 rounds: 0,
                 tool_calls: 0,
                 missing: true,
+                search_calls: 0,
+                search_hits: 0,
+                search_empty: 0,
+                search_ms_p50: 0,
+                forgotten_items: 0,
+                recovered_items: 0,
+                access_search_hits: 0,
+                access_inspects: 0,
+                access_fetches: 0,
+                access_consumption_acks: 0,
             });
             continue;
         }
@@ -586,6 +669,16 @@ fn load_cell(
         rounds: metric_u64(&summary.metrics, "rounds"),
         tool_calls: metric_u64(&summary.metrics, "tool_calls"),
         missing: false,
+        search_calls: metric_u64(&summary.metrics, "search_calls"),
+        search_hits: metric_u64(&summary.metrics, "search_hits"),
+        search_empty: metric_u64(&summary.metrics, "search_empty"),
+        search_ms_p50: metric_u64(&summary.metrics, "search_ms_p50"),
+        forgotten_items: metric_u64(&summary.metrics, "forgotten_items"),
+        recovered_items: metric_u64(&summary.metrics, "recovered_items"),
+        access_search_hits: metric_u64(&summary.metrics, "access_search_hits"),
+        access_inspects: metric_u64(&summary.metrics, "access_inspects"),
+        access_fetches: metric_u64(&summary.metrics, "access_fetches"),
+        access_consumption_acks: metric_u64(&summary.metrics, "access_consumption_acks"),
     })
 }
 
@@ -740,6 +833,83 @@ fn cost_summary(cells: &[CellRecord], both_pass: bool) -> Option<CostSummary> {
     })
 }
 
+fn retrieval_summary(cells: &[CellRecord]) -> Option<RetrievalSummary> {
+    let mut n = 0u32;
+    let mut a_search = 0.0;
+    let mut c_search = 0.0;
+    let mut a_hits = 0.0;
+    let mut c_hits = 0.0;
+    let mut a_empty = 0.0;
+    let mut c_empty = 0.0;
+    let mut a_ms = 0.0;
+    let mut c_ms = 0.0;
+    let mut a_forgotten = 0.0;
+    let mut c_forgotten = 0.0;
+    let mut a_recovered = 0.0;
+    let mut c_recovered = 0.0;
+    let mut a_access_search = 0.0;
+    let mut c_access_search = 0.0;
+    let mut a_access_inspect = 0.0;
+    let mut c_access_inspect = 0.0;
+    let mut a_access_fetch = 0.0;
+    let mut c_access_fetch = 0.0;
+    let mut a_access_ack = 0.0;
+    let mut c_access_ack = 0.0;
+    for (a, c) in paired_ac(cells) {
+        if !a.cost_eligible() || !c.cost_eligible() {
+            continue;
+        }
+        n += 1;
+        a_search += a.search_calls as f64;
+        c_search += c.search_calls as f64;
+        a_hits += a.search_hits as f64;
+        c_hits += c.search_hits as f64;
+        a_empty += a.search_empty as f64;
+        c_empty += c.search_empty as f64;
+        a_ms += a.search_ms_p50 as f64;
+        c_ms += c.search_ms_p50 as f64;
+        a_forgotten += a.forgotten_items as f64;
+        c_forgotten += c.forgotten_items as f64;
+        a_recovered += a.recovered_items as f64;
+        c_recovered += c.recovered_items as f64;
+        a_access_search += a.access_search_hits as f64;
+        c_access_search += c.access_search_hits as f64;
+        a_access_inspect += a.access_inspects as f64;
+        c_access_inspect += c.access_inspects as f64;
+        a_access_fetch += a.access_fetches as f64;
+        c_access_fetch += c.access_fetches as f64;
+        a_access_ack += a.access_consumption_acks as f64;
+        c_access_ack += c.access_consumption_acks as f64;
+    }
+    if n == 0 {
+        return None;
+    }
+    let denom = n as f64;
+    Some(RetrievalSummary {
+        pairs: n,
+        mean_a_search_calls: a_search / denom,
+        mean_c_search_calls: c_search / denom,
+        mean_a_search_hits: a_hits / denom,
+        mean_c_search_hits: c_hits / denom,
+        mean_a_search_empty: a_empty / denom,
+        mean_c_search_empty: c_empty / denom,
+        mean_a_search_ms_p50: a_ms / denom,
+        mean_c_search_ms_p50: c_ms / denom,
+        mean_a_forgotten: a_forgotten / denom,
+        mean_c_forgotten: c_forgotten / denom,
+        mean_a_recovered: a_recovered / denom,
+        mean_c_recovered: c_recovered / denom,
+        mean_a_access_search: a_access_search / denom,
+        mean_c_access_search: c_access_search / denom,
+        mean_a_access_inspect: a_access_inspect / denom,
+        mean_c_access_inspect: c_access_inspect / denom,
+        mean_a_access_fetch: a_access_fetch / denom,
+        mean_c_access_fetch: c_access_fetch / denom,
+        mean_a_access_ack: a_access_ack / denom,
+        mean_c_access_ack: c_access_ack / denom,
+    })
+}
+
 fn cost_missing(cells: &[CellRecord]) -> Option<CostMissing> {
     let mut intended_pairs = 0u32;
     let mut eligible_pairs = 0u32;
@@ -888,6 +1058,16 @@ mod tests {
             rounds: 1,
             tool_calls: 1,
             missing: false,
+            search_calls: 0,
+            search_hits: 0,
+            search_empty: 0,
+            search_ms_p50: 0,
+            forgotten_items: 0,
+            recovered_items: 0,
+            access_search_hits: 0,
+            access_inspects: 0,
+            access_fetches: 0,
+            access_consumption_acks: 0,
         }
     }
 
@@ -1133,6 +1313,73 @@ mod tests {
         let text = render_report(&report);
         assert!(text.contains("cost-eligible tokens"));
         assert!(!text.contains("itt tokens (all intended pairs)"));
+    }
+
+    #[test]
+    fn retrieval_secondaries_use_cost_eligible_pairs_and_stay_out_of_the_lcl_gate() {
+        let mut cells = vec![
+            CellRecord {
+                search_calls: 1,
+                search_hits: 2,
+                search_empty: 0,
+                search_ms_p50: 40,
+                forgotten_items: 4,
+                recovered_items: 2,
+                access_search_hits: 1,
+                access_inspects: 1,
+                access_fetches: 0,
+                access_consumption_acks: 3,
+                ..cell("ok", 1, "append", true)
+            },
+            CellRecord {
+                search_calls: 3,
+                search_hits: 1,
+                search_empty: 2,
+                search_ms_p50: 80,
+                forgotten_items: 8,
+                recovered_items: 4,
+                access_search_hits: 2,
+                access_inspects: 0,
+                access_fetches: 1,
+                access_consumption_acks: 5,
+                ..cell("ok", 1, "dynamic", true)
+            },
+            CellRecord {
+                search_calls: 99,
+                forgotten_items: 99,
+                recovered_items: 99,
+                usage_incomplete: true,
+                passed: false,
+                outcome: "verify_failed".into(),
+                ..cell("uuid-like", 1, "append", false)
+            },
+            CellRecord {
+                search_calls: 99,
+                forgotten_items: 99,
+                recovered_items: 99,
+                usage_incomplete: true,
+                passed: false,
+                outcome: "verify_failed".into(),
+                ..cell("uuid-like", 1, "dynamic", false)
+            },
+        ];
+        cells.push(cell("ok", 1, "rolling", true));
+        cells.push(cell("uuid-like", 1, "rolling", false));
+        let report = analyze(&cells);
+        let retrieval = report.retrieval.as_ref().expect("retrieval summary");
+        assert_eq!(retrieval.pairs, 1);
+        assert!((retrieval.mean_a_search_calls - 1.0).abs() < 1e-12);
+        assert!((retrieval.mean_c_search_calls - 3.0).abs() < 1e-12);
+        assert!((retrieval.mean_a_forgotten - 4.0).abs() < 1e-12);
+        assert!((retrieval.mean_c_recovered - 4.0).abs() < 1e-12);
+        assert!((retrieval.mean_c_search_ms_p50 - 80.0).abs() < 1e-12);
+        assert!((retrieval.mean_a_access_ack - 3.0).abs() < 1e-12);
+        let text = render_report(&report);
+        assert!(text.contains("retrieval secondaries (cost-eligible paired A/C; not in LCL gate): n=1"));
+        assert!(text.contains("search A/C calls=1.0/3.0"));
+        assert!(text.contains("found-after-forgotten A/C forgotten=4.0/8.0 recovered=2.0/4.0"));
+        assert!(!text.contains("calls=99"));
+        assert_eq!(report.decision, "ineligible");
     }
 
     #[test]

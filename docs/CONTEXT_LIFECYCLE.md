@@ -807,10 +807,20 @@ GC marks it a root and reactivates it from the warm buffer or the cold
 store; `StorageRequired` keeps the target's store entry out of Storage GC.
 Claims resolve by item id, `context://run/<id>` uri, or exact entity
 signature, and semantic death is terminal — a claim never resurrects a
-superseded/verified-fixed/tombstoned item. The completion boundary
-force-clears the projection, so a finished task's records stop being
-rooted; the GC report carries `anchor_roots_protected` and the Storage GC
-report `anchor_roots_protected` for the same reason.
+superseded/verified-fixed/tombstoned item. The three strengths are
+independent: `PromptRequired` is mandatory materialization, `ResidentRequired`
+is online residency, `StorageRequired` is storage retention only. Each
+projected claim carries `anchor_revision`, `source_field_id`, and a
+`RootReason`; the GC and Storage GC reports list matching
+`anchor_root_protections`. The completion boundary force-clears the
+projection, so a finished task's records stop being rooted.
+
+The same materialize request also carries a bounded `TaskAnchorView`
+(`ContextHints.task` → `MaterializedContext.task`). That view is the
+active task contract in the focus frame (`TASK ANCHOR rev=N`); the engine
+copies it through without scoring it as a heap item. Goal/interpretation/
+constraints/criteria/progress/open loops are in the view; working/evidence
+refs stay on the root projection.
 
 Producing a `RuntimeDirective` requires the `runtime:context-control`
 permission in the capability manifest; a tool without it gets its directive
@@ -1191,7 +1201,13 @@ observations flow in two distinct phases:
 - **When the turn ends** (the model stops calling tools) the observations
   are persisted as the long-term record: `ingest(ToolObservation)` for each
   result, then one `maintain(AfterTool)` pass, then the final assistant
-  message and `maintain(AfterModel)`.
+  message and `maintain(AfterModel)`. Live `fs.read` stamps workspace
+  `path` and content `revision` on `ToolOutput.metadata`; ingest copies
+  those onto `ContextItem.file_path` / `file_revision` and the entity
+  catalog. The numbered `model_content` is not a path header. Latest-file-
+  body roots and path search use the structured identity (replay
+  `path:\nbody` remains a fallback). Writes and patches are not file-body
+  observations even if they later carry a path.
 
 Consequences:
 

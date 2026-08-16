@@ -56,5 +56,6 @@ pub use prompt::PromptAssembler;
 pub use services::{AuthorityRecoveryServices, RuntimeServices};
 pub use task::{
     AnchorPatch, ContextRootClaim, RootClaimRole, RootClaimStrength, TaskAnchor, TaskInfo,
-    TaskManager, TaskRecord, TaskStatus, TaskToolRequirementSet,
+    TaskManager, TaskRecord, TaskStatus, TaskToolRequirementSet, anchor_root_claims,
+    task_anchor_view,
 };

@@ -553,8 +553,14 @@ impl CoreAuthority {
                         output.model_content = hits
                             .iter()
                             .map(|entry| {
+                                let path = entry
+                                    .file_path
+                                    .as_deref()
+                                    .filter(|path| !path.is_empty())
+                                    .map(|path| format!(" path={path}"))
+                                    .unwrap_or_default();
                                 format!(
-                                    "{} | kind={:?} scope={:?} task={} source={} residency={:?} | {}\n  tags: {}\n  entities: {}",
+                                    "{} | kind={:?} scope={:?} task={} source={}{path} residency={:?} | {}\n  tags: {}\n  entities: {}",
                                     entry.context_ref.uri,
                                     entry.kind,
                                     entry.scope,
@@ -610,8 +616,14 @@ impl CoreAuthority {
                         output.summary = "external ref metadata".into();
                         // inspect 是元数据视图：来源权威（source）与
                         // residency/semantic 并列展示，None 显示 "-"。
+                        let path = entry
+                            .file_path
+                            .as_deref()
+                            .filter(|path| !path.is_empty())
+                            .map(|path| format!(" path={path}"))
+                            .unwrap_or_default();
                         output.model_content = format!(
-                            "{} | kind={:?} scope={:?} task={} source={} residency={:?} semantic={:?}\nsummary: {}\ntags: {}\nentities: {}",
+                            "{} | kind={:?} scope={:?} task={} source={}{path} residency={:?} semantic={:?}\nsummary: {}\ntags: {}\nentities: {}",
                             entry.context_ref.uri,
                             entry.kind,
                             entry.scope,
@@ -673,8 +685,14 @@ impl CoreAuthority {
                         output.summary = "external item fetched".into();
                         // fetch 返回完整条目：来源权威（source）进头部行，
                         // None 显示 "-"；正文仍经 output.bound 截断 + spill。
+                        let path = item
+                            .file_path
+                            .as_deref()
+                            .filter(|path| !path.is_empty())
+                            .map(|path| format!(" | path={path}"))
+                            .unwrap_or_default();
                         output.model_content = format!(
-                            "[{:?} | {:?} | id={} | source={}]\n{}",
+                            "[{:?} | {:?} | id={} | source={}{path}]\n{}",
                             item.kind,
                             item.scope,
                             item.id,
@@ -1818,6 +1836,8 @@ mod tests {
             gc_generation: 0,
             evicted_at_tick: None,
             entities: Vec::new(),
+            file_path: None,
+            file_revision: None,
         }
     }
 
@@ -1881,6 +1901,8 @@ mod tests {
             search_reinforce_count: 0,
             gc_generation: 0,
             evicted_at_tick: None,
+            file_path: None,
+            file_revision: None,
         }
     }
 

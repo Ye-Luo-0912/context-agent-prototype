@@ -311,8 +311,57 @@ pub fn materialize_live_workspace(task: &SuiteTask, root: &Path) -> anyhow::Resu
         let cache = crate::harvest::ensure_checkout(repo, commit, instance)?;
         crate::harvest::clone_engine_workspace(&cache, root)
     } else {
-        materialize_seed(task, root)
+        materialize_seed(task, root)?;
+        ensure_workspace_git(root)
     }
+}
+
+/// File-only eval workspaces are not clones. Init a local git repo so
+/// `git.status` / `git.diff` are real probes, not "not a git repository".
+/// Do not hide those tools. SWE-bench clones already have `.git` and skip.
+pub fn ensure_workspace_git(root: &Path) -> anyhow::Result<()> {
+    if root.join(".git").exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(root)?;
+    git_ok(root, &["init", "--quiet"])?;
+    // Keep this repo's line endings off WinINET/core.autocrlf so
+    // `git.status` is not a wall of CRLF noise on Windows live cells.
+    git_ok(root, &["config", "core.autocrlf", "false"])?;
+    git_ok(root, &["add", "-A"])?;
+    let status = Command::new("git")
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "eval seed",
+            "--quiet",
+            "--allow-empty",
+        ])
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "agent-eval")
+        .env("GIT_AUTHOR_EMAIL", "eval@invalid")
+        .env("GIT_COMMITTER_NAME", "agent-eval")
+        .env("GIT_COMMITTER_EMAIL", "eval@invalid")
+        .stdin(Stdio::null())
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("git commit eval seed failed with {status}");
+    }
+    Ok(())
+}
+
+fn git_ok(root: &Path, args: &[&str]) -> anyhow::Result<()> {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("git {args:?} failed with {status}");
+    }
+    Ok(())
 }
 
 pub fn apply_files(root: &Path, files: &[SuiteSeedFile]) -> anyhow::Result<()> {
@@ -824,6 +873,46 @@ mod tests {
             }],
             runtime: String::new(),
         }
+    }
+
+    #[test]
+    fn file_only_workspace_is_a_git_repo_so_status_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = sample_task("file-git");
+        materialize_live_workspace(&task, dir.path()).unwrap();
+        assert!(
+            dir.path().join(".git").is_dir(),
+            "file-only seed must become a git repo"
+        );
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git.status must succeed after seed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "seed commit must be clean, got {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn existing_git_dir_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(
+            dir.path().join(".git").join("HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
+        ensure_workspace_git(dir.path()).unwrap();
+        let head = fs::read_to_string(dir.path().join(".git").join("HEAD")).unwrap();
+        assert_eq!(head, "ref: refs/heads/main\n");
     }
 
     #[test]

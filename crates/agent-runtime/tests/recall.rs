@@ -870,6 +870,14 @@ async fn task_anchor_roots_are_projected_into_materialization_hints() {
         "无声明时投影必须为空，got {:?}",
         hints[0].anchor_roots
     );
+    assert_eq!(
+        hints[0]
+            .task
+            .as_ref()
+            .map(|view| view.original_goal.as_str()),
+        Some("start the auth refactor"),
+        "第一轮已有活跃任务，必须投影 TaskAnchorView"
+    );
     let last = hints.last().expect("at least one materialize");
     assert_eq!(last.anchor_roots.len(), 1, "投影携带声明");
     assert_eq!(last.anchor_roots[0].item_ref, "context://run/target");
@@ -879,4 +887,11 @@ async fn task_anchor_roots_are_projected_into_materialization_hints() {
         "强度原样投影"
     );
     assert_eq!(last.anchor_roots[0].source_field_id, "working_refs");
+    assert_eq!(
+        last.anchor_roots[0].reason,
+        agent_contracts::RootReason::TaskAnchor
+    );
+    let view = last.task.as_ref().expect("active task supplies TaskAnchorView");
+    assert_eq!(view.original_goal, "start the auth refactor");
+    assert_eq!(view.current_interpretation, "refactor");
 }

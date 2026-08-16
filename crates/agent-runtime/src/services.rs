@@ -441,6 +441,7 @@ mod tests {
             Ok(MaterializedContext {
                 materialization_id: 0,
                 focus: None,
+                task: None,
                 items: Vec::new(),
                 external: agent_contracts::ContextMapView::default(),
                 selected: Vec::new(),

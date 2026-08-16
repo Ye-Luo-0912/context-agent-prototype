@@ -2022,15 +2022,21 @@ impl RuntimeActor {
             active_tools_tokens,
         );
         let materialize_started = std::time::Instant::now();
-        // 当前活跃任务锚的根声明投影：PromptRequired 的声明会强制条目
-        // 进帧。任务权威留在 TaskManager，引擎只消费有界投影。
-        let anchor_roots = self
+        // 当前活跃任务锚的根声明 + TaskAnchorView 投影：PromptRequired
+        // 的声明会强制条目进帧；view 进 focus 帧，引擎不评分。任务权威
+        // 留在 TaskManager，引擎只消费有界投影。
+        let (anchor_roots, task_view) = self
             .state
             .tasks
             .active()
             .and_then(|task_id| self.state.tasks.get(task_id))
-            .map(|task| crate::task::anchor_root_claims(&task.anchor))
-            .unwrap_or_default();
+            .map(|task| {
+                (
+                    crate::task::anchor_root_claims(&task.anchor),
+                    Some(crate::task::task_anchor_view(&task.anchor)),
+                )
+            })
+            .unwrap_or((Vec::new(), None));
         let materialized = match self
             .services
             .context_materialize(ContextQuery {
@@ -2039,6 +2045,7 @@ impl RuntimeActor {
                 hints: ContextHints {
                     max_selected_items: Some(CONTEXT_CONSUMPTION_ACK_ITEM_CAP),
                     anchor_roots,
+                    task: task_view,
                 },
             })
             .await
@@ -3023,7 +3030,7 @@ impl RuntimeActor {
                 let _ = self
                     .services
                     .context_ingest(ContextIngress::WorkingSetSignal {
-                        content: output.model_content.clone(),
+                        content: output.working_set_signal_text(),
                     })
                     .await;
                 if let Some(turn) = self.state.turn.as_mut() {
@@ -4057,6 +4064,7 @@ mod restore_tests {
             Ok(MaterializedContext {
                 materialization_id: 0,
                 focus: None,
+                task: None,
                 items: Vec::new(),
                 external: Default::default(),
                 selected: Vec::new(),

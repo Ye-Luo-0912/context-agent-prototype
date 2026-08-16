@@ -91,6 +91,10 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(config: OpenAiConfig) -> Self {
+        // Keep auto_sys_proxy (reqwest default). The workspace crate must
+        // enable reqwest's `system-proxy` feature so Windows Internet
+        // Settings are honored; HTTP_PROXY/HTTPS_PROXY are still read
+        // from the process environment either way.
         let client = Client::builder()
             .timeout(config.timeout)
             .build()

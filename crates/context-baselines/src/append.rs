@@ -110,6 +110,7 @@ impl ContextEngine for AppendOnlyEngine {
         Ok(MaterializedContext {
             materialization_id: state.materialization_revision,
             focus: None,
+            task: None,
             items,
             external: agent_contracts::ContextMapView::default(),
             selected,

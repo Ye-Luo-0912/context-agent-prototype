@@ -695,6 +695,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_manage_search_names_the_whole_catalog() {
+        let dispatcher = dispatcher().await;
+        let spec = dispatcher
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "context.manage")
+            .expect("context.manage is on the default surface");
+        assert!(
+            spec.description.contains("whole catalog")
+                && spec.description.contains("Resident/Warm/Stored"),
+            "search affordance must say the catalog is larger than the selected frame: {}",
+            spec.description
+        );
+        assert!(
+            !spec.description.contains("prefer") && !spec.description.contains("instead of"),
+            "schema states coverage, not a retrieval tutorial: {}",
+            spec.description
+        );
+        let query = spec.input_schema["properties"]["query"]["description"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            query.contains("path") && query.contains("entity"),
+            "query key stays `query` and names the indexed fields: {query}"
+        );
+    }
+
+    #[tokio::test]
     async fn context_manage_attaches_typed_directives() {
         let dispatcher = dispatcher().await;
         let names = surface(&dispatcher);

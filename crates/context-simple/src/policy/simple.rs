@@ -156,6 +156,8 @@ mod tests {
             gc_generation: 0,
             evicted_at_tick: None,
             entities,
+            file_path: None,
+            file_revision: None,
         }
     }
 

@@ -178,6 +178,35 @@ pub struct ToolOutput {
     pub metadata: Value,
 }
 
+impl ToolOutput {
+    /// 工具在 `metadata.path` 上盖的工作区相对路径。ingest 用它做结构化
+    /// 身份；`fs.read` 的 model_content 是带行号的片段，没有路径。
+    pub fn file_path(&self) -> Option<&str> {
+        self.metadata
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+    }
+
+    /// 工具在 `metadata.revision` 上盖的内容摘要。
+    pub fn file_revision(&self) -> Option<&str> {
+        self.metadata
+            .get("revision")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|revision| !revision.is_empty())
+    }
+
+    /// 中轮 WorkingSetSignal 文本：路径单独一行，后面才是正文。
+    pub fn working_set_signal_text(&self) -> String {
+        match self.file_path() {
+            Some(path) => format!("{path}\n{}", self.model_content),
+            None => self.model_content.clone(),
+        }
+    }
+}
+
 /// What happens to a tool result after the turn: whether it becomes a new
 /// long-term observation or stays transient.
 ///

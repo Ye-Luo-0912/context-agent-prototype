@@ -223,10 +223,10 @@ pub struct EngineRun {
 }
 
 /// Count the manager/derivation tokens an engine would feed the model:
-/// rolling-summary markers, task summaries and derived facts, measured
-/// from a fresh final materialization. This makes the context policy's own
-/// cost visible separately from the user/tool content that drives each
-/// engine's input-token gap.
+/// rolling-summary markers, task summaries, episode cards and derived
+/// facts, measured from a fresh final materialization. This makes the
+/// context policy's own cost visible separately from the user/tool
+/// content that drives each engine's input-token gap.
 async fn manager_token_cost(engine: &dyn ContextEngine) -> anyhow::Result<u64> {
     let materialized = engine
         .materialize(ContextQuery {
@@ -366,6 +366,7 @@ async fn compare_engines_with_model(
         let root = workspace_root.join(name);
         std::fs::create_dir_all(&root)?;
         workload::seed_fixture(fixture, &root);
+        suite::ensure_workspace_git(&root)?;
         eprintln!("  engine {name}: starting");
         let _ = std::io::Write::flush(&mut std::io::stderr());
         let eval = run_fixture_with_engine(

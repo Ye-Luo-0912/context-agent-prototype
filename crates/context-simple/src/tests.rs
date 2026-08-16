@@ -812,6 +812,8 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
             gc_generation: 0,
             evicted_at_tick: None,
             entities: Vec::new(),
+            file_path: None,
+            file_revision: None,
         };
         let dep = ContextItem {
             id: dep_id,
@@ -840,6 +842,8 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
             gc_generation: 0,
             evicted_at_tick: None,
             entities: Vec::new(),
+            file_path: None,
+            file_revision: None,
         };
         state.items.push(hub);
         state.items.push(dep);
@@ -912,6 +916,8 @@ async fn dependency_expansion_can_be_disabled() {
             gc_generation: 0,
             evicted_at_tick: None,
             entities: Vec::new(),
+            file_path: None,
+            file_revision: None,
         };
         let dep = ContextItem {
             id: dep_id,
@@ -940,6 +946,8 @@ async fn dependency_expansion_can_be_disabled() {
             gc_generation: 0,
             evicted_at_tick: None,
             entities: Vec::new(),
+            file_path: None,
+            file_revision: None,
         };
         state.items.push(hub);
         state.items.push(dep);
@@ -1000,6 +1008,8 @@ async fn archived_dependency_below_threshold_stays_out() {
             gc_generation: 0,
             evicted_at_tick: None,
             entities: Vec::new(),
+            file_path: None,
+            file_revision: None,
         };
         let dep = ContextItem {
             id: dep_id,
@@ -1028,6 +1038,8 @@ async fn archived_dependency_below_threshold_stays_out() {
             gc_generation: 0,
             evicted_at_tick: None,
             entities: Vec::new(),
+            file_path: None,
+            file_revision: None,
         };
         state.items.push(hub);
         state.items.push(dep);
@@ -1544,6 +1556,7 @@ async fn max_selected_items_hint_caps_the_working_set() {
             hints: ContextHints {
                 max_selected_items: Some(2),
                 anchor_roots: Vec::new(),
+                task: None,
             },
         })
         .await
@@ -1589,6 +1602,8 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
             gc_generation: 0,
             evicted_at_tick: None,
             entities: Vec::new(),
+            file_path: None,
+            file_revision: None,
         };
         let oversized_pin = ContextItem {
             id: ContextItemId::new(),
@@ -1617,6 +1632,8 @@ async fn pinned_items_get_priority_but_never_break_the_budget() {
             gc_generation: 0,
             evicted_at_tick: None,
             entities: Vec::new(),
+            file_path: None,
+            file_revision: None,
         };
         state.items.push(small_pin);
         state.items.push(oversized_pin);
@@ -2501,6 +2518,64 @@ async fn catalog_search_surfaces_resident_hits_instead_of_empty() {
             .unwrap()
             .is_none(),
         "fetch remains a store read; resident bodies stay in the working set"
+    );
+}
+
+#[tokio::test]
+async fn live_fs_read_stamps_path_and_is_a_catalog_search_hit() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "fix src/auth/login.rs").await;
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "     1 | fn handle_21() {}".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({
+                    "path": "src/auth/login.rs",
+                    "revision": "abc",
+                }),
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+
+    let item_id = {
+        let state = engine.state.lock().await;
+        let item = state
+            .items
+            .iter()
+            .find(|item| item.source.as_deref() == Some("tool:fs.read"))
+            .expect("fs.read observation is ingested");
+        assert_eq!(item.file_path.as_deref(), Some("src/auth/login.rs"));
+        assert_eq!(item.file_revision.as_deref(), Some("abc"));
+        assert!(
+            item.entities
+                .iter()
+                .any(|entity| entity == "src/auth/login.rs"),
+            "catalog entity index must include the stamped path: {:?}",
+            item.entities
+        );
+        assert!(
+            state.latest_file_body_ids().contains(&item.id),
+            "numbered-line reads with metadata.path are latest-file-body roots"
+        );
+        item.id
+    };
+
+    let hits = engine
+        .search_external(ContextSearchQuery::new("src/auth/login.rs", 8))
+        .await
+        .unwrap();
+    assert!(
+        hits.iter()
+            .any(|hit| hit.item_id == item_id
+                && hit.file_path.as_deref() == Some("src/auth/login.rs")),
+        "path-based catalog search must hit a live fs.read: {hits:?}"
     );
 }
 
@@ -6611,6 +6686,211 @@ async fn task_completion_distills_with_derived_from_and_keeps_sources() {
     assert_eq!(diagnostics.compaction_output_tokens, 3);
 }
 
+fn episode_budget_config() -> SimpleContextConfig {
+    SimpleContextConfig {
+        // Related messages never fire the semantic signal; only the turn
+        // budget rotates. FocusChanged already bumps generation to 1, so
+        // the second user message observes generation >= 2 and rotates.
+        episode_rotate_threshold: 0.0,
+        episode_max_user_turns: 2,
+        ..SimpleContextConfig::default()
+    }
+}
+
+async fn ingest_related(engine: &SimpleContextEngine, turn: u64) {
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: format!("keep AuthService.rs in the login path round {turn}"),
+        })
+        .await
+        .unwrap();
+}
+
+/// Episode rotation with a compactor distills the closing episode into a
+/// derived Summary; ordinary dialogue is archived, not destroyed.
+#[tokio::test]
+async fn episode_rotation_distills_with_derived_from_and_keeps_sources() {
+    let engine = SimpleContextEngine::new(episode_budget_config())
+        .with_compactor(Arc::new(TaskDistillCompactor));
+    let task = open_focus(&engine, "keep AuthService.rs").await;
+    ingest_related(&engine, 1).await;
+    ingest_related(&engine, 2).await;
+
+    let state = engine.state.lock().await;
+    let source = state
+        .items
+        .iter()
+        .find(|item| item.kind == ContextKind::UserMessage && item.content.contains("round 1"))
+        .expect("first-episode user message must remain retrievable");
+    let source_id = source.id;
+    assert_eq!(
+        source.attention,
+        AttentionState::Archived,
+        "ordinary dialogue leaves the working set on rotation"
+    );
+    let summary = state
+        .items
+        .iter()
+        .find(|item| {
+            item.kind == ContextKind::Summary && item.source.as_deref() == Some("episode-derived")
+        })
+        .expect("episode distill summary must exist");
+    assert_eq!(summary.task_id, Some(task));
+    assert_eq!(summary.retention, ContextRetention::Durable);
+    assert!(
+        summary.content.contains("[distilled]"),
+        "compactor output must become the episode card, got: {}",
+        summary.content
+    );
+    assert!(
+        summary.content.contains("round 1"),
+        "distill source must include the closing episode body, got: {}",
+        summary.content
+    );
+    assert!(
+        !summary.content.contains("round 2"),
+        "the new episode's message must not be in the closing-episode card, got: {}",
+        summary.content
+    );
+    assert!(
+        summary
+            .dependencies
+            .iter()
+            .any(|edge| edge.kind == DependencyKind::DerivedFrom && edge.target == source_id),
+        "episode card must carry DerivedFrom, got: {:?}",
+        summary.dependencies
+    );
+    drop(state);
+
+    let diagnostics = engine.diagnostics().await.unwrap();
+    assert_eq!(diagnostics.compaction_input_tokens, 5);
+    assert_eq!(diagnostics.compaction_output_tokens, 3);
+}
+
+/// A later rotation supersedes the previous episode card; the newest card
+/// stays live. Raw bodies of the older episode remain.
+#[tokio::test]
+async fn later_episode_card_supersedes_the_previous_one() {
+    let engine = SimpleContextEngine::new(episode_budget_config())
+        .with_compactor(Arc::new(TaskDistillCompactor));
+    open_focus(&engine, "keep AuthService.rs").await;
+    ingest_related(&engine, 1).await;
+    ingest_related(&engine, 2).await;
+    let first_card = engine
+        .state
+        .lock()
+        .await
+        .items
+        .iter()
+        .find(|item| item.source.as_deref() == Some("episode-derived"))
+        .map(|item| item.id)
+        .expect("first episode card");
+
+    ingest_related(&engine, 3).await;
+    ingest_related(&engine, 4).await;
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+
+    let state = engine.state.lock().await;
+    let first = state
+        .items
+        .iter()
+        .find(|item| item.id == first_card)
+        .expect("superseded card stays addressable");
+    assert!(
+        matches!(first.semantic, SemanticState::Superseded { .. }),
+        "prior episode card must be superseded, got {:?}",
+        first.semantic
+    );
+    let live_cards: Vec<_> = state
+        .items
+        .iter()
+        .filter(|item| item.source.as_deref() == Some("episode-derived") && item.semantic.is_live())
+        .collect();
+    assert_eq!(
+        live_cards.len(),
+        1,
+        "at most one live episode card per task, got {live_cards:?}"
+    );
+    assert!(
+        live_cards[0].content.contains("round 2") || live_cards[0].content.contains("round 3"),
+        "the live card must distill the second episode, got: {}",
+        live_cards[0].content
+    );
+    assert!(
+        state.items.iter().any(|item| {
+            item.kind == ContextKind::UserMessage && item.content.contains("round 1")
+        }),
+        "raw first-episode body stays retrievable"
+    );
+}
+
+/// Compact failure must not fail the user turn: rotation still lands, and
+/// the card falls back to a bounded marker.
+#[tokio::test]
+async fn episode_rotation_compact_failure_falls_back_and_does_not_fail_ingest() {
+    struct FailingCompactor;
+    #[async_trait::async_trait]
+    impl BoundedCompactor for FailingCompactor {
+        async fn compact(
+            &self,
+            _request: CompactionRequest,
+        ) -> agent_contracts::AgentResult<CompactionOutput> {
+            Err(AgentError::Model("boom".into()))
+        }
+    }
+
+    let engine = SimpleContextEngine::new(episode_budget_config())
+        .with_compactor(Arc::new(FailingCompactor));
+    open_focus(&engine, "keep AuthService.rs").await;
+    ingest_related(&engine, 1).await;
+    ingest_related(&engine, 2).await;
+
+    let state = engine.state.lock().await;
+    let summary = state
+        .items
+        .iter()
+        .find(|item| item.source.as_deref() == Some("episode-derived"))
+        .expect("fallback episode card must exist");
+    assert!(
+        summary.content.contains("[episode]"),
+        "compact failure must fall back to the bounded marker, got: {}",
+        summary.content
+    );
+    assert!(
+        summary.content.contains("round 1"),
+        "fallback still carries bounded episode source, got: {}",
+        summary.content
+    );
+}
+
+/// Without a compactor, rotation stays promote-and-evict: no derived card.
+#[tokio::test]
+async fn episode_rotation_without_compactor_does_not_insert_a_card() {
+    let engine = SimpleContextEngine::new(episode_budget_config());
+    open_focus(&engine, "keep AuthService.rs").await;
+    ingest_related(&engine, 1).await;
+    ingest_related(&engine, 2).await;
+    let state = engine.state.lock().await;
+    assert!(
+        !state
+            .items
+            .iter()
+            .any(|item| item.source.as_deref() == Some("episode-derived")),
+        "no episode card without a compactor"
+    );
+    assert!(
+        state.items.iter().any(|item| {
+            item.kind == ContextKind::UserMessage
+                && item.content.contains("round 1")
+                && item.attention == AttentionState::Archived
+        }),
+        "ordinary dialogue still archives on rotation"
+    );
+}
+
 /// The dependency-expansion token reserve is only carved out when expansion
 /// can actually run: with expansion disabled the whole budget belongs to the
 /// working set, so an item that fits the budget must not be pushed out by a
@@ -7387,6 +7667,7 @@ async fn anchor_roots_directive_replaces_the_root_set_and_is_bounded() {
         item_ref: item_ref.to_string(),
         strength: agent_contracts::AnchorRootStrength::ResidentRequired,
         source_field_id: "working_refs".into(),
+        ..Default::default()
     };
 
     // 推送一组根声明：整组替换（不是逐条增删），engine 只镜像投影。
@@ -7485,6 +7766,8 @@ async fn anchor_root_claims_protect_items_from_gc() {
                     item_ref: target_id.to_string(),
                     strength: agent_contracts::AnchorRootStrength::ResidentRequired,
                     source_field_id: "working_refs".into(),
+                    anchor_revision: 4,
+                    reason: agent_contracts::RootReason::OpenLoop,
                 }],
             },
         })
@@ -7494,6 +7777,16 @@ async fn anchor_root_claims_protect_items_from_gc() {
     assert!(
         report.anchor_roots_protected >= 1,
         "报告必须说明声明保护的条目数：{report:?}"
+    );
+    assert!(
+        report.anchor_root_protections.iter().any(|protection| {
+            protection.item_ref == target_id.to_string()
+                && protection.source_field_id == "working_refs"
+                && protection.anchor_revision == 4
+                && protection.reason == agent_contracts::RootReason::OpenLoop
+                && protection.strength == agent_contracts::AnchorRootStrength::ResidentRequired
+        }),
+        "每个 residency 根必须报告 revision + source_field + RootReason：{report:?}"
     );
     let state = engine.state.lock().await;
     let resident = state
@@ -7553,6 +7846,7 @@ async fn anchor_root_claims_reactivate_evicted_items_from_the_warm_buffer() {
                     item_ref: target_id.to_string(),
                     strength: agent_contracts::AnchorRootStrength::PromptRequired,
                     source_field_id: "open_loops".into(),
+                    ..Default::default()
                 }],
             },
         })
@@ -7603,6 +7897,7 @@ async fn anchor_root_claims_never_resurrect_terminal_items() {
                     item_ref: target_id.to_string(),
                     strength: agent_contracts::AnchorRootStrength::ResidentRequired,
                     source_field_id: "working_refs".into(),
+                    ..Default::default()
                 }],
             },
         })
@@ -7671,7 +7966,9 @@ async fn prompt_required_anchor_roots_force_selection() {
                     item_ref: target_id.to_string(),
                     strength: agent_contracts::AnchorRootStrength::PromptRequired,
                     source_field_id: "constraints".into(),
+                    ..Default::default()
                 }],
+                task: None,
             },
         })
         .await
@@ -7748,6 +8045,8 @@ async fn storage_required_anchor_roots_protect_the_store() {
                     item_ref: protected_id.to_string(),
                     strength: agent_contracts::AnchorRootStrength::StorageRequired,
                     source_field_id: "evidence_refs".into(),
+                    anchor_revision: 2,
+                    reason: agent_contracts::RootReason::CompletionEvidence,
                 }],
             },
         })
@@ -7758,9 +8057,155 @@ async fn storage_required_anchor_roots_protect_the_store() {
         report.anchor_roots_protected >= 1,
         "报告必须说明声明保护的 store 条目：{report:?}"
     );
+    assert!(
+        report.anchor_root_protections.iter().any(|protection| {
+            protection.item_ref == protected_id.to_string()
+                && protection.source_field_id == "evidence_refs"
+                && protection.anchor_revision == 2
+                && protection.reason == agent_contracts::RootReason::CompletionEvidence
+                && protection.strength == agent_contracts::AnchorRootStrength::StorageRequired
+        }),
+        "每个 storage 根必须报告 revision + source_field + RootReason：{report:?}"
+    );
     let state = engine.state.lock().await;
     assert!(
         state.external.iter().any(|e| e.item_id == protected_id),
         "StorageRequired 声明指向的条目必须保留"
+    );
+}
+
+#[tokio::test]
+async fn task_anchor_view_passes_through_materialize_unscored() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let view = agent_contracts::TaskAnchorView {
+        revision: 7,
+        original_goal: "refactor auth".into(),
+        current_interpretation: "split the module".into(),
+        constraints: vec!["keep the public API".into()],
+        ..Default::default()
+    };
+    let materialized = engine
+        .materialize(agent_contracts::ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 4096,
+            hints: agent_contracts::ContextHints {
+                task: Some(view.clone()),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        materialized.task.as_ref(),
+        Some(&view),
+        "引擎必须原样回传 TaskAnchorView，不能评分或改写"
+    );
+    assert!(
+        materialized
+            .items
+            .iter()
+            .all(|item| item.content != "refactor auth"),
+        "view 不是 heap 条目"
+    );
+}
+
+#[tokio::test]
+async fn resident_required_does_not_force_prompt_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let target_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "resident-only note".into(),
+            ContextKind::Note,
+            ContextScope::Session,
+            ContextRetention::Working,
+            0.1,
+            None,
+        );
+        item.id = ContextItemId::new();
+        item.attention = AttentionState::Archived;
+        let id = item.id;
+        state.items.push(item);
+        id
+    };
+    let materialized = engine
+        .materialize(agent_contracts::ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 4096,
+            hints: agent_contracts::ContextHints {
+                anchor_roots: vec![agent_contracts::AnchorRootClaim {
+                    item_ref: target_id.to_string(),
+                    strength: agent_contracts::AnchorRootStrength::ResidentRequired,
+                    source_field_id: "working_refs".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    assert!(
+        !materialized
+            .items
+            .iter()
+            .any(|item| item.item_id == target_id),
+        "ResidentRequired 不是 prompt 根：{materialized:?}"
+    );
+}
+
+#[tokio::test]
+async fn storage_required_is_not_a_residency_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let target_id = {
+        let mut state = engine.state.lock().await;
+        let mut item = crate::item::make_item(
+            &state,
+            &engine.config,
+            "storage-only evidence".into(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.2,
+            Some("tool-capture".into()),
+        );
+        item.id = ContextItemId::new();
+        item.attention = AttentionState::Archived;
+        item.gc_generation = 3;
+        let id = item.id;
+        state.items.push(item);
+        id
+    };
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::AnchorRoots {
+                roots: vec![agent_contracts::AnchorRootClaim {
+                    item_ref: target_id.to_string(),
+                    strength: agent_contracts::AnchorRootStrength::StorageRequired,
+                    source_field_id: "evidence_refs".into(),
+                    ..Default::default()
+                }],
+            },
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert_eq!(
+        report.anchor_roots_protected, 0,
+        "StorageRequired 不得充当 residency 根：{report:?}"
+    );
+    let state = engine.state.lock().await;
+    assert!(
+        !state.items.iter().any(|item| item.id == target_id),
+        "StorageRequired 条目可以离开 heap"
     );
 }

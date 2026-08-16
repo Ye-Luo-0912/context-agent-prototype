@@ -212,9 +212,11 @@ pub enum RootClaimStrength {
 
 /// 把任务锚的根声明投影为上下文策略消费的有界集合。任务权威留在
 /// `TaskManager`；GC/materialization 只看到这条投影（有界、按强度原样
-/// 映射、来源字段保留），从不复制锚本身。working_refs 与 evidence_refs
-/// 都投影；超出 `MAX_ANCHOR_ROOT_CLAIMS` 的尾部截断（TaskAnchor 本身
-/// 已被 `MAX_TASK_ANCHOR_CLAIMS` 限制，双上限下投影不会膨胀）。
+/// 映射、来源字段与锚修订保留），从不复制锚本身。working_refs 与
+/// evidence_refs 都投影；超出 `MAX_ANCHOR_ROOT_CLAIMS` 的尾部截断
+/// （TaskAnchor 本身已被 `MAX_TASK_ANCHOR_CLAIMS` 限制，双上限下投影
+/// 不会膨胀）。三类强度保持独立：PromptRequired 进帧，ResidentRequired
+/// 保 residency，StorageRequired 只挡永久删除。
 pub fn anchor_root_claims(anchor: &TaskAnchor) -> Vec<agent_contracts::AnchorRootClaim> {
     let mut claims = Vec::with_capacity(
         anchor
@@ -242,10 +244,38 @@ pub fn anchor_root_claims(anchor: &TaskAnchor) -> Vec<agent_contracts::AnchorRoo
                 RootClaimStrength::Recallable => agent_contracts::AnchorRootStrength::Recallable,
             },
             source_field_id: claim.source_field_id.clone(),
+            anchor_revision: anchor.revision,
+            reason: root_reason_for_role(claim.role),
         });
     }
     claims.truncate(agent_contracts::MAX_ANCHOR_ROOT_CLAIMS);
     claims
+}
+
+/// Bounded prompt projection of the active TaskAnchor. Raw working/evidence
+/// refs stay on `anchor_root_claims`; this view is the contract the model
+/// sees, not a heap item and not a copy of task authority.
+pub fn task_anchor_view(anchor: &TaskAnchor) -> agent_contracts::TaskAnchorView {
+    agent_contracts::TaskAnchorView {
+        revision: anchor.revision,
+        original_goal: anchor.original_goal.clone(),
+        current_interpretation: anchor.current_interpretation.clone(),
+        constraints: anchor.constraints.clone(),
+        acceptance_criteria: anchor.acceptance_criteria.clone(),
+        plan_progress: anchor.plan_progress.clone(),
+        open_loops: anchor.open_loops.clone(),
+    }
+}
+
+fn root_reason_for_role(role: RootClaimRole) -> agent_contracts::RootReason {
+    match role {
+        RootClaimRole::ConstraintSource => agent_contracts::RootReason::HardConstraint,
+        RootClaimRole::AcceptanceEvidence => agent_contracts::RootReason::CompletionEvidence,
+        RootClaimRole::ActiveDecision => agent_contracts::RootReason::TaskAnchor,
+        RootClaimRole::OpenLoopEvidence => agent_contracts::RootReason::OpenLoop,
+        RootClaimRole::WorkingArtifact => agent_contracts::RootReason::CurrentEpisode,
+        RootClaimRole::Verification => agent_contracts::RootReason::CompletionEvidence,
+    }
 }
 
 /// One immutable, typed task completion outcome.
@@ -1636,9 +1666,25 @@ mod tests {
             "强度原样映射"
         );
         assert_eq!(claims[0].source_field_id, "working_refs");
+        assert_eq!(claims[0].anchor_revision, 0);
+        assert_eq!(claims[0].reason, agent_contracts::RootReason::TaskAnchor);
         assert_eq!(claims[1].strength, AnchorRootStrength::ResidentRequired);
+        assert_eq!(
+            claims[1].reason,
+            agent_contracts::RootReason::CurrentEpisode
+        );
         assert_eq!(claims[2].strength, AnchorRootStrength::StorageRequired);
         assert_eq!(claims[2].source_field_id, "evidence_refs");
+        assert_eq!(
+            claims[2].reason,
+            agent_contracts::RootReason::CompletionEvidence
+        );
+        let view = task_anchor_view(&anchor);
+        assert_eq!(view.revision, 0);
+        assert_eq!(view.original_goal, "refactor auth");
+        assert_eq!(view.current_interpretation, "split the module");
+        assert!(view.constraints.is_empty());
+        assert!(view.open_loops.is_empty());
     }
 
     #[test]

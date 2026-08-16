@@ -316,6 +316,8 @@ mod tests {
             search_reinforce_count: 0,
             gc_generation: 0,
             evicted_at_tick: None,
+            file_path: None,
+            file_revision: None,
         }
     }
 

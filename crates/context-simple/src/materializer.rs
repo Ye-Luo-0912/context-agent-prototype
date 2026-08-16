@@ -2,9 +2,9 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use agent_contracts::{
-    AnchorRootStrength, AttentionState, CONTEXT_MAP_VIEW_CAP, ContextItem, ContextItemId,
-    ContextMapView, ContextQuery, ContextRetention, ContextSelection, MaterializedContext,
-    MaterializedItem, ScopeId, ScopeKind, ScopeState, ScoreBreakdown,
+    AttentionState, CONTEXT_MAP_VIEW_CAP, ContextItem, ContextItemId, ContextMapView, ContextQuery,
+    ContextRetention, ContextSelection, MaterializedContext, MaterializedItem, ScopeId, ScopeKind,
+    ScopeState, ScoreBreakdown,
 };
 
 use crate::diagnostics;
@@ -160,7 +160,7 @@ pub(crate) fn materialize(
         .hints
         .anchor_roots
         .iter()
-        .filter(|claim| claim.strength == AnchorRootStrength::PromptRequired)
+        .filter(|claim| claim.strength.requires_prompt())
         .flat_map(|claim| {
             state
                 .items
@@ -423,6 +423,7 @@ pub(crate) fn materialize(
                 retention: item.retention,
                 content: item.content.clone(),
                 source: item.source.clone(),
+                file_path: item.file_path.clone(),
             }
         })
         .collect();
@@ -447,6 +448,7 @@ pub(crate) fn materialize(
     MaterializedContext {
         materialization_id: 0,
         focus,
+        task: query.hints.task.clone(),
         items,
         // The lightweight context map: a *bounded* slice of the external
         // entries, never the whole map. The full `state.external` stays in

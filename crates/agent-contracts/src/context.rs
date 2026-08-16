@@ -335,6 +335,13 @@ pub struct ContextItem {
     /// valid (restore backfills items with an empty signature).
     #[serde(default)]
     pub entities: Vec<String>,
+    /// 工作区相对路径：live `fs.read` 从 ToolOutput.metadata.path 盖章，
+    /// 不从带行号的 model_content 猜测。缺省兼容旧 checkpoint。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    /// 同一次读取的内容摘要（`fs.read` 的 SHA-256 hex revision）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -538,12 +545,62 @@ pub struct ContextHints {
     /// terminal semantic state is never resurrected by a claim.
     #[serde(default)]
     pub anchor_roots: Vec<AnchorRootClaim>,
+    /// Bounded prompt projection of the active TaskAnchor. The engine copies
+    /// this through to `MaterializedContext` without scoring it as a heap
+    /// item; task authority stays with the TaskManager.
+    #[serde(default)]
+    pub task: Option<TaskAnchorView>,
 }
 
 /// Hard cap on the anchor-root projection the runtime pushes into one
 /// materialization or GC pass. The model cannot grow the root set without
 /// bound through anchor patches.
 pub const MAX_ANCHOR_ROOT_CLAIMS: usize = 64;
+
+/// Bounded prompt projection of a `TaskAnchor`. Raw refs and bodies stay
+/// out: the assembler renders this contract in the focus frame, while
+/// `anchor_roots` carry the independent prompt/residency/storage claims.
+/// The engine must not own, score, or patch this view.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TaskAnchorView {
+    pub revision: u64,
+    pub original_goal: String,
+    pub current_interpretation: String,
+    pub constraints: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub plan_progress: Vec<String>,
+    pub open_loops: Vec<String>,
+}
+
+impl TaskAnchorView {
+    pub fn is_empty(&self) -> bool {
+        self.original_goal.is_empty()
+            && self.current_interpretation.is_empty()
+            && self.constraints.is_empty()
+            && self.acceptance_criteria.is_empty()
+            && self.plan_progress.is_empty()
+            && self.open_loops.is_empty()
+    }
+}
+
+/// Why a record is a root. Independent of `AnchorRootStrength` (how strongly
+/// to hold it) so prompt, residency, and storage decisions stay separate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootReason {
+    #[default]
+    TaskAnchor,
+    CurrentEpisode,
+    OpenLoop,
+    HardConstraint,
+    ActiveError,
+    CompletionPending,
+    CompletionEvidence,
+    StrongDependency,
+    ExplicitLease,
+    AuditPin,
+}
 
 /// One typed root claim projected from a `TaskAnchor` into the context
 /// policy. The ref names a context item id, `context://run/<id>` uri, or an
@@ -560,9 +617,30 @@ pub struct AnchorRootClaim {
     pub strength: AnchorRootStrength,
     /// Which anchor field the claim came from (provenance/audit).
     pub source_field_id: String,
+    /// Anchor revision this claim was projected from.
+    #[serde(default)]
+    pub anchor_revision: u64,
+    /// Why this claim is a root. Independent of `strength`.
+    #[serde(default)]
+    pub reason: RootReason,
+}
+
+impl Default for AnchorRootClaim {
+    fn default() -> Self {
+        Self {
+            item_ref: String::new(),
+            strength: AnchorRootStrength::Recallable,
+            source_field_id: String::new(),
+            anchor_revision: 0,
+            reason: RootReason::TaskAnchor,
+        }
+    }
 }
 
 /// How strongly the context policy must hold one anchor root claim.
+/// The three protections are independent decisions: prompt membership,
+/// online residency, and storage retention. PromptRequired implies
+/// residency only because a body must be available to render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnchorRootStrength {
@@ -574,6 +652,48 @@ pub enum AnchorRootStrength {
     StorageRequired,
     /// The item is recallable on demand; no residency guarantee.
     Recallable,
+}
+
+impl AnchorRootStrength {
+    /// Mandatory materialization: force the item into the next model frame.
+    pub fn requires_prompt(self) -> bool {
+        matches!(self, Self::PromptRequired)
+    }
+
+    /// Online residency: keep or recall the body in the fast working set.
+    /// PromptRequired implies residency because rendering needs the body.
+    pub fn requires_residency(self) -> bool {
+        matches!(self, Self::PromptRequired | Self::ResidentRequired)
+    }
+
+    /// Storage retention: forbid permanent deletion while the claim stands.
+    /// Does not by itself keep the body resident or in the prompt.
+    pub fn requires_storage(self) -> bool {
+        matches!(self, Self::StorageRequired)
+    }
+}
+
+/// One explainable root protection applied this GC/storage-GC pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AnchorRootProtection {
+    pub item_ref: String,
+    pub strength: AnchorRootStrength,
+    pub source_field_id: String,
+    pub anchor_revision: u64,
+    pub reason: RootReason,
+}
+
+impl From<&AnchorRootClaim> for AnchorRootProtection {
+    fn from(claim: &AnchorRootClaim) -> Self {
+        Self {
+            item_ref: claim.item_ref.clone(),
+            strength: claim.strength,
+            source_field_id: claim.source_field_id.clone(),
+            anchor_revision: claim.anchor_revision,
+            reason: claim.reason,
+        }
+    }
 }
 
 /// Hard bound on full working-set item ids carried by one consumption
@@ -810,6 +930,9 @@ pub struct MaterializedItem {
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// 选中条目若是文件正文观察，装配器用它标路径，不从 content 猜。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
 }
 
 /// Missing `retention` on old wire/checkpoint data means a normal working
@@ -823,13 +946,17 @@ fn default_retention() -> ContextRetention {
 /// (externalized items visible only by `ContextRef`) and the
 /// selections/diagnostics. Prompt rendering is deliberately absent — that
 /// is the prompt assembler's job.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MaterializedContext {
     /// Opaque identity of this preview. It is echoed by
     /// `ContextConsumptionAck` only after the final provider request succeeds.
     #[serde(default)]
     pub materialization_id: u64,
     pub focus: Option<FocusState>,
+    /// Bounded TaskAnchor prompt projection, copied from `ContextHints.task`
+    /// without scoring. Absent when no active task supplied a view.
+    #[serde(default)]
+    pub task: Option<TaskAnchorView>,
     pub items: Vec<MaterializedItem>,
     /// The lightweight context map: externalized items the model can only
     /// see as references (`context://...`), never as full content. The
@@ -923,6 +1050,10 @@ pub struct ContextGcReport {
     /// (the working set slice the active task's TaskAnchor protects).
     #[serde(default)]
     pub anchor_roots_protected: usize,
+    /// Bounded per-claim explanations for those protections
+    /// (`anchor_revision + source_field + RootReason`).
+    #[serde(default)]
+    pub anchor_root_protections: Vec<AnchorRootProtection>,
     #[serde(default)]
     pub evictions: Vec<ContextEviction>,
     #[serde(default)]
@@ -1073,6 +1204,11 @@ pub struct ExternalizedContext {
     /// 进入 warm 缓冲的 tick，随条目保留。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evicted_at_tick: Option<u64>,
+    /// 外部化时的文件身份，inspect/search 不必读 store body。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_revision: Option<String>,
 }
 
 /// Cap on the external refs surfaced in one materialized context. The
@@ -1080,11 +1216,14 @@ pub struct ExternalizedContext {
 /// should see a handful of pullable refs, not the whole external history.
 pub const CONTEXT_MAP_VIEW_CAP: usize = 32;
 
-/// Default coding-agent system policy. Two sentences on purpose: the packed
-/// working set and tool results carry facts; this string must not teach
-/// retrieval. Do not retune scoring from this text.
-pub const DEFAULT_CODING_AGENT_SYSTEM_PROMPT: &str =
-    "You are a focused coding agent. Work on the current task only.";
+/// Default coding-agent system policy. Short on purpose: a stable runtime
+/// contract, not a retrieval tutorial. Do not name ops, prefer/avoid lists,
+/// or retune scoring from this text.
+pub const DEFAULT_CODING_AGENT_SYSTEM_PROMPT: &str = concat!(
+    "You are a focused coding agent. Work on the current task only. ",
+    "The selected working context is not the full catalog; prior evidence may remain outside this frame and can be searched or retrieved with context tools. ",
+    "Additional tools can be discovered and loaded with capability tools."
+);
 
 /// The bounded, model-facing view of the external context map. The engine
 /// selects at most [`CONTEXT_MAP_VIEW_CAP`] refs per materialization; the
@@ -1224,6 +1363,9 @@ pub struct StorageGcReport {
     /// deleted while the claim stands.
     #[serde(default)]
     pub anchor_roots_protected: usize,
+    /// Bounded per-claim explanations for those storage protections.
+    #[serde(default)]
+    pub anchor_root_protections: Vec<AnchorRootProtection>,
     /// Store entries that could not be touched because the filesystem
     /// returned a real error (permission, disk). Those entries are *kept* —
     /// an IO failure must never be mistaken for "the file is already gone".
@@ -1417,6 +1559,25 @@ pub trait ContextEngine: Send + Sync {
 mod tests {
     use super::*;
 
+    #[test]
+    fn anchor_root_strengths_are_independent_protections() {
+        assert!(AnchorRootStrength::PromptRequired.requires_prompt());
+        assert!(AnchorRootStrength::PromptRequired.requires_residency());
+        assert!(!AnchorRootStrength::PromptRequired.requires_storage());
+
+        assert!(!AnchorRootStrength::ResidentRequired.requires_prompt());
+        assert!(AnchorRootStrength::ResidentRequired.requires_residency());
+        assert!(!AnchorRootStrength::ResidentRequired.requires_storage());
+
+        assert!(!AnchorRootStrength::StorageRequired.requires_prompt());
+        assert!(!AnchorRootStrength::StorageRequired.requires_residency());
+        assert!(AnchorRootStrength::StorageRequired.requires_storage());
+
+        assert!(!AnchorRootStrength::Recallable.requires_prompt());
+        assert!(!AnchorRootStrength::Recallable.requires_residency());
+        assert!(!AnchorRootStrength::Recallable.requires_storage());
+    }
+
     fn ref_entry() -> ExternalizedContext {
         ExternalizedContext {
             item_id: ContextItemId::new(),
@@ -1457,6 +1618,8 @@ mod tests {
             search_reinforce_count: 0,
             gc_generation: 0,
             evicted_at_tick: None,
+            file_path: None,
+            file_revision: None,
         }
     }
 
@@ -1607,14 +1770,28 @@ mod tests {
     }
 
     #[test]
-    fn default_coding_prompt_stays_two_sentences() {
-        assert_eq!(
-            DEFAULT_CODING_AGENT_SYSTEM_PROMPT,
-            "You are a focused coding agent. Work on the current task only."
+    fn default_coding_prompt_states_the_runtime_contract() {
+        let prompt = DEFAULT_CODING_AGENT_SYSTEM_PROMPT;
+        assert!(prompt.contains("focused coding agent"));
+        assert!(prompt.contains("not the full catalog"));
+        assert!(prompt.contains("context tools"));
+        assert!(prompt.contains("capability tools"));
+        assert!(
+            !prompt.contains("bounded cache"),
+            "calling the working set a cache made the model re-read it"
         );
         assert!(
-            !DEFAULT_CODING_AGENT_SYSTEM_PROMPT.contains("bounded cache"),
-            "calling the working set a cache made the model re-read it"
+            !prompt.contains("Use context.manage") && !prompt.contains("prefer Live"),
+            "the contract names surfaces, not retrieval steps: {prompt}"
+        );
+        let sentences = prompt
+            .split('.')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .count();
+        assert!(
+            (3..=4).contains(&sentences),
+            "keep the contract short, got {sentences} sentences: {prompt}"
         );
     }
 }

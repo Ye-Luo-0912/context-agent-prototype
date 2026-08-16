@@ -48,7 +48,10 @@ base64 = "0.22"
 libc = "0.2"
 futures-util = "0.3"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# `system-proxy` is required on Windows: Clash/V2Ray typically set WinINET
+# (`127.0.0.1:7897`) without HTTP_PROXY. Without this feature the OpenAI
+# client goes direct and pinaic returns 403 permission_error from this region.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "system-proxy"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

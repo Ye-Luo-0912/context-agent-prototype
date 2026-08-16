@@ -110,7 +110,13 @@ pub(crate) async fn externalize_async(
 }
 
 pub(crate) fn make_context_ref(item: &ContextItem) -> ContextRef {
-    let summary: String = item.content.chars().take(SUMMARY_CHARS).collect();
+    let body: String = item.content.chars().take(SUMMARY_CHARS).collect();
+    let summary = match item.file_path.as_deref() {
+        Some(path) if !path.is_empty() && !body.starts_with(path) => {
+            format!("{path}\n{body}")
+        }
+        _ => body,
+    };
     ContextRef {
         uri: context_uri(item.id),
         item_id: item.id,
@@ -227,6 +233,8 @@ fn project_item(item: &ContextItem) -> ExternalizedContext {
         search_reinforce_count: 0,
         gc_generation: item.gc_generation,
         evicted_at_tick: item.evicted_at_tick,
+        file_path: item.file_path.clone(),
+        file_revision: item.file_revision.clone(),
     }
 }
 
@@ -282,15 +290,20 @@ pub(crate) fn search_entries<'a>(
             .entities
             .iter()
             .any(|entity| entity.to_lowercase().contains(&needle));
+        let path_match = entry
+            .file_path
+            .as_deref()
+            .is_some_and(|path| path.to_lowercase().contains(&needle));
         if !needle.is_empty()
             && !entity_match
+            && !path_match
             && !entry.context_ref.summary.to_lowercase().contains(&needle)
             && !entry.context_ref.uri.to_lowercase().contains(&needle)
         {
             continue;
         }
         let candidate = SearchEntry {
-            entity_match,
+            entity_match: entity_match || path_match,
             last_access_tick: entry.last_access_tick,
             externalized_at_tick: entry.externalized_at_tick,
             id: entry.item_id,
@@ -405,6 +418,8 @@ pub(crate) fn to_external_entry(
         search_reinforce_count: 0,
         gc_generation: item.gc_generation,
         evicted_at_tick: item.evicted_at_tick,
+        file_path: item.file_path.clone(),
+        file_revision: item.file_revision.clone(),
     }
 }
 
@@ -528,18 +543,28 @@ pub(crate) fn plan_storage_gc(
     }
 
     let mut anchor_roots_protected = 0usize;
+    let mut anchor_root_protections = Vec::new();
     let candidates = state
         .external
         .iter()
         .filter_map(|entry| {
             // TaskAnchor 的 StorageRequired 声明：活跃任务声称这条证据
             // 必须永久保留，storage GC 不把它列入候选（任务权威 > TTL）。
-            let claimed = state.anchor_roots.iter().any(|claim| {
-                claim.strength == agent_contracts::AnchorRootStrength::StorageRequired
+            if let Some(claim) = state.anchor_roots.iter().find(|claim| {
+                claim.strength.requires_storage()
                     && crate::engine::anchor_claim_matches_entry(claim, entry)
-            });
-            if claimed {
+            }) {
                 anchor_roots_protected += 1;
+                if anchor_root_protections.len() < agent_contracts::MAX_ANCHOR_ROOT_CLAIMS
+                    && !anchor_root_protections
+                        .iter()
+                        .any(|existing: &agent_contracts::AnchorRootProtection| {
+                            existing.item_ref == claim.item_ref
+                                && existing.source_field_id == claim.source_field_id
+                        })
+                {
+                    anchor_root_protections.push(claim.into());
+                }
                 return None;
             }
             storage_candidate(
@@ -554,6 +579,7 @@ pub(crate) fn plan_storage_gc(
     StorageGcPlan {
         candidates,
         anchor_roots_protected,
+        anchor_root_protections,
     }
 }
 
@@ -563,6 +589,7 @@ pub(crate) struct StorageGcPlan {
     /// Entries kept this pass because a `StorageRequired` anchor root
     /// claim protects them.
     pub(crate) anchor_roots_protected: usize,
+    pub(crate) anchor_root_protections: Vec<agent_contracts::AnchorRootProtection>,
 }
 
 /// Phase 2 (no lock held): remove the planned store files. Real IO errors
@@ -649,6 +676,7 @@ pub(crate) fn commit_storage_gc(
     state.external.replace_all(kept);
     report.scanned = state.external.len() + report.deleted;
     report.anchor_roots_protected = plan.anchor_roots_protected;
+    report.anchor_root_protections = plan.anchor_root_protections;
     report
 }
 

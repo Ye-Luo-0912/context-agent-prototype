@@ -49,6 +49,7 @@ impl ContextEngine for TestContextEngine {
         Ok(MaterializedContext {
             materialization_id: 0,
             focus: None,
+            task: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
@@ -223,6 +224,7 @@ impl ContextEngine for RecordingContextEngine {
         Ok(MaterializedContext {
             materialization_id: 0,
             focus: None,
+            task: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
@@ -761,6 +763,7 @@ impl ContextEngine for ScopeRecordingEngine {
         Ok(MaterializedContext {
             materialization_id: 0,
             focus: None,
+            task: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
@@ -1037,6 +1040,7 @@ impl ContextEngine for PublishingScopeEngine {
         Ok(MaterializedContext {
             materialization_id: 0,
             focus: None,
+            task: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
@@ -1094,6 +1098,7 @@ impl ContextEngine for FailingCloseScopeEngine {
         Ok(MaterializedContext {
             materialization_id: 0,
             focus: None,
+            task: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
@@ -1142,6 +1147,7 @@ impl ContextEngine for HangingCloseScopeEngine {
         Ok(MaterializedContext {
             materialization_id: 0,
             focus: None,
+            task: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
@@ -1285,6 +1291,7 @@ impl ContextEngine for IngestRecordingEngine {
         Ok(MaterializedContext {
             materialization_id: 0,
             focus: None,
+            task: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
@@ -2636,6 +2643,7 @@ impl ContextEngine for FailingAssistantIngestEngine {
         Ok(MaterializedContext {
             materialization_id: 0,
             focus: None,
+            task: None,
             items: Vec::new(),
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),

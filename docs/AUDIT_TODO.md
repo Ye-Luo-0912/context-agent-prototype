@@ -1629,6 +1629,10 @@ Required closure:
    / `--pilot-calibrate` landed; `decision=pilot` cannot pass the gate.
    File-only live 9×3 collected (81 cells, `crates/agent-eval/evidence/pilot-30`):
    ITT A=C=0.778, diagnostic C−A LCL=−0.146, `n_tasks=9 != 300` ineligible.
+   **2026-08-15.** `--pilot-calibrate --file-only` is required when that
+   directory also contains P0 SWE-bench floor cells. Retrieval
+   secondaries on the 21 cost-eligible file-only A/C pairs: search
+   calls 0.2/0.2; C forgotten/recovered 11.3/0.9 vs A 0/0; not in LCL.
    **EVAL-01.5.p1 (2026-08-15).** P0 SWE-bench remaining spend skipped
    (send floor 19904 + 12 rounds cannot host the workload). P1: declared
    send window (default 128k), C/B pack 24k, A grows until send, 48
@@ -1644,16 +1648,123 @@ Required closure:
    graded-access distribution) are secondary lifecycle endpoints reported
    from the same cells; no separate later retrieval experiment. Declared
    in SPEC at EVAL-01.3b (no gate change).
+   **2026-08-15.** `--analyze-evidence` reports those secondaries from
+   cell `summary.json` on cost-eligible A/C pairs; they are not in the
+   LCL gate. Next SPEC re-registration (if adding a C-vs-B non-inferiority
+   contrast and an efficiency secondary) should keep these retrieval
+   lines rather than a second retrieval-only SPEC edit; n/margin stay
+   until that amendment; never after seeing acceptance cells.
 5. use executable hidden build/tests and a model-backed bounded compaction B.
    **Partial 2026-08-15 (EVAL-01.5.p1b).** Shared `BoundedCompactor` is
    live for B fold and C `TaskCompleted` distill; scripted digest remains
    CI. Executable hidden build/test commands are still open. Do not
    amend n. Do not mix P0/P1 ITT tables.
+   **Follow-up 2026-08-16.** C also distills on focus episode rotation
+   (`episode-derived` card; sources kept; prior card superseded). Do not
+   amend n.
    **Partial 2026-08-15 (EVAL-01.5.p1c).** Catalog-wide search/inspect;
    prompt stuffing (cache/optional/how-to) was removed rather than
    replaced with a longer tutorial. Extra C rounds are still a treatment
    effect; P1 n=1 file-only + recall is collected and leftover extra
    rounds are mixed, not universal. Scoring stays frozen.
+   **P1 SWE-bench n=1 (2026-08-15).** Three Django tasks under
+   `target/eval-evidence/p1-swebench-diag` (pre-path-stamp binary, not
+   the P0 table). C passed 3/3; A exhausted 48 rounds; B mixed including
+   one `usage_incomplete` flake. C catalog search stayed 0.
+   **P1 after-path n=1 (2026-08-15).** Path/contract re-measure:
+   js-ms-negative C extra rounds gone this cell; recall extra rounds
+   remain (search 0, failed `git.status` / rereads). Scoring stays frozen.
+   **P1 after-anchor n=1 (2026-08-15).** TaskAnchorView binary,
+   `p1-after-anchor`. recall A/B/C verify-failed (`4B`); C 16r vs A 13r,
+   search 0. js-ms-negative C 10r pass ≈ A 11r; B hidden fail.
+   `--analyze-evidence` on those cells: search A/C calls=0/0; C
+   forgotten/recovered 15.5/2.5 vs A 0/0; not in the LCL gate.
+   **P1 SWE-bench after-anchor n=1 attempt (2026-08-15).**
+   `django-13344` three engines HTTP 403 on turn 1 (`outcome=error`,
+   cost-missing 1.0). A cheap `fix_off_by_one` probe
+   (`p1-provider-probe`) hit the same 403. Direct connect from this
+   region; Windows system proxy (`127.0.0.1:7897`) was on but reqwest
+   lacked `system-proxy`. Infrastructure, not a treatment effect. Do
+   not mix ITT tables. Scoring stays frozen.
+   **P1 SWE-bench after-proxy n=1 (2026-08-15).** `p1-swebench-after-proxy`
+   / `django-13344`: A/B/C `verify_failed` (gold `resolved=0`), not 403.
+   C 33r/926950in search 2/3; A 47r/1550204in search 0. Probe
+   `fix_off_by_one` 3/3 pass. Ineligible n=1. Do not mix ITT tables.
+   Scoring stays frozen.
+   **P1 after-proxy `django-13809` (2026-08-15).** B gold pass; A/C
+   48-round cap (`outcome=error`). Dir n=2 ineligible. Scoring stays
+   frozen.
+   **P1 after-proxy `django-14007` (2026-08-15).** A 48-round cap; B/C
+   `verify_failed`. Dir n=3 ineligible; ITT A=C=0. Scoring stays frozen.
+   **P1 after-proxy `django-14011` (2026-08-15).** A/B/C `verify_failed`.
+   Dir n=4 ineligible; ITT A=C=0. Scoring stays frozen.
+   **P1 after-proxy `django-15268` (2026-08-15).** B gold pass; C 48-round
+   cap; A HTTP 401 `INVALID_API_KEY` (`usage_incomplete`). Dir n=5
+   ineligible; cost-missing 1/5. Scoring stays frozen. Operator: 401 is
+   relay jitter; continue same dir.
+   **P1 after-proxy `django-15503` (2026-08-15).** A `verify_failed`; B/C
+   48-round cap. Dir n=6 ineligible; ITT A=C=0. Scoring stays frozen.
+   **P1 after-proxy `django-15695` (2026-08-15).** A/B/C `verify_failed`
+   (C forgotten 55 recovered 0). Dir n=7 ineligible; ITT A=C=0. Scoring
+   stays frozen.
+   **P1 after-proxy `django-16642` (2026-08-15).** A/B/C `verify_failed`
+   (C 8r forgotten 14 recovered 0). Dir n=8 ineligible; ITT A=C=0.
+   Scoring stays frozen. Next frozen SWE-bench is matplotlib.
+   **P1 after-proxy `matplotlib-23314` (2026-08-15).** A/B/C gold pass
+   (C forgotten 43 recovered 0). First both-pass pair. Dir n=9
+   ineligible; ITT A=C=0. Scoring stays frozen.
+   **P1 after-proxy `pylint-4551` (2026-08-15).** A/B turn-4 48-round
+   cap; C `verify_failed` recovered 12/99. Dir n=10 ineligible; ITT
+   A=C=0. Scoring stays frozen.
+   **P1 after-proxy `pytest-5787` (2026-08-15).** A/B/C `verify_failed`
+   (C forgotten 30 recovered 0). Dir n=11 ineligible; ITT A=C=0. Scoring
+   stays frozen.
+   **P1 after-proxy `pytest-6202` (2026-08-15).** A/B gold pass; C 48-round
+   cap. First A=1 C=0 pair (d=-1). Dir n=12 ineligible; ITT mean=-0.083
+   `degenerate=false`. Not a gate. Scoring stays frozen.
+   **P1 after-proxy `pytest-7571` (2026-08-15).** A/B/C gold pass (C
+   forgotten 47 recovered 0). Second both-pass. Dir n=13 ineligible;
+   ITT mean=-0.077. Not a gate. Scoring stays frozen.
+   **P1 after-proxy `scikit-learn-11310` (2026-08-15).** A 48-round cap;
+   B/C gold pass. First A=0 C=1 pair (d=+1). Dir n=14 ineligible; ITT
+   mean=0 `degenerate=false`. Not a gate. Scoring stays frozen.
+   **P1 after-proxy `scikit-learn-13496` (2026-08-15).** A gold pass; B/C
+   48-round cap. Second A=1 C=0 pair. Dir n=15 ineligible; ITT mean=-0.067.
+   Not a gate. Scoring stays frozen.
+   **P1 after-proxy `scikit-learn-14894` (2026-08-15).** A `verify_failed`
+   7r; B gold pass; C 48-round cap. Dir n=16 ineligible; ITT mean=-0.062.
+   Not a gate. Scoring stays frozen. Next frozen SWE-bench is sphinx.
+   **P1 after-proxy `sphinx-8548` (2026-08-15).** B/C `verify_failed`; A
+   HTTP 502 (`usage_incomplete`). Dir n=17 ineligible; cost-missing 2/17.
+   Treat 502 as relay jitter. Scoring stays frozen.
+   **P1 after-proxy `sympy-22914` (2026-08-15).** B/C 429
+   `DAILY_LIMIT_EXCEEDED`; A 502. Dir n=18 ineligible; cost-missing 3/18.
+   Quota stop. Do not start more live cells. Scoring stays frozen.
+   **P1 after-proxy `sympy-22914` retry (2026-08-16).** A/C gold pass; B
+   `verify_failed`. Third both-pass. Dir n=18 ineligible; cost-missing
+   2/18. Not a gate. Scoring stays frozen. Next: backfill django-11749.
+   **P1 after-proxy `django-11749` (2026-08-16).** A `verify_failed` 6r;
+   B/C empty-assistant (`usage_incomplete`). Dir n=19 ineligible;
+   cost-missing 3/19. Not mixed with diag. Scoring stays frozen.
+   **P1 after-proxy `django-11999` (2026-08-16).** C gold pass; A
+   `verify_failed` 2r; B turn timeout. Second A=0 C=1 pair. Dir n=20
+   ineligible; ITT mean=0. Not a gate. Scoring stays frozen.
+   **P1 after-proxy `django-12708` (2026-08-16).** A/B/C gold pass (C 18r
+   forgotten 31 recovered 0). Fourth both-pass. Dir n=21 ineligible;
+   ITT mean=0 LCL=-0.168. Frozen SWE-bench n=1 in this dir complete
+   (repeats=1, not ~30×3). Not a gate. Scoring stays frozen.
+   **P1 after-episode-distill n=1 (2026-08-16).** `p1-after-episode-distill`.
+   recall B pass; A/C `verify_failed` (C missing `4B`, 17r = A); js-ms
+   A/B/C pass (C 6r = A). Extra C rounds on js-ms stay gone. Not mixed
+   with after-proxy ITT. Scoring stays frozen.
+   **Follow-up 2026-08-16.** File-only eval workspaces get a local git
+   seed so `git.status` is not "not a git repository". Do not hide the
+   tool. Scoring stays frozen.
+   **P1 file-only 9×3 (2026-08-16).** `p1-file-only-calibrate` (not
+   `pilot-30`, not after-proxy). `decision=pilot`; analyze ineligible
+   n=9; ITT A=B=C=0.889; LCL=0 `degenerate=true`. `uuid-parity-keys`
+   0/9 hidden `cargo test`; other 8 9/9. Cost-missing 0/27. Not a
+   gate. Remaining item 2: SWE-bench 21×3. Scoring stays frozen.
    **Decision 2026-08-15.** Smoke `FIXTURES` stay interpreter-free
    file-content asserts. Executable hidden stays on the suite pack
    (overlay + commands; SWE-bench docker opt-in). Do not bind the cheap
@@ -1675,6 +1786,8 @@ closed. M12/M13 remain independent trusted-execution blockers.
   sums `ContextMaintained` per-pass costs so a later zero GC snapshot
   cannot wipe B fold. Actor/recall/store/schema wall-time accounting
   was already on the event stream.
+  **Follow-up 2026-08-16.** C episode-rotation distillation uses the same
+  operator (`episode-derived` card; sources kept; prior card superseded).
 - audit process parity whenever `ContextEngine` gains a method;
 - compare dynamic, rolling and append-only engines on these scenarios:
 
@@ -1708,8 +1821,9 @@ as new work. The independent queues that are still actionable are:
 
 1. **Context target:** fix the measured `long_refactor` current-file miss
    without disabling turn-boundary GC or regrowing Resident bytes, then pursue
-   TaskAnchorView/root projection, sourced EpisodeOutcome, bounded incremental GC and M15 lifecycle/cost
-   measurements. The `ContextCatalog` directory and search indexes landed
+   sourced EpisodeOutcome, bounded incremental GC and M15 lifecycle/cost
+   measurements. `TaskAnchorView` and independent prompt/residency/storage
+   roots landed 2026-08-15. The `ContextCatalog` directory and search indexes landed
    2026-08-14; graded access signals (`CTX-GC-11`) landed 2026-08-14.
    Context + Tool discovery (`CTX-DISC-01..03`, `TOOLS-10`) landed
    2026-08-14 as an internal planner behind `context.manage` /

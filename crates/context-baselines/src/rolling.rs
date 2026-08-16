@@ -6,7 +6,7 @@
 //! folded into a single rolling summary marker. This models the classic
 //! "summarize when the window fills" baseline. The marker defaults to a
 //! bounded placeholder; inject a [`BoundedCompactor`] so live B uses the
-//! same model-backed operator as C's task distillation. CI keeps a
+//! same model-backed operator as C's task and episode distillation. CI keeps a
 //! scripted digest. Fold work is taken under the mutex, then the
 //! compactor runs without holding it.
 
@@ -316,6 +316,7 @@ impl ContextEngine for RollingSummaryEngine {
         Ok(MaterializedContext {
             materialization_id: state.materialization_revision,
             focus: None,
+            task: None,
             items,
             external: agent_contracts::ContextMapView::default(),
             selected,

@@ -108,7 +108,8 @@ impl Tool for ContextManageTool {
             description: concat!(
                 "Runtime context control and catalog retrieval. ",
                 "Directive ops: gc_hint, tag, lease, collect, admit, derive. ",
-                "Query ops: search, inspect, fetch. Item ids come from the working-set frame or search hits."
+                "Query ops: search, inspect, fetch. search covers the whole catalog (Resident/Warm/Stored), not only the selected working context. Hits include id, source, and residency. fetch reads store bodies only. ",
+                "Item ids come from the working-set frame or search hits."
             )
             .to_string(),
             input_schema: json!({
@@ -125,7 +126,7 @@ impl Tool for ContextManageTool {
                     "turns": {"type": "integer", "minimum": 1, "description": "lease: how many turns the item stays protected"},
                     "reason": {"type": "string", "description": "admit: why this ref is being pulled back into the working set"},
                     "fact": {"type": "string", "description": "derive: the fact to persist as a new derived item"},
-                    "query": {"type": "string", "description": "search: free text across the catalog"},
+                    "query": {"type": "string", "description": "search: free text over entity, path, label, and summary across the catalog"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 64, "description": "search: max refs to return (default 16)"},
                     "kind": {"type": "string", "description": "search: optional ContextKind filter"},
                     "scope": {"type": "string", "description": "search: optional ContextScope filter"},

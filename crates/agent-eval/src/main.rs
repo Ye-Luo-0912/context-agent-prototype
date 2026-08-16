@@ -114,7 +114,7 @@ fn usage() -> ! {
          \n\
          usage: agent-eval --pilot\n\
          usage: agent-eval [--repeats N] [--evidence-dir <dir>] [--include-swebench] [--pilot-id <id>] --pilot-run\n\
-         usage: agent-eval --pilot-calibrate <dir>\n\
+         usage: agent-eval [--file-only] --pilot-calibrate <dir>\n\
          \n\
          Frozen EVAL-01.5 sample (30 ids, 10/10/10 size). --pilot lists it.\n\
          --pilot-run is live A/B/C on that sample; default file-only (9 tasks).\n\
@@ -122,7 +122,9 @@ fn usage() -> ! {
          diff with the official Docker harness (AGENT_EVAL_SWEBENCH_CLONE=1\n\
          and AGENT_EVAL_SWEBENCH_DOCKER=1). Calibration design is 3 repeats;\n\
          --pilot-calibrate prints decision=pilot and never opens the gate.\n\
-         Do not collect 300×3 acceptance cells from this command.\n\
+         --file-only keeps pack file-runtime tasks so P0 SWE-bench floor\n\
+         cells cannot mix into the 9-task ITT table. Do not collect 300×3\n\
+         acceptance cells from this command.\n\
          \n\
          usage: agent-eval --analyze-evidence <dir>\n\
          \n\
@@ -148,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
     let mut repeats: u32 = 1;
     let mut evidence_dir: Option<std::path::PathBuf> = None;
     let mut include_swebench = false;
+    let mut file_only = false;
     let mut pilot_id: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
@@ -271,6 +274,9 @@ async fn main() -> anyhow::Result<()> {
             "--include-swebench" => {
                 include_swebench = true;
             }
+            "--file-only" => {
+                file_only = true;
+            }
             "--pilot-id" => {
                 let Some(id) = args.next() else {
                     usage();
@@ -290,7 +296,7 @@ async fn main() -> anyhow::Result<()> {
                 let Some(path) = args.next() else {
                     usage();
                 };
-                let report = pilot::load_and_calibrate(std::path::Path::new(&path))?;
+                let report = pilot::load_and_calibrate(std::path::Path::new(&path), file_only)?;
                 print!("{}", pilot::render_calibration(&report));
                 return Ok(());
             }

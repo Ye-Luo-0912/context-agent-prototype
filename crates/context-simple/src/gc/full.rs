@@ -120,7 +120,7 @@ pub(crate) fn plan_full_gc(
     let focus = state.focus.clone();
     let hot_entities = state.hot_entities.clone();
     let latest_file_bodies = state.latest_file_body_ids();
-    let (marked, anchor_roots_protected) = mark_roots(
+        let (marked, anchor_roots_protected) = mark_roots(
         state,
         config,
         focus.as_ref(),
@@ -486,6 +486,7 @@ pub(crate) fn commit_full_gc(
         reactivated: plan.reactivated + recalled_reactivations.len(),
         aged_external: plan.aged_external,
         anchor_roots_protected: plan.anchor_roots_protected,
+        anchor_root_protections: collect_residency_protections(state),
         store_write_bytes,
         store_read_bytes,
         store_recalled_items,
@@ -576,11 +577,8 @@ fn mark_roots(
         // 这里只消费投影；semantic 死亡是终态，sweep 的 alive_root 仍
         // 要求 live，所以声明从不复活死条目。
         let anchor_rooted = state.anchor_roots.iter().any(|claim| {
-            matches!(
-                claim.strength,
-                agent_contracts::AnchorRootStrength::ResidentRequired
-                    | agent_contracts::AnchorRootStrength::PromptRequired
-            ) && crate::engine::anchor_claim_matches_item(claim, item)
+            claim.strength.requires_residency()
+                && crate::engine::anchor_claim_matches_item(claim, item)
         });
         let latest_file_body = latest_file_bodies.contains(&item.id);
         if is_pin
@@ -606,11 +604,8 @@ fn mark_roots(
         .filter(|item| {
             item.semantic.is_live()
                 && state.anchor_roots.iter().any(|claim| {
-                    matches!(
-                        claim.strength,
-                        agent_contracts::AnchorRootStrength::ResidentRequired
-                            | agent_contracts::AnchorRootStrength::PromptRequired
-                    ) && crate::engine::anchor_claim_matches_item(claim, item)
+                    claim.strength.requires_residency()
+                        && crate::engine::anchor_claim_matches_item(claim, item)
                 })
         })
         .count();
@@ -645,6 +640,28 @@ fn mark_roots(
         }
     }
     (marked, anchor_roots_protected)
+}
+
+/// Per-claim explanations for residency protections this pass. Bounded by
+/// `MAX_ANCHOR_ROOT_CLAIMS`. StorageRequired claims are omitted — they are
+/// not residency roots.
+fn collect_residency_protections(state: &State) -> Vec<agent_contracts::AnchorRootProtection> {
+    let mut out = Vec::new();
+    for claim in &state.anchor_roots {
+        if !claim.strength.requires_residency() {
+            continue;
+        }
+        let hits = state.items.iter().any(|item| {
+            item.semantic.is_live() && crate::engine::anchor_claim_matches_item(claim, item)
+        });
+        if hits {
+            out.push(claim.into());
+            if out.len() >= agent_contracts::MAX_ANCHOR_ROOT_CLAIMS {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// The dependency edges of an item wherever its record lives: the resident
@@ -847,11 +864,8 @@ fn reactivate(
         // claim exempts it the same way — task authority outranks the
         // aging heuristic (computed below and re-checked here).
         let anchor_rooted = state.anchor_roots.iter().any(|claim| {
-            matches!(
-                claim.strength,
-                agent_contracts::AnchorRootStrength::ResidentRequired
-                    | agent_contracts::AnchorRootStrength::PromptRequired
-            ) && crate::engine::anchor_claim_matches_item(claim, item)
+            claim.strength.requires_residency()
+                && crate::engine::anchor_claim_matches_item(claim, item)
         });
         let hot_now = !hot_entities.is_empty() && entities_match(&item.entities, &hot_entities);
         if !anchor_rooted && aged_ordinary_dialogue(item, config, state.turn, hot_now) {
@@ -935,11 +949,8 @@ fn reactivate(
                     break;
                 }
                 let claimed = state.anchor_roots.iter().any(|claim| {
-                    matches!(
-                        claim.strength,
-                        agent_contracts::AnchorRootStrength::ResidentRequired
-                            | agent_contracts::AnchorRootStrength::PromptRequired
-                    ) && crate::engine::anchor_claim_matches_entry(claim, entry)
+                    claim.strength.requires_residency()
+                        && crate::engine::anchor_claim_matches_entry(claim, entry)
                 });
                 if claimed
                     && entry.semantic.is_live()
@@ -1201,16 +1212,25 @@ mod tests {
             })
             .await
             .unwrap();
+        let model_content = body
+            .lines()
+            .enumerate()
+            .map(|(index, line)| format!("{:>6} | {line}", index + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
         engine
             .ingest(ContextIngress::ToolObservation {
                 output: ToolOutput {
                     call_id: "1".into(),
                     tool_name: "fs.read".into(),
                     ok: true,
-                    summary: "ok".into(),
-                    model_content: format!("{path}:\n{body}\n"),
+                    summary: format!("read of {path}"),
+                    model_content,
                     artifact_ref: None,
-                    metadata: json!({}),
+                    metadata: json!({
+                        "path": path,
+                        "revision": "test-rev",
+                    }),
                 },
                 scope_id: None,
             })
@@ -1254,6 +1274,18 @@ mod tests {
             .await
             .unwrap();
         let rendered = snapshot_text(&snapshot);
+        assert!(
+            snapshot
+                .items
+                .iter()
+                .any(|item| item.file_path.as_deref() == Some("src/auth/login.rs")),
+            "live-shaped reads must carry structured path, got {:?}",
+            snapshot
+                .items
+                .iter()
+                .map(|item| item.file_path.clone())
+                .collect::<Vec<_>>()
+        );
         assert!(
             rendered.contains("fn handle_21()"),
             "the previous file's latest body must stay in the working set, got {rendered}"

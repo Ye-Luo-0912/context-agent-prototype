@@ -1309,7 +1309,8 @@ be used to declare the Platform or sandbox gates complete.
    stored entries). The authority/body split (`ContextCatalog`, one
    `item_id -> location` directory plus query indexes) is landed
    (2026-08-14); bodies remain in the three stores. `TaskAnchorView` and
-   sourced EpisodeOutcome remain.
+   independent prompt/residency/storage root reporting landed 2026-08-15.
+   Sourced EpisodeOutcome remains.
 3. **Contain current protocol boundaries (`PLAT-00`, P0a).** Before designing
    a new envelope, fix current codecs, bidirectional frame/exchange caps,
    known decoded-large-field caps, and MCP child ownership/cancellation.
@@ -1478,8 +1479,10 @@ must preserve the trusted-runtime gates above:
    experiment. Provider residuals above remain feature work; M15 measures
    whatever retrieval surface exists at run time.
    **Retrieval instrumentation landed 2026-08-14:** `RunMetrics` plus
-   `agent-eval --retrieval` (engine-only found-after-forgotten). The paired
-   real-model coding gate is still open.
+   `agent-eval --retrieval` (engine-only found-after-forgotten).
+   **2026-08-15:** `--analyze-evidence` prints the same secondaries from
+   cell bundles on cost-eligible A/C pairs; they are not in the primary
+   LCL. The paired real-model coding gate is still open.
 4. **Lifecycle separation.** Split schema/catalog residency, invocation/effect
    state, hosted-process state, and managed-child state. Existing tool GC is
    retained; active calls, pending effects, and child assignments become

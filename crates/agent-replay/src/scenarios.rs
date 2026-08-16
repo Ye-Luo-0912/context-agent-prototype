@@ -254,7 +254,12 @@ fn tool(name: &str, ok: bool, content: &str) -> ToolOutput {
 }
 
 fn read_snippet(path: &str, body: &str) -> ToolOutput {
-    tool("fs.read", true, &format!("{path}:\n{body}"))
+    let mut output = tool("fs.read", true, &format!("{path}:\n{body}"));
+    output.metadata = json!({
+        "path": path,
+        "revision": "replay",
+    });
+    output
 }
 
 /// Deterministic "build log" of `lines` lines, ~90 chars each, so baseline A

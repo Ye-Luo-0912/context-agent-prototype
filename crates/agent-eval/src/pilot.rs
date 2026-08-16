@@ -442,11 +442,21 @@ pub fn size_index(pack: &SuitePack) -> BTreeMap<String, String> {
         .collect()
 }
 
-pub fn load_and_calibrate(root: &Path) -> anyhow::Result<CalibrationReport> {
+pub fn load_and_calibrate(root: &Path, file_only: bool) -> anyhow::Result<CalibrationReport> {
     let pack = crate::suite::load_pack()?;
-    let _sample = select_pilot(&pack)?;
-    let cells = analysis::load_evidence_root(root)?;
+    let mut cells = analysis::load_evidence_root(root)?;
+    if file_only {
+        cells.retain(|cell| cell_is_file_runtime(cell, &pack));
+    }
     Ok(calibrate(&cells, FROZEN_PILOT_IDS, &size_index(&pack)))
+}
+
+fn cell_is_file_runtime(cell: &CellRecord, pack: &SuitePack) -> bool {
+    pack.tasks
+        .iter()
+        .find(|task| task.id == cell.fixture_id)
+        .map(is_file_runtime)
+        .unwrap_or(true)
 }
 
 fn overall_rates<'a>(cells: impl IntoIterator<Item = &'a CellRecord>) -> (f64, f64, f64) {
@@ -686,6 +696,16 @@ mod tests {
             rounds: 1,
             tool_calls: 1,
             missing: false,
+            search_calls: 0,
+            search_hits: 0,
+            search_empty: 0,
+            search_ms_p50: 0,
+            forgotten_items: 0,
+            recovered_items: 0,
+            access_search_hits: 0,
+            access_inspects: 0,
+            access_fetches: 0,
+            access_consumption_acks: 0,
         }
     }
 
@@ -785,5 +805,27 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("incomplete sample"))
         );
+    }
+
+    #[test]
+    fn file_only_filter_drops_swebench_floor_cells() {
+        let pack = crate::suite::load_pack().unwrap();
+        let file_id = "js-ms-negative-parse";
+        let swebench_id = "swebench-django__django-11749";
+        let mut cells = Vec::new();
+        for repeat in 1..=3 {
+            cells.push(cell(file_id, repeat, "append", true));
+            cells.push(cell(file_id, repeat, "rolling", true));
+            cells.push(cell(file_id, repeat, "dynamic", true));
+            cells.push(cell(swebench_id, repeat, "append", false));
+            cells.push(cell(swebench_id, repeat, "rolling", false));
+            cells.push(cell(swebench_id, repeat, "dynamic", false));
+        }
+        cells.retain(|cell| cell_is_file_runtime(cell, &pack));
+        let report = calibrate(&cells, FROZEN_PILOT_IDS, &size_index(&pack));
+        assert_eq!(report.observed_n, 1);
+        assert!((report.overall_a - 1.0).abs() < 1e-12);
+        assert!((report.overall_c - 1.0).abs() < 1e-12);
+        assert!(report.tasks.iter().all(|task| !task.fixture_id.starts_with("swebench-")));
     }
 }

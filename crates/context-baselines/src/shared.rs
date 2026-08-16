@@ -147,6 +147,7 @@ pub(crate) fn materialized_items(
             retention: ContextRetention::Durable,
             content: summary.content.clone(),
             source: summary.source.clone(),
+            file_path: None,
         });
     }
     items.extend(records.iter().map(|record| MaterializedItem {
@@ -158,6 +159,7 @@ pub(crate) fn materialized_items(
         retention: ContextRetention::Working,
         content: record.content.clone(),
         source: record.source.clone(),
+        file_path: None,
     }));
     items
 }

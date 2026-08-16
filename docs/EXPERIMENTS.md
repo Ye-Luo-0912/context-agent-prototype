@@ -278,6 +278,10 @@ Before claiming real-evaluation completion:
   Decision (2026-08-14): Search/GC evaluation is folded into these same
   cells — retrieval metrics are secondary lifecycle endpoints of the
   paired A/B/C runs, recorded per cell, not a separate later experiment.
+  `--analyze-evidence` rolls the same secondaries up from cell bundles
+  (search recall/latency, found-after-forgotten, graded-access stamps)
+  on cost-eligible A/C pairs; they are not in the primary LCL. The
+  engine-only `--retrieval` dashboard remains the catalog baseline.
 
 ### Contemporaneous smoke bound (2026-08-14; not a formal preregistration)
 
@@ -652,8 +656,138 @@ current-file / `handle_21` slice is landed (active-task latest file body,
    (js-ms-negative C 14r vs A 5r; rust-jcs C fewer). Empty-assistant
    flake on js-ms-minutes B, openai-wire B, rust-grep C. Cell compact
    harvest now sums `ContextMaintained` pass costs (old cells still
-   show `compact=0/0`). Next: P1 SWE-bench n=1 cohort in a new dir.
+   show `compact=0/0`). **P1 SWE-bench n=1 (2026-08-15):** 3 Django
+   tasks in `target/eval-evidence/p1-swebench-diag` (pre-path-stamp).
+   C 3/3 pass; A 0/3 at 48-round cap; B mixed (11749 empty-assistant
+   flake). C search 0. **P1 after-path n=1 (2026-08-15):**
+   `target/eval-evidence/p1-after-path`. js-ms-negative C extra rounds
+   gone (9r vs A 11r, C search 1/2). recall C still 21r/30t search 0.
+   **P1 after-anchor n=1 (2026-08-15):** `p1-after-anchor`. recall A/B/C
+   verify-failed (`4B`); C 16r vs A 13r, search 0. js-ms-negative C 10r
+   pass ≈ A 11r, search 0; B hidden fail. `--analyze-evidence` on that
+   dir: search A/C calls=0/0; C forgotten/recovered 15.5/2.5 vs A 0/0.
+   **P1 SWE-bench after-anchor n=1 attempt (2026-08-15):**
+   `p1-swebench-after-anchor` / `django-13344` A/B/C HTTP 403 on turn 1
+   (`outcome=error`, cost-missing 1.0). Direct connect; WinINET proxy
+   `127.0.0.1:7897` was on, but reqwest lacked `system-proxy`. curl via
+   that port is 200. Infrastructure, not a coding split; not mixed into
+   P0 or `p1-swebench-diag`.
+   **P1 SWE-bench after-proxy n=1 (2026-08-15):** `p1-swebench-after-proxy`
+   / `django-13344` A/B/C `verify_failed` (gold unresolved), not 403.
+   C 33r/59t 926950in search 2/3 forgotten 48 recovered 0; A 47r/69t
+   1550204in search 0. Ineligible n=1. Not mixed into P0, the 403 dir,
+   or `p1-swebench-diag`.
+   **P1 after-proxy `django-13809` (2026-08-15):** B gold passed; A/C
+   48-round cap. `--analyze-evidence` n=2 ineligible; ITT A=C=0;
+   tokens A 1573556 / C 1076972. Not mixed into P0 / 403 / diag.
+   **P1 after-proxy `django-14007` (2026-08-15):** A 48-round cap; B/C
+   `verify_failed`. `--analyze-evidence` n=3 ineligible; ITT A=C=0;
+   tokens A 1477619.7 / C 1141977.3. Not mixed into P0 / 403 / diag.
+   **P1 after-proxy `django-14011` (2026-08-15):** A/B/C `verify_failed`
+   (C 27r `681903`; A 29r `594658`). `--analyze-evidence` n=4 ineligible;
+   ITT A=C=0; tokens A 1256879.2 / C 1026958.8. Not mixed into P0 / 403
+   / diag.
+   **P1 after-proxy `django-15268` (2026-08-15):** B gold passed; C
+   48-round cap; A HTTP 401 `INVALID_API_KEY` (`usage_incomplete`).
+   `--analyze-evidence` n=5 ineligible; cost-missing 1/5. Operator: 401 is
+   relay jitter; continue same dir. Not mixed into P0 / 403 / diag.
+   **P1 after-proxy `django-15503` (2026-08-15):** A `verify_failed` 20r
+   `493440`; B/C 48-round cap (C search 1 empty). `--analyze-evidence`
+   n=6 ineligible; ITT A=C=0; tokens A 1104191.4 / C 1062320.8. Not mixed
+   into P0 / 403 / diag.
+   **P1 after-proxy `django-15695` (2026-08-15):** A/B/C `verify_failed`
+   (C 44r `1503592` search 1/1 forgotten 55 recovered 0).
+   `--analyze-evidence` n=7 ineligible; ITT A=C=0; tokens A 1197934.7 /
+   C 1135866.0. Not mixed into P0 / 403 / diag.
+   **P1 after-proxy `django-16642` (2026-08-15):** A/B/C `verify_failed`
+   (C 8r `77182` search 1 empty forgotten 14 recovered 0).
+   `--analyze-evidence` n=8 ineligible; ITT A=C=0; tokens A 1102014.4 /
+   C 984625.4. Not mixed into P0 / 403 / diag.
+   **P1 after-proxy `matplotlib-23314` (2026-08-15):** A/B/C gold passed
+   (C 35r `751527` search 2/14 forgotten 43 recovered 0). First both-pass
+   pair (tokens C-A=-21745). `--analyze-evidence` n=9 ineligible; ITT
+   A=C=0; tokens A 1060921.6 / C 955488.1. Not mixed into P0 / 403 /
+   diag.
+   **P1 after-proxy `pylint-4551` (2026-08-15):** A/B turn-4 48-round
+   cap; C `verify_failed` 63r forgotten 99 recovered 12. First non-zero
+   recover in this dir. `--analyze-evidence` n=10 ineligible; ITT A=C=0;
+   tokens A 1428904.0 / C 1026865.2. Not mixed into P0 / 403 / diag.
+   **P1 after-proxy `pytest-5787` (2026-08-15):** A/B/C `verify_failed`
+   (C 31r `863738` search 1/2 forgotten 30 recovered 0).
+   `--analyze-evidence` n=11 ineligible; ITT A=C=0; tokens A 1400711.7 /
+   C 1010552.5. Not mixed into P0 / 403 / diag.
+   **P1 after-proxy `pytest-6202` (2026-08-15):** A/B gold passed; C
+   48-round cap. First A=1 C=0 pair. `--analyze-evidence` n=12
+   ineligible; ITT mean=-0.083 LCL=-0.233 `degenerate=false`; tokens A
+   1327469.2 / C 1018846.4. Not a gate. Not mixed into P0 / 403 / diag.
+   **P1 after-proxy `pytest-7571` (2026-08-15):** A/B/C gold passed (C
+   38r `756640` forgotten 47 recovered 0). Second both-pass.
+   `--analyze-evidence` n=13 ineligible; ITT mean=-0.077 LCL=-0.214;
+   tokens A 1266552.4 / C 996995.8; both-pass n=2 C-A=+69213.5. Not a
+   gate. Not mixed into P0 / 403 / diag.
+   **P1 after-proxy `scikit-learn-11310` (2026-08-15):** A 48-round cap;
+   B/C gold passed (C 48r forgotten 66 recovered 0). First A=0 C=1 pair.
+   `--analyze-evidence` n=14 ineligible; ITT mean=0 LCL=-0.186
+   `degenerate=false`; tokens A 1327902.6 / C 1022527.8. Not a gate. Not
+   mixed into P0 / 403 / diag.
+   **P1 after-proxy `scikit-learn-13496` (2026-08-15):** A gold passed;
+   B/C 48-round cap. Second A=1 C=0 pair. `--analyze-evidence` n=15
+   ineligible; ITT mean=-0.067 LCL=-0.275; tokens A 1282476.1 /
+   C 1059177.3. Not a gate. Not mixed into P0 / 403 / diag.
+   **P1 after-proxy `scikit-learn-14894` (2026-08-15):** A `verify_failed`
+   7r `28616`; B gold passed; C 48-round cap. `--analyze-evidence` n=16
+   ineligible; ITT mean=-0.062 LCL=-0.256; tokens A 1198885.4 /
+   C 1055563.8. Not a gate. Not mixed into P0 / 403 / diag.
+   **P1 after-proxy `sphinx-8548` (2026-08-15):** B/C `verify_failed`
+   (C 2r); A HTTP 502 `upstream_error`. `--analyze-evidence` n=17
+   ineligible; cost-missing 2/17. Treat 502 as relay jitter. Not mixed
+   into P0 / 403 / diag.
+   **P1 after-proxy `sympy-22914` (2026-08-15):** B/C 429
+   `DAILY_LIMIT_EXCEEDED`; A 502. `--analyze-evidence` n=18 ineligible;
+   cost-missing 3/18. Quota stop. Not mixed into P0 / 403 / diag.
+   **P1 after-proxy `sympy-22914` retry (2026-08-16):** A/C gold passed
+   (C 11r forgotten 25 recovered 0); B `verify_failed`. Third both-pass.
+   `--analyze-evidence` n=18 ineligible; ITT mean=-0.056; tokens A
+   1141378.4 / C 999071.7; both-pass n=3 C-A=+3781. Not a gate. Not
+   mixed into P0 / 403 / diag.
+   **P1 after-proxy `django-11749` (2026-08-16):** A `verify_failed` 6r;
+   B/C empty-assistant (`model_in=0`). `--analyze-evidence` n=19
+   ineligible; ITT mean=-0.053; cost-missing 3/19. Not mixed into P0 /
+   403 / diag.
+   **P1 after-proxy `django-11999` (2026-08-16):** C gold passed 32r
+   forgotten 39 recovered 0; A `verify_failed` 2r; B turn timeout.
+   Second A=0 C=1 pair. `--analyze-evidence` n=20 ineligible; ITT mean=0
+   LCL=-0.177; tokens A 1074592.0 / C 981106.8. Not a gate. Not mixed
+   into P0 / 403 / diag.
+   **P1 after-proxy `django-12708` (2026-08-16):** A/B/C gold passed (C
+   18r `374119` forgotten 31 recovered 0). Fourth both-pass.
+   `--analyze-evidence` n=21 ineligible; ITT mean=0 LCL=-0.168
+   `degenerate=false`; cost-missing 3/21; tokens A 1066469.9 /
+   C 947385.2; both-pass n=4 C-A=-135733. Frozen SWE-bench n=1 in this
+   dir is complete (still repeats=1). Not a gate. Not mixed into P0 /
+   403 / diag.
+   **P1 after-episode-distill n=1 (2026-08-16):**
+   `p1-after-episode-distill` (not the after-proxy ITT). `recall_after_fix`
+   B pass 15r; A/C `verify_failed` both 17r (C missing `4B`); C search 0
+   recovered 5/18. `js-ms-negative-parse` A/B/C pass (C 6r = A 6r). Extra
+   C rounds on js-ms stay gone. Not a gate. Not mixed into P0 / 403 /
+   diag / after-proxy.
+   **Follow-up 2026-08-16:** file-only eval workspaces get a local git
+   seed so `git.status` is a real probe. Do not hide the tool.
+   File-only 81-cell retrieval secondaries (`--file-only --pilot-calibrate`
+   on `pilot-30`): search calls 0.2/0.2; C forgotten/recovered 11.3/0.9.
    Do not retune scoring. Do not amend n. Do not mix P0/P1 ITT tables.
+   **P1 file-only 9×3 (2026-08-16):** `target/eval-evidence/p1-file-only-calibrate`
+   (not `pilot-30`, not after-proxy). `--file-only --pilot-calibrate`
+   `decision=pilot` coverage 9/30 cells 81/270; ITT A=B=C=0.889;
+   diagnostic C−A mean=0 LCL=0 `degenerate=true`. `--analyze-evidence`
+   ineligible n=9; SPEC hash unchanged. 72 pass / 9 `verify_failed`;
+   `uuid-parity-keys` 0/9 all arms (hidden `cargo test --offline`);
+   other 8 tasks 9/9. Cost-missing 0/27; tokens A 62899.6 / C 69826.4
+   C−A=+6926.8 rounds 8.9/9.5. Retrieval search 0.1/0.0; C
+   forgotten/recovered 14.7/1.4 vs A 0/0. Not a gate. Remaining
+   calibration: frozen SWE-bench 21×3 (after-proxy is n=1). Do not
+   retune scoring. Do not amend n. Do not mix P0/P1 ITT tables.
 
 Until those artifacts and the predeclared interval exist, the live tables are
 diagnostic observations rather than independently reproducible acceptance
