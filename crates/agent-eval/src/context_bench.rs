@@ -386,22 +386,19 @@ pub fn require_python() -> anyhow::Result<()> {
         .status()
     {
         Ok(status) if status.success() => Ok(()),
-        Ok(status) => anyhow::bail!(
-            "context-bench verifier preflight failed: {bin} exited {status}"
-        ),
-        Err(error) => anyhow::bail!(
-            "context-bench verifier preflight failed: {bin} missing ({error})"
-        ),
+        Ok(status) => {
+            anyhow::bail!("context-bench verifier preflight failed: {bin} exited {status}")
+        }
+        Err(error) => {
+            anyhow::bail!("context-bench verifier preflight failed: {bin} missing ({error})")
+        }
     }
 }
 
 pub fn check_pack(pack: &BenchPack) -> anyhow::Result<String> {
     require_python()?;
     if spec_sha256() != FROZEN_SPEC_SHA256 {
-        anyhow::bail!(
-            "SPEC hash {} != frozen {FROZEN_SPEC_SHA256}",
-            spec_sha256()
-        );
+        anyhow::bail!("SPEC hash {} != frozen {FROZEN_SPEC_SHA256}", spec_sha256());
     }
     let digest = pack_digest(pack);
     if digest != FROZEN_PACK_DIGEST {
@@ -864,7 +861,9 @@ mod tests {
                 .unwrap();
             for needle in restated {
                 assert!(
-                    !last.to_ascii_lowercase().contains(&needle.to_ascii_lowercase()),
+                    !last
+                        .to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase()),
                     "{id} last user turn restates {needle:?}: {last}"
                 );
             }
