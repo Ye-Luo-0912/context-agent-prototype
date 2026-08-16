@@ -6,12 +6,17 @@
 //! record. The catalog is derived navigation state (like heap/external
 //! indexes): checkpoints serialize the three body stores and rebuild this
 //! directory on restore.
+//!
+//! Hot-path updates are incremental: heap/external dirty ids upsert or
+//! remove one record. Wholesale rebuild remains the restore / GC-sweep
+//! path and the safety net when an unmarked length change is detected.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 
 use agent_contracts::{
     AttentionState, ContextItem, ContextItemId, ContextKind, ContextResidency, ContextScope,
-    ContextSearchQuery, ExternalizedContext, SemanticState, TaskId,
+    ContextSearchQuery, ExternalizedContext, TaskId,
 };
 
 /// Where the item's body currently lives. Exactly one location per id.
@@ -30,10 +35,95 @@ struct CatalogFingerprint {
     event_seq: u64,
 }
 
+/// Navigation snapshot used only to unindex a dirty id. Not authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalogKeys {
+    task_id: Option<TaskId>,
+    scope: ContextScope,
+    kind: ContextKind,
+    entities: Vec<String>,
+    labels: Vec<String>,
+    residency: ContextResidency,
+    attention: AttentionState,
+    live: bool,
+}
+
+impl CatalogKeys {
+    fn from_item(item: &ContextItem) -> Self {
+        Self {
+            task_id: item.task_id,
+            scope: item.scope,
+            kind: item.kind,
+            entities: item.entities.clone(),
+            labels: item
+                .tags
+                .iter()
+                .map(|tag| tag.as_str().to_string())
+                .collect(),
+            residency: item.residency,
+            attention: item.attention,
+            live: item.semantic.is_live(),
+        }
+    }
+
+    fn from_entry(entry: &ExternalizedContext) -> Self {
+        Self {
+            task_id: entry.task_id,
+            scope: entry.scope,
+            kind: entry.kind,
+            entities: entry.entities.clone(),
+            labels: entry
+                .tags
+                .iter()
+                .map(|tag| tag.as_str().to_string())
+                .collect(),
+            residency: entry.residency,
+            attention: entry.attention,
+            live: entry.semantic.is_live(),
+        }
+    }
+}
+
+/// Dirty ids plus a rebuild flag drained into [`ContextCatalog::sync`].
+#[derive(Debug, Default)]
+pub(crate) struct CatalogDirty {
+    ids: HashSet<ContextItemId>,
+    rebuild: bool,
+}
+
+impl CatalogDirty {
+    pub(crate) fn mark(&mut self, id: ContextItemId) {
+        if !self.rebuild {
+            self.ids.insert(id);
+        }
+    }
+
+    pub(crate) fn mark_rebuild(&mut self) {
+        self.rebuild = true;
+        self.ids.clear();
+    }
+
+    pub(crate) fn merge(&mut self, rebuild: bool, ids: HashSet<ContextItemId>) {
+        if rebuild {
+            self.mark_rebuild();
+            return;
+        }
+        if self.rebuild {
+            return;
+        }
+        self.ids.extend(ids);
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.rebuild && self.ids.is_empty()
+    }
+}
+
 /// Unified directory + provider-owned query indexes over every residency.
 #[derive(Debug, Default)]
 pub(crate) struct ContextCatalog {
     by_id: HashMap<ContextItemId, CatalogLocation>,
+    records: HashMap<ContextItemId, CatalogKeys>,
     by_task: HashMap<TaskId, Vec<ContextItemId>>,
     by_scope: HashMap<ContextScope, Vec<ContextItemId>>,
     by_kind: HashMap<ContextKind, Vec<ContextItemId>>,
@@ -43,18 +133,22 @@ pub(crate) struct ContextCatalog {
     by_attention: HashMap<AttentionState, Vec<ContextItemId>>,
     live: HashSet<ContextItemId>,
     fingerprint: CatalogFingerprint,
+    #[cfg(test)]
+    last_sync_rebuilt: bool,
 }
 
 impl ContextCatalog {
-    /// Rebuild from the three body stores when the fingerprint no longer
-    /// matches. `event_seq` catches same-length field edits (semantic/tags)
-    /// so search never ranks from a stale label/lifecycle bucket.
+    /// Apply dirty ids, or rebuild when the stores were replaced wholesale
+    /// or an unmarked length change is detected. Same-length field edits
+    /// (semantic/tags/attention) must be in `dirty` so search never ranks
+    /// from a stale label/lifecycle bucket.
     pub(crate) fn sync(
         &mut self,
         heap: &[ContextItem],
         warm: &[ContextItem],
         stored: &[ExternalizedContext],
         event_seq: u64,
+        dirty: CatalogDirty,
     ) {
         let fingerprint = CatalogFingerprint {
             heap: heap.len(),
@@ -62,10 +156,35 @@ impl ContextCatalog {
             stored: stored.len(),
             event_seq,
         };
-        if self.fingerprint == fingerprint {
+        let lengths_unchanged = fingerprint.heap == self.fingerprint.heap
+            && fingerprint.warm == self.fingerprint.warm
+            && fingerprint.stored == self.fingerprint.stored;
+        if dirty.is_empty() && lengths_unchanged {
+            self.fingerprint.event_seq = event_seq;
             return;
         }
-        self.rebuild(heap, warm, stored);
+        if dirty.rebuild || dirty.ids.is_empty() || (!lengths_unchanged && dirty.ids.len() > 64) {
+            self.rebuild(heap, warm, stored);
+            self.fingerprint = fingerprint;
+            return;
+        }
+        for id in dirty.ids {
+            self.apply_id(id, heap, warm, stored);
+        }
+        if self.by_id.len()
+            != heap
+                .len()
+                .saturating_add(warm.len())
+                .saturating_add(stored.len())
+            && !self.covers_first_locations(heap, warm, stored)
+        {
+            self.rebuild(heap, warm, stored);
+        } else {
+            #[cfg(test)]
+            {
+                self.last_sync_rebuilt = false;
+            }
+        }
         self.fingerprint = fingerprint;
     }
 
@@ -85,6 +204,15 @@ impl ContextCatalog {
         for entry in stored {
             self.insert_entry(entry);
         }
+        #[cfg(test)]
+        {
+            self.last_sync_rebuilt = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_sync_rebuilt(&self) -> bool {
+        self.last_sync_rebuilt
     }
 
     pub(crate) fn location(&self, id: ContextItemId) -> Option<CatalogLocation> {
@@ -251,8 +379,65 @@ impl ContextCatalog {
         ids
     }
 
+    fn apply_id(
+        &mut self,
+        id: ContextItemId,
+        heap: &[ContextItem],
+        warm: &[ContextItem],
+        stored: &[ExternalizedContext],
+    ) {
+        if let Some(item) = heap.iter().find(|item| item.id == id) {
+            self.upsert_item(item, CatalogLocation::Resident);
+            return;
+        }
+        if let Some(item) = warm.iter().find(|item| item.id == id) {
+            self.upsert_item(item, CatalogLocation::Warm);
+            return;
+        }
+        if let Some(entry) = stored.iter().find(|entry| entry.item_id == id) {
+            self.upsert_entry(entry);
+            return;
+        }
+        self.remove_id(id);
+    }
+
+    fn covers_first_locations(
+        &self,
+        heap: &[ContextItem],
+        warm: &[ContextItem],
+        stored: &[ExternalizedContext],
+    ) -> bool {
+        let mut seen = HashSet::new();
+        for item in heap {
+            if !seen.insert(item.id) {
+                continue;
+            }
+            if self.location(item.id) != Some(CatalogLocation::Resident) {
+                return false;
+            }
+        }
+        for item in warm {
+            if !seen.insert(item.id) {
+                continue;
+            }
+            if self.location(item.id) != Some(CatalogLocation::Warm) {
+                return false;
+            }
+        }
+        for entry in stored {
+            if !seen.insert(entry.item_id) {
+                continue;
+            }
+            if self.location(entry.item_id) != Some(CatalogLocation::Stored) {
+                return false;
+            }
+        }
+        self.by_id.len() == seen.len()
+    }
+
     fn clear(&mut self) {
         self.by_id.clear();
+        self.records.clear();
         self.by_task.clear();
         self.by_scope.clear();
         self.by_kind.clear();
@@ -267,68 +452,106 @@ impl ContextCatalog {
         if self.by_id.contains_key(&item.id) {
             return;
         }
-        self.by_id.insert(item.id, location);
-        self.index_keys(
-            item.id,
-            item.task_id,
-            item.scope,
-            item.kind,
-            &item.entities,
-            item.tags.iter().map(|tag| tag.as_str()),
-            item.residency,
-            item.attention,
-            item.semantic,
-        );
+        self.install(item.id, location, CatalogKeys::from_item(item));
     }
 
     fn insert_entry(&mut self, entry: &ExternalizedContext) {
         if self.by_id.contains_key(&entry.item_id) {
             return;
         }
-        self.by_id.insert(entry.item_id, CatalogLocation::Stored);
-        self.index_keys(
+        self.install(
             entry.item_id,
-            entry.task_id,
-            entry.scope,
-            entry.kind,
-            &entry.entities,
-            entry.tags.iter().map(|tag| tag.as_str()),
-            entry.residency,
-            entry.attention,
-            entry.semantic,
+            CatalogLocation::Stored,
+            CatalogKeys::from_entry(entry),
         );
     }
 
-    /// 各生命周期维度各自入索引，参数就是这些正交键，不是漏收成 struct。
-    #[allow(clippy::too_many_arguments)]
-    fn index_keys<'a>(
-        &mut self,
-        id: ContextItemId,
-        task_id: Option<TaskId>,
-        scope: ContextScope,
-        kind: ContextKind,
-        entities: &[String],
-        labels: impl IntoIterator<Item = &'a str>,
-        residency: ContextResidency,
-        attention: AttentionState,
-        semantic: SemanticState,
-    ) {
-        if let Some(task) = task_id {
+    fn upsert_item(&mut self, item: &ContextItem, location: CatalogLocation) {
+        self.remove_id(item.id);
+        self.install(item.id, location, CatalogKeys::from_item(item));
+    }
+
+    fn upsert_entry(&mut self, entry: &ExternalizedContext) {
+        self.remove_id(entry.item_id);
+        self.install(
+            entry.item_id,
+            CatalogLocation::Stored,
+            CatalogKeys::from_entry(entry),
+        );
+    }
+
+    fn remove_id(&mut self, id: ContextItemId) {
+        if let Some(keys) = self.records.remove(&id) {
+            self.unindex(id, &keys);
+        }
+        self.by_id.remove(&id);
+    }
+
+    fn install(&mut self, id: ContextItemId, location: CatalogLocation, keys: CatalogKeys) {
+        self.by_id.insert(id, location);
+        self.index_keys(id, &keys);
+        self.records.insert(id, keys);
+    }
+
+    fn index_keys(&mut self, id: ContextItemId, keys: &CatalogKeys) {
+        if let Some(task) = keys.task_id {
             self.by_task.entry(task).or_default().push(id);
         }
-        self.by_scope.entry(scope).or_default().push(id);
-        self.by_kind.entry(kind).or_default().push(id);
-        for entity in entities {
+        self.by_scope.entry(keys.scope).or_default().push(id);
+        self.by_kind.entry(keys.kind).or_default().push(id);
+        for entity in &keys.entities {
             self.by_entity.entry(entity.clone()).or_default().push(id);
         }
-        for label in labels {
-            self.by_label.entry(label.to_string()).or_default().push(id);
+        for label in &keys.labels {
+            self.by_label.entry(label.clone()).or_default().push(id);
         }
-        self.by_residency.entry(residency).or_default().push(id);
-        self.by_attention.entry(attention).or_default().push(id);
-        if semantic.is_live() {
+        self.by_residency
+            .entry(keys.residency)
+            .or_default()
+            .push(id);
+        self.by_attention
+            .entry(keys.attention)
+            .or_default()
+            .push(id);
+        if keys.live {
             self.live.insert(id);
         }
+    }
+
+    fn unindex(&mut self, id: ContextItemId, keys: &CatalogKeys) {
+        if let Some(task) = keys.task_id {
+            remove_from_bucket(&mut self.by_task, task, id);
+        }
+        remove_from_bucket(&mut self.by_scope, keys.scope, id);
+        remove_from_bucket(&mut self.by_kind, keys.kind, id);
+        for entity in &keys.entities {
+            remove_from_bucket(&mut self.by_entity, entity.clone(), id);
+        }
+        for label in &keys.labels {
+            remove_from_bucket(&mut self.by_label, label.clone(), id);
+        }
+        remove_from_bucket(&mut self.by_residency, keys.residency, id);
+        remove_from_bucket(&mut self.by_attention, keys.attention, id);
+        self.live.remove(&id);
+    }
+}
+
+fn remove_from_bucket<K: Eq + Hash>(
+    map: &mut HashMap<K, Vec<ContextItemId>>,
+    key: K,
+    id: ContextItemId,
+) {
+    let empty = {
+        let Some(bucket) = map.get_mut(&key) else {
+            return;
+        };
+        if let Some(pos) = bucket.iter().position(|entry| *entry == id) {
+            bucket.swap_remove(pos);
+        }
+        bucket.is_empty()
+    };
+    if empty {
+        map.remove(&key);
     }
 }
 
@@ -506,6 +729,69 @@ mod tests {
                 .expect("stored filter still runs")
                 .is_empty(),
             "a resident-only entity must not appear in stored_search_ids"
+        );
+    }
+
+    #[test]
+    fn sync_upserts_dirty_ids_without_rebuilding() {
+        let resident_id = ContextItemId::new();
+        let stored_id = ContextItemId::new();
+        let mut heap = vec![item(resident_id, "AuthService.rs", None)];
+        let stored = vec![stored(&item(stored_id, "CacheStore.rs", None))];
+        let mut catalog = ContextCatalog::default();
+        catalog.sync(&heap, &[], &stored, 1, CatalogDirty::default());
+        assert!(catalog.last_sync_rebuilt(), "first fill is a rebuild");
+
+        heap[0].semantic = SemanticState::Tombstoned;
+        heap[0].attention = AttentionState::Archived;
+        let mut dirty = CatalogDirty::default();
+        dirty.mark(resident_id);
+        catalog.sync(&heap, &[], &stored, 2, dirty);
+        assert!(
+            !catalog.last_sync_rebuilt(),
+            "same-length dirty field edits stay incremental"
+        );
+        assert!(
+            catalog
+                .ids_for_attention(AttentionState::Archived)
+                .contains(&resident_id),
+            "attention bucket follows the dirty upsert"
+        );
+        assert!(
+            !catalog
+                .search_ids(&ContextSearchQuery::new("AuthService", 8))
+                .expect("entity keys still bound the set")
+                .contains(&resident_id),
+            "tombstoned items leave the live search set"
+        );
+        assert_eq!(
+            catalog
+                .search_ids(&ContextSearchQuery::new("CacheStore", 8))
+                .expect("stored live hit remains"),
+            vec![stored_id]
+        );
+    }
+
+    #[test]
+    fn unmarked_length_change_rebuilds() {
+        let first = ContextItemId::new();
+        let second = ContextItemId::new();
+        let heap = vec![item(first, "One.rs", None)];
+        let mut catalog = ContextCatalog::default();
+        catalog.sync(&heap, &[], &[], 1, CatalogDirty::default());
+
+        let heap = vec![item(first, "One.rs", None), item(second, "Two.rs", None)];
+        catalog.sync(&heap, &[], &[], 2, CatalogDirty::default());
+        assert!(
+            catalog.last_sync_rebuilt(),
+            "an unmarked push is the rebuild safety net"
+        );
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(
+            catalog
+                .search_ids(&ContextSearchQuery::new("Two", 8))
+                .expect("new entity is indexed after rebuild"),
+            vec![second]
         );
     }
 }

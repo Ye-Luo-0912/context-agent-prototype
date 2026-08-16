@@ -556,12 +556,12 @@ pub(crate) fn plan_storage_gc(
             }) {
                 anchor_roots_protected += 1;
                 if anchor_root_protections.len() < agent_contracts::MAX_ANCHOR_ROOT_CLAIMS
-                    && !anchor_root_protections
-                        .iter()
-                        .any(|existing: &agent_contracts::AnchorRootProtection| {
+                    && !anchor_root_protections.iter().any(
+                        |existing: &agent_contracts::AnchorRootProtection| {
                             existing.item_ref == claim.item_ref
                                 && existing.source_field_id == claim.source_field_id
-                        })
+                        },
+                    )
                 {
                     anchor_root_protections.push(claim.into());
                 }
@@ -718,9 +718,12 @@ pub(crate) fn age_external_entries(
     config: &SimpleContextConfig,
     gc_epoch: u64,
 ) -> usize {
-    state
-        .external
-        .age_entries(config.gc_external_ttl_generations as u64, gc_epoch)
+    state.external.age_entries_bounded(
+        config.gc_external_ttl_generations as u64,
+        gc_epoch,
+        &mut state.gc_cursor.stored,
+        config.gc_work_batch.max(1),
+    )
 }
 
 /// Whether the store can provide a read path (used by recall).

@@ -120,7 +120,7 @@ pub(crate) fn plan_full_gc(
     let focus = state.focus.clone();
     let hot_entities = state.hot_entities.clone();
     let latest_file_bodies = state.latest_file_body_ids();
-        let (marked, anchor_roots_protected) = mark_roots(
+    let (marked, anchor_roots_protected) = mark_roots(
         state,
         config,
         focus.as_ref(),

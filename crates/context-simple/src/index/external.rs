@@ -20,7 +20,7 @@
 //! keys, so the recall pass keeps a residual scan over entries the index
 //! did not already cover — coverage is preserved, exact matches are fast.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,8 @@ pub(crate) struct ExternalMap {
     cold_entries: usize,
     /// External-entry count (the reference-only tail of the store).
     external_entries: usize,
+    catalog_dirty: HashSet<ContextItemId>,
+    catalog_rebuild: bool,
 }
 
 impl ExternalMap {
@@ -51,6 +53,7 @@ impl ExternalMap {
     /// Push one externalized entry and index it at its slot. The entry
     /// must be fully formed (entities captured) before the push.
     pub(crate) fn push(&mut self, entry: ExternalizedContext) {
+        self.mark_catalog(entry.item_id);
         let slot = self.entries.len();
         self.id_index.insert(entry.item_id, slot);
         for entity in &entry.entities {
@@ -74,11 +77,49 @@ impl ExternalMap {
     /// without a single GC pass having run. Entries restored from
     /// pre-epoch checkpoints (`last_access_gc_epoch == None`) start fresh
     /// at the current epoch instead of aging out instantly.
+    #[cfg(test)]
     pub(crate) fn age_entries(&mut self, ttl_generations: u64, gc_epoch: u64) -> usize {
+        let mut cursor = 0;
+        self.age_entries_bounded(ttl_generations, gc_epoch, &mut cursor, usize::MAX)
+    }
+
+    /// Age at most `batch` entries starting at `cursor`, wrapping. A batch
+    /// of `usize::MAX` or `>= len` visits every entry (same as a full scan).
+    /// When the store is larger than the batch, unfinished entries wait for
+    /// the next GC pass.
+    pub(crate) fn age_entries_bounded(
+        &mut self,
+        ttl_generations: u64,
+        gc_epoch: u64,
+        cursor: &mut usize,
+        batch: usize,
+    ) -> usize {
+        let n = self.entries.len();
+        if n == 0 {
+            *cursor = 0;
+            return 0;
+        }
+        let take = batch.max(1).min(n);
+        let start = if take == n { 0 } else { *cursor % n };
         let mut aged = 0usize;
-        for entry in &mut self.entries {
+        for step in 0..take {
+            let idx = (start + step) % n;
+            let changed = self.age_one(idx, ttl_generations, gc_epoch);
+            if changed {
+                aged += 1;
+                let id = self.entries[idx].item_id;
+                self.mark_catalog(id);
+            }
+        }
+        *cursor = if take == n { 0 } else { (start + take) % n };
+        aged
+    }
+
+    fn age_one(&mut self, idx: usize, ttl_generations: u64, gc_epoch: u64) -> bool {
+        {
+            let entry = &mut self.entries[idx];
             if entry.residency != ContextResidency::Cold {
-                continue;
+                return false;
             }
             let Some(last) = entry.last_access_gc_epoch else {
                 // A pre-epoch checkpoint has no generation anchor. Establish
@@ -86,17 +127,17 @@ impl ExternalMap {
                 // normally; merely substituting `gc_epoch` here would leave
                 // the field `None` forever and make the entry immortal.
                 entry.last_access_gc_epoch = Some(gc_epoch);
-                continue;
+                return false;
             };
             let idle = gc_epoch.saturating_sub(last);
-            if idle >= ttl_generations {
-                entry.residency = ContextResidency::External;
-                self.cold_entries = self.cold_entries.saturating_sub(1);
-                self.external_entries += 1;
-                aged += 1;
+            if idle < ttl_generations {
+                return false;
             }
+            entry.residency = ContextResidency::External;
         }
-        aged
+        self.cold_entries = self.cold_entries.saturating_sub(1);
+        self.external_entries += 1;
+        true
     }
 
     /// O(1) count of `Cold` entries (diagnostics; the store can grow with
@@ -127,6 +168,8 @@ impl ExternalMap {
     /// the GC commit is not the hot path, and a partial index update would
     /// risk drifting on the entity buckets.
     pub(crate) fn retain(&mut self, keep: impl FnMut(&ExternalizedContext) -> bool) {
+        self.catalog_rebuild = true;
+        self.catalog_dirty.clear();
         self.entries.retain(keep);
         self.rebuild_indexes();
     }
@@ -135,6 +178,8 @@ impl ExternalMap {
     /// caller must `replace_all` the survivors before any indexed query
     /// runs again.
     pub(crate) fn take_all(&mut self) -> Vec<ExternalizedContext> {
+        self.catalog_rebuild = true;
+        self.catalog_dirty.clear();
         self.id_index.clear();
         self.entity_index.clear();
         self.map_len = 0;
@@ -144,6 +189,8 @@ impl ExternalMap {
     /// Replace the whole map (storage-GC commit, restore) and rebuild the
     /// indexes.
     pub(crate) fn replace_all(&mut self, entries: Vec<ExternalizedContext>) {
+        self.catalog_rebuild = true;
+        self.catalog_dirty.clear();
         self.entries = entries;
         self.rebuild_indexes();
     }
@@ -193,6 +240,19 @@ impl ExternalMap {
     pub(crate) fn ensure_consistent(&mut self) {
         if self.map_len != self.entries.len() {
             self.rebuild_indexes();
+        }
+    }
+
+    pub(crate) fn drain_catalog_dirty(&mut self) -> (bool, HashSet<ContextItemId>) {
+        (
+            std::mem::take(&mut self.catalog_rebuild),
+            std::mem::take(&mut self.catalog_dirty),
+        )
+    }
+
+    fn mark_catalog(&mut self, id: ContextItemId) {
+        if !self.catalog_rebuild {
+            self.catalog_dirty.insert(id);
         }
     }
 
@@ -431,5 +491,28 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert_eq!(map.cold_entries(), 0);
         assert_eq!(map.external_entries(), 2, "a and c survived as External");
+    }
+
+    #[test]
+    fn age_entries_bounded_resumes_from_the_cursor() {
+        let mut map = ExternalMap::new();
+        let ids: Vec<ContextItemId> = (0..3).map(|_| ContextItemId::new()).collect();
+        for id in &ids {
+            map.push(entry(*id, &["x.rs"]));
+        }
+        let mut cursor = 0;
+        assert_eq!(
+            map.age_entries_bounded(1, 1, &mut cursor, 1),
+            1,
+            "one Cold entry ages per pass"
+        );
+        assert_eq!(map.cold_entries(), 2);
+        assert_eq!(cursor, 1);
+        assert_eq!(map.age_entries_bounded(1, 1, &mut cursor, 1), 1);
+        assert_eq!(map.cold_entries(), 1);
+        assert_eq!(map.age_entries_bounded(1, 1, &mut cursor, 1), 1);
+        assert_eq!(map.cold_entries(), 0);
+        assert_eq!(map.external_entries(), 3);
+        assert_eq!(cursor, 0, "full wrap resets the stored cursor");
     }
 }

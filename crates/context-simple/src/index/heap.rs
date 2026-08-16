@@ -11,9 +11,11 @@
 //! tags, keep_alive, lease, access stamps) remain reachable through
 //! `iter_mut`, which cannot affect any index bucket.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
-use agent_contracts::{ContextItem, ScopeId};
+use agent_contracts::{ContextItem, ContextItemId, ScopeId};
 
 use super::indexes::Indexes;
 
@@ -21,6 +23,8 @@ use super::indexes::Indexes;
 pub(crate) struct ContextHeap {
     items: Vec<ContextItem>,
     indexes: Indexes,
+    catalog_dirty: HashSet<ContextItemId>,
+    catalog_rebuild: bool,
 }
 
 impl ContextHeap {
@@ -28,11 +32,14 @@ impl ContextHeap {
         Self {
             items: Vec::new(),
             indexes: Indexes::default(),
+            catalog_dirty: HashSet::new(),
+            catalog_rebuild: false,
         }
     }
     /// Push an item and index it at its slot. The item must be fully
     /// formed (entities and scope stamp set) before the push.
     pub(crate) fn push(&mut self, item: ContextItem) {
+        self.mark_catalog(item.id);
         let slot = self.items.len();
         self.indexes.insert(&item, slot);
         self.items.push(item);
@@ -40,6 +47,8 @@ impl ContextHeap {
 
     /// Replace the whole heap (GC sweep, restore) and rebuild the indexes.
     pub(crate) fn replace_all(&mut self, items: Vec<ContextItem>) {
+        self.catalog_rebuild = true;
+        self.catalog_dirty.clear();
         self.items = items;
         self.indexes.rebuild(&self.items);
     }
@@ -48,6 +57,8 @@ impl ContextHeap {
     /// item); the caller must `replace_all` or push the survivors back
     /// before any indexed query runs again.
     pub(crate) fn take_all(&mut self) -> Vec<ContextItem> {
+        self.catalog_rebuild = true;
+        self.catalog_dirty.clear();
         self.indexes = Indexes::default();
         std::mem::take(&mut self.items)
     }
@@ -61,6 +72,7 @@ impl ContextHeap {
         to: Option<ScopeId>,
     ) {
         let id = self.items[index].id;
+        self.mark_catalog(id);
         self.items[index].scope_id = to;
         self.indexes.update_scope(id, from, to);
     }
@@ -72,8 +84,22 @@ impl ContextHeap {
         let item = &mut self.items[index];
         let old = std::mem::replace(&mut item.entities, entities);
         let id = item.id;
+        self.mark_catalog(id);
         self.indexes
             .update_entities(id, &old, &self.items[index].entities);
+    }
+
+    pub(crate) fn drain_catalog_dirty(&mut self) -> (bool, HashSet<ContextItemId>) {
+        (
+            std::mem::take(&mut self.catalog_rebuild),
+            std::mem::take(&mut self.catalog_dirty),
+        )
+    }
+
+    fn mark_catalog(&mut self, id: ContextItemId) {
+        if !self.catalog_rebuild {
+            self.catalog_dirty.insert(id);
+        }
     }
 
     pub(crate) fn indexes(&self) -> &Indexes {

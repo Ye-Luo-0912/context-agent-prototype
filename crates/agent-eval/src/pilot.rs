@@ -826,6 +826,11 @@ mod tests {
         assert_eq!(report.observed_n, 1);
         assert!((report.overall_a - 1.0).abs() < 1e-12);
         assert!((report.overall_c - 1.0).abs() < 1e-12);
-        assert!(report.tasks.iter().all(|task| !task.fixture_id.starts_with("swebench-")));
+        assert!(
+            report
+                .tasks
+                .iter()
+                .all(|task| !task.fixture_id.starts_with("swebench-"))
+        );
     }
 }

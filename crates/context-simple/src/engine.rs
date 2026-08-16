@@ -126,6 +126,10 @@ pub struct SimpleContextConfig {
     /// (oldest rows drop) and is exported to a JSONL artifact on demand —
     /// never written on the context hot path.
     pub max_ledger_records: usize,
+    /// Items (or store entries) one minor/aging pass will scan. Heaps at
+    /// or below this batch still run a full stable-order pass. Larger
+    /// stores resume from `GcWorkCursor` on the next event.
+    pub gc_work_batch: usize,
 }
 
 impl Default for SimpleContextConfig {
@@ -155,6 +159,7 @@ impl Default for SimpleContextConfig {
             episode_rotate_threshold: 0.15,
             episode_max_user_turns: 500,
             max_ledger_records: 4096,
+            gc_work_batch: 4096,
         }
     }
 }
@@ -260,6 +265,14 @@ pub(crate) struct State {
     /// and skipped in checkpoints; restore rebuilds it.
     #[serde(skip)]
     pub(crate) catalog: crate::index::catalog::ContextCatalog,
+    /// Field edits (attention/semantic/tags) that do not go through heap
+    /// or external structural methods. Drained into catalog sync.
+    #[serde(skip)]
+    pub(crate) catalog_dirty: crate::index::catalog::CatalogDirty,
+    /// Bounded minor/aging resume points. Default batch covers the heaps
+    /// used in tests, so a pass still visits every item in stable order.
+    #[serde(default)]
+    pub(crate) gc_cursor: crate::gc::GcWorkCursor,
     /// Counts full GC passes only. External-entry aging (Cold -> External)
     /// and TTLs compare this epoch, never the tick counter — the tick also
     /// advances on ingest/maintain/materialize, so a pass-based TTL must
@@ -328,16 +341,26 @@ pub(crate) struct State {
 }
 
 impl State {
-    /// Rebuild the catalog when the body stores or event clock moved.
+    /// Apply dirty catalog ids, or rebuild after a wholesale store replace.
     /// Search and GC recall consume this directory; callers must sync
     /// before reading it.
     pub(crate) fn sync_catalog(&mut self) {
+        let (heap_rebuild, heap_dirty) = self.items.drain_catalog_dirty();
+        let (ext_rebuild, ext_dirty) = self.external.drain_catalog_dirty();
+        self.catalog_dirty.merge(heap_rebuild, heap_dirty);
+        self.catalog_dirty.merge(ext_rebuild, ext_dirty);
+        let dirty = std::mem::take(&mut self.catalog_dirty);
         self.catalog.sync(
             &self.items[..],
             &self.eviction_buffer,
             &self.external[..],
             self.event_seq,
+            dirty,
         );
+    }
+
+    pub(crate) fn mark_catalog(&mut self, id: ContextItemId) {
+        self.catalog_dirty.mark(id);
     }
 
     /// 活跃任务里每个最近文件的最新成功观察。已完成任务或没有焦点时为空：
@@ -1407,6 +1430,10 @@ impl ContextEngine for SimpleContextEngine {
                 }
             }
         }
+        // Restore can rewrite entity signatures and semantic death; rebuild
+        // the derived catalog before the next search rather than trusting
+        // the pre-migration directory.
+        state.catalog_dirty.mark_rebuild();
         Ok(())
     }
 
@@ -1599,35 +1626,42 @@ fn apply_directive(
         return Some(reason);
     }
 
-    let mut target = state
-        .items
-        .iter_mut()
-        .chain(state.eviction_buffer.iter_mut())
-        .find(|item| item.id == target_id);
-    if let Some(item) = target.as_mut() {
-        match action {
-            ContextAction::GcHint { keep_alive, .. } => {
-                item.keep_alive = keep_alive;
-            }
-            ContextAction::Tag { tag, .. } => {
-                let label = Label::extension(tag);
-                if !item.tags.contains(&label) {
-                    item.tags.push(label);
+    let mut tagged = false;
+    {
+        let mut target = state
+            .items
+            .iter_mut()
+            .chain(state.eviction_buffer.iter_mut())
+            .find(|item| item.id == target_id);
+        if let Some(item) = target.as_mut() {
+            match action {
+                ContextAction::GcHint { keep_alive, .. } => {
+                    item.keep_alive = keep_alive;
                 }
+                ContextAction::Tag { tag, .. } => {
+                    let label = Label::extension(tag);
+                    if !item.tags.contains(&label) {
+                        item.tags.push(label);
+                        tagged = true;
+                    }
+                }
+                ContextAction::Lease { turns, .. } => {
+                    let turns = turns.min(config.max_lease_turns);
+                    item.lease_until_turn = Some(state.turn.saturating_add(turns as u64));
+                }
+                // The runtime owns the GC pass; `context.collect` never arrives
+                // as an ingest directive (the actor calls `ContextEngine::gc`).
+                ContextAction::Collect => {}
+                // Admit/Derive/AnchorRoots are dispatched above and never reach
+                // the in-memory directive loop.
+                ContextAction::Admit { .. }
+                | ContextAction::Derive { .. }
+                | ContextAction::AnchorRoots { .. } => unreachable!(),
             }
-            ContextAction::Lease { turns, .. } => {
-                let turns = turns.min(config.max_lease_turns);
-                item.lease_until_turn = Some(state.turn.saturating_add(turns as u64));
-            }
-            // The runtime owns the GC pass; `context.collect` never arrives
-            // as an ingest directive (the actor calls `ContextEngine::gc`).
-            ContextAction::Collect => {}
-            // Admit/Derive/AnchorRoots are dispatched above and never reach
-            // the in-memory directive loop.
-            ContextAction::Admit { .. }
-            | ContextAction::Derive { .. }
-            | ContextAction::AnchorRoots { .. } => unreachable!(),
         }
+    }
+    if tagged {
+        state.mark_catalog(target_id);
     }
     None
 }

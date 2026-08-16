@@ -891,7 +891,10 @@ async fn task_anchor_roots_are_projected_into_materialization_hints() {
         last.anchor_roots[0].reason,
         agent_contracts::RootReason::TaskAnchor
     );
-    let view = last.task.as_ref().expect("active task supplies TaskAnchorView");
+    let view = last
+        .task
+        .as_ref()
+        .expect("active task supplies TaskAnchorView");
     assert_eq!(view.original_goal, "start the auth refactor");
     assert_eq!(view.current_interpretation, "refactor");
 }

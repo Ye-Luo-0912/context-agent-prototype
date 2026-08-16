@@ -161,7 +161,10 @@ fn render_task_anchor(task: &TaskAnchorView) -> String {
         out.push_str(&format!("Goal: {}\n", task.original_goal));
     }
     if !task.current_interpretation.is_empty() {
-        out.push_str(&format!("Interpretation: {}\n", task.current_interpretation));
+        out.push_str(&format!(
+            "Interpretation: {}\n",
+            task.current_interpretation
+        ));
     }
     append_list(&mut out, "Constraints", &task.constraints);
     append_list(&mut out, "Acceptance", &task.acceptance_criteria);

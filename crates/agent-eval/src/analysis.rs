@@ -1375,7 +1375,9 @@ mod tests {
         assert!((retrieval.mean_c_search_ms_p50 - 80.0).abs() < 1e-12);
         assert!((retrieval.mean_a_access_ack - 3.0).abs() < 1e-12);
         let text = render_report(&report);
-        assert!(text.contains("retrieval secondaries (cost-eligible paired A/C; not in LCL gate): n=1"));
+        assert!(
+            text.contains("retrieval secondaries (cost-eligible paired A/C; not in LCL gate): n=1")
+        );
         assert!(text.contains("search A/C calls=1.0/3.0"));
         assert!(text.contains("found-after-forgotten A/C forgotten=4.0/8.0 recovered=2.0/4.0"));
         assert!(!text.contains("calls=99"));
