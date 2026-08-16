@@ -2,6 +2,7 @@ mod access;
 mod checkpoint;
 mod diagnostics;
 mod directive;
+mod distill;
 mod engine;
 mod gc;
 mod heap;

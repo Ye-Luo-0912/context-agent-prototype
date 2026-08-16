@@ -85,7 +85,7 @@ boundedness, and integrity rather than replace it with transcript history.
 
 | Area | Current state | Code-grounded assessment |
 | --- | --- | --- |
-| Runtime triggers | Implemented | `ContextMaintenanceTrigger` covers `UserInput`, `BeforeModel`, `AfterModel`, `AfterTool`, `FocusChanged`, `TaskCompleted`, and `Checkpoint` in `crates/agent-contracts/src/context.rs`. `RuntimeActor` invokes these paths in `crates/agent-runtime/src/actor.rs`. |
+| Runtime triggers | Implemented | `ContextMaintenanceTrigger` covers `UserInput`, `BeforeModel`, `AfterModel`, `AfterTool`, `FocusChanged`, `TaskCompleted`, and `Checkpoint` in `crates/agent-contracts/src/context.rs`. `RuntimeActor` invokes these paths in `crates/agent-runtime/src/actor/`. |
 | Continuous collection | Implemented baseline | `maintain()` runs lifecycle maintenance at runtime events, and `finalize_turn()` runs full `context_gc()` after every committed model turn. `context.collect` can request an additional pass. There is no token-limit trigger. |
 | Orthogonal lifecycle axes | Implemented | `ContextItem` separates attention, semantic state, physical residency, retention, and GC generation. This is the right base model. |
 | Reversible residency | Implemented baseline | `Resident -> Warm -> Cold -> External` moves old bodies through heap, bounded eviction buffer, and filesystem store; full GC reports eviction/reactivation reasons. |
@@ -1689,7 +1689,7 @@ current slice above.)
   the warm buffer", tombstoned once dead); externalized (`Cold`) entries
   age to `External` by full-GC generations (`gc_external_ttl_generations`,
   `store::age_external_entries`), and a full GC whose heap and buffer are
-  empty still runs and ages external entries (`gc/full.rs`: "An
+  empty still runs and ages external entries (`gc/full/`: "An
   external-only state must ...") — so aging never stalls when nothing is
   resident. Storage GC deletes only entries whose semantic lifecycle ended
   `storage_ttl_ticks` ago (`store::plan_storage_gc`). Regressions cover

@@ -71,7 +71,7 @@ Implemented:
   boundary (token overlap below the threshold AND informative content) or
   the turn budget; the close promotes durable outcomes to the task scope and
   evicts ordinary dialogue (close_members now evicts for Focus too);
-- `gc/full.rs`: a member of a closed scope is an eviction candidate
+- `gc/full/`: a member of a closed scope is an eviction candidate
   regardless of attention (the residency score floor can no longer keep
   same-template dialogue Active forever), and is recallable only for a fresh
   causal reason (hot entity / pin / model hint/lease), never for the score
@@ -118,7 +118,7 @@ Confirmed behavior (as audited):
 - every User/Assistant message is `Working` inside that long-lived focus;
 - same-task score floors remain above the default archive threshold after
   recency vanishes (User ≈ 0.349, Assistant ≈ 0.296, threshold 0.24);
-- `gc/full.rs::mark_roots` roots every live member of the active Focus scope,
+- `gc/full::mark_roots` roots every live member of the active Focus scope,
   regardless of `Active`/`Cooling` attention;
 - the materializer admits all `Cooling` candidates and runtime supplies no
   finite `max_selected_items`.

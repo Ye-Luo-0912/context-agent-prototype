@@ -963,7 +963,7 @@ context engine; tools still never touch the engine (invariant 3).
   `max_leased_items_per_task`, `max_leased_tokens_per_task`,
   `max_lease_turns` — a refusal surfaces as an `InvalidRequest` error, and
   keep_alive/lease auto-expire on task close;
-- GC roots (`context-simple` `gc/full.rs`): `keep_alive` or a live lease
+- GC roots (`context-simple` `gc/full/`): `keep_alive` or a live lease
   marks an item `model_directed_root`, and an explicit directive overrides
   the consumed-ephemeral heuristic in the sweep — a spent turn observation
   the model asked to keep stays resident. Reactivations report
@@ -1905,7 +1905,7 @@ in the authoritative table above:
   degraded/recovery warning and tells the model the change *did* land but
   its record did not — the filesystem and the journal never silently
   disagree.
-- **Coverage** (`agent-runtime/tests/turn.rs`): a live capability effect
+- **Coverage** (`agent-runtime/tests/turn/`): a live capability effect
   commits behind the fence and a stale one rolls back (cancelled operation
   → no avoidable stale mutation), plus the two commit-failure branches.
   The workspace mutation transaction itself (atomic replace, rollback
