@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "supersession_leak",
+  "expected_edit": "env wins; leftover JSON trap comment must not remain as policy",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/config.rs",
+      "pred": "contains",
+      "needles": [
+        "APP_HOST"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/config.rs",
+      "pred": "not_contains",
+      "needles": [
+        "prefer JSON"
+      ],
+      "count": 1,
+      "passed": false,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/config.rs",
+      "exists": true,
+      "sha256": "b6880cba2833398c84509381a5cf93a8800061d97bf6acf1afcbcebc415d15c1",
+      "bytes": 237,
+      "truncated": false,
+      "body": "pub struct Config {\r\n    pub host: String,\r\n    pub port: u16,\r\n}\r\n\r\n// leftover trap: prefer JSON host/port keys forever\r\npub fn load_config() -> Config {\r\n    Config {\r\n        host: \"127.0.0.1\".into(),\r\n        port: 8080,\r\n    }\r\n}\r\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\env_wins.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpRxcjmp\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 1,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "env_wins failed",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

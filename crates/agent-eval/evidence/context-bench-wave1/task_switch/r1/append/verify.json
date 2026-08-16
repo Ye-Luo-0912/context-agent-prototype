@@ -1,0 +1,75 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "task_switch",
+  "expected_edit": "auth rate_limit + operator allow; billing index fix",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "operator"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "rate_limit"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/billing.rs",
+      "pred": "not_contains",
+      "needles": [
+        "items[i + 1]"
+      ],
+      "count": 0,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/auth.rs",
+      "exists": true,
+      "sha256": "3d7a801361e5914f32cece70711083735011f0595cccd02ebc93b9b53c5bf259",
+      "bytes": 129,
+      "truncated": false,
+      "body": "pub fn allow(user: &str) -> bool {\n    user == \"admin\" || user == \"operator\"\n}\n\npub fn rate_limit(_user: &str) -> u32 {\n    30\n}\n"
+    },
+    {
+      "path": "src/billing.rs",
+      "exists": true,
+      "sha256": "78d016b2bb19168ce712965cc165483ba1296f989e8edd5b9096138c6b195e3b",
+      "bytes": 136,
+      "truncated": false,
+      "body": "pub fn total(items: &[u32]) -> u32 {\r\n    let mut sum = 0;\r\n    for i in 0..items.len() {\r\n        sum += items[i];\r\n    }\r\n    sum\r\n}\r\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\switch_resume.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpwTyXZ7\\append"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

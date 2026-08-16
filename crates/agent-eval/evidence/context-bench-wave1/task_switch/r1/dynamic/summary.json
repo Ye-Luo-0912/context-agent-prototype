@@ -1,0 +1,94 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 131431,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 1072,
+  "model_started": 23,
+  "model_used": 23,
+  "usage_incomplete": false,
+  "workspace_sha256": "0915b5dfd904960ae950ee1940b960661fc690656c4b4c6f2022e8fe3632f7ae",
+  "workspace_files": 30,
+  "tools": [
+    {
+      "name": "edit.replace",
+      "calls": 3,
+      "failed": 1
+    },
+    {
+      "name": "fs.list",
+      "calls": 8,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 10,
+      "failed": 0
+    },
+    {
+      "name": "fs.write",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 7,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 8,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 4,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 5,
+      "failed": 2
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 102,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 3,
+    "fetch_calls": 0,
+    "final_resident_bytes": 2454,
+    "forgotten_items": 43,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 128,
+    "materialize_rounds": 23,
+    "model_input_tokens": 151831,
+    "model_output_tokens": 3569,
+    "peak_resident_bytes": 2454,
+    "provider_tokens_total": 155400,
+    "recovered_items": 18,
+    "recovery_auto_reactivation": 18,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 25,
+    "recovery_workspace_reread": 7,
+    "repeated_fs_reads": 7,
+    "rounds": 23,
+    "schema_tokens_total": 31579,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "search_ms_p50": 0,
+    "search_ms_p95": 0,
+    "tool_calls": 46,
+    "turns": 5
+  }
+}

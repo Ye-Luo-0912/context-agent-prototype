@@ -1,0 +1,67 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall_fallback",
+  "expected_edit": "missing user returns anonymous, never lookup(id)?",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/store.rs",
+      "pred": "contains",
+      "needles": [
+        "anonymous"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/store.rs",
+      "pred": "not_contains",
+      "needles": [
+        "lookup(id)?"
+      ],
+      "count": 0,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/store.rs",
+      "pred": "contains",
+      "needles": [
+        "cached_load"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/store.rs",
+      "exists": true,
+      "sha256": "f2649ed85c2ec7cacc4c72985478cede983a732685d7407a7b2e8e79906ca491",
+      "bytes": 528,
+      "truncated": false,
+      "body": "pub struct User {\n    pub id: String,\n}\n\npub fn normalize_id(id: &str) -> String {\n    id.trim().into()\n}\n\npub fn lookup(id: &str) -> Result<User, String> {\n    if id == \"missing\" {\n        return Err(\"not found\".into());\n    }\n    Ok(User { id: id.into() })\n}\n\npub fn load_user(id: &str) -> Result<User, String> {\n    match lookup(id) {\n        Ok(user) => Ok(user),\n        Err(_) => Ok(User {\n            id: \"anonymous\".into(),\n        }),\n    }\n}\n\npub fn cached_load(id: &str) -> Result<User, String> {\n    load_user(id)\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\fallback_anonymous.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpEFLqnp\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

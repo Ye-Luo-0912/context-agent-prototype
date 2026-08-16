@@ -1,0 +1,14 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "fixture_id": "horizon_short",
+  "engine": "dynamic",
+  "repeat": 1,
+  "repeats": 1,
+  "live": true,
+  "fixture_sha256": "675007a47a05463e82dc047c959701c9a6f7f59b85404fef932efd968a2b0181",
+  "git_head": "89fbfbaba4549d484aa421590fae460df69644bd",
+  "git_dirty": true,
+  "git_dirty_sha256": "7e925f656acd32777c583dab834c3d5d152fe1c89ca56d3670083284ebf7169b",
+  "openai_model": "gpt-5.6-luna",
+  "openai_base_url": "https://api.pinaic.com/v1"
+}

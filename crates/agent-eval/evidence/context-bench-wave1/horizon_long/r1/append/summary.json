@@ -1,0 +1,89 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "error",
+  "error": "op 8 failed: fixture turn timed out",
+  "passed": false,
+  "wall_ms": 748466,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 1332,
+  "model_started": 34,
+  "model_used": 33,
+  "usage_incomplete": true,
+  "workspace_sha256": "70ce1c6b42069eb9ec599341549e631899df84504ee0f4183c724587d1dfdb01",
+  "workspace_files": 34,
+  "tools": [
+    {
+      "name": "edit.replace",
+      "calls": 15,
+      "failed": 4
+    },
+    {
+      "name": "fs.list",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 17,
+      "failed": 1
+    },
+    {
+      "name": "git.diff",
+      "calls": 7,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 4,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 4,
+      "failed": 1
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 0,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 6,
+    "fetch_calls": 0,
+    "final_resident_bytes": 13791,
+    "forgotten_items": 0,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 0,
+    "materialize_rounds": 34,
+    "model_input_tokens": 285843,
+    "model_output_tokens": 4736,
+    "peak_resident_bytes": 13791,
+    "provider_tokens_total": 290579,
+    "recovered_items": 0,
+    "recovery_auto_reactivation": 0,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 0,
+    "recovery_workspace_reread": 12,
+    "repeated_fs_reads": 12,
+    "rounds": 34,
+    "schema_tokens_total": 46682,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "search_ms_p50": 0,
+    "search_ms_p95": 0,
+    "tool_calls": 52,
+    "turns": 8
+  }
+}

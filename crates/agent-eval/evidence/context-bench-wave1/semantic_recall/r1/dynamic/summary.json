@@ -1,0 +1,104 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 463474,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 3105,
+  "model_started": 59,
+  "model_used": 59,
+  "usage_incomplete": false,
+  "workspace_sha256": "9b08302bdf43a4ec388a3da1357b155a5588e85f6d576dc53d2515f325535d21",
+  "workspace_files": 28,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 2,
+      "failed": 1
+    },
+    {
+      "name": "context.manage",
+      "calls": 15,
+      "failed": 5
+    },
+    {
+      "name": "edit.replace",
+      "calls": 5,
+      "failed": 1
+    },
+    {
+      "name": "fs.list",
+      "calls": 10,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 14,
+      "failed": 4
+    },
+    {
+      "name": "fs.write",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 7,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 10,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 5,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 40,
+      "failed": 19
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 584,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 7,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 30,
+    "fetch_calls": 0,
+    "final_resident_bytes": 13198,
+    "forgotten_items": 114,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 368,
+    "materialize_rounds": 59,
+    "model_input_tokens": 632878,
+    "model_output_tokens": 14391,
+    "peak_resident_bytes": 15134,
+    "provider_tokens_total": 647269,
+    "recovered_items": 42,
+    "recovery_auto_reactivation": 41,
+    "recovery_explicit_search": 1,
+    "recovery_failed": 72,
+    "recovery_workspace_reread": 8,
+    "repeated_fs_reads": 8,
+    "rounds": 59,
+    "schema_tokens_total": 81007,
+    "search_calls": 12,
+    "search_empty": 7,
+    "search_hits": 7,
+    "search_ms_p50": 3,
+    "search_ms_p95": 4,
+    "tool_calls": 109,
+    "turns": 9
+  }
+}

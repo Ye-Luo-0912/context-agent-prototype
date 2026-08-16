@@ -1,0 +1,14 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "fixture_id": "supersession_leak",
+  "engine": "dynamic",
+  "repeat": 1,
+  "repeats": 1,
+  "live": true,
+  "fixture_sha256": "d0bfc5c9fcb9864f53ec33b8b6bbfeb4489be6e5b3ebf20bff00b77227d44b2c",
+  "git_head": "89fbfbaba4549d484aa421590fae460df69644bd",
+  "git_dirty": true,
+  "git_dirty_sha256": "821493b01a567671e6f810822967571ca38d693644f4d6a443198d6b0e05476c",
+  "openai_model": "gpt-5.6-luna",
+  "openai_base_url": "https://api.pinaic.com/v1"
+}

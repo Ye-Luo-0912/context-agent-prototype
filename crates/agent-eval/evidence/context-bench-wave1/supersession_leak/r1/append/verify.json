@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "supersession_leak",
+  "expected_edit": "env wins; leftover JSON trap comment must not remain as policy",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/config.rs",
+      "pred": "contains",
+      "needles": [
+        "APP_HOST"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/config.rs",
+      "pred": "not_contains",
+      "needles": [
+        "prefer JSON"
+      ],
+      "count": 0,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/config.rs",
+      "exists": true,
+      "sha256": "b3a7eb454c921b1e3afdb80c2f5031a2a20f9aff963001497847b2dbb0b63e8c",
+      "bytes": 1299,
+      "truncated": false,
+      "body": "pub struct Config {\n    pub host: String,\n    pub port: u16,\n}\n\npub fn load_config() -> Config {\n    let file_config = std::fs::read_to_string(\"config.json\")\n        .ok()\n        .map(|contents| parse_json_config(&contents))\n        .unwrap_or_default();\n\n    Config {\n        host: std::env::var(\"APP_HOST\")\n            .ok()\n            .or(file_config.host)\n            .unwrap_or_else(|| \"127.0.0.1\".into()),\n        port: std::env::var(\"APP_PORT\")\n            .ok()\n            .and_then(|value| value.parse().ok())\n            .or(file_config.port)\n            .unwrap_or(8080),\n    }\n}\n\n#[derive(Default)]\nstruct PartialConfig {\n    host: Option<String>,\n    port: Option<u16>,\n}\n\nfn parse_json_config(contents: &str) -> PartialConfig {\n    let mut config = PartialConfig::default();\n\n    for entry in contents\n        .trim_matches(|character| character == '{' || character == '}')\n        .split(',')\n    {\n        let Some((key, value)) = entry.split_once(':') else {\n            continue;\n        };\n\n        let key = key.trim().trim_matches('\"');\n        let value = value.trim();\n        match key {\n            \"host\" => config.host = Some(value.trim_matches('\"').to_owned()),\n            \"port\" => config.port = value.parse().ok(),\n            _ => {}\n        }\n    }\n\n    config\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\env_wins.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpRxcjmp\\append"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

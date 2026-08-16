@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 8,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 9,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "f8e6404ff93119a746e28daf7d43c662cd41bd8a329f069d5c855a13190db320",
+      "bytes": 2105,
+      "truncated": false,
+      "body": "const CURRENT_VERSION: &str = \"v1\";\nconst V2_HELLO_PREFIX: &str = \"v:2:hello:\";\n\npub enum Msg {\n    Ping,\n    Hello(String),\n}\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    match bytes {\n        \"ping\" | \"v1:ping\" => Ok(Msg::Ping),\n        _ if bytes.starts_with(V2_HELLO_PREFIX) => {\n            Ok(Msg::Hello(bytes[V2_HELLO_PREFIX.len()..].to_owned()))\n        }\n        _ => {\n            eprintln!(\"protocol decode error: unknown message body {bytes:?}\");\n            Err(\"unknown\".into())\n        }\n    }\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => format!(\"{CURRENT_VERSION}:ping\"),\n        Msg::Hello(text) => format!(\"{V2_HELLO_PREFIX}{text}\"),\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{decode, encode, Msg};\n\n    #[test]\n    fn decodes_ping_forms() {\n        assert!(matches!(decode(\"ping\"), Ok(Msg::Ping)));\n        assert!(matches!(decode(\"v1:ping\"), Ok(Msg::Ping)));\n    }\n\n    #[test]\n    fn decodes_v2_hello_envelope() {\n        assert!(matches!(\n            decode(\"v:2:hello:world\"),\n            Ok(Msg::Hello(text)) if text == \"world\"\n        ));\n        assert!(matches!(\n            decode(\"v:2:hello:\"),\n            Ok(Msg::Hello(text)) if text.is_empty()\n        ));\n    }\n\n    #[test]\n    fn rejects_invalid_v2_envelopes() {\n        assert!(decode(\"v2:hello:world\").is_err());\n        assert!(decode(\"v:2:hello\").is_err());\n    }\n\n    #[test]\n    fn encodes_v2_hello_envelope() {\n        assert_eq!(encode(&Msg::Hello(\"world\".into())), \"v:2:hello:world\");\n    }\n\n    #[test]\n    fn roundtrips_hello_encoding() {\n        let msg = Msg::Hello(\"hello:world\".into());\n        assert!(matches!(\n            encode_roundtrip(&msg),\n            Ok(Msg::Hello(text)) if text == \"hello:world\"\n        ));\n    }\n\n    fn encode_roundtrip(msg: &Msg) -> Result<Msg, String> {\n        decode(&encode(msg))\n    }\n\n    #[test]\n    fn encodes_versioned_ping() {\n        assert_eq!(encode(&Msg::Ping), \"v1:ping\");\n    }\n\n    #[test]\n    fn roundtrips_ping_encoding() {\n        assert!(matches!(encode_roundtrip(&Msg::Ping), Ok(Msg::Ping)));\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpgBvNdB\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 3,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "8c01d7202e2196db14ed956a05cae8e19375a24df32a630e393746b4d15b3d1b",
+      "bytes": 1340,
+      "truncated": false,
+      "body": "pub enum Msg {\r\n    Ping,\r\n    Hello(String),\r\n}\r\n\r\npub fn decode(bytes: &str) -> Result<Msg, String> {\r\n    if bytes.contains(\"ping\") {\r\n        return Ok(Msg::Ping);\r\n    }\r\n\r\n    let mut fields = bytes.splitn(3, '|');\r\n    if fields.next() == Some(\"v:2\") && fields.next() == Some(\"hello\") {\r\n        if let Some(name) = fields.next() {\r\n            return Ok(Msg::Hello(name.into()));\r\n        }\r\n    }\r\n\r\n    Err(\"unknown\".into())\r\n}\r\n\r\npub fn encode(msg: &Msg) -> String {\r\n    match msg {\r\n        Msg::Ping => \"ping\".into(),\r\n        Msg::Hello(name) => format!(\"v:2|hello|{}\", name),\r\n    }\r\n}\r\n\r\n#[cfg(test)]\r\nmod tests {\r\n    use super::{decode, encode, Msg};\r\n\r\n    #[test]\r\n    fn encode_roundtrip_ping() {\r\n        let encoded = encode(&Msg::Ping);\r\n        assert!(matches!(decode(&encoded), Ok(Msg::Ping)));\r\n    }\r\n\r\n    #[test]\r\n    fn encode_roundtrip_hello() {\r\n        let msg = Msg::Hello(\"Ada|Lovelace\".into());\r\n        let encoded = encode(&msg);\r\n\r\n        assert_eq!(encoded, \"v:2|hello|Ada|Lovelace\");\r\n        assert!(matches!(decode(&encoded), Ok(Msg::Hello(name)) if name == \"Ada|Lovelace\"));\r\n    }\r\n\r\n    #[test]\r\n    fn decode_rejects_unknown_input() {\r\n        assert!(decode(\"pong\").is_err());\r\n        assert!(decode(\"v:1|hello|Ada\").is_err());\r\n        assert!(decode(\"v:2|hello\").is_err());\r\n    }\r\n}\r\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpgBvNdB\\rolling"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

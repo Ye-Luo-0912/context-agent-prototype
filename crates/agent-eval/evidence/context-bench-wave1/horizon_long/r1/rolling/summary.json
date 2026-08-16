@@ -1,0 +1,84 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "error",
+  "error": "op 4 failed: fixture turn timed out",
+  "passed": false,
+  "wall_ms": 720556,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 306,
+  "model_started": 10,
+  "model_used": 9,
+  "usage_incomplete": true,
+  "workspace_sha256": "9e49840ecce91d68e3538a2e421090420ce483cf4dc212cef1d06f196c3968ea",
+  "workspace_files": 34,
+  "tools": [
+    {
+      "name": "edit.replace",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 4,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 1,
+      "failed": 1
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 0,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 14383,
+    "compaction_output_tokens": 558,
+    "failed_tool_outputs": 1,
+    "fetch_calls": 0,
+    "final_resident_bytes": 1084,
+    "forgotten_items": 0,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 18,
+    "materialize_rounds": 10,
+    "model_input_tokens": 50331,
+    "model_output_tokens": 1040,
+    "peak_resident_bytes": 1084,
+    "provider_tokens_total": 66312,
+    "recovered_items": 0,
+    "recovery_auto_reactivation": 0,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 0,
+    "recovery_workspace_reread": 1,
+    "repeated_fs_reads": 1,
+    "rounds": 10,
+    "schema_tokens_total": 13730,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "search_ms_p50": 0,
+    "search_ms_p95": 0,
+    "tool_calls": 14,
+    "turns": 4
+  }
+}

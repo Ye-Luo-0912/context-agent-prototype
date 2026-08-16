@@ -1,0 +1,99 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 335851,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 1468,
+  "model_started": 33,
+  "model_used": 33,
+  "usage_incomplete": false,
+  "workspace_sha256": "6bfc4e555d3d32ea63d3ffe2627b2ef93dd048ed59950195bfe5da2c184bd767",
+  "workspace_files": 28,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "edit.replace",
+      "calls": 5,
+      "failed": 3
+    },
+    {
+      "name": "fs.list",
+      "calls": 7,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 10,
+      "failed": 0
+    },
+    {
+      "name": "fs.write",
+      "calls": 2,
+      "failed": 1
+    },
+    {
+      "name": "git.diff",
+      "calls": 6,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 7,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 5,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 7,
+      "failed": 2
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 300,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 6,
+    "fetch_calls": 0,
+    "final_resident_bytes": 5663,
+    "forgotten_items": 55,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 215,
+    "materialize_rounds": 33,
+    "model_input_tokens": 245737,
+    "model_output_tokens": 5751,
+    "peak_resident_bytes": 5663,
+    "provider_tokens_total": 251488,
+    "recovered_items": 27,
+    "recovery_auto_reactivation": 27,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 28,
+    "recovery_workspace_reread": 8,
+    "repeated_fs_reads": 8,
+    "rounds": 33,
+    "schema_tokens_total": 45309,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "search_ms_p50": 0,
+    "search_ms_p95": 0,
+    "tool_calls": 50,
+    "turns": 7
+  }
+}

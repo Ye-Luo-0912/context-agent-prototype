@@ -1,0 +1,75 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "task_switch_long_b",
+  "expected_edit": "auth rate_limit + operator; billing index fix after a long B",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "operator"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "rate_limit"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/billing.rs",
+      "pred": "not_contains",
+      "needles": [
+        "items[i + 1]"
+      ],
+      "count": 0,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/auth.rs",
+      "exists": true,
+      "sha256": "3979cdba4d5c5aa344857f0cbd6de951409d8a7b522314558a4cece97f84f5ef",
+      "bytes": 112,
+      "truncated": false,
+      "body": "pub const RATE_LIMIT: u32 = 30;\n\npub fn allow(user: &str) -> bool {\n    user == \"admin\" || user == \"operator\"\n}\n"
+    },
+    {
+      "path": "src/billing.rs",
+      "exists": true,
+      "sha256": "31e581dfd633354e27ad31d1b378d1eb7ea83cf70fc862aa6ae993cbf3003cf0",
+      "bytes": 129,
+      "truncated": false,
+      "body": "pub fn total(items: &[u32]) -> u32 {\n    let mut sum = 0;\n    for i in 0..items.len() {\n        sum += items[i];\n    }\n    sum\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\switch_resume.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpJWc5Dc\\append"
+      ],
+      "expect_exit": 0,
+      "exit": 1,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "switch_resume failed",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

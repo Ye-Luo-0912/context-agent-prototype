@@ -1,0 +1,75 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "task_switch",
+  "expected_edit": "auth rate_limit + operator allow; billing index fix",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "operator"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "rate_limit"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/billing.rs",
+      "pred": "not_contains",
+      "needles": [
+        "items[i + 1]"
+      ],
+      "count": 1,
+      "passed": false,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/auth.rs",
+      "exists": true,
+      "sha256": "54b6a7cbdc9e6dcb54a8501617eb4db8c2964685c9bfecff4d69df02b2aa45c8",
+      "bytes": 60,
+      "truncated": false,
+      "body": "pub fn allow(user: &str) -> bool {\r\n    user == \"admin\"\r\n}\r\n"
+    },
+    {
+      "path": "src/billing.rs",
+      "exists": true,
+      "sha256": "77179751df48d83af5ca7b8ae87e5c089ae6969fbeab999c9aabe580b90e4704",
+      "bytes": 140,
+      "truncated": false,
+      "body": "pub fn total(items: &[u32]) -> u32 {\r\n    let mut sum = 0;\r\n    for i in 0..items.len() {\r\n        sum += items[i + 1];\r\n    }\r\n    sum\r\n}\r\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\switch_resume.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpwTyXZ7\\rolling"
+      ],
+      "expect_exit": 0,
+      "exit": 1,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "switch_resume failed",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

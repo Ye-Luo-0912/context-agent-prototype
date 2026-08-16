@@ -1,0 +1,99 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "error",
+  "error": "op 2 failed: fixture turn timed out",
+  "passed": false,
+  "wall_ms": 495585,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 652,
+  "model_started": 15,
+  "model_used": 14,
+  "usage_incomplete": true,
+  "workspace_sha256": "bb3d7b3645717df2ab0555ccdf457988ba6128e533d657c5264e470bc0311ebd",
+  "workspace_files": 33,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "edit.replace",
+      "calls": 1,
+      "failed": 1
+    },
+    {
+      "name": "fs.list",
+      "calls": 5,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 5,
+      "failed": 2
+    },
+    {
+      "name": "fs.write",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 5,
+      "failed": 4
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 0,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 7,
+    "fetch_calls": 0,
+    "final_resident_bytes": 919,
+    "forgotten_items": 21,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 35,
+    "materialize_rounds": 15,
+    "model_input_tokens": 96110,
+    "model_output_tokens": 2879,
+    "peak_resident_bytes": 919,
+    "provider_tokens_total": 98989,
+    "recovered_items": 0,
+    "recovery_auto_reactivation": 0,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 21,
+    "recovery_workspace_reread": 1,
+    "repeated_fs_reads": 1,
+    "rounds": 15,
+    "schema_tokens_total": 20595,
+    "search_calls": 1,
+    "search_empty": 1,
+    "search_hits": 0,
+    "search_ms_p50": 4,
+    "search_ms_p95": 4,
+    "tool_calls": 24,
+    "turns": 2
+  }
+}

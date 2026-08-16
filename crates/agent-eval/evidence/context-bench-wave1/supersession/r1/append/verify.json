@@ -1,0 +1,67 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "supersession",
+  "expected_edit": "env APP_HOST/APP_PORT override defaults",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/config.rs",
+      "pred": "contains",
+      "needles": [
+        "APP_HOST"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/config.rs",
+      "pred": "contains",
+      "needles": [
+        "APP_PORT"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/config.rs",
+      "pred": "not_contains",
+      "needles": [
+        "serde_json"
+      ],
+      "count": 0,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/config.rs",
+      "exists": true,
+      "sha256": "c99925a27694ba5b34156a4dc5bf09b5d94e96daae9daf4ae96ac74f23566502",
+      "bytes": 1251,
+      "truncated": false,
+      "body": "pub struct Config {\n    pub host: String,\n    pub port: u16,\n}\n\npub fn load_config() -> Config {\n    let contents = std::fs::read_to_string(\"config.json\")\n        .expect(\"failed to read config.json\");\n\n    let host = json_string_value(&contents, \"host\")\n        .expect(\"config.json must contain a string `host` field\");\n    let port = json_number_value(&contents, \"port\")\n        .and_then(|value| value.parse().ok())\n        .expect(\"config.json must contain a valid `port` field\");\n\n    Config { host, port }\n}\n\nfn json_string_value(json: &str, key: &str) -> Option<String> {\n    let value = json_value(json, key)?;\n    let value = value.strip_prefix('\\\"')?;\n    let end = value.find('\\\"')?;\n    Some(value[..end].to_string())\n}\n\nfn json_number_value<'a>(json: &'a str, key: &str) -> Option<&'a str> {\n    let value = json_value(json, key)?;\n    let end = value\n        .find(|character: char| !character.is_ascii_digit())\n        .unwrap_or(value.len());\n    Some(&value[..end])\n}\n\nfn json_value<'a>(json: &'a str, key: &str) -> Option<&'a str> {\n    let key = format!(\"\\\"{key}\\\"\");\n    let key_start = json.find(&key)? + key.len();\n    let value_start = json[key_start..].find(':')? + key_start + 1;\n    Some(json[value_start..].trim_start())\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\env_wins.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpGFa4NA\\append"
+      ],
+      "expect_exit": 0,
+      "exit": 1,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "env_wins failed",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

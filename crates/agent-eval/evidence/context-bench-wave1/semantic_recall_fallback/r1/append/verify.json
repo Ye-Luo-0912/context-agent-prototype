@@ -1,0 +1,67 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall_fallback",
+  "expected_edit": "missing user returns anonymous, never lookup(id)?",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/store.rs",
+      "pred": "contains",
+      "needles": [
+        "anonymous"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/store.rs",
+      "pred": "not_contains",
+      "needles": [
+        "lookup(id)?"
+      ],
+      "count": 0,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/store.rs",
+      "pred": "contains",
+      "needles": [
+        "cached_load"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/store.rs",
+      "exists": true,
+      "sha256": "2e0e750833cd49f6086659d29196ee998df06c222ecbb65ab2fbde1233f801d0",
+      "bytes": 509,
+      "truncated": false,
+      "body": "pub struct User {\n    pub id: String,\n}\n\npub fn normalize_id(id: &str) -> String {\n    id.trim().into()\n}\n\npub fn lookup(id: &str) -> Result<User, String> {\n    if id == \"missing\" {\n        return Err(\"not found\".into());\n    }\n    Ok(User { id: id.into() })\n}\n\npub fn load_user(id: &str) -> Result<User, String> {\n    let id = normalize_id(id);\n    Ok(lookup(&id).unwrap_or_else(|_| User {\n        id: \"anonymous\".into(),\n    }))\n}\n\npub fn cached_load(id: &str) -> Result<User, String> {\n    load_user(id)\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\fallback_anonymous.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpEFLqnp\\append"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

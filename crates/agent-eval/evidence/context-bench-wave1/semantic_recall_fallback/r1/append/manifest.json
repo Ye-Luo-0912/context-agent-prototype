@@ -1,0 +1,14 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "fixture_id": "semantic_recall_fallback",
+  "engine": "append",
+  "repeat": 1,
+  "repeats": 1,
+  "live": true,
+  "fixture_sha256": "10f9a5b3acc6d1f06ca8f5df8a3bf0eb0a21cce2275e77291bf9de01e55e902e",
+  "git_head": "89fbfbaba4549d484aa421590fae460df69644bd",
+  "git_dirty": true,
+  "git_dirty_sha256": "821493b01a567671e6f810822967571ca38d693644f4d6a443198d6b0e05476c",
+  "openai_model": "gpt-5.6-luna",
+  "openai_base_url": "https://api.pinaic.com/v1"
+}

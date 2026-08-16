@@ -1,0 +1,113 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "long_refactor",
+  "expected_edit": "verify + now + String expiry error",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/token.rs",
+      "pred": "contains",
+      "needles": [
+        "fn verify"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/token.rs",
+      "pred": "not_contains",
+      "needles": [
+        "fn parse"
+      ],
+      "count": 1,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "Token::verify"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/session.rs",
+      "pred": "contains",
+      "needles": [
+        "Token::verify"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "now"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/session.rs",
+      "pred": "contains",
+      "needles": [
+        "now"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/auth.rs",
+      "exists": true,
+      "sha256": "f26ebe7231de4f80e9652cbc477757b764f7f73b635bdc82ae28a5969c0d124f",
+      "bytes": 163,
+      "truncated": false,
+      "body": "use crate::token::Token;\r\n\r\npub fn login(raw: &str) -> Result<String, String> {\r\n    let token = Token::parse(raw)?;\r\n    Ok(format!(\"session:{}\", token.raw))\r\n}\r\n"
+    },
+    {
+      "path": "src/session.rs",
+      "exists": true,
+      "sha256": "0e7a114e5a0985aabc54227410b6dfc7a46716b6ab9994f912c090dfc2c626f0",
+      "bytes": 105,
+      "truncated": false,
+      "body": "use crate::token::Token;\r\n\r\npub fn bind(raw: &str) -> Result<Token, String> {\r\n    Token::parse(raw)\r\n}\r\n"
+    },
+    {
+      "path": "src/token.rs",
+      "exists": true,
+      "sha256": "61d40b4f8ce84806f945af09a237afedd97287a71fac819338eb1dd273ba2265",
+      "bytes": 250,
+      "truncated": false,
+      "body": "pub struct Token {\r\n    pub raw: String,\r\n}\r\n\r\nimpl Token {\r\n    pub fn parse(raw: &str) -> Result<Self, String> {\r\n        if raw.is_empty() {\r\n            return Err(\"empty\".into());\r\n        }\r\n        Ok(Self { raw: raw.to_string() })\r\n    }\r\n}\r\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\token_now.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpLoSEyH\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 1,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "token_now failed",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

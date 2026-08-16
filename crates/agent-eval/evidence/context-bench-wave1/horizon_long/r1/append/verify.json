@@ -1,0 +1,115 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content",
+  "fixture_id": "horizon_long",
+  "expected_edit": "rename parse to verify, expiry, format_token",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/token.rs",
+      "pred": "contains",
+      "needles": [
+        "fn verify"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/token.rs",
+      "pred": "not_contains",
+      "needles": [
+        "fn parse"
+      ],
+      "count": 0,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "Token::verify"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/session.rs",
+      "pred": "contains",
+      "needles": [
+        "Token::verify"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/token.rs",
+      "pred": "contains",
+      "needles": [
+        "expires_at"
+      ],
+      "count": 3,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/tests.rs",
+      "pred": "contains",
+      "needles": [
+        "expired"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "format_token"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/auth.rs",
+      "exists": true,
+      "sha256": "5775662e13c7efe2f6cbe510abab7bb9840756f99efea52cb858ceadac5ee40e",
+      "bytes": 179,
+      "truncated": false,
+      "body": "use crate::token::Token;\r\n\r\npub fn login(raw: &str, now: u64) -> Result<String, String> {\r\n    let token = Token::verify(raw, now)?;\r\n    Ok(format!(\"session:{}\", token.raw))\r\n}\r\n"
+    },
+    {
+      "path": "src/session.rs",
+      "exists": true,
+      "sha256": "85660ed63575a025b9de974902735f82685f122a15cc56c1fe9a030696bfa2c4",
+      "bytes": 121,
+      "truncated": false,
+      "body": "use crate::token::Token;\r\n\r\npub fn bind(raw: &str, now: u64) -> Result<Token, String> {\r\n    Token::verify(raw, now)\r\n}\r\n"
+    },
+    {
+      "path": "src/tests.rs",
+      "exists": true,
+      "sha256": "e60e957cc8291efe742f32cc77ca270113f6a5eef6d6f168cfe3b9e6593d7856",
+      "bytes": 186,
+      "truncated": false,
+      "body": "use crate::auth;\r\nuse crate::session;\r\n\r\npub fn test_login_ok() {\r\n    assert!(auth::login(\"abc\").is_ok());\r\n}\r\n\r\npub fn test_bind_ok() {\r\n    assert!(session::bind(\"abc\").is_ok());\r\n}\r\n"
+    },
+    {
+      "path": "src/token.rs",
+      "exists": true,
+      "sha256": "2905fbb2f6e26d95c215c434b8cbb704be94cb4fd16634718611ee0f88152e54",
+      "bytes": 452,
+      "truncated": false,
+      "body": "pub struct Token {\r\n    pub raw: String,\n    pub expires_at: u64,\r\n}\r\n\r\nimpl Token {\r\n    pub fn verify(raw: &str, now: u64) -> Result<Self, String> {\r\n        if raw.is_empty() {\r\n            return Err(\"empty\".into());\r\n        }\r\n        let token = Self {\n            raw: raw.to_string(),\n            expires_at: 9999,\n        };\n        if token.expires_at < now {\n            return Err(\"expired\".into());\n        }\n        Ok(token)\r\n    }\r\n}\r\n"
+    }
+  ],
+  "commands": []
+}

@@ -1,0 +1,67 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "supersession",
+  "expected_edit": "env APP_HOST/APP_PORT override defaults",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/config.rs",
+      "pred": "contains",
+      "needles": [
+        "APP_HOST"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/config.rs",
+      "pred": "contains",
+      "needles": [
+        "APP_PORT"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/config.rs",
+      "pred": "not_contains",
+      "needles": [
+        "serde_json"
+      ],
+      "count": 1,
+      "passed": false,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/config.rs",
+      "exists": true,
+      "sha256": "7a44cad8a7c4e38bbd760323164bde4ea434ddf5fce17c67de2f9003e82acbf0",
+      "bytes": 334,
+      "truncated": false,
+      "body": "use serde::Deserialize;\n\n#[derive(Debug, Deserialize)]\npub struct Config {\n    pub host: String,\n    pub port: u16,\n}\n\npub fn load_config() -> Config {\n    let contents = std::fs::read_to_string(\"config.json\")\n        .expect(\"failed to read config.json\");\n\n    serde_json::from_str(&contents).expect(\"failed to parse config.json\")\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\env_wins.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpGFa4NA\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 1,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "env_wins failed",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}
