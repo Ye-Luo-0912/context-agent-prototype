@@ -1,0 +1,47 @@
+{
+  "id": "horizon_short",
+  "scenario": "horizon",
+  "variant": "short",
+  "name": "Same auth rename, one user turn",
+  "seed": "authbox",
+  "include_rolling": false,
+  "target_rounds_lo": 3,
+  "target_rounds_hi": 5,
+  "expected_edit": "rename parse to verify and update callers",
+  "ops": [
+    {
+      "op": "user",
+      "text": "In this small Rust crate, rename Token::parse to Token::verify and update every caller in src/auth.rs, src/session.rs, and src/tests.rs. Do not add extra features."
+    }
+  ],
+  "hidden": [
+    {
+      "path": "src/token.rs",
+      "pred": "contains",
+      "needles": [
+        "fn verify"
+      ]
+    },
+    {
+      "path": "src/token.rs",
+      "pred": "not_contains",
+      "needles": [
+        "fn parse"
+      ]
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "Token::verify"
+      ]
+    },
+    {
+      "path": "src/session.rs",
+      "pred": "contains",
+      "needles": [
+        "Token::verify"
+      ]
+    }
+  ]
+}

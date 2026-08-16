@@ -1,0 +1,112 @@
+{
+  "id": "horizon_long",
+  "scenario": "horizon",
+  "variant": "long",
+  "name": "Same auth rename stretched across explore/test/edit turns",
+  "seed": "authbox",
+  "include_rolling": true,
+  "target_rounds_lo": 25,
+  "target_rounds_hi": 40,
+  "expected_edit": "rename parse to verify, expiry, format_token",
+  "ops": [
+    {
+      "op": "user",
+      "text": "Rename Token::parse to Token::verify in src/token.rs only. Leave callers broken for now."
+    },
+    {
+      "op": "user",
+      "text": "Update src/auth.rs so login uses Token::verify."
+    },
+    {
+      "op": "user",
+      "text": "Update src/session.rs so bind uses Token::verify."
+    },
+    {
+      "op": "user",
+      "text": "Fix src/tests.rs to compile against verify."
+    },
+    {
+      "op": "user",
+      "text": "Add an expires_at: u64 field on Token. Existing tokens expire at 9999."
+    },
+    {
+      "op": "user",
+      "text": "verify must take now: u64 and return Err(\"expired\") when expires_at < now. Keep the error type as String."
+    },
+    {
+      "op": "user",
+      "text": "Thread now through auth::login and session::bind."
+    },
+    {
+      "op": "user",
+      "text": "Add a test_expired_is_string_error in src/tests.rs."
+    },
+    {
+      "op": "user",
+      "text": "Session must not persist an expired token."
+    },
+    {
+      "op": "user",
+      "text": "Add auth::format_token that logs only the token length, never the raw bytes."
+    },
+    {
+      "op": "user",
+      "text": "Do not log raw token bytes anywhere."
+    },
+    {
+      "op": "user",
+      "text": "Final pass: every caller compiles, expiry is a String error, format_token exists."
+    }
+  ],
+  "hidden": [
+    {
+      "path": "src/token.rs",
+      "pred": "contains",
+      "needles": [
+        "fn verify"
+      ]
+    },
+    {
+      "path": "src/token.rs",
+      "pred": "not_contains",
+      "needles": [
+        "fn parse"
+      ]
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "Token::verify"
+      ]
+    },
+    {
+      "path": "src/session.rs",
+      "pred": "contains",
+      "needles": [
+        "Token::verify"
+      ]
+    },
+    {
+      "path": "src/token.rs",
+      "pred": "contains",
+      "needles": [
+        "expires_at"
+      ]
+    },
+    {
+      "path": "src/tests.rs",
+      "pred": "contains",
+      "needles": [
+        "expired"
+      ]
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "format_token"
+      ]
+    }
+  ]
+}

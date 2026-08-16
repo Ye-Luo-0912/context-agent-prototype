@@ -1,0 +1,95 @@
+{
+  "id": "long_refactor_relitigate",
+  "scenario": "refactor",
+  "variant": "relitigate",
+  "name": "Same refactor plus a second constraint after the first lands",
+  "seed": "authbox",
+  "include_rolling": false,
+  "target_rounds_lo": 15,
+  "target_rounds_hi": 25,
+  "expected_edit": "verify + expiry + format_token",
+  "ops": [
+    {
+      "op": "user",
+      "text": "Change the Token interface: parse becomes verify(raw, now). Update token.rs."
+    },
+    {
+      "op": "user",
+      "text": "Update every caller of Token::parse."
+    },
+    {
+      "op": "user",
+      "text": "The tests fail because they still call parse. Fix src/tests.rs."
+    },
+    {
+      "op": "user",
+      "text": "Add expires_at and reject expired tokens with a String error."
+    },
+    {
+      "op": "user",
+      "text": "Re-run the tests mentally and keep String errors. Do not switch to a custom error enum."
+    },
+    {
+      "op": "user",
+      "text": "New constraint: add format_token and never log raw token bytes."
+    }
+  ],
+  "hidden": [
+    {
+      "path": "src/token.rs",
+      "pred": "contains",
+      "needles": [
+        "fn verify"
+      ]
+    },
+    {
+      "path": "src/token.rs",
+      "pred": "not_contains",
+      "needles": [
+        "fn parse"
+      ]
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "Token::verify"
+      ]
+    },
+    {
+      "path": "src/session.rs",
+      "pred": "contains",
+      "needles": [
+        "Token::verify"
+      ]
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "now"
+      ]
+    },
+    {
+      "path": "src/session.rs",
+      "pred": "contains",
+      "needles": [
+        "now"
+      ]
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "format_token"
+      ]
+    },
+    {
+      "path": "src/token.rs",
+      "pred": "contains",
+      "needles": [
+        "expires_at"
+      ]
+    }
+  ]
+}

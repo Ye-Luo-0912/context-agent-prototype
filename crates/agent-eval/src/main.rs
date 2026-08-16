@@ -12,6 +12,7 @@
 mod acceptance;
 mod analysis;
 mod bundle;
+mod context_bench;
 mod driver;
 mod envfile;
 mod fixture_driver;
@@ -136,7 +137,16 @@ fn usage() -> ! {
          \n\
          Engine-only retrieval baseline: GC-externalize unique facts, then\n\
          measure search recall/latency and graded access stamps. Not the\n\
-         paired real-model coding gate.\n"
+         paired real-model coding gate.\n\
+         \n\
+         usage: agent-eval --context-bench\n\
+         usage: agent-eval [--repeats N] [--evidence-dir <dir>] --context-bench-run [id]\n\
+         \n\
+         EVAL-02 Context Benchmark: 12 tasks that ask where dynamic context\n\
+         helps or hurts a coding agent. --context-bench prints the pack.\n\
+         --context-bench-run is live A/C (rolling only on horizon_long,\n\
+         semantic_recall, task_switch). Wave 1 is 24+3 cells at repeats=1.\n\
+         This does not close M15 and does not open the 300×3 ITT gate.\n"
     );
     std::process::exit(2);
 }
@@ -360,6 +370,17 @@ async fn main() -> anyhow::Result<()> {
                 print!("{}", retrieval::render_retrieval(&report));
                 return Ok(());
             }
+            "--context-bench" => {
+                let pack = context_bench::load_pack()?;
+                print!("{}", context_bench::render_pack(&pack));
+                print!("{}", context_bench::check_pack(&pack)?);
+                return Ok(());
+            }
+            "--context-bench-run" => {
+                let only = args.next().filter(|value| !value.starts_with('-'));
+                run_context_bench_live(only, repeats, evidence_dir).await?;
+                return Ok(());
+            }
             "--all" => engines = vec!["append", "rolling", "dynamic"],
             "--engine" => {
                 let Some(value) = args.next() else {
@@ -552,6 +573,58 @@ async fn run_pilot_live(
         "pilot cells written under {}. --pilot-calibrate that directory; decision=pilot.",
         evidence_root.display()
     );
+    Ok(())
+}
+
+async fn run_context_bench_live(
+    only_id: Option<String>,
+    repeats: u32,
+    evidence_dir: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    let pack = context_bench::load_pack()?;
+    let model = driver::build_live_coding_model()?;
+    let evidence_root = evidence_dir.unwrap_or_else(default_evidence_dir);
+    std::fs::create_dir_all(&evidence_root)?;
+    eprintln!("evidence dir: {}", evidence_root.display());
+    let tasks: Vec<&context_bench::BenchTask> = pack
+        .tasks
+        .iter()
+        .filter(|task| only_id.as_ref().is_none_or(|id| task.id() == id))
+        .collect();
+    if tasks.is_empty() {
+        anyhow::bail!(
+            "no context-bench task matches {:?} (see --context-bench)",
+            only_id
+        );
+    }
+    for task in tasks {
+        for round in 1..=repeats {
+            eprintln!(
+                "== context-bench {} engines={:?} repeat {round}/{repeats} ==",
+                task.id(),
+                fixture_driver::bench_arm_order(task, round)
+            );
+            let dir = tempfile::tempdir()?;
+            let pair = bundle::PairSink {
+                root: evidence_root.clone(),
+                fixture_id: task.id().to_string(),
+                repeat: round,
+                repeats,
+                live: true,
+            };
+            let runs = fixture_driver::compare_bench_live(
+                &pack,
+                task,
+                dir.path(),
+                model.clone(),
+                Some(&pair),
+            )
+            .await?;
+            print!("{}", fixture_driver::render_live_comparison(&runs));
+            let pair_dir = pair.root.join(task.id()).join(format!("r{round}"));
+            print!("{}", bundle::render_evidence(&pair_dir)?);
+        }
+    }
     Ok(())
 }
 

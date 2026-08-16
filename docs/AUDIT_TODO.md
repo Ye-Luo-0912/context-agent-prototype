@@ -1770,6 +1770,28 @@ Required closure:
    (overlay + commands; SWE-bench docker opt-in). Do not bind the cheap
    CI path to `python`/`cargo` or exec model-written files. Do not amend n.
 
+### EVAL-02 — Context Benchmark is the current M15 decision instrument
+
+Confirmed 2026-08-16:
+
+- the 30-task / 300×3 SWE-bench question (“can the agent fix random bugs?”)
+  is the wrong instrument for whether C is worth continuing;
+- M15 should report per-scenario cost, residency, forgotten/recovered
+  attribution and a likely optimization target, not a success-rate LCL.
+
+Landed 2026-08-16:
+
+- schema `agent-eval.context-bench.v1` (independent of analysis.v2; not
+  hash-frozen yet);
+- 12-task pack under `crates/agent-eval/context-bench/`;
+- `--context-bench` / `--context-bench-run`; rolling only on
+  `horizon_long`, `semantic_recall`, `task_switch`;
+- recovery metrics split (explicit search / auto reactivation /
+  workspace reread / failed);
+- driver `TurnOp` includes Suspend / Activate / Complete.
+  Do not implement ResumePoint from this item. Do not retune scoring.
+  Do not collect 300×3 cells. Do not run live unless asked.
+
 Until closure, M15, V2, learned/vector policy and PLAT-08 evidence gates stay
 closed. M12/M13 remain independent trusted-execution blockers.
 

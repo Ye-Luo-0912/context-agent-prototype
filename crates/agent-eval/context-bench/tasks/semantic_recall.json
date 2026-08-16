@@ -1,0 +1,82 @@
+{
+  "id": "semantic_recall",
+  "scenario": "semantic",
+  "variant": "wire",
+  "name": "Verbal wire-compat constraint, then a v2 change",
+  "seed": "protocol",
+  "include_rolling": true,
+  "target_rounds_lo": 10,
+  "target_rounds_hi": 20,
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "ops": [
+    {
+      "op": "user",
+      "text": "Important constraint that must not be written into any file comments: old clients send an unversioned ping body and must keep working. Do not mention this constraint in source."
+    },
+    {
+      "op": "user",
+      "text": "Read src/protocol.rs and summarize the current message types."
+    },
+    {
+      "op": "user",
+      "text": "Add a unit-style comment-free helper encode roundtrip for Ping."
+    },
+    {
+      "op": "user",
+      "text": "List possible v2 fields you might add. Do not add them yet."
+    },
+    {
+      "op": "user",
+      "text": "Sketch how a Hello message could look. Still no v2 in code."
+    },
+    {
+      "op": "user",
+      "text": "Add logging around decode errors without changing the grammar."
+    },
+    {
+      "op": "user",
+      "text": "Clean up any unused notes. Keep Ping working."
+    },
+    {
+      "op": "user",
+      "text": "Now add v2: Msg::Hello(String) with an explicit v:2 envelope."
+    },
+    {
+      "op": "user",
+      "text": "decode must still accept the original unversioned ping body."
+    },
+    {
+      "op": "user",
+      "text": "Final check: v2 Hello exists and unversioned ping still decodes."
+    }
+  ],
+  "hidden": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ]
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ]
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "decode_v1"
+      ]
+    }
+  ],
+  "hidden_commands": [
+    {
+      "name": "wire_v1",
+      "script": "wire_v1.py"
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+{
+  "id": "task_switch_long_b",
+  "scenario": "task_switch",
+  "variant": "long_b",
+  "name": "Same switch with a longer billing interrupt",
+  "seed": "switch",
+  "include_rolling": false,
+  "target_rounds_lo": 16,
+  "target_rounds_hi": 28,
+  "expected_edit": "auth rate_limit + operator; billing index fix after a long B",
+  "ops": [
+    {
+      "op": "user",
+      "text": "Task A: allow operator in src/auth.rs and add rate_limit -> 30."
+    },
+    {
+      "op": "suspend"
+    },
+    {
+      "op": "user",
+      "text": "Task B: inspect src/billing.rs. Do not fix yet."
+    },
+    {
+      "op": "user",
+      "text": "Task B: explain the off-by-one in words, still no edit."
+    },
+    {
+      "op": "user",
+      "text": "Task B: now fix items[i + 1] to items[i]."
+    },
+    {
+      "op": "user",
+      "text": "Task B: add a trivial comment-free second loop pass that also uses items[i]."
+    },
+    {
+      "op": "user",
+      "text": "Task B: remove that second pass if it duplicates work; keep the fix."
+    },
+    {
+      "op": "activate",
+      "slot": "first"
+    },
+    {
+      "op": "user",
+      "text": "Resume A: operator + rate_limit must still be present."
+    }
+  ],
+  "hidden": [
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "operator"
+      ]
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "rate_limit"
+      ]
+    },
+    {
+      "path": "src/billing.rs",
+      "pred": "not_contains",
+      "needles": [
+        "items[i + 1]"
+      ]
+    }
+  ]
+}

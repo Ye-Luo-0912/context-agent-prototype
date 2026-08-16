@@ -8,21 +8,23 @@
 //! model replaces only the `ScriptedModel`; the workspace, tool surface,
 //! verification and accounting stay.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_contracts::{
     AgentResult, ApprovalDecision, ApprovalGate, ContextEngine, ContextHints, ContextKind,
-    ContextQuery, ModelTransport, RuntimeEvent, RuntimeEventEnvelope, ToolCall, ToolDispatcher,
-    ToolSpec, tokens,
+    ContextQuery, ModelTransport, RuntimeEvent, RuntimeEventEnvelope, TaskId, ToolCall,
+    ToolDispatcher, ToolSpec, tokens,
 };
-use agent_runtime::RuntimeHandle;
+use agent_runtime::{RuntimeHandle, TaskStatus};
 use context_baselines::{RollingConfig, RollingSummaryEngine};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 use serde_json::json;
 use tokio::sync::broadcast;
 
+use crate::context_bench::{self, BenchPack, BenchTask, TurnOp};
 use crate::{bundle, harvest, metrics, mock_model::ScriptedModel, suite, workload};
 
 /// 脚本化 fixture：事件之间最多等这么久（本机工具面，不该接近这个上限）。
@@ -719,6 +721,22 @@ async fn run_workspace_session(
     turns: &[&str],
     limits: TurnLimits,
 ) -> anyhow::Result<WorkspaceSession> {
+    let ops: Vec<TurnOp> = turns
+        .iter()
+        .map(|text| TurnOp::User {
+            text: (*text).to_string(),
+        })
+        .collect();
+    run_workspace_session_ops(workspace_root, model, context_engine, &ops, limits).await
+}
+
+async fn run_workspace_session_ops(
+    workspace_root: &Path,
+    model: Arc<dyn ModelTransport>,
+    context_engine: Arc<dyn ContextEngine>,
+    ops: &[TurnOp],
+    limits: TurnLimits,
+) -> anyhow::Result<WorkspaceSession> {
     let started = Instant::now();
     let approval: Arc<dyn ApprovalGate> = Arc::new(AllowAllGate);
 
@@ -761,12 +779,49 @@ async fn run_workspace_session(
 
     let mut capture = EventCapture::default();
     let mut error = None;
-    for (index, turn) in turns.iter().enumerate() {
-        composed.handle().user_message(turn.to_string()).await?;
-        if let Err(reason) =
-            wait_for_turn(&mut events, &mut capture, composed.handle(), limits).await
-        {
-            error = Some(format!("turn {} failed: {reason}", index + 1));
+    let mut slots: HashMap<String, TaskId> = HashMap::new();
+    for (index, op) in ops.iter().enumerate() {
+        let result = match op {
+            TurnOp::User { text } => {
+                composed.handle().user_message(text.clone()).await?;
+                let waited =
+                    wait_for_turn(&mut events, &mut capture, composed.handle(), limits).await;
+                if waited.is_ok()
+                    && !slots.contains_key("first")
+                    && let Ok(tasks) = composed.handle().list_tasks().await
+                    && let Some(task) = tasks
+                        .into_iter()
+                        .find(|task| task.status == TaskStatus::Active)
+                {
+                    slots.insert("first".into(), task.id);
+                    slots.insert("A".into(), task.id);
+                }
+                waited
+            }
+            TurnOp::Suspend => composed
+                .handle()
+                .suspend_task()
+                .await
+                .map_err(|err| err.to_string()),
+            TurnOp::Activate { slot } => {
+                let Some(task_id) = slots.get(slot).copied() else {
+                    error = Some(format!("op {} activate: unknown slot {slot}", index + 1));
+                    break;
+                };
+                composed
+                    .handle()
+                    .activate_task(task_id)
+                    .await
+                    .map_err(|err| err.to_string())
+            }
+            TurnOp::Complete { summary } => composed
+                .handle()
+                .complete_current_task(summary.clone().unwrap_or_else(|| "done".into()))
+                .await
+                .map_err(|err| err.to_string()),
+        };
+        if let Err(reason) = result {
+            error = Some(format!("op {} failed: {reason}", index + 1));
             break;
         }
     }
@@ -856,6 +911,104 @@ async fn wait_for_turn(
     }
 }
 
+pub fn bench_arm_order(task: &BenchTask, repeat: u32) -> Vec<&'static str> {
+    crate::analysis::arm_order(task.id(), repeat)
+        .into_iter()
+        .filter(|name| task.include_rolling() || *name != "rolling")
+        .collect()
+}
+
+/// Live Context Bench cell: staged TurnOps, hidden checks outside the seed.
+pub async fn compare_bench_live(
+    pack: &BenchPack,
+    task: &BenchTask,
+    workspace_root: &Path,
+    model: Arc<dyn ModelTransport>,
+    pair: Option<&bundle::PairSink>,
+) -> anyhow::Result<Vec<EngineRun>> {
+    let limits = LIVE_LIMITS;
+    let repeat = pair.map(|p| p.repeat).unwrap_or(1);
+    let order = bench_arm_order(task, repeat);
+    let mut runs = Vec::new();
+    for &name in &order {
+        let engine = named_engine(name, Some(model.clone()))?;
+        let root = workspace_root.join(name);
+        std::fs::create_dir_all(&root)?;
+        context_bench::seed_task(pack, task, &root)?;
+        suite::ensure_workspace_git(&root)?;
+        let eval = run_bench_with_engine(
+            pack,
+            task,
+            &root,
+            model.clone(),
+            engine.clone(),
+            limits,
+            name,
+            pair,
+        )
+        .await?;
+        let manager_tokens = manager_token_cost(engine.as_ref()).await?;
+        runs.push(EngineRun {
+            engine: name,
+            eval,
+            manager_tokens,
+        });
+    }
+    if let Some(pair) = pair {
+        bundle::write_pair_with_schema(pair, &order, context_bench::SCHEMA)?;
+    }
+    Ok(runs)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_bench_with_engine(
+    pack: &BenchPack,
+    task: &BenchTask,
+    workspace_root: &Path,
+    model: Arc<dyn ModelTransport>,
+    context_engine: Arc<dyn ContextEngine>,
+    limits: TurnLimits,
+    engine: &'static str,
+    pair: Option<&bundle::PairSink>,
+) -> anyhow::Result<FixtureEval> {
+    let session = run_workspace_session_ops(
+        workspace_root,
+        model,
+        context_engine,
+        &task.file.ops,
+        limits,
+    )
+    .await?;
+    let report = context_bench::evaluate_task(pack, task, workspace_root);
+    let passed = session.error.is_none() && report.passed;
+    let eval = FixtureEval {
+        fixture_id: task.id().to_string(),
+        passed,
+        metrics: metrics::aggregate_metrics(&session.events),
+        wall_ms: session.wall_ms,
+        error: session.error.clone(),
+    };
+    if let Some(pair) = pair {
+        bundle::write_cell_parts(
+            &pair.cell_dir(engine),
+            task.id(),
+            &context_bench::task_sha256(task),
+            engine,
+            pair,
+            &session.events,
+            &eval.metrics,
+            eval.passed,
+            eval.wall_ms,
+            eval.error.as_deref(),
+            workspace_root,
+            session.lagged,
+            session.deltas_omitted,
+            &report,
+        )?;
+    }
+    Ok(eval)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,6 +1019,68 @@ mod tests {
         assert_eq!(LIVE_MAX_MODEL_ROUNDS, 48);
         assert_eq!(LIVE_LIMITS.max_model_rounds, Some(48));
         assert_eq!(SCRIPTED_LIMITS.max_model_rounds, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn suspend_and_activate_ops_complete_without_a_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "x").unwrap();
+        let ops = vec![
+            TurnOp::User {
+                text: "Task A: say hello".into(),
+            },
+            TurnOp::Suspend,
+            TurnOp::User {
+                text: "Task B: say world".into(),
+            },
+            TurnOp::Activate {
+                slot: "first".into(),
+            },
+            TurnOp::User {
+                text: "Back on A".into(),
+            },
+        ];
+        let model = Arc::new(ScriptedModel::new(Vec::new(), "ok"));
+        let engine = named_engine("append", None).unwrap();
+        let session = run_workspace_session_ops(dir.path(), model, engine, &ops, SCRIPTED_LIMITS)
+            .await
+            .unwrap();
+        assert!(session.error.is_none(), "{:?}", session.error);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_bench_task_ops_complete_without_a_provider() {
+        let pack = context_bench::load_pack().expect("context-bench pack");
+        for task in &pack.tasks {
+            let dir = tempfile::tempdir().unwrap();
+            context_bench::seed_task(&pack, task, dir.path()).unwrap();
+            suite::ensure_workspace_git(dir.path()).unwrap();
+            let model = Arc::new(ScriptedModel::new(Vec::new(), "ok"));
+            let engine = named_engine("append", None).unwrap();
+            let session = run_workspace_session_ops(
+                dir.path(),
+                model,
+                engine,
+                &task.file.ops,
+                SCRIPTED_LIMITS,
+            )
+            .await
+            .unwrap();
+            assert!(
+                session.error.is_none(),
+                "{} ops failed: {:?}",
+                task.id(),
+                session.error
+            );
+            assert!(
+                session
+                    .events
+                    .iter()
+                    .any(|envelope| { matches!(envelope.event, RuntimeEvent::TurnCompleted) }),
+                "{} produced no TurnCompleted",
+                task.id()
+            );
+        }
     }
 
     #[tokio::test]

@@ -1138,7 +1138,7 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 | M12 Effect Runtime | 🟡 staged-effect baseline | Trusted prepared effects commit behind the Core-owned authority-epoch/lease fence (`CORE-01`); stale dispatch and commit are rejected, and cancellation advances the fence before awaiting cleanup. Non-empty process-capability wire effects currently fail closed before staging pending PLAT actual-intent/recovery proof, and cancellation kills owned process trees (`CORE-06`). Generic `shell.exec` / `process.run` execute before completion and may already mutate the world, so they remain bounded, separately authorized non-transactional exceptions—not proof that every side effect uses one commit path. |
 | M13 Extension Sandbox | 🟡 partial | Env scrub, private cwd, bounded stderr, process-tree cancellation, Windows Job-Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE), Unix rlimits (CPU/process) and directory-handle-relative workspace opens with reparse substitution rejected at open time (`CORE-07`) are enforced. Mid-invoke filesystem access is now brokered: a child's `fs.read` system request is answered only under the invocation's `workspace:read` grant, only through a confined workspace handle, and only for relative non-escaping paths (absolute/rooted and `..` paths refused before the handle is consulted); network is explicitly deny-by-default (no network permission word exists; recognized network ops get a named refusal). OS-level *write* filtering is now kernel-enforced on Linux (landlock, `MOD-06`): a confined child may create/modify/destroy filesystem state only under its configured write roots, irrevocably and inherited by every descendant, verified on a real kernel. OS-level *network* filtering (sockets) remains the residual gap (`CORE-01` open). |
 | M14 Resource Policy | ✅ | Schema/context quotas, risk/permission validation and final output guards exist; the narrow standing `TaskExecutionPolicy` is landed (`CORE-08`: effect + target + constraint + expiry grants, revocable, zero-responder deny/skip); the kernel-level trusted output broker is landed (`CORE-04`: capped fields, one-time artifact spill, execution-enforced query limits); a declared per-tool output budget on `ToolSpec` is enforced by the broker (clamped to the global hard cap); approval is now effect-derived: `EffectIntent` (contract type) is derived from the validated arguments and standing grants match the concrete intent (path, content bytes, command prefix) instead of re-parsing raw arguments; commit-time resource enforcement is landed (`AuthorityLease`: every side-effecting call mints a short-lived lease at approval, and Core refuses stale-epoch or expired-lease commits — rollback, never commit); and every meta-tool surface is bounded by logical history size, not by it: diagnostics answers in O(1) (Cold/External counts), `inspect` and `search` keep only their limit of rows while streaming (memory O(limit)), and the ledger is capped. The acceptance — the LLM cannot exhaust runtime resources through meta-tools — is met. |
-| M15 Real Evaluation | 🧪 live paired harness landed; gate open | Replay is a policy proxy. Default live `agent-eval` is still the no-tool retention smoke. `--compare-live` is the live paired coding harness, not a 300×3 result. Replay scenarios emit turn-boundary `ContextGc` like the actor: C Resident bytes on heavy traces are a fraction of A (`long_refactor` 69 332 → 4 298). Active-task latest-file-body policy makes `long_refactor` required facts **4/4**; scoring stays frozen. Live cells now write versioned evidence bundles (EVAL-01.1) with replayable file-content hidden asserts (EVAL-01.1b). EVAL-01.2 freezes the clustered C−A estimator; EVAL-01.3 re-freezes the gate at 300×3 / −5 pp. EVAL-01.3b freezes the 509-task suite in SPEC (`SUITE_FROZEN=true`) and declares retrieval secondaries; n/margin unchanged. EVAL-01.3c locks the exact 300 acceptance ids (not any ≥300 subset) and honors `cost_eligible` in token diagnostics. EVAL-01.5 freezes the 30-task calibration sample; a file-only 9×3 live spend exists (`decision=pilot`). EVAL-01.5.p1 splits send vs pack and raises the shared live round cap to 48; remaining P0 SWE-bench is skipped. EVAL-01.5.p1b lands the shared model-backed bounded compactor for live B and C `TaskCompleted` distillation (CI scripted digest remains). EVAL-01.5.p1c lands catalog-wide search/inspect and strips retrieval tutorials from the coding prompt; extra C rounds are still a treatment effect. P1 n=1 file-only + recall is collected (`rehydration-diag`); a P1 SWE-bench n=1 cohort is the next spend. The non-inferiority gate remains open. |
+| M15 Real Evaluation | 🧪 Context Bench is the current decision instrument; 300×3 parked | The question is where dynamic context helps or hurts a coding agent, not whether the agent can fix random bugs. `agent-eval --context-bench` is 12 tasks × A/C (rolling only on three mechanism tasks). Replay remains a policy proxy. The frozen analysis.v2 300×3 ITT gate is unchanged and parked until this bench says C is worth continuing. Do not mix P0/P1 ITT tables. Do not close M15 from the 30-task pilot. |
 | V2 Self-Iteration | 🔒 blocked | Registry maturity and sandboxed self-checks are foundations only. Autonomous generation/promotion stays disabled until M12/M13/M15 close and the `PLAT-00..04` containment/protocol/recovery boundary is proven. |
 
 The milestone dependency remains M10 → M11 → M12 → M13 → M14 → M15 → V2;
@@ -1260,19 +1260,15 @@ the required gate order; the numbered list and table above are authoritative.
    a failed tool result. The named M14 acceptance is closed; further typed
    policy evolution belongs to Platform Protocol/M13 hardening rather than
    reopening this milestone.
-6. **V1-M15 Real Evaluation** — coding workload A/B/C + lifecycle metrics.
-   Acceptance: the dynamic runtime saves tokens without lowering task
-   success rate. 🧪 The deterministic fixture harness and the
-   cross-engine comparison are landed (`agent-eval --fixture <id>` /
-   `--fixture-live <id>` / `--compare-arm <id>` / `--compare-live <id>`):
-   on the same real builtin tool surface and the same five-turn scripted
-   model, every engine passes the fixture's hidden verification while
-   dynamic feeds the model measurably fewer input tokens than append-only
-   and rolling-summary (current scripted `fix_off_by_one`: append 13 761,
-   rolling 13 407, dynamic 12 744 model input tokens; dynamic is the only
-   engine that performs lifecycle maintenance). `--compare-live` is the
-   real-model pairing harness; durable per-cell evidence, an independently
-   frozen task suite and a 300×3 non-inferiority result remain unmeasured.
+6. **V1-M15 Real Evaluation** — Context Bench is the current decision
+   instrument: where dynamic context helps or hurts a coding agent.
+   `agent-eval --context-bench` is 12 tasks × A/C (rolling only on
+   `horizon_long` / `semantic_recall` / `task_switch`; 27 cells at
+   repeats=1). Replay remains a policy proxy. The fixture harness
+   (`--fixture` / `--compare-arm` / `--compare-live`) is landed smoke.
+   The frozen analysis.v2 300×3 ITT gate is unchanged and parked until
+   this bench says C is worth continuing. Do not mix P0/P1 ITT tables.
+   Do not close M15 from the 30-task pilot.
 7. **V2 Self-Iteration** — generate → sandbox → test → replay → evaluate →
    canary → stable. The LLM grows capabilities, but cannot modify the
    evaluation or permission Core. 🔒 Blocked; only prerequisite scaffolding
@@ -1402,7 +1398,9 @@ be used to declare the Platform or sandbox gates complete.
    policy (2026-08-14) keeps `fn handle_21()` in view on `long_refactor`
    (4/4 required) without regrowing Resident bytes or leaking forbidden
    facts. Scoring stays frozen. Materialize p50/p95 and store I/O are recorded.
-10. **Run the real gate (M15).** First make the experiment auditable: every
+10. **Run the real gate (M15).** Current work is EVAL-02 Context Bench
+   (`--context-bench` / `--context-bench-run`), not 300×3 collection.
+   First make the experiment auditable: every
    intended cell writes a versioned manifest, complete gap-checked event
    trace, usage-completeness status, final workspace diff/hash, hidden-test
    evidence and machine-readable summary. **EVAL-01.1 (2026-08-14):** live
@@ -1694,13 +1692,22 @@ cannot smuggle a hostile child through: brokered filesystem reads and
 network requests are permission-gated at the adapter. See
 `CORE-04`, `CORE-08`, `CTX-07` and `CTX-09`.
 
-## V1-M15 Real Evaluation 🧪 (replay, fixture harness and live smoke)
+## V1-M15 Real Evaluation 🧪 (Context Bench current; 300×3 parked)
+
+The current decision instrument is the Context Benchmark
+(`agent-eval --context-bench`, pack `crates/agent-eval/context-bench/`):
+12 coding tasks that report per-scenario cost, residency, forgotten/
+recovered attribution and a likely optimization target — not a
+success-rate LCL. Replay and the five smoke fixtures remain
+policy/harness proxies. The frozen `agent-eval.analysis.v2` 300×3 ITT
+gate is unchanged and parked until this bench says C is worth
+continuing. Do not close M15 from the 30-task pilot.
 
 The evaluation infrastructure has useful deterministic policy comparisons,
 and real-model paired smoke runs have exercised the real tool surface. The
-named real-coding acceptance is still incomplete because the sample is tiny,
-the cells are not preserved as independently auditable evidence, and no
-predeclared non-inferiority interval has been computed.
+named real-coding acceptance is still incomplete because Context Bench live
+cells have not been collected, and the parked 300×3 non-inferiority
+interval has not been computed.
 
 - **Harness.** `agent-replay` replays each scripted workload through the
   three engines (A append-only / B rolling-summary / C dynamic) under a
@@ -1792,6 +1799,14 @@ turn commit with the round's reported input/output tokens).
   eighteen turns of unrelated noise, then a question only answerable from
   what the context frame retained. Useful long-context smoke, not a coding
   workload.
+- **Context Benchmark (`--context-bench` / `--context-bench-run`).**
+  EVAL-02 is the current M15 instrument: 12 tasks × A/C (rolling only on
+  `horizon_long` / `semantic_recall` / `task_switch`). `--context-bench`
+  prints the pack and self-checks seed vs golden file asserts.
+  `--context-bench-run` writes the existing pair evidence layout plus a
+  per-scenario why report (`--show-evidence` recognizes
+  `agent-eval.context-bench.v1`). Do not run live unless asked. Do not
+  freeze the bench SPEC hash until pack and report fields are CI-stable.
 - Measured (2026-08-10, 20 turns, real model): all three engines pass
   (A/B/C each answer both facts correctly), and C costs **22% less
   input tokens than A** (133,249 vs 170,240; B 169,778). The gap is

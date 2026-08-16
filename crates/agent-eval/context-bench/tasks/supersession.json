@@ -1,0 +1,52 @@
+{
+  "id": "supersession",
+  "scenario": "supersession",
+  "variant": "clean",
+  "name": "JSON then TOML then env-first config",
+  "seed": "config",
+  "include_rolling": false,
+  "target_rounds_lo": 8,
+  "target_rounds_hi": 16,
+  "expected_edit": "env APP_HOST/APP_PORT override defaults",
+  "ops": [
+    {
+      "op": "user",
+      "text": "Load config from JSON in config.json."
+    },
+    {
+      "op": "user",
+      "text": "Switch the on-disk format plan to TOML. You may keep defaults in code."
+    },
+    {
+      "op": "user",
+      "text": "TOML stays the file format, but environment variables must win."
+    },
+    {
+      "op": "user",
+      "text": "Implement load_config with APP_HOST and APP_PORT, defaulting to 127.0.0.1:8080."
+    }
+  ],
+  "hidden": [
+    {
+      "path": "src/config.rs",
+      "pred": "contains",
+      "needles": [
+        "APP_HOST"
+      ]
+    },
+    {
+      "path": "src/config.rs",
+      "pred": "contains",
+      "needles": [
+        "APP_PORT"
+      ]
+    },
+    {
+      "path": "src/config.rs",
+      "pred": "not_contains",
+      "needles": [
+        "serde_json"
+      ]
+    }
+  ]
+}

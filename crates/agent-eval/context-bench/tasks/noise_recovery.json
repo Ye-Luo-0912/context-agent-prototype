@@ -1,0 +1,48 @@
+{
+  "id": "noise_recovery",
+  "scenario": "noise",
+  "variant": "once",
+  "name": "Huge unrelated logs plus two real errors",
+  "seed": "noise",
+  "include_rolling": false,
+  "target_rounds_lo": 6,
+  "target_rounds_hi": 16,
+  "expected_edit": "fix items[i + 1] in visit_all",
+  "ops": [
+    {
+      "op": "user",
+      "text": "Run through src/dump.rs noisy_log output in your head. Ignore unrelated chatter."
+    },
+    {
+      "op": "user",
+      "text": "There are two real errors about visit_all / items[i + 1]. Fix src/parse.rs."
+    },
+    {
+      "op": "user",
+      "text": "Do not delete dump.rs. Keep the noisy helper."
+    }
+  ],
+  "hidden": [
+    {
+      "path": "src/parse.rs",
+      "pred": "contains",
+      "needles": [
+        "items[i]"
+      ]
+    },
+    {
+      "path": "src/parse.rs",
+      "pred": "not_contains",
+      "needles": [
+        "items[i + 1]"
+      ]
+    },
+    {
+      "path": "src/dump.rs",
+      "pred": "contains",
+      "needles": [
+        "unrelated compiler chatter"
+      ]
+    }
+  ]
+}

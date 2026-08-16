@@ -5,7 +5,12 @@
 The central hypothesis of this prototype is that a continuously maintained,
 task-focused working set (policy C) can beat classic baselines on long coding
 tasks. The current experiment is a deterministic, coding-shaped policy replay;
-it is not yet the real coding-workload acceptance test:
+it is **not** the M15 decision instrument. That instrument is the Context
+Benchmark (`agent-eval --context-bench`, pack
+`crates/agent-eval/context-bench/`): 12 live coding tasks that ask where
+dynamic context helps or hurts. Replay still proves policy on scripted
+events (`long_refactor`, `superseded_decisions`, `task_switch_and_return`,
+`high_volume_irrelevant_output`). The frozen 300×3 ITT gate stays parked.
 
 - **A — append-only**: every message and tool result is resent every model
   turn until the *send* window forces a trim. Live P1 does not starve A
@@ -27,12 +32,9 @@ replayed through all three `ContextEngine` implementations and measured with
 the same token estimator (`ascii/4 + non-ascii`, shared by all engines).
 
 This replay is one half of the evaluation story: the deterministic coding
-fixtures that drive the real builtin tool surface (four arms, hidden
-verification, event-derived cost accounting) live in `agent-eval` (`--fixtures`,
-`--fixture <id>`, `--compare-arm <id>`, `--compare-live <id>`,
-`--evidence-dir`, `--show-evidence`, `--preregister`, `--analyze-evidence`, `--metrics`; see `docs/ROADMAP.md` M15).
-The live paired coding path is now runnable and writes versioned cell
-bundles; it does not by itself close the 300×3 non-inferiority gate.
+fixtures that drive the real builtin tool surface live in `agent-eval`
+(`--fixtures`, `--compare-live`, `--context-bench`, `--preregister`; see
+`docs/ROADMAP.md` M15). Replay ≠ live Context Bench. Neither closes M15.
 
 ## 2. How to run
 
@@ -45,6 +47,10 @@ cargo run -p agent-replay -- --compare long_refactor
 
 # Completion-quality proxy: same comparison plus key-fact coverage
 cargo run -p agent-replay -- --facts
+
+# Context Bench pack + seed/golden self-check (no model). Do not run
+# --context-bench-run unless asked; that is live A/C.
+cargo run -p agent-eval -- --context-bench
 ```
 
 The same engines are available live in the TUI (the kernel, tools and UI are

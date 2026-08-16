@@ -1,0 +1,45 @@
+{
+  "id": "noise_repeat_fail",
+  "scenario": "noise",
+  "variant": "repeat",
+  "name": "Same bug with three repeated failing test dumps",
+  "seed": "noise",
+  "include_rolling": false,
+  "target_rounds_lo": 8,
+  "target_rounds_hi": 18,
+  "expected_edit": "fix visit_all after repeated noisy failures",
+  "ops": [
+    {
+      "op": "user",
+      "text": "The tests dumped src/dump.rs. The real error is items[i + 1]. Do not fix yet; just read."
+    },
+    {
+      "op": "user",
+      "text": "Tests failed again with the same dump. Still the same two real errors."
+    },
+    {
+      "op": "user",
+      "text": "Third failure, same dump. Now fix visit_all."
+    },
+    {
+      "op": "user",
+      "text": "Keep dump.rs. Confirm parse.rs no longer uses items[i + 1]."
+    }
+  ],
+  "hidden": [
+    {
+      "path": "src/parse.rs",
+      "pred": "not_contains",
+      "needles": [
+        "items[i + 1]"
+      ]
+    },
+    {
+      "path": "src/dump.rs",
+      "pred": "contains",
+      "needles": [
+        "index out of bounds"
+      ]
+    }
+  ]
+}

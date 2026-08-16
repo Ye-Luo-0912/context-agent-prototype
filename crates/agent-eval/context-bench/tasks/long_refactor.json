@@ -1,0 +1,77 @@
+{
+  "id": "long_refactor",
+  "scenario": "refactor",
+  "variant": "once",
+  "name": "Interface change, callers, failing tests, then a constraint",
+  "seed": "authbox",
+  "include_rolling": false,
+  "target_rounds_lo": 15,
+  "target_rounds_hi": 25,
+  "expected_edit": "verify + now + String expiry error",
+  "ops": [
+    {
+      "op": "user",
+      "text": "Change the Token interface: parse becomes verify(raw, now). Update token.rs."
+    },
+    {
+      "op": "user",
+      "text": "Update every caller of Token::parse."
+    },
+    {
+      "op": "user",
+      "text": "The tests fail because they still call parse. Fix src/tests.rs."
+    },
+    {
+      "op": "user",
+      "text": "Add expires_at and reject expired tokens with a String error."
+    },
+    {
+      "op": "user",
+      "text": "Re-run the tests mentally and keep String errors. Do not switch to a custom error enum."
+    }
+  ],
+  "hidden": [
+    {
+      "path": "src/token.rs",
+      "pred": "contains",
+      "needles": [
+        "fn verify"
+      ]
+    },
+    {
+      "path": "src/token.rs",
+      "pred": "not_contains",
+      "needles": [
+        "fn parse"
+      ]
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "Token::verify"
+      ]
+    },
+    {
+      "path": "src/session.rs",
+      "pred": "contains",
+      "needles": [
+        "Token::verify"
+      ]
+    },
+    {
+      "path": "src/auth.rs",
+      "pred": "contains",
+      "needles": [
+        "now"
+      ]
+    },
+    {
+      "path": "src/session.rs",
+      "pred": "contains",
+      "needles": [
+        "now"
+      ]
+    }
+  ]
+}

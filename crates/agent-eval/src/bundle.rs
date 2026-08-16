@@ -177,7 +177,7 @@ pub fn write_suite_cell(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_cell_parts(
+pub(crate) fn write_cell_parts(
     dir: &Path,
     fixture_id: &str,
     fixture_sha256: &str,
@@ -265,6 +265,14 @@ fn write_cell_parts(
 }
 
 pub fn write_pair(pair: &PairSink, engines: &[&str]) -> anyhow::Result<PathBuf> {
+    write_pair_with_schema(pair, engines, ANALYSIS_SCHEMA)
+}
+
+pub fn write_pair_with_schema(
+    pair: &PairSink,
+    engines: &[&str],
+    analysis_schema: &str,
+) -> anyhow::Result<PathBuf> {
     let dir = pair
         .root
         .join(&pair.fixture_id)
@@ -288,7 +296,7 @@ pub fn write_pair(pair: &PairSink, engines: &[&str]) -> anyhow::Result<PathBuf> 
             "repeats": pair.repeats,
             "live": pair.live,
             "arm_order": engines,
-            "analysis_schema": ANALYSIS_SCHEMA,
+            "analysis_schema": analysis_schema,
             "cells": cells,
         }),
     )?;
@@ -328,6 +336,10 @@ pub fn render_evidence(path: &Path) -> anyhow::Result<String> {
             out.push_str(&render_cell(&dir)?);
         }
     }
+    if pair.get("analysis_schema").and_then(|v| v.as_str()) == Some(crate::context_bench::SCHEMA) {
+        out.push('\n');
+        out.push_str(&crate::context_bench::render_why_from_pair(pair_dir)?);
+    }
     Ok(out)
 }
 
@@ -358,7 +370,7 @@ fn render_cell(dir: &Path) -> anyhow::Result<String> {
         summary.usage_incomplete,
     ));
     out.push_str(&format!(
-        "           forgotten={} recovered={} reread={} failed={} compact={}/{}\n",
+        "           forgotten={} recovered={} search={} reactivate={} reread={} failed={} compact={}/{}\n",
         summary
             .metrics
             .get("forgotten_items")
@@ -367,6 +379,16 @@ fn render_cell(dir: &Path) -> anyhow::Result<String> {
         summary
             .metrics
             .get("recovered_items")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        summary
+            .metrics
+            .get("recovery_explicit_search")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        summary
+            .metrics
+            .get("recovery_auto_reactivation")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
         summary
@@ -589,6 +611,10 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
         "admit_calls": metrics.admit_calls,
         "recovered_items": metrics.recovered_items,
         "forgotten_items": metrics.forgotten_items,
+        "recovery_explicit_search": metrics.recovery_explicit_search,
+        "recovery_auto_reactivation": metrics.recovery_auto_reactivation,
+        "recovery_workspace_reread": metrics.recovery_workspace_reread,
+        "recovery_failed": metrics.recovery_failed,
         "access_search_hits": metrics.access_search_hits,
         "access_inspects": metrics.access_inspects,
         "access_fetches": metrics.access_fetches,

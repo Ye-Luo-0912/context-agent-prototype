@@ -1,0 +1,17 @@
+{
+  "schema": "agent-eval.context-bench.v1",
+  "tasks": [
+    "tasks/horizon_short.json",
+    "tasks/horizon_long.json",
+    "tasks/long_refactor.json",
+    "tasks/long_refactor_relitigate.json",
+    "tasks/semantic_recall.json",
+    "tasks/semantic_recall_fallback.json",
+    "tasks/supersession.json",
+    "tasks/supersession_leak.json",
+    "tasks/task_switch.json",
+    "tasks/task_switch_long_b.json",
+    "tasks/noise_recovery.json",
+    "tasks/noise_repeat_fail.json"
+  ]
+}

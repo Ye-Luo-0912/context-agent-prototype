@@ -1,0 +1,74 @@
+{
+  "id": "semantic_recall_fallback",
+  "scenario": "semantic",
+  "variant": "fallback",
+  "name": "Verbal fallback-not-propagate constraint, then cache work",
+  "seed": "fallback",
+  "include_rolling": false,
+  "target_rounds_lo": 10,
+  "target_rounds_hi": 20,
+  "expected_edit": "missing user returns anonymous, never lookup(id)?",
+  "ops": [
+    {
+      "op": "user",
+      "text": "Constraint not to write into files: a missing user must fallback to an anonymous user and must not propagate the lookup error."
+    },
+    {
+      "op": "user",
+      "text": "Read src/store.rs."
+    },
+    {
+      "op": "user",
+      "text": "Add a cached_load wrapper that calls load_user."
+    },
+    {
+      "op": "user",
+      "text": "Document nothing. Just keep exploring load_user."
+    },
+    {
+      "op": "user",
+      "text": "Add a comment-free id normalizer that trims whitespace."
+    },
+    {
+      "op": "user",
+      "text": "Now implement the missing-user policy in load_user."
+    },
+    {
+      "op": "user",
+      "text": "cached_load must use the same fallback."
+    },
+    {
+      "op": "user",
+      "text": "Final: anonymous fallback, no lookup(id)? propagation."
+    }
+  ],
+  "hidden": [
+    {
+      "path": "src/store.rs",
+      "pred": "contains",
+      "needles": [
+        "anonymous"
+      ]
+    },
+    {
+      "path": "src/store.rs",
+      "pred": "not_contains",
+      "needles": [
+        "lookup(id)?"
+      ]
+    },
+    {
+      "path": "src/store.rs",
+      "pred": "contains",
+      "needles": [
+        "cached_load"
+      ]
+    }
+  ],
+  "hidden_commands": [
+    {
+      "name": "fallback",
+      "script": "fallback_anonymous.py"
+    }
+  ]
+}

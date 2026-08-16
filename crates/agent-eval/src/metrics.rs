@@ -13,6 +13,12 @@ use agent_contracts::{
 };
 use std::collections::{HashMap, HashSet};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoverPath {
+    Search,
+    Reactivate,
+}
+
 /// Deterministic per-run measurements aggregated from the event stream.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunMetrics {
@@ -106,6 +112,14 @@ pub struct RunMetrics {
     pub forgotten_items: u64,
     /// Forgotten ids later seen in a search/inspect/fetch/admit/reactivation.
     pub recovered_items: u64,
+    /// Forgotten ids whose *first* recovery was an explicit search/inspect/fetch/admit.
+    pub recovery_explicit_search: u64,
+    /// Forgotten ids whose *first* recovery was a GC reactivation.
+    pub recovery_auto_reactivation: u64,
+    /// Repeated `fs.read` of the same path (workspace reread, not an id partition).
+    pub recovery_workspace_reread: u64,
+    /// Forgotten ids that were never recovered.
+    pub recovery_failed: u64,
     /// Final diagnostics snapshot of graded access stamps.
     pub access_search_hits: u64,
     pub access_inspects: u64,
@@ -126,6 +140,7 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     let mut open_calls: HashMap<String, OpenManageCall> = HashMap::new();
     let mut forgotten: HashSet<ContextItemId> = HashSet::new();
     let mut recovered: HashSet<ContextItemId> = HashSet::new();
+    let mut recovered_path: HashMap<ContextItemId, RecoverPath> = HashMap::new();
 
     for envelope in events {
         match &envelope.event {
@@ -194,9 +209,13 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                             .push(envelope.timestamp_ms.saturating_sub(started.started_ms));
                     }
                     for id in descriptor_ids(&output.metadata) {
-                        if forgotten.contains(&id) {
-                            recovered.insert(id);
-                        }
+                        mark_recovered(
+                            &forgotten,
+                            &mut recovered,
+                            &mut recovered_path,
+                            id,
+                            RecoverPath::Search,
+                        );
                     }
                 }
                 if is_manage_tool(&output.tool_name)
@@ -214,7 +233,13 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     && let Some(id) = started.item_id
                     && forgotten.contains(&id)
                 {
-                    recovered.insert(id);
+                    mark_recovered(
+                        &forgotten,
+                        &mut recovered,
+                        &mut recovered_path,
+                        id,
+                        RecoverPath::Search,
+                    );
                 }
             }
             RuntimeEvent::ContextMaintained { report, .. } => {
@@ -242,9 +267,13 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     forgotten.insert(*id);
                 }
                 for reactivation in &report.reactivations {
-                    if forgotten.contains(&reactivation.item_id) {
-                        recovered.insert(reactivation.item_id);
-                    }
+                    mark_recovered(
+                        &forgotten,
+                        &mut recovered,
+                        &mut recovered_path,
+                        reactivation.item_id,
+                        RecoverPath::Reactivate,
+                    );
                 }
                 snapshot_access(&mut metrics, &report.diagnostics);
             }
@@ -300,7 +329,30 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     }
     metrics.forgotten_items = forgotten.len() as u64;
     metrics.recovered_items = recovered.len() as u64;
+    metrics.recovery_explicit_search = recovered_path
+        .values()
+        .filter(|path| **path == RecoverPath::Search)
+        .count() as u64;
+    metrics.recovery_auto_reactivation = recovered_path
+        .values()
+        .filter(|path| **path == RecoverPath::Reactivate)
+        .count() as u64;
+    metrics.recovery_workspace_reread = metrics.repeated_fs_reads;
+    metrics.recovery_failed = forgotten.difference(&recovered).count() as u64;
     metrics
+}
+
+fn mark_recovered(
+    forgotten: &HashSet<ContextItemId>,
+    recovered: &mut HashSet<ContextItemId>,
+    recovered_path: &mut HashMap<ContextItemId, RecoverPath>,
+    id: ContextItemId,
+    path: RecoverPath,
+) {
+    if forgotten.contains(&id) {
+        recovered.insert(id);
+        recovered_path.entry(id).or_insert(path);
+    }
 }
 
 struct OpenManageCall {
@@ -371,7 +423,7 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          store: write_bytes={} read_bytes={} recalled_items={}\n\
          retrieval: search_calls={} hits={} empty={} miss(not_found/absent/unavailable)={}/{}/{}\n\
          retrieval_latency: p50={}ms p95={}ms inspect={} fetch={} admit={}\n\
-         recovery: forgotten={} recovered={}\n\
+         recovery: forgotten={} recovered={} search={} reactivate={} reread={} failed={}\n\
          access: search_hits={} inspects={} fetches={} admits={} acks={}\n\
          compaction: in={} out={}\n\
          behavior: tool_calls={} failed_outputs={} spills={} output_chars={} repeated_fs_reads={}\n",
@@ -413,6 +465,10 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.admit_calls,
         metrics.forgotten_items,
         metrics.recovered_items,
+        metrics.recovery_explicit_search,
+        metrics.recovery_auto_reactivation,
+        metrics.recovery_workspace_reread,
+        metrics.recovery_failed,
         metrics.access_search_hits,
         metrics.access_inspects,
         metrics.access_fetches,
@@ -806,9 +862,73 @@ mod tests {
         assert_eq!(metrics.search_ms_p50, 40);
         assert_eq!(metrics.forgotten_items, 1);
         assert_eq!(metrics.recovered_items, 1);
+        assert_eq!(metrics.recovery_explicit_search, 1);
+        assert_eq!(metrics.recovery_auto_reactivation, 0);
+        assert_eq!(metrics.recovery_failed, 0);
         let rendered = render_metrics(&metrics);
         assert!(rendered.contains("retrieval: search_calls=1 hits=1"));
         assert!(rendered.contains("recovery: forgotten=1 recovered=1"));
+    }
+
+    #[test]
+    fn first_recovery_path_is_reactivation_not_a_later_search() {
+        let run = RunId::new();
+        let forgotten = ContextItemId::new();
+        let events = vec![
+            envelope(
+                run,
+                1,
+                RuntimeEvent::ContextGc {
+                    report: ContextGcReport {
+                        evicted: 1,
+                        evictions: vec![agent_contracts::ContextEviction {
+                            item_id: forgotten,
+                            kind: ContextKind::Note,
+                            scope: ContextScope::Task,
+                            generation: 1,
+                            evicted_at_tick: 1,
+                            reason: "stale".into(),
+                        }],
+                        reactivations: vec![agent_contracts::ContextReactivation {
+                            item_id: forgotten,
+                            kind: ContextKind::Note,
+                            scope: ContextScope::Task,
+                            reactivated_at_tick: 2,
+                            reason: "hot entity".into(),
+                        }],
+                        reactivated: 1,
+                        diagnostics: ContextDiagnostics::default(),
+                        ..ContextGcReport::default()
+                    },
+                },
+            ),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::ToolFinished {
+                    output: ToolOutput {
+                        call_id: "s".into(),
+                        tool_name: agent_contracts::CONTEXT_MANAGE.into(),
+                        ok: true,
+                        summary: "hit".into(),
+                        model_content: "hit".into(),
+                        artifact_ref: None,
+                        metadata: json!({
+                            "op": "search",
+                            "descriptors": [{
+                                "ref": { "id": forgotten.to_string() }
+                            }]
+                        }),
+                    },
+                },
+            ),
+        ];
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.forgotten_items, 1);
+        assert_eq!(metrics.recovered_items, 1);
+        assert_eq!(metrics.recovery_auto_reactivation, 1);
+        assert_eq!(metrics.recovery_explicit_search, 0);
+        assert_eq!(metrics.recovery_failed, 0);
     }
 
     #[test]

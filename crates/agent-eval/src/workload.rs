@@ -380,7 +380,7 @@ pub fn reverify_from_report(report: &HiddenReport) -> anyhow::Result<bool> {
     Ok(passed)
 }
 
-fn read_hidden_file(root: &Path, rel: &str) -> HiddenFileBody {
+pub(crate) fn read_hidden_file(root: &Path, rel: &str) -> HiddenFileBody {
     let path = root.join(rel);
     match std::fs::read(&path) {
         Ok(bytes) => {
@@ -434,7 +434,12 @@ fn pred_parts(pred: HiddenPred) -> (&'static str, Vec<&'static str>, Option<usiz
     }
 }
 
-fn eval_pred(content: &str, kind: &str, needles: &[&str], min: Option<usize>) -> (bool, usize) {
+pub(crate) fn eval_pred(
+    content: &str,
+    kind: &str,
+    needles: &[&str],
+    min: Option<usize>,
+) -> (bool, usize) {
     match kind {
         "contains" => {
             let needle = needles.first().copied().unwrap_or("");

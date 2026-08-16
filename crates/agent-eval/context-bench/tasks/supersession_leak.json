@@ -1,0 +1,41 @@
+{
+  "id": "supersession_leak",
+  "scenario": "supersession",
+  "variant": "leak",
+  "name": "Same config evolution with a leftover JSON trap comment",
+  "seed": "config_leak",
+  "include_rolling": false,
+  "target_rounds_lo": 8,
+  "target_rounds_hi": 16,
+  "expected_edit": "env wins; leftover JSON trap comment must not remain as policy",
+  "ops": [
+    {
+      "op": "user",
+      "text": "The leftover comment about JSON keys is stale. Env must win."
+    },
+    {
+      "op": "user",
+      "text": "Implement APP_HOST / APP_PORT overrides."
+    },
+    {
+      "op": "user",
+      "text": "Delete the JSON-forever trap comment so it cannot leak as the latest decision."
+    }
+  ],
+  "hidden": [
+    {
+      "path": "src/config.rs",
+      "pred": "contains",
+      "needles": [
+        "APP_HOST"
+      ]
+    },
+    {
+      "path": "src/config.rs",
+      "pred": "not_contains",
+      "needles": [
+        "prefer JSON"
+      ]
+    }
+  ]
+}
