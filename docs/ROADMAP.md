@@ -1852,7 +1852,7 @@ the effect/sandbox gates:
   `Experimental` regardless of its declared status — a generated
   capability cannot promote itself. Activation gating, quarantine
   rollback and reserved-name protection are covered end to end in
-  `agent-runtime/tests/host.rs`.
+  `agent-runtime/tests/host/`.
 - **The permission Core grants nothing undeclared.** The runtime builds
   the invocation context from `CapabilityManifest.permissions` alone
   (V1-M14 PermissionSet): a capability that did not declare a permission
@@ -1860,7 +1860,7 @@ the effect/sandbox gates:
   the effect-commit channel — and unknown permission strings grant
   nothing. Covered by the
   `undeclared_permissions_receive_no_handle` test in
-  `agent-runtime/tests/host.rs`: a capability declaring only
+  `agent-runtime/tests/host/lifecycle.rs`: a capability declaring only
   `runtime:context-control` receives no workspace handle at all, a
   `workspace:read`-only capability's write and staged-write paths are
   refused with an error naming the missing grant while its reads work,
