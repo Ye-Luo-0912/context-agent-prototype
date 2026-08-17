@@ -1005,7 +1005,7 @@ fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
     out
 }
 
-struct SplitMix64(u64);
+pub(crate) struct SplitMix64(pub(crate) u64);
 
 impl SplitMix64 {
     fn next_u64(&mut self) -> u64 {
@@ -1016,7 +1016,7 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
-    fn bounded(&mut self, max: u64) -> u64 {
+    pub(crate) fn bounded(&mut self, max: u64) -> u64 {
         if max == 0 {
             return 0;
         }

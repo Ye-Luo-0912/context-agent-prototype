@@ -141,6 +141,8 @@ pub enum RuntimeEvent {
         surface_revision: u64,
         #[serde(default)]
         model_round: usize,
+        #[serde(default)]
+        prompt_layers: crate::PromptLayerCosts,
     },
     /// Live streamed text delta. Never journaled (the final `AssistantMessage`
     /// carries the complete content); only forwarded to live subscribers.

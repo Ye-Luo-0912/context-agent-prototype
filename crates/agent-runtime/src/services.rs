@@ -40,6 +40,8 @@ pub struct RuntimeServices {
     /// truncation (raw-evidence retention). `None` skips the persistence
     /// (tests and bare compositions).
     artifact_workspace: Option<Arc<Workspace>>,
+    /// Ablation: when false, PromptAssembler omits TaskProgress. Default true.
+    project_task_progress: bool,
 }
 
 /// Trusted, construction-time recovery dependencies for Core authority.
@@ -91,6 +93,7 @@ impl RuntimeServices {
             model,
             tools,
             artifact_workspace: None,
+            project_task_progress: true,
         }
     }
 
@@ -122,6 +125,7 @@ impl RuntimeServices {
             model,
             tools,
             artifact_workspace: None,
+            project_task_progress: true,
         })
     }
 
@@ -177,6 +181,15 @@ impl RuntimeServices {
     pub fn with_artifact_workspace(mut self, workspace: Arc<Workspace>) -> Self {
         self.artifact_workspace = Some(workspace);
         self
+    }
+
+    pub fn with_project_task_progress(mut self, project: bool) -> Self {
+        self.project_task_progress = project;
+        self
+    }
+
+    pub(crate) fn project_task_progress(&self) -> bool {
+        self.project_task_progress
     }
 
     pub(crate) fn artifact_workspace(&self) -> Option<&Workspace> {

@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 6,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 4,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "fead657e74ad2169945ce3a8664e0b96b1b1df3a104f4d67f97373d251378526",
+      "bytes": 1122,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\nconst CURRENT_VERSION: &str = \"v1\";\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    let input = bytes.trim();\n    match input {\n        \"ping\" | \"v1:ping\" => Ok(Msg::Ping),\n        _ if input.starts_with(\"v:2:hello:\") => Ok(Msg::Hello(input[10..].to_owned())),\n        _ => Err(\"unknown\".into()),\n    }\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"ping\".into(),\n        Msg::Hello(value) => format!(\"v:2:hello:{}\", value),\n    }\n}\n\npub fn encode_versioned(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => format!(\"{}:{}\", CURRENT_VERSION, encode(msg)),\n        Msg::Hello(value) => format!(\"v:2:hello:{}\", value),\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{decode, encode, Msg};\n\n    #[test]\n    fn ping_encode_roundtrip() {\n        assert!(matches!(decode(&encode(&Msg::Ping)), Ok(Msg::Ping)));\n    }\n\n    #[test]\n    fn hello_v2_encode_roundtrip() {\n        let message = Msg::Hello(\"client-42\".into());\n        assert!(matches!(decode(&encode(&message)), Ok(Msg::Hello(value)) if value == \"client-42\"));\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpSzmPed\\force-compact"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

@@ -676,8 +676,10 @@ impl TaskAnchorView {
     }
 }
 
-/// Bounded prompt projection of a `ResumePoint`. Bodies stay in storage;
-/// this is refs and status only, never a second task authority.
+/// Bounded prompt projection of a `ResumePoint`. Operational cache only:
+/// checked resources, verification facts, failed operations. Goal/blockers/
+/// next-actions belong to `TaskAnchor` and are not independent writable
+/// state. Bodies stay in storage.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct TaskProgressView {
@@ -1030,6 +1032,22 @@ pub struct ContextDiagnostics {
     pub reactivation_selected_tokens: u64,
     #[serde(default)]
     pub reactivation_consumed_tokens: u64,
+    /// Reactivation *events* (a later GC pass on the same id counts again).
+    #[serde(default)]
+    pub reactivation_events: u64,
+    /// Distinct ids that entered a reactivation trace this run.
+    #[serde(default)]
+    pub unique_reactivated: u64,
+    #[serde(default)]
+    pub reactivated_tokens: u64,
+    #[serde(default)]
+    pub reactivation_tool_observation_selected: u64,
+    #[serde(default)]
+    pub reactivation_tool_observation_consumed: u64,
+    #[serde(default)]
+    pub reactivation_file_observation_selected: u64,
+    #[serde(default)]
+    pub reactivation_file_observation_consumed: u64,
     /// 有界压缩器（B 折叠 / C 派生）累计的 provider 输入 token。
     #[serde(default)]
     pub compaction_input_tokens: u64,

@@ -459,7 +459,9 @@ The P1 contract adds:
 - Retry/backoff lives at the transport boundary: `provider-openai` ships a
   generic `RetryingTransport` wrapper that retries only
   `AgentError::Transport { retryable: true }` errors (network, timeout, 5xx,
-  429) with exponential backoff.
+  429, and gateway-wrapped upstream failures presented as HTTP 400
+  `Upstream request failed`) with exponential backoff. A genuine 400
+  (illegal tool name, context overflow) is not retryable.
 
 `provider-openai` speaks the OpenAI Chat Completions SSE protocol, which
 DeepSeek, Qwen, Moonshot/Kimi, GLM, and most vendors also implement: point

@@ -22,6 +22,7 @@ use agent_runtime::{RuntimeHandle, TaskStatus};
 use context_baselines::{RollingConfig, RollingSummaryEngine};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 use crate::context_bench::{self, BenchPack, BenchTask, TurnOp};
@@ -727,7 +728,7 @@ async fn run_workspace_session(
             text: (*text).to_string(),
         })
         .collect();
-    run_workspace_session_ops(workspace_root, model, context_engine, &ops, limits).await
+    run_workspace_session_ops(workspace_root, model, context_engine, &ops, limits, true).await
 }
 
 async fn run_workspace_session_ops(
@@ -736,6 +737,7 @@ async fn run_workspace_session_ops(
     context_engine: Arc<dyn ContextEngine>,
     ops: &[TurnOp],
     limits: TurnLimits,
+    project_task_progress: bool,
 ) -> anyhow::Result<WorkspaceSession> {
     let started = Instant::now();
     let approval: Arc<dyn ApprovalGate> = Arc::new(AllowAllGate);
@@ -772,6 +774,7 @@ async fn run_workspace_session_ops(
         artifact_store: None,
         output_broker: None,
         max_tool_rounds: limits.max_model_rounds.map(|n| n as usize),
+        project_task_progress,
     })
     .await?;
     let mut events = composed.subscribe();
@@ -970,6 +973,7 @@ pub async fn compare_bench_live(
             limits,
             name,
             pair,
+            true,
         )
         .await?;
         let manager_tokens = manager_token_cost(engine.as_ref()).await?;
@@ -994,6 +998,95 @@ pub async fn compare_bench_live(
     Ok(runs)
 }
 
+pub const ABLATION_ARMS: [&str; 3] = ["current", "force-compact", "no-progress"];
+const ABLATION_ARM_SALT: &str = "agent-eval.ablation-arm.v1";
+
+pub fn ablation_arm_order(repeat: u32) -> [&'static str; 3] {
+    let mut arms = ABLATION_ARMS;
+    let mut hasher = Sha256::new();
+    hasher.update(ABLATION_ARM_SALT.as_bytes());
+    hasher.update([0]);
+    hasher.update(b"semantic_recall");
+    hasher.update([0]);
+    hasher.update(repeat.to_string().as_bytes());
+    let digest = hasher.finalize();
+    let seed = u64::from_le_bytes(digest[..8].try_into().expect("sha256 is 32 bytes"));
+    let mut rng = crate::analysis::SplitMix64(seed);
+    for i in (1..arms.len()).rev() {
+        let j = rng.bounded(i as u64 + 1) as usize;
+        arms.swap(i, j);
+    }
+    arms
+}
+
+/// Three C-only arms on `semantic_recall`: current / force-compact / no-progress.
+/// Does not change the frozen Context Bench pack.
+pub async fn compare_ablation_live(
+    pack: &BenchPack,
+    task: &BenchTask,
+    workspace_root: &Path,
+    model: Arc<dyn ModelTransport>,
+    pair: Option<&bundle::PairSink>,
+) -> anyhow::Result<Vec<EngineRun>> {
+    anyhow::ensure!(
+        task.id() == "semantic_recall",
+        "C-ablation is semantic_recall only, got {}",
+        task.id()
+    );
+    let limits = LIVE_LIMITS;
+    let repeat = pair.map(|p| p.repeat).unwrap_or(1);
+    let order = ablation_arm_order(repeat);
+    let mut runs = Vec::new();
+    for &name in &order {
+        let config = SimpleContextConfig {
+            force_episode_llm_distill: name == "force-compact",
+            ..SimpleContextConfig::default()
+        };
+        let project_task_progress = name != "no-progress";
+        let engine = SimpleContextEngine::new(config).with_compactor(Arc::new(
+            agent_compose::ModelBackedCompactor::new(model.clone()),
+        ));
+        let engine: Arc<dyn ContextEngine> = Arc::new(engine);
+        let root = workspace_root.join(name);
+        std::fs::create_dir_all(&root)?;
+        context_bench::seed_task(pack, task, &root)?;
+        suite::ensure_workspace_git(&root)?;
+        let eval = run_bench_with_engine(
+            pack,
+            task,
+            &root,
+            model.clone(),
+            engine.clone(),
+            limits,
+            name,
+            pair,
+            project_task_progress,
+        )
+        .await?;
+        let manager_tokens = manager_token_cost(engine.as_ref()).await?;
+        runs.push(EngineRun {
+            engine: name,
+            eval,
+            manager_tokens,
+        });
+    }
+    if let Some(pair) = pair {
+        bundle::write_pair_doc(
+            pair,
+            &order[..],
+            context_bench::SCHEMA,
+            &serde_json::json!({
+                "ablation": "semantic_recall_c_only",
+                "arms": ABLATION_ARMS,
+                "spec_sha256": context_bench::spec_sha256(),
+                "pack_digest": context_bench::pack_digest(pack),
+                "task_sha256": context_bench::task_sha256(pack, task),
+            }),
+        )?;
+    }
+    Ok(runs)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_bench_with_engine(
     pack: &BenchPack,
@@ -1004,6 +1097,7 @@ async fn run_bench_with_engine(
     limits: TurnLimits,
     engine: &'static str,
     pair: Option<&bundle::PairSink>,
+    project_task_progress: bool,
 ) -> anyhow::Result<FixtureEval> {
     let session = run_workspace_session_ops(
         workspace_root,
@@ -1011,6 +1105,7 @@ async fn run_bench_with_engine(
         context_engine,
         &task.file.ops,
         limits,
+        project_task_progress,
     )
     .await?;
     let report = context_bench::evaluate_task(pack, task, workspace_root);
@@ -1055,6 +1150,22 @@ mod tests {
         assert_eq!(SCRIPTED_LIMITS.max_model_rounds, None);
     }
 
+    #[test]
+    fn ablation_arm_order_is_a_salted_permutation() {
+        for repeat in 1..=8 {
+            let mut seen = ablation_arm_order(repeat);
+            seen.sort();
+            let mut expected = ABLATION_ARMS;
+            expected.sort();
+            assert_eq!(seen, expected);
+        }
+        let distinct: std::collections::HashSet<_> = (1..=8).map(ablation_arm_order).collect();
+        assert!(
+            distinct.len() > 1,
+            "repeat must shuffle arm order, got {distinct:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn suspend_and_activate_ops_complete_without_a_provider() {
         let dir = tempfile::tempdir().unwrap();
@@ -1076,9 +1187,10 @@ mod tests {
         ];
         let model = Arc::new(ScriptedModel::new(Vec::new(), "ok"));
         let engine = named_engine("append", None).unwrap();
-        let session = run_workspace_session_ops(dir.path(), model, engine, &ops, SCRIPTED_LIMITS)
-            .await
-            .unwrap();
+        let session =
+            run_workspace_session_ops(dir.path(), model, engine, &ops, SCRIPTED_LIMITS, true)
+                .await
+                .unwrap();
         assert!(session.error.is_none(), "{:?}", session.error);
         assert!(
             session
@@ -1104,6 +1216,7 @@ mod tests {
                 engine,
                 &task.file.ops,
                 SCRIPTED_LIMITS,
+                true,
             )
             .await
             .unwrap();

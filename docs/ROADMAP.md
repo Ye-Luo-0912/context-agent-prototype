@@ -111,7 +111,8 @@ Run real coding tasks without coupling the kernel to one vendor.
   `ToolCall`; malformed arguments degrade to `null`;
 - usage accounting: parsed from the stream (`ModelUsage`);
 - retry/backoff at transport boundary: `RetryingTransport` wrapper (retryable
-  network/5xx/429 errors only, exponential backoff).
+  network/5xx/429, plus gateway-wrapped `Upstream request failed` 400;
+  genuine 400 is not retried).
 
 ### Acceptance
 

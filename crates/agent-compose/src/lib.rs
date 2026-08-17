@@ -196,6 +196,8 @@ pub struct ComposeConfig {
     /// Live eval 把内核 tool-loop 上限抬到与 harness 相同的共享 cap。
     /// `None` 保持 `CoreAuthorityConfig` 默认 16（TUI）。不要给 C 比 A 更高的上限。
     pub max_tool_rounds: Option<usize>,
+    /// Ablation: omit TaskProgress from the Focus frame. Default true.
+    pub project_task_progress: bool,
 }
 
 /// A composed runtime. Owns the workspace and the spawned `RuntimeInstance`
@@ -249,6 +251,7 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         artifact_store,
         output_broker,
         max_tool_rounds,
+        project_task_progress,
     } = config;
 
     let mut host = ModuleHost::new();
@@ -300,11 +303,12 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     if let Some(max_tool_rounds) = max_tool_rounds {
         authority.max_tool_rounds = max_tool_rounds;
     }
-    let services = RuntimeServices::from_registry_with_operation_journal(
+    let mut services = RuntimeServices::from_registry_with_operation_journal(
         host.registry(),
         authority,
         AuthorityRecoveryServices::new(operation_journal, Some(Arc::new(workspace.clone()))),
     )?;
+    services = services.with_project_task_progress(project_task_progress);
     let instance = RuntimeInstance::spawn(host, services);
     Ok(ComposedRuntime {
         workspace,

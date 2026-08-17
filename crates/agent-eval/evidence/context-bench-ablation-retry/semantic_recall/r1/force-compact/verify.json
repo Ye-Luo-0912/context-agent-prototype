@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 6,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "95bbf862aeddbd08d8bd21947e0de4206cb8109809f36c0efb360712c7f2eafc",
+      "bytes": 1189,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    if bytes == \"ping\" {\n        return Ok(Msg::Ping);\n    }\n\n    if let Some(name) = bytes.strip_prefix(\"v:2|hello:\") {\n        return Ok(Msg::Hello(name.into()));\n    }\n\n    eprintln!(\"decode error: unknown message\");\n    Err(\"unknown\".into())\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"ping\".into(),\n        Msg::Hello(name) => format!(\"v:2|hello:{name}\"),\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{decode, encode, Msg};\n\n    fn ping_encode_roundtrip() -> Msg {\n        decode(&encode(&Msg::Ping)).unwrap()\n    }\n\n    #[test]\n    fn ping_roundtrips_through_encoding() {\n        assert!(matches!(ping_encode_roundtrip(), Msg::Ping));\n    }\n\n    #[test]\n    fn hello_uses_the_v2_envelope() {\n        let encoded = encode(&Msg::Hello(\"Ada\".into()));\n        assert_eq!(encoded, \"v:2|hello:Ada\");\n        assert!(matches!(decode(&encoded), Ok(Msg::Hello(name)) if name == \"Ada\"));\n    }\n\n    #[test]\n    fn versioned_hello_can_have_an_empty_name() {\n        assert!(matches!(decode(\"v:2|hello:\"), Ok(Msg::Hello(name)) if name.is_empty()));\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmp70gJQL\\force-compact"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

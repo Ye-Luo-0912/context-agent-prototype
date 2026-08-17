@@ -59,6 +59,14 @@ impl PromptAssembler {
             + agent_contracts::tokens::approx_tokens(&self.runtime_facts.render())
     }
 
+    pub fn system_policy_tokens(&self) -> usize {
+        agent_contracts::tokens::approx_tokens(&self.system_prompt)
+    }
+
+    pub fn runtime_facts_tokens(&self) -> usize {
+        agent_contracts::tokens::approx_tokens(&self.runtime_facts.render())
+    }
+
     pub fn assemble(
         &self,
         runtime_focus: Option<&FocusState>,
@@ -148,6 +156,74 @@ impl PromptAssembler {
     }
 }
 
+/// Token cost of the runtime-owned Focus frame (TaskAnchor + TaskProgress +
+/// Current Focus). Subtracted from the pack window before materialize.
+pub fn focus_frame_tokens(
+    focus: Option<&FocusState>,
+    task: Option<&TaskAnchorView>,
+    progress: Option<&TaskProgressView>,
+) -> usize {
+    render_focus_frame(focus, task, progress)
+        .map(|text| agent_contracts::tokens::approx_tokens(&text))
+        .unwrap_or(0)
+}
+
+pub fn prompt_layer_costs(
+    assembler: &PromptAssembler,
+    focus: Option<&FocusState>,
+    task: Option<&TaskAnchorView>,
+    progress: Option<&TaskProgressView>,
+    history: &MaterializedContext,
+    turn: &TurnFrame,
+    tools: &[ToolSpec],
+) -> agent_contracts::PromptLayerCosts {
+    let assembled = assembler.assemble(focus, task, progress, history, turn, tools.to_vec());
+    let historical = assembled
+        .context_frame
+        .iter()
+        .map(|message| agent_contracts::tokens::approx_tokens(&message.content) as u64)
+        .sum();
+    agent_contracts::PromptLayerCosts {
+        system_tokens: assembler.system_policy_tokens() as u64,
+        runtime_facts_tokens: assembler.runtime_facts_tokens() as u64,
+        task_anchor_tokens: task
+            .filter(|view| !view.is_empty())
+            .map(|view| agent_contracts::tokens::approx_tokens(&render_task_anchor(view)) as u64)
+            .unwrap_or(0),
+        task_progress_tokens: progress
+            .filter(|view| !view.is_empty())
+            .map(|view| agent_contracts::tokens::approx_tokens(&render_task_progress(view)) as u64)
+            .unwrap_or(0),
+        current_focus_tokens: focus
+            .map(|focus| {
+                agent_contracts::tokens::approx_tokens(&render_current_focus(focus, task)) as u64
+            })
+            .unwrap_or(0),
+        historical_context_tokens: historical,
+        turn_frame_tokens: crate::budget::approx_layer_tokens(&assembled.turn_frame.messages())
+            as u64,
+        tool_schema_tokens: crate::budget::approx_layer_tokens(&assembled.tool_schemas) as u64,
+    }
+}
+
+fn render_current_focus(focus: &FocusState, task: Option<&TaskAnchorView>) -> String {
+    let mut out = String::from("CURRENT FOCUS\n");
+    if task.is_none_or(TaskAnchorView::is_empty) {
+        out.push_str(&format!("Goal: {}\n", focus.goal));
+    }
+    out.push_str(&format!(
+        "Phase: {}\nCurrent query: {}\nActive entities: {}",
+        focus.phase,
+        focus.current_query,
+        if focus.active_entities.is_empty() {
+            "(none)".to_string()
+        } else {
+            focus.active_entities.join(", ")
+        }
+    ));
+    out
+}
+
 fn render_focus_frame(
     focus: Option<&FocusState>,
     task: Option<&TaskAnchorView>,
@@ -173,20 +249,7 @@ fn render_focus_frame(
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str("CURRENT FOCUS\n");
-        if task.is_none_or(TaskAnchorView::is_empty) {
-            out.push_str(&format!("Goal: {}\n", focus.goal));
-        }
-        out.push_str(&format!(
-            "Phase: {}\nCurrent query: {}\nActive entities: {}",
-            focus.phase,
-            focus.current_query,
-            if focus.active_entities.is_empty() {
-                "(none)".to_string()
-            } else {
-                focus.active_entities.join(", ")
-            }
-        ));
+        out.push_str(&render_current_focus(focus, task));
     }
     Some(out)
 }
@@ -214,11 +277,6 @@ fn render_task_anchor(task: &TaskAnchorView) -> String {
 
 fn render_task_progress(progress: &TaskProgressView) -> String {
     let mut out = format!("TASK PROGRESS anchor_rev={}\n", progress.anchor_revision);
-    if !progress.objective.is_empty() {
-        out.push_str(&format!("Objective: {}\n", progress.objective));
-    }
-    append_list(&mut out, "Blockers", &progress.blockers);
-    append_list(&mut out, "Next", &progress.next_actions);
     append_list(&mut out, "Checked", &progress.checked_files);
     append_list(&mut out, "Verification", &progress.verifications);
     append_list(&mut out, "Failed commands", &progress.failed_commands);
@@ -533,6 +591,73 @@ mod tests {
             !focus.contains("engine should not render"),
             "engine materialize must not own CURRENT FOCUS: {focus}"
         );
+    }
+
+    #[test]
+    fn task_progress_is_omitted_when_not_projected() {
+        use agent_contracts::{FocusState, TaskAnchorView, TaskId, TaskProgressView};
+        let assembler = PromptAssembler::new("policy");
+        let runtime_focus = FocusState::for_task(TaskId::new(), "refactor auth");
+        let task = TaskAnchorView {
+            revision: 1,
+            original_goal: "refactor auth".into(),
+            ..Default::default()
+        };
+        let progress = TaskProgressView {
+            checked_files: vec!["src/auth.rs".into()],
+            verifications: vec!["cargo test".into()],
+            failed_commands: vec!["shell.exec cargo test".into()],
+            ..Default::default()
+        };
+        let history = materialized_with(Vec::new(), ContextMapView::default());
+        let with_progress = assembler.assemble(
+            Some(&runtime_focus),
+            Some(&task),
+            Some(&progress),
+            &history,
+            &TurnFrame::new("continue"),
+            Vec::new(),
+        );
+        let focus = with_progress.focus_frame.expect("progress must render");
+        assert!(focus.contains("TASK PROGRESS"));
+        assert!(focus.contains("src/auth.rs"));
+        assert!(!focus.contains("Objective:"));
+        assert!(!focus.contains("Blockers:"));
+        assert!(!focus.contains("Next actions:"));
+        let layers = prompt_layer_costs(
+            &assembler,
+            Some(&runtime_focus),
+            Some(&task),
+            Some(&progress),
+            &history,
+            &TurnFrame::new("continue"),
+            &[],
+        );
+        assert!(layers.task_progress_tokens > 0);
+        assert!(layers.task_anchor_tokens > 0);
+
+        let without = assembler.assemble(
+            Some(&runtime_focus),
+            Some(&task),
+            None,
+            &history,
+            &TurnFrame::new("continue"),
+            Vec::new(),
+        );
+        let focus = without.focus_frame.expect("anchor + focus still render");
+        assert!(!focus.contains("TASK PROGRESS"));
+        assert!(!focus.contains("src/auth.rs"));
+        let layers_off = prompt_layer_costs(
+            &assembler,
+            Some(&runtime_focus),
+            Some(&task),
+            None,
+            &history,
+            &TurnFrame::new("continue"),
+            &[],
+        );
+        assert_eq!(layers_off.task_progress_tokens, 0);
+        assert_eq!(layers_off.task_anchor_tokens, layers.task_anchor_tokens);
     }
 
     #[test]

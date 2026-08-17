@@ -14,6 +14,7 @@
 //! Pack window = min(kernel context_budget_tokens, send window)
 //!         - Output Reserve
 //!         - System Policy (includes Runtime Facts)
+//!         - Runtime Focus Frame (TaskAnchor + TaskProgress + Current Focus)
 //!         - Turn Frame
 //!         - Active Tool Schemas
 //!         = Context Frame Budget   (what the engine receives)
@@ -145,6 +146,7 @@ pub struct ModelBudget {
     pub context_window: usize,
     pub output_reserve: usize,
     pub system_policy_tokens: usize,
+    pub runtime_focus_frame_tokens: usize,
     pub turn_frame_tokens: usize,
     pub active_tools_tokens: usize,
     pub context_frame_budget: usize,
@@ -155,18 +157,21 @@ impl ModelBudget {
         context_window: usize,
         output_reserve: usize,
         system_policy_tokens: usize,
+        runtime_focus_frame_tokens: usize,
         turn_frame_tokens: usize,
         active_tools_tokens: usize,
     ) -> Self {
         let context_frame_budget = context_window
             .saturating_sub(output_reserve)
             .saturating_sub(system_policy_tokens)
+            .saturating_sub(runtime_focus_frame_tokens)
             .saturating_sub(turn_frame_tokens)
             .saturating_sub(active_tools_tokens);
         Self {
             context_window,
             output_reserve,
             system_policy_tokens,
+            runtime_focus_frame_tokens,
             turn_frame_tokens,
             active_tools_tokens,
             context_frame_budget,
@@ -189,17 +194,17 @@ mod tests {
 
     #[test]
     fn budget_subtracts_every_layer_from_the_window() {
-        let budget = ModelBudget::compute(30_000, 2_000, 1_500, 800, 300);
+        let budget = ModelBudget::compute(30_000, 2_000, 1_500, 400, 800, 300);
         assert_eq!(
             budget.context_frame_budget,
-            30_000 - 2_000 - 1_500 - 800 - 300
+            30_000 - 2_000 - 1_500 - 400 - 800 - 300
         );
         assert_eq!(budget.context_window, 30_000);
     }
 
     #[test]
     fn budget_saturates_at_zero() {
-        let budget = ModelBudget::compute(1_000, 2_000, 1_500, 800, 300);
+        let budget = ModelBudget::compute(1_000, 2_000, 1_500, 400, 800, 300);
         assert_eq!(budget.context_frame_budget, 0);
     }
 

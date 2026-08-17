@@ -133,6 +133,9 @@ pub struct SimpleContextConfig {
     /// or below this batch still run a full stable-order pass. Larger
     /// stores resume from `GcWorkCursor` on the next event.
     pub gc_work_batch: usize,
+    /// Ablation: pay for an LLM episode card even without a semantic delta.
+    /// Default false. Do not retune production policy from this flag.
+    pub force_episode_llm_distill: bool,
 }
 
 impl Default for SimpleContextConfig {
@@ -163,6 +166,7 @@ impl Default for SimpleContextConfig {
             episode_max_user_turns: 500,
             max_ledger_records: 4096,
             gc_work_batch: 4096,
+            force_episode_llm_distill: false,
         }
     }
 }
@@ -311,6 +315,20 @@ pub(crate) struct State {
     pub(crate) reactivation_selected_tokens: u64,
     #[serde(default)]
     pub(crate) reactivation_consumed_tokens: u64,
+    #[serde(default)]
+    pub(crate) reactivation_events: u64,
+    #[serde(default)]
+    pub(crate) unique_reactivated: u64,
+    #[serde(default)]
+    pub(crate) reactivated_tokens: u64,
+    #[serde(default)]
+    pub(crate) reactivation_tool_observation_selected: u64,
+    #[serde(default)]
+    pub(crate) reactivation_tool_observation_consumed: u64,
+    #[serde(default)]
+    pub(crate) reactivation_file_observation_selected: u64,
+    #[serde(default)]
+    pub(crate) reactivation_file_observation_consumed: u64,
     #[serde(skip)]
     pub(crate) reactivation_traces: std::collections::HashMap<
         agent_contracts::ContextItemId,
@@ -550,7 +568,7 @@ impl ContextEngine for SimpleContextEngine {
                         // after it drops. Without a compactor the rotation
                         // is still just promote-and-evict.
                         if self.compactor.is_some() {
-                            distill = plan_episode_distill(&state);
+                            distill = plan_episode_distill(&state, &self.config);
                         }
                         let transitions = scope::close_focus_episode(&mut state);
                         state.pending_ingest_transitions.extend(transitions);

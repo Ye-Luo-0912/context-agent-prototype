@@ -1,7 +1,8 @@
 //! Generic retry/backoff wrapper for any `ModelTransport`.
 //!
 //! Only errors marked retryable (`AgentError::Transport { retryable: true }`,
-//! i.e. network failures, timeouts, 5xx, 429) are retried. Auth errors and
+//! i.e. network failures, timeouts, 5xx, 429, and gateway-wrapped upstream
+//! 400 `Upstream request failed`) are retried. Auth errors and genuine
 //! provider-level rejections fail immediately. The backoff yields to the
 //! request's cancellation token, so a cancelled request aborts instead of
 //! sleeping out the wait.

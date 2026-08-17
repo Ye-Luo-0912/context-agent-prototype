@@ -419,6 +419,7 @@ impl AppState {
                 generation,
                 surface_revision,
                 model_round,
+                ..
             } => {
                 self.current_op = Some((turn_id, operation_id, generation));
                 self.busy = true;
@@ -670,6 +671,7 @@ mod tests {
             generation: 3,
             surface_revision: 8,
             model_round: 2,
+            prompt_layers: Default::default(),
         }));
 
         // The current operation's deltas render.
@@ -718,6 +720,7 @@ mod tests {
             generation: 4,
             surface_revision: 1,
             model_round: 1,
+            prompt_layers: Default::default(),
         }));
 
         app.apply_runtime_event(envelope(RuntimeEvent::TurnCancelled {
@@ -802,6 +805,7 @@ mod tests {
             generation: 5,
             surface_revision: 3,
             model_round: 1,
+            prompt_layers: Default::default(),
         }));
 
         app.apply_runtime_event(envelope(RuntimeEvent::ToolSurfacePlanned {

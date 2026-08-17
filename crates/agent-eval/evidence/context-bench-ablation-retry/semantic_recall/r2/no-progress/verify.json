@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 7,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 4,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "9625e6e7304fd90ebba467ad77e36554014a91f585229f591e64b6c8d5a47758",
+      "bytes": 5265,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    let trimmed = bytes.trim();\n    if !trimmed.starts_with('{') && bytes.contains(\"ping\") {\n        return Ok(Msg::Ping);\n    }\n\n    let fields = parse_object(bytes)?;\n    if fields.get(\"v\").map(String::as_str) != Some(\"2\") {\n        return Err(\"unsupported version\".into());\n    }\n    if fields.get(\"type\").map(String::as_str) != Some(\"hello\") {\n        return Err(\"unknown message type\".into());\n    }\n\n    fields\n        .get(\"value\")\n        .cloned()\n        .ok_or_else(|| \"missing hello value\".into())\n        .map(Msg::Hello)\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"ping\".into(),\n        Msg::Hello(value) => format!(\n            \"{{\\\"v\\\":2,\\\"type\\\":\\\"hello\\\",\\\"value\\\":{}}}\",\n            quote_json_string(value)\n        ),\n    }\n}\n\nfn quote_json_string(value: &str) -> String {\n    let mut quoted = String::with_capacity(value.len() + 2);\n    quoted.push('\"');\n    for byte in value.bytes() {\n        match byte {\n            b'\"' => quoted.push_str(\"\\\\\\\"\"),\n            b'\\\\' => quoted.push_str(\"\\\\\\\\\"),\n            b'\\n' => quoted.push_str(\"\\\\n\"),\n            b'\\r' => quoted.push_str(\"\\\\r\"),\n            b'\\t' => quoted.push_str(\"\\\\t\"),\n            0x00..=0x1f => quoted.push_str(&format!(\"\\\\u{:04x}\", byte)),\n            _ => quoted.push(byte as char),\n        }\n    }\n    quoted.push('\"');\n    quoted\n}\n\nfn parse_object(input: &str) -> Result<std::collections::BTreeMap<String, String>, String> {\n    let input = input.trim();\n    let inner = input\n        .strip_prefix('{')\n        .and_then(|value| value.strip_suffix('}'))\n        .ok_or_else(|| \"invalid envelope\".to_string())?\n        .trim();\n    let mut fields = std::collections::BTreeMap::new();\n\n    if inner.is_empty() {\n        return Ok(fields);\n    }\n\n    for member in split_members(inner)? {\n        let (key, value) = member\n            .split_once(':')\n            .ok_or_else(|| \"invalid envelope member\".to_string())?;\n        let key = parse_json_string(key.trim())?;\n        let value = value.trim();\n        let value = if key == \"v\" {\n            value.to_string()\n        } else {\n            parse_json_string(value)?\n        };\n        if fields.insert(key, value).is_some() {\n            return Err(\"duplicate envelope field\".into());\n        }\n    }\n\n    Ok(fields)\n}\n\nfn split_members(input: &str) -> Result<Vec<&str>, String> {\n    let mut members = Vec::new();\n    let mut start = 0;\n    let mut in_string = false;\n    let mut escaped = false;\n\n    for (index, byte) in input.bytes().enumerate() {\n        if in_string {\n            if escaped {\n                escaped = false;\n            } else if byte == b'\\\\' {\n                escaped = true;\n            } else if byte == b'\"' {\n                in_string = false;\n            }\n        } else if byte == b'\"' {\n            in_string = true;\n        } else if byte == b',' {\n            members.push(input[start..index].trim());\n            start = index + 1;\n        }\n    }\n\n    if in_string || escaped {\n        return Err(\"invalid envelope string\".into());\n    }\n    members.push(input[start..].trim());\n    Ok(members)\n}\n\nfn parse_json_string(input: &str) -> Result<String, String> {\n    let bytes = input.as_bytes();\n    if bytes.len() < 2 || bytes[0] != b'\"' || bytes[bytes.len() - 1] != b'\"' {\n        return Err(\"expected JSON string\".into());\n    }\n\n    let mut value = String::new();\n    let mut chars = input[1..bytes.len() - 1].chars();\n    while let Some(character) = chars.next() {\n        if character != '\\\\' {\n            value.push(character);\n            continue;\n        }\n        match chars.next() {\n            Some('\"') => value.push('\"'),\n            Some('\\\\') => value.push('\\\\'),\n            Some('/') => value.push('/'),\n            Some('b') => value.push('\\u{0008}'),\n            Some('f') => value.push('\\u{000c}'),\n            Some('n') => value.push('\\n'),\n            Some('r') => value.push('\\r'),\n            Some('t') => value.push('\\t'),\n            Some('u') => return Err(\"unicode escapes are not supported\".into()),\n            _ => return Err(\"invalid JSON escape\".into()),\n        }\n    }\n    Ok(value)\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{decode, encode, Msg};\n\n    #[test]\n    fn ping_encode_roundtrip() {\n        let encoded = encode(&Msg::Ping);\n        assert!(matches!(decode(&encoded), Ok(Msg::Ping)));\n    }\n\n    #[test]\n    fn hello_uses_v2_envelope() {\n        let encoded = encode(&Msg::Hello(\"example-client\".into()));\n        assert_eq!(\n            encoded,\n            \"{\\\"v\\\":2,\\\"type\\\":\\\"hello\\\",\\\"value\\\":\\\"example-client\\\"}\"\n        );\n        assert!(matches!(\n            decode(&encoded),\n            Ok(Msg::Hello(value)) if value == \"example-client\"\n        ));\n    }\n\n    #[test]\n    fn hello_value_is_escaped() {\n        let message = Msg::Hello(\"a\\\"b\\\\c\\nd\".into());\n        assert!(matches!(decode(&encode(&message)), Ok(Msg::Hello(value)) if value == \"a\\\"b\\\\c\\nd\"));\n    }\n\n    #[test]\n    fn hello_requires_v2_and_type() {\n        assert!(decode(r#\"{\"v\":1,\"type\":\"hello\",\"value\":\"client\"}\"#).is_err());\n        assert!(decode(r#\"{\"v\":2,\"type\":\"ping\",\"value\":\"client\"}\"#).is_err());\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpSzmPed\\no-progress"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

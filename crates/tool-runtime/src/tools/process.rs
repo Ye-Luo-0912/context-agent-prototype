@@ -295,6 +295,7 @@ impl Tool for ProcessRunTool {
             "artifact_truncated": artifact_truncated,
             "outcome": outcome,
             "cwd": if cwd_text.is_empty() { "." } else { &cwd_text },
+            "argv": argv_text,
         });
         if let Some(class) = super::classify_process_outcome(
             outcome,

@@ -496,14 +496,19 @@ Regressions: `task_anchor_update_publishes_a_bounded_event`,
 
 ### CTX-11 — Task progress is not yet a bounded, sourced resume contract
 
-**LANDED (2026-08-17).** `ResumePoint` is an actor-owned subrecord on
-`TaskRecord`, bound to `task_id + anchor_revision`. `TaskProgressView` is
-the prompt projection only. Updates come from trusted tool facts at turn
-commit; file observations replace stale digests; a later success clears
-the matching failed command; lists are hard-capped. Suspended tasks keep
-the record but it is not rendered on another task's prompt. Restore
-validates caps; oversized observations truncate rather than grow
-unbounded.
+**NARROWED (2026-08-18).** `ResumePoint` is an actor-owned operational cache
+on `TaskRecord`, bound to `task_id + anchor_revision`. It is **not** a
+second task authority: objective / blockers / next-actions are not written
+here. `TaskProgressView` projects checked resources, verification facts, and
+unresolved operation failures only. Updates apply **after** the durable
+`TurnCompleted` barrier. Successful file observations become checked
+resources; failed observations become failed operations. Verification is
+typed (`metadata.verification` / `intent=verify` / test-or-compiler
+command), never `shell.exec` by name. Failure identity is tool + command
+or resource target. A generic may-mutate process without a path invalidates
+workspace file facts. Prompt packing subtracts the runtime Focus frame
+before `materialize`. This slice is not an M15 close and does not prove
+ResumePoint value on `task_switch_long_b`; keep historical `semantic_recall.v1`.
 
 Required closure:
 
@@ -513,16 +518,23 @@ Required closure:
 - hard-cap every string/list/ref; retain file and command bodies once in
   context/artifact storage and carry only path/entity, digest/revision, bounded
   status and evidence refs;
-- update only from trusted tool/verification facts, durable turn completion and
-  explicit suspend, with idempotent revision checks; model-generated progress
-  is non-authoritative until the runtime validates/commits it;
+- update only from trusted tool/verification facts after the durable turn
+  commit; model-generated progress is non-authoritative;
 - restore the exact bounded record through checkpoint, downgrade suspended refs
   to storage retention, and rematerialize only Anchor + ResumePoint refs on
   activation — never ordinary transcript history;
-- test stale file observations, failure-then-success resolution, corrupt/
-  oversized restore, thousands of inspected files/repeated failures, task
-  switch plus GC, and failed-tool loops. Prompt/resident/checkpoint size must
-  remain bounded and resume must not silently claim stale verification.
+- test stale file observations, failure-then-success resolution by operation
+  identity, corrupt/oversized restore, thousands of inspected files, and
+  generic process invalidation. Prompt/resident/checkpoint size must remain
+  bounded. Do not retune reactivation thresholds from this slice.
+- ablation (`with` vs `without` ResumePoint projection) is still required
+  before claiming V1 value. `task_switch_long_b` pass does not prove it.
+  The C-only harness is `--context-bench-ablation`. The 2026-08-18 retry
+  under `evidence/context-bench-ablation-retry/` is 6/6 pass on
+  `semantic_recall` only: TaskProgress can be omitted without failing this
+  task; adaptive episode skip stayed 0/0 compact; force-compact paid ~38k
+  compact in. Live traces are not identical, so this is not a token-savings
+  or V1-closure result. Checkpoint restore and named hard-caps remain.
 
 The Context Bench `task_switch` and failed-tool measurements may validate the
 effect after landing, but their likely-optimization label does not authorize

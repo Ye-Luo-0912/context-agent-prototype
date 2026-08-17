@@ -198,6 +198,45 @@ impl ToolOutput {
             .filter(|revision| !revision.is_empty())
     }
 
+    /// Command or argv the producer stamped, used to identity a failed
+    /// operation without collapsing every `shell.exec` into one slot.
+    pub fn operation_target(&self) -> Option<&str> {
+        if let Some(path) = self.file_path() {
+            return Some(path);
+        }
+        if let Some(command) = self
+            .metadata
+            .get("command")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+        {
+            return Some(command);
+        }
+        self.metadata
+            .get("argv")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|argv| !argv.is_empty())
+    }
+
+    /// Explicit verification intent, never inferred from the tool name.
+    pub fn is_verification(&self) -> bool {
+        if self
+            .metadata
+            .get("verification")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            return true;
+        }
+        if self.metadata.get("intent").and_then(|value| value.as_str()) == Some("verify") {
+            return true;
+        }
+        self.operation_target()
+            .is_some_and(command_looks_like_verification)
+    }
+
     /// 中轮 WorkingSetSignal 文本：路径单独一行，后面才是正文。
     pub fn working_set_signal_text(&self) -> String {
         match self.file_path() {
@@ -228,6 +267,24 @@ impl ToolOutput {
     pub fn heats_working_set(&self) -> bool {
         self.ok && self.failure_class().is_none()
     }
+}
+
+fn command_looks_like_verification(command: &str) -> bool {
+    let text = command.to_ascii_lowercase();
+    const NEEDLES: &[&str] = &[
+        "cargo test",
+        "cargo check",
+        "cargo clippy",
+        "pytest",
+        "dotnet test",
+        "go test",
+        "mvn test",
+        "gradle test",
+        "npm test",
+        "rustc ",
+        "rustc.exe",
+    ];
+    NEEDLES.iter().any(|needle| text.contains(needle))
 }
 
 /// Metadata key for [`ToolFailureClass`]. Producers must not set `retryable`.

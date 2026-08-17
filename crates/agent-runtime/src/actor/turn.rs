@@ -461,6 +461,7 @@ impl RuntimeActor {
             .as_ref()
             .map(|turn| turn.model_round as u64)
             .unwrap_or(0);
+        let mut pending_resume = Vec::new();
         if let Some(turn) = self.state.turn.as_mut() {
             for step in &turn.turn_frame.steps {
                 let TurnFrameStep::ToolResult {
@@ -478,7 +479,7 @@ impl RuntimeActor {
                 if *disposition != ToolResultDisposition::PersistObservation {
                     continue;
                 }
-                self.state.tasks.observe_tool(output, resume_turn);
+                pending_resume.push(output.clone());
                 if let Err(error) = self
                     .services
                     .context_ingest(ContextIngress::ToolObservation {
@@ -648,6 +649,9 @@ impl RuntimeActor {
         }
         if let Some(turn) = self.state.turn.as_mut() {
             turn.turn_state = TurnState::Committed;
+        }
+        for output in pending_resume {
+            self.state.tasks.observe_tool(&output, resume_turn);
         }
         // Publish the evidence locator only after the same durable barrier as
         // the turn. A failed commit must not leave a later `/done` pointing

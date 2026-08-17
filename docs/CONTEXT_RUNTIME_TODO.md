@@ -86,7 +86,7 @@ boundedness, and integrity rather than replace it with transcript history.
 | Area | Current state | Code-grounded assessment |
 | --- | --- | --- |
 | Runtime triggers | Implemented | `ContextMaintenanceTrigger` covers `UserInput`, `BeforeModel`, `AfterModel`, `AfterTool`, `FocusChanged`, `TaskCompleted`, and `Checkpoint` in `crates/agent-contracts/src/context.rs`. `RuntimeActor` invokes these paths in `crates/agent-runtime/src/actor/`. |
-| Continuous collection | Implemented baseline | `maintain()` runs lifecycle maintenance at runtime events, and `finalize_turn()` runs full `context_gc()` after every committed model turn. `context.collect` can request an additional pass. There is no token-limit trigger. |
+| Continuous collection | Implemented baseline | `maintain()` runs lifecycle maintenance at runtime events, and `finalize_turn()` runs full `context_gc()` after every committed model turn. `context.collect` is not a model-facing tool. There is no token-limit trigger. |
 | Orthogonal lifecycle axes | Implemented | `ContextItem` separates attention, semantic state, physical residency, retention, and GC generation. This is the right base model. |
 | Reversible residency | Implemented baseline | `Resident -> Warm -> Cold -> External` moves old bodies through heap, bounded eviction buffer, and filesystem store; full GC reports eviction/reactivation reasons. |
 | Scope ownership | Implemented | Session, Task, Focus, and Tool scopes exist. Runtime owns Task/Tool transitions; the engine owns policy within the contract. |
@@ -96,7 +96,7 @@ boundedness, and integrity rather than replace it with transcript history.
 | Transient retrieval result | Implemented baseline (`CTX-03`) + capability search/inspect (`CTX-DISC-03`) | `ToolResultDisposition` keeps context search/inspect/fetch and `capability.manage` search/inspect transient in the current `TurnFrame`; load/unload still persist. Runtime E2E and context-service parity verify that context retrieval does not create duplicate observations. |
 | User input envelope | Partial (`CTX-EVENT`) | Dialogue goes through `RuntimeInputEnvelope`. `/focus` `/done` `/cancel` stay direct commands. `UserMessageAccepted` is a 240-char preview; the exact body is sealed as `user-input` when a workspace is wired. Busy dialogue uses a 1-slot in-memory `Queued` (overflow `Rejected`). Cancel publishes `InterruptCommitted` after `TurnCancelled`. Applied → Consumed → Archived on a successful turn. Replay resolves `body_ref` when given a workspace. Dialogue `proposal` is still `None`. |
 | Admission/derivation | Partial | `admit` and `derive` operations, quotas and identity/non-duplication tests exist, but authority/taint, richer provenance, storage-root, and canonical-catalog semantics remain open. Do not infer their full lifecycle contract from the closed transient-retrieval defect. |
-| Task anchor | Implemented baseline (`CTX-10`) | Each `TaskRecord` owns a bounded, versioned `TaskAnchor` (goal interpretation, constraints, acceptance criteria, plan progress, open loops, typed root claims) with whole-set CAS, a bounded `TaskAnchorChanged` audit event, and RuntimeCheckpoint v4 persistence + restore validation. The tool-demand slice (`TaskToolRequirementSet`) remains its own bounded CAS surface. A prompt `TaskAnchorView` now flows through materialize into the focus frame; typed claims split prompt/residency/storage and report `anchor_revision + source_field + RootReason`. Active/Suspended downgrade and sourced `EpisodeOutcome` remain. |
+| Task anchor | Implemented baseline (`CTX-10`) | Each `TaskRecord` owns a bounded, versioned `TaskAnchor` (goal interpretation, constraints, acceptance criteria, plan progress, open loops, typed root claims) with whole-set CAS, a bounded `TaskAnchorChanged` audit event, and RuntimeCheckpoint v4 persistence + restore validation. The tool-demand slice (`TaskToolRequirementSet`) remains its own bounded CAS surface. `PromptAssembler` renders `TaskAnchorView` and Focus from `TaskManager`; production engines leave `MaterializedContext.focus`/`task` empty. `ContextHints.task` still projects the view for engine-internal roots. Typed claims split prompt/residency/storage and report `anchor_revision + source_field + RootReason`. Active/Suspended downgrade and sourced `EpisodeOutcome` remain. |
 | Structured episode outcome | Partial | Task completion now commits an immutable typed `CompletionRecord` (task id, anchor revision, summary, final-output ref/digest, artifacts) atomically with the status flip (`CTX-10`). Episode rotation still does not derive a typed, sourced `EpisodeOutcome` per rotated focus episode. |
 | Task completion output | Implemented baseline (`CTX-10`) | `/done`/`task.complete` commit one task-owned `CompletionRecord`; `TaskCompleted` carries task/result identity, and completed records are storage rather than residency roots. When an artifact workspace is wired, the actor writes the complete final assistant response before `ContextItem` truncation and attaches its artifact ref to the record. The dedicated `final_output_ref`/digest still identify the bounded completion summary, so richer outcome/evidence fields remain open. |
 | Canonical catalog | Implemented navigation directory + incremental dirty sync | `ContextCatalog` is the `item_id -> location` directory plus task/scope/kind/entity/label/lifecycle indexes. Bodies remain in heap / warm / store; GC moves location, it does not copy authority. Checkpoints serialize the three stores and rebuild the directory. Hot-path updates are dirty-id upserts; unmarked length changes still rebuild. |
@@ -242,7 +242,7 @@ cadences.
 | Implemented | `TaskToolRequirementSet` retains exact-name `MustSurface`/`PreferSurface`/`KeepReady` demand. `RoundSurfacePlan` is the bounded per-round projection; loading remains lifecycle, never activation or permission. |
 | Implemented | Live restore rebases focus/surface/requirement revisions, applies capability state fail-closed, and publishes a bounded durable `RuntimeRestored` event before clearing the recovery fence. |
 | Implemented | Task completion atomically closes context/task authority and commits exactly one immutable typed `CompletionRecord`. With an artifact workspace, the complete final assistant response is persisted before bounded context ingest and its ref is attached to the record. |
-| Still open | `CTX-11`: Active/Suspended root downgrade plus a bounded, sourced `ResumePoint`/`TaskProgressView`; sourced `EpisodeOutcome`; ack/obligation-driven episode root release; richer provenance and outcome fields. `TaskAnchor` remains the only task-authority owner. |
+| Still open | `CTX-11`: Active/Suspended root downgrade; `ResumePoint` is a bounded operational cache (checked resources / verification / failed operations) applied after turn commit — not a second TaskAnchor. Sourced `EpisodeOutcome`; ack/obligation-driven episode root release remain. `TaskAnchor` remains the only task-authority owner. |
 
 Tool-demand semantics remain intentionally narrow:
 
@@ -358,22 +358,16 @@ is denied/skipped, the agent continues independent safe work, and the task
 finishes `Partial`/`Blocked` with one consolidated boundary report if the
 operation was essential.
 
-The actor now supplies a bounded `TaskAnchorView` plus typed root claims on
-every materialize (`ContextHints.task` / `anchor_roots`). The engine copies
-the view through without owning or scoring it, so model input is still built
-through `ContextEngine::materialize` without making the engine a second task
-manager. A versioned `ContextTaskView` wrapper is not required: the two
-projections already travel together on `ContextHints`.
+The actor supplies a bounded `TaskAnchorView` on `ContextHints.task` for
+engine-internal roots. `PromptAssembler` renders Focus / TaskAnchor /
+TaskProgress from `TaskManager`. Production engines leave
+`MaterializedContext.focus` and `.task` empty.
 
-The next context integration step is Active/Suspended root downgrade and
-ResumePoint rehydration. Its causal evaluation is queued behind the measured
-tool-quality preflight (`TOOL-ENV-01`, `TOOL-EDIT-01`, `TOOL-VIEW-01`,
-`TOOL-ERROR-01`): current failed-tool loops cannot prove that missing progress
-state caused C's extra rounds. The contract may be designed and unit-tested in
-parallel, but another live Context Bench comparison must first rerun the same
-frozen cells on the corrected tool baseline with scoring unchanged. Target
-task-state semantics (the current runtime exposes
-`Active | Suspended | Completed` and has not yet landed the full root view):
+`ResumePoint` is a bounded operational cache, not a second task authority.
+Objective / blockers / next-actions stay on `TaskAnchor`. Causal evaluation
+of ResumePoint still needs a dedicated ablation; `task_switch_long_b` pass
+does not prove it. Keep historical `semantic_recall.v1` as a long-protocol
+trajectory, not as a GC-forget-and-recall test.
 
 - **Active:** the anchor is a mandatory materialization tier; current
   `working_refs` are online residency roots.
@@ -382,17 +376,12 @@ task-state semantics (the current runtime exposes
   bodies may cool/externalize. A bounded sourced `ResumePoint` captures the
   operational progress needed to continue without reconstructing it from
   dialogue. It is an actor-owned subrecord bound to `task_id + anchor_revision`,
-  not a second task-authority store: the current objective is a projection of
-  the anchor, and the resume record cannot rewrite the goal, hard constraints,
-  or acceptance criteria. Its bounded `TaskProgressView` contains:
-  - current objective, unresolved constraints/blockers and next actions;
-  - checked file/entity refs with the observed content digest or revision and
-    last-checked turn, never copied file bodies;
-  - recent verification facts with a bounded command display/digest, target,
-    outcome and evidence ref, never full stdout/stderr;
-  - known failed-command facts with failure class, last result/evidence ref and
-    whether the failure still blocks progress;
-  - bounded working/evidence refs needed to rematerialize the next step.
+  not a second task-authority store. `TaskProgressView` contains:
+  - checked file/entity refs with the observed content digest or revision;
+  - recent verification facts from typed verify intent, never every shell;
+  - known failed-command facts keyed by tool + command/resource target;
+  - last execution cursor.
+  Objective / blockers / next-actions stay on `TaskAnchor`.
   Every collection and string gets a named hard cap; overflow content is stored
   once as an artifact/context body and represented only by a typed ref. Runtime
   updates this record only from trusted safe-point facts (successful tool

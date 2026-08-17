@@ -53,7 +53,7 @@ pub use plugin::{
     HookRef, HookView, PLUGIN_TEST_OUTPUT_TAIL_CHARS, PLUGIN_TEST_TIMEOUT, PluginPackageView,
     PluginRegistry, PluginTestReport, PluginTestResult, SkillView,
 };
-pub use prompt::PromptAssembler;
+pub use prompt::{PromptAssembler, focus_frame_tokens};
 pub use services::{AuthorityRecoveryServices, RuntimeServices};
 pub use task::{
     AnchorPatch, ContextRootClaim, RootClaimRole, RootClaimStrength, TaskAnchor, TaskInfo,

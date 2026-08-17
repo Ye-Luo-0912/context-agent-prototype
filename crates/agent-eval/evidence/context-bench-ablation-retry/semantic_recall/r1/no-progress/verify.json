@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 7,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 9,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "e31deb5cd021762c95786cfa86c46426d702a231b96b80cf4761ce970b84325d",
+      "bytes": 3554,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    let body = bytes.trim();\n\n    if body == \"ping\" || body == r#\"{\"version\":1,\"type\":\"ping\"}\"# {\n        return Ok(Msg::Ping);\n    }\n\n    if let Some(value) = body\n        .strip_prefix(r#\"{\"v\":2,\"type\":\"hello\",\"value\":\"\"#)\n        .and_then(|body| body.strip_suffix(r#\"\"}\"#))\n    {\n        return unescape_json(value).map(Msg::Hello);\n    }\n\n    eprintln!(\"decode error: unknown message body: {body:?}\");\n    Err(\"unknown\".into())\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => r#\"{\"version\":1,\"type\":\"ping\"}\"#.into(),\n        Msg::Hello(value) => format!(\n            r#\"{{\"v\":2,\"type\":\"hello\",\"value\":\"{}\"}}\"#,\n            escape_json(value)\n        ),\n    }\n}\n\nfn escape_json(value: &str) -> String {\n    let mut escaped = String::with_capacity(value.len());\n    for character in value.chars() {\n        match character {\n            '\"' => escaped.push_str(r#\"\\\"\"#),\n            '\\\\' => escaped.push_str(r#\"\\\\\"#),\n            '\\n' => escaped.push_str(r#\"\\n\"#),\n            '\\r' => escaped.push_str(r#\"\\r\"#),\n            '\\t' => escaped.push_str(r#\"\\t\"#),\n            character if character.is_control() => {\n                escaped.push_str(&format!(r#\"\\u{:04x}\"#, character as u32));\n            }\n            character => escaped.push(character),\n        }\n    }\n    escaped\n}\n\nfn unescape_json(value: &str) -> Result<String, String> {\n    let mut unescaped = String::with_capacity(value.len());\n    let mut characters = value.chars();\n    while let Some(character) = characters.next() {\n        if character != '\\\\' {\n            unescaped.push(character);\n            continue;\n        }\n\n        match characters.next() {\n            Some('\"') => unescaped.push('\"'),\n            Some('\\\\') => unescaped.push('\\\\'),\n            Some('/') => unescaped.push('/'),\n            Some('b') => unescaped.push('\\u{0008}'),\n            Some('f') => unescaped.push('\\u{000c}'),\n            Some('n') => unescaped.push('\\n'),\n            Some('r') => unescaped.push('\\r'),\n            Some('t') => unescaped.push('\\t'),\n            _ => return Err(\"unknown\".into()),\n        }\n    }\n    Ok(unescaped)\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{decode, encode, Msg};\n\n    #[test]\n    fn decodes_ping_bodies() {\n        assert!(matches!(decode(\"ping\"), Ok(Msg::Ping)));\n        assert!(matches!(\n            decode(r#\" {\"version\":1,\"type\":\"ping\"} \"#),\n            Ok(Msg::Ping)\n        ));\n    }\n\n    #[test]\n    fn decodes_a_v2_hello() {\n        assert!(matches!(\n            decode(r#\" {\"v\":2,\"type\":\"hello\",\"value\":\"client\"} \"#),\n            Ok(Msg::Hello(value)) if value == \"client\"\n        ));\n    }\n\n    #[test]\n    fn encodes_versioned_messages() {\n        assert_eq!(encode(&Msg::Ping), r#\"{\"version\":1,\"type\":\"ping\"}\"#);\n        assert_eq!(\n            encode(&Msg::Hello(\"client\".into())),\n            r#\"{\"v\":2,\"type\":\"hello\",\"value\":\"client\"}\"#\n        );\n    }\n\n    #[test]\n    fn roundtrips_messages() {\n        assert!(matches!(decode(&encode(&Msg::Ping)), Ok(Msg::Ping)));\n        assert!(matches!(\n            decode(&encode(&Msg::Hello(\"a \\\"quoted\\\" value\".into()))),\n            Ok(Msg::Hello(value)) if value == \"a \\\"quoted\\\" value\"\n        ));\n    }\n\n    #[test]\n    fn rejects_unrecognized_bodies() {\n        assert!(decode(\"not-ping\").is_err());\n        assert!(decode(r#\"{\"version\":2,\"type\":\"ping\"}\"#).is_err());\n        assert!(decode(r#\"{\"v\":1,\"type\":\"hello\",\"value\":\"client\"}\"#).is_err());\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmp70gJQL\\no-progress"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

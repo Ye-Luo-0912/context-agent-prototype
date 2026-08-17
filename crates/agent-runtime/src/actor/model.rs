@@ -310,10 +310,17 @@ impl RuntimeActor {
         } else {
             DEFAULT_OUTPUT_RESERVE
         };
+        let (runtime_focus, task_view, progress_view) = self.runtime_prompt_focus(&turn_frame);
+        let runtime_focus_frame_tokens = crate::prompt::focus_frame_tokens(
+            runtime_focus.as_ref(),
+            task_view.as_ref(),
+            progress_view.as_ref(),
+        );
         let model_budget = ModelBudget::compute(
             pack_window,
             output_reserve,
             self.assembler.system_prompt_tokens(),
+            runtime_focus_frame_tokens,
             turn_frame_tokens,
             active_tools_tokens,
         );
@@ -321,18 +328,13 @@ impl RuntimeActor {
         // 当前活跃任务锚的根声明投影：PromptRequired 的声明会强制条目进帧。
         // TaskAnchorView 和 Focus 由 PromptAssembler 从 TaskManager 取，
         // 不再经引擎 materialize 回传。hints.task 仍投影给引擎内部使用。
-        let (anchor_roots, task_view) = self
+        let anchor_roots = self
             .state
             .tasks
             .active()
             .and_then(|task_id| self.state.tasks.get(task_id))
-            .map(|task| {
-                (
-                    crate::task::anchor_root_claims(&task.anchor),
-                    Some(crate::task::task_anchor_view(&task.anchor)),
-                )
-            })
-            .unwrap_or((Vec::new(), None));
+            .map(|task| crate::task::anchor_root_claims(&task.anchor))
+            .unwrap_or_default();
         let materialized = match self
             .services
             .context_materialize(ContextQuery {
@@ -341,7 +343,7 @@ impl RuntimeActor {
                 hints: ContextHints {
                     max_selected_items: Some(CONTEXT_CONSUMPTION_ACK_ITEM_CAP),
                     anchor_roots,
-                    task: task_view,
+                    task: task_view.clone(),
                 },
             })
             .await
@@ -570,6 +572,15 @@ impl RuntimeActor {
                 generation,
                 surface_revision,
                 model_round,
+                prompt_layers: crate::prompt::prompt_layer_costs(
+                    &self.assembler,
+                    runtime_focus.as_ref(),
+                    task_view.as_ref(),
+                    progress_view.as_ref(),
+                    &materialized,
+                    &turn_frame,
+                    &input.tool_schemas,
+                ),
             })
             .await
         {
@@ -687,10 +698,14 @@ impl RuntimeActor {
         if !turn_frame.user_message.is_empty() {
             focus.current_query = turn_frame.user_message.clone();
         }
+        let progress = self
+            .services
+            .project_task_progress()
+            .then(|| task.resume.view());
         (
             Some(focus),
             Some(crate::task::task_anchor_view(&task.anchor)),
-            Some(task.resume.view()),
+            progress,
         )
     }
 }

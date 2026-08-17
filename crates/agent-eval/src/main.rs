@@ -141,11 +141,16 @@ fn usage() -> ! {
          \n\
          usage: agent-eval --context-bench\n\
          usage: agent-eval [--repeats N] [--evidence-dir <dir>] --context-bench-run [id]\n\
+         usage: agent-eval [--repeats N] [--evidence-dir <dir>] --context-bench-ablation\n\
          \n\
          EVAL-02 Context Benchmark: 12 tasks that ask where dynamic context\n\
          helps or hurts a coding agent. --context-bench prints the pack.\n\
          --context-bench-run is live A/C (rolling only on horizon_long,\n\
          semantic_recall, task_switch). Wave 1 is 24+3 cells at repeats=1.\n\
+         --context-bench-ablation is C-only on semantic_recall: current /\n\
+         force-compact / no-progress, default repeats=2, shuffled arm order.\n\
+         It does not rewrite SPEC or the frozen pack. Default evidence dir\n\
+         is crates/agent-eval/evidence/context-bench-ablation/.\n\
          This does not close M15 and does not open the 300×3 ITT gate.\n"
     );
     std::process::exit(2);
@@ -158,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let mut engines: Vec<&'static str> = Vec::new();
     let mut repeats: u32 = 1;
+    let mut repeats_set = false;
     let mut evidence_dir: Option<std::path::PathBuf> = None;
     let mut include_swebench = false;
     let mut file_only = false;
@@ -259,6 +265,7 @@ async fn main() -> anyhow::Result<()> {
                 if !(1..=8).contains(&repeats) {
                     anyhow::bail!("--repeats must be 1..=8 (harness smoke, not the 300×3 gate)");
                 }
+                repeats_set = true;
             }
             "--evidence-dir" => {
                 let Some(value) = args.next() else {
@@ -379,6 +386,11 @@ async fn main() -> anyhow::Result<()> {
             "--context-bench-run" => {
                 let only = args.next().filter(|value| !value.starts_with('-'));
                 run_context_bench_live(only, repeats, evidence_dir).await?;
+                return Ok(());
+            }
+            "--context-bench-ablation" => {
+                let repeats = if repeats_set { repeats } else { 2 };
+                run_context_bench_ablation(repeats, evidence_dir).await?;
                 return Ok(());
             }
             "--all" => engines = vec!["append", "rolling", "dynamic"],
@@ -625,6 +637,51 @@ async fn run_context_bench_live(
             let pair_dir = pair.root.join(task.id()).join(format!("r{round}"));
             print!("{}", bundle::render_evidence(&pair_dir)?);
         }
+    }
+    Ok(())
+}
+
+async fn run_context_bench_ablation(
+    repeats: u32,
+    evidence_dir: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    let pack = context_bench::load_pack()?;
+    eprintln!("{}", context_bench::check_pack(&pack)?);
+    let task = pack
+        .tasks
+        .iter()
+        .find(|task| task.id() == "semantic_recall")
+        .ok_or_else(|| anyhow::anyhow!("context-bench pack is missing semantic_recall"))?;
+    let model = driver::build_live_coding_model()?;
+    let evidence_root = evidence_dir.unwrap_or_else(|| {
+        std::path::PathBuf::from("crates/agent-eval/evidence/context-bench-ablation")
+    });
+    std::fs::create_dir_all(&evidence_root)?;
+    eprintln!("evidence dir: {}", evidence_root.display());
+    for round in 1..=repeats {
+        eprintln!(
+            "== context-bench-ablation semantic_recall arms={:?} repeat {round}/{repeats} ==",
+            fixture_driver::ablation_arm_order(round)
+        );
+        let dir = tempfile::tempdir()?;
+        let pair = bundle::PairSink {
+            root: evidence_root.clone(),
+            fixture_id: task.id().to_string(),
+            repeat: round,
+            repeats,
+            live: true,
+        };
+        let runs = fixture_driver::compare_ablation_live(
+            &pack,
+            task,
+            dir.path(),
+            model.clone(),
+            Some(&pair),
+        )
+        .await?;
+        print!("{}", fixture_driver::render_live_comparison(&runs));
+        let pair_dir = pair.root.join(task.id()).join(format!("r{round}"));
+        print!("{}", bundle::render_evidence(&pair_dir)?);
     }
     Ok(())
 }

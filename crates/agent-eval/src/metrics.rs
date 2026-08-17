@@ -123,6 +123,21 @@ pub struct RunMetrics {
     pub reactivation_consumed: u64,
     pub reactivation_selected_tokens: u64,
     pub reactivation_consumed_tokens: u64,
+    pub reactivation_events: u64,
+    pub unique_reactivated: u64,
+    pub reactivated_tokens: u64,
+    pub reactivation_tool_observation_selected: u64,
+    pub reactivation_tool_observation_consumed: u64,
+    pub reactivation_file_observation_selected: u64,
+    pub reactivation_file_observation_consumed: u64,
+    pub prompt_system_tokens: u64,
+    pub prompt_runtime_facts_tokens: u64,
+    pub prompt_task_anchor_tokens: u64,
+    pub prompt_task_progress_tokens: u64,
+    pub prompt_current_focus_tokens: u64,
+    pub prompt_historical_context_tokens: u64,
+    pub prompt_turn_frame_tokens: u64,
+    pub prompt_tool_schema_tokens: u64,
     /// Repeated `fs.read` of the same path (workspace reread, not an id partition).
     pub recovery_workspace_reread: u64,
     /// Forgotten ids that were never recovered.
@@ -315,6 +330,32 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 metrics.rounds += 1;
                 metrics.schema_tokens_total += report.selected_schema_tokens as u64;
             }
+            RuntimeEvent::ModelStarted { prompt_layers, .. } => {
+                metrics.prompt_system_tokens = metrics
+                    .prompt_system_tokens
+                    .saturating_add(prompt_layers.system_tokens);
+                metrics.prompt_runtime_facts_tokens = metrics
+                    .prompt_runtime_facts_tokens
+                    .saturating_add(prompt_layers.runtime_facts_tokens);
+                metrics.prompt_task_anchor_tokens = metrics
+                    .prompt_task_anchor_tokens
+                    .saturating_add(prompt_layers.task_anchor_tokens);
+                metrics.prompt_task_progress_tokens = metrics
+                    .prompt_task_progress_tokens
+                    .saturating_add(prompt_layers.task_progress_tokens);
+                metrics.prompt_current_focus_tokens = metrics
+                    .prompt_current_focus_tokens
+                    .saturating_add(prompt_layers.current_focus_tokens);
+                metrics.prompt_historical_context_tokens = metrics
+                    .prompt_historical_context_tokens
+                    .saturating_add(prompt_layers.historical_context_tokens);
+                metrics.prompt_turn_frame_tokens = metrics
+                    .prompt_turn_frame_tokens
+                    .saturating_add(prompt_layers.turn_frame_tokens);
+                metrics.prompt_tool_schema_tokens = metrics
+                    .prompt_tool_schema_tokens
+                    .saturating_add(prompt_layers.tool_schema_tokens);
+            }
             RuntimeEvent::ModelUsed {
                 input_tokens,
                 output_tokens,
@@ -439,6 +480,17 @@ fn snapshot_access(metrics: &mut RunMetrics, diagnostics: &agent_contracts::Cont
     metrics.reactivation_consumed = diagnostics.reactivation_consumed;
     metrics.reactivation_selected_tokens = diagnostics.reactivation_selected_tokens;
     metrics.reactivation_consumed_tokens = diagnostics.reactivation_consumed_tokens;
+    metrics.reactivation_events = diagnostics.reactivation_events;
+    metrics.unique_reactivated = diagnostics.unique_reactivated;
+    metrics.reactivated_tokens = diagnostics.reactivated_tokens;
+    metrics.reactivation_tool_observation_selected =
+        diagnostics.reactivation_tool_observation_selected;
+    metrics.reactivation_tool_observation_consumed =
+        diagnostics.reactivation_tool_observation_consumed;
+    metrics.reactivation_file_observation_selected =
+        diagnostics.reactivation_file_observation_selected;
+    metrics.reactivation_file_observation_consumed =
+        diagnostics.reactivation_file_observation_consumed;
 }
 
 /// The nearest-rank percentile of a sorted sample: index
@@ -463,7 +515,9 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          retrieval_latency: p50={}ms p95={}ms inspect={} fetch={} admit={}\n\
          recovery: forgotten={} recovered={} search={} reactivate={} reread={} failed={}\n\
          access: search_hits={} inspects={} fetches={} admits={} acks={}\n\
-         reactivation_utility: selected={} consumed={} selected_tokens={} consumed_tokens={}\n\
+         reactivation_utility: events={} unique={} selected={} consumed={} tokens(reactivated/selected/consumed)={}/{}/{}\n\
+         reactivation_kind: tool_obs selected/consumed={}/{} file_obs selected/consumed={}/{}\n\
+         prompt_layers: system={} facts={} anchor={} progress={} focus={} history={} turn={} tools={}\n\
          compaction: in={} out={}\n\
          behavior: tool_calls={} failed_outputs={} spills={} output_chars={} repeated_fs_reads={}\n\
          tool_failures: {:?}\n",
@@ -514,10 +568,25 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.access_fetches,
         metrics.access_admits,
         metrics.access_consumption_acks,
+        metrics.reactivation_events,
+        metrics.unique_reactivated,
         metrics.reactivation_selected,
         metrics.reactivation_consumed,
+        metrics.reactivated_tokens,
         metrics.reactivation_selected_tokens,
         metrics.reactivation_consumed_tokens,
+        metrics.reactivation_tool_observation_selected,
+        metrics.reactivation_tool_observation_consumed,
+        metrics.reactivation_file_observation_selected,
+        metrics.reactivation_file_observation_consumed,
+        metrics.prompt_system_tokens,
+        metrics.prompt_runtime_facts_tokens,
+        metrics.prompt_task_anchor_tokens,
+        metrics.prompt_task_progress_tokens,
+        metrics.prompt_current_focus_tokens,
+        metrics.prompt_historical_context_tokens,
+        metrics.prompt_turn_frame_tokens,
+        metrics.prompt_tool_schema_tokens,
         metrics.compaction_input_tokens,
         metrics.compaction_output_tokens,
         metrics.tool_calls,
@@ -535,9 +604,10 @@ mod tests {
     use agent_contracts::{
         AttentionState, CompactionReason, ContextDiagnostics, ContextGcReport, ContextItemId,
         ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextScope,
-        ContextSelection, ContextStateTransition, InputLifecycle, RunId, RuntimeInputEnvelope,
-        ScoreBreakdown, TaskId, ToolOutput, ToolSurfaceDemand, ToolSurfacePlanReport,
-        ToolSurfacePlanStatus, ToolSurfaceSelection, ToolSurfaceSourceRevisions, TurnId,
+        ContextSelection, ContextStateTransition, InputLifecycle, OperationId, PromptLayerCosts,
+        RunId, RuntimeInputEnvelope, ScoreBreakdown, TaskId, ToolOutput, ToolSurfaceDemand,
+        ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceSelection,
+        ToolSurfaceSourceRevisions, TurnId,
     };
     use serde_json::json;
 
@@ -717,6 +787,28 @@ mod tests {
         events.push(envelope(
             run,
             seq,
+            RuntimeEvent::ModelStarted {
+                turn_id: TurnId::new(),
+                operation_id: OperationId::new(),
+                generation: 1,
+                surface_revision: 1,
+                model_round: 1,
+                prompt_layers: PromptLayerCosts {
+                    system_tokens: 80,
+                    runtime_facts_tokens: 20,
+                    task_anchor_tokens: 30,
+                    task_progress_tokens: 40,
+                    current_focus_tokens: 15,
+                    historical_context_tokens: 800,
+                    turn_frame_tokens: 50,
+                    tool_schema_tokens: 512,
+                },
+            },
+        ));
+        seq += 1;
+        events.push(envelope(
+            run,
+            seq,
             RuntimeEvent::ModelUsed {
                 input_tokens: 9_000,
                 output_tokens: 120,
@@ -772,6 +864,17 @@ mod tests {
                     cold_items: 1,
                     external_items: 1,
                     approx_active_tokens: 4_000,
+                    reactivation_events: 42,
+                    unique_reactivated: 32,
+                    reactivation_selected: 10,
+                    reactivation_consumed: 8,
+                    reactivated_tokens: 400,
+                    reactivation_selected_tokens: 120,
+                    reactivation_consumed_tokens: 90,
+                    reactivation_tool_observation_selected: 6,
+                    reactivation_tool_observation_consumed: 4,
+                    reactivation_file_observation_selected: 3,
+                    reactivation_file_observation_consumed: 2,
                     ..ContextDiagnostics::default()
                 },
                 selected: vec![ContextSelection {
@@ -806,6 +909,12 @@ mod tests {
         assert_eq!(metrics.schema_tokens_total, 512);
         assert_eq!(metrics.model_input_tokens, 9_000);
         assert_eq!(metrics.model_output_tokens, 120);
+        assert_eq!(metrics.prompt_task_progress_tokens, 40);
+        assert_eq!(metrics.prompt_historical_context_tokens, 800);
+        assert_eq!(metrics.reactivation_events, 42);
+        assert_eq!(metrics.unique_reactivated, 32);
+        assert_eq!(metrics.reactivation_selected, 10);
+        assert_eq!(metrics.reactivation_tool_observation_selected, 6);
         assert_eq!(metrics.materialize_rounds, 2);
         assert_eq!(metrics.selected_items_total, 3);
         assert_eq!(metrics.selected_tokens_total, 750);
@@ -837,6 +946,10 @@ mod tests {
         assert!(rendered.contains("store: write_bytes=512 read_bytes=128 recalled_items=2"));
         assert!(rendered.contains("retrieval: search_calls=0"));
         assert!(rendered.contains("recovery: forgotten=0 recovered=0"));
+        assert!(rendered.contains("events=42 unique=32"));
+        assert!(rendered.contains("progress=40"));
+        assert!(rendered.contains("history=800"));
+        assert!(rendered.contains("tool_obs selected/consumed=6/4"));
     }
 
     #[test]

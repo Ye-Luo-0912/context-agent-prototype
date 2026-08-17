@@ -2,8 +2,9 @@
 //! Behavior is unchanged; these used to live in `engine.rs`.
 
 use agent_contracts::{
-    CompactionReason, ContextItemId, ContextKind, ContextRetention, ContextScope, DependencyEdge,
-    DependencyKind, ScopeId, ScopeKind, ScopeState, TaskId, bound_compaction_source,
+    CompactionReason, ContextItemId, ContextKind, ContextRetention, ContextScope, CoreLabel,
+    DependencyEdge, DependencyKind, ScopeId, ScopeKind, ScopeState, TaskId,
+    bound_compaction_source,
 };
 
 use crate::engine::{SimpleContextConfig, State};
@@ -58,7 +59,10 @@ pub(crate) fn plan_task_distill(
 /// `close_focus_episode` so membership still uses the open focus scope's
 /// `opened_tick`. Raw bodies stay; the compact result becomes a Durable
 /// task-scope card. `None` when there is nothing to distill.
-pub(crate) fn plan_episode_distill(state: &State) -> Option<DistillJob> {
+pub(crate) fn plan_episode_distill(
+    state: &State,
+    config: &SimpleContextConfig,
+) -> Option<DistillJob> {
     let task = state.focus.as_ref()?.task_id;
     let opened_tick = state
         .scopes
@@ -85,7 +89,7 @@ pub(crate) fn plan_episode_distill(state: &State) -> Option<DistillJob> {
     }
     // Short episodes with no durable semantic payload are not worth a
     // provider round: raw tool dumps stay retrievable without an LLM card.
-    if !episode_worth_llm_distill(state, opened_tick, task) {
+    if !config.force_episode_llm_distill && !episode_worth_llm_distill(state, opened_tick, task) {
         return None;
     }
     let start = members.len().saturating_sub(MAX_DISTILL_SOURCES);
@@ -126,24 +130,46 @@ fn episode_worth_llm_distill(state: &State, opened_tick: u64, task: TaskId) -> b
     if generation >= 4 {
         return true;
     }
-    state.items.iter().any(|item| {
-        item.task_id == Some(task)
-            && item.created_tick >= opened_tick
-            && item.semantic.is_live()
-            && item_has_semantic_outcome(item)
-    })
+    state
+        .items
+        .iter()
+        .any(|item| item_carries_semantic_delta(item, opened_tick, task))
 }
 
-fn item_has_semantic_outcome(item: &agent_contracts::ContextItem) -> bool {
+fn item_carries_semantic_delta(
+    item: &agent_contracts::ContextItem,
+    opened_tick: u64,
+    task: TaskId,
+) -> bool {
+    if item.task_id != Some(task) || item.created_tick < opened_tick {
+        return false;
+    }
     if matches!(
         item.semantic,
         agent_contracts::SemanticState::VerifiedFixed { .. }
     ) {
         return true;
     }
+    if !item.semantic.is_live() {
+        return false;
+    }
+    if item.kind == ContextKind::Error {
+        return true;
+    }
+    if item.tags.iter().any(|tag| {
+        tag.is_core(CoreLabel::Decision)
+            || tag.is_core(CoreLabel::Finding)
+            || tag.is_core(CoreLabel::Constraint)
+            || tag.is_core(CoreLabel::OpenLoop)
+    }) {
+        return true;
+    }
     matches!(
+        item.retention,
+        ContextRetention::Durable | ContextRetention::Pinned
+    ) && matches!(
         item.kind,
-        ContextKind::Decision | ContextKind::FileObservation | ContextKind::Summary
+        ContextKind::Constraint | ContextKind::Decision | ContextKind::Summary | ContextKind::Goal
     )
 }
 

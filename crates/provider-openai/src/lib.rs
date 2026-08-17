@@ -74,6 +74,23 @@ pub const DEFAULT_MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 /// model's real limit; override with `OPENAI_CONTEXT_WINDOW`.
 pub const DEFAULT_DECLARED_CONTEXT_WINDOW: usize = 128_000;
 
+/// 5xx and 429 are retryable. A genuine 400 (bad schema, illegal tool
+/// name, context overflow) is not. Some compatible gateways wrap a
+/// transient upstream failure as HTTP 400 `invalid_request_error` with
+/// message `Upstream request failed`; that body is retryable, because the
+/// same payload later succeeds. Do not treat every 400 as retryable.
+fn http_status_retryable(code: u16, body: &str) -> bool {
+    if (500..600).contains(&code) || code == 429 {
+        return true;
+    }
+    code == 400 && gateway_wrapped_upstream_failure(body)
+}
+
+fn gateway_wrapped_upstream_failure(body: &str) -> bool {
+    body.to_ascii_lowercase()
+        .contains("upstream request failed")
+}
+
 fn truncate_error_body(body: &str) -> String {
     let trimmed = body.trim();
     let total = trimmed.chars().count();
@@ -146,9 +163,8 @@ impl ModelTransport for OpenAiProvider {
         if !status.is_success() {
             let code = status.as_u16();
             let body = response.text().await.unwrap_or_default();
-            let retryable = status.is_server_error() || code == 429;
             return Err(AgentError::Transport {
-                retryable,
+                retryable: http_status_retryable(code, &body),
                 message: format!("HTTP {code}: {}", truncate_error_body(&body)),
             });
         }
@@ -499,6 +515,24 @@ mod tests {
         assert_eq!(output.tool_calls.len(), 1);
         assert_eq!(output.tool_calls[0].id, "c1");
         assert_eq!(output.tool_calls[0].name, "fs.list");
+    }
+
+    #[test]
+    fn gateway_wrapped_upstream_400_is_retryable_real_400_is_not() {
+        let wrapped =
+            r#"{"error":{"message":"Upstream request failed","type":"invalid_request_error"}}"#;
+        assert!(http_status_retryable(400, wrapped));
+        assert!(http_status_retryable(502, "bad gateway"));
+        assert!(http_status_retryable(429, "rate limited"));
+        assert!(!http_status_retryable(
+            400,
+            r#"{"error":{"message":"Invalid 'tools[0].name': string does not match pattern. Expected '^[a-zA-Z0-9_-]+$'."}}"#
+        ));
+        assert!(!http_status_retryable(
+            400,
+            r#"{"error":{"message":"context_length_exceeded"}}"#
+        ));
+        assert!(!http_status_retryable(401, wrapped));
     }
 
     #[test]

@@ -1,0 +1,126 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 467456,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 1617,
+  "model_started": 58,
+  "model_used": 58,
+  "usage_incomplete": false,
+  "workspace_sha256": "222c5743561265712c4ceb04a46b547b1f3b0500f04ea98d1ed4633a88657274",
+  "workspace_files": 30,
+  "tools": [
+    {
+      "name": "context.manage",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "edit.replace",
+      "calls": 12,
+      "failed": 8
+    },
+    {
+      "name": "fs.list",
+      "calls": 10,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 19,
+      "failed": 2
+    },
+    {
+      "name": "fs.write",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 9,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 12,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 5,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 16,
+      "failed": 2
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 388,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 12,
+    "fetch_calls": 0,
+    "final_resident_bytes": 5442,
+    "forgotten_items": 95,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 306,
+    "materialize_rounds": 58,
+    "model_input_tokens": 541931,
+    "model_output_tokens": 16438,
+    "peak_resident_bytes": 5442,
+    "prompt_current_focus_tokens": 2233,
+    "prompt_historical_context_tokens": 46655,
+    "prompt_runtime_facts_tokens": 1566,
+    "prompt_system_tokens": 4118,
+    "prompt_task_anchor_tokens": 2900,
+    "prompt_task_progress_tokens": 0,
+    "prompt_tool_schema_tokens": 88392,
+    "prompt_turn_frame_tokens": 133588,
+    "provider_tokens_total": 558369,
+    "reactivated_tokens": 2402,
+    "reactivation_consumed": 22,
+    "reactivation_consumed_tokens": 1592,
+    "reactivation_events": 48,
+    "reactivation_file_observation_consumed": 0,
+    "reactivation_file_observation_selected": 0,
+    "reactivation_selected": 22,
+    "reactivation_selected_tokens": 1592,
+    "reactivation_tool_observation_consumed": 22,
+    "reactivation_tool_observation_selected": 22,
+    "recovered_items": 32,
+    "recovery_auto_reactivation": 32,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 63,
+    "recovery_workspace_reread": 16,
+    "repeated_fs_reads": 16,
+    "rounds": 58,
+    "schema_tokens_total": 88392,
+    "search_calls": 3,
+    "search_empty": 3,
+    "search_hits": 0,
+    "search_ms_p50": 3,
+    "search_ms_p95": 4,
+    "tool_calls": 89,
+    "tool_failure_classes": {
+      "missing_project_marker": 1,
+      "no_exact_match": 1,
+      "no_search_match": 1,
+      "path_not_found": 2,
+      "process_exit": 1,
+      "stale_revision": 7
+    },
+    "turns": 9,
+    "unique_reactivated": 32
+  }
+}

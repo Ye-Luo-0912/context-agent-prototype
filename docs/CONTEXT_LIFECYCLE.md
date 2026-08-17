@@ -830,23 +830,18 @@ projected claim carries `anchor_revision`, `source_field_id`, and a
 `anchor_root_protections`. The completion boundary force-clears the
 projection, so a finished task's records stop being rooted.
 
-The same materialize request also carries a bounded `TaskAnchorView`
-(`ContextHints.task` → `MaterializedContext.task`). That view is the
-active task contract in the focus frame (`TASK ANCHOR rev=N`); the engine
-copies it through without scoring it as a heap item. Goal/interpretation/
-constraints/criteria/progress/open loops are in the view; working/evidence
-refs stay on the root projection.
+The same materialize request also carries a bounded `TaskAnchorView` on
+`ContextHints.task` for engine-internal root policy. The assembler renders
+Focus / TaskAnchor / TaskProgress from the runtime `TaskManager`; production
+engines leave `MaterializedContext.focus` / `.task` empty.
 
-`CTX-11` is landed as an actor-owned `ResumePoint` bound to
-`task_id + anchor_revision`. `TaskProgressView` is only its bounded prompt
-projection. It records current objective, unresolved constraints/blockers,
-next actions, checked file/entity refs with their observed digest/revision,
-recent verification facts, and known failed-command facts. Bodies and full
-command output remain in context/artifact storage. Updates land from trusted
-tool results at durable turn commit; model prose is not authority. While
-suspended, the view is absent from unrelated prompts. Reactivation
-materializes `TaskAnchorView + TaskProgressView` from the runtime assembler;
-it never reconstructs the old transcript.
+`CTX-11` is a bounded operational cache (`ResumePoint`) on `TaskRecord`,
+bound to `task_id + anchor_revision`. `TaskProgressView` projects checked
+resources, verification state, and unresolved operation failures. It does
+not own objective / blockers / next-actions. Updates apply after the
+durable turn commit. Generic may-mutate processes without a resource path
+invalidate workspace file facts. This is not yet evidence that ResumePoint
+belongs in V1.
 
 Producing a `RuntimeDirective` requires the `runtime:context-control`
 permission in the capability manifest; a tool without it gets its directive

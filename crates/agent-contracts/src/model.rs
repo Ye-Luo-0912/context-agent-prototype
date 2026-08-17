@@ -230,6 +230,51 @@ impl ModelInput {
     }
 }
 
+/// Per-request prompt-layer token accounting. Sums across `ModelStarted`
+/// events tell whether C grew because of historical context or because
+/// TaskProgress / Focus itself got longer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PromptLayerCosts {
+    pub system_tokens: u64,
+    pub runtime_facts_tokens: u64,
+    pub task_anchor_tokens: u64,
+    pub task_progress_tokens: u64,
+    pub current_focus_tokens: u64,
+    pub historical_context_tokens: u64,
+    pub turn_frame_tokens: u64,
+    pub tool_schema_tokens: u64,
+}
+
+impl PromptLayerCosts {
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            system_tokens: self.system_tokens.saturating_add(other.system_tokens),
+            runtime_facts_tokens: self
+                .runtime_facts_tokens
+                .saturating_add(other.runtime_facts_tokens),
+            task_anchor_tokens: self
+                .task_anchor_tokens
+                .saturating_add(other.task_anchor_tokens),
+            task_progress_tokens: self
+                .task_progress_tokens
+                .saturating_add(other.task_progress_tokens),
+            current_focus_tokens: self
+                .current_focus_tokens
+                .saturating_add(other.current_focus_tokens),
+            historical_context_tokens: self
+                .historical_context_tokens
+                .saturating_add(other.historical_context_tokens),
+            turn_frame_tokens: self
+                .turn_frame_tokens
+                .saturating_add(other.turn_frame_tokens),
+            tool_schema_tokens: self
+                .tool_schema_tokens
+                .saturating_add(other.tool_schema_tokens),
+        }
+    }
+}
+
 /// Provider capability declaration. The kernel/UI can branch on this without
 /// vendor-specific knowledge.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

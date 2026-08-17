@@ -603,7 +603,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> anyhow::Resu
 }
 
 fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
-    json!({
+    let mut value = json!({
         "model_input_tokens": metrics.model_input_tokens,
         "model_output_tokens": metrics.model_output_tokens,
         "schema_tokens_total": metrics.schema_tokens_total,
@@ -647,7 +647,32 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
         "final_resident_bytes": metrics.final_resident_bytes,
         "peak_resident_bytes": metrics.peak_resident_bytes,
         "materialize_rounds": metrics.materialize_rounds,
-    })
+    });
+    if let Some(map) = value.as_object_mut() {
+        map.extend(
+            json!({
+                "reactivation_events": metrics.reactivation_events,
+                "unique_reactivated": metrics.unique_reactivated,
+                "reactivated_tokens": metrics.reactivated_tokens,
+                "reactivation_tool_observation_selected": metrics.reactivation_tool_observation_selected,
+                "reactivation_tool_observation_consumed": metrics.reactivation_tool_observation_consumed,
+                "reactivation_file_observation_selected": metrics.reactivation_file_observation_selected,
+                "reactivation_file_observation_consumed": metrics.reactivation_file_observation_consumed,
+                "prompt_system_tokens": metrics.prompt_system_tokens,
+                "prompt_runtime_facts_tokens": metrics.prompt_runtime_facts_tokens,
+                "prompt_task_anchor_tokens": metrics.prompt_task_anchor_tokens,
+                "prompt_task_progress_tokens": metrics.prompt_task_progress_tokens,
+                "prompt_current_focus_tokens": metrics.prompt_current_focus_tokens,
+                "prompt_historical_context_tokens": metrics.prompt_historical_context_tokens,
+                "prompt_turn_frame_tokens": metrics.prompt_turn_frame_tokens,
+                "prompt_tool_schema_tokens": metrics.prompt_tool_schema_tokens,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
+    }
+    value
 }
 
 fn count_event(events: &[RuntimeEventEnvelope], pred: impl Fn(&RuntimeEvent) -> bool) -> u64 {

@@ -8,9 +8,9 @@ use agent_contracts::{
     ContextMaintenanceTrigger, ContextQuery, ContextRetention, ContextScope,
     ContextStateTransition, EventJournal, FocusState, MaterializedContext, MaterializedItem,
     ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput, ModelRequest, ModelTransport,
-    RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, SemanticState, ToolCatalogEntry,
-    ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolRisk, ToolSpec,
-    ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceSnapshot,
+    RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, SemanticState, TaskId,
+    ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolRisk,
+    ToolSpec, ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceSnapshot,
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{RuntimeHandle, RuntimeServices, spawn_runtime};
@@ -266,6 +266,62 @@ impl ToolDispatcher for OneToolDispatcher {
         Err(agent_contracts::AgentError::Tool(
             "no tools configured".into(),
         ))
+    }
+}
+
+/// Records FocusChanged task ids. Materialize leaves focus empty because
+/// production engines no longer own the prompt Focus projection.
+#[derive(Default)]
+pub(crate) struct RecordingFocusEngine {
+    pub received_focus: Mutex<Vec<(TaskId, String)>>,
+}
+
+#[async_trait::async_trait]
+impl ContextEngine for RecordingFocusEngine {
+    async fn ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
+        if let ContextIngress::FocusChanged { focus } = ingress {
+            self.received_focus
+                .lock()
+                .unwrap()
+                .push((focus.task_id, focus.goal.clone()));
+        }
+        Ok(())
+    }
+    async fn maintain(
+        &self,
+        _trigger: ContextMaintenanceTrigger,
+    ) -> AgentResult<ContextMaintenanceReport> {
+        Ok(ContextMaintenanceReport::default())
+    }
+    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+        Ok(MaterializedContext {
+            materialization_id: 0,
+            focus: None,
+            task: None,
+            items: Vec::new(),
+            external: agent_contracts::ContextMapView::default(),
+            selected: Vec::new(),
+            approx_tokens: 0,
+            diagnostics: ContextDiagnostics::default(),
+        })
+    }
+    async fn open_scope(&self, _kind: ScopeKind, _parent: Option<ScopeId>) -> AgentResult<ScopeId> {
+        Ok(ScopeId::new())
+    }
+    async fn close_scope(&self, _scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
+        Ok(Vec::new())
+    }
+    async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+        Ok(ContextDiagnostics::default())
+    }
+    async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+        Ok(Vec::new())
+    }
+    async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+        Ok(())
     }
 }
 

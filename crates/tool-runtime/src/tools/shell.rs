@@ -420,6 +420,7 @@ impl Tool for ShellExecTool {
             "artifact_truncated": artifact_truncated,
             "outcome": outcome,
             "shell_dialect": self.dialect.label(),
+            "command": args.command.clone(),
         });
         if let Some(class) = super::classify_process_outcome(
             outcome,

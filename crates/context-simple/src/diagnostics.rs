@@ -43,6 +43,13 @@ pub(crate) fn compute(state: &State) -> ContextDiagnostics {
         reactivation_consumed: state.reactivation_consumed,
         reactivation_selected_tokens: state.reactivation_selected_tokens,
         reactivation_consumed_tokens: state.reactivation_consumed_tokens,
+        reactivation_events: state.reactivation_events,
+        unique_reactivated: state.unique_reactivated,
+        reactivated_tokens: state.reactivated_tokens,
+        reactivation_tool_observation_selected: state.reactivation_tool_observation_selected,
+        reactivation_tool_observation_consumed: state.reactivation_tool_observation_consumed,
+        reactivation_file_observation_selected: state.reactivation_file_observation_selected,
+        reactivation_file_observation_consumed: state.reactivation_file_observation_consumed,
         compaction_input_tokens: state.compaction_input_tokens,
         compaction_output_tokens: state.compaction_output_tokens,
         ..ContextDiagnostics::default()

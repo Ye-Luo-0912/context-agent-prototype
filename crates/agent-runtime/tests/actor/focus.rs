@@ -77,9 +77,7 @@ async fn rollback_failure_poison_fences_further_runtime_mutation() {
 
 #[tokio::test]
 async fn journal_failure_after_focus_never_splits_task_and_context() {
-    let context = Arc::new(context_simple::SimpleContextEngine::new(
-        context_simple::SimpleContextConfig::default(),
-    ));
+    let context = Arc::new(RecordingFocusEngine::default());
     let kernel = Arc::new(RuntimeServices::new(
         CoreAuthorityConfig::default(),
         context.clone(),
@@ -96,19 +94,11 @@ async fn journal_failure_after_focus_never_splits_task_and_context() {
     let tasks = handle.list_tasks().await.unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].status, agent_runtime::TaskStatus::Active);
-    let focus = context
-        .materialize(ContextQuery {
-            current_input: String::new(),
-            budget_tokens: 0,
-            hints: Default::default(),
-        })
-        .await
-        .unwrap()
-        .focus;
+    let received = context.received_focus.lock().unwrap().clone();
     assert_eq!(
-        focus.map(|focus| focus.task_id),
-        Some(tasks[0].id),
-        "journal failure may create an audit gap, but not split task authority from context"
+        received,
+        vec![(tasks[0].id, "goal A".into())],
+        "journal failure may create an audit gap, but Context and TaskManager must see the same TaskId"
     );
     let next = handle.set_focus("goal B".into()).await.unwrap_err();
     assert!(
