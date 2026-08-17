@@ -16,8 +16,9 @@ use crate::policy::score_item_with_breakdown;
 
 /// Per-snapshot cap on items pulled in by dependency expansion.
 const MAX_EXPANSION_ITEMS: usize = 8;
-/// Token reserve carved out of the model budget so dependency expansion
-/// can follow selected items without blowing the budget.
+/// Token reserve carved from the primary budget only when some candidate
+/// actually has a Continuation (prompt-body) edge. Frames with no such
+/// edge keep the full working-set budget.
 const EXPANSION_RESERVE_TOKENS: usize = 1024;
 
 /// One dependency-expansion candidate for the bounded top-K heap: ordered
@@ -56,10 +57,11 @@ impl PartialEq for ExpandedCandidate {
 impl Eq for ExpandedCandidate {}
 
 /// Materialize the working set for one model request: score the heap, pack
-/// the best candidates into the budget and expand along explicit dependency
-/// edges within a reserved slice. The result is structured items — prompt
+/// the best candidates into the budget and expand along Continuation
+/// edges using leftover budget. The result is structured items — prompt
 /// rendering belongs to the runtime's prompt assembler. The runtime owns
-/// the turn frame; this only covers the long-term working set.
+/// the turn frame and CURRENT FOCUS; this only covers historical working
+/// context.
 pub(crate) fn materialize(
     state: &mut State,
     config: &SimpleContextConfig,
@@ -68,7 +70,7 @@ pub(crate) fn materialize(
     // Event sequence orders the preview (created_tick comparisons); recency
     // scoring reads the user-turn clock, so a preview never ages items.
     let turn = state.turn;
-    let focus = state.focus.clone();
+    let engine_focus = state.focus.clone();
 
     // Candidate generation via the indexes instead of a full-heap scan: the
     // active scope subtree (session + the active task's open task/focus
@@ -87,7 +89,7 @@ pub(crate) fn materialize(
     state.external.ensure_consistent();
     // The scope tree's length guard, for the same reason.
     state.scopes.ensure_consistent();
-    let active_task_id = focus.as_ref().map(|f| f.task_id);
+    let active_task_id = engine_focus.as_ref().map(|f| f.task_id);
     let mut active_scopes: HashSet<ScopeId> = HashSet::new();
     for scope in &state.scopes {
         let open = scope.state != ScopeState::Closed;
@@ -185,12 +187,14 @@ pub(crate) fn materialize(
         let item = &state.items[index];
         if !item.semantic.is_live()
             || (item.kind == agent_contracts::ContextKind::UserMessage
-                && item.content == query.current_input)
+                && turn > 0
+                && item.created_turn == turn)
             || is_excluded(item)
         {
             continue;
         }
-        let breakdown = score_item_with_breakdown(item, focus.as_ref(), &state.hot_entities, turn);
+        let breakdown =
+            score_item_with_breakdown(item, engine_focus.as_ref(), &state.hot_entities, turn);
         let tokens = approx_tokens(&item.content);
         candidates.push((index, breakdown, tokens));
     }
@@ -211,21 +215,17 @@ pub(crate) fn materialize(
     };
     candidates.sort_by(by_score);
 
-    // The engine owns the focus frame and the selected items; the current
-    // input rides in the runtime's turn frame and is charged there, so it is
-    // not deducted a second time here.
-    let fixed_tokens = focus
-        .as_ref()
-        .map(|f| approx_tokens(&f.goal) + approx_tokens(&f.current_query))
-        .unwrap_or_default();
-    // A small slice of the budget is reserved for dependency expansion so
-    // traceability items can follow the working set without letting the
-    // snapshot exceed the budget. The reserve is only carved out when
-    // expansion can actually run — with expansion disabled the whole budget
-    // belongs to the working set, and reserving a slice that is never spent
-    // would shrink the frame for no reason.
-    let total_budget = query.budget_tokens.saturating_sub(fixed_tokens);
-    let expansion_reserve = if config.dependency_expansion {
+    // Historical working set only: CURRENT FOCUS / TaskAnchor are runtime-
+    // owned and charged at assemble time. The current user message is skipped
+    // by turn stamp above, not by body equality.
+    let total_budget = query.budget_tokens;
+    let expansion_reserve = if config.dependency_expansion
+        && candidates.iter().any(|(index, _, _)| {
+            state.items[*index]
+                .dependencies
+                .iter()
+                .any(|edge| edge.kind.requires_prompt_body())
+        }) {
         EXPANSION_RESERVE_TOKENS.min(total_budget)
     } else {
         0
@@ -327,7 +327,15 @@ pub(crate) fn materialize(
         .iter()
         .map(|selection| selection.item_id)
         .collect();
-    if config.dependency_expansion {
+    if config.dependency_expansion
+        && selected_indices.iter().any(|&index| {
+            state.items[index]
+                .dependencies
+                .iter()
+                .any(|edge| edge.kind.requires_prompt_body())
+        })
+    {
+        // Leftover primary budget plus the Continuation reserve carved above.
         let mut expansion_budget = remaining + expansion_reserve;
         // Bounded top-K: the expansion window is at most MAX_EXPANSION_ITEMS
         // distinct items, so a max-heap pops exactly the best candidates
@@ -358,8 +366,12 @@ pub(crate) fn materialize(
                 if dep.semantic.is_dead() || is_excluded(dep) {
                     continue;
                 }
-                let breakdown =
-                    score_item_with_breakdown(dep, focus.as_ref(), &state.hot_entities, turn);
+                let breakdown = score_item_with_breakdown(
+                    dep,
+                    engine_focus.as_ref(),
+                    &state.hot_entities,
+                    turn,
+                );
                 if archived_below_cutoff(dep, &breakdown, config, &latest_file_bodies) {
                     continue;
                 }
@@ -434,27 +446,19 @@ pub(crate) fn materialize(
         })
         .collect();
 
-    // The engine-side token share: focus frame + selected items + the
-    // external refs surfaced in this snapshot. The system prompt, turn
-    // frame and tool schemas are the runtime's share and are charged by the
-    // model budget before this snapshot is requested. Refs are model-visible
-    // (uri + summary), so they are charged here with the same measure the
-    // selection walked — not free.
+    // Historical working-set tokens only. Focus/TaskAnchor rendering is
+    // the runtime assembler's share and is charged after this snapshot.
     let external = external_view(state, &state.hot_entities);
-    let approx_tokens_total = focus
-        .as_ref()
-        .map(|f| approx_tokens(&f.goal) + approx_tokens(&f.current_query))
-        .unwrap_or_default()
-        + items
-            .iter()
-            .map(|item| approx_tokens(&item.content))
-            .sum::<usize>()
+    let approx_tokens_total = items
+        .iter()
+        .map(|item| approx_tokens(&item.content))
+        .sum::<usize>()
         + external.iter().map(external_ref_tokens).sum::<usize>();
 
     MaterializedContext {
         materialization_id: 0,
-        focus,
-        task: query.hints.task.clone(),
+        focus: None,
+        task: None,
         items,
         // The lightweight context map: a *bounded* slice of the external
         // entries, never the whole map. The full `state.external` stays in

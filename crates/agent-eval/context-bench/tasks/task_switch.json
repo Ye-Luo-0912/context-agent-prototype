@@ -15,7 +15,7 @@
     },
     {
       "op": "user",
-      "text": "Still on A: add rate_limit(user) -> 30."
+      "text": "Still on A: add pub fn rate_limit(user: &str) -> u32 that returns 30."
     },
     {
       "op": "suspend"

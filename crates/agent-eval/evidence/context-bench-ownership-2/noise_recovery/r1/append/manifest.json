@@ -1,0 +1,14 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "fixture_id": "noise_recovery",
+  "engine": "append",
+  "repeat": 1,
+  "repeats": 1,
+  "live": true,
+  "fixture_sha256": "d1cd235692021e9928da48b80135f17d6bc67424bec2acbce5651977fde5d491",
+  "git_head": "d82b802f4f84fad2373993f2b2ab67cdb6507d96",
+  "git_dirty": true,
+  "git_dirty_sha256": "4000b365ce96141de005ff8111c947a7e692bdeeed75a8c9c86f73dafd906c3d",
+  "openai_model": "gpt-5.6-luna",
+  "openai_base_url": "https://api.pinaic.com/v1"
+}

@@ -617,9 +617,16 @@ async fn recall_turn_pulls_external_content_back_without_polluting_the_prompt() 
         ContextResidency::Resident,
         "recall is a location move into the working set, not a store miss"
     );
-    assert!(
-        engine.fetch_external(target_id).await.unwrap().is_none(),
-        "fetch stays a store read; the recalled body is not a store blob"
+    let fetched = engine
+        .fetch_external(target_id)
+        .await
+        .unwrap()
+        .expect("Resident fetch returns the catalog body");
+    assert_eq!(fetched.id, target_id);
+    assert_eq!(
+        fetched.residency,
+        ContextResidency::Resident,
+        "recall is a catalog body, not a store miss"
     );
 }
 
@@ -762,9 +769,16 @@ async fn admit_and_derive_through_the_runtime_never_duplicate_observations() {
         ContextResidency::Resident,
         "admit is a location move into the working set, not a store miss"
     );
-    assert!(
-        engine.fetch_external(target_id).await.unwrap().is_none(),
-        "the admitted item must leave the store (no duplicate owner)"
+    let fetched = engine
+        .fetch_external(target_id)
+        .await
+        .unwrap()
+        .expect("admitted Resident fetch returns the catalog body");
+    assert_eq!(fetched.id, target_id);
+    assert_eq!(
+        fetched.residency,
+        ContextResidency::Resident,
+        "admit is a catalog body; fetch no longer means store membership"
     );
     // The two seeded step observations remain the only ToolObservations in
     // the logical catalog (one warm in the buffer, one admitted back into

@@ -59,9 +59,9 @@ impl Default for ToolLifecycleConfig {
                 // Completion is a task-level control: the model can always
                 // propose a structured outcome.
                 "task.complete".into(),
-                // The merged control surface: one `context.manage` (gc hints,
-                // tags, leases, manual collect, and the on-demand retrieval
-                // loop over externalized refs) and one `capability.manage`
+                // The merged control surface: one `context.manage` (tags,
+                // leases, admit/derive, and the on-demand retrieval
+                // loop over the catalog) and one `capability.manage`
                 // (catalog search/inspect/load/unload). A dozen
                 // single-purpose meta-tools would cost more model input than
                 // the runtime control they provide.
@@ -728,6 +728,10 @@ mod tests {
             "gc_hint is not a model-facing op: {ops:?}"
         );
         assert!(
+            !ops.iter().any(|op| op.as_str() == Some("collect")),
+            "collect is not a model-facing op: {ops:?}"
+        );
+        assert!(
             spec.description.contains("context://run/"),
             "schema names the catalog uri the mutation ops consume: {}",
             spec.description
@@ -778,19 +782,18 @@ mod tests {
             agent_contracts::RuntimeDirective::Context(ContextAction::Lease { turns: 3, .. })
         ));
 
-        let output = dispatcher
-            .execute(request("context.manage", json!({"op": "collect"})))
-            .await
-            .unwrap();
-        assert!(matches!(
-            directive(output),
-            agent_contracts::RuntimeDirective::Context(ContextAction::Collect)
-        ));
-
-        // Bad arguments are rejected like any other tool. gc_hint is not a
-        // model-facing op: fail closed, no tutorial.
+        // Bad arguments are rejected like any other tool. gc_hint / collect
+        // are not model-facing ops: fail closed, no tutorial.
         let error = dispatcher
             .execute(request("context.manage", json!({"op": "gc_hint"})))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("args") || error.to_string().contains("unknown"),
+            "{error}"
+        );
+        let error = dispatcher
+            .execute(request("context.manage", json!({"op": "collect"})))
             .await
             .unwrap_err();
         assert!(
@@ -890,6 +893,14 @@ mod tests {
         assert!(error.to_string().contains("missing 'query'"), "{error}");
         let error = dispatcher
             .execute(request("context.manage", json!({"op": "gc_hint"})))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("args") || error.to_string().contains("unknown"),
+            "{error}"
+        );
+        let error = dispatcher
+            .execute(request("context.manage", json!({"op": "collect"})))
             .await
             .unwrap_err();
         assert!(

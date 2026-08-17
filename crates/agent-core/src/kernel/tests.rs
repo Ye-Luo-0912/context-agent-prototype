@@ -1022,7 +1022,7 @@ async fn fetch_renders_the_source_authority() {
 }
 
 #[tokio::test]
-async fn fetch_of_resident_explains_already_in_catalog() {
+async fn fetch_of_resident_names_catalog_not_working_set() {
     let mut entry = external_entry(None);
     entry.residency = ContextResidency::Resident;
     let kernel = query_kernel(Arc::new(RecordingEngine {
@@ -1038,10 +1038,18 @@ async fn fetch_of_resident_explains_already_in_catalog() {
         )
         .await;
     assert!(output.ok);
-    assert_eq!(output.summary, "item already in catalog");
+    assert_eq!(output.summary, "item in catalog, not stored");
     assert!(
-        output.model_content.contains("already in the working set"),
-        "a Resident fetch names the location, it does not lecture: {}",
+        output.model_content.contains("lives in the catalog")
+            && output
+                .model_content
+                .contains("not the selected working set"),
+        "a Resident fetch names the catalog location, not the working set: {}",
+        output.model_content
+    );
+    assert!(
+        !output.model_content.contains("already in the working set"),
+        "must not claim the body is already in the prompt: {}",
         output.model_content
     );
 }

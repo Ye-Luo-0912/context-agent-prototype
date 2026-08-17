@@ -50,7 +50,7 @@ frozen=true
 pub const FROZEN_SPEC_SHA256: &str =
     "248312578144464242b5a7d54282be0fc8cc484ba3a99cf2b39d82d91bf8e18e";
 pub const FROZEN_PACK_DIGEST: &str =
-    "141ffd8dc8ed352676b338fa6ad272650a7a7646545a5de300bf32852180ef20";
+    "0b48a54fac023306bf79c9817795b7a97cc41b599bdb15a3280fa5fe663100de";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

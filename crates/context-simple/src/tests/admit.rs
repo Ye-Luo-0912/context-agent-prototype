@@ -138,9 +138,15 @@ async fn admit_externalized_item_preserves_identity_and_produces_one_transition(
         AttentionState::Active,
         "the admitted item re-enters as an active working-set member"
     );
-    assert!(
-        engine.fetch_external(target).await.unwrap().is_none(),
-        "the admitted item must leave the external map (no duplicate owner)"
+    let fetched = engine
+        .fetch_external(target)
+        .await
+        .unwrap()
+        .expect("admitted Resident fetch returns the catalog body");
+    assert_eq!(fetched.id, target);
+    assert_eq!(
+        fetched.residency,
+        agent_contracts::ContextResidency::Resident
     );
 }
 
@@ -3138,7 +3144,7 @@ async fn storage_required_anchor_roots_protect_the_store() {
 }
 
 #[tokio::test]
-async fn task_anchor_view_passes_through_materialize_unscored() {
+async fn task_anchor_view_is_not_copied_onto_materialize() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
     let view = agent_contracts::TaskAnchorView {
         revision: 7,
@@ -3158,10 +3164,9 @@ async fn task_anchor_view_passes_through_materialize_unscored() {
         })
         .await
         .unwrap();
-    assert_eq!(
-        materialized.task.as_ref(),
-        Some(&view),
-        "引擎必须原样回传 TaskAnchorView，不能评分或改写"
+    assert!(
+        materialized.task.is_none() && materialized.focus.is_none(),
+        "engine materialize is historical working context; TaskAnchor/Focus stay on the runtime assembler"
     );
     assert!(
         materialized

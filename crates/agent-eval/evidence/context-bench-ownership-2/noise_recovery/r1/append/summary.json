@@ -1,0 +1,99 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 86858,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 795,
+  "model_started": 14,
+  "model_used": 14,
+  "usage_incomplete": false,
+  "workspace_sha256": "9ae2084a95ca976a314d4891820c569f9b3d7c1e93da8ae7e8f425652b750a89",
+  "workspace_files": 30,
+  "tools": [
+    {
+      "name": "context.manage",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "edit.replace",
+      "calls": 2,
+      "failed": 2
+    },
+    {
+      "name": "fs.list",
+      "calls": 3,
+      "failed": 1
+    },
+    {
+      "name": "fs.read",
+      "calls": 7,
+      "failed": 1
+    },
+    {
+      "name": "fs.write",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 2,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 0,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 4,
+    "fetch_calls": 0,
+    "final_resident_bytes": 4783,
+    "forgotten_items": 0,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 0,
+    "materialize_rounds": 14,
+    "model_input_tokens": 100371,
+    "model_output_tokens": 2615,
+    "peak_resident_bytes": 4783,
+    "provider_tokens_total": 102986,
+    "recovered_items": 0,
+    "recovery_auto_reactivation": 0,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 0,
+    "recovery_workspace_reread": 4,
+    "repeated_fs_reads": 4,
+    "rounds": 14,
+    "schema_tokens_total": 21336,
+    "search_calls": 1,
+    "search_empty": 1,
+    "search_hits": 0,
+    "search_ms_p50": 1,
+    "search_ms_p95": 1,
+    "tool_calls": 22,
+    "tool_failure_classes": {
+      "no_exact_match": 1,
+      "path_not_found": 2,
+      "stale_revision": 1
+    },
+    "turns": 3
+  }
+}

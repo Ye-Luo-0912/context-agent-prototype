@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 6,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "6a56601b42d9d64fd07bdff5195d0a6e0a4fe910a93817c05c3561d373aeb297",
+      "bytes": 3438,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    if let Some(msg) = decode_v2_hello(bytes) {\n        return Ok(msg);\n    }\n    if bytes.contains(\"ping\") {\n        return Ok(Msg::Ping);\n    }\n    Err(\"unknown\".into())\n}\n\nfn decode_v2_hello(bytes: &str) -> Option<Msg> {\n    let bytes = bytes.trim();\n    let prefix = r#\"{\"v\":2,\"hello\":\"#;\n    let value = bytes.strip_prefix(prefix)?.strip_suffix('}')?;\n    let (hello, used) = parse_json_string(value)?;\n    if used != value.len() {\n        return None;\n    }\n    Some(Msg::Hello(hello))\n}\n\nfn parse_json_string(value: &str) -> Option<(String, usize)> {\n    let mut result = String::new();\n    let mut chars = value.char_indices();\n    if chars.next()?.1 != '\"' {\n        return None;\n    }\n\n    while let Some((index, ch)) = chars.next() {\n        match ch {\n            '\"' => return Some((result, index + ch.len_utf8())),\n            '\\\\' => {\n                let (_, escaped) = chars.next()?;\n                match escaped {\n                    '\"' => result.push('\"'),\n                    '\\\\' => result.push('\\\\'),\n                    '/' => result.push('/'),\n                    'b' => result.push('\\u{0008}'),\n                    'f' => result.push('\\u{000c}'),\n                    'n' => result.push('\\n'),\n                    'r' => result.push('\\r'),\n                    't' => result.push('\\t'),\n                    'u' => {\n                        let mut code = 0u32;\n                        for _ in 0..4 {\n                            let (_, digit) = chars.next()?;\n                            code = code.checked_mul(16)?.checked_add(digit.to_digit(16)?)?;\n                        }\n                        result.push(char::from_u32(code)?);\n                    }\n                    _ => return None,\n                }\n            }\n            ch if ch < '\\u{0020}' => return None,\n            _ => result.push(ch),\n        }\n    }\n    None\n}\n\nfn encode_json_string(value: &str) -> String {\n    let mut encoded = String::with_capacity(value.len() + 2);\n    encoded.push('\"');\n    for ch in value.chars() {\n        match ch {\n            '\"' => encoded.push_str(\"\\\\\\\"\"),\n            '\\\\' => encoded.push_str(\"\\\\\\\\\"),\n            '\\u{0008}' => encoded.push_str(\"\\\\b\"),\n            '\\u{000c}' => encoded.push_str(\"\\\\f\"),\n            '\\n' => encoded.push_str(\"\\\\n\"),\n            '\\r' => encoded.push_str(\"\\\\r\"),\n            '\\t' => encoded.push_str(\"\\\\t\"),\n            ch if ch < '\\u{0020}' => encoded.push_str(&format!(\"\\\\u{:04x}\", ch as u32)),\n            _ => encoded.push(ch),\n        }\n    }\n    encoded.push('\"');\n    encoded\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"ping\".into(),\n        Msg::Hello(value) => format!(r#\"{{\"v\":2,\"hello\":{}}}\"#, encode_json_string(value)),\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn roundtrip_ping() -> Msg {\n        decode(&encode(&Msg::Ping)).unwrap()\n    }\n\n    #[test]\n    fn ping_encode_roundtrip() {\n        assert!(matches!(roundtrip_ping(), Msg::Ping));\n    }\n\n    #[test]\n    fn hello_uses_v2_envelope() {\n        assert_eq!(encode(&Msg::Hello(\"world\".into())), r#\"{\"v\":2,\"hello\":\"world\"}\"#);\n    }\n\n    #[test]\n    fn hello_encode_roundtrip() {\n        let value = \"hello \\\"world\\\"\\\\line\\n\";\n        assert!(matches!(decode(&encode(&Msg::Hello(value.into()))), Ok(Msg::Hello(decoded)) if decoded == value));\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpH8zb6W\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

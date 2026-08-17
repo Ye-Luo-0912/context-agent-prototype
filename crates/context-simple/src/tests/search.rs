@@ -205,14 +205,16 @@ async fn catalog_search_surfaces_resident_hits_instead_of_empty() {
         .unwrap()
         .expect("resident inspect returns a descriptor");
     assert_eq!(inspected.residency, ContextResidency::Resident);
+    let fetched = engine
+        .fetch_external(resident.item_id)
+        .await
+        .unwrap()
+        .expect("fetch returns the catalog body");
     assert!(
-        engine
-            .fetch_external(resident.item_id)
-            .await
-            .unwrap()
-            .is_none(),
-        "fetch remains a store read; resident bodies stay in the working set"
+        fetched.content.contains("AuthService"),
+        "Resident fetch must return the heap body, not claim it is already in the working set"
     );
+    assert_eq!(fetched.residency, ContextResidency::Resident);
 }
 
 #[tokio::test]

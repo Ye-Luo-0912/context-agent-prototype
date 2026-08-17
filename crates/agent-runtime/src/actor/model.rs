@@ -318,9 +318,9 @@ impl RuntimeActor {
             active_tools_tokens,
         );
         let materialize_started = std::time::Instant::now();
-        // 当前活跃任务锚的根声明 + TaskAnchorView 投影：PromptRequired
-        // 的声明会强制条目进帧；view 进 focus 帧，引擎不评分。任务权威
-        // 留在 TaskManager，引擎只消费有界投影。
+        // 当前活跃任务锚的根声明投影：PromptRequired 的声明会强制条目进帧。
+        // TaskAnchorView 和 Focus 由 PromptAssembler 从 TaskManager 取，
+        // 不再经引擎 materialize 回传。hints.task 仍投影给引擎内部使用。
         let (anchor_roots, task_view) = self
             .state
             .tasks
@@ -372,8 +372,7 @@ impl RuntimeActor {
         let max_input_budget = send_window.saturating_sub(output_reserve);
         let mut materialized = materialized;
         let mut input =
-            self.assembler
-                .assemble(&materialized, &turn_frame, surface_plan.specs().to_vec());
+            self.assemble_model_input(&materialized, &turn_frame, surface_plan.specs().to_vec());
         let assembled_total = |input: &ModelInput| {
             approx_layer_tokens(&input.into_messages()) + approx_layer_tokens(&input.tool_schemas)
         };
@@ -405,9 +404,11 @@ impl RuntimeActor {
             materialized.approx_tokens = materialized
                 .approx_tokens
                 .saturating_sub(approx_tokens(&dropped.content));
-            input =
-                self.assembler
-                    .assemble(&materialized, &turn_frame, surface_plan.specs().to_vec());
+            input = self.assemble_model_input(
+                &materialized,
+                &turn_frame,
+                surface_plan.specs().to_vec(),
+            );
         }
 
         // The context frame is empty but the fixed layers still overshoot:
@@ -420,9 +421,11 @@ impl RuntimeActor {
             if surface_plan.omit_largest_for_provider_budget().is_none() {
                 break;
             }
-            input =
-                self.assembler
-                    .assemble(&materialized, &turn_frame, surface_plan.specs().to_vec());
+            input = self.assemble_model_input(
+                &materialized,
+                &turn_frame,
+                surface_plan.specs().to_vec(),
+            );
         }
 
         let estimated_input_tokens = assembled_total(&input);
@@ -647,5 +650,36 @@ impl RuntimeActor {
                 })
                 .await;
         });
+    }
+
+    fn assemble_model_input(
+        &self,
+        history: &MaterializedContext,
+        turn_frame: &TurnFrame,
+        tools: Vec<ToolSpec>,
+    ) -> ModelInput {
+        let (focus, task) = self.runtime_prompt_focus(turn_frame);
+        self.assembler
+            .assemble(focus.as_ref(), task.as_ref(), history, turn_frame, tools)
+    }
+
+    fn runtime_prompt_focus(
+        &self,
+        turn_frame: &TurnFrame,
+    ) -> (Option<FocusState>, Option<TaskAnchorView>) {
+        let Some(task_id) = self.state.task_id else {
+            return (None, None);
+        };
+        let Some(task) = self.state.tasks.get(task_id) else {
+            return (None, None);
+        };
+        let mut focus = FocusState::for_task(task_id, task.goal.clone());
+        if !turn_frame.user_message.is_empty() {
+            focus.current_query = turn_frame.user_message.clone();
+        }
+        (
+            Some(focus),
+            Some(crate::task::task_anchor_view(&task.anchor)),
+        )
     }
 }

@@ -543,8 +543,8 @@ that gate while taking one atomic base snapshot to form a common source cut
 without retry; concurrency tests cover catalog mutation during capture.
 
 Since V1-M9 the model can also steer the *context* surface through
-read-only meta-tools (`context.gc_hint` / `context.tag` / `context.lease` /
-`context.collect`, always loaded with the core set). They do no work
+read-only meta-tools (`context.tag` / `context.lease`, always loaded with
+the core set; `gc_hint` and `collect` are not model-facing). They do no work
 themselves: each returns a `ToolOutcome::RuntimeDirective` carrying a typed
 `ContextAction` (`Collect` runs the GC pass via `ContextEngine::gc`; the
 rest become a `ContextDirective` ingest) — tools still never touch the
@@ -557,9 +557,8 @@ Two guards keep these directives from becoming a backdoor:
 
 - **commit-time execution**: the directive is executed by the actor when
   the tool result commits (inside the operation's generation fence), not
-  at turn finalize — `context.collect` really collects *now*, and a hint
-  lands before the next model round observes it. Finalize only persists
-  observations;
+  at turn finalize — a lease or tag lands before the next model round
+  observes it. Finalize only persists observations;
 - **permission gate**: producing a `RuntimeDirective` requires the
   `runtime:context-control` permission in the capability manifest. A
   random `weather.lookup` tool cannot return a `GcHint`/`Lease`; the
@@ -791,7 +790,8 @@ maintain(BeforeModel)
 ContextEngine.materialize(ContextQuery)   ── the Context Frame (long-term working set)
    │
    v
-PromptAssembler.assemble() = System Policy + Focus Frame + Context Frame + Turn Frame + Tool Schemas
+PromptAssembler.assemble(runtime_focus, task_anchor, history, turn, tools)
+   = System Policy + Focus Frame + Context Frame + Turn Frame + Tool Schemas
    │
    v
 ModelTransport.complete_stream()
@@ -844,7 +844,9 @@ it just knows it has N tokens for the working set. A large declared provider
 window must not inflate C's working set; append-only A may ignore the pack
 query and grow until the send guard trims it. The current user input is
 charged inside the turn frame (it rides there), so the engine does not
-deduct it a second time; the focus frame stays engine-owned. Pinned items
+deduct it a second time. CURRENT FOCUS and TaskAnchor are runtime-owned
+and charged at assemble time; the engine's budget is historical working
+set only. Pinned items
 get selection priority (they go first) but not exemption: every selected
 item must fit the remaining budget, so the frame is a hard bound.
 
@@ -895,8 +897,8 @@ replaying an append-only transcript. The input is assembled in five layers:
 
 ```text
 System Policy    - standing instructions (runtime-owned)
-Focus Frame      - the current task/goal, rendered from the materialized focus
-Context Frame    - the selected working set, rendered from MaterializedItem's
+Focus Frame      - current TaskAnchor + Focus from TaskManager (runtime-owned)
+Context Frame    - historical working set from MaterializedItem's
 Turn Frame       - the current turn's execution stack (runtime-owned)
 Active Tool Schemas - tool definitions for this request
 ```
@@ -911,8 +913,8 @@ operator's instructions (prompt injection defense, `CORE-05`).
 The split is deliberate. The context engine owns the long-term working set
 and knows nothing about the execution protocol; the runtime owns the turn
 stack and never scores or evicts it while the turn is open. Since V1-P0-2
-prompt rendering lives in one place only: `PromptAssembler` turns the
-engine's structured `MaterializedContext` into the five-layer input. The
+prompt rendering lives in one place only: `PromptAssembler` takes runtime
+Focus/TaskAnchor plus the engine's historical `MaterializedContext`. The
 engine could not format a prompt even if it wanted to — it never sees the
 system prompt or the tool schemas.
 
@@ -1525,9 +1527,11 @@ single-purpose meta-tools:
 
 - `context.manage` — `op` dispatch over catalog retrieval (`search` /
   `inspect` / `fetch`) and deliberate mutations (`tag` / `lease` /
-  `collect` / `admit` / `derive`). `item_id` accepts a bare UUID or the
-  catalog uri `context://run/<uuid>` that search hits return. `gc_hint` is
-  not a model-facing op: the engine owns collection. The tool never
+  `admit` / `derive`). `item_id` accepts a bare UUID or the
+  catalog uri `context://run/<uuid>` that search hits return. `gc_hint`
+  and `collect` are not model-facing ops: the engine owns collection.
+  `fetch` returns the catalog or stored body; catalog residency is not
+  the selected working set. The tool never
   touches the engine.
 - `capability.manage` — `op` dispatch over `search` / `inspect` / `load` /
   `unload`, provided identically by the builtin dispatcher and the

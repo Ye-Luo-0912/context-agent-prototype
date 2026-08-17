@@ -261,6 +261,59 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
 }
 
 #[tokio::test]
+async fn primary_selection_keeps_full_budget_without_continuation() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    {
+        let mut state = engine.state.lock().await;
+        let item = ContextItem {
+            id: ContextItemId::new(),
+            task_id: None,
+            scope_id: None,
+            content: "noise data ".repeat(800),
+            kind: ContextKind::Note,
+            scope: ContextScope::Task,
+            retention: ContextRetention::Working,
+            attention: AttentionState::Active,
+            semantic: SemanticState::Live,
+            importance: 1.0,
+            relevance: 0.5,
+            created_tick: 1,
+            last_access_tick: 1,
+            access_count: 0,
+            created_turn: 1,
+            last_access_turn: 1,
+            last_selected_turn: 1,
+            dependencies: Vec::new(),
+            tags: Vec::new(),
+            keep_alive: false,
+            lease_until_turn: None,
+            source: None,
+            residency: agent_contracts::ContextResidency::Resident,
+            gc_generation: 0,
+            evicted_at_tick: None,
+            entities: Vec::new(),
+            file_path: None,
+            file_revision: None,
+        };
+        state.items.push(item);
+    }
+    let snapshot = engine
+        .materialize(ContextQuery {
+            current_input: "go".into(),
+            budget_tokens: 2500,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.selected.len(),
+        1,
+        "without Continuation the full budget is primary selection; a 1024 reserve would drop this ~2000 token item: {:?}",
+        snapshot.selected
+    );
+}
+
+#[tokio::test]
 async fn dependency_expansion_can_be_disabled() {
     let engine = SimpleContextEngine::new(SimpleContextConfig {
         dependency_expansion: false,

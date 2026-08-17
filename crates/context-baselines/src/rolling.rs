@@ -295,6 +295,7 @@ impl ContextEngine for RollingSummaryEngine {
     }
 
     async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
+        let _ = query.budget_tokens;
         let mut state = self.state.lock().expect("rolling state poisoned");
         state.materialization_revision =
             state
@@ -303,8 +304,7 @@ impl ContextEngine for RollingSummaryEngine {
                 .ok_or_else(|| {
                     AgentError::Internal("context materialization id is exhausted".into())
                 })?;
-        let items =
-            materialized_items(&state.records, state.summary.as_ref(), &query.current_input);
+        let items = materialized_items(&state.records, state.summary.as_ref(), state.turn);
         let approx_tokens_total: usize = items
             .iter()
             .map(|item| approx_tokens(&item.content))
@@ -323,7 +323,7 @@ impl ContextEngine for RollingSummaryEngine {
             state
                 .records
                 .iter()
-                .filter(|record| !is_current_user_input(record, &query.current_input))
+                .filter(|record| !is_current_user_input(record, state.turn))
                 .map(|record| ContextSelection {
                     item_id: record.id,
                     score: 1.0,

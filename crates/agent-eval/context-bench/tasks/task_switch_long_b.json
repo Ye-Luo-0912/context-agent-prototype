@@ -11,7 +11,7 @@
   "ops": [
     {
       "op": "user",
-      "text": "Task A: allow operator in src/auth.rs and add rate_limit -> 30."
+      "text": "Task A: allow operator in src/auth.rs and add pub fn rate_limit(user: &str) -> u32 that returns 30."
     },
     {
       "op": "suspend"

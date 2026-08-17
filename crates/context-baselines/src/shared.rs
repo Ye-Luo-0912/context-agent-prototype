@@ -132,13 +132,13 @@ pub(crate) fn records_for_ingress(ingress: &ContextIngress, turn: u64) -> Vec<Re
 /// render protocol messages themselves — the prompt assembler does that, so
 /// A/B/C measure the selection policy, not the rendering.
 ///
-/// Current-turn user input is runtime-owned (`ContextQuery::current_input` /
-/// TurnFrame). Historical UserMessages stay; the matching current message
-/// is excluded so A/B do not double-count what C already leaves out.
+/// Current-turn user input is runtime-owned (`TurnFrame`). Historical
+/// UserMessages stay; the current turn's UserMessage is skipped by turn
+/// stamp so A/B do not double-count what the turn frame already carries.
 pub(crate) fn materialized_items(
     records: &[Record],
     summary: Option<&Record>,
-    current_input: &str,
+    current_turn: u64,
 ) -> Vec<MaterializedItem> {
     let mut items = Vec::with_capacity(records.len() + usize::from(summary.is_some()));
     if let Some(summary) = summary {
@@ -157,7 +157,7 @@ pub(crate) fn materialized_items(
     items.extend(
         records
             .iter()
-            .filter(|record| !is_current_user_input(record, current_input))
+            .filter(|record| !is_current_user_input(record, current_turn))
             .map(|record| MaterializedItem {
                 item_id: record.id,
                 kind: record.kind,
@@ -173,8 +173,10 @@ pub(crate) fn materialized_items(
     items
 }
 
-pub(crate) fn is_current_user_input(record: &Record, current_input: &str) -> bool {
-    record.kind == ContextKind::UserMessage && record.content == current_input
+pub(crate) fn is_current_user_input(record: &Record, current_turn: u64) -> bool {
+    current_turn > 0
+        && record.kind == ContextKind::UserMessage
+        && record.created_turn == current_turn
 }
 
 /// Diagnostics for engines where everything retained counts as active.

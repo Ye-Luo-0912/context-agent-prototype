@@ -566,7 +566,7 @@ sys.exit(0 if "anonymous" in text and "lookup(id)?" not in text else 1)
             expected_edit="auth rate_limit + operator allow; billing index fix",
             ops=[
                 {"op": "user", "text": "Task A: in src/auth.rs allow operator as well as admin. Do not touch billing."},
-                {"op": "user", "text": "Still on A: add rate_limit(user) -> 30."},
+                {"op": "user", "text": "Still on A: add pub fn rate_limit(user: &str) -> u32 that returns 30."},
                 {"op": "suspend"},
                 {"op": "user", "text": "Task B: src/billing.rs total() indexes one past the end. Fix it. Do not change auth."},
                 {"op": "user", "text": "On B: double-check the loop uses items[i]."},
@@ -586,7 +586,7 @@ sys.exit(0 if "anonymous" in text and "lookup(id)?" not in text else 1)
             target_rounds_lo=16, target_rounds_hi=28,
             expected_edit="auth rate_limit + operator; billing index fix after a long B",
             ops=[
-                {"op": "user", "text": "Task A: allow operator in src/auth.rs and add rate_limit -> 30."},
+                {"op": "user", "text": "Task A: allow operator in src/auth.rs and add pub fn rate_limit(user: &str) -> u32 that returns 30."},
                 {"op": "suspend"},
                 {"op": "user", "text": "Task B: inspect src/billing.rs. Do not fix yet."},
                 {"op": "user", "text": "Task B: explain the off-by-one in words, still no edit."},

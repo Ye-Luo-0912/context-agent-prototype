@@ -1,0 +1,94 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 177788,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 1289,
+  "model_started": 31,
+  "model_used": 31,
+  "usage_incomplete": false,
+  "workspace_sha256": "9ab8e42490b6302adf4e101fe0efbe0ac144c7693c65d60700c2f2e29667c36d",
+  "workspace_files": 30,
+  "tools": [
+    {
+      "name": "edit.replace",
+      "calls": 8,
+      "failed": 6
+    },
+    {
+      "name": "fs.list",
+      "calls": 5,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 13,
+      "failed": 2
+    },
+    {
+      "name": "fs.write",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 7,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 2,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 132,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 4592,
+    "compaction_output_tokens": 114,
+    "failed_tool_outputs": 8,
+    "fetch_calls": 0,
+    "final_resident_bytes": 2590,
+    "forgotten_items": 39,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 112,
+    "materialize_rounds": 31,
+    "model_input_tokens": 208482,
+    "model_output_tokens": 4489,
+    "peak_resident_bytes": 2594,
+    "provider_tokens_total": 217677,
+    "recovered_items": 13,
+    "recovery_auto_reactivation": 13,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 26,
+    "recovery_workspace_reread": 9,
+    "repeated_fs_reads": 9,
+    "rounds": 31,
+    "schema_tokens_total": 47244,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "search_ms_p50": 0,
+    "search_ms_p95": 0,
+    "tool_calls": 40,
+    "tool_failure_classes": {
+      "no_exact_match": 3,
+      "path_not_found": 2,
+      "stale_revision": 3
+    },
+    "turns": 7
+  }
+}

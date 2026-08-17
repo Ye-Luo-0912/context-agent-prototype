@@ -185,6 +185,32 @@ mod tests {
                 .any(|item| item.kind == ContextKind::Goal),
             "FocusChanged must not mint a Goal history record"
         );
+
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "hello from the user".into(),
+            })
+            .await
+            .unwrap();
+        let repeated = engine
+            .materialize(ContextQuery {
+                current_input: "hello from the user".into(),
+                budget_tokens: 100_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        let prior_hellos = repeated
+            .items
+            .iter()
+            .filter(|item| {
+                item.kind == ContextKind::UserMessage && item.content == "hello from the user"
+            })
+            .count();
+        assert_eq!(
+            prior_hellos, 1,
+            "identical prior-turn text stays; only the current turn stamp is skipped"
+        );
     }
 
     #[tokio::test]

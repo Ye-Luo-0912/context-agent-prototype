@@ -184,6 +184,18 @@ fn project_all_live(state: &State) -> Vec<ExternalizedContext> {
     rows
 }
 
+pub(crate) fn catalog_body(state: &State, id: ContextItemId) -> Option<ContextItem> {
+    if let Some(index) = state.items.indexes().get(id) {
+        let item = &state.items[index];
+        return item.semantic.is_live().then(|| item.clone());
+    }
+    state
+        .eviction_buffer
+        .iter()
+        .find(|item| item.id == id && item.semantic.is_live())
+        .cloned()
+}
+
 pub(crate) fn project_search_hit(state: &State, id: ContextItemId) -> Option<ExternalizedContext> {
     if let Some(index) = state.items.indexes().get(id) {
         let item = &state.items[index];

@@ -708,9 +708,9 @@ impl CoreAuthority {
                             )
                         {
                             output.ok = true;
-                            output.summary = "item already in catalog".into();
+                            output.summary = "item in catalog, not stored".into();
                             output.model_content = format!(
-                                "context.fetch: item {item_id} is {:?}; body is already in the working set.",
+                                "context.fetch: item {item_id} is {:?}; body lives in the catalog, not the store. Catalog residency is not the selected working set.",
                                 entry.residency
                             );
                             output.metadata = serde_json::json!({

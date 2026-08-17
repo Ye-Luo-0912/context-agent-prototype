@@ -1,11 +1,11 @@
 //! The merged context meta-tool: one `context.manage` entry point with an
 //! `op` dispatch covering catalog retrieval (`search` / `inspect` / `fetch`)
-//! and deliberate mutations (`tag` / `lease` / `collect` / `admit` /
-//! `derive`).
+//! and deliberate mutations (`tag` / `lease` / `admit` / `derive`).
 //!
-//! GC hint / residency micromanagement is not a model-facing op: the
-//! engine owns collection. `ContextAction::GcHint` remains for tests and
-//! the engine; a model `op=gc_hint` is an invalid request.
+//! GC / collect is not a model-facing op: the engine owns collection.
+//! `ContextAction::Collect` and `ContextAction::GcHint` remain for tests
+//! and the engine; a model `op=collect` or `op=gc_hint` is an invalid
+//! request.
 //!
 //! The directive ops do no work themselves — each attaches a typed
 //! `ContextAction` to its output that the runtime routes to the context
@@ -35,8 +35,6 @@ enum ManageOp {
     Tag,
     /// Protect an item from GC for the next N turns.
     Lease,
-    /// Run a full GC pass now (manual collect).
-    Collect,
     /// Deterministic search over externalized refs.
     Search,
     /// Metadata of one externalized ref by item id (no store read).
@@ -116,8 +114,8 @@ impl Tool for ContextManageTool {
             name: CONTEXT_MANAGE.into(),
             description: concat!(
                 "Runtime context control and catalog retrieval. ",
-                "Directive ops: tag, lease, collect, admit, derive. ",
-                "Query ops: search, inspect, fetch. search covers the whole catalog (Resident/Warm/Stored), not only the selected working context. Hits include id, source, and residency. fetch reads store bodies only. ",
+                "Directive ops: tag, lease, admit, derive. ",
+                "Query ops: search, inspect, fetch. search covers the whole catalog (Resident/Warm/Stored), not only the selected working context. Hits include id, source, and residency. fetch returns the catalog or stored body; catalog residency is not the selected working set. ",
                 "item_id accepts a bare UUID or the catalog uri context://run/<uuid>."
             )
             .to_string(),
@@ -127,7 +125,7 @@ impl Tool for ContextManageTool {
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["tag", "lease", "collect", "search", "inspect", "fetch", "admit", "derive"]
+                        "enum": ["tag", "lease", "search", "inspect", "fetch", "admit", "derive"]
                     },
                     "item_id": {"type": "string", "description": "Target item (tag/lease/inspect/fetch/admit/derive). Bare UUID or context://run/<uuid>."},
                     "tag": {"type": "string", "description": "tag: tag text (stored under the ext: namespace)"},
@@ -180,22 +178,6 @@ impl Tool for ContextManageTool {
                 let item_id = require(args.item_id, "lease", "item_id")?;
                 let turns = require(args.turns, "lease", "turns")?;
                 let action = ContextAction::Lease { item_id, turns };
-                let description = describe(&action);
-                Ok(ToolOutcome::RuntimeDirective {
-                    output: ToolOutput {
-                        call_id: call_id.into(),
-                        tool_name: CONTEXT_MANAGE.into(),
-                        ok: true,
-                        summary: description.clone(),
-                        model_content: description,
-                        artifact_ref: None,
-                        metadata: json!({"context_action": action}),
-                    },
-                    directive: agent_contracts::RuntimeDirective::Context(action),
-                })
-            }
-            ManageOp::Collect => {
-                let action = ContextAction::Collect;
                 let description = describe(&action);
                 Ok(ToolOutcome::RuntimeDirective {
                     output: ToolOutput {

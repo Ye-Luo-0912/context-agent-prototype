@@ -483,11 +483,12 @@ hits no entity/label key still residual-scans summaries/uris/bodies. See
 
 The model-facing retrieval loop (`context.manage` op=search/inspect/fetch)
 is **not an observation**: search/inspect may return catalog projections
-(including Resident/Warm heap descriptors); fetch remains a store read.
+(including Resident/Warm heap descriptors); fetch returns the catalog or
+stored body. Catalog residency is not the selected working set.
 Hits identify items with the catalog uri `context://run/<uuid>`; inspect /
 fetch / admit / derive consume that same string (or the bare UUID).
-`gc_hint` is not a model-facing op — the engine owns collection; a model
-call with `op=gc_hint` is an invalid request. The result is visible to the
+`gc_hint` and `collect` are not model-facing ops — the engine owns
+collection; a model call with those ops is an invalid request. The result is visible to the
 current turn through the tool result, but
 finalization must not persist it under a new `ToolObservation` id. Every
 `TurnFrameStep::ToolResult` carries
@@ -1248,9 +1249,11 @@ observations flow in two distinct phases:
   message carrying `tool_calls`, then a `tool` message paired by
   `tool_call_id` — and they are never scored, garbage-collected or evicted.
   The current user message, current TaskAnchor/Focus, and current tool
-  result are runtime-owned. Context engines (A, B, and C) own *prior*
-  historical context only: they must not mint a Goal from `FocusChanged`
-  or select a `UserMessage` whose body equals `query.current_input`.
+  result are runtime-owned. `PromptAssembler` receives runtime Focus and
+  TaskAnchor plus historical `MaterializedContext`; engines (A, B, and C)
+  must not mint a Goal from `FocusChanged` or select a `UserMessage`
+  whose `created_turn` is the current user-turn clock. Catalog residency
+  is not the selected working set.
 - **When the turn ends** (the model stops calling tools) the observations
   are persisted as the long-term record: `ingest(ToolObservation)` for each
   result, then one `maintain(AfterTool)` pass, then the final assistant

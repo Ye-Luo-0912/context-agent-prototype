@@ -636,9 +636,10 @@ pub struct ContextHints {
     /// terminal semantic state is never resurrected by a claim.
     #[serde(default)]
     pub anchor_roots: Vec<AnchorRootClaim>,
-    /// Bounded prompt projection of the active TaskAnchor. The engine copies
-    /// this through to `MaterializedContext` without scoring it as a heap
-    /// item; task authority stays with the TaskManager.
+    /// Bounded prompt projection of the active TaskAnchor. The engine must
+    /// not copy this onto `MaterializedContext` for prompt rendering; the
+    /// runtime assembler receives the view from TaskManager. Engines may
+    /// ignore it.
     #[serde(default)]
     pub task: Option<TaskAnchorView>,
 }
@@ -1033,19 +1034,22 @@ fn default_retention() -> ContextRetention {
 }
 
 /// The structured result of one `ContextEngine::materialize` call: the
-/// focus, the selected working set, the lightweight external context map
+/// selected historical working set, the lightweight external context map
 /// (externalized items visible only by `ContextRef`) and the
-/// selections/diagnostics. Prompt rendering is deliberately absent — that
-/// is the prompt assembler's job.
+/// selections/diagnostics. Prompt rendering is the runtime assembler's job.
+/// `focus` / `task` remain on the wire for older snapshots but engines must
+/// leave them empty — CURRENT FOCUS and TaskAnchor are runtime-owned.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MaterializedContext {
     /// Opaque identity of this preview. It is echoed by
     /// `ContextConsumptionAck` only after the final provider request succeeds.
     #[serde(default)]
     pub materialization_id: u64,
+    /// Engine-internal snapshot leftover. PromptAssembler must not read this;
+    /// production engines leave it empty.
     pub focus: Option<FocusState>,
-    /// Bounded TaskAnchor prompt projection, copied from `ContextHints.task`
-    /// without scoring. Absent when no active task supplied a view.
+    /// Engine-internal snapshot leftover. PromptAssembler must not read this;
+    /// production engines leave it empty.
     #[serde(default)]
     pub task: Option<TaskAnchorView>,
     pub items: Vec<MaterializedItem>,
@@ -1630,7 +1634,8 @@ pub trait ContextEngine: Send + Sync {
     /// Deterministic catalog search: matches the query against entity
     /// signatures, kind/scope/task/label filters and recency, capped at
     /// `query.limit`. Hits may be Resident, Warm, Cold, or External so a
-    /// live file already in the working set is not an empty miss. The
+    /// live catalog file is not an empty miss. Catalog residency is not the
+    /// selected working set. The
     /// default implementation returns nothing, so engines without a catalog
     /// (baselines) keep working unchanged.
     async fn search_external(
@@ -1652,10 +1657,10 @@ pub trait ContextEngine: Send + Sync {
         Ok(None)
     }
 
-    /// Pull one externalized item's full content back from the store. The
-    /// item stays externalized — this is a deliberate, access-stamped read,
-    /// not a reactivation; the caller (the model) decides what to do with
-    /// the content and the working set is left untouched.
+    /// Pull one catalog item's full content. Resident/Warm bodies come from
+    /// the in-memory catalog; Cold/External bodies come from the store. The
+    /// item stays at its current residency — this is a stamped read, not a
+    /// reactivation. Catalog residency is not the selected working set.
     async fn fetch_external(&self, item_id: ContextItemId) -> AgentResult<Option<ContextItem>> {
         let _ = item_id;
         Ok(None)

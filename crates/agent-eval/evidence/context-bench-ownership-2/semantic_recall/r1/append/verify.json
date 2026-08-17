@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 7,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 3,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "2cff03a590ff1e65b65c857c4752ea6c9ab2fe270bc38a6a615a66bb231f0a45",
+      "bytes": 2633,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    if let Some(value) = decode_v2_hello(bytes) {\n        return Ok(Msg::Hello(value));\n    }\n    if bytes.contains(\"ping\") {\n        return Ok(Msg::Ping);\n    }\n    eprintln!(\"decode error: unknown input: {:?}\", bytes);\n    Err(\"unknown\".into())\n}\n\nfn decode_v2_hello(bytes: &str) -> Option<String> {\n    let prefix = r#\"{\"v\":2,\"hello\":\"\"#;\n    let suffix = r#\"\"}\"#;\n    let value = bytes.strip_prefix(prefix)?.strip_suffix(suffix)?;\n    Some(unescape_json(value))\n}\n\nfn unescape_json(value: &str) -> String {\n    let mut result = String::with_capacity(value.len());\n    let mut escaped = false;\n    for character in value.chars() {\n        if escaped {\n            result.push(match character {\n                '\"' => '\"',\n                '\\\\' => '\\\\',\n                'n' => '\\n',\n                'r' => '\\r',\n                't' => '\\t',\n                other => other,\n            });\n            escaped = false;\n        } else if character == '\\\\' {\n            escaped = true;\n        } else {\n            result.push(character);\n        }\n    }\n    if escaped {\n        result.push('\\\\');\n    }\n    result\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"ping\".into(),\n        Msg::Hello(value) => format!(r#\"{{\"v\":2,\"hello\":\"{}\"}}\"#, escape_json(value)),\n    }\n}\n\nfn escape_json(value: &str) -> String {\n    let mut result = String::with_capacity(value.len());\n    for character in value.chars() {\n        match character {\n            '\"' => result.push_str(r#\"\\\"\"#),\n            '\\\\' => result.push_str(r#\"\\\\\"#),\n            '\\n' => result.push_str(r#\"\\n\"#),\n            '\\r' => result.push_str(r#\"\\r\"#),\n            '\\t' => result.push_str(r#\"\\t\"#),\n            character => result.push(character),\n        }\n    }\n    result\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{decode, encode, Msg};\n\n    fn encode_roundtrip(msg: &Msg) -> Msg {\n        decode(&encode(msg)).unwrap()\n    }\n\n    #[test]\n    fn ping_encode_roundtrip() {\n        assert!(matches!(encode_roundtrip(&Msg::Ping), Msg::Ping));\n    }\n\n    #[test]\n    fn hello_uses_v2_envelope() {\n        let encoded = encode(&Msg::Hello(\"world\".into()));\n        assert_eq!(encoded, r#\"{\"v\":2,\"hello\":\"world\"}\"#);\n        assert!(matches!(decode(&encoded), Ok(Msg::Hello(value)) if value == \"world\"));\n    }\n\n    #[test]\n    fn hello_roundtrip_escapes_json_values() {\n        let message = Msg::Hello(\"say \\\"hello\\\"\\n\".into());\n        assert!(matches!(encode_roundtrip(&message), Msg::Hello(value) if value == \"say \\\"hello\\\"\\n\"));\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpH8zb6W\\append"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

@@ -1152,14 +1152,24 @@ impl ContextEngine for SimpleContextEngine {
     }
 
     async fn fetch_external(&self, item_id: ContextItemId) -> AgentResult<Option<ContextItem>> {
-        // Membership and the access-stamp inputs under the lock; the disk
-        // read happens *outside* it — sync store IO must never stall the
-        // context hot path.
+        // Catalog bodies (Resident / Warm) are returned from heap/buffer.
+        // Catalog residency is not the selected working set; this is a
+        // stamped read, not a reactivation. Stored bodies still come from
+        // disk outside the lock.
+        {
+            let mut state = self.state.lock().await;
+            if let Some(item) = crate::store::catalog_body(&state, item_id) {
+                crate::access::stamp_read(
+                    &mut state,
+                    item_id,
+                    agent_contracts::AccessSignal::Fetch,
+                );
+                return Ok(Some(item));
+            }
+        }
         let dir = crate::store::store_dir(&self.config);
         let retrievable = {
             let state = self.state.lock().await;
-            // O(1) id-index membership instead of a linear scan: the
-            // model's retrieval loop calls this per item.
             state
                 .external
                 .get(item_id)
@@ -1170,8 +1180,6 @@ impl ContextEngine for SimpleContextEngine {
         }
         let item = crate::store::read_item_async(&dir, item_id).await;
         if item.is_some() {
-            // fetch 读到 body，信号强于 inspect/search。更强的 ack 已经
-            // 写过时 stamp 拒绝降级。
             let mut state = self.state.lock().await;
             let still_retrievable = state
                 .external

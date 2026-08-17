@@ -345,8 +345,8 @@ async fn runtime_task_id_matches_the_context_task_id() {
     }
     let runtime_task_id = runtime_task_id.expect("FocusChanged must carry the task id");
 
-    // The engine's materialized focus must carry the same task id the
-    // runtime assigned — the single source of task identity, not a copy.
+    // Engine-internal FocusState keeps the runtime task id for scoring/GC.
+    // Materialize must not return it for prompt rendering.
     let snapshot = context
         .materialize(ContextQuery {
             current_input: "continue".into(),
@@ -355,9 +355,19 @@ async fn runtime_task_id_matches_the_context_task_id() {
         })
         .await
         .unwrap();
+    assert!(
+        snapshot.focus.is_none() && snapshot.task.is_none(),
+        "materialize is historical working context, not CURRENT FOCUS"
+    );
+    let checkpoint = context.checkpoint().await.unwrap();
+    let engine_task = checkpoint
+        .get("focus")
+        .and_then(|value| value.get("task_id"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
     assert_eq!(
-        snapshot.focus.map(|focus| focus.task_id),
-        Some(runtime_task_id),
+        engine_task.as_deref(),
+        Some(runtime_task_id.to_string().as_str()),
         "the context engine must be focused on the runtime's task id, not a parallel one"
     );
     instance.shutdown().await.unwrap();
