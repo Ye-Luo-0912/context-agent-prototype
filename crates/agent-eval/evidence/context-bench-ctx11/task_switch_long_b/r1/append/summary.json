@@ -1,0 +1,97 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 144619,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 1060,
+  "model_started": 29,
+  "model_used": 29,
+  "usage_incomplete": false,
+  "workspace_sha256": "f0d3b1996ba4b7a39042ad3cafc4ed85e819e93f686a5d1492cc9f4bedd71b05",
+  "workspace_files": 32,
+  "tools": [
+    {
+      "name": "edit.replace",
+      "calls": 5,
+      "failed": 3
+    },
+    {
+      "name": "fs.list",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 12,
+      "failed": 0
+    },
+    {
+      "name": "fs.write",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 4,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 7,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 2,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 0,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 3,
+    "fetch_calls": 0,
+    "final_resident_bytes": 7331,
+    "forgotten_items": 0,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 0,
+    "materialize_rounds": 29,
+    "model_input_tokens": 242931,
+    "model_output_tokens": 3676,
+    "peak_resident_bytes": 7331,
+    "provider_tokens_total": 246607,
+    "reactivation_consumed": 0,
+    "reactivation_consumed_tokens": 0,
+    "reactivation_selected": 0,
+    "reactivation_selected_tokens": 0,
+    "recovered_items": 0,
+    "recovery_auto_reactivation": 0,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 0,
+    "recovery_workspace_reread": 10,
+    "repeated_fs_reads": 10,
+    "rounds": 29,
+    "schema_tokens_total": 44196,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "search_ms_p50": 0,
+    "search_ms_p95": 0,
+    "tool_calls": 35,
+    "tool_failure_classes": {
+      "no_exact_match": 2,
+      "stale_revision": 1
+    },
+    "turns": 7
+  }
+}

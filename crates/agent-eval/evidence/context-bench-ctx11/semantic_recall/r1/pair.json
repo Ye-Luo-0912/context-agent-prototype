@@ -1,0 +1,30 @@
+{
+  "analysis_schema": "agent-eval.context-bench.v1",
+  "arm_order": [
+    "dynamic",
+    "rolling",
+    "append"
+  ],
+  "cells": [
+    {
+      "dir": "dynamic",
+      "engine": "dynamic"
+    },
+    {
+      "dir": "rolling",
+      "engine": "rolling"
+    },
+    {
+      "dir": "append",
+      "engine": "append"
+    }
+  ],
+  "fixture_id": "semantic_recall",
+  "live": true,
+  "pack_digest": "dfcfe75413ad4ee6e55dc1d34f6d17332d8f05ee5a334d82b14ef19fed2e15dd",
+  "repeat": 1,
+  "repeats": 1,
+  "schema": "agent-eval.pair.v1",
+  "spec_sha256": "2e8a89b27c5bf6ec7a2bdbc3011f3000c92585dc01c68517c277666df43314b4",
+  "task_sha256": "ae2d1d72db615d65c1b9352a550651c65b9dce4b29868d9c2222687def442457"
+}

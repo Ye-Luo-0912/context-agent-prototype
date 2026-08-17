@@ -1,0 +1,65 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "noise_recovery",
+  "expected_edit": "fix items[i + 1] in visit_all",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/parse.rs",
+      "pred": "not_contains",
+      "needles": [
+        "items[i + 1]"
+      ],
+      "count": 0,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/dump.rs",
+      "pred": "contains",
+      "needles": [
+        "unrelated compiler chatter"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/dump.rs",
+      "exists": true,
+      "sha256": "e370e57ba85b816ee7faa3bca209054139408e4445fd776f9e0cfb379736b635",
+      "bytes": 317,
+      "truncated": false,
+      "body": "pub fn noisy_log() -> String {\r\n    let mut out = String::new();\r\n    for i in 0..400 {\r\n        out.push_str(&format!(\"unrelated compiler chatter line {i}\\n\"));\r\n    }\r\n    out.push_str(\"error[E0308]: mismatched types in visit_all\\n\");\r\n    out.push_str(\"error: index out of bounds at items[i + 1]\\n\");\r\n    out\r\n}\r\n"
+    },
+    {
+      "path": "src/parse.rs",
+      "exists": true,
+      "sha256": "aa546587e97c6b1a3c8f4d13b74df5504073cc76a7a524f7832992b5d84eb6d9",
+      "bytes": 139,
+      "truncated": false,
+      "body": "pub fn visit_all(items: &[u8]) -> Vec<u8> {\n    let mut out = Vec::new();\n    for item in items {\n        out.push(*item);\n    }\n    out\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\index_fix.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpDldrJc\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

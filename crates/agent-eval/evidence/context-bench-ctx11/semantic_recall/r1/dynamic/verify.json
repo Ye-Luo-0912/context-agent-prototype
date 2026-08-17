@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 7,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 12,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "f021a61f909e46d6096ca21bc1ccd2bb0d399e6a33057548f04830dceaade8e0",
+      "bytes": 1888,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    let payload = bytes.trim();\n\n    match payload {\n        \"ping\" | \"v1:ping\" => Ok(Msg::Ping),\n        payload if payload.starts_with(\"v:2:hello:\") => {\n            Ok(Msg::Hello(payload[10..].to_owned()))\n        }\n        _ => Err(\"unknown\".into()),\n    }\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"v1:ping\".into(),\n        Msg::Hello(value) => format!(\"v:2:hello:{}\", value),\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{decode, encode, Msg};\n\n    #[test]\n    fn decodes_current_ping() {\n        assert!(matches!(decode(\"v1:ping\"), Ok(Msg::Ping)));\n    }\n\n    #[test]\n    fn decodes_legacy_ping() {\n        assert!(matches!(decode(\"ping\"), Ok(Msg::Ping)));\n    }\n\n    #[test]\n    fn rejects_payloads_that_only_contain_ping() {\n        assert!(decode(\"not-a-ping\").is_err());\n    }\n\n    #[test]\n    fn encodes_current_ping() {\n        assert_eq!(encode(&Msg::Ping), \"v1:ping\");\n    }\n\n    #[test]\n    fn encode_roundtrip_ping() {\n        let encoded = encode(&Msg::Ping);\n        assert!(matches!(decode(&encoded), Ok(Msg::Ping)));\n    }\n\n    #[test]\n    fn decodes_v2_hello() {\n        assert!(matches!(\n            decode(\"v:2:hello:client\"),\n            Ok(Msg::Hello(name)) if name == \"client\"\n        ));\n    }\n\n    #[test]\n    fn encodes_v2_hello() {\n        assert_eq!(encode(&Msg::Hello(\"client\".into())), \"v:2:hello:client\");\n    }\n\n    #[test]\n    fn encode_roundtrip_hello() {\n        let encoded = encode(&Msg::Hello(\"client\".into()));\n        assert!(matches!(\n            decode(&encoded),\n            Ok(Msg::Hello(name)) if name == \"client\"\n        ));\n    }\n\n    #[test]\n    fn rejects_hello_without_v2_envelope() {\n        assert!(decode(\"hello:client\").is_err());\n        assert!(decode(\"v2:hello:client\").is_err());\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpRdHd7j\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

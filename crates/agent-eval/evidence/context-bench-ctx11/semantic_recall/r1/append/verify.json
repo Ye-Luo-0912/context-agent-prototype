@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "0d43a2f5169482ba5f9f4038c346d930998a1bdc34c67d9027594aee0f352e96",
+      "bytes": 1157,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    if bytes.contains(\"ping\") {\n        return Ok(Msg::Ping);\n    }\n    if let Some(value) = bytes.strip_prefix(\"v:2|hello:\") {\n        return Ok(Msg::Hello(value.into()));\n    }\n    eprintln!(\"decode error: unknown message\");\n    Err(\"unknown\".into())\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"ping\".into(),\n        Msg::Hello(value) => format!(\"v:2|hello:{value}\"),\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn encode_roundtrip_ping() {\n        let encoded = encode(&Msg::Ping);\n        assert!(matches!(decode(&encoded), Ok(Msg::Ping)));\n    }\n\n    #[test]\n    fn ping_roundtrips() {\n        encode_roundtrip_ping();\n    }\n\n    #[test]\n    fn hello_roundtrips_with_v2_envelope() {\n        let encoded = encode(&Msg::Hello(\"client\".into()));\n        assert_eq!(encoded, \"v:2|hello:client\");\n        assert!(matches!(decode(&encoded), Ok(Msg::Hello(value)) if value == \"client\"));\n    }\n\n    #[test]\n    fn malformed_v2_message_is_rejected() {\n        assert!(decode(\"v:1|hello:client\").is_err());\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpRdHd7j\\append"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

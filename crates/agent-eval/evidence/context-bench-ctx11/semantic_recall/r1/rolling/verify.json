@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 6,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 8,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "1873a8d04f74a8f9089e51ca8c5afd61c5c5ce51c109e1ba716a9696fc480c01",
+      "bytes": 4191,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\npub const VERSION: u8 = 1;\nconst HELLO_VERSION: u8 = 2;\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    if bytes.contains(\"ping\") {\n        return Ok(Msg::Ping);\n    }\n\n    decode_hello(bytes).ok_or_else(|| \"unknown\".into())\n}\n\nfn compact_json(body: &str) -> Option<String> {\n    let mut compact = String::new();\n    let mut in_string = false;\n    let mut escaped = false;\n    for ch in body.chars() {\n        if in_string {\n            compact.push(ch);\n            if escaped {\n                escaped = false;\n            } else if ch == '\\\\' {\n                escaped = true;\n            } else if ch == '\"' {\n                in_string = false;\n            }\n        } else if ch == '\"' {\n            in_string = true;\n            compact.push(ch);\n        } else if !ch.is_whitespace() {\n            compact.push(ch);\n        }\n    }\n    if in_string || escaped {\n        None\n    } else {\n        Some(compact)\n    }\n}\n\nfn decode_hello(body: &str) -> Option<Msg> {\n    let compact = compact_json(body)?;\n    let prefix = format!(r#\"{{\"v\":{},\"type\":\"hello\",\"message\":\"\"#, HELLO_VERSION);\n    let suffix = \"\\\"}\";\n    if !compact.starts_with(&prefix) || !compact.ends_with(suffix) {\n        return None;\n    }\n\n    let value = &compact[prefix.len()..compact.len() - suffix.len()];\n    parse_json_string_fragment(value).map(Msg::Hello)\n}\n\nfn parse_json_string_fragment(value: &str) -> Option<String> {\n    let mut result = String::new();\n    let mut chars = value.chars();\n    while let Some(ch) = chars.next() {\n        if ch != '\\\\' {\n            result.push(ch);\n            continue;\n        }\n\n        match chars.next()? {\n            '\"' => result.push('\"'),\n            '\\\\' => result.push('\\\\'),\n            '/' => result.push('/'),\n            'b' => result.push('\\u{0008}'),\n            'f' => result.push('\\u{000c}'),\n            'n' => result.push('\\n'),\n            'r' => result.push('\\r'),\n            't' => result.push('\\t'),\n            _ => return None,\n        }\n    }\n    Some(result)\n}\n\nfn encode_json_string(value: &str) -> String {\n    let mut encoded = String::new();\n    for ch in value.chars() {\n        match ch {\n            '\"' => encoded.push_str(r#\"\\\"\"#),\n            '\\\\' => encoded.push_str(r#\"\\\\\"#),\n            '\\n' => encoded.push_str(r#\"\\n\"#),\n            '\\r' => encoded.push_str(r#\"\\r\"#),\n            '\\t' => encoded.push_str(r#\"\\t\"#),\n            ch if ch.is_control() => encoded.push_str(&format!(r#\"\\u{:04x}\"#, ch as u32)),\n            ch => encoded.push(ch),\n        }\n    }\n    encoded\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"ping\".into(),\n        Msg::Hello(message) => format!(\n            r#\"{{\"v\":{},\"type\":\"hello\",\"message\":\"{}\"}}\"#,\n            HELLO_VERSION,\n            encode_json_string(message)\n        ),\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{decode, encode, Msg};\n\n    #[test]\n    fn decodes_versioned_ping() {\n        assert!(matches!(\n            decode(r#\"{ \"version\": 1, \"type\": \"ping\" }\"#),\n            Ok(Msg::Ping)\n        ));\n        assert!(matches!(\n            decode(r#\"{ \"type\": \"ping\", \"version\": 1 }\"#),\n            Ok(Msg::Ping)\n        ));\n    }\n\n    #[test]\n    fn preserves_ping_encoding() {\n        assert_eq!(encode(&Msg::Ping), \"ping\");\n        assert!(matches!(decode(&encode(&Msg::Ping)), Ok(Msg::Ping)));\n    }\n\n    #[test]\n    fn decodes_v2_hello() {\n        assert!(matches!(\n            decode(r#\"{ \"v\": 2, \"type\": \"hello\", \"message\": \"world\" }\"#),\n            Ok(Msg::Hello(message)) if message == \"world\"\n        ));\n    }\n\n    #[test]\n    fn encodes_and_roundtrips_v2_hello() {\n        let msg = Msg::Hello(\"hello, \\\"world\\\"!\".into());\n        assert_eq!(\n            encode(&msg),\n            r#\"{\"v\":2,\"type\":\"hello\",\"message\":\"hello, \\\"world\\\"!\"}\"#\n        );\n        assert!(matches!(decode(&encode(&msg)), Ok(Msg::Hello(message)) if message == \"hello, \\\"world\\\"!\"));\n    }\n\n    #[test]\n    fn rejects_unknown_bodies() {\n        assert!(decode(r#\"{ \"version\": 2, \"type\": \"ping\" }\"#).is_ok());\n        assert!(decode(r#\"{ \"v\": 1, \"type\": \"hello\", \"message\": \"world\" }\"#).is_err());\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpRdHd7j\\rolling"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 143407,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 1213,
+  "model_started": 28,
+  "model_used": 28,
+  "usage_incomplete": false,
+  "workspace_sha256": "ab730e160a69f5b6dc5ac2c07b865c8d36a1220309ca0a2b30b7b54c6739ac3d",
+  "workspace_files": 32,
+  "tools": [
+    {
+      "name": "edit.replace",
+      "calls": 6,
+      "failed": 4
+    },
+    {
+      "name": "fs.list",
+      "calls": 4,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 11,
+      "failed": 0
+    },
+    {
+      "name": "fs.write",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 6,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 5,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 2,
+      "failed": 1
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 127,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 5,
+    "fetch_calls": 0,
+    "final_resident_bytes": 2778,
+    "forgotten_items": 36,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 113,
+    "materialize_rounds": 28,
+    "model_input_tokens": 188951,
+    "model_output_tokens": 4076,
+    "peak_resident_bytes": 2927,
+    "provider_tokens_total": 193027,
+    "reactivation_consumed": 4,
+    "reactivation_consumed_tokens": 105,
+    "reactivation_selected": 4,
+    "reactivation_selected_tokens": 105,
+    "recovered_items": 14,
+    "recovery_auto_reactivation": 14,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 22,
+    "recovery_workspace_reread": 9,
+    "repeated_fs_reads": 9,
+    "rounds": 28,
+    "schema_tokens_total": 42672,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "search_ms_p50": 0,
+    "search_ms_p95": 0,
+    "tool_calls": 37,
+    "tool_failure_classes": {
+      "missing_project_marker": 1,
+      "no_exact_match": 3,
+      "no_search_match": 1,
+      "stale_revision": 1
+    },
+    "turns": 7
+  }
+}

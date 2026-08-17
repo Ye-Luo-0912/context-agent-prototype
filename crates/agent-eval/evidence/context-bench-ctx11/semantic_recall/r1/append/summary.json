@@ -1,0 +1,108 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 300934,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 1682,
+  "model_started": 33,
+  "model_used": 33,
+  "usage_incomplete": false,
+  "workspace_sha256": "5f6f6fee03ae414c451f0a96d97e001d5a3672cff6771620312394e9ecf56b72",
+  "workspace_files": 30,
+  "tools": [
+    {
+      "name": "context.manage",
+      "calls": 4,
+      "failed": 0
+    },
+    {
+      "name": "edit.replace",
+      "calls": 3,
+      "failed": 3
+    },
+    {
+      "name": "fs.list",
+      "calls": 5,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 8,
+      "failed": 1
+    },
+    {
+      "name": "fs.write",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 5,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 7,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 11,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 0,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 4,
+    "fetch_calls": 0,
+    "final_resident_bytes": 18037,
+    "forgotten_items": 0,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 0,
+    "materialize_rounds": 33,
+    "model_input_tokens": 351250,
+    "model_output_tokens": 8276,
+    "peak_resident_bytes": 18037,
+    "provider_tokens_total": 359526,
+    "reactivation_consumed": 0,
+    "reactivation_consumed_tokens": 0,
+    "reactivation_selected": 0,
+    "reactivation_selected_tokens": 0,
+    "recovered_items": 0,
+    "recovery_auto_reactivation": 0,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 0,
+    "recovery_workspace_reread": 6,
+    "repeated_fs_reads": 6,
+    "rounds": 33,
+    "schema_tokens_total": 50292,
+    "search_calls": 4,
+    "search_empty": 4,
+    "search_hits": 0,
+    "search_ms_p50": 3,
+    "search_ms_p95": 4,
+    "tool_calls": 47,
+    "tool_failure_classes": {
+      "no_exact_match": 1,
+      "path_not_found": 1,
+      "stale_revision": 2
+    },
+    "turns": 9
+  }
+}

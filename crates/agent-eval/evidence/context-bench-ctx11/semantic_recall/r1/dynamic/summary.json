@@ -1,0 +1,115 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 376596,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 2824,
+  "model_started": 52,
+  "model_used": 52,
+  "usage_incomplete": false,
+  "workspace_sha256": "73f62dcaa5f09ba4f17d13a3b9567ff41a55b30fcdcc6d8539d2130aed9ff3ce",
+  "workspace_files": 30,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "context.manage",
+      "calls": 4,
+      "failed": 1
+    },
+    {
+      "name": "edit.replace",
+      "calls": 8,
+      "failed": 2
+    },
+    {
+      "name": "fs.list",
+      "calls": 8,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 20,
+      "failed": 3
+    },
+    {
+      "name": "fs.write",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 10,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 11,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 4,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 22,
+      "failed": 3
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 379,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 9,
+    "fetch_calls": 0,
+    "final_resident_bytes": 9244,
+    "forgotten_items": 95,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 322,
+    "materialize_rounds": 52,
+    "model_input_tokens": 514953,
+    "model_output_tokens": 13097,
+    "peak_resident_bytes": 9244,
+    "provider_tokens_total": 528050,
+    "reactivation_consumed": 32,
+    "reactivation_consumed_tokens": 3794,
+    "reactivation_selected": 32,
+    "reactivation_selected_tokens": 3794,
+    "recovered_items": 42,
+    "recovery_auto_reactivation": 42,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 53,
+    "recovery_workspace_reread": 17,
+    "repeated_fs_reads": 17,
+    "rounds": 52,
+    "schema_tokens_total": 79248,
+    "search_calls": 5,
+    "search_empty": 3,
+    "search_hits": 6,
+    "search_ms_p50": 4,
+    "search_ms_p95": 4,
+    "tool_calls": 90,
+    "tool_failure_classes": {
+      "invalid_request": 1,
+      "missing_project_marker": 2,
+      "path_not_found": 3,
+      "process_exit": 1,
+      "stale_revision": 2
+    },
+    "turns": 9
+  }
+}

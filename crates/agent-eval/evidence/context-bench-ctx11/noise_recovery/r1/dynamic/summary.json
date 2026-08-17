@@ -1,0 +1,96 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 65668,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 473,
+  "model_started": 10,
+  "model_used": 10,
+  "usage_incomplete": false,
+  "workspace_sha256": "ab8333fc551a5255fe0d0a66dbf675bb9c22bc5d009b6e234459ef28eb741791",
+  "workspace_files": 32,
+  "tools": [
+    {
+      "name": "fs.list",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 5,
+      "failed": 0
+    },
+    {
+      "name": "fs.write",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 1,
+      "failed": 1
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 30,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 1,
+    "fetch_calls": 0,
+    "final_resident_bytes": 1427,
+    "forgotten_items": 14,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 34,
+    "materialize_rounds": 10,
+    "model_input_tokens": 66347,
+    "model_output_tokens": 1719,
+    "peak_resident_bytes": 1427,
+    "provider_tokens_total": 68066,
+    "reactivation_consumed": 1,
+    "reactivation_consumed_tokens": 12,
+    "reactivation_selected": 1,
+    "reactivation_selected_tokens": 12,
+    "recovered_items": 6,
+    "recovery_auto_reactivation": 6,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 8,
+    "recovery_workspace_reread": 3,
+    "repeated_fs_reads": 3,
+    "rounds": 10,
+    "schema_tokens_total": 15240,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "search_ms_p50": 0,
+    "search_ms_p95": 0,
+    "tool_calls": 16,
+    "tool_failure_classes": {
+      "missing_project_marker": 1
+    },
+    "turns": 3
+  }
+}
