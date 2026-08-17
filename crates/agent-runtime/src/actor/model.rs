@@ -45,11 +45,7 @@ impl RuntimeActor {
         {
             Ok(report) => {
                 if let Err(error) = self
-                    .core
-                    .emit_event(RuntimeEvent::ContextMaintained {
-                        trigger: ContextMaintenanceTrigger::BeforeModel,
-                        report,
-                    })
+                    .emit_context_maintained(ContextMaintenanceTrigger::BeforeModel, report)
                     .await
                 {
                     // The maintenance state change landed but its audit

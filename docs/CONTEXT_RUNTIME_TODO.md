@@ -104,7 +104,7 @@ boundedness, and integrity rather than replace it with transcript history.
 | Store integrity | Implemented crash-recovery baseline (`CTX-04`) | Atomic write/rename, checksums, bounded I/O, post-commit recall deletion, startup reconcile, quarantine, and process-service parity are implemented. Canonical record ownership and the documented quarantine/operator workflow remain broader structural work. |
 | Strong provenance graph | Implemented storage-safety baseline (`CTX-05`) | `DerivedFrom`, `EvidenceFor`, `VerifiedBy`, `ArtifactOf`, and `Continuation` are strong edges; `SharesEntities` remains weak. Storage GC roots non-deletable stored records and traverses only strong edges, with deterministic and random-graph tests. Provenance admission/authority policy remains incomplete. |
 | Incremental GC work | Partial | `ContextCatalog` applies a dirty-id upsert on ingest/maintain/tag instead of rebuilding every event; heap `replace_all` / restore still rebuild. Minor residency and Cold→External aging walk a `gc_work_batch` (default 4096) cursor so a heap at or below the batch keeps the previous full stable-order pass. |
-| Immediate tool signal | Implemented (`CTX-08`) | Tool commit emits a bounded, body-free `WorkingSetSignal`; discovered entities heat related context before the immediately following model round while the tool body remains in `TurnFrame` until finalization. |
+| Immediate tool signal | Implemented (`CTX-08`) | Successful tool commit emits a bounded, body-free `WorkingSetSignal`; discovered entities heat related context before the immediately following model round while the tool body remains in `TurnFrame` until finalization. Failed execution results stay on the TurnFrame and do not heat `hot_entities`. |
 | Final model-consumption acknowledgement | Implemented (`CTX-07`) | `materialize` returns a non-consuming preview. After final packing, only a successful non-stale ModelOutput commits a bounded `ContextConsumptionAck` with the exact inline/external ids; failure paths do not reinforce. Fit-before-top-K, bounded/charged external refs, and bounded candidate generation are covered; workload cost evaluation remains separate. |
 | Prompt authority separation | Implemented (`CORE-05`) | `PromptAssembler` keeps policy in System, renders selected history/external refs as delimited low-authority User observations, and preserves live file/tool output as Tool-role content. Injection regressions cover all three paths. |
 | Real evaluation | Partial | EVAL-02 Context Bench (`agent-eval --context-bench`) is the current M15 decision instrument; 300×3 parked. Unit/property coverage is strong and the 10,000-turn residency regression exists. `agent-eval --compare-live` is the live paired coding harness (real model, independent workspaces, hidden verify). EVAL-01.1 writes per-cell bundles; EVAL-01.1b persists replayable file-content hidden asserts. EVAL-01.2 freezes the clustered C−A estimator; EVAL-01.3 re-freezes the gate at 300×3 / −5 pp (historical 30×3 is underpowered). EVAL-01.4e freezes the 509-task pack; EVAL-01.3b sets `SUITE_FROZEN=true` and declares retrieval secondaries in SPEC (no gate n/margin change). EVAL-01.3c locks the exact 300 acceptance ids and makes token diagnostics honor `cost_eligible`. EVAL-01.5 freezes the 30-task calibration sample; a file-only 9×3 live spend is in `crates/agent-eval/evidence/pilot-30` (`decision=pilot`). EVAL-01.5.p1 splits send vs pack and raises the shared live round cap to 48; remaining P0 SWE-bench (24k/12) is skipped as a floor-effect host. EVAL-01.5.p1b lands the shared model-backed bounded compactor for live B and C `TaskCompleted` distillation (CI keeps the scripted digest). EVAL-01.5.p1c is the retrieval-trust slice (catalog-wide search/inspect, trusted packed-set prompt); extra C rounds are still a treatment effect. P1 n=1 file-only + recall is collected (`rehydration-diag`); leftover extra rounds are mixed, not gone. Compaction cell harvest now sums `ContextMaintained` pass costs. P1 SWE-bench n=1 (`p1-swebench-diag`, pre-path-stamp): C 3/3 pass, A 0/3 at 48-round cap, B mixed. P1 after-path n=1: js-ms-negative C extra rounds gone this cell; recall extra rounds remain. Do not mix P0/P1 ITT tables. P1 file-only 9×3 on the current binary (`target/eval-evidence/p1-file-only-calibrate`, not `pilot-30`): ITT A=B=C=0.889, `decision=pilot`, analyze ineligible n=9 LCL=0 `degenerate=true`; `uuid-parity-keys` 0/9 hidden `cargo test`. Frozen SWE-bench 21×3 is still missing (after-proxy is n=1). The 300×3 non-inferiority run is still open. |
@@ -1156,7 +1156,8 @@ in AUDIT; this list does not duplicate checkbox state):
    tokens): js-ms-minutes B, openai-wire B, rust-grep C — not a compact
    crash, not C vs A. Catalog search almost unused. Cell `compact=0/0`
    was a harvest bug (later GC snapshot wiped B fold); metrics now sum
-   `ContextMaintained` per-pass costs. **P1 SWE-bench n=1 (2026-08-15).**
+   `ContextCompacted` events, falling back to `ContextMaintained` pass
+   costs on older traces. **P1 SWE-bench n=1 (2026-08-15).**
    Three Django tasks in `target/eval-evidence/p1-swebench-diag` (not
    `pilot-30`; pre-path-stamp binary). C passed 3/3 (11749 25r/38t
    `model_in=420258`; 11999 27r/43t `520717`; 12708 24r/55t `679564`).
@@ -1918,8 +1919,9 @@ current slice above.)
   task. The TUI surfaces the report (scanned/deleted/io-errors) when
   anything was deleted. E2E:
   `task_completion_schedules_storage_gc_and_publishes_the_report`.
-- [x] Emit a bounded metadata-only `WorkingSetSignal` at tool commit so the
-  next model round sees newly hot files/symbols (`CTX-08`).
+- [x] Emit a bounded metadata-only `WorkingSetSignal` at successful tool
+  commit so the next model round sees newly hot files/symbols (`CTX-08`).
+  Failed execution results stay on the TurnFrame and do not heat C.
 - [x] Bound materialization candidates and external preview tokens and fix
   fit-before-top-K (`CTX-07`). Keep candidate/materialize cost in the M15
   evaluation queue rather than reopening the correctness defect.

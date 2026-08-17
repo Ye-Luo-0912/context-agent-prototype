@@ -38,7 +38,7 @@ pub fn capture_host_runtime_facts() -> RuntimeFactsView {
 impl Workspace {
     /// Confined root scan of known project markers plus the immutable host
     /// profile. Callers refresh only the marker portion after a committed
-    /// workspace mutation.
+    /// workspace mutation or a successful `shell.exec` / `process.run`.
     pub fn runtime_facts(&self) -> RuntimeFactsView {
         RuntimeFactsView::new(
             detect_platform(),

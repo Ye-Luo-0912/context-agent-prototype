@@ -120,12 +120,19 @@ impl RuntimeActor {
         if let Err(error) = self.core.emit_event(event).await {
             return Err(self.audit_gap_after_commit(error).await);
         }
-        if let Err(error) = self
-            .core
-            .emit_event(RuntimeEvent::ContextMaintained { trigger, report })
-            .await
-        {
+        if let Err(error) = self.emit_context_maintained(trigger, report).await {
             return Err(self.audit_gap_after_commit(error).await);
+        }
+        Ok(())
+    }
+
+    pub(super) async fn emit_context_maintained(
+        &self,
+        trigger: ContextMaintenanceTrigger,
+        report: ContextMaintenanceReport,
+    ) -> AgentResult<()> {
+        for event in context_maintenance_events(trigger, report) {
+            self.core.emit_event(event).await?;
         }
         Ok(())
     }

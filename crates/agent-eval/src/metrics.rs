@@ -129,7 +129,8 @@ pub struct RunMetrics {
     pub access_fetches: u64,
     pub access_admits: u64,
     pub access_consumption_acks: u64,
-    /// 有界压缩器累计 provider 输入（ContextMaintained 本轮花费之和）。
+    /// 有界压缩器累计 provider 输入。优先 `ContextCompacted` 事件之和；
+    /// 旧 traces 回退到 `ContextMaintained.report` 本轮花费。
     pub compaction_input_tokens: u64,
     pub compaction_output_tokens: u64,
 }
@@ -144,6 +145,7 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     let mut forgotten: HashSet<ContextItemId> = HashSet::new();
     let mut recovered: HashSet<ContextItemId> = HashSet::new();
     let mut recovered_path: HashMap<ContextItemId, RecoverPath> = HashMap::new();
+    let mut seen_context_compacted = false;
 
     for envelope in events {
         match &envelope.event {
@@ -255,12 +257,31 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 metrics.lifecycle_transitions += report.transitions.len() as u64;
                 snapshot_access(&mut metrics, &report.diagnostics);
                 // 报告字段是本轮花费；diagnostics 快照会被随后的 GC 清零。
+                if !seen_context_compacted {
+                    metrics.compaction_input_tokens = metrics
+                        .compaction_input_tokens
+                        .saturating_add(report.compaction_input_tokens);
+                    metrics.compaction_output_tokens = metrics
+                        .compaction_output_tokens
+                        .saturating_add(report.compaction_output_tokens);
+                }
+            }
+            RuntimeEvent::ContextCompacted {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                if !seen_context_compacted {
+                    metrics.compaction_input_tokens = 0;
+                    metrics.compaction_output_tokens = 0;
+                    seen_context_compacted = true;
+                }
                 metrics.compaction_input_tokens = metrics
                     .compaction_input_tokens
-                    .saturating_add(report.compaction_input_tokens);
+                    .saturating_add(*input_tokens);
                 metrics.compaction_output_tokens = metrics
                     .compaction_output_tokens
-                    .saturating_add(report.compaction_output_tokens);
+                    .saturating_add(*output_tokens);
             }
             RuntimeEvent::ContextGc { report } => {
                 metrics.gc_evictions += report.evicted as u64;
@@ -499,11 +520,11 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
 mod tests {
     use super::*;
     use agent_contracts::{
-        AttentionState, ContextDiagnostics, ContextGcReport, ContextItemId, ContextKind,
-        ContextMaintenanceReport, ContextMaintenanceTrigger, ContextScope, ContextSelection,
-        ContextStateTransition, InputLifecycle, RunId, RuntimeInputEnvelope, ScoreBreakdown,
-        TaskId, ToolOutput, ToolSurfaceDemand, ToolSurfacePlanReport, ToolSurfacePlanStatus,
-        ToolSurfaceSelection, ToolSurfaceSourceRevisions, TurnId,
+        AttentionState, CompactionReason, ContextDiagnostics, ContextGcReport, ContextItemId,
+        ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextScope,
+        ContextSelection, ContextStateTransition, InputLifecycle, RunId, RuntimeInputEnvelope,
+        ScoreBreakdown, TaskId, ToolOutput, ToolSurfaceDemand, ToolSurfacePlanReport,
+        ToolSurfacePlanStatus, ToolSurfaceSelection, ToolSurfaceSourceRevisions, TurnId,
     };
     use serde_json::json;
 
@@ -998,6 +1019,38 @@ mod tests {
         let metrics = aggregate_metrics(&events);
         assert_eq!(metrics.compaction_input_tokens, 80);
         assert_eq!(metrics.compaction_output_tokens, 20);
+    }
+
+    #[test]
+    fn context_compacted_events_are_the_cost_authority() {
+        let run = RunId::new();
+        let events = vec![
+            envelope(
+                run,
+                1,
+                RuntimeEvent::ContextMaintained {
+                    trigger: ContextMaintenanceTrigger::UserInput,
+                    report: ContextMaintenanceReport {
+                        compaction_input_tokens: 80,
+                        compaction_output_tokens: 20,
+                        ..ContextMaintenanceReport::default()
+                    },
+                },
+            ),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::ContextCompacted {
+                    reason: CompactionReason::EpisodeRotation,
+                    input_tokens: 34600,
+                    output_tokens: 1300,
+                    source_items: 8,
+                },
+            ),
+        ];
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.compaction_input_tokens, 34600);
+        assert_eq!(metrics.compaction_output_tokens, 1300);
     }
 
     #[test]

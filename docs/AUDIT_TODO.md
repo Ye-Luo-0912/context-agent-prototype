@@ -1180,7 +1180,11 @@ engine merges the signaled entities with no item created) and
 `tool_commit_signals_discovered_entities_before_the_next_round` (the actor
 sends the signal at tool commit, before the turn-end observation ingest;
 the observed ingest order in the turn test now shows `WorkingSetSignal`
-between the user message and the persisted tool observation). The existing
+between the user message and the persisted tool observation). **Follow-up
+2026-08-17:** only successful semantic observations emit the signal. Failed
+execution results (`ok: false` or a typed `failure_class`, including empty
+search) stay on the TurnFrame and may persist as typed `Error` items; they
+must not merge candidate paths into `hot_entities`. The existing
 recall end-to-end test now exercises the acceptance directly: a fetch tool
 that discovers `AuthService.rs` signals it, and the turn-boundary GC
 recalls the seeded Warm/Cold entries into the resident heap under their
@@ -1473,9 +1477,18 @@ Required closure:
 
 ### TOOL-ERROR-01 — Preventable tool failures have no typed recovery contract
 
-**CLOSED (2026-08-17).** Tool results project `metadata.failure_class` and a
-bounded recovery hint. Kernel `Err` paths classify from the error string.
-Eval aggregates class counts. No automatic retry or command translation.
+**CLOSED (2026-08-17).** Tool results project trusted `metadata._runtime`
+(`failure_class` + recovery hint) and a model-visible `runtime_failure:`
+header. Kernel `Err` paths classify from the error string. Eval aggregates
+class counts. No automatic retry or command translation.
+
+**Follow-up 2026-08-17.** Producer `_runtime` is ignored. First-party tools
+pass a class as a top-level hint; Core strips reserved keys and overwrites
+the trusted object. `MissingProjectMarker` requires command + specific
+subcommand + stderr/stdout evidence + confined absence (`rustc`/`pytest`/
+`pip`/`npx` are not markers). Failed execution results are TurnFrame-only
+and must not emit `WorkingSetSignal`. Compaction cost is `ContextCompacted`
+event sum.
 
 **Was OPEN (confirmed 2026-08-17).** The outer error vocabulary distinguishes
 classes such as invalid request, I/O, timeout and cancellation, but important
@@ -2018,8 +2031,9 @@ closed. M12/M13 remain independent trusted-execution blockers.
   **Partial 2026-08-15.** Live B/C inject `ModelBackedCompactor`; CI
   rolling keeps `ScriptedCompactor`. Compactor tokens are on diagnostics
   / `manager_token_cost` / rendered metrics. Cell `compact=in/out` now
-  sums `ContextMaintained` per-pass costs so a later zero GC snapshot
-  cannot wipe B fold. Actor/recall/store/schema wall-time accounting
+  sums `ContextCompacted` events (legacy traces without that event still
+  use `ContextMaintained.report` pass costs) so ingest-time episode
+  rotation is not reported as compact=0. Actor/recall/store/schema wall-time accounting
   was already on the event stream.
   **Follow-up 2026-08-16.** C episode-rotation distillation uses the same
   operator (`episode-derived` card; sources kept; prior card superseded).

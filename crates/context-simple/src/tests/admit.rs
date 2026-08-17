@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use agent_contracts::{
-    AgentError, AttentionState, BoundedCompactor, CompactionOutput, CompactionRequest,
-    ContextAction, ContextEngine, ContextHints, ContextIngress, ContextItemId, ContextKind,
-    ContextMaintenanceTrigger, ContextQuery, ContextResidency, ContextRetention, ContextScope,
-    ContextSearchQuery, DependencyEdge, DependencyKind, LifecycleLabel, ScopeId, ScopeKind,
-    ScopeState, SemanticState, TaskId, ToolOutput,
+    AgentError, AttentionState, BoundedCompactor, CompactionOutput, CompactionReason,
+    CompactionRequest, ContextAction, ContextEngine, ContextHints, ContextIngress, ContextItemId,
+    ContextKind, ContextMaintenanceTrigger, ContextQuery, ContextResidency, ContextRetention,
+    ContextScope, ContextSearchQuery, DependencyEdge, DependencyKind, LifecycleLabel, ScopeId,
+    ScopeKind, ScopeState, SemanticState, TaskId, ToolOutput,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -1755,6 +1755,18 @@ async fn episode_rotation_distills_with_derived_from_and_keeps_sources() {
     let diagnostics = engine.diagnostics().await.unwrap();
     assert_eq!(diagnostics.compaction_input_tokens, 5);
     assert_eq!(diagnostics.compaction_output_tokens, 3);
+
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    assert_eq!(report.compactions.len(), 1);
+    assert_eq!(
+        report.compactions[0].reason,
+        CompactionReason::EpisodeRotation
+    );
+    assert_eq!(report.compaction_input_tokens, 5);
+    assert_eq!(report.compaction_output_tokens, 3);
 }
 
 /// A later rotation supersedes the previous episode card; the newest card

@@ -293,8 +293,9 @@ executables.
 The facts block is system-owned, cache-stable and charged as a fixed prompt
 layer; it never enters `ContextEngine`, transcript history or GC. V1 hard caps:
 1 KiB UTF-8 total, at most 16 workspace markers and 64 bytes per marker.
-Workspace-marker refresh happens only at actor safe points after a committed
-workspace mutation; OS/shell identity stays immutable for the run.
+Workspace-marker refresh happens at actor safe points after a committed
+workspace mutation and after a successful `shell.exec` / `process.run`;
+OS/shell identity stays immutable for the run.
 
 ### Measured tool-reliability preflight (`TOOL-ENV-01` → `TOOL-ERROR-01`)
 
@@ -1527,6 +1528,11 @@ together with TaskAnchor and continuous context GC.
   runtime/VCS internals from ordinary file navigation.
 - [x] **TOOL-ERROR-01** Add trusted bounded failure classes/recovery hints and
   evaluation attribution without blind retries or cost exclusion.
+  **Follow-up 2026-08-17:** Core strips reserved producer keys and writes
+  `metadata._runtime` plus a model-visible `runtime_failure:` header.
+  `MissingProjectMarker` is evidence-gated (command + subcommand + output
+  evidence + true absence). Failed tool results stay on the TurnFrame and
+  do not heat C via `WorkingSetSignal`.
 
 These four items are the measured tool-reliability preflight for the next
 Context Bench wave. They do not reopen completed `TOOLS-05..09` safety work

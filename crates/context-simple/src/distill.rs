@@ -2,8 +2,8 @@
 //! Behavior is unchanged; these used to live in `engine.rs`.
 
 use agent_contracts::{
-    ContextItemId, ContextKind, ContextRetention, ContextScope, DependencyEdge, DependencyKind,
-    ScopeId, ScopeKind, ScopeState, TaskId, bound_compaction_source,
+    CompactionReason, ContextItemId, ContextKind, ContextRetention, ContextScope, DependencyEdge,
+    DependencyKind, ScopeId, ScopeKind, ScopeState, TaskId, bound_compaction_source,
 };
 
 use crate::engine::{SimpleContextConfig, State};
@@ -17,6 +17,7 @@ pub(crate) struct DistillJob {
     pub(crate) source: String,
     pub(crate) source_ids: Vec<ContextItemId>,
     pub(crate) source_label: &'static str,
+    pub(crate) reason: CompactionReason,
 }
 
 const MAX_DISTILL_SOURCES: usize = 8;
@@ -49,6 +50,7 @@ pub(crate) fn plan_task_distill(
         source: bound_compaction_source(&source),
         source_ids,
         source_label: TASK_DERIVED_SOURCE,
+        reason: CompactionReason::TaskCompleted,
     }
 }
 
@@ -106,6 +108,7 @@ pub(crate) fn plan_episode_distill(state: &State) -> Option<DistillJob> {
         source,
         source_ids,
         source_label: EPISODE_DERIVED_SOURCE,
+        reason: CompactionReason::EpisodeRotation,
     })
 }
 

@@ -114,11 +114,7 @@ impl RuntimeActor {
             .services
             .context_maintain(ContextMaintenanceTrigger::UserInput)
             .await?;
-        self.core
-            .emit_event(RuntimeEvent::ContextMaintained {
-                trigger: ContextMaintenanceTrigger::UserInput,
-                report,
-            })
+        self.emit_context_maintained(ContextMaintenanceTrigger::UserInput, report)
             .await?;
 
         // A new turn has no active call from a previous turn: the
@@ -508,11 +504,7 @@ impl RuntimeActor {
                 }
             };
             if let Err(error) = self
-                .core
-                .emit_event(RuntimeEvent::ContextMaintained {
-                    trigger: ContextMaintenanceTrigger::AfterTool,
-                    report,
-                })
+                .emit_context_maintained(ContextMaintenanceTrigger::AfterTool, report)
                 .await
             {
                 return self
@@ -597,11 +589,7 @@ impl RuntimeActor {
             }
         };
         if let Err(error) = self
-            .core
-            .emit_event(RuntimeEvent::ContextMaintained {
-                trigger: ContextMaintenanceTrigger::AfterModel,
-                report,
-            })
+            .emit_context_maintained(ContextMaintenanceTrigger::AfterModel, report)
             .await
         {
             return self

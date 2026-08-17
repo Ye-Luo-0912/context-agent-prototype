@@ -427,11 +427,11 @@ pub enum ContextIngress {
         scope_id: Option<ScopeId>,
     },
     /// A lightweight, bounded mid-turn working-set signal from the runtime:
-    /// a tool's output named entities the *next* model round should treat
-    /// as hot, before the observation body is persisted at turn end. No
-    /// item is created and nothing is externalized — the signal only
-    /// extends the hot-entity set, so Warm/Cold evidence can be recalled
-    /// immediately without duplicating the tool body.
+    /// a *successful* tool observation named entities the next model round
+    /// should treat as hot, before the body is persisted at turn end. Failed
+    /// execution results stay on the TurnFrame and must not extend
+    /// `hot_entities`. No item is created — the signal only extends the hot
+    /// set so Warm/Cold evidence can be recalled without duplicating the body.
     WorkingSetSignal {
         content: String,
     },
@@ -987,6 +987,28 @@ pub struct ContextMaintenanceReport {
     /// 本轮维护里压缩器花费的 provider 输出 token。
     #[serde(default)]
     pub compaction_output_tokens: u64,
+    /// Explicit compaction passes drained this maintain (ingest-time episode
+    /// rotation plus in-pass folds). Eval sums [`crate::RuntimeEvent::ContextCompacted`].
+    #[serde(default)]
+    pub compactions: Vec<ContextCompaction>,
+}
+
+/// Why a bounded compaction pass ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionReason {
+    EpisodeRotation,
+    TaskCompleted,
+    RollingFold,
+}
+
+/// One bounded compaction pass. Token fields are the compressor call itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompaction {
+    pub reason: CompactionReason,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub source_items: usize,
 }
 
 /// One reversible eviction produced by a full GC pass: the item left the

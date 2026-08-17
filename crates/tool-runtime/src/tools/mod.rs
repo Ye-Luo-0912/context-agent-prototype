@@ -224,18 +224,19 @@ pub(crate) fn classify_process_outcome(
     if exit_ok {
         return None;
     }
-    if let Some(command) = command
-        && let Some(marker) = required_project_marker(command)
-        && !marker_present(markers, marker)
-    {
-        return Some(ToolFailureClass::MissingProjectMarker);
-    }
     let tail = output_tail.to_ascii_lowercase();
     if looks_unavailable(&tail) {
         if dialect.is_some_and(|d| d.kind.wrong_dialect_likely(command.unwrap_or(""), &tail)) {
             return Some(ToolFailureClass::ShellDialectMismatch);
         }
         return Some(ToolFailureClass::CommandUnavailable);
+    }
+    if let Some(command) = command
+        && let Some(marker) = required_project_marker(command)
+        && !marker_present(markers, marker)
+        && marker_missing_evidence(marker, &tail)
+    {
+        return Some(ToolFailureClass::MissingProjectMarker);
     }
     if dialect.is_some_and(|d| d.kind.wrong_dialect_likely(command.unwrap_or(""), &tail)) {
         return Some(ToolFailureClass::ShellDialectMismatch);
@@ -244,7 +245,26 @@ pub(crate) fn classify_process_outcome(
 }
 
 pub(crate) fn required_project_marker(command: &str) -> Option<&'static str> {
-    let token = command.split_whitespace().next()?.trim_matches('"');
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let exe = normalize_exe(tokens.first()?)?;
+    let sub = tokens
+        .get(1)
+        .map(|token| token.trim_matches('"').to_ascii_lowercase());
+    match (exe.as_str(), sub.as_deref()) {
+        ("cargo", Some("test" | "build" | "run" | "check" | "clippy" | "fmt" | "bench")) => {
+            Some("Cargo.toml")
+        }
+        ("npm", Some("test" | "install" | "ci" | "run")) => Some("package.json"),
+        ("yarn", Some("test" | "install" | "run")) => Some("package.json"),
+        ("pnpm", Some("test" | "install" | "run")) => Some("package.json"),
+        ("go", Some("test" | "build" | "run" | "mod")) => Some("go.mod"),
+        ("mvn", Some("test" | "package" | "install")) => Some("pom.xml"),
+        _ => None,
+    }
+}
+
+fn normalize_exe(token: &str) -> Option<String> {
+    let token = token.trim_matches('"');
     let token = token
         .rsplit(['/', '\\'])
         .next()
@@ -253,15 +273,17 @@ pub(crate) fn required_project_marker(command: &str) -> Option<&'static str> {
         .trim_end_matches(".cmd")
         .trim_end_matches(".bat")
         .to_ascii_lowercase();
-    match token.as_str() {
-        "cargo" | "rustc" => Some("Cargo.toml"),
-        "npm" | "npx" | "yarn" | "pnpm" => Some("package.json"),
-        "pytest" | "pip" | "pip3" => Some("pyproject.toml"),
-        "go" => Some("go.mod"),
-        "mvn" => Some("pom.xml"),
-        "gradle" | "gradlew" => Some("build.gradle"),
-        _ => None,
-    }
+    if token.is_empty() { None } else { Some(token) }
+}
+
+fn marker_missing_evidence(marker: &str, tail: &str) -> bool {
+    let needle = marker.to_ascii_lowercase();
+    tail.contains(&needle)
+        && (tail.contains("could not find")
+            || tail.contains("no such file")
+            || tail.contains("cannot find")
+            || tail.contains("not found")
+            || tail.contains("enoent"))
 }
 
 fn marker_present(markers: &[String], needed: &str) -> bool {
@@ -367,4 +389,85 @@ pub(crate) trait Tool: Send + Sync {
         effect_context: Option<OperationEffectContext>,
         cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome>;
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+    use agent_contracts::ToolFailureClass;
+
+    #[test]
+    fn rustc_and_generic_tools_are_not_missing_project_marker() {
+        assert_eq!(
+            required_project_marker("rustc --test src/protocol.rs"),
+            None
+        );
+        assert_eq!(required_project_marker("pytest"), None);
+        assert_eq!(required_project_marker("pip install foo"), None);
+        assert_eq!(required_project_marker("npx tsc"), None);
+        assert_eq!(
+            classify_process_outcome(
+                "exited",
+                false,
+                "error: couldn't compile src/protocol.rs",
+                Some("rustc --test src/protocol.rs"),
+                None,
+                &[],
+            ),
+            Some(ToolFailureClass::ProcessExit)
+        );
+    }
+
+    #[test]
+    fn cargo_test_missing_marker_requires_subcommand_evidence_and_absence() {
+        assert_eq!(required_project_marker("cargo test"), Some("Cargo.toml"));
+        assert_eq!(
+            classify_process_outcome(
+                "exited",
+                false,
+                "error: could not find `Cargo.toml` in `/tmp/x` or any parent directory",
+                Some("cargo test"),
+                None,
+                &[],
+            ),
+            Some(ToolFailureClass::MissingProjectMarker)
+        );
+        assert_eq!(
+            classify_process_outcome(
+                "exited",
+                false,
+                "error: test failed",
+                Some("cargo test"),
+                None,
+                &[],
+            ),
+            Some(ToolFailureClass::ProcessExit)
+        );
+        assert_eq!(
+            classify_process_outcome(
+                "exited",
+                false,
+                "error: could not find `Cargo.toml`",
+                Some("cargo test"),
+                None,
+                &["Cargo.toml".into()],
+            ),
+            Some(ToolFailureClass::ProcessExit)
+        );
+    }
+
+    #[test]
+    fn unavailable_binary_is_not_missing_project_marker() {
+        assert_eq!(
+            classify_process_outcome(
+                "exited",
+                false,
+                "'cargo' is not recognized as an internal or external command",
+                Some("cargo test"),
+                None,
+                &[],
+            ),
+            Some(ToolFailureClass::CommandUnavailable)
+        );
+    }
 }

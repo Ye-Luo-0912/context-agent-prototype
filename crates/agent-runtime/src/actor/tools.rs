@@ -673,17 +673,20 @@ impl RuntimeActor {
                 if let Some(directive) = completion.directive {
                     self.execute_directive(directive).await;
                 }
-                // The tool's bounded output names entities the next model
-                // round should treat as hot, *before* the observation body
-                // is persisted at turn end. The signal is a no-body, bounded
-                // hot-entity extension: Warm/Cold evidence can be recalled
-                // immediately without duplicating the tool body.
-                let _ = self
-                    .services
-                    .context_ingest(ContextIngress::WorkingSetSignal {
-                        content: output.working_set_signal_text(),
-                    })
-                    .await;
+                if output.ok && matches!(output.tool_name.as_str(), "shell.exec" | "process.run") {
+                    self.refresh_runtime_fact_markers();
+                }
+                // Successful semantic observations heat related context
+                // before the next model round. Failed execution results
+                // stay on the TurnFrame only.
+                if output.heats_working_set() {
+                    let _ = self
+                        .services
+                        .context_ingest(ContextIngress::WorkingSetSignal {
+                            content: output.working_set_signal_text(),
+                        })
+                        .await;
+                }
                 if let Some(turn) = self.state.turn.as_mut() {
                     turn.turn_frame.push_tool_result_with(
                         output.clone(),

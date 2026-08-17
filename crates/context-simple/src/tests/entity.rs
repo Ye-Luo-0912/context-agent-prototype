@@ -67,6 +67,53 @@ async fn hot_entities_follow_user_then_tool_then_reset() {
 }
 
 #[tokio::test]
+async fn failed_tool_observation_does_not_heat_candidate_entities() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "fix AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "edit.replace".into(),
+                ok: false,
+                summary: "no_exact_match".into(),
+                model_content: "candidate:\nsrc/foo.rs\nsrc/bar.rs".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({"failure_class": "no_exact_match"}),
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(state.hot_entities.contains(&"AuthService.rs".to_string()));
+        assert!(
+            state
+                .items
+                .iter()
+                .any(|item| item.kind == ContextKind::Error),
+            "failed observations still persist as typed Error items"
+        );
+        assert!(
+            !state.hot_entities.iter().any(|e| e.contains("foo.rs")),
+            "failed edit candidates must not become hot: {:?}",
+            state.hot_entities
+        );
+        assert!(
+            !state.hot_entities.iter().any(|e| e.contains("bar.rs")),
+            "failed edit candidates must not become hot: {:?}",
+            state.hot_entities
+        );
+    }
+}
+
+#[tokio::test]
 async fn ingest_links_items_sharing_entities() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
     engine

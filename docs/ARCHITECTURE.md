@@ -920,10 +920,11 @@ system prompt or the tool schemas.
 
 `PromptAssembler` places a bounded system-owned facts block immediately after
 System Policy. Composition captures the immutable host profile at startup
-(normalized OS product/release and architecture); the actor refreshes only
-workspace markers after a committed mutation. Caps: 1 KiB UTF-8, 16 sorted
-markers, 64 bytes per marker. Facts never enter `ContextEngine`, transcript
-storage or lifecycle scoring, and they do not repeat the tool catalog.
+(normalized OS product/release and architecture); the actor refreshes workspace
+markers after a committed durable mutation and after a successful `shell.exec`
+or `process.run`. Caps: 1 KiB UTF-8, 16 sorted markers, 64 bytes per marker.
+Facts never enter `ContextEngine`, transcript storage or lifecycle scoring, and
+they do not repeat the tool catalog. Stale trusted facts are worse than none.
 
 `shell.exec` binds one dialect for the whole run and names it in the schema.
 Windows prefers detected/pinned PowerShell 7, then Windows PowerShell 5.1,
@@ -942,10 +943,30 @@ distinguish `stale_revision`, `no_exact_match` and `ambiguous_match` and
 return the current revision plus at most three candidate regions. Matching
 stays exact. `edit.patch` remains the revision-aware multi-hunk form.
 
-Trusted tool results project `metadata.failure_class` and a bounded recovery
-hint. The runtime does not blindly translate or retry. Evaluation counts these
-classes separately while keeping every started cell in end-to-end ITT, rounds,
-latency and cost.
+Trusted tool results are projected at the Core output boundary. Producers may
+pass a typed class as a top-level hint; they cannot author `metadata._runtime`.
+The broker strips reserved keys (`_runtime`, `failure_class`, `recovery_hint`,
+`retryable`) and writes:
+
+```text
+metadata._runtime.failure_class
+metadata._runtime.recovery_hint
+```
+
+plus a model-visible header on `model_content`:
+
+```text
+runtime_failure:
+class=command_unavailable
+hint=...
+```
+
+`MissingProjectMarker` requires a specific command+subcommand, stderr/stdout
+evidence that names the marker, and a true confined absence. `rustc` / `pytest`
+/ `pip` / `npx` never imply a missing manifest. Failed execution results stay
+on the TurnFrame and do not emit `WorkingSetSignal`. The runtime does not
+blindly translate or retry. Evaluation counts these classes separately while
+keeping every started cell in end-to-end ITT, rounds, latency and cost.
 
 A `MaterializedContext` is a disposable projection of the Context Frame. It
 is not the source of truth and should never be persisted as the memory

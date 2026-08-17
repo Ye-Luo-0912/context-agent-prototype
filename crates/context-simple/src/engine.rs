@@ -1,10 +1,10 @@
 use agent_contracts::{
     AgentError, AgentResult, BoundedCompactor, CompactionOutput, CompactionRequest, ContextAction,
-    ContextConsumptionAck, ContextDiagnostics, ContextEngine, ContextGcReport, ContextIngress,
-    ContextItem, ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextQuery, ContextRetention, ContextScope,
-    ContextStateTransition, CoreLabel, FocusState, Label, MaterializedContext, ScopeId, ScopeKind,
-    ScopeState, StoreReconcileReport, bound_compaction_output,
+    ContextCompaction, ContextConsumptionAck, ContextDiagnostics, ContextEngine, ContextGcReport,
+    ContextIngress, ContextItem, ContextItemId, ContextItemSummary, ContextKind,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention,
+    ContextScope, ContextStateTransition, CoreLabel, FocusState, Label, MaterializedContext,
+    ScopeId, ScopeKind, ScopeState, StoreReconcileReport, bound_compaction_output,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -308,6 +308,9 @@ pub(crate) struct State {
     pub(crate) compaction_input_tokens: u64,
     #[serde(default)]
     pub(crate) compaction_output_tokens: u64,
+    /// Compaction passes that have run since the last maintain drain.
+    #[serde(skip)]
+    pub(crate) pending_compactions: Vec<ContextCompaction>,
     /// Directives counted against the per-turn admit cap. Reset by the
     /// next user message (turn boundary); a turn whose admits are refused
     /// keeps the count so the model learns the cap from refusals.
@@ -604,6 +607,7 @@ impl ContextEngine for SimpleContextEngine {
                 }
                 ContextIngress::ToolObservation { output, scope_id } => {
                     state.tool_round += 1;
+                    let heats = output.heats_working_set();
                     let file_path = output.file_path().map(str::to_owned);
                     let file_revision = output.file_revision().map(str::to_owned);
                     let mut content = output.model_content;
@@ -676,9 +680,10 @@ impl ContextEngine for SimpleContextEngine {
                     if ok {
                         reachability::queue_file_body_supersessions(&mut state, &item);
                     }
-                    // Entities the agent actually touched via tools extend the
-                    // hot set for the rest of this turn.
-                    if self.config.entity_affinity {
+                    // Successful observations may extend the hot set.
+                    // Failed execution results are typed Error items and
+                    // must not generic-heat candidate paths/symbols.
+                    if self.config.entity_affinity && heats {
                         entity::merge_hot_entities(&mut state.hot_entities, item.entities.clone());
                     }
                     dependency::push_linked(&mut state, &self.config, item);
@@ -714,11 +719,9 @@ impl ContextEngine for SimpleContextEngine {
                     }
                 }
                 ContextIngress::WorkingSetSignal { content } => {
-                    // A mid-turn signal from a tool commit: the entities the
-                    // tool just touched become hot for the *next* model round,
-                    // without persisting a body yet (the observation lands at
-                    // turn end). Bounded merge, no item, no scope change — the
-                    // signal only extends the hot-entity set.
+                    // Successful mid-turn tool commit only. Failures never
+                    // reach this path from the actor; keep the merge anyway
+                    // only for the signaled content.
                     if self.config.entity_affinity {
                         entity::merge_hot_entities(
                             &mut state.hot_entities,
@@ -874,6 +877,14 @@ impl ContextEngine for SimpleContextEngine {
                 &job.source_ids,
                 job.source_label,
             );
+            if output.input_tokens > 0 || output.output_tokens > 0 {
+                state.pending_compactions.push(ContextCompaction {
+                    reason: job.reason,
+                    input_tokens: output.input_tokens,
+                    output_tokens: output.output_tokens,
+                    source_items: job.source_ids.len(),
+                });
+            }
             state.compaction_input_tokens = state
                 .compaction_input_tokens
                 .saturating_add(output.input_tokens);

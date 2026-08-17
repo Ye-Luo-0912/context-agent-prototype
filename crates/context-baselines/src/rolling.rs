@@ -14,10 +14,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_contracts::{
     AgentError, AgentResult, AttentionState, BoundedCompactor, COMPACTION_SOURCE_CHARS,
-    CompactionOutput, CompactionRequest, ContextDiagnostics, ContextEngine, ContextIngress,
-    ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextScope,
-    ContextSelection, ContextStateTransition, MaterializedContext, ScopeId, ScopeKind,
-    ScoreBreakdown, bound_compaction_output, bound_compaction_source,
+    CompactionOutput, CompactionReason, CompactionRequest, ContextCompaction, ContextDiagnostics,
+    ContextEngine, ContextIngress, ContextKind, ContextMaintenanceReport,
+    ContextMaintenanceTrigger, ContextQuery, ContextScope, ContextSelection,
+    ContextStateTransition, MaterializedContext, ScopeId, ScopeKind, ScoreBreakdown,
+    bound_compaction_output, bound_compaction_source,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -235,10 +236,19 @@ impl ContextEngine for RollingSummaryEngine {
         let mut transitions: Vec<ContextStateTransition> = Vec::new();
         let mut pass_in = 0u64;
         let mut pass_out = 0u64;
+        let mut compactions = Vec::new();
         while let Some(job) = self.take_fold_job() {
             let compacted = self.compact_fold(&job).await;
             pass_in = pass_in.saturating_add(compacted.input_tokens);
             pass_out = pass_out.saturating_add(compacted.output_tokens);
+            if compacted.input_tokens > 0 || compacted.output_tokens > 0 {
+                compactions.push(ContextCompaction {
+                    reason: CompactionReason::RollingFold,
+                    input_tokens: compacted.input_tokens,
+                    output_tokens: compacted.output_tokens,
+                    source_items: job.collapsed,
+                });
+            }
             {
                 let mut state = self.state.lock().expect("rolling state poisoned");
                 state.compaction_input_tokens = state
@@ -267,6 +277,7 @@ impl ContextEngine for RollingSummaryEngine {
             diagnostics: state.diagnostics(),
             compaction_input_tokens: pass_in,
             compaction_output_tokens: pass_out,
+            compactions,
             ..ContextMaintenanceReport::default()
         })
     }

@@ -191,6 +191,11 @@ pub(crate) fn run_minor(
         state.mark_catalog(id);
     }
 
+    let pending = std::mem::take(&mut state.pending_compactions);
+    report.compaction_input_tokens = pending.iter().map(|c| c.input_tokens).sum();
+    report.compaction_output_tokens = pending.iter().map(|c| c.output_tokens).sum();
+    report.compactions = pending;
+
     report.diagnostics = diagnostics::compute(state);
     report
 }

@@ -329,6 +329,16 @@ impl AppState {
                 self.context = report.diagnostics;
                 self.record_transitions(report.transitions);
             }
+            RuntimeEvent::ContextCompacted {
+                reason,
+                input_tokens,
+                output_tokens,
+                source_items,
+            } => {
+                self.push_system(format!(
+                    "context compacted ({reason:?}): {input_tokens}->{output_tokens} tokens, {source_items} sources"
+                ));
+            }
             RuntimeEvent::ContextGc { report } => {
                 let evicted_buffer = report.diagnostics.warm_items;
                 self.context = report.diagnostics;

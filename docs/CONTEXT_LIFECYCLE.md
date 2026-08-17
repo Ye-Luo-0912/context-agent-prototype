@@ -85,8 +85,10 @@ score ≈
 
 `entity_affinity` (P4) is 0.18 × the fraction of an item's entity signature
 that is currently hot — the hot set is seeded by the last user message and
-extended by entities touched in tool observations (cap 24, reset on user
-message / focus change). It overlaps `active entity match` for user-message
+extended by entities from *successful* semantic tool observations (cap 24,
+reset on user message / focus change). Failed execution results stay on the
+TurnFrame (and may persist as typed `Error` items) but do not generic-heat
+candidate paths. It overlaps `active entity match` for user-message
 entities and additionally covers files/symbols the agent actually touched via
 tools; both components are reported separately in the score breakdown.
 
@@ -524,8 +526,10 @@ agent is actually touching.
 
 The engine keeps a bounded **hot-entity set** (cap 24): seeded by the last
 user message (`extract_entities(content)`), extended by entities appearing
-in tool observations (most recent first), and reset by a new user message or
-`FocusChanged`. An "entity" is a cheap signature — a whitespace token of
+in successful semantic tool observations and mid-turn `WorkingSetSignal`s
+(most recent first), and reset by a new user message or `FocusChanged`.
+Failed tool results (`ok: false` or a typed `failure_class`) do not extend
+the set. An "entity" is a cheap signature — a whitespace token of
 length ≥ 3 carrying a path/name/case marker (`.`, `/`, `::`, `_` or an
 uppercase letter).
 

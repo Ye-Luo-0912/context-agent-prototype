@@ -300,6 +300,7 @@ pub(crate) async fn run_engine_observing(
                         });
                 }
             }
+            RuntimeEvent::ContextCompacted { .. } => {}
             RuntimeEvent::ContextPrepared { selected, .. } => {
                 let snapshot =
                     prepare_replay_snapshot(engine.as_ref(), &current_input, config).await?;

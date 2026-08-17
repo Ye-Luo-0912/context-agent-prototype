@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentResult, ContextConsumptionAck, ContextDiagnostics, ContextGcReport,
+    AgentResult, CompactionReason, ContextConsumptionAck, ContextDiagnostics, ContextGcReport,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextSelection, ContextStateTransition,
     OperationId, OperationSnapshot, RunId, RuntimeInputEnvelope, ScopeId, StorageGcReport, TaskId,
     ToolCall, ToolOutput, ToolSurfacePlanReport, ToolSurfaceRequirement, TurnId,
@@ -100,6 +100,14 @@ pub enum RuntimeEvent {
         #[serde(default)]
         trigger: ContextMaintenanceTrigger,
         report: ContextMaintenanceReport,
+    },
+    /// One bounded compaction pass. Cost accounting sums these events
+    /// instead of guessing from diagnostics snapshots or maintain deltas.
+    ContextCompacted {
+        reason: CompactionReason,
+        input_tokens: u64,
+        output_tokens: u64,
+        source_items: usize,
     },
     /// A full GC pass ran: roots were marked, unmarked items were evicted to
     /// the reversible buffer and/or reactivated. The report explains every
@@ -304,6 +312,25 @@ impl RuntimeEvent {
             input: RuntimeInputEnvelope::from_preview(body),
         }
     }
+}
+
+/// Emit `ContextCompacted` rows then the `ContextMaintained` audit.
+pub fn context_maintenance_events(
+    trigger: ContextMaintenanceTrigger,
+    report: ContextMaintenanceReport,
+) -> Vec<RuntimeEvent> {
+    let mut events: Vec<RuntimeEvent> = report
+        .compactions
+        .iter()
+        .map(|compaction| RuntimeEvent::ContextCompacted {
+            reason: compaction.reason,
+            input_tokens: compaction.input_tokens,
+            output_tokens: compaction.output_tokens,
+            source_items: compaction.source_items,
+        })
+        .collect();
+    events.push(RuntimeEvent::ContextMaintained { trigger, report });
+    events
 }
 
 #[async_trait]

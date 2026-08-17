@@ -12,7 +12,7 @@ use agent_contracts::{
     OperationQueryResult, OperationSnapshot, OperationState, OperationTerminal, OutputBroker,
     ResourceDescriptor, RunId, RuntimeEvent, TaskId, ToolCall, ToolDispatcher,
     ToolExecutionRequest, ToolOperationIdentity, ToolOutcome, ToolOutput, ToolRisk,
-    ToolSurfaceSnapshot, derive_effect_intent,
+    ToolSurfaceSnapshot, context_maintenance_events, derive_effect_intent,
 };
 
 use crate::authority::{
@@ -1252,11 +1252,9 @@ impl CoreAuthority {
             .context
             .maintain(ContextMaintenanceTrigger::Checkpoint)
             .await?;
-        self.emit_event(RuntimeEvent::ContextMaintained {
-            trigger: ContextMaintenanceTrigger::Checkpoint,
-            report,
-        })
-        .await?;
+        for event in context_maintenance_events(ContextMaintenanceTrigger::Checkpoint, report) {
+            self.emit_event(event).await?;
+        }
         self.context.checkpoint().await
     }
 

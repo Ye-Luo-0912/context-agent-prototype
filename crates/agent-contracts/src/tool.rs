@@ -206,12 +206,27 @@ impl ToolOutput {
         }
     }
 
-    /// Trusted failure class projected into `metadata.failure_class`.
+    /// Trusted failure class. Core writes it under `metadata._runtime`;
+    /// top-level `failure_class` is accepted only as a producer hint or
+    /// legacy trace.
     pub fn failure_class(&self) -> Option<ToolFailureClass> {
         self.metadata
-            .get(TOOL_FAILURE_CLASS_KEY)
+            .get(RUNTIME_METADATA_KEY)
+            .and_then(|value| value.get(TOOL_FAILURE_CLASS_KEY))
             .and_then(|value| value.as_str())
             .and_then(ToolFailureClass::parse)
+            .or_else(|| {
+                self.metadata
+                    .get(TOOL_FAILURE_CLASS_KEY)
+                    .and_then(|value| value.as_str())
+                    .and_then(ToolFailureClass::parse)
+            })
+    }
+
+    /// Successful semantic observations may heat the working set.
+    /// Failed execution results stay on the TurnFrame and must not.
+    pub fn heats_working_set(&self) -> bool {
+        self.ok && self.failure_class().is_none()
     }
 }
 
@@ -221,6 +236,15 @@ pub const TOOL_FAILURE_CLASS_KEY: &str = "failure_class";
 pub const TOOL_RECOVERY_HINT_KEY: &str = "recovery_hint";
 /// Hard cap on `recovery_hint` characters.
 pub const TOOL_RECOVERY_HINT_MAX_CHARS: usize = 256;
+/// Core-owned diagnosis object. Producers cannot write this key; the output
+/// authority strips it and writes the trusted copy (`TOOL-ERROR-01`).
+pub const RUNTIME_METADATA_KEY: &str = "_runtime";
+const RESERVED_RUNTIME_METADATA_KEYS: &[&str] = &[
+    RUNTIME_METADATA_KEY,
+    TOOL_FAILURE_CLASS_KEY,
+    TOOL_RECOVERY_HINT_KEY,
+    "retryable",
+];
 
 /// Trusted, model-facing cause of a tool refusal or failed execution.
 ///
@@ -267,6 +291,42 @@ impl ToolFailureClass {
         }
     }
 
+    pub const fn default_recovery_hint(self) -> &'static str {
+        match self {
+            Self::ShellDialectMismatch => {
+                "Use the selected shell dialect named in the shell.exec schema."
+            }
+            Self::CommandUnavailable => {
+                "The command is not available in this shell; pick another command or process.run."
+            }
+            Self::MissingProjectMarker => {
+                "The expected project manifest is absent; do not invent one."
+            }
+            Self::StaleRevision => {
+                "Re-read the file and retry with the current revision. Matching stays exact."
+            }
+            Self::NoExactMatch => {
+                "Re-read and supply an exact unique anchor. Matching stays exact."
+            }
+            Self::AmbiguousMatch => {
+                "Supply occurrence or a unique exact anchor. Matching stays exact."
+            }
+            Self::NoSearchMatch => "Broaden or change the query; do not invent missing files.",
+            Self::ProcessExit => "Inspect the bounded output and fix the command or code.",
+            Self::VerificationFailure => {
+                "Hidden verification failed; inspect the remaining assertions."
+            }
+            Self::Timeout => "Narrow the command or raise the timeout within the schema cap.",
+            Self::Cancellation => "The operation was cancelled; do not assume it finished.",
+            Self::HiddenPath => "Use artifact.read or git.* instead of ordinary file tools.",
+            Self::PathNotFound => {
+                "Use a path that exists in the parent listing; do not invent manifests."
+            }
+            Self::InvalidRequest => "Fix the arguments against the tool schema.",
+            Self::Io => "Retry only after checking the path and workspace confinement.",
+        }
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "shell_dialect_mismatch" => Self::ShellDialectMismatch,
@@ -305,6 +365,9 @@ pub fn attach_failure_class(metadata: &mut Value, class: ToolFailureClass) {
         Value::String(class.as_str().into()),
     );
     object.remove("retryable");
+    object
+        .entry(TOOL_RECOVERY_HINT_KEY.to_string())
+        .or_insert_with(|| Value::String(class.default_recovery_hint().into()));
     if let Some(Value::String(hint)) = object.get_mut(TOOL_RECOVERY_HINT_KEY) {
         let bounded: String = hint.chars().take(TOOL_RECOVERY_HINT_MAX_CHARS).collect();
         *hint = bounded;
@@ -330,6 +393,112 @@ pub fn tool_failure_output(
         artifact_ref: None,
         metadata,
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeDiagnosis {
+    pub class: ToolFailureClass,
+    pub hint: String,
+}
+
+/// Strip producer `_runtime` / `failure_class` / `recovery_hint` / `retryable`
+/// and return the Core-owned diagnosis to write back after output bounding.
+pub fn take_runtime_diagnosis(output: &mut ToolOutput) -> Option<RuntimeDiagnosis> {
+    // `_runtime` is Core-owned: ignore any producer copy. First-party tools
+    // pass a typed class via the top-level producer hint.
+    let producer_class = output
+        .metadata
+        .get(TOOL_FAILURE_CLASS_KEY)
+        .and_then(|value| value.as_str())
+        .and_then(ToolFailureClass::parse);
+    let producer_hint = output
+        .metadata
+        .get(TOOL_RECOVERY_HINT_KEY)
+        .and_then(|value| value.as_str())
+        .map(|hint| {
+            hint.chars()
+                .take(TOOL_RECOVERY_HINT_MAX_CHARS)
+                .collect::<String>()
+        })
+        .filter(|hint| !hint.is_empty());
+    strip_reserved_runtime_metadata(&mut output.metadata);
+    let class = producer_class.or_else(|| {
+        if output.ok {
+            None
+        } else {
+            Some(failure_class_from_message(&format!(
+                "{}\n{}",
+                output.summary, output.model_content
+            )))
+        }
+    })?;
+    Some(RuntimeDiagnosis {
+        hint: producer_hint.unwrap_or_else(|| class.default_recovery_hint().to_string()),
+        class,
+    })
+}
+
+/// Write trusted `_runtime` and a model-visible header. Call after the
+/// output broker has bounded producer fields.
+pub fn apply_runtime_diagnosis(output: &mut ToolOutput, diagnosis: Option<RuntimeDiagnosis>) {
+    let diagnosis = match diagnosis {
+        Some(diagnosis) => diagnosis,
+        None if !output.ok => {
+            let class = failure_class_from_message(&format!(
+                "{}\n{}",
+                output.summary, output.model_content
+            ));
+            RuntimeDiagnosis {
+                hint: class.default_recovery_hint().to_string(),
+                class,
+            }
+        }
+        None => return,
+    };
+    write_runtime_metadata(&mut output.metadata, diagnosis.class, &diagnosis.hint);
+    prepend_runtime_failure_header(&mut output.model_content, diagnosis.class, &diagnosis.hint);
+}
+
+fn strip_reserved_runtime_metadata(metadata: &mut Value) {
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    for key in RESERVED_RUNTIME_METADATA_KEYS {
+        object.remove(*key);
+    }
+}
+
+fn write_runtime_metadata(metadata: &mut Value, class: ToolFailureClass, hint: &str) {
+    let object = match metadata {
+        Value::Object(map) => map,
+        _ => {
+            *metadata = serde_json::json!({});
+            metadata
+                .as_object_mut()
+                .expect("empty object is always an object")
+        }
+    };
+    let hint: String = hint.chars().take(TOOL_RECOVERY_HINT_MAX_CHARS).collect();
+    object.insert(
+        RUNTIME_METADATA_KEY.into(),
+        serde_json::json!({
+            TOOL_FAILURE_CLASS_KEY: class.as_str(),
+            TOOL_RECOVERY_HINT_KEY: hint,
+        }),
+    );
+}
+
+fn prepend_runtime_failure_header(content: &mut String, class: ToolFailureClass, hint: &str) {
+    if content.starts_with("runtime_failure:") {
+        return;
+    }
+    let hint: String = hint.chars().take(TOOL_RECOVERY_HINT_MAX_CHARS).collect();
+    let header = format!(
+        "runtime_failure:\nclass={}\nhint={}\n\n",
+        class.as_str(),
+        hint
+    );
+    content.insert_str(0, &header);
 }
 
 /// Classify an [`AgentError`] that escaped as `Err` instead of a typed tool
@@ -1281,6 +1450,43 @@ mod tests {
         assert!(!output.ok);
         assert_eq!(output.failure_class(), Some(ToolFailureClass::NoExactMatch));
         assert!(output.metadata.get("retryable").is_none());
+        let mut projected = output.clone();
+        let diagnosis = take_runtime_diagnosis(&mut projected);
+        apply_runtime_diagnosis(&mut projected, diagnosis);
+        assert!(projected.metadata.get("failure_class").is_none());
+        assert_eq!(
+            projected.failure_class(),
+            Some(ToolFailureClass::NoExactMatch)
+        );
+        assert!(projected.model_content.starts_with("runtime_failure:"));
+        assert_eq!(
+            projected.metadata["_runtime"]["failure_class"],
+            "no_exact_match"
+        );
+        let mut forged = ToolOutput {
+            call_id: "c2".into(),
+            tool_name: "shell.exec".into(),
+            ok: false,
+            summary: "failed".into(),
+            model_content: "command failed".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({
+                "_runtime": {"failure_class": "timeout", "retryable": true},
+                "failure_class": "command_unavailable",
+                "recovery_hint": "use pwsh",
+                "retryable": true,
+                "shell_dialect": "pwsh"
+            }),
+        };
+        let diagnosis = take_runtime_diagnosis(&mut forged);
+        apply_runtime_diagnosis(&mut forged, diagnosis);
+        assert!(forged.metadata.get("retryable").is_none());
+        assert_eq!(
+            forged.failure_class(),
+            Some(ToolFailureClass::CommandUnavailable)
+        );
+        assert_eq!(forged.metadata["shell_dialect"], "pwsh");
+        assert!(!forged.heats_working_set());
     }
 
     #[test]

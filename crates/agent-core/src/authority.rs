@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agent_contracts::{
     AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, Effect, EffectReceipt,
     EventJournal, IntentShadowGate, OutputBroker, RunId, RuntimeEvent, RuntimeEventEnvelope,
-    ShadowVerdict, ToolCall, ToolOutput, ToolSpec,
+    ShadowVerdict, ToolCall, ToolOutput, ToolSpec, apply_runtime_diagnosis, take_runtime_diagnosis,
 };
 use tokio::sync::broadcast;
 
@@ -249,11 +249,15 @@ impl OutputAuthority {
         budget: Option<usize>,
         output: ToolOutput,
     ) -> ToolOutput {
-        if let Some(broker) = &self.broker {
+        let mut output = output;
+        let diagnosis = take_runtime_diagnosis(&mut output);
+        let mut output = if let Some(broker) = &self.broker {
             broker.bound(run_id, budget, output).await
         } else {
             output
-        }
+        };
+        apply_runtime_diagnosis(&mut output, diagnosis);
+        output
     }
 }
 
@@ -269,7 +273,7 @@ mod tests {
     use super::*;
     use agent_contracts::{
         AgentError, AgentResult, EffectDurability, EffectReceipt, EventJournal, RuntimeEvent,
-        RuntimeEventEnvelope, ToolCall, ToolRisk,
+        RuntimeEventEnvelope, ToolCall, ToolFailureClass, ToolRisk,
     };
     use serde_json::json;
     use std::sync::{
@@ -625,5 +629,28 @@ mod tests {
         let passthrough = OutputAuthority::new(None);
         let result = passthrough.bound(run, None, output()).await;
         assert_eq!(result.summary, "read");
+        assert!(result.heats_working_set());
+    }
+
+    #[tokio::test]
+    async fn output_authority_projects_trusted_runtime_failure() {
+        let authority = OutputAuthority::new(None);
+        let mut failed = output();
+        failed.ok = false;
+        failed.summary = "refused".into();
+        failed.model_content = "old appears 0 times".into();
+        failed.metadata = json!({
+            "failure_class": "no_exact_match",
+            "_runtime": {"failure_class": "timeout"},
+            "retryable": true,
+            "path": "src/foo.rs"
+        });
+        let result = authority.bound(run(), None, failed).await;
+        assert_eq!(result.failure_class(), Some(ToolFailureClass::NoExactMatch));
+        assert_eq!(result.metadata["path"], "src/foo.rs");
+        assert!(result.metadata.get("retryable").is_none());
+        assert!(result.model_content.starts_with("runtime_failure:"));
+        assert!(result.model_content.contains("class=no_exact_match"));
+        assert!(!result.heats_working_set());
     }
 }

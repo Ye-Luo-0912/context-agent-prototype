@@ -753,4 +753,29 @@ mod tests {
         );
         assert_eq!(output.metadata["missing_marker"], "Cargo.toml");
     }
+
+    #[tokio::test]
+    async fn rustc_without_manifest_is_not_missing_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ShellExecTool::with_dialect(workspace, test_dialect());
+        let output = value(
+            tool.execute(
+                RunId::new(),
+                "c",
+                json!({"command": "rustc --test src/protocol.rs", "timeout_ms": 8000}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(!output.ok);
+        assert_ne!(
+            output.failure_class(),
+            Some(ToolFailureClass::MissingProjectMarker),
+            "rustc must not be attributed to a missing Cargo.toml, got {:?}",
+            output.failure_class()
+        );
+    }
 }

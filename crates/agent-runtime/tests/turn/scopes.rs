@@ -847,6 +847,62 @@ async fn tool_commit_signals_discovered_entities_before_the_next_round() {
     );
 }
 
+/// Failed execution results stay on the TurnFrame. Candidate paths in the
+/// error body must not become a WorkingSetSignal / hot-entity merge.
+struct FailedEntitySignalingDispatcher;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for FailedEntitySignalingDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "fs.read".into(),
+            description: "read a file".into(),
+            input_schema: json!({"type": "object"}),
+            risk: agent_contracts::ToolRisk::ReadOnly,
+            output_budget: None,
+        }]
+    }
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        Ok(ToolOutcome::Value(ToolOutput {
+            call_id: request.call.id,
+            tool_name: request.call.name,
+            ok: false,
+            summary: "no_exact_match".into(),
+            model_content: "candidate:\nsrc/foo.rs\nsrc/bar.rs".into(),
+            artifact_ref: None,
+            metadata: json!({"failure_class": "no_exact_match"}),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn failed_tool_commit_does_not_signal_hot_entities() {
+    let context = Arc::new(IngestRecordingEngine::default());
+    let handle = spawn_with(
+        Arc::new(TwoRoundToolModel::default()) as Arc<dyn ModelTransport>,
+        context.clone() as Arc<dyn ContextEngine>,
+        Arc::new(FailedEntitySignalingDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("go".into()).await.unwrap();
+    wait_for_turn_completion(&mut events).await;
+
+    let ingests = context.ingests.lock().await;
+    assert!(
+        ingests
+            .iter()
+            .all(|ingress| !matches!(ingress, ContextIngress::WorkingSetSignal { .. })),
+        "failed tool output must not heat the working set, got: {ingests:?}"
+    );
+    assert!(
+        ingests
+            .iter()
+            .any(|ingress| matches!(ingress, ContextIngress::ToolObservation { .. })),
+        "the failed observation must still persist at turn end"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Context directive routing: a tool's `RuntimeDirective` is executed at
 // operation-commit time — right after any staged effect, before the result
