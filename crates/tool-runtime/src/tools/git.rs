@@ -125,6 +125,7 @@ async fn run_git(
     } else {
         format!("{stdout}\n[stderr]\n{stderr}")
     };
+    let combined = strip_runtime_paths(&combined);
 
     let ok = status.success();
     if !ok && combined.trim().is_empty() {
@@ -181,6 +182,19 @@ async fn run_git(
     })
 }
 
+fn strip_runtime_paths(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let normalized = line.replace('\\', "/");
+            !normalized.contains(".focus-agent")
+                && !normalized.contains("/.git/")
+                && normalized.trim() != ".git"
+                && !normalized.trim().ends_with("/.git")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn tail_chars(text: &str, max_chars: usize) -> String {
     let count = text.chars().count();
     if count <= max_chars {
@@ -216,7 +230,14 @@ impl Tool for GitStatusTool {
     ) -> AgentResult<ToolOutcome> {
         let output = run_git(
             &self.workspace,
-            &["status", "--short"],
+            &[
+                "status",
+                "--short",
+                "--",
+                ".",
+                ":(exclude).focus-agent",
+                ":(exclude).focus-agent/**",
+            ],
             run_id,
             call_id,
             "git.status",
@@ -271,6 +292,12 @@ impl Tool for GitDiffTool {
             git_args.push("--".into());
             git_args.push(path);
         }
+        if !git_args.iter().any(|arg| arg == "--") {
+            git_args.push("--".into());
+            git_args.push(".".into());
+        }
+        git_args.push(":(exclude).focus-agent".into());
+        git_args.push(":(exclude).focus-agent/**".into());
         let refs: Vec<&str> = git_args.iter().map(String::as_str).collect();
         let output = run_git(&self.workspace, &refs, run_id, call_id, "git.diff", cancel).await?;
         Ok(ToolOutcome::Value(output))
@@ -360,5 +387,38 @@ mod tests {
             .execute(RunId::new(), "status-call", json!({}), None, cancel)
             .await;
         assert!(matches!(result, Err(AgentError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn status_hides_focus_agent_runtime_state() {
+        let dir = tempfile::tempdir().unwrap();
+        git_command(dir.path(), &["init", "--quiet"]);
+        git_command(dir.path(), &["config", "core.autocrlf", "false"]);
+        tokio::fs::write(dir.path().join("readme.txt"), "ok\n")
+            .await
+            .unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        tokio::fs::write(workspace.state_dir().join("secret.jsonl"), "lease\n")
+            .await
+            .unwrap();
+        let tool = GitStatusTool::new(workspace);
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "status-call",
+                json!({}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("expected a value");
+        };
+        assert!(
+            !output.model_content.contains(".focus-agent"),
+            "git.status leaked runtime state: {}",
+            output.model_content
+        );
     }
 }

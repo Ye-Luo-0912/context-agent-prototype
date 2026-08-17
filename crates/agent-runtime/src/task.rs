@@ -46,6 +46,10 @@ pub struct TaskRecord {
     /// acceptance criteria, plan, open loops and typed root claims. This is
     /// task authority, not a scored ContextItem.
     pub anchor: TaskAnchor,
+    /// Operational resume facts bound to this task's current anchor
+    /// revision. Not a second authority: the assembler projects a
+    /// `TaskProgressView` and never scores it as a heap item.
+    pub resume: crate::resume::ResumePoint,
 }
 
 /// The bounded, revisioned tool-requirement slice of a TaskAnchor.
@@ -431,6 +435,20 @@ impl TaskManager {
         self.tasks.iter().find(|task| task.id == id)
     }
 
+    /// Record a trusted tool fact on the active task's ResumePoint.
+    pub fn observe_tool(&mut self, output: &agent_contracts::ToolOutput, turn: u64) {
+        let Some(id) = self.active else {
+            return;
+        };
+        let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) else {
+            return;
+        };
+        if task.status == TaskStatus::Completed {
+            return;
+        }
+        task.resume.observe_tool(output, task.anchor.revision, turn);
+    }
+
     /// Plan to make `goal` the active task. A non-completed task with the
     /// same goal is resumed instead — the `/focus A -> /focus B ->
     /// /focus A` sequence must come back to task A, not spawn task C. A
@@ -722,6 +740,7 @@ impl TaskManager {
                         original_goal: goal,
                         ..TaskAnchor::default()
                     },
+                    resume: crate::resume::ResumePoint::default(),
                 });
                 self.active = Some(target);
             }
@@ -762,6 +781,7 @@ impl TaskManager {
                 replacement,
             } => {
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == target) {
+                    task.resume.anchor_revision = replacement.revision;
                     task.anchor = replacement;
                 }
             }

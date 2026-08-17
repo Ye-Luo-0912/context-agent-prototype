@@ -633,6 +633,10 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
         "access_fetches": metrics.access_fetches,
         "access_admits": metrics.access_admits,
         "access_consumption_acks": metrics.access_consumption_acks,
+        "reactivation_selected": metrics.reactivation_selected,
+        "reactivation_consumed": metrics.reactivation_consumed,
+        "reactivation_selected_tokens": metrics.reactivation_selected_tokens,
+        "reactivation_consumed_tokens": metrics.reactivation_consumed_tokens,
         "compaction_input_tokens": metrics.compaction_input_tokens,
         "compaction_output_tokens": metrics.compaction_output_tokens,
         "provider_tokens_total": metrics

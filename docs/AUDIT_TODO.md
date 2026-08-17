@@ -496,15 +496,14 @@ Regressions: `task_anchor_update_publishes_a_bounded_event`,
 
 ### CTX-11 — Task progress is not yet a bounded, sourced resume contract
 
-**OPEN.** `TaskAnchor` correctly owns goal/constraints/criteria plus generic
-`plan_progress` and `open_loops`, but the runtime has no first-class sourced
-record for the operational facts needed after a long tool loop, task switch or
-restart. In particular, checked files, their observed revisions/digests,
-recent verification outcomes, still-relevant failed commands and the exact
-next action are not represented as typed bounded facts. Reconstructing them by
-rereading the workspace or old dialogue contributes avoidable rounds; putting
-them into transcript prose would violate the context authority and boundedness
-contract.
+**LANDED (2026-08-17).** `ResumePoint` is an actor-owned subrecord on
+`TaskRecord`, bound to `task_id + anchor_revision`. `TaskProgressView` is
+the prompt projection only. Updates come from trusted tool facts at turn
+commit; file observations replace stale digests; a later success clears
+the matching failed command; lists are hard-capped. Suspended tasks keep
+the record but it is not rendered on another task's prompt. Restore
+validates caps; oversized observations truncate rather than grow
+unbounded.
 
 Required closure:
 

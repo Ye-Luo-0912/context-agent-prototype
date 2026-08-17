@@ -119,6 +119,10 @@ pub struct RunMetrics {
     pub recovery_explicit_search: u64,
     /// Forgotten ids whose *first* recovery was a GC reactivation.
     pub recovery_auto_reactivation: u64,
+    pub reactivation_selected: u64,
+    pub reactivation_consumed: u64,
+    pub reactivation_selected_tokens: u64,
+    pub reactivation_consumed_tokens: u64,
     /// Repeated `fs.read` of the same path (workspace reread, not an id partition).
     pub recovery_workspace_reread: u64,
     /// Forgotten ids that were never recovered.
@@ -431,6 +435,10 @@ fn snapshot_access(metrics: &mut RunMetrics, diagnostics: &agent_contracts::Cont
     metrics.access_fetches = diagnostics.access_fetches;
     metrics.access_admits = diagnostics.access_admits;
     metrics.access_consumption_acks = diagnostics.access_consumption_acks;
+    metrics.reactivation_selected = diagnostics.reactivation_selected;
+    metrics.reactivation_consumed = diagnostics.reactivation_consumed;
+    metrics.reactivation_selected_tokens = diagnostics.reactivation_selected_tokens;
+    metrics.reactivation_consumed_tokens = diagnostics.reactivation_consumed_tokens;
 }
 
 /// The nearest-rank percentile of a sorted sample: index
@@ -455,6 +463,7 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          retrieval_latency: p50={}ms p95={}ms inspect={} fetch={} admit={}\n\
          recovery: forgotten={} recovered={} search={} reactivate={} reread={} failed={}\n\
          access: search_hits={} inspects={} fetches={} admits={} acks={}\n\
+         reactivation_utility: selected={} consumed={} selected_tokens={} consumed_tokens={}\n\
          compaction: in={} out={}\n\
          behavior: tool_calls={} failed_outputs={} spills={} output_chars={} repeated_fs_reads={}\n\
          tool_failures: {:?}\n",
@@ -505,6 +514,10 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.access_fetches,
         metrics.access_admits,
         metrics.access_consumption_acks,
+        metrics.reactivation_selected,
+        metrics.reactivation_consumed,
+        metrics.reactivation_selected_tokens,
+        metrics.reactivation_consumed_tokens,
         metrics.compaction_input_tokens,
         metrics.compaction_output_tokens,
         metrics.tool_calls,

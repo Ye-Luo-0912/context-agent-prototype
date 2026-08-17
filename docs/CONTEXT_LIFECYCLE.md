@@ -837,23 +837,16 @@ copies it through without scoring it as a heap item. Goal/interpretation/
 constraints/criteria/progress/open loops are in the view; working/evidence
 refs stay on the root projection.
 
-`CTX-11` will add the missing operational resume layer without introducing a
-second task authority. The actor-owned `ResumePoint` is a revision-bound
-subrecord of the task; `TaskProgressView` is only its bounded prompt projection.
-It records current objective, unresolved constraints/blockers, next actions,
-checked file/entity refs with their observed digest/revision, recent
-verification facts, and known failed-command facts. Bodies and full command
-output remain in context/artifact storage. Updates may land only from trusted
-tool/verification results, durable turn commits, or explicit suspension; model
-prose is a proposal, not authority. While suspended, the view is absent from
-unrelated prompts and its refs downgrade to storage retention. Reactivation
-materializes `TaskAnchorView + TaskProgressView` and their typed refs only; it
-never reconstructs or appends the old transcript. This contract is planned,
-not yet implemented. Its live effect is measured only after the
-`TOOL-ENV-01` / `TOOL-EDIT-01` / `TOOL-VIEW-01` / `TOOL-ERROR-01` preflight
-removes the current wrong-shell, stale-edit and workspace-noise confounders;
-the contract can be unit-tested in parallel, but the existing failed-tool
-loops are not evidence by themselves that ResumePoint is the cause.
+`CTX-11` is landed as an actor-owned `ResumePoint` bound to
+`task_id + anchor_revision`. `TaskProgressView` is only its bounded prompt
+projection. It records current objective, unresolved constraints/blockers,
+next actions, checked file/entity refs with their observed digest/revision,
+recent verification facts, and known failed-command facts. Bodies and full
+command output remain in context/artifact storage. Updates land from trusted
+tool results at durable turn commit; model prose is not authority. While
+suspended, the view is absent from unrelated prompts. Reactivation
+materializes `TaskAnchorView + TaskProgressView` from the runtime assembler;
+it never reconstructs the old transcript.
 
 Producing a `RuntimeDirective` requires the `runtime:context-control`
 permission in the capability manifest; a tool without it gets its directive

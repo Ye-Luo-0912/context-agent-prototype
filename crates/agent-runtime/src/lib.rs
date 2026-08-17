@@ -15,6 +15,7 @@ mod platform;
 mod plugin;
 mod policy;
 mod prompt;
+mod resume;
 mod services;
 mod sink;
 mod surface;

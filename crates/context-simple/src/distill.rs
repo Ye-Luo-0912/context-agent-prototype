@@ -83,6 +83,11 @@ pub(crate) fn plan_episode_distill(state: &State) -> Option<DistillJob> {
     if members.is_empty() {
         return None;
     }
+    // Short episodes with no durable semantic payload are not worth a
+    // provider round: raw tool dumps stay retrievable without an LLM card.
+    if !episode_worth_llm_distill(state, opened_tick, task) {
+        return None;
+    }
     let start = members.len().saturating_sub(MAX_DISTILL_SOURCES);
     let mut source = String::new();
     let mut source_ids = Vec::new();
@@ -110,6 +115,36 @@ pub(crate) fn plan_episode_distill(state: &State) -> Option<DistillJob> {
         source_label: EPISODE_DERIVED_SOURCE,
         reason: CompactionReason::EpisodeRotation,
     })
+}
+
+fn episode_worth_llm_distill(state: &State, opened_tick: u64, task: TaskId) -> bool {
+    let generation = state
+        .focus
+        .as_ref()
+        .map(|focus| focus.generation)
+        .unwrap_or(0);
+    if generation >= 4 {
+        return true;
+    }
+    state.items.iter().any(|item| {
+        item.task_id == Some(task)
+            && item.created_tick >= opened_tick
+            && item.semantic.is_live()
+            && item_has_semantic_outcome(item)
+    })
+}
+
+fn item_has_semantic_outcome(item: &agent_contracts::ContextItem) -> bool {
+    if matches!(
+        item.semantic,
+        agent_contracts::SemanticState::VerifiedFixed { .. }
+    ) {
+        return true;
+    }
+    matches!(
+        item.kind,
+        ContextKind::Decision | ContextKind::FileObservation | ContextKind::Summary
+    )
 }
 
 pub(crate) fn insert_derived_summary(

@@ -1763,6 +1763,22 @@ async fn ingest_related(engine: &SimpleContextEngine, turn: u64) {
         .unwrap();
 }
 
+async fn ingest_file_outcome(engine: &SimpleContextEngine) {
+    let mut state = engine.state.lock().await;
+    let mut item = crate::item::make_item(
+        &state,
+        &engine.config,
+        "src/auth.rs observed".into(),
+        ContextKind::FileObservation,
+        ContextScope::Task,
+        ContextRetention::Working,
+        0.7,
+        Some("fs.read".into()),
+    );
+    item.file_path = Some("src/auth.rs".into());
+    state.items.push(item);
+}
+
 /// Episode rotation with a compactor distills the closing episode into a
 /// derived Summary; ordinary dialogue is archived, not destroyed.
 #[tokio::test]
@@ -1771,6 +1787,7 @@ async fn episode_rotation_distills_with_derived_from_and_keeps_sources() {
         .with_compactor(Arc::new(TaskDistillCompactor));
     let task = open_focus(&engine, "keep AuthService.rs").await;
     ingest_related(&engine, 1).await;
+    ingest_file_outcome(&engine).await;
     ingest_related(&engine, 2).await;
 
     let state = engine.state.lock().await;
@@ -1844,6 +1861,7 @@ async fn later_episode_card_supersedes_the_previous_one() {
         .with_compactor(Arc::new(TaskDistillCompactor));
     open_focus(&engine, "keep AuthService.rs").await;
     ingest_related(&engine, 1).await;
+    ingest_file_outcome(&engine).await;
     ingest_related(&engine, 2).await;
     let first_card = engine
         .state
@@ -1856,6 +1874,7 @@ async fn later_episode_card_supersedes_the_previous_one() {
         .expect("first episode card");
 
     ingest_related(&engine, 3).await;
+    ingest_file_outcome(&engine).await;
     ingest_related(&engine, 4).await;
     engine
         .maintain(ContextMaintenanceTrigger::AfterModel)
@@ -1915,6 +1934,7 @@ async fn episode_rotation_compact_failure_falls_back_and_does_not_fail_ingest() 
         .with_compactor(Arc::new(FailingCompactor));
     open_focus(&engine, "keep AuthService.rs").await;
     ingest_related(&engine, 1).await;
+    ingest_file_outcome(&engine).await;
     ingest_related(&engine, 2).await;
 
     let state = engine.state.lock().await;
@@ -1950,13 +1970,42 @@ async fn episode_rotation_without_compactor_does_not_insert_a_card() {
             .any(|item| item.source.as_deref() == Some("episode-derived")),
         "no episode card without a compactor"
     );
+}
+
+#[tokio::test]
+async fn short_episode_without_semantic_outcome_skips_llm_compactor() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CountingCompactor(AtomicUsize);
+    #[async_trait::async_trait]
+    impl BoundedCompactor for CountingCompactor {
+        async fn compact(
+            &self,
+            request: CompactionRequest,
+        ) -> agent_contracts::AgentResult<CompactionOutput> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(CompactionOutput {
+                text: format!("[distilled] {}", request.source),
+                input_tokens: 9,
+                output_tokens: 3,
+            })
+        }
+    }
+
+    let counter = Arc::new(CountingCompactor(AtomicUsize::new(0)));
+    let engine = SimpleContextEngine::new(episode_budget_config()).with_compactor(counter.clone());
+    open_focus(&engine, "keep AuthService.rs").await;
+    ingest_related(&engine, 1).await;
+    ingest_related(&engine, 2).await;
+    assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+    let diagnostics = engine.diagnostics().await.unwrap();
+    assert_eq!(diagnostics.compaction_input_tokens, 0);
+    let state = engine.state.lock().await;
     assert!(
-        state.items.iter().any(|item| {
-            item.kind == ContextKind::UserMessage
-                && item.content.contains("round 1")
-                && item.attention == AttentionState::Archived
-        }),
-        "ordinary dialogue still archives on rotation"
+        !state
+            .items
+            .iter()
+            .any(|item| item.source.as_deref() == Some("episode-derived")),
+        "short chatter must not mint an LLM episode card"
     );
 }
 

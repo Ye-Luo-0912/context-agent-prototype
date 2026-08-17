@@ -11,6 +11,7 @@ mod item;
 mod ledger;
 mod materializer;
 mod policy;
+mod reactivation;
 mod residency;
 mod scope;
 mod scope_tree;

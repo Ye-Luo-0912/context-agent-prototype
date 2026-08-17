@@ -328,6 +328,10 @@ pub fn ensure_workspace_git(root: &Path) -> anyhow::Result<()> {
     // Keep this repo's line endings off WinINET/core.autocrlf so
     // `git.status` is not a wall of CRLF noise on Windows live cells.
     git_ok(root, &["config", "core.autocrlf", "false"])?;
+    let gitignore = root.join(".gitignore");
+    if !gitignore.exists() {
+        fs::write(&gitignore, ".focus-agent/\n")?;
+    }
     git_ok(root, &["add", "-A"])?;
     let status = Command::new("git")
         .args([

@@ -7,7 +7,7 @@
 
 use agent_contracts::{
     FocusState, MaterializedContext, ModelInput, ModelMessage, RuntimeFactsView, TaskAnchorView,
-    ToolSpec, TurnFrame,
+    TaskProgressView, ToolSpec, TurnFrame,
 };
 use agent_workspace::capture_host_runtime_facts;
 
@@ -63,6 +63,7 @@ impl PromptAssembler {
         &self,
         runtime_focus: Option<&FocusState>,
         task_anchor: Option<&TaskAnchorView>,
+        task_progress: Option<&TaskProgressView>,
         history: &MaterializedContext,
         turn: &TurnFrame,
         tools: Vec<ToolSpec>,
@@ -139,7 +140,7 @@ impl PromptAssembler {
                 ModelMessage::system(self.system_prompt.clone()),
                 ModelMessage::system(self.runtime_facts.render()),
             ],
-            focus_frame: render_focus_frame(runtime_focus, task_anchor),
+            focus_frame: render_focus_frame(runtime_focus, task_anchor, task_progress),
             context_frame,
             turn_frame: turn.clone(),
             tool_schemas: tools,
@@ -147,13 +148,26 @@ impl PromptAssembler {
     }
 }
 
-fn render_focus_frame(focus: Option<&FocusState>, task: Option<&TaskAnchorView>) -> Option<String> {
-    if focus.is_none() && task.is_none_or(TaskAnchorView::is_empty) {
+fn render_focus_frame(
+    focus: Option<&FocusState>,
+    task: Option<&TaskAnchorView>,
+    progress: Option<&TaskProgressView>,
+) -> Option<String> {
+    if focus.is_none()
+        && task.is_none_or(TaskAnchorView::is_empty)
+        && progress.is_none_or(TaskProgressView::is_empty)
+    {
         return None;
     }
     let mut out = String::new();
     if let Some(task) = task.filter(|view| !view.is_empty()) {
         out.push_str(&render_task_anchor(task));
+    }
+    if let Some(progress) = progress.filter(|view| !view.is_empty()) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&render_task_progress(progress));
     }
     if let Some(focus) = focus {
         if !out.is_empty() {
@@ -192,6 +206,22 @@ fn render_task_anchor(task: &TaskAnchorView) -> String {
     append_list(&mut out, "Acceptance", &task.acceptance_criteria);
     append_list(&mut out, "Progress", &task.plan_progress);
     append_list(&mut out, "Open loops", &task.open_loops);
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn render_task_progress(progress: &TaskProgressView) -> String {
+    let mut out = format!("TASK PROGRESS anchor_rev={}\n", progress.anchor_revision);
+    if !progress.objective.is_empty() {
+        out.push_str(&format!("Objective: {}\n", progress.objective));
+    }
+    append_list(&mut out, "Blockers", &progress.blockers);
+    append_list(&mut out, "Next", &progress.next_actions);
+    append_list(&mut out, "Checked", &progress.checked_files);
+    append_list(&mut out, "Verification", &progress.verifications);
+    append_list(&mut out, "Failed commands", &progress.failed_commands);
     while out.ends_with('\n') {
         out.pop();
     }
@@ -242,7 +272,7 @@ mod tests {
         turn: &TurnFrame,
         tools: Vec<ToolSpec>,
     ) -> ModelInput {
-        assembler.assemble(None, None, history, turn, tools)
+        assembler.assemble(None, None, None, history, turn, tools)
     }
 
     fn item(content: &str) -> MaterializedItem {
@@ -479,6 +509,7 @@ mod tests {
         let input = assembler.assemble(
             Some(&runtime_focus),
             Some(&task),
+            None,
             &history,
             &TurnFrame::new("continue"),
             Vec::new(),

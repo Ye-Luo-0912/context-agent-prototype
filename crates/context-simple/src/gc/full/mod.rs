@@ -466,8 +466,9 @@ pub(crate) fn commit_full_gc(
             kind: item.kind,
             scope: item.scope,
             reactivated_at_tick: now_tick,
-            reason,
+            reason: reason.clone(),
         });
+        crate::reactivation::record(state, &item, &reason);
         item.attention = AttentionState::Active;
         item.relevance = item.relevance.max(0.5);
         item.residency = ContextResidency::Resident;
@@ -913,8 +914,9 @@ fn reactivate(
             kind: item.kind,
             scope: item.scope,
             reactivated_at_tick: now_tick,
-            reason,
+            reason: reason.clone(),
         });
+        crate::reactivation::record(state, &item, &reason);
         plan.reactivated += 1;
         if anchor_rooted {
             plan.anchor_roots_protected += 1;

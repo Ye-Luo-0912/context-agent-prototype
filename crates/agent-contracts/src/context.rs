@@ -676,6 +676,31 @@ impl TaskAnchorView {
     }
 }
 
+/// Bounded prompt projection of a `ResumePoint`. Bodies stay in storage;
+/// this is refs and status only, never a second task authority.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TaskProgressView {
+    pub anchor_revision: u64,
+    pub objective: String,
+    pub blockers: Vec<String>,
+    pub next_actions: Vec<String>,
+    pub checked_files: Vec<String>,
+    pub verifications: Vec<String>,
+    pub failed_commands: Vec<String>,
+}
+
+impl TaskProgressView {
+    pub fn is_empty(&self) -> bool {
+        self.objective.is_empty()
+            && self.blockers.is_empty()
+            && self.next_actions.is_empty()
+            && self.checked_files.is_empty()
+            && self.verifications.is_empty()
+            && self.failed_commands.is_empty()
+    }
+}
+
 /// Why a record is a root. Independent of `AnchorRootStrength` (how strongly
 /// to hold it) so prompt, residency, and storage decisions stay separate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -995,6 +1020,16 @@ pub struct ContextDiagnostics {
     pub access_admits: u64,
     #[serde(default)]
     pub access_consumption_acks: u64,
+    /// Hot-reactivation utility: reactivated items later selected into a
+    /// materialized frame. Measurement only; does not change GC policy.
+    #[serde(default)]
+    pub reactivation_selected: u64,
+    #[serde(default)]
+    pub reactivation_consumed: u64,
+    #[serde(default)]
+    pub reactivation_selected_tokens: u64,
+    #[serde(default)]
+    pub reactivation_consumed_tokens: u64,
     /// 有界压缩器（B 折叠 / C 派生）累计的 provider 输入 token。
     #[serde(default)]
     pub compaction_input_tokens: u64,

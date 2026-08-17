@@ -23,12 +23,12 @@ use agent_contracts::{
     MaterializedContext, ModelInput, ModelRequest, OperationId, OperationOutcome,
     OperationQueryResult, OperationResult, OperationState, OperationTerminal, RestoreRevision,
     RunId, RuntimeDirective, RuntimeEvent, RuntimeInputEnvelope, RuntimeInputId, ScopeId,
-    ScopeKind, StatePatchProposal, TaskAnchorView, TaskId, ToolCall, ToolOperationIdentity,
-    ToolOutcome, ToolOutput, ToolResultDisposition, ToolSpec, ToolSurfaceBlock,
-    ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceSnapshot, TurnCancelAck,
-    TurnCancellationReason, TurnFrame, TurnFrameStep, TurnId, USER_INPUT_ARTIFACT_OWNER,
-    USER_INPUT_PREVIEW_CHARS, USER_INPUT_QUEUE_CAP, bounded_preview, context_maintenance_events,
-    discovery_search_from_call,
+    ScopeKind, StatePatchProposal, TaskAnchorView, TaskId, TaskProgressView, ToolCall,
+    ToolOperationIdentity, ToolOutcome, ToolOutput, ToolResultDisposition, ToolSpec,
+    ToolSurfaceBlock, ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceSnapshot,
+    TurnCancelAck, TurnCancellationReason, TurnFrame, TurnFrameStep, TurnId,
+    USER_INPUT_ARTIFACT_OWNER, USER_INPUT_PREVIEW_CHARS, USER_INPUT_QUEUE_CAP, bounded_preview,
+    context_maintenance_events, discovery_search_from_call,
 };
 use agent_core::{
     ApprovalVerdict, CorePort, EffectCommitDisposition, EffectCommitRejection, EffectCommitRequest,

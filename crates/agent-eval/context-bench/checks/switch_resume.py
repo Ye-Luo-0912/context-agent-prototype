@@ -1,7 +1,8 @@
-"""Verify switch-resume: operator allow, billing index fix, and rate_limit API.
+"""Verify switch-resume by compile-and-call, not file substrings.
 
-`pub fn rate_limit(...) -> u32` must compile and return 30. A comment or
-identifier substring is not enough.
+`allow("operator")` must be true, `total([1, 2, 3])` must be 6, and
+`rate_limit("user")` must return 30. Comments, dead code, or a leftover
+identifier cannot pass.
 """
 
 from __future__ import annotations
@@ -15,15 +16,7 @@ import tempfile
 
 root = pathlib.Path(sys.argv[1])
 auth_path = root / "src" / "auth.rs"
-billing = (root / "src" / "billing.rs").read_text(encoding="utf-8")
-auth_text = auth_path.read_text(encoding="utf-8")
-
-if "operator" not in auth_text:
-    sys.stderr.write("allow() must still accept operator\n")
-    sys.exit(1)
-if "i + 1" in billing or "i+1" in billing:
-    sys.stderr.write("billing still uses items[i + 1]\n")
-    sys.exit(1)
+billing_path = root / "src" / "billing.rs"
 
 
 def rustc_cmd() -> list[str]:
@@ -52,12 +45,8 @@ def run(argv: list[str], cwd: pathlib.Path) -> None:
         sys.exit(1)
 
 
-rustc = rustc_cmd()
-workdir = pathlib.Path(tempfile.mkdtemp(prefix="switch_resume_"))
-try:
-    lib_src = workdir / "auth.rs"
-    shutil.copyfile(auth_path, lib_src)
-    rlib = workdir / "libauth.rlib"
+def compile_rlib(rustc: list[str], src: pathlib.Path, name: str, dest: pathlib.Path) -> pathlib.Path:
+    rlib = dest / f"lib{name}.rlib"
     run(
         rustc
         + [
@@ -66,17 +55,29 @@ try:
             "--crate-type",
             "rlib",
             "--crate-name",
-            "auth",
-            str(lib_src),
+            name,
+            str(src),
             "-o",
             str(rlib),
         ],
-        workdir,
+        dest,
     )
+    return rlib
+
+
+rustc = rustc_cmd()
+workdir = pathlib.Path(tempfile.mkdtemp(prefix="switch_resume_"))
+try:
+    auth_rlib = compile_rlib(rustc, auth_path, "auth", workdir)
+    billing_rlib = compile_rlib(rustc, billing_path, "billing", workdir)
     driver = workdir / "driver.rs"
     driver.write_text(
         "fn main() {\n"
+        "    assert!(auth::allow(\"admin\"));\n"
+        "    assert!(auth::allow(\"operator\"));\n"
+        "    assert!(!auth::allow(\"nobody\"));\n"
         "    assert_eq!(auth::rate_limit(\"user\"), 30);\n"
+        "    assert_eq!(billing::total(&[1, 2, 3]), 6);\n"
         "}\n",
         encoding="utf-8",
     )
@@ -88,7 +89,9 @@ try:
             "2021",
             str(driver),
             "--extern",
-            f"auth={rlib}",
+            f"auth={auth_rlib}",
+            "--extern",
+            f"billing={billing_rlib}",
             "-o",
             str(exe),
         ],

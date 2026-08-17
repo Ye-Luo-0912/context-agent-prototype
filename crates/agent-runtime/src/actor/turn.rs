@@ -455,6 +455,12 @@ impl RuntimeActor {
             turn.turn_state = TurnState::ModelFinished;
         }
         let mut ingested = false;
+        let resume_turn = self
+            .state
+            .turn
+            .as_ref()
+            .map(|turn| turn.model_round as u64)
+            .unwrap_or(0);
         if let Some(turn) = self.state.turn.as_mut() {
             for step in &turn.turn_frame.steps {
                 let TurnFrameStep::ToolResult {
@@ -472,6 +478,7 @@ impl RuntimeActor {
                 if *disposition != ToolResultDisposition::PersistObservation {
                     continue;
                 }
+                self.state.tasks.observe_tool(output, resume_turn);
                 if let Err(error) = self
                     .services
                     .context_ingest(ContextIngress::ToolObservation {

@@ -455,6 +455,10 @@ pub(crate) fn materialize(
         .sum::<usize>()
         + external.iter().map(external_ref_tokens).sum::<usize>();
 
+    for sel in &selections {
+        crate::reactivation::mark_selected(state, sel.item_id, sel.approx_tokens);
+    }
+
     MaterializedContext {
         materialization_id: 0,
         focus: None,

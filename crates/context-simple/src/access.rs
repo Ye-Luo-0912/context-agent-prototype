@@ -28,14 +28,18 @@ pub(crate) fn stamp_consumed(
     turn: u64,
     gc_epoch: u64,
 ) -> bool {
-    stamp(
+    let applied = stamp(
         state,
         item_id,
         AccessSignal::ConsumptionAck,
         now_tick,
         Some(turn),
         Some(gc_epoch),
-    )
+    );
+    if applied {
+        crate::reactivation::mark_consumed(state, item_id);
+    }
+    applied
 }
 
 /// inspect / fetch 的故意读取。弱于 ack，强于 search；从不增加

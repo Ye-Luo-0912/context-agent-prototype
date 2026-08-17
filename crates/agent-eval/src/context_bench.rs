@@ -42,15 +42,15 @@ provider_tokens=coding_in+coding_out+compactor_in+compactor_out
 report=delta abs and pct; actual rounds; peak and final resident
 hidden_live=missing verifier is preflight fail
 current_turn=runtime-owned TaskAnchor/Focus/UserMessage/ToolResult; A/B/C compare historical context only
-switch_verify=compile/call pub fn rate_limit(...) -> u32; not substring
+switch_verify=compile/call allow(operator), total([1,2,3])==6, rate_limit==30; not substring
 frozen=true
 ";
 
 /// Filled after the deterministic pack self-check is green.
 pub const FROZEN_SPEC_SHA256: &str =
-    "248312578144464242b5a7d54282be0fc8cc484ba3a99cf2b39d82d91bf8e18e";
+    "2e8a89b27c5bf6ec7a2bdbc3011f3000c92585dc01c68517c277666df43314b4";
 pub const FROZEN_PACK_DIGEST: &str =
-    "0b48a54fac023306bf79c9817795b7a97cc41b599bdb15a3280fa5fe663100de";
+    "dfcfe75413ad4ee6e55dc1d34f6d17332d8f05ee5a334d82b14ef19fed2e15dd";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -656,11 +656,28 @@ pub fn render_why_from_pair(pair_dir: &Path) -> anyhow::Result<String> {
     Ok(render_why(&fixture_id, &scenario, &cells))
 }
 
+fn canonical_file_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' {
+            if index + 1 < bytes.len() && bytes[index + 1] == b'\n' {
+                index += 1;
+            }
+            out.push(b'\n');
+        } else {
+            out.push(bytes[index]);
+        }
+        index += 1;
+    }
+    out
+}
+
 fn hash_named(hasher: &mut Sha256, label: &str, path: &Path) {
     hasher.update(label.as_bytes());
     hasher.update([0]);
     if let Ok(bytes) = fs::read(path) {
-        hasher.update(&bytes);
+        hasher.update(canonical_file_bytes(&bytes));
     }
     hasher.update([0]);
 }
@@ -675,7 +692,7 @@ fn hash_tree(hasher: &mut Sha256, label: &str, root: &Path) {
         hasher.update(rel.as_bytes());
         hasher.update([0]);
         if let Ok(bytes) = fs::read(root.join(&rel)) {
-            hasher.update(&bytes);
+            hasher.update(canonical_file_bytes(&bytes));
         }
         hasher.update([0]);
     }
@@ -784,6 +801,13 @@ mod tests {
         assert!(rendered.contains("schema=agent-eval.context-bench.v1"));
         assert!(rendered.contains("spec_sha256="));
         assert!(rendered.contains("pack_digest="));
+    }
+
+    #[test]
+    fn pack_digest_is_stable_across_crlf() {
+        let lf = b"abc\nxyz\n";
+        let crlf = b"abc\r\nxyz\r\n";
+        assert_eq!(canonical_file_bytes(lf), canonical_file_bytes(crlf));
     }
 
     #[test]

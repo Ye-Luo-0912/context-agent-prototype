@@ -303,6 +303,19 @@ pub(crate) struct State {
     pub(crate) access_admits: u64,
     #[serde(default)]
     pub(crate) access_consumption_acks: u64,
+    #[serde(default)]
+    pub(crate) reactivation_selected: u64,
+    #[serde(default)]
+    pub(crate) reactivation_consumed: u64,
+    #[serde(default)]
+    pub(crate) reactivation_selected_tokens: u64,
+    #[serde(default)]
+    pub(crate) reactivation_consumed_tokens: u64,
+    #[serde(skip)]
+    pub(crate) reactivation_traces: std::collections::HashMap<
+        agent_contracts::ContextItemId,
+        crate::reactivation::ReactivationTrace,
+    >,
     /// 引擎自有蒸馏（任务完成）累计的压缩器花费。
     #[serde(default)]
     pub(crate) compaction_input_tokens: u64,

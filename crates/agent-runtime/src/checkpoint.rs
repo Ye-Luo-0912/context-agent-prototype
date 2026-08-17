@@ -105,6 +105,8 @@ pub struct TaskRecordSnapshot {
     /// there is intentionally no v2-to-v3 migration.
     #[serde(default)]
     pub anchor: TaskAnchor,
+    #[serde(default)]
+    pub resume: crate::resume::ResumePoint,
 }
 
 /// One dynamic capability's surface state: its activation and which of its
@@ -175,6 +177,12 @@ impl RuntimeCheckpoint {
             validate_anchor(&task.anchor).map_err(|error| {
                 AgentError::InvalidRequest(format!(
                     "checkpoint task {} has an invalid anchor: {error}",
+                    task.id
+                ))
+            })?;
+            crate::resume::validate_resume(&task.resume).map_err(|error| {
+                AgentError::InvalidRequest(format!(
+                    "checkpoint task {} has an invalid resume point: {error}",
                     task.id
                 ))
             })?;
@@ -309,6 +317,7 @@ impl TaskManagerSnapshot {
                     last_active_ms: task.last_active_ms,
                     tool_requirements: task.tool_requirements.clone(),
                     anchor: task.anchor.clone(),
+                    resume: task.resume.clone(),
                 })
                 .collect(),
             active: tasks.active(),
@@ -327,6 +336,7 @@ impl From<TaskRecordSnapshot> for TaskRecord {
             last_active_ms: snapshot.last_active_ms,
             tool_requirements: snapshot.tool_requirements,
             anchor: snapshot.anchor,
+            resume: snapshot.resume,
         }
     }
 }

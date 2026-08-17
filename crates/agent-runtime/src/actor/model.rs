@@ -658,20 +658,30 @@ impl RuntimeActor {
         turn_frame: &TurnFrame,
         tools: Vec<ToolSpec>,
     ) -> ModelInput {
-        let (focus, task) = self.runtime_prompt_focus(turn_frame);
-        self.assembler
-            .assemble(focus.as_ref(), task.as_ref(), history, turn_frame, tools)
+        let (focus, task, progress) = self.runtime_prompt_focus(turn_frame);
+        self.assembler.assemble(
+            focus.as_ref(),
+            task.as_ref(),
+            progress.as_ref(),
+            history,
+            turn_frame,
+            tools,
+        )
     }
 
     fn runtime_prompt_focus(
         &self,
         turn_frame: &TurnFrame,
-    ) -> (Option<FocusState>, Option<TaskAnchorView>) {
+    ) -> (
+        Option<FocusState>,
+        Option<TaskAnchorView>,
+        Option<TaskProgressView>,
+    ) {
         let Some(task_id) = self.state.task_id else {
-            return (None, None);
+            return (None, None, None);
         };
         let Some(task) = self.state.tasks.get(task_id) else {
-            return (None, None);
+            return (None, None, None);
         };
         let mut focus = FocusState::for_task(task_id, task.goal.clone());
         if !turn_frame.user_message.is_empty() {
@@ -680,6 +690,7 @@ impl RuntimeActor {
         (
             Some(focus),
             Some(crate::task::task_anchor_view(&task.anchor)),
+            Some(task.resume.view()),
         )
     }
 }
