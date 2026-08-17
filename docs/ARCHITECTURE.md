@@ -916,6 +916,37 @@ engine's structured `MaterializedContext` into the five-layer input. The
 engine could not format a prompt even if it wanted to — it never sees the
 system prompt or the tool schemas.
 
+#### Runtime Facts layer (`TOOL-ENV-01`)
+
+`PromptAssembler` places a bounded system-owned facts block immediately after
+System Policy. Composition captures the immutable host profile at startup
+(normalized OS product/release and architecture); the actor refreshes only
+workspace markers after a committed mutation. Caps: 1 KiB UTF-8, 16 sorted
+markers, 64 bytes per marker. Facts never enter `ContextEngine`, transcript
+storage or lifecycle scoring, and they do not repeat the tool catalog.
+
+`shell.exec` binds one dialect for the whole run and names it in the schema.
+Windows prefers detected/pinned PowerShell 7, then Windows PowerShell 5.1,
+then `cmd.exe`; Unix uses POSIX `sh`. Fallbacks are explicit. `process.run`
+remains the no-shell argv path.
+
+#### Model-visible workspace and failure contract
+
+Ordinary `fs.list` / `fs.read` / search / code-navigation calls hide
+`.focus-agent` and raw `.git` internals. Sealed evidence is addressed through
+`artifact.read` and VCS through `git.*`. Missing paths return a bounded
+parent/topology hint without inventing manifests.
+
+`edit.replace` accepts the `fs.read` revision as `base_revision`. Refusals
+distinguish `stale_revision`, `no_exact_match` and `ambiguous_match` and
+return the current revision plus at most three candidate regions. Matching
+stays exact. `edit.patch` remains the revision-aware multi-hunk form.
+
+Trusted tool results project `metadata.failure_class` and a bounded recovery
+hint. The runtime does not blindly translate or retry. Evaluation counts these
+classes separately while keeping every started cell in end-to-end ITT, rounds,
+latency and cost.
+
 A `MaterializedContext` is a disposable projection of the Context Frame. It
 is not the source of truth and should never be persisted as the memory
 model.

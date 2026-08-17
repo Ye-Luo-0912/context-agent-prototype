@@ -10,15 +10,15 @@
 //! generation fence.
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, Effect, RunId, ToolOutcome, ToolOutput, ToolRisk,
-    ToolSpec,
+    AgentError, AgentResult, CancellationToken, Effect, RunId, ToolFailureClass, ToolOutcome,
+    ToolOutput, ToolRisk, ToolSpec, tool_failure_output,
 };
 use agent_workspace::Workspace;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Tool, content_digest};
+use super::{Tool, candidate_regions, content_digest, hidden_path_output, ordinary_view_blocked};
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_HUNKS: usize = 64;
@@ -95,11 +95,9 @@ impl EditPatchTool {
     /// Apply one exact-match hunk to the working text. The hunk's `old`
     /// must match exactly once (or a valid `occurrence` is given),
     /// mirroring `edit.replace`'s explicitness.
-    fn apply_hunk(original: &str, hunk: &Hunk) -> AgentResult<String> {
+    fn apply_hunk(original: &str, hunk: &Hunk) -> Result<String, ToolFailureClass> {
         if hunk.old.is_empty() {
-            return Err(AgentError::InvalidRequest(
-                "edit.patch hunk `old` must not be empty".into(),
-            ));
+            return Err(ToolFailureClass::InvalidRequest);
         }
         let occurrences: Vec<_> = original.match_indices(&hunk.old).collect();
         let count = occurrences.len();
@@ -108,19 +106,18 @@ impl EditPatchTool {
                 let (idx, matched) = occurrences[n - 1];
                 (idx, idx + matched.len())
             }
-            Some(n) => {
-                return Err(AgentError::InvalidRequest(format!(
-                    "edit.patch: hunk occurrence {n} requested but `old` appears only {count} times"
-                )));
+            Some(_) => {
+                return Err(ToolFailureClass::NoExactMatch);
             }
             None if count == 1 => {
                 let (idx, matched) = occurrences[0];
                 (idx, idx + matched.len())
             }
+            None if count == 0 => {
+                return Err(ToolFailureClass::NoExactMatch);
+            }
             None => {
-                return Err(AgentError::InvalidRequest(format!(
-                    "edit.patch: `old` appears {count} times; pass `occurrence` to disambiguate"
-                )));
+                return Err(ToolFailureClass::AmbiguousMatch);
             }
         };
         let mut result = String::with_capacity(original.len() + hunk.new.len());
@@ -239,6 +236,13 @@ impl Tool for EditPatchTool {
         // anywhere refuses the whole call with no side effects.
         let mut resolved: Vec<ResolvedPatch> = Vec::with_capacity(files.len());
         for file in &files {
+            if ordinary_view_blocked(&file.path) {
+                return Ok(ToolOutcome::Value(hidden_path_output(
+                    call_id,
+                    "edit.patch",
+                    &file.path,
+                )));
+            }
             // Reject state-dir targets up front (reads may legitimately
             // reach into artifacts; editing them is a mutation policy
             // decision).
@@ -272,17 +276,47 @@ impl Tool for EditPatchTool {
             if let Some(expected) = &file.base_revision {
                 let current = content_digest(original.as_bytes());
                 if current != *expected {
-                    return Err(AgentError::InvalidRequest(format!(
-                        "edit.patch: base_revision mismatch for {} (file changed since it was read; re-read and retry)",
-                        display_relative(&self.workspace, &path)
+                    let relative = display_relative(&self.workspace, &path);
+                    return Ok(ToolOutcome::Value(patch_refusal(
+                        call_id,
+                        ToolFailureClass::StaleRevision,
+                        &relative,
+                        current,
+                        &original,
+                        file.hunks.first().map(|h| h.old.as_str()).unwrap_or(""),
+                        "stale_revision: file changed since fs.read; re-read and retry. Matching stays exact.",
+                        0,
                     )));
                 }
             }
 
             let mut updated = original.clone();
             for hunk in &file.hunks {
-                let next = Self::apply_hunk(&updated, hunk)?;
-                updated = next;
+                match Self::apply_hunk(&updated, hunk) {
+                    Ok(next) => updated = next,
+                    Err(ToolFailureClass::InvalidRequest) => {
+                        return Err(AgentError::InvalidRequest(
+                            "edit.patch hunk `old` must not be empty".into(),
+                        ));
+                    }
+                    Err(class) => {
+                        let relative = display_relative(&self.workspace, &path);
+                        let current = content_digest(original.as_bytes());
+                        let count = updated.match_indices(&hunk.old).count();
+                        let message = match class {
+                            ToolFailureClass::AmbiguousMatch => format!(
+                                "ambiguous_match: hunk `old` appears {count} times; pass occurrence or use a unique exact anchor"
+                            ),
+                            _ => format!(
+                                "no_exact_match: hunk `old` appears {count} times. Matching stays exact."
+                            ),
+                        };
+                        return Ok(ToolOutcome::Value(patch_refusal(
+                            call_id, class, &relative, current, &updated, &hunk.old, &message,
+                            count,
+                        )));
+                    }
+                }
             }
             resolved.push(ResolvedPatch {
                 relative: display_relative(&self.workspace, &path),
@@ -372,6 +406,39 @@ impl Tool for EditPatchTool {
             effect: Box::new(effects),
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn patch_refusal(
+    call_id: &str,
+    class: ToolFailureClass,
+    path: &str,
+    revision: String,
+    original: &str,
+    needle: &str,
+    message: &str,
+    match_count: usize,
+) -> ToolOutput {
+    let candidates = candidate_regions(original, needle);
+    let candidate_text = if candidates.is_empty() {
+        "no candidate".to_string()
+    } else {
+        candidates.join("\n---\n")
+    };
+    tool_failure_output(
+        call_id,
+        "edit.patch",
+        class,
+        format!("edit.patch refused: {}", class.as_str()),
+        format!("{message}\npath={path}\nrevision={revision}\n{candidate_text}"),
+        json!({
+            "path": path,
+            "revision": revision,
+            "match_count": match_count,
+            "candidates": candidates,
+            "recovery_hint": format!("current revision {revision}; matching stays exact"),
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -499,10 +566,18 @@ mod tests {
                 CancellationToken::new(),
             )
             .await;
-        let message = result.unwrap_err().to_string();
+        let ToolOutcome::Value(output) = result.unwrap() else {
+            panic!("a stale edit must refuse without staging");
+        };
+        assert!(!output.ok);
+        assert_eq!(
+            output.failure_class(),
+            Some(ToolFailureClass::StaleRevision)
+        );
         assert!(
-            message.contains("base_revision mismatch"),
-            "a stale edit must be refused: {message}"
+            output.model_content.contains("stale_revision"),
+            "a stale edit must be refused: {}",
+            output.model_content
         );
 
         // The file is untouched.
@@ -573,9 +648,12 @@ mod tests {
                 CancellationToken::new(),
             )
             .await;
-        assert!(
-            result.unwrap_err().to_string().contains("appears 2 times"),
-            "ambiguous hunks must be rejected"
+        let ToolOutcome::Value(output) = result.unwrap() else {
+            panic!("ambiguous hunks must be a typed refusal");
+        };
+        assert_eq!(
+            output.failure_class(),
+            Some(ToolFailureClass::AmbiguousMatch)
         );
 
         // Missing: the hunk's `old` is not in the file.
@@ -593,10 +671,10 @@ mod tests {
                 CancellationToken::new(),
             )
             .await;
-        assert!(
-            result.unwrap_err().to_string().contains("appears 0 times"),
-            "a missing hunk must be rejected"
-        );
+        let ToolOutcome::Value(output) = result.unwrap() else {
+            panic!("missing hunks must be a typed refusal");
+        };
+        assert_eq!(output.failure_class(), Some(ToolFailureClass::NoExactMatch));
     }
 
     #[tokio::test]
@@ -705,10 +783,17 @@ mod tests {
                 CancellationToken::new(),
             )
             .await;
-        let message = result.unwrap_err().to_string();
+        let ToolOutcome::Value(output) = result.unwrap() else {
+            panic!("one stale file must refuse the whole patch");
+        };
+        assert_eq!(
+            output.failure_class(),
+            Some(ToolFailureClass::StaleRevision)
+        );
         assert!(
-            message.contains("base_revision mismatch"),
-            "one stale file must refuse the whole patch: {message}"
+            output.model_content.contains("stale_revision"),
+            "one stale file must refuse the whole patch: {}",
+            output.model_content
         );
 
         // No side effects anywhere: the good file was not touched either.

@@ -6,15 +6,15 @@
 //! workspace change journal (`.focus-agent/changes.jsonl`).
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, Effect, RunId, ToolOutcome, ToolOutput, ToolRisk,
-    ToolSpec,
+    AgentError, AgentResult, CancellationToken, Effect, RunId, ToolFailureClass, ToolOutcome,
+    ToolOutput, ToolRisk, ToolSpec, tool_failure_output,
 };
 use agent_workspace::Workspace;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::Tool;
+use super::{Tool, candidate_regions, content_digest, hidden_path_output, ordinary_view_blocked};
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -38,6 +38,10 @@ struct ReplaceArgs {
     occurrence: Option<usize>,
     #[serde(default)]
     replace_all: bool,
+    /// The `fs.read` revision this change is based on. When present, the file
+    /// must still be exactly that digest; a mismatch is `stale_revision`.
+    #[serde(default)]
+    base_revision: Option<String>,
 }
 
 fn display_relative(workspace: &Workspace, path: &std::path::Path) -> String {
@@ -52,7 +56,7 @@ impl Tool for EditReplaceTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit.replace".into(),
-            description: "Replace an exact substring in a workspace file (occurrence-aware). Records the change in the workspace change journal.".into(),
+            description: "Replace one exact substring in a workspace file. Pass `base_revision` from fs.read so a stale file is refused. Matching is exact and never fuzzy. For several hunks or revision-checked multi-edit, use edit.patch. Records the change in the workspace change journal.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path", "old", "new"],
@@ -61,7 +65,8 @@ impl Tool for EditReplaceTool {
                     "old": {"type": "string", "description": "Exact text to replace (must match exactly once unless occurrence/replace_all is given)"},
                     "new": {"type": "string"},
                     "occurrence": {"type": "integer", "minimum": 1, "description": "1-based occurrence to replace"},
-                    "replace_all": {"type": "boolean", "description": "Replace every occurrence"}
+                    "replace_all": {"type": "boolean", "description": "Replace every occurrence"},
+                    "base_revision": {"type": "string", "description": "The fs.read `revision` this change is based on; a mismatch refuses the edit"}
                 }
             }),
             risk: ToolRisk::WorkspaceWrite,
@@ -89,6 +94,13 @@ impl Tool for EditReplaceTool {
                 "edit.replace: `occurrence` and `replace_all` are mutually exclusive".into(),
             ));
         }
+        if ordinary_view_blocked(&args.path) {
+            return Ok(ToolOutcome::Value(hidden_path_output(
+                call_id,
+                "edit.replace",
+                &args.path,
+            )));
+        }
 
         // Reject state-dir targets up front (reads may legitimately reach
         // into artifacts; editing them is a mutation policy decision).
@@ -114,8 +126,36 @@ impl Tool for EditReplaceTool {
         file.read_to_string(&mut original)
             .await
             .map_err(|e| AgentError::Io(format!("read {}: {e}", path.display())))?;
+        let current_revision = content_digest(original.as_bytes());
+        let relative = display_relative(&self.workspace, &path);
+        if let Some(expected) = args.base_revision.as_deref()
+            && expected != current_revision
+        {
+            return Ok(ToolOutcome::Value(edit_refusal(
+                call_id,
+                ToolFailureClass::StaleRevision,
+                &relative,
+                current_revision,
+                &original,
+                &args.old,
+                "stale_revision: file changed since fs.read; re-read and retry. Matching stays exact.",
+                0,
+            )));
+        }
         let occurrences: Vec<_> = original.match_indices(&args.old).collect();
         let count = occurrences.len();
+        if count == 0 && args.replace_all {
+            return Ok(ToolOutcome::Value(edit_refusal(
+                call_id,
+                ToolFailureClass::NoExactMatch,
+                &relative,
+                current_revision,
+                &original,
+                &args.old,
+                "no_exact_match: `old` appears 0 times. Matching stays exact; re-read and supply a current anchor.",
+                0,
+            )));
+        }
 
         let updated = if args.replace_all {
             original.replace(&args.old, &args.new)
@@ -133,14 +173,44 @@ impl Tool for EditReplaceTool {
                     result
                 }
                 Some(n) => {
-                    return Err(AgentError::InvalidRequest(format!(
-                        "edit.replace: occurrence {n} requested but `old` appears only {count} times"
+                    return Ok(ToolOutcome::Value(edit_refusal(
+                        call_id,
+                        ToolFailureClass::NoExactMatch,
+                        &relative,
+                        current_revision,
+                        &original,
+                        &args.old,
+                        &format!(
+                            "no_exact_match: occurrence {n} requested but `old` appears only {count} times"
+                        ),
+                        count,
                     )));
                 }
                 None if count == 1 => original.replacen(&args.old, &args.new, 1),
+                None if count == 0 => {
+                    return Ok(ToolOutcome::Value(edit_refusal(
+                        call_id,
+                        ToolFailureClass::NoExactMatch,
+                        &relative,
+                        current_revision,
+                        &original,
+                        &args.old,
+                        "no_exact_match: `old` appears 0 times. Matching stays exact; re-read and supply a current anchor.",
+                        0,
+                    )));
+                }
                 None => {
-                    return Err(AgentError::InvalidRequest(format!(
-                        "edit.replace: `old` appears {count} times; pass `occurrence` or `replace_all` to disambiguate"
+                    return Ok(ToolOutcome::Value(edit_refusal(
+                        call_id,
+                        ToolFailureClass::AmbiguousMatch,
+                        &relative,
+                        current_revision,
+                        &original,
+                        &args.old,
+                        &format!(
+                            "ambiguous_match: `old` appears {count} times; pass `occurrence` or `replace_all`, or use edit.patch for multi-hunk work"
+                        ),
+                        count,
                     )));
                 }
             }
@@ -194,11 +264,44 @@ impl Tool for EditReplaceTool {
                     updated.len()
                 ),
                 artifact_ref: None,
-                metadata: json!({"changed": true, "occurrences": count, "bytes_before": metadata.len(), "bytes_after": updated.len()}),
+                metadata: json!({"changed": true, "occurrences": count, "bytes_before": metadata.len(), "bytes_after": updated.len(), "revision": content_digest(updated.as_bytes())}),
             },
             effect,
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn edit_refusal(
+    call_id: &str,
+    class: ToolFailureClass,
+    path: &str,
+    revision: String,
+    original: &str,
+    needle: &str,
+    message: &str,
+    match_count: usize,
+) -> ToolOutput {
+    let candidates = candidate_regions(original, needle);
+    let candidate_text = if candidates.is_empty() {
+        "no candidate".to_string()
+    } else {
+        candidates.join("\n---\n")
+    };
+    tool_failure_output(
+        call_id,
+        "edit.replace",
+        class,
+        format!("edit.replace refused: {}", class.as_str()),
+        format!("{message}\npath={path}\nrevision={revision}\n{candidate_text}"),
+        json!({
+            "path": path,
+            "revision": revision,
+            "match_count": match_count,
+            "candidates": candidates,
+            "recovery_hint": format!("current revision {revision}; matching stays exact"),
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -298,8 +401,17 @@ mod tests {
                 None,
                 CancellationToken::new(),
             )
-            .await;
-        assert!(result.is_err(), "ambiguous match must be rejected");
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = result else {
+            panic!("ambiguous match must return a typed refusal");
+        };
+        assert!(!output.ok);
+        assert_eq!(
+            output.failure_class(),
+            Some(ToolFailureClass::AmbiguousMatch)
+        );
+        assert!(output.metadata.get("revision").is_some());
 
         // With replace_all it succeeds (staged, then committed like the
         // runtime would).
@@ -326,5 +438,70 @@ mod tests {
             "the staged effect must commit durably"
         );
         assert_eq!(tfs::read_to_string(&file).await.unwrap(), "x b x\n");
+    }
+
+    #[tokio::test]
+    async fn stale_base_revision_is_typed_and_does_not_mutate() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let file = dir.path().join("f.txt");
+        tfs::write(&file, "hello\n").await.unwrap();
+        let stale = content_digest(b"hello\n");
+        tfs::write(&file, "changed\n").await.unwrap();
+
+        let tool = EditReplaceTool::new(workspace);
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({
+                    "path": "f.txt",
+                    "old": "hello",
+                    "new": "hi",
+                    "base_revision": stale
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("stale revision must refuse without staging");
+        };
+        assert!(!output.ok);
+        assert_eq!(
+            output.failure_class(),
+            Some(ToolFailureClass::StaleRevision)
+        );
+        assert_eq!(tfs::read_to_string(&file).await.unwrap(), "changed\n");
+        assert!(output.model_content.contains("revision="));
+    }
+
+    #[tokio::test]
+    async fn zero_matches_returns_no_exact_match_and_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        tfs::write(dir.path().join("f.txt"), "alpha beta gamma\n")
+            .await
+            .unwrap();
+        let tool = EditReplaceTool::new(workspace);
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"path": "f.txt", "old": "delta", "new": "x"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("zero matches must be a typed refusal");
+        };
+        assert_eq!(output.failure_class(), Some(ToolFailureClass::NoExactMatch));
+        assert!(
+            output.model_content.contains("no candidate")
+                || output.metadata["candidates"].as_array().is_some()
+        );
     }
 }

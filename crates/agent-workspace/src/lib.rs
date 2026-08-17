@@ -20,6 +20,7 @@ mod handles;
 mod journal;
 mod process_journal;
 mod remote_journal;
+mod runtime_facts;
 
 pub use agent_contracts::{ArtifactLocator, MAX_ARTIFACT_REFERENCE_BYTES};
 pub use broker::WorkspaceOutputBroker;
@@ -27,6 +28,7 @@ pub use confined::{ConfinedDir, ConfinedFile};
 pub use handles::{ArtifactStoreHandle, ConfinedWorkspaceHandle};
 pub use journal::WorkspaceEffectRecovery;
 pub use remote_journal::RemoteEffectAck;
+pub use runtime_facts::capture_host_runtime_facts;
 
 /// One record in the workspace change journal (`.focus-agent/changes.jsonl`).
 ///
@@ -1203,6 +1205,11 @@ fn clean_relative(relative: &Path) -> AgentResult<PathBuf> {
 fn confined_io_error(operation: &str, path: &Path, e: io::Error) -> AgentError {
     if e.kind() == io::ErrorKind::InvalidData {
         AgentError::InvalidRequest(format!("{operation} {}: {e}", path.display()))
+    } else if e.kind() == io::ErrorKind::NotFound {
+        // Custom Windows NTSTATUS payloads display as `NTSTATUS 0xc0000034`
+        // without the words "not found"; keep the kind in the agent string
+        // so ordinary file tools can return a typed path_not_found hint.
+        AgentError::Io(format!("{operation} {}: not found ({e})", path.display()))
     } else {
         AgentError::Io(format!("{operation} {}: {e}", path.display()))
     }

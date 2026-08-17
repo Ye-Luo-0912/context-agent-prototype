@@ -11,7 +11,7 @@
 use agent_contracts::{
     CAPABILITY_MANAGE, CONTEXT_MANAGE, ContextItemId, RuntimeEvent, RuntimeEventEnvelope,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RecoverPath {
@@ -55,6 +55,9 @@ pub struct RunMetrics {
     /// Repeated `fs.read` of the same workspace path (the second and later
     /// reads of one path — a proxy for search/re-read inefficiency).
     pub repeated_fs_reads: u64,
+    /// Counts of trusted `metadata.failure_class` values (`TOOL-ERROR-01`).
+    /// Includes classified no-match searches that still have `ok: true`.
+    pub tool_failure_classes: BTreeMap<String, u64>,
 
     // Materialization (the Phase 0 measurement baseline: how big the model
     // input actually was and where the working set lived).
@@ -178,6 +181,12 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             RuntimeEvent::ToolFinished { output } => {
                 if !output.ok {
                     metrics.failed_tool_outputs += 1;
+                }
+                if let Some(class) = output.failure_class() {
+                    *metrics
+                        .tool_failure_classes
+                        .entry(class.as_str().to_string())
+                        .or_default() += 1;
                 }
                 if output.artifact_ref.is_some() {
                     metrics.artifact_spills += 1;
@@ -426,7 +435,8 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          recovery: forgotten={} recovered={} search={} reactivate={} reread={} failed={}\n\
          access: search_hits={} inspects={} fetches={} admits={} acks={}\n\
          compaction: in={} out={}\n\
-         behavior: tool_calls={} failed_outputs={} spills={} output_chars={} repeated_fs_reads={}\n",
+         behavior: tool_calls={} failed_outputs={} spills={} output_chars={} repeated_fs_reads={}\n\
+         tool_failures: {:?}\n",
         metrics.model_input_tokens,
         metrics.model_output_tokens,
         metrics.schema_tokens_total,
@@ -481,6 +491,7 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.artifact_spills,
         metrics.output_chars_total,
         metrics.repeated_fs_reads,
+        metrics.tool_failure_classes,
     )
 }
 
@@ -592,7 +603,7 @@ mod tests {
                     summary: "failed".into(),
                     model_content: String::new(),
                     artifact_ref: None,
-                    metadata: json!({}),
+                    metadata: json!({"failure_class": "no_exact_match"}),
                 },
             },
         ));
@@ -747,6 +758,10 @@ mod tests {
         assert_eq!(metrics.tool_calls, 2);
         assert_eq!(metrics.repeated_fs_reads, 1);
         assert_eq!(metrics.failed_tool_outputs, 1);
+        assert_eq!(
+            metrics.tool_failure_classes.get("no_exact_match").copied(),
+            Some(1)
+        );
         assert_eq!(metrics.artifact_spills, 1);
         assert_eq!(metrics.output_chars_total, 7, "content + failed(0)");
         assert_eq!(metrics.lifecycle_transitions, 2);

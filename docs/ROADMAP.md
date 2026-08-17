@@ -1138,7 +1138,7 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 | M12 Effect Runtime | 🟡 staged-effect baseline | Trusted prepared effects commit behind the Core-owned authority-epoch/lease fence (`CORE-01`); stale dispatch and commit are rejected, and cancellation advances the fence before awaiting cleanup. Non-empty process-capability wire effects currently fail closed before staging pending PLAT actual-intent/recovery proof, and cancellation kills owned process trees (`CORE-06`). Generic `shell.exec` / `process.run` execute before completion and may already mutate the world, so they remain bounded, separately authorized non-transactional exceptions—not proof that every side effect uses one commit path. |
 | M13 Extension Sandbox | 🟡 partial | Env scrub, private cwd, bounded stderr, process-tree cancellation, Windows Job-Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE), Unix rlimits (CPU/process) and directory-handle-relative workspace opens with reparse substitution rejected at open time (`CORE-07`) are enforced. Mid-invoke filesystem access is now brokered: a child's `fs.read` system request is answered only under the invocation's `workspace:read` grant, only through a confined workspace handle, and only for relative non-escaping paths (absolute/rooted and `..` paths refused before the handle is consulted); network is explicitly deny-by-default (no network permission word exists; recognized network ops get a named refusal). OS-level *write* filtering is now kernel-enforced on Linux (landlock, `MOD-06`): a confined child may create/modify/destroy filesystem state only under its configured write roots, irrevocably and inherited by every descendant, verified on a real kernel. OS-level *network* filtering (sockets) remains the residual gap (`CORE-01` open). |
 | M14 Resource Policy | ✅ | Schema/context quotas, risk/permission validation and final output guards exist; the narrow standing `TaskExecutionPolicy` is landed (`CORE-08`: effect + target + constraint + expiry grants, revocable, zero-responder deny/skip); the kernel-level trusted output broker is landed (`CORE-04`: capped fields, one-time artifact spill, execution-enforced query limits); a declared per-tool output budget on `ToolSpec` is enforced by the broker (clamped to the global hard cap); approval is now effect-derived: `EffectIntent` (contract type) is derived from the validated arguments and standing grants match the concrete intent (path, content bytes, command prefix) instead of re-parsing raw arguments; commit-time resource enforcement is landed (`AuthorityLease`: every side-effecting call mints a short-lived lease at approval, and Core refuses stale-epoch or expired-lease commits — rollback, never commit); and every meta-tool surface is bounded by logical history size, not by it: diagnostics answers in O(1) (Cold/External counts), `inspect` and `search` keep only their limit of rows while streaming (memory O(limit)), and the ledger is capped. The acceptance — the LLM cannot exhaust runtime resources through meta-tools — is met. |
-| M15 Real Evaluation | 🧪 Context Bench is the current decision instrument; 300×3 parked | The question is where dynamic context helps or hurts a coding agent, not whether the agent can fix random bugs. `agent-eval --context-bench` is 12 tasks × A/C (rolling only on three mechanism tasks); pack/SPEC are hash-frozen. Replay remains a policy proxy. The frozen analysis.v2 300×3 ITT gate is unchanged and parked until this bench says C is worth continuing. Do not mix P0/P1 ITT tables. Do not close M15 from the 30-task pilot. |
+| M15 Real Evaluation | 🧪 Context Bench is the current decision instrument; 300×3 parked | The question is where dynamic context helps or hurts a coding agent, not whether the agent can fix random bugs. `agent-eval --context-bench` is 12 tasks × A/C (rolling only on three mechanism tasks); pack/SPEC are hash-frozen; wave-1 live is under `evidence/context-bench-wave1/`. Before another live wave, finish `TOOL-ENV-01`→`TOOL-ERROR-01`. Replay remains a policy proxy. The frozen analysis.v2 300×3 ITT gate is unchanged and parked until this bench says C is worth continuing. Do not mix P0/P1 ITT tables. Do not close M15 from the 30-task pilot. |
 | V2 Self-Iteration | 🔒 blocked | Registry maturity and sandboxed self-checks are foundations only. Autonomous generation/promotion stays disabled until M12/M13/M15 close and the `PLAT-00..04` containment/protocol/recovery boundary is proven. |
 
 The milestone dependency remains M10 → M11 → M12 → M13 → M14 → M15 → V2;
@@ -1205,8 +1205,12 @@ root transfer with fault injection coverage, and completed-task records are
    storage roots so 1,000 completions stay bounded. The completion ref/digest
    identify the bounded summary; when artifact storage is wired, the full
    assistant response is written before ContextItem truncation and attached
-   separately. A raw-body digest and typed `EpisodeOutcome` per rotated episode
-   remain before M15 can claim long-task success.
+   separately. A raw-body digest, `CTX-11` (bounded `ResumePoint` /
+   TaskProgress under `TaskAnchor`; not a second authority), and typed
+   `EpisodeOutcome` per rotated episode remain before M15 can claim
+   long-task continuity. Do not land `CTX-11` until the tool-quality
+   preflight below has a cleaner baseline; design detail lives in
+   `docs/AUDIT_TODO.md` (`CTX-11`) and optimization-order item 2.
 
 The detailed milestone notes below retain implementation landing order, not
 the required gate order; the numbered list and table above are authoritative.
@@ -1264,7 +1268,10 @@ the required gate order; the numbered list and table above are authoritative.
    instrument: where dynamic context helps or hurts a coding agent.
    `agent-eval --context-bench` is 12 tasks × A/C (rolling only on
    `horizon_long` / `semantic_recall` / `task_switch`; 27 cells at
-   repeats=1). Replay remains a policy proxy. The fixture harness
+   repeats=1). Pack/SPEC are hash-frozen; wave-1 live evidence is under
+   `crates/agent-eval/evidence/context-bench-wave1/`. Before another live
+   wave, finish the tool-quality preflight (`TOOL-ENV-01`…
+   `TOOL-ERROR-01`). Replay remains a policy proxy. The fixture harness
    (`--fixture` / `--compare-arm` / `--compare-live`) is landed smoke.
    The frozen analysis.v2 300×3 ITT gate is unchanged and parked until
    this bench says C is worth continuing. Do not mix P0/P1 ITT tables.
@@ -1285,6 +1292,38 @@ starts at item 3 (`PLAT-00`) and must stay ahead of external/managed workers;
 the context-objective lane in item 2 may proceed in parallel, but it cannot
 be used to declare the Platform or sandbox gates complete.
 
+**2026-08-17 tool-quality preflight (blocks causal Context claims).** Wave-1
+live (`crates/agent-eval/evidence/context-bench-wave1/`, 27 cells,
+repeats=1) showed many fixture-turn timeouts, A/C discordance on
+`supersession_leak` / `task_switch_long_b`, and no C provider-token win on
+passed A/C pairs. Coarse `Likely optimization target` was `none` on every
+cell — attribution only, never a modification order. Before another live
+wave, or any claim that C's extra rounds/cost come from context lifecycle,
+close preventable tool defects in this order (owning specs:
+`docs/TOOL_ECOSYSTEM_TODO.md` / `docs/AUDIT_TODO.md`):
+
+- `TOOL-ENV-01` — bounded Runtime Facts (platform product/release, arch,
+  workspace-relative contract, ≤16 confined project markers) and one
+  exact `shell.exec` dialect/version for the run (Windows: prefer pinned
+  PowerShell 7; 5.1/`cmd.exe` only if explicit).
+- `TOOL-EDIT-01` — revision-aware exact `edit.replace` (optional `fs.read`
+  revision precondition; typed stale/no/ambiguous-match diagnostics; no
+  fuzzy auto-mutation).
+- `TOOL-VIEW-01` — one noise-free model-visible workspace view (hide
+  `.focus-agent` / raw `.git` from ordinary list/read/nav; sealed evidence
+  via `artifact.read`, VCS via `git.*`).
+- `TOOL-ERROR-01` — typed bounded recovery classes/hints; separate
+  preventable product failures from task/provider/infra without blind
+  retry or dropping cells from end-to-end cost.
+
+Then rerun the **same frozen** Context Bench cells with scoring unchanged.
+Focused regressions precede that rerun. `CTX-11` stays a valid
+task-continuity design, but its incremental value is measured only on the
+residual after this cleaner tool baseline. This preflight may proceed in
+parallel with M12/M13 confinement work; it does **not** close those gates
+or make arbitrary shell mutation transactional. Tool failures remain in
+end-to-end success, rounds, latency and cost.
+
 1. **State authority (M10, complete).** Serialize or revision-fence context GC,
    storage GC, checkpoint and restore; capture actor + capability state as one
    snapshot; make restore rebasing a bounded durable event/recovery
@@ -1292,10 +1331,11 @@ be used to declare the Platform or sandbox gates complete.
    checkpoint + restore-commit audit (`CORE-03`).
 2. **Continue the context target after M10/M11.** Move lifecycle metadata
    into one canonical catalog, project the implemented TaskAnchor into prompt
-   and GC roots, and add sourced EpisodeOutcome cards. Historical
-   content has left the System role (`CORE-05`): observations render as
-   low-authority `user` messages, so retrieved history cannot gain system
-   precedence. **Done:** TaskAnchor,
+   and GC roots, and (only after the tool-quality preflight + frozen-cell
+   rerun) add the bounded `CTX-11` ResumePoint/TaskProgress projection, then
+   sourced EpisodeOutcome cards. Historical content has left the System role
+   (`CORE-05`): observations render as low-authority `user` messages, so
+   retrieved history cannot gain system precedence. **Done:** TaskAnchor,
    `CompletionRecord`, atomic completion root transfer and verifiable
    completion-summary digest (`CTX-10`); the System-role split (`CORE-05`); the
    episode-local turn counter (rotation resets it, and GC ages ordinary
@@ -1306,7 +1346,15 @@ be used to declare the Platform or sandbox gates complete.
    `item_id -> location` directory plus query indexes) is landed
    (2026-08-14); bodies remain in the three stores. `TaskAnchorView` and
    independent prompt/residency/storage root reporting landed 2026-08-15.
-   Sourced EpisodeOutcome remains.
+   **Next context slice (`CTX-11`):** queued behind the tool-quality
+   preflight for causal measurement. `TaskAnchor` stays the sole task
+   authority; `ResumePoint` is a revision-bound actor subrecord (objective,
+   blockers, checked refs, verification facts, failed commands, next
+   actions — refs only, no body/output/dialogue copies). Validate first on
+   task-switch / failed-tool residuals after the preflight rerun. Do not
+   retune scoring or treat likely-target as implementation authority.
+   Contract detail: `docs/AUDIT_TODO.md` (`CTX-11`). Sourced EpisodeOutcome
+   remains after this slice.
 3. **Contain current protocol boundaries (`PLAT-00`, P0a).** Before designing
    a new envelope, fix current codecs, bidirectional frame/exchange caps,
    known decoded-large-field caps, and MCP child ownership/cancellation.
@@ -1333,6 +1381,10 @@ be used to declare the Platform or sandbox gates complete.
    authority/recovery contract plus OS-level network isolation,
    cross-platform confinement and the generic shell/process non-transactional
    effect contract with adversarial escape/recovery tests.
+   The `TOOL-ENV-01` → `TOOL-EDIT-01` → `TOOL-VIEW-01` → `TOOL-ERROR-01`
+   preflight above may run in parallel as product quality work; it does not
+   satisfy M12/M13 acceptance and must not be read as a substitute for
+   confinement or transactional shell recovery.
 5. **Finish remaining PLAT-03 recovery (`PLAT-03` partial; `PLAT-04` landed) on the
    landed PLAT-01/02 + PLAT-03a1-a4 boundary.** PLAT-01 formalized Platform=`RuntimeActor`, made the
    concrete actor/Core internals private behind a narrow `CorePort`, and added
@@ -1427,6 +1479,14 @@ be used to declare the Platform or sandbox gates complete.
    after that separate evidence may `PLAT-08` add Named Pipe/UDS for
    persistent services. Only after M15 may learned/vector recall or V2
    advance.
+   The frozen Context Bench (`agent-eval.context-bench.v1`) hashes task JSON +
+   seed + golden + checker, keeps hidden command sources outside the
+   model-visible workspace, requires seed-fail/golden-pass, and rejects
+   planted/restated hidden constraints. Wave-1 evidence is under
+   `crates/agent-eval/evidence/context-bench-wave1/`. Coarse
+   `Likely optimization target` was `none` on every wave-1 cell and is not a
+   modification order until `TOOL-ERROR-01` attribution exists; use raw
+   trace/cost deltas and the tool-quality preflight order above.
 
 ### Next design package: Platform Protocol, events, discovery, and managed Agents
 

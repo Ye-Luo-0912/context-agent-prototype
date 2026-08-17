@@ -11,6 +11,7 @@ mod session;
 mod shell;
 mod stream;
 mod task;
+mod view;
 
 pub(crate) use artifact::ArtifactReadTool;
 pub(crate) use code::{CodeDiagnosticsTool, CodeSymbolsTool};
@@ -23,7 +24,12 @@ pub(crate) use process::ProcessRunTool;
 pub(crate) use search::SearchGrepTool;
 pub(crate) use session::{ProcessSession, ProcessSessionTool};
 pub(crate) use shell::ShellExecTool;
+pub use shell::{ShellDialect, ShellKind};
 pub(crate) use task::TaskCompleteTool;
+pub(crate) use view::{
+    hidden_path_output, is_hidden_name, is_not_found_error, missing_path_output,
+    ordinary_view_blocked,
+};
 
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, OperationEffectContext, RunId, ToolOutcome,
@@ -138,6 +144,142 @@ pub(crate) fn content_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+const MAX_EDIT_CANDIDATES: usize = 3;
+const CANDIDATE_CONTEXT_LINES: usize = 2;
+const CANDIDATE_MAX_CHARS: usize = 400;
+
+/// Bounded line-numbered windows around exact or first-line probes.
+/// Never used to authorize a fuzzy mutation.
+pub(crate) fn candidate_regions(text: &str, needle: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (idx, _) in text.match_indices(needle).take(MAX_EDIT_CANDIDATES) {
+        out.push(region_at(text, idx));
+    }
+    if !out.is_empty() {
+        return out;
+    }
+    let probe = needle
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(needle);
+    let probe = if probe.chars().count() > 48 {
+        probe.chars().take(48).collect::<String>()
+    } else {
+        probe.to_string()
+    };
+    if probe.trim().is_empty() {
+        return Vec::new();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        if line.contains(&probe) {
+            out.push(window_at(&lines, index));
+            if out.len() >= MAX_EDIT_CANDIDATES {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn region_at(text: &str, byte_index: usize) -> String {
+    let before = text[..byte_index].lines().count().saturating_sub(1);
+    let lines: Vec<&str> = text.lines().collect();
+    window_at(&lines, before)
+}
+
+fn window_at(lines: &[&str], center: usize) -> String {
+    let start = center.saturating_sub(CANDIDATE_CONTEXT_LINES);
+    let end = (center + CANDIDATE_CONTEXT_LINES + 1).min(lines.len());
+    let mut block = String::new();
+    for (offset, line) in lines[start..end].iter().enumerate() {
+        let number = start + offset + 1;
+        let clipped: String = line.chars().take(120).collect();
+        block.push_str(&format!("{number:>6} | {clipped}\n"));
+    }
+    if block.chars().count() > CANDIDATE_MAX_CHARS {
+        block.chars().take(CANDIDATE_MAX_CHARS).collect()
+    } else {
+        block
+    }
+}
+
+pub(crate) fn classify_process_outcome(
+    outcome: &str,
+    exit_ok: bool,
+    output_tail: &str,
+    command: Option<&str>,
+    dialect: Option<&ShellDialect>,
+    markers: &[String],
+) -> Option<agent_contracts::ToolFailureClass> {
+    use agent_contracts::ToolFailureClass;
+    if outcome == "cancelled" {
+        return Some(ToolFailureClass::Cancellation);
+    }
+    if outcome == "timed out" {
+        return Some(ToolFailureClass::Timeout);
+    }
+    if exit_ok {
+        return None;
+    }
+    if let Some(command) = command
+        && let Some(marker) = required_project_marker(command)
+        && !marker_present(markers, marker)
+    {
+        return Some(ToolFailureClass::MissingProjectMarker);
+    }
+    let tail = output_tail.to_ascii_lowercase();
+    if looks_unavailable(&tail) {
+        if dialect.is_some_and(|d| d.kind.wrong_dialect_likely(command.unwrap_or(""), &tail)) {
+            return Some(ToolFailureClass::ShellDialectMismatch);
+        }
+        return Some(ToolFailureClass::CommandUnavailable);
+    }
+    if dialect.is_some_and(|d| d.kind.wrong_dialect_likely(command.unwrap_or(""), &tail)) {
+        return Some(ToolFailureClass::ShellDialectMismatch);
+    }
+    Some(ToolFailureClass::ProcessExit)
+}
+
+pub(crate) fn required_project_marker(command: &str) -> Option<&'static str> {
+    let token = command.split_whitespace().next()?.trim_matches('"');
+    let token = token
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(token)
+        .trim_end_matches(".exe")
+        .trim_end_matches(".cmd")
+        .trim_end_matches(".bat")
+        .to_ascii_lowercase();
+    match token.as_str() {
+        "cargo" | "rustc" => Some("Cargo.toml"),
+        "npm" | "npx" | "yarn" | "pnpm" => Some("package.json"),
+        "pytest" | "pip" | "pip3" => Some("pyproject.toml"),
+        "go" => Some("go.mod"),
+        "mvn" => Some("pom.xml"),
+        "gradle" | "gradlew" => Some("build.gradle"),
+        _ => None,
+    }
+}
+
+fn marker_present(markers: &[String], needed: &str) -> bool {
+    if markers.iter().any(|marker| marker == needed) {
+        return true;
+    }
+    needed == "pyproject.toml"
+        && markers
+            .iter()
+            .any(|marker| marker == "requirements.txt" || marker == "setup.py")
+}
+
+fn looks_unavailable(tail: &str) -> bool {
+    tail.contains("is not recognized")
+        || tail.contains("commandnotfoundexception")
+        || tail.contains("not found")
+        || tail.contains("no such file or directory")
+        || tail.contains("is not recognized as a name of a cmdlet")
 }
 
 /// Upper bound for reading a spilled snapshot back during cursor paging.

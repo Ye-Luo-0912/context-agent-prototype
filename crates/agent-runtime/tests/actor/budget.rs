@@ -6,6 +6,7 @@ use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{
     ModelBudget, RuntimeServices, approx_layer_tokens, engine_pack_window, spawn_runtime,
 };
+use agent_workspace::capture_host_runtime_facts;
 
 use crate::harness::*;
 
@@ -13,7 +14,8 @@ use crate::harness::*;
 async fn engine_receives_only_the_context_frame_budget() {
     let context = Arc::new(RecordingContextEngine::default());
     let config = CoreAuthorityConfig::default();
-    let system_tokens = approx_tokens(&config.system_prompt);
+    let system_tokens = approx_tokens(&config.system_prompt)
+        + approx_tokens(&capture_host_runtime_facts().render());
     let tool_specs = OneToolDispatcher.specs();
     let tools_tokens = approx_layer_tokens(&tool_specs);
     let kernel = Arc::new(RuntimeServices::new(

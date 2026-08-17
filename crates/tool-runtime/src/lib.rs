@@ -6,3 +6,4 @@ pub use agent_contracts::{
     ToolLifecycle,
 };
 pub use registry::{BuiltinToolDispatcher, ToolLifecycleConfig};
+pub use tools::{ShellDialect, ShellKind};

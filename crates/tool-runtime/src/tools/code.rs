@@ -24,7 +24,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
-use super::{Tool, display_relative, walk_files};
+use super::{Tool, display_relative, hidden_path_output, ordinary_view_blocked, walk_files};
 
 // ---------------------------------------------------------------------------
 // `code.symbols`
@@ -393,6 +393,13 @@ impl Tool for CodeSymbolsTool {
             return self.page_from_snapshot(run_id, call_id, cursor).await;
         }
         let limit = args.limit.clamp(1, 1_000);
+        if ordinary_view_blocked(&args.path) {
+            return Ok(ToolOutcome::Value(hidden_path_output(
+                call_id,
+                "code.symbols",
+                &args.path,
+            )));
+        }
         let root = self.workspace.resolve_relative(&args.path).await?;
 
         let mut files = Vec::new();
@@ -759,6 +766,9 @@ async fn read_block(
 }
 
 async fn read_file_lines(workspace: &Workspace, file: &str) -> Result<Vec<String>, String> {
+    if ordinary_view_blocked(file) {
+        return Err("hidden from ordinary file tools; use git.* or artifact.read".into());
+    }
     // `confined_open_read` takes the workspace-relative path directly: it
     // validates it (lexical + link-swap pinned descent) and opens it from
     // the root handle. Resolving first would hand it an absolute path,

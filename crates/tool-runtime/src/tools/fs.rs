@@ -10,7 +10,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::fs;
 
-use super::{Tool, content_digest};
+use super::{
+    Tool, content_digest, hidden_path_output, is_hidden_name, is_not_found_error,
+    missing_path_output, ordinary_view_blocked,
+};
 
 const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_READ_LINES: usize = 400;
@@ -49,7 +52,7 @@ impl Tool for FsListTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "fs.list".into(),
-            description: "List files/directories inside the current workspace.".into(),
+            description: "List files/directories inside the current workspace. Runtime state (.focus-agent) and raw .git internals are omitted; use artifact.read or git.* for those.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -74,15 +77,39 @@ impl Tool for FsListTool {
         let args: ListArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("fs.list args: {e}")))?;
         let limit = args.limit.clamp(1, MAX_LIST_ENTRIES);
+        if ordinary_view_blocked(&args.path) {
+            return Ok(ToolOutcome::Value(hidden_path_output(
+                call_id, "fs.list", &args.path,
+            )));
+        }
         if let Some(cursor) = args.cursor.as_deref() {
             return self
                 .page_from_snapshot(run_id, call_id, cursor, limit)
                 .await;
         }
-        let path = self.workspace.resolve_relative(&args.path).await?;
-        let mut reader = fs::read_dir(&path)
-            .await
-            .map_err(|e| AgentError::Io(format!("list {}: {e}", path.display())))?;
+        let path = match self.workspace.resolve_relative(&args.path).await {
+            Ok(path) => path,
+            Err(error) if is_not_found_error(&error) => {
+                return Ok(ToolOutcome::Value(
+                    missing_path_output(&self.workspace, call_id, "fs.list", &args.path).await,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let mut reader = match fs::read_dir(&path).await {
+            Ok(reader) => reader,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.kind() == std::io::ErrorKind::NotADirectory =>
+            {
+                return Ok(ToolOutcome::Value(
+                    missing_path_output(&self.workspace, call_id, "fs.list", &args.path).await,
+                ));
+            }
+            Err(e) => {
+                return Err(AgentError::Io(format!("list {}: {e}", path.display())));
+            }
+        };
 
         let mut entries = Vec::new();
         while let Some(entry) = reader
@@ -90,6 +117,10 @@ impl Tool for FsListTool {
             .await
             .map_err(|e| AgentError::Io(format!("read directory: {e}")))?
         {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_hidden_name(&name) {
+                continue;
+            }
             if entries.len() >= MAX_LIST_ENTRIES {
                 break;
             }
@@ -106,7 +137,7 @@ impl Tool for FsListTool {
                     }
                 })
                 .unwrap_or("unknown");
-            entries.push(format!("{kind}\t{}", entry.file_name().to_string_lossy()));
+            entries.push(format!("{kind}\t{name}"));
         }
         entries.sort();
 
@@ -245,8 +276,7 @@ impl Tool for FsReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "fs.read".into(),
-            description: "Read a bounded line range from a UTF-8 text file in the workspace."
-                .into(),
+            description: "Read a bounded line range from a UTF-8 text file in the workspace. Runtime state (.focus-agent) and raw .git internals are not readable here; use artifact.read or git.*.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path"],
@@ -279,11 +309,24 @@ impl Tool for FsReadTool {
                 "fs.read is limited to {MAX_READ_LINES} lines per call"
             )));
         }
+        if ordinary_view_blocked(&args.path) {
+            return Ok(ToolOutcome::Value(hidden_path_output(
+                call_id, "fs.read", &args.path,
+            )));
+        }
 
         // Validation and open are fused into a directory-handle-relative
         // descent; the size check and the content read both go through the
         // pinned handle, so a link swap cannot redirect the read.
-        let confined = self.workspace.confined_open_read(&args.path).await?;
+        let confined = match self.workspace.confined_open_read(&args.path).await {
+            Ok(confined) => confined,
+            Err(error) if is_not_found_error(&error) => {
+                return Ok(ToolOutcome::Value(
+                    missing_path_output(&self.workspace, call_id, "fs.read", &args.path).await,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let metadata = confined.metadata().map_err(|e| {
             AgentError::Io(format!("metadata {}: {e}", confined.display().display()))
         })?;
@@ -354,6 +397,11 @@ impl FsWriteTool {
     ) -> AgentResult<ToolOutcome> {
         let args: WriteArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("fs.write args: {e}")))?;
+        if ordinary_view_blocked(&args.path) {
+            return Ok(ToolOutcome::Value(hidden_path_output(
+                call_id, "fs.write", &args.path,
+            )));
+        }
         let path = self.workspace.resolve_mutation(&args.path).await?;
         let transaction = self
             .workspace
@@ -433,7 +481,7 @@ fn display_relative(workspace: &Workspace, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{CancellationToken, ToolExecutionRequest};
+    use agent_contracts::{CancellationToken, ToolExecutionRequest, ToolFailureClass};
     use serde_json::json;
 
     #[tokio::test]
@@ -532,8 +580,13 @@ mod tests {
         };
         let result = tool
             .execute(run_id, "c", request.call.arguments, None, request.cancel)
-            .await;
-        assert!(result.is_err(), "state dir writes must be rejected");
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = result else {
+            panic!("hidden writes must refuse without staging");
+        };
+        assert!(!output.ok);
+        assert_eq!(output.failure_class(), Some(ToolFailureClass::HiddenPath));
     }
 
     #[tokio::test]
@@ -684,5 +737,77 @@ mod tests {
         let bad = format!("{}#9999", output.artifact_ref.as_deref().unwrap());
         let result = list(json!({"path": "d", "limit": 4, "cursor": bad})).await;
         assert!(result.is_err(), "a cursor past the snapshot must error");
+    }
+
+    #[tokio::test]
+    async fn root_list_hides_runtime_and_git() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "x").unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git").join("HEAD"), "ref").unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = FsListTool::new(workspace);
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"path": ""}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("fs.list returns a value");
+        };
+        assert!(output.ok);
+        assert!(output.model_content.contains("README.md"));
+        assert!(!output.model_content.contains(".focus-agent"));
+        assert!(!output.model_content.contains(".git"));
+    }
+
+    #[tokio::test]
+    async fn read_hidden_and_missing_paths_are_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("src.txt"), "ok\n").unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = FsReadTool::new(workspace);
+        let run_id = RunId::new();
+        let hidden = tool
+            .execute(
+                run_id,
+                "c",
+                json!({"path": ".focus-agent/changes.jsonl"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = hidden else {
+            panic!("hidden read is a value");
+        };
+        assert_eq!(output.failure_class(), Some(ToolFailureClass::HiddenPath));
+
+        let missing = tool
+            .execute(
+                run_id,
+                "c",
+                json!({"path": "src/lib.rs"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = missing else {
+            panic!("missing read is a value");
+        };
+        assert_eq!(output.failure_class(), Some(ToolFailureClass::PathNotFound));
+        assert!(
+            output.model_content.contains("src.txt") || output.model_content.contains("parent")
+        );
+        assert!(
+            !output.model_content.contains("Cargo.toml")
+                || output.model_content.contains("Do not invent")
+        );
     }
 }

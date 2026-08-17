@@ -250,6 +250,86 @@ bounded arguments/result envelopes, and does not trust producer-returned
 identity or self-declared risk. Full JSON-schema/output-schema support is not
 part of the current contract and must not introduce an unbounded validator.
 
+### Minimal model-visible runtime facts (`TOOL-ENV-01`)
+
+The active tool schemas already tell the model which tools exist. Do not copy
+their names or usage instructions into the standing prompt. The missing
+contract is smaller: the model must know which host it is operating on and the
+exact dialect of any raw shell tool before it constructs a command.
+
+Trusted composition should capture one bounded, revisioned
+`RuntimeFactsView` at startup and let `PromptAssembler` place its stable block
+immediately after System Policy on every model request. The initial profile is
+limited to:
+
+```text
+runtime_facts/v1
+platform: windows 11 | ubuntu 24.04 | macos 15 | <normalized unknown>
+architecture: x86_64 | aarch64 | <normalized unknown>
+workspace: relative paths; markers: [.git, Cargo.toml, ...]
+```
+
+Linux reports distribution plus product release when available (for example
+`ubuntu 24.04`), not merely the word `linux`; an unknown distribution or
+release is reported as `unknown`, never guessed. Windows reports the product
+release (for example `windows 11`). Full Windows build numbers, kernel strings,
+host/user names, environment variables, absolute workspace paths, PATH
+inventories and installed-program lists stay out of the default block. Exact
+build/toolchain versions are queried only when a concrete compatibility check
+requires them. Project markers are obtained through confined reads, are
+bounded and sorted, and say explicitly when no known manifest is present.
+
+Shell identity belongs to the selected tool schema, not to Runtime Facts.
+`shell.exec` must state the exact fixed dialect selected for the run, such as
+`PowerShell 7.x`, `Windows PowerShell 5.1`, `cmd.exe`, or `POSIX sh`; it must
+not advertise the generic word "shell" while dispatching a different grammar.
+On Windows the target product default is an explicitly detected/pinned
+PowerShell 7 (`pwsh`) because it gives one modern, well-known command language.
+If it is unavailable, composition may select Windows PowerShell 5.1 or
+`cmd.exe`, but the fallback must be visible in the schema and must not change
+mid-run. `process.run` remains the preferred no-shell argv path for direct
+executables.
+
+The facts block is system-owned, cache-stable and charged as a fixed prompt
+layer; it never enters `ContextEngine`, transcript history or GC. V1 hard caps:
+1 KiB UTF-8 total, at most 16 workspace markers and 64 bytes per marker.
+Workspace-marker refresh happens only at actor safe points after a committed
+workspace mutation; OS/shell identity stays immutable for the run.
+
+### Measured tool-reliability preflight (`TOOL-ENV-01` → `TOOL-ERROR-01`)
+
+The 2026-08-17 Context Bench wave cannot cleanly attribute extra model rounds
+to context policy while preventable tool failures dominate the traces. Before
+another live A/C wave, close the following product-quality preflight with
+scoring frozen (same order as `docs/ROADMAP.md` tool-quality preflight):
+
+1. **Platform and project contract (`TOOL-ENV-01`).** Land the bounded facts
+   layer above and bind `shell.exec` to one disclosed dialect/version. A model
+   must not infer POSIX syntax on `cmd.exe` or run a project-specific build
+   command against an absent manifest.
+2. **Revision-aware editing (`TOOL-EDIT-01`).** Keep exact matching and staged
+   effects, but let `edit.replace` accept the `fs.read` revision. Refusals must
+   distinguish stale revision, no exact match and ambiguous match and return
+   only bounded current-revision/candidate context. `edit.patch` remains the
+   preferred revision-aware multi-hunk operation. Never fuzzy-apply a guessed
+   anchor.
+3. **One model-visible workspace view (`TOOL-VIEW-01`).** Use the same bounded
+   visibility policy across list/read/search/code navigation. Ordinary file
+   tools must not expose `.focus-agent` or raw `.git` internals; sealed output
+   is fetched through `artifact.read` and VCS state through `git.*`. Runtime
+   Facts supplies real project markers; missing files/manifests stay missing.
+4. **Typed recovery feedback (`TOOL-ERROR-01`).** Project trusted bounded
+   failure classes and the minimum corrective fact into tool results. A failed
+   tool normally needs another model turn; do not hide that treatment cost and
+   do not add blind automatic retries or command translation.
+
+Acceptance is the same frozen wave rerun plus focused tool regressions:
+wrong-dialect, missing-marker and stale-edit failures must fall; first-attempt
+edit success must rise; model-visible `.focus-agent` access must be zero; and
+all residual product/task/provider/infrastructure failures remain separately
+counted in rounds, latency, tokens and task outcome. Only after this preflight
+may the Context Bench be used to estimate the incremental value of `CTX-11`.
+
 ### One protocol, selectable transports
 
 | Boundary | Default |
@@ -303,8 +383,11 @@ The repository is already partially aligned with this architecture.
 | Extension sandbox | [~] M13 residual | Env scrub, private cwd, bounded stderr, deadlines, whole-process-tree termination, Windows Job quotas, Unix rlimits, brokered filesystem reads, deny-by-default brokered network and Linux Landlock write confinement are implemented. Direct sockets/reads, cross-platform write confinement and I/O/disk limits remain open. |
 | Permission model | [~] bounded baseline | Registration validates the known permission vocabulary, derives minimum risk, and Core stores the accepted grant rather than trusting a live manifest. Standing grants narrow concrete effect intent. The vocabulary remains coarse and the landed PLAT-02 identity/error vocabulary is not yet the recoverable per-operation Platform authority of `PLAT-03/04`. |
 | Output contract | [x] model boundary / protocol caps closed | The trusted output broker caps model-facing fields when wired and the actor keeps a last-line guard; process streams use bounded fragments and an 8 MiB per-invocation/session artifact cap while draining overflow. Process responses take `call_id`/`tool_name` from the trusted request. `PLAT-00` caps every outbound/control/decoded frame and constrains large broker values (256 KiB bounded reads with truncation metadata). Artifact refs are capped identity locators (`artifact://v1/<run>/<owner>/<digest>`); live captures use an explicit draft until seal. Parse-time decoded JSON DOM budgets are landed. Remaining `PLAT-04` work is landed (JCS, legacy negotiation, shared fault matrix). Adapter envelope migration remains `PLAT-07`. |
-| File/navigation tools | [~] useful baseline | `fs.list`, ranged `fs.read`, `search.grep`, `fs.write`, exact `edit.replace`, multi-file `edit.patch`, `artifact.read`, `code.symbols`, and `code.diagnostics` cover the bounded baseline. `search.grep` observes cancellation mid-walk/mid-scan and returns partial hits as an explicit cancelled `ToolOutput`. Glob/multi-read, binary/media metadata, and read-tool cancellation remain optional gaps. |
-| Process tools | [~] useful baseline | `shell.exec` has timeout, bounded tail, and artifact output. `process.run` runs an explicit argv with workspace-relative cwd, env overrides and whole-tree kill on timeout/cancel; `process.session` adds start/poll/stop for long-running processes. The raw shell string remains a controlled fallback. |
+| File/navigation tools | [~] bounded baseline / visible-view residual | `fs.list`, ranged `fs.read`, `search.grep`, `fs.write`, exact `edit.replace`, multi-file `edit.patch`, `artifact.read`, `code.symbols`, and `code.diagnostics` cover the bounded baseline. `search.grep` skips runtime/build internals and observes cancellation, but root `fs.list` still exposes `.focus-agent` and `fs.read` can address it; `TOOL-VIEW-01` must make the model-visible view consistent. Glob/multi-read, binary/media metadata, and read-tool cancellation remain optional gaps. |
+| Edit reliability | [~] safe exact baseline / `TOOL-EDIT-01` open | `fs.read` emits a stable content revision and `edit.patch` can bind it; workspace mutations are staged and journaled. `edit.replace` has no revision precondition and zero-match errors lack bounded current-context hints. Preserve exact matching; add revision-bound refusal and typed actionable diagnostics rather than fuzzy mutation. |
+| Tool failure feedback | [~] outer classes only / `TOOL-ERROR-01` open | Generic invalid/I/O/timeout/cancel classes exist, but wrong shell, missing marker, stale edit and no-match causes remain free text. Add a bounded trusted recovery projection; never auto-retry arbitrary commands or exclude these costs from M15. |
+| Process tools | [~] useful baseline / dialect disclosure open | `shell.exec` has timeout, bounded tail, and artifact output, but today its generic schema hides that Windows dispatch uses `cmd /C` and other hosts use `sh -lc`; `TOOL-ENV-01` must bind the advertised schema to the selected dialect. `process.run` runs an explicit argv with workspace-relative cwd, env overrides and whole-tree kill on timeout/cancel; `process.session` adds start/poll/stop for long-running processes. The raw shell string remains a controlled fallback. |
+| Runtime facts | [ ] `TOOL-ENV-01` | Add the bounded system-owned platform product/release, architecture, workspace-relative contract and confined project-marker view described above. Do not duplicate active tools or expose host secrets/inventories. |
 | VCS tools | [~] minimal | `git.status` and `git.diff` are confined, bounded, and read-only. `log/show/blame` and structured change review are absent; commit/push must remain higher-risk effects. |
 | Runtime control | [x] bounded baseline | `context.manage`, `capability.manage`, typed TaskAnchor patches, `task.complete`, and `artifact.read` exist. Federated resource discovery and managed-child controls are the next experimental surfaces. |
 | Completion semantics | [x] typed baseline | `task.complete` commits a task-owned `CompletionRecord` whose ref/digest identify the bounded completion summary; with artifact storage wired, the complete assistant response is retained separately by artifact ref. Completion transfers roots atomically. A raw-body digest and typed EpisodeOutcome remain context work. |
@@ -1436,6 +1519,18 @@ together with TaskAnchor and continuous context GC.
   are catalog-optional: loaded on demand through `capability.manage`, never
   always-on, and they obey the same envelope, confinement and spill rules as
   every tool. No embeddings, no vector storage, no index.
+- [x] **TOOL-ENV-01** Publish the bounded Runtime Facts profile and make the
+  selected `shell.exec` dialect/version agree exactly with its schema.
+- [x] **TOOL-EDIT-01** Add revision-aware `edit.replace` refusal and bounded
+  stale/no-match diagnostics; retain exact, staged mutation semantics.
+- [x] **TOOL-VIEW-01** Unify the model-visible workspace view and remove raw
+  runtime/VCS internals from ordinary file navigation.
+- [x] **TOOL-ERROR-01** Add trusted bounded failure classes/recovery hints and
+  evaluation attribution without blind retries or cost exclusion.
+
+These four items are the measured tool-reliability preflight for the next
+Context Bench wave. They do not reopen completed `TOOLS-05..09` safety work
+and do not replace M12/M13 sandbox closure.
 
 ### Gate 3.5: Platform protocol, discovery and managed workers
 

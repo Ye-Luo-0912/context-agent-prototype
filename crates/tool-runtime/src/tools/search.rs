@@ -6,7 +6,8 @@
 //! skipped by default so build artifacts never pollute the working set.
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    AgentError, AgentResult, CancellationToken, RunId, ToolFailureClass, ToolOutcome, ToolOutput,
+    ToolRisk, ToolSpec, attach_failure_class,
 };
 use agent_workspace::Workspace;
 use async_trait::async_trait;
@@ -15,7 +16,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::fs;
 
-use super::{Tool, display_relative, walk_files};
+use super::{
+    Tool, display_relative, hidden_path_output, is_not_found_error, missing_path_output,
+    ordinary_view_blocked, walk_files,
+};
 
 const MAX_FILES_SCANNED: usize = 5_000;
 const MAX_BYTES_PER_FILE: u64 = 2 * 1024 * 1024;
@@ -65,6 +69,15 @@ fn cancelled_outcome(
     scanned_files: usize,
 ) -> ToolOutcome {
     let model_hits: Vec<String> = hits.iter().take(MODEL_HITS).cloned().collect();
+    let mut metadata = json!({
+        "cancelled": true,
+        "hits": hits.len(),
+        "files_scanned": scanned_files,
+        "returned": model_hits.len(),
+        "has_more": false,
+        "cursor": serde_json::Value::Null,
+    });
+    attach_failure_class(&mut metadata, ToolFailureClass::Cancellation);
     ToolOutcome::Value(ToolOutput {
         call_id: call_id.into(),
         tool_name: "search.grep".into(),
@@ -81,14 +94,7 @@ fn cancelled_outcome(
             model_hits.join("\n")
         },
         artifact_ref: None,
-        metadata: json!({
-            "cancelled": true,
-            "hits": hits.len(),
-            "files_scanned": scanned_files,
-            "returned": model_hits.len(),
-            "has_more": false,
-            "cursor": serde_json::Value::Null,
-        }),
+        metadata,
     })
 }
 
@@ -132,7 +138,22 @@ impl Tool for SearchGrepTool {
         }
         let regex = Regex::new(&args.pattern)
             .map_err(|e| AgentError::InvalidRequest(format!("invalid regex: {e}")))?;
-        let root = self.workspace.resolve_relative(&args.path).await?;
+        if ordinary_view_blocked(&args.path) {
+            return Ok(ToolOutcome::Value(hidden_path_output(
+                call_id,
+                "search.grep",
+                &args.path,
+            )));
+        }
+        let root = match self.workspace.resolve_relative(&args.path).await {
+            Ok(root) => root,
+            Err(error) if is_not_found_error(&error) => {
+                return Ok(ToolOutcome::Value(
+                    missing_path_output(&self.workspace, call_id, "search.grep", &args.path).await,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
 
         let mut files = Vec::new();
         let mut budget = MAX_FILES_SCANNED;
@@ -222,6 +243,17 @@ impl Tool for SearchGrepTool {
             })
             .unwrap_or_default();
 
+        let mut metadata = json!({
+            "hits": hits.len(),
+            "files_scanned": scanned_files,
+            "returned": model_hits.len(),
+            "has_more": has_more,
+            "cursor": cursor,
+        });
+        if hits.is_empty() {
+            attach_failure_class(&mut metadata, ToolFailureClass::NoSearchMatch);
+        }
+
         Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
             tool_name: "search.grep".into(),
@@ -238,13 +270,7 @@ impl Tool for SearchGrepTool {
                 format!("{}{}", model_hits.join("\n"), truncated_note)
             },
             artifact_ref,
-            metadata: json!({
-                "hits": hits.len(),
-                "files_scanned": scanned_files,
-                "returned": model_hits.len(),
-                "has_more": has_more,
-                "cursor": cursor,
-            }),
+            metadata,
         }))
     }
 }

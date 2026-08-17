@@ -676,9 +676,10 @@ fn ntstatus_to_io(status: i32) -> io::Error {
     const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
     const STATUS_FILE_IS_A_DIRECTORY: i32 = 0xC000_00BAu32 as i32;
     match status {
-        STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => {
-            io::Error::new(io::ErrorKind::NotFound, format!("NTSTATUS {status:#010x}"))
-        }
+        STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("not found (NTSTATUS {status:#010x})"),
+        ),
         STATUS_OBJECT_NAME_COLLISION => io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("NTSTATUS {status:#010x}"),

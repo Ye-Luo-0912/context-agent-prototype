@@ -1500,6 +1500,9 @@ fn reconcile_recovered_effect(
 }
 
 fn tool_error_output(call: &ToolCall, message: String) -> ToolOutput {
+    let class = agent_contracts::failure_class_from_message(&message);
+    let mut metadata = serde_json::json!({});
+    agent_contracts::attach_failure_class(&mut metadata, class);
     ToolOutput {
         call_id: call.id.clone(),
         tool_name: call.name.clone(),
@@ -1507,7 +1510,7 @@ fn tool_error_output(call: &ToolCall, message: String) -> ToolOutput {
         summary: message.clone(),
         model_content: format!("tool error: {message}"),
         artifact_ref: None,
-        metadata: serde_json::Value::Null,
+        metadata,
     }
 }
 

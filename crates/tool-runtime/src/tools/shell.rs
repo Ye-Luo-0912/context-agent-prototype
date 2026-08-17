@@ -9,9 +9,11 @@
 //! stays as the controlled escape hatch (TOOLS-06).
 
 use std::process::Stdio;
+use std::sync::OnceLock;
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    AgentError, AgentResult, CancellationToken, RunId, ToolFailureClass, ToolOutcome, ToolOutput,
+    ToolRisk, ToolSpec, attach_failure_class,
 };
 use agent_process::kill_process_tree;
 use agent_workspace::Workspace;
@@ -27,13 +29,203 @@ use super::stream::{
 
 const MAX_TIMEOUT_MS: u64 = 120_000;
 
+/// Exact shell grammar bound for one run (`TOOL-ENV-01`). The schema and the
+/// dispatcher must name the same dialect; it never switches mid-run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellDialect {
+    pub kind: ShellKind,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellKind {
+    PowerShell7,
+    WindowsPowerShell51,
+    Cmd,
+    PosixSh,
+}
+
+impl ShellKind {
+    pub fn program(self) -> &'static str {
+        match self {
+            Self::PowerShell7 => "pwsh",
+            Self::WindowsPowerShell51 => "powershell",
+            Self::Cmd => "cmd",
+            Self::PosixSh => "sh",
+        }
+    }
+
+    pub fn label(self, version: &str) -> String {
+        match self {
+            Self::PowerShell7 => format!("PowerShell {version}"),
+            Self::WindowsPowerShell51 => format!("Windows PowerShell {version}"),
+            Self::Cmd => "cmd.exe".into(),
+            Self::PosixSh => "POSIX sh".into(),
+        }
+    }
+
+    pub(crate) fn wrong_dialect_likely(self, command: &str, tail: &str) -> bool {
+        match self {
+            Self::PosixSh => {
+                let cmd = command.to_ascii_lowercase();
+                (cmd.contains("%cd%") || cmd.contains("dir /") || cmd.contains("& echo"))
+                    && (tail.contains("syntax error") || tail.contains("unexpected"))
+            }
+            Self::Cmd | Self::WindowsPowerShell51 | Self::PowerShell7 => {
+                looks_posix_command(command)
+                    && (tail.contains("syntax error")
+                        || tail.contains("unexpected token")
+                        || tail.contains("parsererror")
+                        || tail.contains("was unexpected")
+                        || tail.contains("is not recognized"))
+            }
+        }
+    }
+}
+
+fn looks_posix_command(command: &str) -> bool {
+    command.contains("$(")
+        || command.contains("&&") && command.contains("export ")
+        || command.contains(" /usr/")
+        || command.starts_with("ls ")
+        || command.contains("ls -")
+        || command.contains("#!/")
+}
+
+impl ShellDialect {
+    pub fn detect() -> Self {
+        static DETECTED: OnceLock<ShellDialect> = OnceLock::new();
+        DETECTED.get_or_init(detect_inner).clone()
+    }
+
+    pub fn cmd() -> Self {
+        Self {
+            kind: ShellKind::Cmd,
+            version: "unknown".into(),
+        }
+    }
+
+    pub fn posix_sh() -> Self {
+        Self {
+            kind: ShellKind::PosixSh,
+            version: "unknown".into(),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        self.kind.label(&self.version)
+    }
+
+    pub fn schema_description(&self) -> String {
+        format!(
+            "Execute a command in {} with the workspace as cwd. This dialect is fixed for the whole run; do not use a different shell grammar. Prefer process.run for a direct executable argv. A bounded output prefix streams to an artifact; only a bounded tail reaches the model.",
+            self.label()
+        )
+    }
+
+    fn spawn_command(&self, script: &str) -> Command {
+        let mut command = Command::new(self.kind.program());
+        match self.kind {
+            ShellKind::PowerShell7 | ShellKind::WindowsPowerShell51 => {
+                command
+                    .arg("-NoLogo")
+                    .arg("-NoProfile")
+                    .arg("-NonInteractive")
+                    .arg("-Command")
+                    .arg(script);
+            }
+            ShellKind::Cmd => {
+                command.arg("/C").arg(script);
+            }
+            ShellKind::PosixSh => {
+                command.arg("-lc").arg(script);
+            }
+        }
+        command
+    }
+}
+
+fn detect_inner() -> ShellDialect {
+    #[cfg(windows)]
+    {
+        if let Some(version) = probe_powershell("pwsh") {
+            return ShellDialect {
+                kind: ShellKind::PowerShell7,
+                version,
+            };
+        }
+        if let Some(version) = probe_powershell("powershell") {
+            return ShellDialect {
+                kind: ShellKind::WindowsPowerShell51,
+                version,
+            };
+        }
+        ShellDialect::cmd()
+    }
+    #[cfg(not(windows))]
+    {
+        ShellDialect::posix_sh()
+    }
+}
+
+#[cfg(windows)]
+fn probe_powershell(program: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    if !program_on_path(program) {
+        return None;
+    }
+    let output = std::process::Command::new(program)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$PSVersionTable.PSVersion.ToString()",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()?
+        .to_string();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
+}
+
+#[cfg(windows)]
+fn program_on_path(program: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("where")
+        .arg(program)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 pub struct ShellExecTool {
     workspace: Workspace,
+    dialect: ShellDialect,
 }
 
 impl ShellExecTool {
     pub fn new(workspace: Workspace) -> Self {
-        Self { workspace }
+        Self::with_dialect(workspace, ShellDialect::detect())
+    }
+
+    pub fn with_dialect(workspace: Workspace, dialect: ShellDialect) -> Self {
+        Self { workspace, dialect }
     }
 }
 
@@ -53,7 +245,7 @@ impl Tool for ShellExecTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "shell.exec".into(),
-            description: "Execute a shell command with the workspace as cwd. A bounded output prefix streams to an artifact; only a bounded tail reaches the model.".into(),
+            description: self.dialect.schema_description(),
             input_schema: json!({
                 "type": "object",
                 "required": ["command"],
@@ -79,19 +271,7 @@ impl Tool for ShellExecTool {
             .map_err(|e| AgentError::InvalidRequest(format!("shell.exec args: {e}")))?;
         let timeout_ms = args.timeout_ms.clamp(100, MAX_TIMEOUT_MS);
 
-        #[cfg(windows)]
-        let mut command = {
-            let mut cmd = Command::new("cmd");
-            cmd.arg("/C").arg(&args.command);
-            cmd
-        };
-
-        #[cfg(not(windows))]
-        let mut command = {
-            let mut cmd = Command::new("sh");
-            cmd.arg("-lc").arg(&args.command);
-            cmd
-        };
+        let mut command = self.dialect.spawn_command(&args.command);
 
         command.current_dir(self.workspace.root());
         command.stdout(Stdio::piped());
@@ -229,6 +409,40 @@ impl Tool for ShellExecTool {
             ""
         };
 
+        let markers = self.workspace.project_markers();
+        let mut metadata = json!({
+            "exit_code": exit_code,
+            "timeout_ms": timeout_ms,
+            "lines": total_lines,
+            "output_bytes": total_bytes,
+            "artifact_bytes": artifact_bytes,
+            "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
+            "artifact_truncated": artifact_truncated,
+            "outcome": outcome,
+            "shell_dialect": self.dialect.label(),
+        });
+        if let Some(class) = super::classify_process_outcome(
+            outcome,
+            ok,
+            &model_content,
+            Some(&args.command),
+            Some(&self.dialect),
+            &markers,
+        ) {
+            attach_failure_class(&mut metadata, class);
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert(
+                    "recovery_hint".into(),
+                    json!(format!("selected shell: {}", self.dialect.label())),
+                );
+                if class == ToolFailureClass::MissingProjectMarker
+                    && let Some(marker) = super::required_project_marker(&args.command)
+                {
+                    object.insert("missing_marker".into(), json!(marker));
+                }
+            }
+        }
+
         Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
             tool_name: "shell.exec".into(),
@@ -240,16 +454,7 @@ impl Tool for ShellExecTool {
             ),
             model_content: format!("{model_content}\n\n{artifact_note}"),
             artifact_ref: Some(artifact_ref),
-            metadata: json!({
-                "exit_code": exit_code,
-                "timeout_ms": timeout_ms,
-                "lines": total_lines,
-                "output_bytes": total_bytes,
-                "artifact_bytes": artifact_bytes,
-                "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
-                "artifact_truncated": artifact_truncated,
-                "outcome": outcome,
-            }),
+            metadata,
         }))
     }
 }
@@ -261,6 +466,17 @@ mod tests {
     use serde_json::json;
 
     use crate::tools::stream::MODEL_OUTPUT_CHARS;
+
+    fn test_dialect() -> ShellDialect {
+        #[cfg(windows)]
+        {
+            ShellDialect::cmd()
+        }
+        #[cfg(not(windows))]
+        {
+            ShellDialect::posix_sh()
+        }
+    }
 
     /// Unwrap a plain tool value (shell.exec never stages an effect).
     fn value(outcome: ToolOutcome) -> ToolOutput {
@@ -287,7 +503,7 @@ mod tests {
     async fn shell_bounds_model_output_and_writes_artifact() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
-        let tool = ShellExecTool::new(workspace.clone());
+        let tool = ShellExecTool::with_dialect(workspace.clone(), test_dialect());
         let run_id = RunId::new();
 
         let request = ToolExecutionRequest {
@@ -328,7 +544,7 @@ mod tests {
     async fn shell_honors_cancellation() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
-        let tool = ShellExecTool::new(workspace.clone());
+        let tool = ShellExecTool::with_dialect(workspace.clone(), test_dialect());
 
         #[cfg(windows)]
         let command = "ping -n 20 127.0.0.1".to_string();
@@ -383,7 +599,7 @@ mod tests {
         // mutation).
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
-        let tool = ShellExecTool::new(workspace.clone());
+        let tool = ShellExecTool::with_dialect(workspace.clone(), test_dialect());
         let heartbeat = dir.path().join("descendant-heartbeat.txt");
 
         // A foreground loop that itself spawns a per-iteration child
@@ -460,5 +676,81 @@ mod tests {
             frozen,
             "the descendant must be terminated after cancellation — the heartbeat stopped"
         );
+        assert_eq!(output.failure_class(), Some(ToolFailureClass::Cancellation));
+    }
+
+    #[tokio::test]
+    async fn schema_names_the_pinned_dialect() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let dialect = test_dialect();
+        let tool = ShellExecTool::with_dialect(workspace, dialect.clone());
+        let spec = tool.spec();
+        assert!(
+            spec.description.contains(&dialect.label()),
+            "schema must name {}: {}",
+            dialect.label(),
+            spec.description
+        );
+        assert!(
+            !spec.description.starts_with("Execute a shell command"),
+            "generic shell wording hides the grammar: {}",
+            spec.description
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_command_is_classified() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ShellExecTool::with_dialect(workspace, test_dialect());
+        let output = value(
+            tool.execute(
+                RunId::new(),
+                "c",
+                json!({"command": "definitely-not-a-command-xyz-9f3a", "timeout_ms": 8000}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(!output.ok);
+        assert!(
+            matches!(
+                output.failure_class(),
+                Some(ToolFailureClass::CommandUnavailable) | Some(ToolFailureClass::ProcessExit)
+            ),
+            "unavailable command class: {:?}",
+            output.failure_class()
+        );
+        assert_eq!(
+            output.metadata["shell_dialect"].as_str().unwrap(),
+            test_dialect().label()
+        );
+    }
+
+    #[tokio::test]
+    async fn cargo_without_manifest_is_missing_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ShellExecTool::with_dialect(workspace, test_dialect());
+        let output = value(
+            tool.execute(
+                RunId::new(),
+                "c",
+                json!({"command": "cargo test", "timeout_ms": 8000}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(!output.ok);
+        assert_eq!(
+            output.failure_class(),
+            Some(ToolFailureClass::MissingProjectMarker)
+        );
+        assert_eq!(output.metadata["missing_marker"], "Cargo.toml");
     }
 }

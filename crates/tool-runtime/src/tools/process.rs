@@ -12,6 +12,7 @@ use std::{collections::HashMap, process::Stdio};
 
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    attach_failure_class,
 };
 use agent_process::kill_process_tree;
 use agent_workspace::Workspace;
@@ -283,6 +284,29 @@ impl Tool for ProcessRunTool {
             ""
         };
 
+        let argv_text = args.argv.join(" ");
+        let mut metadata = json!({
+            "exit_code": exit_code,
+            "timeout_ms": timeout_ms,
+            "lines": total_lines,
+            "output_bytes": total_bytes,
+            "artifact_bytes": artifact_bytes,
+            "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
+            "artifact_truncated": artifact_truncated,
+            "outcome": outcome,
+            "cwd": if cwd_text.is_empty() { "." } else { &cwd_text },
+        });
+        if let Some(class) = super::classify_process_outcome(
+            outcome,
+            ok,
+            &model_content,
+            Some(&argv_text),
+            None,
+            &self.workspace.project_markers(),
+        ) {
+            attach_failure_class(&mut metadata, class);
+        }
+
         Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
             tool_name: "process.run".into(),
@@ -294,17 +318,7 @@ impl Tool for ProcessRunTool {
             ),
             model_content: format!("{model_content}\n\n{artifact_note}"),
             artifact_ref: Some(artifact_ref),
-            metadata: json!({
-                "exit_code": exit_code,
-                "timeout_ms": timeout_ms,
-                "lines": total_lines,
-                "output_bytes": total_bytes,
-                "artifact_bytes": artifact_bytes,
-                "artifact_limit_bytes": MAX_ARTIFACT_BYTES,
-                "artifact_truncated": artifact_truncated,
-                "outcome": outcome,
-                "cwd": if cwd_text.is_empty() { "." } else { &cwd_text },
-            }),
+            metadata,
         }))
     }
 }

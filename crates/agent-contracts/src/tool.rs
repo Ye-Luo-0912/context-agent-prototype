@@ -205,6 +205,186 @@ impl ToolOutput {
             None => self.model_content.clone(),
         }
     }
+
+    /// Trusted failure class projected into `metadata.failure_class`.
+    pub fn failure_class(&self) -> Option<ToolFailureClass> {
+        self.metadata
+            .get(TOOL_FAILURE_CLASS_KEY)
+            .and_then(|value| value.as_str())
+            .and_then(ToolFailureClass::parse)
+    }
+}
+
+/// Metadata key for [`ToolFailureClass`]. Producers must not set `retryable`.
+pub const TOOL_FAILURE_CLASS_KEY: &str = "failure_class";
+/// Optional bounded corrective fact for the next model turn.
+pub const TOOL_RECOVERY_HINT_KEY: &str = "recovery_hint";
+/// Hard cap on `recovery_hint` characters.
+pub const TOOL_RECOVERY_HINT_MAX_CHARS: usize = 256;
+
+/// Trusted, model-facing cause of a tool refusal or failed execution.
+///
+/// The kernel/runtime projects this class. A producer must not mark its own
+/// failure retryable or widen authority (`TOOL-ERROR-01`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolFailureClass {
+    ShellDialectMismatch,
+    CommandUnavailable,
+    MissingProjectMarker,
+    StaleRevision,
+    NoExactMatch,
+    AmbiguousMatch,
+    NoSearchMatch,
+    ProcessExit,
+    VerificationFailure,
+    Timeout,
+    Cancellation,
+    HiddenPath,
+    PathNotFound,
+    InvalidRequest,
+    Io,
+}
+
+impl ToolFailureClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ShellDialectMismatch => "shell_dialect_mismatch",
+            Self::CommandUnavailable => "command_unavailable",
+            Self::MissingProjectMarker => "missing_project_marker",
+            Self::StaleRevision => "stale_revision",
+            Self::NoExactMatch => "no_exact_match",
+            Self::AmbiguousMatch => "ambiguous_match",
+            Self::NoSearchMatch => "no_search_match",
+            Self::ProcessExit => "process_exit",
+            Self::VerificationFailure => "verification_failure",
+            Self::Timeout => "timeout",
+            Self::Cancellation => "cancellation",
+            Self::HiddenPath => "hidden_path",
+            Self::PathNotFound => "path_not_found",
+            Self::InvalidRequest => "invalid_request",
+            Self::Io => "io",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "shell_dialect_mismatch" => Self::ShellDialectMismatch,
+            "command_unavailable" => Self::CommandUnavailable,
+            "missing_project_marker" => Self::MissingProjectMarker,
+            "stale_revision" => Self::StaleRevision,
+            "no_exact_match" => Self::NoExactMatch,
+            "ambiguous_match" => Self::AmbiguousMatch,
+            "no_search_match" => Self::NoSearchMatch,
+            "process_exit" => Self::ProcessExit,
+            "verification_failure" => Self::VerificationFailure,
+            "timeout" => Self::Timeout,
+            "cancellation" => Self::Cancellation,
+            "hidden_path" => Self::HiddenPath,
+            "path_not_found" => Self::PathNotFound,
+            "invalid_request" => Self::InvalidRequest,
+            "io" => Self::Io,
+            _ => return None,
+        })
+    }
+}
+
+/// Insert `failure_class` and strip any producer-supplied `retryable` flag.
+pub fn attach_failure_class(metadata: &mut Value, class: ToolFailureClass) {
+    let object = match metadata {
+        Value::Object(map) => map,
+        _ => {
+            *metadata = serde_json::json!({});
+            metadata
+                .as_object_mut()
+                .expect("empty object is always an object")
+        }
+    };
+    object.insert(
+        TOOL_FAILURE_CLASS_KEY.into(),
+        Value::String(class.as_str().into()),
+    );
+    object.remove("retryable");
+    if let Some(Value::String(hint)) = object.get_mut(TOOL_RECOVERY_HINT_KEY) {
+        let bounded: String = hint.chars().take(TOOL_RECOVERY_HINT_MAX_CHARS).collect();
+        *hint = bounded;
+    }
+}
+
+/// Bounded failed tool result with a trusted class. `ok` is always false.
+pub fn tool_failure_output(
+    call_id: impl Into<String>,
+    tool_name: impl Into<String>,
+    class: ToolFailureClass,
+    summary: impl Into<String>,
+    model_content: impl Into<String>,
+    mut metadata: Value,
+) -> ToolOutput {
+    attach_failure_class(&mut metadata, class);
+    ToolOutput {
+        call_id: call_id.into(),
+        tool_name: tool_name.into(),
+        ok: false,
+        summary: summary.into(),
+        model_content: model_content.into(),
+        artifact_ref: None,
+        metadata,
+    }
+}
+
+/// Classify an [`AgentError`] that escaped as `Err` instead of a typed tool
+/// result. Prefer returning [`tool_failure_output`] from tools so recovery
+/// facts survive; this path is the kernel's last projection.
+pub fn failure_class_from_agent_error(error: &crate::AgentError) -> ToolFailureClass {
+    use crate::AgentError;
+    match error {
+        AgentError::Cancelled => ToolFailureClass::Cancellation,
+        AgentError::InvalidRequest(message) => failure_class_from_message(message),
+        AgentError::Io(_) => ToolFailureClass::Io,
+        AgentError::Tool(message) => failure_class_from_message(message),
+        _ => failure_class_from_message(&error.to_string()),
+    }
+}
+
+/// True when a workspace/tool I/O string is a missing path.
+///
+/// Windows confined opens often display as `NTSTATUS 0xc0000034` /
+/// `0xc000003a` without the words "not found".
+pub fn message_looks_like_not_found(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("not found")
+        || m.contains("no such file")
+        || m.contains("cannot find")
+        || m.contains("os error 2")
+        || m.contains("os error 3")
+        || m.contains("ntstatus 0xc0000034")
+        || m.contains("ntstatus 0xc000003a")
+}
+
+/// Best-effort classification from a free-text error. Used when a tool or
+/// the kernel only has a string.
+pub fn failure_class_from_message(message: &str) -> ToolFailureClass {
+    let m = message.to_ascii_lowercase();
+    if m.contains("cancelled") {
+        ToolFailureClass::Cancellation
+    } else if m.contains("timed out") || m.contains("timeout") {
+        ToolFailureClass::Timeout
+    } else if m.contains("base_revision") || m.contains("stale_revision") {
+        ToolFailureClass::StaleRevision
+    } else if m.contains("disambiguate") || m.contains("ambiguous") {
+        ToolFailureClass::AmbiguousMatch
+    } else if m.contains("appears 0") || m.contains("no_exact_match") || m.contains("no exact") {
+        ToolFailureClass::NoExactMatch
+    } else if m.contains("hidden_path") || (m.contains(".focus-agent") && m.contains("not allowed"))
+    {
+        ToolFailureClass::HiddenPath
+    } else if message_looks_like_not_found(message) {
+        ToolFailureClass::PathNotFound
+    } else if m.contains("i/o error") || m.contains("io error") {
+        ToolFailureClass::Io
+    } else {
+        ToolFailureClass::InvalidRequest
+    }
 }
 
 /// What happens to a tool result after the turn: whether it becomes a new
@@ -1081,6 +1261,49 @@ mod tests {
             }
             .risk(),
             ToolRisk::ProcessExecution
+        );
+    }
+
+    #[test]
+    fn failure_class_is_trusted_and_strips_retryable() {
+        let mut metadata = serde_json::json!({"retryable": true, "path": "lib.rs"});
+        attach_failure_class(&mut metadata, ToolFailureClass::StaleRevision);
+        assert_eq!(metadata["failure_class"], "stale_revision");
+        assert!(metadata.get("retryable").is_none());
+        let output = tool_failure_output(
+            "c1",
+            "edit.replace",
+            ToolFailureClass::NoExactMatch,
+            "refused",
+            "no exact match",
+            serde_json::json!({"retryable": true}),
+        );
+        assert!(!output.ok);
+        assert_eq!(output.failure_class(), Some(ToolFailureClass::NoExactMatch));
+        assert!(output.metadata.get("retryable").is_none());
+    }
+
+    #[test]
+    fn failure_class_from_message_covers_core_cases() {
+        assert_eq!(
+            failure_class_from_message("cancelled"),
+            ToolFailureClass::Cancellation
+        );
+        assert_eq!(
+            failure_class_from_message("command timed out"),
+            ToolFailureClass::Timeout
+        );
+        assert_eq!(
+            failure_class_from_message("base_revision mismatch"),
+            ToolFailureClass::StaleRevision
+        );
+        assert_eq!(
+            failure_class_from_message("open dir C:\\tmp\\src: NTSTATUS 0xc0000034"),
+            ToolFailureClass::PathNotFound
+        );
+        assert_eq!(
+            failure_class_from_message("open file: not found (NTSTATUS 0xc000003a)"),
+            ToolFailureClass::PathNotFound
         );
     }
 

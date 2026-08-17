@@ -13,7 +13,7 @@
 //!
 //! Pack window = min(kernel context_budget_tokens, send window)
 //!         - Output Reserve
-//!         - System Policy
+//!         - System Policy (includes Runtime Facts)
 //!         - Turn Frame
 //!         - Active Tool Schemas
 //!         = Context Frame Budget   (what the engine receives)

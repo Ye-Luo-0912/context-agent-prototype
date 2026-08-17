@@ -480,6 +480,41 @@ Regressions: `task_anchor_update_publishes_a_bounded_event`,
 `completed_task_summary_leaves_the_resident_heap_but_stays_durable`.
 **CTX-10 closed.**
 
+### CTX-11 — Task progress is not yet a bounded, sourced resume contract
+
+**OPEN.** `TaskAnchor` correctly owns goal/constraints/criteria plus generic
+`plan_progress` and `open_loops`, but the runtime has no first-class sourced
+record for the operational facts needed after a long tool loop, task switch or
+restart. In particular, checked files, their observed revisions/digests,
+recent verification outcomes, still-relevant failed commands and the exact
+next action are not represented as typed bounded facts. Reconstructing them by
+rereading the workspace or old dialogue contributes avoidable rounds; putting
+them into transcript prose would violate the context authority and boundedness
+contract.
+
+Required closure:
+
+- keep `TaskAnchor` as the only task-authority owner; `ResumePoint` is one
+  actor-owned subrecord bound to `task_id + anchor_revision`, and
+  `TaskProgressView` is a derived prompt projection, not another store;
+- hard-cap every string/list/ref; retain file and command bodies once in
+  context/artifact storage and carry only path/entity, digest/revision, bounded
+  status and evidence refs;
+- update only from trusted tool/verification facts, durable turn completion and
+  explicit suspend, with idempotent revision checks; model-generated progress
+  is non-authoritative until the runtime validates/commits it;
+- restore the exact bounded record through checkpoint, downgrade suspended refs
+  to storage retention, and rematerialize only Anchor + ResumePoint refs on
+  activation — never ordinary transcript history;
+- test stale file observations, failure-then-success resolution, corrupt/
+  oversized restore, thousands of inspected files/repeated failures, task
+  switch plus GC, and failed-tool loops. Prompt/resident/checkpoint size must
+  remain bounded and resume must not silently claim stale verification.
+
+The Context Bench `task_switch` and failed-tool measurements may validate the
+effect after landing, but their likely-optimization label does not authorize
+the implementation order and scoring remains frozen.
+
 ### CORE-01 — Process capabilities bypass effect and approval boundaries
 
 Affected: `agent-capability-process`, `agent-process`, registration/approval.
@@ -1318,6 +1353,158 @@ low-authority `user` message, never as `system`:
    (agent-contracts) now pins the user-role context frame in the flattened
    message order.
 
+### TOOL-ENV-01 — Host platform and shell dialect are not visible precisely
+
+**CLOSED (2026-08-17).** Runtime Facts (`runtime_facts/v1`) sit after System
+Policy; `shell.exec` binds and discloses one dialect for the run (Windows
+prefers `pwsh`, then Windows PowerShell 5.1, then `cmd.exe`). Evaluation
+counts `shell_dialect_mismatch`, `command_unavailable` and
+`missing_project_marker` without dropping cells from ITT/cost.
+
+**Was OPEN (confirmed 2026-08-17).** `shell.exec` currently advertises only
+"Execute a shell command", while the implementation dispatches `cmd /C` on
+Windows and `sh -lc` elsewhere. The reviewed M15 failure breakdown reported
+65/141 failed C shell calls versus 38/90 for A, with repeated POSIX commands on
+Windows, quoting mismatches and build/test commands issued where the expected
+project manifest was absent. Those counts are an evaluation signal rather
+than proof that every failure has the same cause, but the schema/implementation
+mismatch is direct and must be removed before using more model rounds to tune
+context policy.
+
+Required closure:
+
+1. capture a trusted, revisioned Runtime Facts profile at composition/startup;
+   expose only normalized OS product/release (for example `windows 11` or
+   `ubuntu 24.04`), architecture, workspace-relative semantics and at most 16
+   confined/sorted project markers;
+2. add the stable ≤1 KiB facts block after System Policy in
+   `PromptAssembler`; charge it in the fixed request budget and keep it out of
+   `ContextEngine`, transcript, checkpoints of conversational history and GC;
+3. do not repeat tool names or instructions in that block — active schemas are
+   already sent. Make `shell.exec` describe the exact immutable run dialect
+   and version. Prefer detected/pinned PowerShell 7 on Windows; explicitly
+   disclose Windows PowerShell 5.1 or `cmd.exe` fallback and never silently
+   switch grammars;
+4. exclude host/user names, environment values, absolute workspace paths,
+   PATH/installed-tool inventories and full kernel/build strings. Report
+   unknown release facts honestly and query exact toolchain/build versions only
+   for a concrete compatibility need;
+5. test Windows/Linux profile normalization, unknown/fallback handling,
+   prompt order/budget/cache stability, no duplicated tool catalog or secrets,
+   marker refresh only after committed mutation, and exact shell-schema to
+   dispatcher agreement;
+6. add typed evaluation attribution for wrong dialect, command unavailable and
+   missing project marker. Keep these cells in end-to-end success and cost — a
+   tool-contract failure is still an agent-product failure until fixed — while
+   also reporting the category separately from context recall failures.
+
+This item improves tool usability and experimental attribution. It does not
+weaken `shell.exec` authorization, make raw shell effects rollback-able, or
+close the M12/M13 sandbox boundary.
+
+### TOOL-EDIT-01 — Exact edits are safe but stale failures are not actionable
+
+**CLOSED (2026-08-17).** `edit.replace` accepts optional `base_revision` and
+returns typed `stale_revision` / `no_exact_match` / `ambiguous_match`
+refusals with the current revision and at most three candidate regions.
+Matching stays exact; `edit.patch` remains the multi-hunk path.
+
+**Was OPEN (confirmed 2026-08-17).** `fs.read` already returns a SHA-256 content
+revision and `edit.patch` can refuse a stale optional `base_revision`.
+`edit.replace`, however, accepts no revision and reports only how many times
+the caller's old text appears. In the reviewed Context Bench traces, the
+dominant edit failure was `old appears 0 times`: the model reused an old or
+guessed anchor, paid for another model round, then reread and replanned. The
+exact-match refusal is the correct safety behavior; silently applying a fuzzy
+match would be worse. The missing part is revision-bound use and bounded,
+actionable diagnostics.
+
+Required closure:
+
+1. add an optional `base_revision` to `edit.replace`, checked against the same
+   digest emitted by `fs.read`; distinguish `stale_revision` from
+   `no_exact_match` and `ambiguous_match` rather than hiding all three in free
+   text;
+2. on refusal, return the current revision plus at most three bounded,
+   line-numbered candidate regions or an explicit "no candidate" result. This
+   information may help the next call but must never authorize fuzzy mutation;
+3. make the schemas steer revision-aware multi-hunk work to `edit.patch` and
+   keep `edit.replace` as the small exact single-hunk operation. Do not add a
+   second whole-file transcript or automatically rewrite user files after a
+   mismatch;
+4. test newline/whitespace drift, changed-after-read, zero/one/many matches,
+   candidate/output caps, symlink confinement and stale effect rollback;
+5. report first-attempt edit success, stale-revision refusal and exact-anchor
+   miss separately. They remain part of end-to-end task cost and success.
+
+This is a model-facing edit reliability residual of landed `TOOLS-05`, not a
+reason to reopen the workspace transaction or weaken exact matching.
+
+### TOOL-VIEW-01 — Model-visible workspace topology includes runtime noise
+
+**CLOSED (2026-08-17).** Ordinary `fs.list` / `fs.read` / search / code tools
+hide `.focus-agent` and raw `.git`. Missing paths return a bounded parent
+hint. `artifact.read` and `git.*` remain the sealed/VCS surfaces.
+
+**Was OPEN (confirmed 2026-08-17).** `search.grep` already skips `.git`,
+`.focus-agent`, build outputs and dependency trees, and workspace mutations
+reject `.focus-agent`. But root `fs.list` uses the raw directory listing and
+`fs.read` can still address the runtime state directory. This exposes
+implementation files the model should reach through `artifact.read`, produces
+inconsistent navigation surfaces, and contributed attempts to inspect or
+modify `.focus-agent`. Guesses such as `src/lib.rs` and `Cargo.toml` are also
+more expensive because the current surface supplies no small root topology or
+project-marker fact.
+
+Required closure:
+
+1. define one model-visible workspace policy shared by `fs.list`, `fs.read`,
+   `search.grep` and code-navigation tools. Hide `.focus-agent` and raw `.git`
+   internals from ordinary file tools; exact sealed artifacts remain available
+   only through `artifact.read`, and VCS state through `git.*`;
+2. have bounded root listings and Runtime Facts expose only useful project
+   markers/top-level entries. Do not invent `Cargo.toml`, `package.json`,
+   `src/lib.rs` or a project type when the confined workspace does not contain
+   them;
+3. make a missing path return a bounded parent/topology hint instead of a
+   recursive dump or an automatic guessed retry;
+4. test list/read/search/code-tool consistency, artifact-only state access,
+   paging after filtering, Windows path handling and no host-path leakage.
+
+### TOOL-ERROR-01 — Preventable tool failures have no typed recovery contract
+
+**CLOSED (2026-08-17).** Tool results project `metadata.failure_class` and a
+bounded recovery hint. Kernel `Err` paths classify from the error string.
+Eval aggregates class counts. No automatic retry or command translation.
+
+**Was OPEN (confirmed 2026-08-17).** The outer error vocabulary distinguishes
+classes such as invalid request, I/O, timeout and cancellation, but important
+model-facing causes still live in tool-specific strings. A failed tool call
+normally requires another model round; that is correct when the model must
+choose the next action. The defect is preventable failure and vague feedback,
+not the existence of the next reasoning turn.
+
+Required closure:
+
+1. add a bounded `ToolFailureClass`/recovery-hint projection for at least
+   shell-dialect mismatch, command unavailable, missing project marker,
+   stale revision, no/ambiguous edit match, no search match, process exit,
+   verification failure, timeout and cancellation;
+2. retain trusted exit/effect truth and include only the minimum corrective
+   fact (selected shell, current revision, present markers, or evidence ref).
+   Never let a producer mark its own failure retryable or widen authority;
+3. do not blindly retry, translate or mutate after an arbitrary failure.
+   Host-side recovery is allowed only when it is deterministic, bounded,
+   non-mutating and preserves the original result (for example classifying a
+   no-match search);
+4. count preventable/product, task/verification, provider and infrastructure
+   failures separately while retaining all started cells in end-to-end ITT,
+   rounds, latency and token cost.
+
+`TOOL-ENV-01`, `TOOL-EDIT-01` and `TOOL-VIEW-01` remove the largest known
+preventable sources. `TOOL-ERROR-01` makes the residual measurable and cheaper
+to recover from; it must not be used to excuse failures from M15.
+
 ### CORE-06 — Cancellation/approval/process cleanup
 
 - Git now kills the direct child, not guaranteed descendants;
@@ -1796,10 +1983,27 @@ Landed 2026-08-16:
   workspace reread / failed);
 - driver `TurnOp` includes Suspend / Activate / Complete.
   Do not treat `Likely optimization target` as a modification order.
-  Do not implement ResumePoint from this item. Do not retune scoring.
-  Do not collect 300×3 cells. Wave-1 live is 27 cells (repeats=1);
-  second repeat only for A/C discordant, anomalous cost, or unexplained
-  tasks.
+  On wave 1 every cell returned `none`; the heuristic sees only coarse totals
+  and cannot distinguish wrong shell dialect, stale edit anchor, missing
+  project marker, provider timeout or verifier failure. The raw per-scenario
+  deltas remain useful, but this label is not currently a useful prioritizer.
+  Do not implement ResumePoint merely because this evaluator labels it a
+  likely target. `CTX-11` is the separately reviewed context-lifecycle route
+  and must satisfy its authority/boundedness acceptance. Do not retune scoring.
+  Do not collect 300×3 cells. Wave-1 live is 27 cells (repeats=1) under
+  `crates/agent-eval/evidence/context-bench-wave1/`; it includes fixture-turn
+  timeouts and A/C discordance, so second repeat is only for discordant,
+  anomalous cost, or unexplained tasks — not automatic. Before another live
+  wave, close `TOOL-ENV-01` → `TOOL-EDIT-01` → `TOOL-VIEW-01` →
+  `TOOL-ERROR-01` and rerun the same frozen cells.
+
+**Benchmark ambiguity from the earlier draft is closed for this frozen pack.**
+Task identity hashes JSON + seed + golden + checker; hidden command sources are
+outside the model-visible seed; CI requires every seed to fail and golden to
+pass; and tests reject planted/restated hidden constraints. Do not reopen that
+work merely because a synthetic workspace intentionally has no Cargo manifest.
+The remaining evaluator residual is typed tool-failure attribution and a clean
+rerun after the tool-quality preflight, not weaker verification.
 
 Until closure, M15, V2, learned/vector policy and PLAT-08 evidence gates stay
 closed. M12/M13 remain independent trusted-execution blockers.

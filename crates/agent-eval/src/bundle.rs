@@ -612,6 +612,7 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
         "tool_calls": metrics.tool_calls,
         "lifecycle_transitions": metrics.lifecycle_transitions,
         "failed_tool_outputs": metrics.failed_tool_outputs,
+        "tool_failure_classes": metrics.tool_failure_classes,
         "repeated_fs_reads": metrics.repeated_fs_reads,
         "search_calls": metrics.search_calls,
         "search_hits": metrics.search_hits,

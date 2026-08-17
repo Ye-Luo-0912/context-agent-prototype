@@ -15,6 +15,7 @@ pub mod model;
 pub mod operation;
 pub mod plugin;
 pub mod runtime;
+pub mod runtime_facts;
 pub mod tokens;
 pub mod tool;
 
@@ -35,5 +36,6 @@ pub use model::*;
 pub use operation::*;
 pub use plugin::*;
 pub use runtime::*;
+pub use runtime_facts::*;
 pub use tokens::*;
 pub use tool::*;

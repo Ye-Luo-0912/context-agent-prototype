@@ -242,7 +242,7 @@ cadences.
 | Implemented | `TaskToolRequirementSet` retains exact-name `MustSurface`/`PreferSurface`/`KeepReady` demand. `RoundSurfacePlan` is the bounded per-round projection; loading remains lifecycle, never activation or permission. |
 | Implemented | Live restore rebases focus/surface/requirement revisions, applies capability state fail-closed, and publishes a bounded durable `RuntimeRestored` event before clearing the recovery fence. |
 | Implemented | Task completion atomically closes context/task authority and commits exactly one immutable typed `CompletionRecord`. With an artifact workspace, the complete final assistant response is persisted before bounded context ingest and its ref is attached to the record. |
-| Still open | Active/Suspended root downgrade and ResumePoint rehydration; sourced `EpisodeOutcome`; ack/obligation-driven episode root release; richer provenance and outcome fields. |
+| Still open | `CTX-11`: Active/Suspended root downgrade plus a bounded, sourced `ResumePoint`/`TaskProgressView`; sourced `EpisodeOutcome`; ack/obligation-driven episode root release; richer provenance and outcome fields. `TaskAnchor` remains the only task-authority owner. |
 
 Tool-demand semantics remain intentionally narrow:
 
@@ -365,18 +365,41 @@ through `ContextEngine::materialize` without making the engine a second task
 manager. A versioned `ContextTaskView` wrapper is not required: the two
 projections already travel together on `ContextHints`.
 
-The next integration step is Active/Suspended root downgrade and
-ResumePoint rehydration. Target task-state semantics (the current runtime
-exposes `Active | Suspended | Completed` and has not yet landed the full
-root view):
+The next context integration step is Active/Suspended root downgrade and
+ResumePoint rehydration. Its causal evaluation is queued behind the measured
+tool-quality preflight (`TOOL-ENV-01`, `TOOL-EDIT-01`, `TOOL-VIEW-01`,
+`TOOL-ERROR-01`): current failed-tool loops cannot prove that missing progress
+state caused C's extra rounds. The contract may be designed and unit-tested in
+parallel, but another live Context Bench comparison must first rerun the same
+frozen cells on the corrected tool baseline with scoring unchanged. Target
+task-state semantics (the current runtime exposes
+`Active | Suspended | Completed` and has not yet landed the full root view):
 
 - **Active:** the anchor is a mandatory materialization tier; current
   `working_refs` are online residency roots.
 - **Suspended:** the anchor remains in RuntimeCheckpoint but is absent from an
   unrelated task's prompt; its refs are storage-retention roots and their
   bodies may cool/externalize. A bounded sourced `ResumePoint` captures the
-  current objective, next actions, blockers, active files and evidence refs;
-  resume rematerializes only Anchor + ResumePoint refs, not the old transcript.
+  operational progress needed to continue without reconstructing it from
+  dialogue. It is an actor-owned subrecord bound to `task_id + anchor_revision`,
+  not a second task-authority store: the current objective is a projection of
+  the anchor, and the resume record cannot rewrite the goal, hard constraints,
+  or acceptance criteria. Its bounded `TaskProgressView` contains:
+  - current objective, unresolved constraints/blockers and next actions;
+  - checked file/entity refs with the observed content digest or revision and
+    last-checked turn, never copied file bodies;
+  - recent verification facts with a bounded command display/digest, target,
+    outcome and evidence ref, never full stdout/stderr;
+  - known failed-command facts with failure class, last result/evidence ref and
+    whether the failure still blocks progress;
+  - bounded working/evidence refs needed to rematerialize the next step.
+  Every collection and string gets a named hard cap; overflow content is stored
+  once as an artifact/context body and represented only by a typed ref. Runtime
+  updates this record only from trusted safe-point facts (successful tool
+  completion, verification outcome, durable turn commit, explicit suspend),
+  with revision/CAS checks; model prose may propose progress but is not itself
+  authority. Resume rematerializes only Anchor + ResumePoint refs, not the old
+  transcript.
 - **Completing:** freeze the anchor revision and retain Anchor/Focus/output/
   verification roots until a completion transaction commits or rolls back.
 - **Closed:** the active anchor is frozen and points to one committed
@@ -1059,10 +1082,13 @@ in AUDIT; this list does not duplicate checkbox state):
    context helps or hurts a coding agent (horizon, long refactor,
    semantic recall, supersession, task switch, noise). Wave 1 is 12×A/C
    plus rolling only on `horizon_long` / `semantic_recall` /
-   `task_switch` (27 cells at repeats=1). Pack/SPEC are hash-frozen.
-   Do not continue the 30-task
+   `task_switch` (27 cells at repeats=1). Pack/SPEC are hash-frozen;
+   wave-1 live is under `evidence/context-bench-wave1/`. Before another
+   live wave, finish the tool-quality preflight (`TOOL-ENV-01` →
+   `TOOL-ERROR-01`; owning specs in TOOL_ECOSYSTEM / AUDIT). `CTX-11` is
+   queued behind that cleaner baseline. Do not continue the 30-task
    pilot or mix P0/P1 ITT tables. analysis.v2 stays frozen. Do not close
-   M15. Wave-1 live is 27 cells after deterministic self-check.
+   M15.
 
 1. Freeze the 300-task suite (`EVAL-01` closure item 2). Heterogeneous
    real coding tasks with executable hidden verification; treat the
@@ -1832,8 +1858,26 @@ current slice above.)
   and is not a residency root. GC/Storage GC reports list bounded
   `anchor_root_protections`. Active/Suspended downgrade and replacing the
   whole Focus subtree as a root remain the next items.
-- [ ] Implement Active/Suspended root downgrade and precise rehydration from
-  TaskAnchor/ResumePoint without restoring the old transcript.
+- [ ] `CTX-11`: implement Active/Suspended root downgrade and precise
+  rehydration from `TaskAnchor + ResumePoint` without restoring the old
+  transcript. Keep `TaskAnchor` as the only task-authority owner; store one
+  actor-owned, revision-bound `ResumePoint` subrecord and expose only its
+  bounded `TaskProgressView` to model context. The contract must cover current
+  objective, unresolved constraints/blockers, next actions, checked file/entity
+  refs with observed digest/revision, recent verification results, known failed
+  commands, and evidence refs. Raw file bodies, command output and dialogue stay
+  in artifacts/context storage and enter the view only through typed refs.
+  Updates occur only at trusted safe points and must be idempotent/revisioned.
+  Acceptance: oversized/corrupt restore fails closed; stale file digests are
+  marked stale rather than reported as checked; a later successful verification
+  resolves the matching failure; suspend -> unrelated work/GC -> resume restores
+  the exact anchor revision and bounded progress while ordinary dialogue remains
+  absent; repeated failures and thousands of inspected files cannot grow the
+  checkpoint, resident heap or prompt without bound. Add a dedicated
+  `task_switch`/failed-tool regression, then compare only after the tool
+  preflight rerun establishes a clean baseline. Do not attribute reduced M15
+  rounds to this change while wrong-shell, stale-edit or workspace-noise
+  failures dominate; scoring remains frozen.
 - [ ] After Anchor/root-claim properties pass, replace “entire active Focus
   subtree is a root” with Anchor claims + unresolved obligations + a bounded
   recent/TurnFrame lease, so continuous GC also works inside a long episode.

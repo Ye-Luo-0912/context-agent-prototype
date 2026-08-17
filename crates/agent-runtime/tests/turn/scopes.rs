@@ -168,13 +168,18 @@ async fn turn_frame_is_execution_stack_not_long_term_memory() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // First model round: policy + user only, no tool frame yet.
+    // First model round: policy + Runtime Facts + user; no tool frame yet.
     let requests = model.requests.lock().await;
     assert_eq!(requests.len(), 2, "two model rounds expected");
     let first = &requests[0];
     assert_eq!(
         first.iter().map(|message| message.role).collect::<Vec<_>>(),
-        vec![ModelRole::System, ModelRole::User]
+        vec![ModelRole::System, ModelRole::System, ModelRole::User]
+    );
+    assert!(
+        first[1].content.starts_with("runtime_facts/v1"),
+        "second system message is Runtime Facts, got {}",
+        first[1].content
     );
 
     // Second round: the tool call and its result appear as protocol-paired

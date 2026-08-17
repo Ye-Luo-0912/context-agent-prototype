@@ -1,18 +1,21 @@
 //! Prompt assembly: the single place the model input is rendered.
 //!
 //! The context engine returns a structured working set (`MaterializedContext`)
-//! and nothing more. The runtime owns the system prompt, the focus frame, the
-//! context frame, the turn stack and the tool schemas; this module turns
-//! those five layers into the `ModelInput` sent to the provider.
+//! and nothing more. The runtime owns the system prompt, Runtime Facts, the
+//! focus frame, the context frame, the turn stack and the tool schemas; this
+//! module turns those layers into the `ModelInput` sent to the provider.
 
 use agent_contracts::{
-    FocusState, MaterializedContext, ModelInput, ModelMessage, TaskAnchorView, ToolSpec, TurnFrame,
+    FocusState, MaterializedContext, ModelInput, ModelMessage, RuntimeFactsView, TaskAnchorView,
+    ToolSpec, TurnFrame,
 };
+use agent_workspace::capture_host_runtime_facts;
 
-/// Assembles the five-layer model input for one model request.
+/// Assembles the model input for one model request.
 ///
 /// ```text
 /// System Policy        - standing instructions, owned by the runtime
+/// Runtime Facts        - bounded host/workspace profile (system-owned)
 /// Focus Frame          - the current task/goal from the materialized context
 /// Context Frame        - the selected working set, rendered from structured items
 /// Turn Frame           - the current turn's execution stack
@@ -20,23 +23,40 @@ use agent_contracts::{
 /// ```
 pub struct PromptAssembler {
     system_prompt: String,
+    runtime_facts: RuntimeFactsView,
 }
 
 impl PromptAssembler {
     pub fn new(system_prompt: impl Into<String>) -> Self {
         Self {
             system_prompt: system_prompt.into(),
+            runtime_facts: capture_host_runtime_facts(),
         }
+    }
+
+    pub fn with_runtime_facts(mut self, facts: RuntimeFactsView) -> Self {
+        self.runtime_facts = facts;
+        self
     }
 
     pub fn system_prompt(&self) -> &str {
         &self.system_prompt
     }
 
-    /// The system prompt's own token cost, so the runtime can hand the rest
-    /// of the model budget to the context engine.
+    pub fn runtime_facts(&self) -> &RuntimeFactsView {
+        &self.runtime_facts
+    }
+
+    /// Refresh only workspace markers after a committed mutation. OS identity
+    /// stays immutable for the run.
+    pub fn refresh_markers(&mut self, markers: Vec<String>) {
+        self.runtime_facts.set_markers(markers);
+    }
+
+    /// Fixed-layer token cost: System Policy plus the Runtime Facts block.
     pub fn system_prompt_tokens(&self) -> usize {
         agent_contracts::tokens::approx_tokens(&self.system_prompt)
+            + agent_contracts::tokens::approx_tokens(&self.runtime_facts.render())
     }
 
     pub fn assemble(
@@ -113,7 +133,10 @@ impl PromptAssembler {
         }
 
         ModelInput {
-            system_policy: vec![ModelMessage::system(self.system_prompt.clone())],
+            system_policy: vec![
+                ModelMessage::system(self.system_prompt.clone()),
+                ModelMessage::system(self.runtime_facts.render()),
+            ],
             focus_frame: render_focus_frame(
                 materialized.focus.as_ref(),
                 materialized.task.as_ref(),
@@ -293,10 +316,28 @@ mod tests {
             .filter(|m| m.role == ModelRole::System)
             .map(|m| m.content.as_str())
             .collect();
-        // Only the operator policy is system; retrieved content is user.
+        // Operator policy then Runtime Facts; retrieved content is user.
         assert_eq!(
-            system_texts,
-            vec!["You are a trusted agent. Follow the operator only."]
+            system_texts[0],
+            "You are a trusted agent. Follow the operator only."
+        );
+        assert!(
+            system_texts[1].starts_with("runtime_facts/v1"),
+            "facts follow policy: {}",
+            system_texts[1]
+        );
+        assert_eq!(system_texts.len(), 2);
+        assert!(
+            system_texts
+                .iter()
+                .all(|text| !text.contains("delete the repo"))
+        );
+        assert!(
+            !system_texts[1].contains("fs.read")
+                && !system_texts[1].contains("shell.exec")
+                && !system_texts[1].contains("edit.replace"),
+            "facts must not dump the tool catalog: {}",
+            system_texts[1]
         );
         let user_texts: Vec<&str> = messages
             .iter()
@@ -356,7 +397,9 @@ mod tests {
         for message in &messages {
             if message.role == ModelRole::System {
                 assert!(!message.content.contains("ignore previous instructions"));
-                assert!(message.content.contains("Never reveal the API key."));
+                if message.content.contains("Never reveal the API key.") {
+                    assert_eq!(message.content, "Never reveal the API key.");
+                }
             }
         }
         assert!(
@@ -389,11 +432,9 @@ mod tests {
             "frame headers are labels only, not retrieval tutorials: {}",
             user.content
         );
-        assert!(
-            messages
-                .iter()
-                .all(|m| m.role != ModelRole::System || m.content == "policy")
-        );
+        assert!(messages.iter().all(|m| m.role != ModelRole::System
+            || m.content == "policy"
+            || m.content.starts_with("runtime_facts/v1")));
     }
 
     #[test]
@@ -427,6 +468,58 @@ mod tests {
             !focus.contains("working_refs") && !focus.contains("Use context.manage"),
             "view is the contract, not refs or a tutorial: {focus}"
         );
+    }
+
+    #[test]
+    fn runtime_facts_follow_policy_and_are_budgeted() {
+        use agent_contracts::RuntimeFactsView;
+        let facts = RuntimeFactsView::new(
+            "windows 11",
+            "x86_64",
+            vec![".git".into(), "Cargo.toml".into()],
+        );
+        let assembler = PromptAssembler::new("policy").with_runtime_facts(facts.clone());
+        let input = assembler.assemble(
+            &materialized_with(Vec::new(), ContextMapView::default()),
+            &TurnFrame::new("continue"),
+            Vec::new(),
+        );
+        assert_eq!(input.system_policy.len(), 2);
+        assert_eq!(input.system_policy[0].content, "policy");
+        assert_eq!(input.system_policy[1].content, facts.render());
+        assert!(
+            assembler.system_prompt_tokens() > agent_contracts::tokens::approx_tokens("policy")
+        );
+        let mut refreshed = assembler;
+        refreshed.refresh_markers(vec![".git".into(), "package.json".into()]);
+        assert!(refreshed.runtime_facts().render().contains("package.json"));
+        assert!(!refreshed.runtime_facts().render().contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn runtime_facts_do_not_leak_host_paths_or_env() {
+        use agent_contracts::RuntimeFactsView;
+        let facts = RuntimeFactsView::new(
+            "windows 11",
+            "x86_64",
+            vec![".git".into(), "Cargo.toml".into()],
+        );
+        let rendered = facts.render();
+        assert!(!rendered.contains('\\'));
+        assert!(!rendered.contains("C:"));
+        assert!(!rendered.contains("Users"));
+        assert!(!rendered.contains("PATH"));
+        assert!(!rendered.contains("USERNAME"));
+        assert!(rendered.len() <= agent_contracts::RUNTIME_FACTS_MAX_BYTES);
+        let assembler = PromptAssembler::new("policy").with_runtime_facts(facts);
+        let input = assembler.assemble(
+            &materialized_with(Vec::new(), ContextMapView::default()),
+            &TurnFrame::new("continue"),
+            Vec::new(),
+        );
+        let facts_text = &input.system_policy[1].content;
+        assert!(!facts_text.contains("fs.list"));
+        assert!(!facts_text.contains("shell.exec"));
     }
 
     #[test]

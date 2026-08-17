@@ -395,8 +395,8 @@ pub(crate) struct RuntimeActor {
     /// triggers. The actor decides every trigger and order; the services
     /// execute the call.
     services: Arc<RuntimeServices>,
-    /// Owns the system prompt and renders the five-layer model input. The
-    /// context engine only ever returns structured items.
+    /// Owns the system prompt and Runtime Facts and renders the model input.
+    /// The context engine only ever returns structured items.
     assembler: PromptAssembler,
     state: ActorState,
 }
@@ -413,11 +413,24 @@ impl RuntimeActor {
             ..ActorState::default()
         };
         Self {
-            assembler: PromptAssembler::new(services.system_prompt()),
+            assembler: {
+                let assembler = PromptAssembler::new(services.system_prompt());
+                match services.artifact_workspace() {
+                    Some(workspace) => assembler.with_runtime_facts(workspace.runtime_facts()),
+                    None => assembler,
+                }
+            },
             core,
             services,
             state,
         }
+    }
+
+    fn refresh_runtime_fact_markers(&mut self) {
+        let Some(workspace) = self.services.artifact_workspace() else {
+            return;
+        };
+        self.assembler.refresh_markers(workspace.project_markers());
     }
 
     /// Run the actor loop until `Stop` or all handles are dropped. Commands

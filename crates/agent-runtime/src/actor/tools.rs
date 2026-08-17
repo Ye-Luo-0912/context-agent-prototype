@@ -537,7 +537,10 @@ impl RuntimeActor {
                         EffectCommitDisposition::Receipt(EffectReceipt::Applied {
                             durability: EffectDurability::Durable,
                             ..
-                        }) => output,
+                        }) => {
+                            self.refresh_runtime_fact_markers();
+                            output
+                        }
                         EffectCommitDisposition::Receipt(EffectReceipt::NotApplied { error }) => {
                             ToolOutput {
                                 ok: false,
