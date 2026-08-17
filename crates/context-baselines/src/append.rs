@@ -17,7 +17,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::shared::{
-    Record, active_diagnostics, approx_tokens, materialized_items, records_for_ingress,
+    Record, active_diagnostics, approx_tokens, is_current_user_input, materialized_items,
+    records_for_ingress,
 };
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -82,7 +83,7 @@ impl ContextEngine for AppendOnlyEngine {
         Ok(Vec::new())
     }
 
-    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+    async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
         let mut state = self.state.lock().expect("append-only state poisoned");
         state.materialization_revision =
             state
@@ -91,7 +92,7 @@ impl ContextEngine for AppendOnlyEngine {
                 .ok_or_else(|| {
                     AgentError::Internal("context materialization id is exhausted".into())
                 })?;
-        let items = materialized_items(&state.records, None);
+        let items = materialized_items(&state.records, None, &query.current_input);
         let approx_tokens_total: usize = items
             .iter()
             .map(|item| approx_tokens(&item.content))
@@ -99,11 +100,12 @@ impl ContextEngine for AppendOnlyEngine {
         let selected = state
             .records
             .iter()
+            .filter(|record| !is_current_user_input(record, &query.current_input))
             .map(|record| ContextSelection {
                 item_id: record.id,
                 score: 1.0,
                 approx_tokens: approx_tokens(&record.content),
-                reason: "append-only baseline: all history retained".into(),
+                reason: "append-only baseline: prior history retained".into(),
                 breakdown: ScoreBreakdown::default(),
             })
             .collect();

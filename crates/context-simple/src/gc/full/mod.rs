@@ -610,15 +610,11 @@ fn mark_roots(
         })
         .count();
 
-    // Reachability through dependency edges, bounded: a root pulls in the
-    // items it *depends on*, so the evidence behind a working item stays
-    // protected. The traversal follows `item.dependencies` (new -> old)
-    // outward from the roots; dependents of a root are not protected — a
-    // root's descendants carry no evidence the working set relies on.
-    // Dependencies are resolved across every residency: the heap, the warm
-    // buffer and the external map all carry edges, so a dependency that
-    // was demoted Warm/Cold is marked here and the reactivate phase below
-    // (which honors the same mark) recalls it.
+    // Reachability through residency-required dependency edges, bounded: a
+    // Continuation root pulls in the prior step of the same line of work.
+    // Affinity (`SharesEntities`) and provenance (`DerivedFrom`) are not
+    // residency roots — compacted sources must not bounce Warm → Resident
+    // because the summary cites them.
     if config.dependency_expansion && !marked.is_empty() {
         let mut seen: HashSet<ContextItemId> = marked.iter().copied().collect();
         let mut queue: Vec<ContextItemId> = marked.clone();
@@ -631,6 +627,12 @@ fn mark_roots(
                 continue;
             };
             for edge in edges {
+                // Residency mark is not storage reachability. Weak
+                // affinity and provenance (DerivedFrom on a compact
+                // summary) must not keep or resurrect the target.
+                if !edge.kind.requires_residency() {
+                    continue;
+                }
                 if seen.insert(edge.target) {
                     marked.push(edge.target);
                     queue.push(edge.target);

@@ -319,10 +319,10 @@ pub(crate) fn materialize(
         });
     }
 
-    // Explicit dependency expansion — pull in dependencies of selected items
-    // (skip Dropped and excluded items; Archived dependencies only when they
-    // still clear the active threshold), best dependencies first, bounded per
-    // snapshot, spending only the reserved slice.
+    // Explicit dependency expansion — pull in Continuation targets of
+    // selected items (skip Dropped and excluded items; Archived only when
+    // they still clear the active threshold). Affinity and provenance
+    // edges do not copy bodies into the prompt.
     let mut selected_ids: Vec<ContextItemId> = selections
         .iter()
         .map(|selection| selection.item_id)
@@ -341,6 +341,12 @@ pub(crate) fn materialize(
             let item = &state.items[index];
             let dependencies = item.dependencies.clone();
             for edge in dependencies {
+                // Affinity and provenance are not prompt citations. A
+                // SharesEntities overlap or a DerivedFrom card must not
+                // pull the target's body back into the working set.
+                if !edge.kind.requires_prompt_body() {
+                    continue;
+                }
                 let dep_id = edge.target;
                 if selected_ids.contains(&dep_id) {
                     continue;

@@ -720,6 +720,18 @@ mod tests {
             query.contains("path") && query.contains("entity"),
             "query key stays `query` and names the indexed fields: {query}"
         );
+        let ops = spec.input_schema["properties"]["op"]["enum"]
+            .as_array()
+            .expect("op enum");
+        assert!(
+            !ops.iter().any(|op| op.as_str() == Some("gc_hint")),
+            "gc_hint is not a model-facing op: {ops:?}"
+        );
+        assert!(
+            spec.description.contains("context://run/"),
+            "schema names the catalog uri the mutation ops consume: {}",
+            spec.description
+        );
     }
 
     #[tokio::test]
@@ -732,6 +744,7 @@ mod tests {
         );
 
         let item_id = "00000000-0000-0000-0000-000000000000";
+        let item_uri = format!("context://run/{item_id}");
 
         // The directive ops return a `RuntimeDirective` (a distinct
         // `ToolOutcome` variant), not a field on the output.
@@ -743,22 +756,7 @@ mod tests {
         let output = dispatcher
             .execute(request(
                 "context.manage",
-                json!({"op": "gc_hint", "item_id": item_id, "keep": true}),
-            ))
-            .await
-            .unwrap();
-        assert!(matches!(
-            directive(output),
-            agent_contracts::RuntimeDirective::Context(ContextAction::GcHint {
-                keep_alive: true,
-                ..
-            })
-        ));
-
-        let output = dispatcher
-            .execute(request(
-                "context.manage",
-                json!({"op": "tag", "item_id": item_id, "tag": "urgent"}),
+                json!({"op": "tag", "item_id": item_uri, "tag": "urgent"}),
             ))
             .await
             .unwrap();
@@ -789,12 +787,16 @@ mod tests {
             agent_contracts::RuntimeDirective::Context(ContextAction::Collect)
         ));
 
-        // Bad arguments are rejected like any other tool.
+        // Bad arguments are rejected like any other tool. gc_hint is not a
+        // model-facing op: fail closed, no tutorial.
         let error = dispatcher
             .execute(request("context.manage", json!({"op": "gc_hint"})))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("missing"), "{error}");
+        assert!(
+            error.to_string().contains("args") || error.to_string().contains("unknown"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -833,17 +835,20 @@ mod tests {
         }
 
         let item_id = "00000000-0000-0000-0000-000000000000";
+        let item_uri = format!("context://run/{item_id}");
         let outcome = dispatcher
             .execute(request(
                 "context.manage",
-                json!({"op": "inspect", "item_id": item_id}),
+                json!({"op": "inspect", "item_id": item_uri}),
             ))
             .await
             .unwrap();
-        assert!(matches!(
-            query(outcome),
-            agent_contracts::EngineQuery::InspectExternal { .. }
-        ));
+        match query(outcome) {
+            agent_contracts::EngineQuery::InspectExternal { item_id: parsed } => {
+                assert_eq!(parsed.to_string(), item_id);
+            }
+            other => panic!("expected InspectExternal, got {other:?}"),
+        }
 
         let outcome = dispatcher
             .execute(request(
@@ -857,6 +862,21 @@ mod tests {
             agent_contracts::EngineQuery::FetchExternal { .. }
         ));
 
+        let outcome = dispatcher
+            .execute(request(
+                "context.manage",
+                json!({"op": "search", "label": "decision"}),
+            ))
+            .await
+            .unwrap();
+        match query(outcome) {
+            agent_contracts::EngineQuery::SearchExternal { query, label, .. } => {
+                assert_eq!(query, "");
+                assert_eq!(label.as_deref(), Some("decision"));
+            }
+            other => panic!("expected SearchExternal, got {other:?}"),
+        }
+
         // Bad arguments are rejected like any other tool.
         let error = dispatcher
             .execute(request("context.manage", json!({})))
@@ -864,10 +884,18 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("args"), "{error}");
         let error = dispatcher
+            .execute(request("context.manage", json!({"op": "search"})))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing 'query'"), "{error}");
+        let error = dispatcher
             .execute(request("context.manage", json!({"op": "gc_hint"})))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("missing"), "{error}");
+        assert!(
+            error.to_string().contains("args") || error.to_string().contains("unknown"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

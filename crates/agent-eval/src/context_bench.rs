@@ -41,14 +41,16 @@ evidence_identity=task_sha256 covers json+seed+golden+checker; pack_digest cover
 provider_tokens=coding_in+coding_out+compactor_in+compactor_out
 report=delta abs and pct; actual rounds; peak and final resident
 hidden_live=missing verifier is preflight fail
+current_turn=runtime-owned TaskAnchor/Focus/UserMessage/ToolResult; A/B/C compare historical context only
+switch_verify=compile/call pub fn rate_limit(...) -> u32; not substring
 frozen=true
 ";
 
 /// Filled after the deterministic pack self-check is green.
 pub const FROZEN_SPEC_SHA256: &str =
-    "12dc8e22f3a649b619f719f4a18e0cf73486a668aded4912ca93a469b22bc902";
+    "248312578144464242b5a7d54282be0fc8cc484ba3a99cf2b39d82d91bf8e18e";
 pub const FROZEN_PACK_DIGEST: &str =
-    "00a6079ee601cd0004060acb168603c80d5d77dc62e77caf1782eccd88e2d38e";
+    "141ffd8dc8ed352676b338fa6ad272650a7a7646545a5de300bf32852180ef20";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -303,7 +305,7 @@ pub fn evaluate_task(pack: &BenchPack, task: &BenchTask, root: &Path) -> HiddenR
                 script.to_string_lossy().into_owned(),
                 root.to_string_lossy().into_owned(),
             ],
-            timeout_ms: 15_000,
+            timeout_ms: 30_000,
             expect_exit: 0,
         };
         let mut result = suite::run_hidden_command(root, &spec);

@@ -520,7 +520,7 @@ pub(crate) fn plan_storage_gc(
         .flat_map(|item| {
             item.dependencies
                 .iter()
-                .filter(|edge| edge.kind.is_strong())
+                .filter(|edge| edge.kind.protects_storage())
                 .map(|edge| edge.target)
         })
         .collect();
@@ -532,7 +532,7 @@ pub(crate) fn plan_storage_gc(
                 continue;
             }
             for edge in &entry.dependencies {
-                if edge.kind.is_strong() && referenced.insert(edge.target) {
+                if edge.kind.protects_storage() && referenced.insert(edge.target) {
                     grew = true;
                 }
             }
@@ -1845,7 +1845,7 @@ mod tests {
             .flat_map(|item| {
                 item.dependencies
                     .iter()
-                    .filter(|edge| edge.kind.is_strong())
+                    .filter(|edge| edge.kind.protects_storage())
                     .map(|edge| edge.target)
             })
             .collect();
@@ -1857,7 +1857,7 @@ mod tests {
                     continue;
                 }
                 for edge in &entry.dependencies {
-                    if edge.kind.is_strong() && protected.insert(edge.target) {
+                    if edge.kind.protects_storage() && protected.insert(edge.target) {
                         grew = true;
                     }
                 }

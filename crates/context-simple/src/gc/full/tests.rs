@@ -472,11 +472,11 @@ async fn gc_protects_dependencies_of_roots_forward_along_the_edges() {
     };
     {
         let mut state = engine.state.lock().await;
-        for item in &mut state.items {
+        for item in state.items.iter_mut() {
             if item.id == a_id {
                 // Cold and unmarked: another task, outside the focus
                 // scope tree, entities outside the hot set, past the
-                // generation cap — only the dependency edge from the
+                // generation cap — only a residency-required edge from the
                 // root can protect it now.
                 item.task_id = Some(TaskId::new());
                 item.scope_id = None;
@@ -487,8 +487,8 @@ async fn gc_protects_dependencies_of_roots_forward_along_the_edges() {
                 item.gc_generation = 99;
             }
             if item.id == b_id {
-                // The root: pinned, so nothing else can protect A.
                 item.retention = ContextRetention::Pinned;
+                item.dependencies = vec![agent_contracts::DependencyEdge::continuation(a_id)];
             }
         }
     }
@@ -508,6 +508,76 @@ async fn gc_protects_dependencies_of_roots_forward_along_the_edges() {
     assert!(
         state_has(&engine, a_id).await,
         "the old decision must still be resident; diagnostics: {diagnostics:?}"
+    );
+}
+
+#[tokio::test]
+async fn gc_does_not_treat_shares_entities_as_a_residency_root() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "use AuthService.rs as the auth layer".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "shell.exec".into(),
+                ok: true,
+                summary: "ok".into(),
+                model_content: "touched AuthService.rs".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    let (a_id, b_id) = {
+        let state = engine.state.lock().await;
+        let a = state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::UserMessage)
+            .expect("decision item");
+        let b = state
+            .items
+            .iter()
+            .find(|item| item.kind == ContextKind::ToolObservation)
+            .expect("finding item");
+        assert!(
+            b.dependencies
+                .iter()
+                .any(|edge| edge.target == a.id && !edge.kind.requires_residency()),
+            "ingest mints SharesEntities, which is not a residency root"
+        );
+        (a.id, b.id)
+    };
+    {
+        let mut state = engine.state.lock().await;
+        for item in state.items.iter_mut() {
+            if item.id == a_id {
+                item.task_id = Some(TaskId::new());
+                item.scope_id = None;
+                item.content = "use OldStore.rs instead".into();
+                item.entities = extract_entities(&item.content);
+                item.attention = AttentionState::Archived;
+                item.relevance = 0.0;
+                item.gc_generation = 99;
+            }
+            if item.id == b_id {
+                item.retention = ContextRetention::Pinned;
+            }
+        }
+    }
+
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.evictions.iter().any(|e| e.item_id == a_id) || !state_has(&engine, a_id).await,
+        "weak affinity must not keep the overlap target resident: evictions={:?}",
+        report.evictions
     );
 }
 

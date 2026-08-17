@@ -484,7 +484,11 @@ hits no entity/label key still residual-scans summaries/uris/bodies. See
 The model-facing retrieval loop (`context.manage` op=search/inspect/fetch)
 is **not an observation**: search/inspect may return catalog projections
 (including Resident/Warm heap descriptors); fetch remains a store read.
-The result is visible to the current turn through the tool result, but
+Hits identify items with the catalog uri `context://run/<uuid>`; inspect /
+fetch / admit / derive consume that same string (or the bare UUID).
+`gc_hint` is not a model-facing op — the engine owns collection; a model
+call with `op=gc_hint` is an invalid request. The result is visible to the
+current turn through the tool result, but
 finalization must not persist it under a new `ToolObservation` id. Every
 `TurnFrameStep::ToolResult` carries
 a `ToolResultDisposition`:
@@ -561,15 +565,18 @@ ingest path is O(N) signature lookups, not O(N) re-extractions. Restore
 backfills items from checkpoints written before the field existed.
 
 At `materialize`, after primary selection, the working set is expanded
-with dependencies of selected items:
+only along edges whose kind `requires_prompt_body()` (today:
+`Continuation`). Auto-minted `SharesEntities` affinity and provenance
+(`DerivedFrom`, `EvidenceFor`, `VerifiedBy`, `ArtifactOf`) do **not**
+copy the target's body into the prompt:
 
 - skipped: already-selected items, `Dropped`, and `superseded` /
   `verified-fixed` items (a verified error or superseded decision never
   re-enters through the back door);
-- `Archived` dependencies only when their score still clears the active
+- `Archived` continuations only when their score still clears the active
   threshold (same gate as primary selection — expansion never resurrects
   cold archived items);
-- best dependencies first (score desc), capped at +8 per snapshot;
+- best continuations first (score desc), capped at +8 per snapshot;
 - spends only a **1 K-token reserve** carved out of the model budget, so the
   snapshot can never exceed the budget (an over-budget guarantee covered by
   tests);
@@ -622,8 +629,11 @@ Roots are the current attention and are never swept while alive:
 - durable session memory (task summaries promoted to the session scope);
 - items whose entity signature overlaps the hot set (last user message +
   recent tool observations);
-- a bounded transitive slice of their dependency edges (`+8`), so a working
-  item keeps the items it *depends on*: the traversal follows
+- a bounded transitive slice of edges whose kind `requires_residency()`
+  (`Continuation` today, cap `+8`), so a working item can keep the prior
+  step of the same line of work. Weak affinity (`SharesEntities`) and
+  provenance (`DerivedFrom` on a compact summary, `EvidenceFor`, …) do
+  not mark or reactivate the target. The traversal follows
   `item.dependencies` (new → old) outward from the roots. Dependents of a
   root are not protected — a root's descendants carry no evidence the
   working set relies on.
@@ -1075,12 +1085,29 @@ externalized entry's captured edges, which the Storage GC reachability
 closure reads) are now `Vec<DependencyEdge>` — `{ target, kind }` —
 instead of bare ids, so GC reachability and supersession/evidence
 policies can distinguish *why* an item is referenced. The kind taxonomy
-separates weak affinity from strong citations: `SharesEntities` (the
-entity-overlap link recorded at ingest, new -> prior — a ranking signal,
-never a permanent-delete guard) versus the strong kinds `DerivedFrom`
-(minted by `context.derive`), `EvidenceFor`, `VerifiedBy`, `ArtifactOf`
-and `Continuation`. The wire deserializer accepts the pre-typed bare-id
-form, so checkpoints written before the graph was typed keep loading.
+separates consumers, not just strong vs weak:
+
+```text
+                ranking   prompt body   residency   storage
+SharesEntities  yes       no            no          no
+DerivedFrom     no        no            no          yes
+EvidenceFor     yes       no            no          yes
+VerifiedBy      no        no            no          yes
+ArtifactOf      no        no            no          yes
+Continuation    yes       yes           yes         yes
+```
+
+`is_strong()` remains the storage-citation alias (`protects_storage()`).
+Prompt expansion uses `requires_prompt_body()`; full-GC mark/reactivate
+uses `requires_residency()`. Affinity is not a citation; a citation is
+not prompt inclusion; prompt inclusion is not residency; residency is not
+storage reachability. `SharesEntities` (the entity-overlap link recorded
+at ingest, new -> prior) ranks and links. `DerivedFrom` (minted by
+`context.derive` and episode compaction) is provenance so a compact card
+can find its sources later — it must not pull those sources back into the
+prompt or resurrect them Warm → Resident. The wire deserializer accepts
+the pre-typed bare-id form, so checkpoints written before the graph was
+typed keep loading.
 `ContextItemSummary.dependencies` remains a projection of target ids
 only, so replay and the UI are untouched.
 
@@ -1220,6 +1247,10 @@ observations flow in two distinct phases:
   execution stack): they are rendered as protocol messages — an assistant
   message carrying `tool_calls`, then a `tool` message paired by
   `tool_call_id` — and they are never scored, garbage-collected or evicted.
+  The current user message, current TaskAnchor/Focus, and current tool
+  result are runtime-owned. Context engines (A, B, and C) own *prior*
+  historical context only: they must not mint a Goal from `FocusChanged`
+  or select a `UserMessage` whose body equals `query.current_input`.
 - **When the turn ends** (the model stops calling tools) the observations
   are persisted as the long-term record: `ingest(ToolObservation)` for each
   result, then one `maintain(AfterTool)` pass, then the final assistant

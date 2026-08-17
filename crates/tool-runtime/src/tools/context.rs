@@ -1,7 +1,11 @@
 //! The merged context meta-tool: one `context.manage` entry point with an
-//! `op` dispatch covering the four directives (`gc_hint` / `tag` / `lease` /
-//! `collect`) and the three retrieval queries (`search` / `inspect` /
-//! `fetch`).
+//! `op` dispatch covering catalog retrieval (`search` / `inspect` / `fetch`)
+//! and deliberate mutations (`tag` / `lease` / `collect` / `admit` /
+//! `derive`).
+//!
+//! GC hint / residency micromanagement is not a model-facing op: the
+//! engine owns collection. `ContextAction::GcHint` remains for tests and
+//! the engine; a model `op=gc_hint` is an invalid request.
 //!
 //! The directive ops do no work themselves — each attaches a typed
 //! `ContextAction` to its output that the runtime routes to the context
@@ -9,13 +13,8 @@
 //! decides how the directive is applied). The query ops attach a typed
 //! `EngineQuery` that the kernel resolves against the engine — same
 //! invariant, same direction: the tool only names *what* it wants, the
-//! runtime answers. The model targets items by the ids it sees in the
-//! materialized context frame; a stale id is a silent no-op in the engine,
-//! so the tool is safe to call even when the target just left.
-//!
-//! One schema instead of seven keeps the always-visible tool surface
-//! small: a dozen single-purpose meta-tools would cost more model input
-//! than the runtime control they provide.
+//! runtime answers. Item ids accept a bare UUID or the catalog uri
+//! `context://run/<uuid>` that search hits return.
 
 use agent_contracts::{
     AgentError, AgentResult, CONTEXT_MANAGE, CancellationToken, ContextAction, ContextItemId,
@@ -32,8 +31,6 @@ use super::Tool;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ManageOp {
-    /// Keep an item resident across GC passes until a later `keep=false`.
-    GcHint,
     /// Attach an extension tag to an item so later inspection can find it.
     Tag,
     /// Protect an item from GC for the next N turns.
@@ -60,8 +57,6 @@ struct ManageArgs {
     // Directives
     #[serde(default)]
     item_id: Option<ContextItemId>,
-    #[serde(default)]
-    keep: Option<bool>,
     #[serde(default)]
     tag: Option<String>,
     #[serde(default)]
@@ -100,6 +95,20 @@ fn require<T>(value: Option<T>, op: &str, field: &str) -> AgentResult<T> {
     })
 }
 
+fn search_query(args: &ManageArgs) -> AgentResult<String> {
+    let has_filter = args.kind.is_some()
+        || args.scope.is_some()
+        || args.task_id.is_some()
+        || args.label.is_some();
+    match args.query.as_deref().map(str::trim) {
+        Some(query) if !query.is_empty() => Ok(query.to_string()),
+        _ if has_filter => Ok(String::new()),
+        _ => Err(AgentError::InvalidRequest(
+            "context.manage search: missing 'query'".into(),
+        )),
+    }
+}
+
 #[async_trait]
 impl Tool for ContextManageTool {
     fn spec(&self) -> ToolSpec {
@@ -107,9 +116,9 @@ impl Tool for ContextManageTool {
             name: CONTEXT_MANAGE.into(),
             description: concat!(
                 "Runtime context control and catalog retrieval. ",
-                "Directive ops: gc_hint, tag, lease, collect, admit, derive. ",
+                "Directive ops: tag, lease, collect, admit, derive. ",
                 "Query ops: search, inspect, fetch. search covers the whole catalog (Resident/Warm/Stored), not only the selected working context. Hits include id, source, and residency. fetch reads store bodies only. ",
-                "Item ids come from the working-set frame or search hits."
+                "item_id accepts a bare UUID or the catalog uri context://run/<uuid>."
             )
             .to_string(),
             input_schema: json!({
@@ -118,10 +127,9 @@ impl Tool for ContextManageTool {
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["gc_hint", "tag", "lease", "collect", "search", "inspect", "fetch", "admit", "derive"]
+                        "enum": ["tag", "lease", "collect", "search", "inspect", "fetch", "admit", "derive"]
                     },
-                    "item_id": {"type": "string", "description": "Target item (gc_hint/tag/lease/inspect/fetch/admit/derive)"},
-                    "keep": {"type": "boolean", "description": "gc_hint: true protects, false releases"},
+                    "item_id": {"type": "string", "description": "Target item (tag/lease/inspect/fetch/admit/derive). Bare UUID or context://run/<uuid>."},
                     "tag": {"type": "string", "description": "tag: tag text (stored under the ext: namespace)"},
                     "turns": {"type": "integer", "minimum": 1, "description": "lease: how many turns the item stays protected"},
                     "reason": {"type": "string", "description": "admit: why this ref is being pulled back into the working set"},
@@ -150,28 +158,6 @@ impl Tool for ContextManageTool {
         let args: ManageArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("context.manage args: {e}")))?;
         match args.op {
-            // ---- Directives: a typed ContextAction the runtime routes ----
-            ManageOp::GcHint => {
-                let item_id = require(args.item_id, "gc_hint", "item_id")?;
-                let keep_alive = require(args.keep, "gc_hint", "keep")?;
-                let action = ContextAction::GcHint {
-                    item_id,
-                    keep_alive,
-                };
-                let description = describe(&action);
-                Ok(ToolOutcome::RuntimeDirective {
-                    output: ToolOutput {
-                        call_id: call_id.into(),
-                        tool_name: CONTEXT_MANAGE.into(),
-                        ok: true,
-                        summary: description.clone(),
-                        model_content: description,
-                        artifact_ref: None,
-                        metadata: json!({"context_action": action}),
-                    },
-                    directive: agent_contracts::RuntimeDirective::Context(action),
-                })
-            }
             ManageOp::Tag => {
                 let item_id = require(args.item_id, "tag", "item_id")?;
                 let tag = require(args.tag, "tag", "tag")?;
@@ -224,9 +210,8 @@ impl Tool for ContextManageTool {
                     directive: agent_contracts::RuntimeDirective::Context(action),
                 })
             }
-            // ---- Retrieval: a typed EngineQuery the kernel resolves ----
             ManageOp::Search => {
-                let query = require(args.query, "search", "query")?;
+                let query = search_query(&args)?;
                 Ok(ToolOutcome::EngineQuery {
                     output: ToolOutput {
                         call_id: call_id.into(),
@@ -277,7 +262,6 @@ impl Tool for ContextManageTool {
                     query: EngineQuery::FetchExternal { item_id },
                 })
             }
-            // ---- Admit / derive: typed ContextActions the runtime routes ----
             ManageOp::Admit => {
                 let item_id = require(args.item_id, "admit", "item_id")?;
                 let reason = require(args.reason, "admit", "reason")?;

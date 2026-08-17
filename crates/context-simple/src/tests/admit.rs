@@ -4,8 +4,8 @@ use agent_contracts::{
     AgentError, AttentionState, BoundedCompactor, CompactionOutput, CompactionReason,
     CompactionRequest, ContextAction, ContextEngine, ContextHints, ContextIngress, ContextItemId,
     ContextKind, ContextMaintenanceTrigger, ContextQuery, ContextResidency, ContextRetention,
-    ContextScope, ContextSearchQuery, DependencyEdge, DependencyKind, LifecycleLabel, ScopeId,
-    ScopeKind, ScopeState, SemanticState, TaskId, ToolOutput,
+    ContextScope, ContextSearchQuery, DependencyKind, LifecycleLabel, ScopeId, ScopeKind,
+    ScopeState, SemanticState, TaskId, ToolOutput,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -984,10 +984,8 @@ async fn demoted_dependency_is_recalled_because_a_live_root_depends_on_it() {
             0.9,
             None,
         );
-        root.dependencies.push(DependencyEdge {
-            target: evidence_id,
-            kind: DependencyKind::EvidenceFor,
-        });
+        root.dependencies
+            .push(agent_contracts::DependencyEdge::continuation(evidence_id));
         state.items.replace_all(vec![root]);
         evidence_id
     };
@@ -1006,6 +1004,69 @@ async fn demoted_dependency_is_recalled_because_a_live_root_depends_on_it() {
         assert!(
             state.items.iter().any(|item| item.id == evidence_id),
             "the recalled evidence must be back in the heap"
+        );
+    }
+}
+
+#[tokio::test]
+async fn derived_from_does_not_reactivate_compacted_sources() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let source_id = {
+        let mut state = engine.state.lock().await;
+        let mut source = crate::item::make_item(
+            &state,
+            &engine.config,
+            "raw episode body that compaction already folded".into(),
+            ContextKind::UserMessage,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.1,
+            None,
+        );
+        let source_id = source.id;
+        source.attention = AttentionState::Archived;
+        source.residency = ContextResidency::Warm;
+        source.evicted_at_tick = Some(0);
+        state.eviction_buffer.push(source);
+
+        let mut summary = crate::item::make_item(
+            &state,
+            &engine.config,
+            "compact episode card".into(),
+            ContextKind::Summary,
+            ContextScope::Pinned,
+            ContextRetention::Pinned,
+            0.9,
+            None,
+        );
+        summary
+            .dependencies
+            .push(agent_contracts::DependencyEdge::derived_from(source_id));
+        state.items.replace_all(vec![summary]);
+        source_id
+    };
+
+    let report = engine.gc().await.unwrap();
+    assert!(
+        !report
+            .reactivations
+            .iter()
+            .any(|r| r.item_id == source_id && r.reason.contains("dependency of a marked root")),
+        "DerivedFrom is provenance, not a residency root: {:?}",
+        report.reactivations
+    );
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            !state.items.iter().any(|item| item.id == source_id),
+            "compacted sources must not return to Resident through DerivedFrom"
+        );
+        assert!(
+            state
+                .eviction_buffer
+                .iter()
+                .any(|item| item.id == source_id),
+            "the source stays Warm"
         );
     }
 }

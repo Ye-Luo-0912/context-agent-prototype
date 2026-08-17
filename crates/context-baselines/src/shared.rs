@@ -93,14 +93,13 @@ pub(crate) fn records_for_ingress(ingress: &ContextIngress, turn: u64) -> Vec<Re
             created_turn: turn,
             source: Some(format!("tool {}", output.tool_name)),
         }],
-        ContextIngress::FocusChanged { focus } => vec![Record {
-            id: ContextItemId::new(),
-            kind: ContextKind::Goal,
-            scope: ContextScope::Task,
-            content: format!("FOCUS: {}", focus.goal),
-            created_turn: turn,
-            source: Some("focus".into()),
-        }],
+        ContextIngress::FocusChanged { .. } => {
+            // Focus is runtime-owned (TurnFrame / FocusState). A/B must not
+            // mint a Goal record that duplicates the current user input,
+            // or the experiment compares current-turn representation as
+            // well as history retention.
+            Vec::new()
+        }
         // Suspension produces no history record in the baselines.
         ContextIngress::FocusCleared => Vec::new(),
         ContextIngress::Pin { content, kind } => vec![Record {
@@ -132,9 +131,14 @@ pub(crate) fn records_for_ingress(ingress: &ContextIngress, turn: u64) -> Vec<Re
 /// Map the retained records to structured working-set items. Baselines never
 /// render protocol messages themselves — the prompt assembler does that, so
 /// A/B/C measure the selection policy, not the rendering.
+///
+/// Current-turn user input is runtime-owned (`ContextQuery::current_input` /
+/// TurnFrame). Historical UserMessages stay; the matching current message
+/// is excluded so A/B do not double-count what C already leaves out.
 pub(crate) fn materialized_items(
     records: &[Record],
     summary: Option<&Record>,
+    current_input: &str,
 ) -> Vec<MaterializedItem> {
     let mut items = Vec::with_capacity(records.len() + usize::from(summary.is_some()));
     if let Some(summary) = summary {
@@ -150,18 +154,27 @@ pub(crate) fn materialized_items(
             file_path: None,
         });
     }
-    items.extend(records.iter().map(|record| MaterializedItem {
-        item_id: record.id,
-        kind: record.kind,
-        scope: record.scope,
-        attention: AttentionState::Active,
-        semantic: SemanticState::Live,
-        retention: ContextRetention::Working,
-        content: record.content.clone(),
-        source: record.source.clone(),
-        file_path: None,
-    }));
+    items.extend(
+        records
+            .iter()
+            .filter(|record| !is_current_user_input(record, current_input))
+            .map(|record| MaterializedItem {
+                item_id: record.id,
+                kind: record.kind,
+                scope: record.scope,
+                attention: AttentionState::Active,
+                semantic: SemanticState::Live,
+                retention: ContextRetention::Working,
+                content: record.content.clone(),
+                source: record.source.clone(),
+                file_path: None,
+            }),
+    );
     items
+}
+
+pub(crate) fn is_current_user_input(record: &Record, current_input: &str) -> bool {
+    record.kind == ContextKind::UserMessage && record.content == current_input
 }
 
 /// Diagnostics for engines where everything retained counts as active.

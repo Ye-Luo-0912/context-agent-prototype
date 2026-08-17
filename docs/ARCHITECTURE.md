@@ -1523,11 +1523,12 @@ The always-visible tool schemas are themselves context. Since V1-M9 the
 runtime control surface is two merged entry points instead of a dozen
 single-purpose meta-tools:
 
-- `context.manage` — `op` dispatch over the four directives (`gc_hint` /
-  `tag` / `lease` / `collect`, producing a `RuntimeDirective`) and the
-  three retrieval queries (`search` / `inspect` / `fetch`, producing an
-  `EngineQuery`). One schema, one description, same invariants: the tool
-  never touches the engine.
+- `context.manage` — `op` dispatch over catalog retrieval (`search` /
+  `inspect` / `fetch`) and deliberate mutations (`tag` / `lease` /
+  `collect` / `admit` / `derive`). `item_id` accepts a bare UUID or the
+  catalog uri `context://run/<uuid>` that search hits return. `gc_hint` is
+  not a model-facing op: the engine owns collection. The tool never
+  touches the engine.
 - `capability.manage` — `op` dispatch over `search` / `inspect` / `load` /
   `unload`, provided identically by the builtin dispatcher and the
   capability-aware dispatcher (which filters out the builtin copy).

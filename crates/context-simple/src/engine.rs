@@ -67,7 +67,7 @@ pub struct SimpleContextConfig {
     /// recent tool observations).
     pub entity_affinity: bool,
     /// Record explicit dependency edges between items sharing entities
-    /// and expand the working set with dependencies of selected items.
+    /// (affinity) and expand the working set with Continuation bodies.
     pub dependency_expansion: bool,
     /// Run the full GC pass (mark roots, sweep, reversible eviction) when
     /// `ContextEngine::gc` is invoked.

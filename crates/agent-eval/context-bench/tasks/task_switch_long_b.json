@@ -54,13 +54,6 @@
       ]
     },
     {
-      "path": "src/auth.rs",
-      "pred": "contains",
-      "needles": [
-        "rate_limit"
-      ]
-    },
-    {
       "path": "src/billing.rs",
       "pred": "not_contains",
       "needles": [

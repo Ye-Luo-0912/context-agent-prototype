@@ -184,7 +184,7 @@ async fn dependency_expansion_pulls_in_dependencies_within_reserved_budget() {
             created_turn: 1,
             last_access_turn: 1,
             last_selected_turn: 1,
-            dependencies: vec![agent_contracts::DependencyEdge::shares(dep_id)],
+            dependencies: vec![agent_contracts::DependencyEdge::continuation(dep_id)],
             tags: Vec::new(),
             keep_alive: false,
             lease_until_turn: None,
@@ -288,7 +288,7 @@ async fn dependency_expansion_can_be_disabled() {
             created_turn: 1,
             last_access_turn: 1,
             last_selected_turn: 1,
-            dependencies: vec![agent_contracts::DependencyEdge::shares(dep_id)],
+            dependencies: vec![agent_contracts::DependencyEdge::continuation(dep_id)],
             tags: Vec::new(),
             keep_alive: false,
             lease_until_turn: None,
@@ -380,7 +380,7 @@ async fn archived_dependency_below_threshold_stays_out() {
             created_turn: 1,
             last_access_turn: 1,
             last_selected_turn: 1,
-            dependencies: vec![agent_contracts::DependencyEdge::shares(dep_id)],
+            dependencies: vec![agent_contracts::DependencyEdge::continuation(dep_id)],
             tags: Vec::new(),
             keep_alive: false,
             lease_until_turn: None,
@@ -448,8 +448,9 @@ async fn archived_dependency_below_threshold_stays_out() {
 async fn pinned_dependency_cannot_break_the_expansion_budget() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
 
-    // A huge pinned constraint: it shares an entity with the observation
-    // below, so the observation links to it as a dependency.
+    // A huge pinned constraint continued by the observation. Entity
+    // overlap would only mint SharesEntities (affinity, not a prompt
+    // body); the budget test needs a Continuation edge.
     let huge_pin = format!("AuthService.rs pinned constraint {}", "x".repeat(8000));
     engine
         .ingest(ContextIngress::Pin {
@@ -473,6 +474,20 @@ async fn pinned_dependency_cannot_break_the_expansion_budget() {
         })
         .await
         .unwrap();
+    {
+        let mut state = engine.state.lock().await;
+        let pin_id = state
+            .items
+            .iter()
+            .find(|item| item.retention == ContextRetention::Pinned)
+            .expect("pin")
+            .id;
+        for item in state.items.iter_mut() {
+            if item.kind == ContextKind::ToolObservation {
+                item.dependencies = vec![agent_contracts::DependencyEdge::continuation(pin_id)];
+            }
+        }
+    }
 
     // Budget big enough for the small observation (primary pass) but far
     // below the pin's token cost: the pin must be reachable only through
@@ -508,4 +523,164 @@ async fn pinned_dependency_cannot_break_the_expansion_budget() {
         snapshot.approx_tokens
     );
     let _ = ids;
+}
+
+fn hub_and_dep(
+    hub_kind: ContextKind,
+    edge: agent_contracts::DependencyEdge,
+    dep_content: String,
+    dep_attention: AttentionState,
+) -> (ContextItem, ContextItem) {
+    let hub_id = ContextItemId::new();
+    let dep_id = edge.target;
+    let hub = ContextItem {
+        id: hub_id,
+        task_id: None,
+        scope_id: None,
+        content: "hub data ".repeat(400),
+        kind: hub_kind,
+        scope: ContextScope::Task,
+        retention: ContextRetention::Working,
+        attention: AttentionState::Active,
+        semantic: SemanticState::Live,
+        importance: 1.0,
+        relevance: 0.5,
+        created_tick: 1,
+        last_access_tick: 1,
+        access_count: 0,
+        created_turn: 1,
+        last_access_turn: 1,
+        last_selected_turn: 1,
+        dependencies: vec![edge],
+        tags: Vec::new(),
+        keep_alive: false,
+        lease_until_turn: None,
+        source: None,
+        residency: agent_contracts::ContextResidency::Resident,
+        gc_generation: 0,
+        evicted_at_tick: None,
+        entities: Vec::new(),
+        file_path: None,
+        file_revision: None,
+    };
+    let dep = ContextItem {
+        id: dep_id,
+        task_id: None,
+        scope_id: None,
+        content: dep_content,
+        kind: ContextKind::UserMessage,
+        scope: ContextScope::Turn,
+        retention: ContextRetention::Working,
+        attention: dep_attention,
+        semantic: SemanticState::Live,
+        importance: 0.0,
+        relevance: 0.0,
+        created_tick: 2,
+        last_access_tick: 2,
+        access_count: 0,
+        created_turn: 1,
+        last_access_turn: 1,
+        last_selected_turn: 1,
+        dependencies: Vec::new(),
+        tags: Vec::new(),
+        keep_alive: false,
+        lease_until_turn: None,
+        source: None,
+        residency: agent_contracts::ContextResidency::Resident,
+        gc_generation: 0,
+        evicted_at_tick: None,
+        entities: Vec::new(),
+        file_path: None,
+        file_revision: None,
+    };
+    (hub, dep)
+}
+
+#[tokio::test]
+async fn shares_entities_does_not_expand_into_the_prompt() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let dep_id = ContextItemId::new();
+    let (hub, dep) = hub_and_dep(
+        ContextKind::UserMessage,
+        agent_contracts::DependencyEdge::shares(dep_id),
+        "raw overlap body".into(),
+        AttentionState::Archived,
+    );
+    {
+        let mut state = engine.state.lock().await;
+        state.items.push(hub);
+        state.items.push(dep);
+    }
+    let snapshot = engine
+        .materialize(ContextQuery {
+            current_input: "go".into(),
+            budget_tokens: 4096,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !snapshot
+            .selected
+            .iter()
+            .any(|selection| selection.reason.contains("included as dependency")),
+        "SharesEntities is affinity, not a prompt citation: {:?}",
+        snapshot
+            .selected
+            .iter()
+            .map(|selection| &selection.reason)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !snapshot.items.iter().any(|item| item.item_id == dep_id),
+        "the overlap target must stay out of the working set"
+    );
+}
+
+#[tokio::test]
+async fn derived_from_does_not_reexpand_compacted_sources() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let dep_id = ContextItemId::new();
+    let (hub, dep) = hub_and_dep(
+        ContextKind::Summary,
+        agent_contracts::DependencyEdge::derived_from(dep_id),
+        "raw episode that compaction already folded".into(),
+        AttentionState::Archived,
+    );
+    {
+        let mut state = engine.state.lock().await;
+        state.items.push(hub);
+        state.items.push(dep);
+    }
+    let snapshot = engine
+        .materialize(ContextQuery {
+            current_input: "go".into(),
+            budget_tokens: 4096,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        snapshot
+            .items
+            .iter()
+            .any(|item| item.kind == ContextKind::Summary),
+        "the compact card itself may be selected"
+    );
+    assert!(
+        !snapshot
+            .selected
+            .iter()
+            .any(|selection| selection.reason.contains("included as dependency")),
+        "DerivedFrom is provenance, not a prompt citation: {:?}",
+        snapshot
+            .selected
+            .iter()
+            .map(|selection| &selection.reason)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !snapshot.items.iter().any(|item| item.item_id == dep_id),
+        "compaction sources must not re-enter through DerivedFrom"
+    );
 }

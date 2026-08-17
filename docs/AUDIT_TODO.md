@@ -410,6 +410,20 @@ Implemented:
   citation; a stored record's entity overlap with a terminal neighbor
   never pins it.
 
+**Typed dependency consumers landed 2026-08-17.** Storage GC already
+honored `is_strong()`. Prompt expansion and full-GC mark/reactivate now
+use `requires_prompt_body()` / `requires_residency()` (`Continuation`
+only). `SharesEntities` stays an affinity graph (ingest still mints it);
+`DerivedFrom` stays storage provenance so episode compaction cannot pull
+raw sources back into the prompt or Warm→Resident. Do not retune
+`active_threshold` / `archive_threshold` / `gc_max_generation` to hide
+this. Regression: `shares_entities_does_not_expand_into_the_prompt`,
+`derived_from_does_not_reexpand_compacted_sources`,
+`gc_does_not_treat_shares_entities_as_a_residency_root`,
+`derived_from_does_not_reactivate_compacted_sources`. Continuation
+expansion and `demoted_dependency_is_recalled_because_a_live_root_depends_on_it`
+remain the positive residency/prompt cases.
+
 Acceptance (new tests): `storage_gc_roots_live_stored_records_through_
 strong_edges` (the reported defect: a Live record's strong edge protects
 its terminal evidence; its weak edge does not),
@@ -991,19 +1005,20 @@ round-trip is unchanged; corrupt/hostile checkpoints are rejected by
 existence is deliberately left to the startup reconcile (which owns blob
 recovery), not to restore.
 
-**Mark/reactivate universe agreement closed 2026-08-10.** The mark phase's
-dependency traversal now resolves edges across every residency — the heap,
-the warm buffer and the external map (entries capture their edges at
-externalize time) — and the reactivate phase honors those marks: a Warm
-buffer item or Cold store entry that a live root depends on is recalled as
-"dependency of a marked root", regardless of closed-scope/completed-task
-guards (the root is live right now) and even when no hot entity names it.
-Previously the traversal only followed edges through the heap and
-reactivation only recalled hot-entity/score matches, so a demoted
-dependency was marked but never brought back. Regression:
-`demoted_dependency_is_recalled_because_a_live_root_depends_on_it` (a low-
-score, non-hot warm-buffer evidence item is recalled because a pinned live
-decision cites it) plus `dependency_edges_resolve_across_heap_buffer_and_store`.
+**Mark/reactivate universe agreement closed 2026-08-10; kind filter
+2026-08-17.** The mark phase's dependency traversal resolves edges across
+every residency — the heap, the warm buffer and the external map — and
+the reactivate phase honors those marks, but only for kinds that
+`requires_residency()` (`Continuation`). A Warm buffer item or Cold store
+entry that a live root *continues* is recalled as "dependency of a marked
+root", regardless of closed-scope/completed-task guards. Weak affinity and
+`DerivedFrom` provenance are not residency roots. Previously the traversal
+followed every edge through the heap only and reactivation only recalled
+hot-entity/score matches. Regression:
+`demoted_dependency_is_recalled_because_a_live_root_depends_on_it` (a
+Continuation target returns) plus
+`derived_from_does_not_reactivate_compacted_sources` and
+`gc_does_not_treat_shares_entities_as_a_residency_root`.
 
 **External-only state no longer skips the GC pass closed 2026-08-10.** The
 pass-skip check treated an empty heap and eviction buffer as "nothing to
@@ -2015,6 +2030,14 @@ Task identity hashes JSON + seed + golden + checker; hidden command sources are
 outside the model-visible seed; CI requires every seed to fail and golden to
 pass; and tests reject planted/restated hidden constraints. Do not reopen that
 work merely because a synthetic workspace intentionally has no Cargo manifest.
+
+**2026-08-17 SPEC/pack re-freeze.** Current-turn representation is
+runtime-owned for A/B/C (`current_turn=...` in SPEC). `task_switch` /
+`task_switch_long_b` verify `pub fn rate_limit(...) -> u32` by compile and
+call, not a `rate_limit` substring. `FROZEN_SPEC_SHA256` and
+`FROZEN_PACK_DIGEST` move with that amendment. `context.manage` no longer
+surfaces `gc_hint`; `item_id` accepts `context://run/<uuid>`.
+
 The remaining evaluator residual is typed tool-failure attribution and a clean
 rerun after the tool-quality preflight, not weaker verification.
 
@@ -2022,7 +2045,7 @@ Until closure, M15, V2, learned/vector policy and PLAT-08 evidence gates stay
 closed. M12/M13 remain independent trusted-execution blockers.
 
 - terminal semantic checks should precede pinned retention;
-- replace weak `SharesEntities` pseudo-dependencies with typed edges;
+- keep typed `SharesEntities` as ranking affinity (not prompt/residency);
 - add store corruption/reconcile and lifecycle growth-slope metrics;
 - [x] fact comparison replays cost and coverage on independent fresh engines;
 - [~] replace the scripted rolling summarizer with a model-backed bounded

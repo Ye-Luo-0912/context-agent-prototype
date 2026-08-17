@@ -575,7 +575,6 @@ sys.exit(0 if "anonymous" in text and "lookup(id)?" not in text else 1)
             ],
             hidden=[
                 hidden("src/auth.rs", "contains", "operator"),
-                hidden("src/auth.rs", "contains", "rate_limit"),
                 hidden("src/billing.rs", "not_contains", "items[i + 1]"),
             ],
             hidden_commands=[{"name": "switch_resume", "script": "switch_resume.py"}],
@@ -599,7 +598,6 @@ sys.exit(0 if "anonymous" in text and "lookup(id)?" not in text else 1)
             ],
             hidden=[
                 hidden("src/auth.rs", "contains", "operator"),
-                hidden("src/auth.rs", "contains", "rate_limit"),
                 hidden("src/billing.rs", "not_contains", "items[i + 1]"),
             ],
             hidden_commands=[{"name": "switch_resume", "script": "switch_resume.py"}],

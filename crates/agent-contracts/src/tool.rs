@@ -1308,9 +1308,9 @@ pub const CAPABILITY_INSPECT: &str = "capability.inspect";
 
 /// The merged control surface: one `capability.manage` entry point (op =
 /// search/inspect/load/unload) and one `context.manage` entry point (op =
-/// gc_hint/tag/lease/collect/search/inspect/fetch) keep the always-visible
-/// schema count small — a dozen single-purpose meta-tools would cost more
-/// model input than the runtime control they provide.
+/// tag/lease/collect/search/inspect/fetch/admit/derive) keep the
+/// always-visible schema count small. `gc_hint` is not model-facing:
+/// collection stays engine-owned.
 pub const CAPABILITY_MANAGE: &str = "capability.manage";
 pub const CONTEXT_MANAGE: &str = "context.manage";
 

@@ -24,7 +24,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::shared::{
-    Record, active_diagnostics, approx_tokens, materialized_items, records_for_ingress,
+    Record, active_diagnostics, approx_tokens, is_current_user_input, materialized_items,
+    records_for_ingress,
 };
 
 /// Configuration for the rolling-summary baseline.
@@ -293,7 +294,7 @@ impl ContextEngine for RollingSummaryEngine {
         Ok(Vec::new())
     }
 
-    async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+    async fn materialize(&self, query: ContextQuery) -> AgentResult<MaterializedContext> {
         let mut state = self.state.lock().expect("rolling state poisoned");
         state.materialization_revision =
             state
@@ -302,7 +303,8 @@ impl ContextEngine for RollingSummaryEngine {
                 .ok_or_else(|| {
                     AgentError::Internal("context materialization id is exhausted".into())
                 })?;
-        let items = materialized_items(&state.records, state.summary.as_ref());
+        let items =
+            materialized_items(&state.records, state.summary.as_ref(), &query.current_input);
         let approx_tokens_total: usize = items
             .iter()
             .map(|item| approx_tokens(&item.content))
@@ -317,13 +319,19 @@ impl ContextEngine for RollingSummaryEngine {
                 breakdown: ScoreBreakdown::default(),
             });
         }
-        selected.extend(state.records.iter().map(|record| ContextSelection {
-            item_id: record.id,
-            score: 1.0,
-            approx_tokens: approx_tokens(&record.content),
-            reason: "append + rolling summary baseline: retained history".into(),
-            breakdown: ScoreBreakdown::default(),
-        }));
+        selected.extend(
+            state
+                .records
+                .iter()
+                .filter(|record| !is_current_user_input(record, &query.current_input))
+                .map(|record| ContextSelection {
+                    item_id: record.id,
+                    score: 1.0,
+                    approx_tokens: approx_tokens(&record.content),
+                    reason: "append + rolling summary baseline: prior history".into(),
+                    breakdown: ScoreBreakdown::default(),
+                }),
+        );
         Ok(MaterializedContext {
             materialization_id: state.materialization_revision,
             focus: None,

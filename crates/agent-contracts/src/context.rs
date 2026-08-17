@@ -203,12 +203,52 @@ pub enum DependencyKind {
 }
 
 impl DependencyKind {
+    /// Ranking / affinity graph: the target may influence selection score
+    /// or working-set clustering. This is not a prompt-inclusion or
+    /// residency root. Auto-minted entity overlap (`SharesEntities`) lives
+    /// here, along with evidence and continuation affinity.
+    pub fn affects_ranking(self) -> bool {
+        matches!(
+            self,
+            DependencyKind::SharesEntities
+                | DependencyKind::EvidenceFor
+                | DependencyKind::Continuation
+        )
+    }
+
+    /// Prompt expansion may copy the target's *body* into the materialized
+    /// working set. Affinity and provenance are not citations-in-the-prompt:
+    /// only a continuation of the same line of work pulls the prior body.
+    pub fn requires_prompt_body(self) -> bool {
+        matches!(self, DependencyKind::Continuation)
+    }
+
+    /// Full-GC mark/reactivate may treat the target as required evidence of
+    /// a live root (Warm → Resident, bypassing closed-scope guards).
+    /// Provenance (`DerivedFrom`) and weak affinity must not resurrect
+    /// compacted or merely-related items.
+    pub fn requires_residency(self) -> bool {
+        matches!(self, DependencyKind::Continuation)
+    }
+
+    /// Storage GC reachability: a deliberate citation that must keep the
+    /// target's blob from permanent deletion. Weak affinity never pins
+    /// storage. Alias of [`Self::is_strong`].
+    pub fn protects_storage(self) -> bool {
+        !matches!(self, DependencyKind::SharesEntities)
+    }
+
     /// Whether this edge is a *strong* citation: a deliberate,
     /// content-preserving reference that must survive permanent deletion.
     /// Weak affinity (`SharesEntities`) is auto-minted from entity
     /// overlap at ingest and must not pin terminal records forever.
+    ///
+    /// This is the storage-GC predicate. Prompt expansion and residency
+    /// mark use [`Self::requires_prompt_body`] and
+    /// [`Self::requires_residency`] instead — a strong citation is not a
+    /// prompt or heap root.
     pub fn is_strong(self) -> bool {
-        !matches!(self, DependencyKind::SharesEntities)
+        self.protects_storage()
     }
 }
 
@@ -230,6 +270,57 @@ impl DependencyEdge {
             target,
             kind: DependencyKind::SharesEntities,
         }
+    }
+
+    pub fn derived_from(target: ContextItemId) -> Self {
+        Self {
+            target,
+            kind: DependencyKind::DerivedFrom,
+        }
+    }
+
+    pub fn evidence_for(target: ContextItemId) -> Self {
+        Self {
+            target,
+            kind: DependencyKind::EvidenceFor,
+        }
+    }
+
+    pub fn verified_by(target: ContextItemId) -> Self {
+        Self {
+            target,
+            kind: DependencyKind::VerifiedBy,
+        }
+    }
+
+    pub fn artifact_of(target: ContextItemId) -> Self {
+        Self {
+            target,
+            kind: DependencyKind::ArtifactOf,
+        }
+    }
+
+    pub fn continuation(target: ContextItemId) -> Self {
+        Self {
+            target,
+            kind: DependencyKind::Continuation,
+        }
+    }
+
+    pub fn affects_ranking(self) -> bool {
+        self.kind.affects_ranking()
+    }
+
+    pub fn requires_prompt_body(self) -> bool {
+        self.kind.requires_prompt_body()
+    }
+
+    pub fn requires_residency(self) -> bool {
+        self.kind.requires_residency()
+    }
+
+    pub fn protects_storage(self) -> bool {
+        self.kind.protects_storage()
     }
 }
 
@@ -1789,6 +1880,54 @@ mod tests {
         let target = ContextItemId::new();
         let legacy: Vec<DependencyEdge> = serde_json::from_str(&format!("[\"{target}\"]")).unwrap();
         assert_eq!(legacy, vec![DependencyEdge::shares(target)]);
+    }
+
+    #[test]
+    fn dependency_kind_consumers_keep_affinity_citation_prompt_and_residency_orthogonal() {
+        use DependencyKind::*;
+        let kinds = [
+            SharesEntities,
+            DerivedFrom,
+            EvidenceFor,
+            VerifiedBy,
+            ArtifactOf,
+            Continuation,
+        ];
+        for kind in kinds {
+            assert_eq!(
+                kind.is_strong(),
+                kind.protects_storage(),
+                "{kind:?}: is_strong is the storage-citation alias"
+            );
+            if kind == SharesEntities {
+                assert!(!kind.requires_prompt_body());
+                assert!(!kind.requires_residency());
+                assert!(!kind.protects_storage());
+            }
+        }
+        assert!(SharesEntities.affects_ranking() && !SharesEntities.requires_prompt_body());
+        assert!(SharesEntities.affects_ranking() && !SharesEntities.requires_residency());
+        assert!(!SharesEntities.protects_storage());
+
+        assert!(!DerivedFrom.affects_ranking());
+        assert!(!DerivedFrom.requires_prompt_body());
+        assert!(!DerivedFrom.requires_residency());
+        assert!(DerivedFrom.protects_storage());
+
+        assert!(EvidenceFor.affects_ranking());
+        assert!(!EvidenceFor.requires_prompt_body());
+        assert!(!EvidenceFor.requires_residency());
+        assert!(EvidenceFor.protects_storage());
+
+        assert!(!VerifiedBy.requires_prompt_body() && !VerifiedBy.requires_residency());
+        assert!(VerifiedBy.protects_storage());
+        assert!(!ArtifactOf.requires_prompt_body() && !ArtifactOf.requires_residency());
+        assert!(ArtifactOf.protects_storage());
+
+        assert!(Continuation.affects_ranking());
+        assert!(Continuation.requires_prompt_body());
+        assert!(Continuation.requires_residency());
+        assert!(Continuation.protects_storage());
     }
 
     #[test]

@@ -22,7 +22,8 @@ mod tests {
     use super::*;
     use agent_contracts::{
         BoundedCompactor, CompactionOutput, CompactionRequest, ContextEngine, ContextHints,
-        ContextIngress, ContextMaintenanceTrigger, ContextQuery, MaterializedContext, ToolOutput,
+        ContextIngress, ContextKind, ContextMaintenanceTrigger, ContextQuery, FocusState,
+        MaterializedContext, TaskId, ToolOutput,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -106,6 +107,83 @@ mod tests {
         assert!(
             tokens_late > tokens_early,
             "append-only history must keep growing: {tokens_early} -> {tokens_late}"
+        );
+    }
+
+    #[tokio::test]
+    async fn baselines_leave_current_turn_to_the_runtime_frame() {
+        let engine = AppendOnlyEngine::new();
+        engine
+            .ingest(ContextIngress::FocusChanged {
+                focus: FocusState::for_task(TaskId::new(), "hello from the user"),
+            })
+            .await
+            .unwrap();
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "hello from the user".into(),
+            })
+            .await
+            .unwrap();
+        let first = engine
+            .materialize(ContextQuery {
+                current_input: "hello from the user".into(),
+                budget_tokens: 100_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            first.selected.is_empty() && first.items.is_empty(),
+            "current user input and focus belong to TurnFrame, not A/B history: {:?}",
+            first
+                .items
+                .iter()
+                .map(|item| (item.kind, item.content.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        engine
+            .ingest(ContextIngress::AssistantMessage {
+                content: "ack".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "second turn".into(),
+            })
+            .await
+            .unwrap();
+        let second = engine
+            .materialize(ContextQuery {
+                current_input: "second turn".into(),
+                budget_tokens: 100_000,
+                hints: ContextHints::default(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            second
+                .items
+                .iter()
+                .any(|item| item.kind == ContextKind::UserMessage
+                    && item.content == "hello from the user"),
+            "prior user messages stay in historical context"
+        );
+        assert!(
+            !second
+                .items
+                .iter()
+                .any(|item| item.content == "second turn"),
+            "the current user message must not duplicate TurnFrame"
+        );
+        assert!(
+            !second
+                .items
+                .iter()
+                .any(|item| item.kind == ContextKind::Goal),
+            "FocusChanged must not mint a Goal history record"
         );
     }
 
