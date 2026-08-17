@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 3,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "603441fc6d51c630a2392c26dcd7c183287ecdbd8c3ab15dca875e9dc9e3e41a",
+      "bytes": 3391,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\nconst HELLO_PREFIX: &str = r#\"{\"v\":2,\"type\":\"hello\",\"value\":\"#;\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    if bytes.starts_with(HELLO_PREFIX) {\n        let value = &bytes[HELLO_PREFIX.len()..];\n        if let Some(value) = value.strip_suffix('}').and_then(parse_json_string) {\n            return Ok(Msg::Hello(value));\n        }\n        return Err(\"invalid hello envelope\".into());\n    }\n\n    if bytes == \"ping\" {\n        return Ok(Msg::Ping);\n    }\n\n    let error = \"unknown\";\n    eprintln!(\"decode error: {error}\");\n    Err(error.into())\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"ping\".into(),\n        Msg::Hello(value) => format!(\n            r#\"{{\"v\":2,\"type\":\"hello\",\"value\":\"{}\"}}\"#,\n            escape_json_string(value)\n        ),\n    }\n}\n\nfn escape_json_string(value: &str) -> String {\n    let mut escaped = String::with_capacity(value.len());\n    for character in value.chars() {\n        match character {\n            '\"' => escaped.push_str(\"\\\\\\\"\"),\n            '\\\\' => escaped.push_str(\"\\\\\\\\\"),\n            '\\n' => escaped.push_str(r#\"\\n\"#),\n            '\\r' => escaped.push_str(r#\"\\r\"#),\n            '\\t' => escaped.push_str(r#\"\\t\"#),\n            '\\u{08}' => escaped.push_str(r#\"\\b\"#),\n            '\\u{0c}' => escaped.push_str(r#\"\\f\"#),\n            character if character.is_control() => {\n                escaped.push_str(&format!(r#\"\\u{:04x}\"#, character as u32));\n            }\n            character => escaped.push(character),\n        }\n    }\n    escaped\n}\n\nfn parse_json_string(input: &str) -> Option<String> {\n    let mut characters = input.chars();\n    if characters.next()? != '\"' {\n        return None;\n    }\n\n    let mut value = String::new();\n    while let Some(character) = characters.next() {\n        match character {\n            '\"' => {\n                if characters.next().is_some() {\n                    return None;\n                }\n                return Some(value);\n            }\n            '\\\\' => match characters.next()? {\n                '\"' => value.push('\"'),\n                '\\\\' => value.push('\\\\'),\n                '/' => value.push('/'),\n                'b' => value.push('\\u{08}'),\n                'f' => value.push('\\u{0c}'),\n                'n' => value.push('\\n'),\n                'r' => value.push('\\r'),\n                't' => value.push('\\t'),\n                _ => return None,\n            },\n            character if character.is_control() => return None,\n            character => value.push(character),\n        }\n    }\n    None\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn encode_roundtrip(msg: Msg) -> Result<Msg, String> {\n        decode(&encode(&msg))\n    }\n\n    #[test]\n    fn ping_encode_roundtrip() {\n        assert!(matches!(encode_roundtrip(Msg::Ping), Ok(Msg::Ping)));\n    }\n\n    #[test]\n    fn hello_uses_v2_envelope() {\n        let msg = Msg::Hello(\"client \\\"one\\\"\".into());\n        assert_eq!(\n            encode(&msg),\n            r#\"{\"v\":2,\"type\":\"hello\",\"value\":\"client \\\"one\\\"\"}\"#\n        );\n        assert!(matches!(decode(&encode(&msg)), Ok(Msg::Hello(value)) if value == \"client \\\"one\\\"\"));\n    }\n\n    #[test]\n    fn hello_requires_v2_envelope() {\n        assert!(decode(r#\"{\"type\":\"hello\",\"value\":\"client\"}\"#).is_err());\n        assert!(decode(r#\"{\"v\":1,\"type\":\"hello\",\"value\":\"client\"}\"#).is_err());\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpAt7VZv\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

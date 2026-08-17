@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 7,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 3,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "84a0b39ee2bbd6a0b6427b4de741c29b62c6536d9d065ee75d8f4f6db42432d0",
+      "bytes": 1478,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    if bytes.contains(\"ping\") {\n        return Ok(Msg::Ping);\n    }\n\n    const HELLO_PREFIX: &str = \"v:2|hello|\";\n    if let Some(name) = bytes.strip_prefix(HELLO_PREFIX) {\n        return Ok(Msg::Hello(name.into()));\n    }\n\n    Err(\"unknown\".into())\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"ping\".into(),\n        Msg::Hello(name) => format!(\"v:2|hello|{name}\"),\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn encode_roundtrip(msg: &Msg) -> Result<Msg, String> {\n        decode(&encode(msg))\n    }\n\n    #[test]\n    fn ping_encode_roundtrip() {\n        assert!(matches!(encode_roundtrip(&Msg::Ping), Ok(Msg::Ping)));\n    }\n\n    #[test]\n    fn hello_uses_v2_envelope_and_roundtrips() {\n        let msg = Msg::Hello(\"Ada Lovelace\".into());\n\n        assert_eq!(encode(&msg), \"v:2|hello|Ada Lovelace\");\n        assert!(matches!(\n            encode_roundtrip(&msg),\n            Ok(Msg::Hello(name)) if name == \"Ada Lovelace\"\n        ));\n    }\n\n    #[test]\n    fn hello_payload_is_opaque() {\n        let msg = Msg::Hello(\"Ada|Lovelace\".into());\n\n        assert!(matches!(\n            encode_roundtrip(&msg),\n            Ok(Msg::Hello(name)) if name == \"Ada|Lovelace\"\n        ));\n    }\n\n    #[test]\n    fn unsupported_versions_are_rejected() {\n        assert!(matches!(decode(\"v:1|hello|Ada\"), Err(error) if error == \"unknown\"));\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpAt7VZv\\rolling"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

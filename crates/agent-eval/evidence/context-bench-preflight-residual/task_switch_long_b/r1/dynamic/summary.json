@@ -1,0 +1,101 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "verify_failed",
+  "error": null,
+  "passed": false,
+  "wall_ms": 237199,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 1697,
+  "model_started": 40,
+  "model_used": 40,
+  "usage_incomplete": false,
+  "workspace_sha256": "928c5967ea6917362b7506122956176ed3eadc6fac6c81cf0a86ee6a602ce397",
+  "workspace_files": 30,
+  "tools": [
+    {
+      "name": "edit.replace",
+      "calls": 11,
+      "failed": 9
+    },
+    {
+      "name": "fs.list",
+      "calls": 5,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 14,
+      "failed": 0
+    },
+    {
+      "name": "fs.write",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 7,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 6,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 8,
+      "failed": 1
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 190,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 4752,
+    "compaction_output_tokens": 195,
+    "failed_tool_outputs": 10,
+    "fetch_calls": 0,
+    "final_resident_bytes": 3214,
+    "forgotten_items": 56,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 156,
+    "materialize_rounds": 40,
+    "model_input_tokens": 282503,
+    "model_output_tokens": 6764,
+    "peak_resident_bytes": 3649,
+    "provider_tokens_total": 294214,
+    "recovered_items": 18,
+    "recovery_auto_reactivation": 18,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 38,
+    "recovery_workspace_reread": 12,
+    "repeated_fs_reads": 12,
+    "rounds": 40,
+    "schema_tokens_total": 61120,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "search_ms_p50": 0,
+    "search_ms_p95": 0,
+    "tool_calls": 57,
+    "tool_failure_classes": {
+      "ambiguous_match": 1,
+      "no_exact_match": 6,
+      "no_search_match": 1,
+      "process_exit": 1,
+      "stale_revision": 2
+    },
+    "turns": 7
+  }
+}

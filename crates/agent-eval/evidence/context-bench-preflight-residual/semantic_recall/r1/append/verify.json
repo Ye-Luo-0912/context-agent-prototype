@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 6,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 3,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "c1c2d76d0d2f67119a9274c444ce2f9d4c94b45f5c213a8fe9986f8c8c9ad383",
+      "bytes": 1033,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    if let Some(payload) = bytes.strip_prefix(\"v:2;hello:\") {\n        return Ok(Msg::Hello(payload.into()));\n    }\n    if bytes.contains(\"ping\") {\n        return Ok(Msg::Ping);\n    }\n    eprintln!(\"decode error: unknown message\");\n    Err(\"unknown\".into())\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"ping\".into(),\n        Msg::Hello(value) => format!(\"v:2;hello:{value}\"),\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn ping_encode_roundtrip() {\n        assert!(matches!(decode(&encode(&Msg::Ping)), Ok(Msg::Ping)));\n    }\n\n    #[test]\n    fn hello_encode_roundtrip() {\n        let message = Msg::Hello(\"desktop:client\".into());\n        assert!(matches!(decode(&encode(&message)), Ok(Msg::Hello(value)) if value == \"desktop:client\"));\n    }\n\n    #[test]\n    fn hello_uses_v2_envelope() {\n        assert_eq!(encode(&Msg::Hello(\"client\".into())), \"v:2;hello:client\");\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpAt7VZv\\append"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

@@ -1,0 +1,107 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 586442,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 2756,
+  "model_started": 53,
+  "model_used": 53,
+  "usage_incomplete": false,
+  "workspace_sha256": "9e7257d096b5295ab25cea0f4ced7a019e3de5e646fabb48108fd1dd148c39d1",
+  "workspace_files": 28,
+  "tools": [
+    {
+      "name": "context.manage",
+      "calls": 19,
+      "failed": 9
+    },
+    {
+      "name": "edit.replace",
+      "calls": 9,
+      "failed": 5
+    },
+    {
+      "name": "fs.list",
+      "calls": 7,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 13,
+      "failed": 0
+    },
+    {
+      "name": "fs.write",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 5,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 7,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 4,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 19,
+      "failed": 4
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 564,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 6,
+    "admit_calls": 0,
+    "compaction_input_tokens": 38456,
+    "compaction_output_tokens": 1051,
+    "failed_tool_outputs": 18,
+    "fetch_calls": 0,
+    "final_resident_bytes": 8466,
+    "forgotten_items": 94,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 315,
+    "materialize_rounds": 53,
+    "model_input_tokens": 526222,
+    "model_output_tokens": 14492,
+    "peak_resident_bytes": 8466,
+    "provider_tokens_total": 580221,
+    "recovered_items": 34,
+    "recovery_auto_reactivation": 32,
+    "recovery_explicit_search": 2,
+    "recovery_failed": 60,
+    "recovery_workspace_reread": 12,
+    "repeated_fs_reads": 12,
+    "rounds": 53,
+    "schema_tokens_total": 80984,
+    "search_calls": 6,
+    "search_empty": 3,
+    "search_hits": 6,
+    "search_ms_p50": 3,
+    "search_ms_p95": 4,
+    "tool_calls": 86,
+    "tool_failure_classes": {
+      "invalid_request": 9,
+      "missing_project_marker": 2,
+      "no_exact_match": 1,
+      "no_search_match": 2,
+      "process_exit": 2,
+      "stale_revision": 4
+    },
+    "turns": 9
+  }
+}
