@@ -287,6 +287,7 @@ async fn registration_rejects_oversized_or_malformed_tool_schemas() {
         input_schema: json!({"padding": "x".repeat(5 * 1024)}),
         risk: ToolRisk::ReadOnly,
         output_budget: None,
+        roles: Vec::new(),
     }];
     let error = registry
         .register(Arc::new(big))

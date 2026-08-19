@@ -2,7 +2,7 @@ use std::path::Path;
 
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, Effect, RunId, ToolOutcome, ToolOutput, ToolRisk,
-    ToolSpec,
+    ToolSemanticRole, ToolSpec,
 };
 use agent_workspace::Workspace;
 use async_trait::async_trait;
@@ -63,6 +63,7 @@ impl Tool for FsListTool {
             }),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::Search],
         }
     }
 
@@ -288,6 +289,7 @@ impl Tool for FsReadTool {
             }),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::ReadResource],
         }
     }
 
@@ -460,6 +462,7 @@ impl Tool for FsWriteTool {
             }),
             risk: ToolRisk::WorkspaceWrite,
             output_budget: None,
+            roles: vec![ToolSemanticRole::Mutate],
         }
     }
 

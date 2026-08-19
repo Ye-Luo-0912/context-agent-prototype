@@ -877,21 +877,36 @@ projected claim carries `anchor_revision`, `source_field_id`, and a
 projection, so a finished task's records stop being rooted.
 
 The same materialize request also carries a bounded `TaskAnchorView` on
-`ContextHints.task` for engine-internal root policy. The assembler renders
-Focus / TaskAnchor / TaskProgress from the runtime `TaskManager`; production
+`ContextHints.task` for engine-internal root policy. The assembler renders Focus (`TASK ORIGIN` / `PERSISTENT TASK STATE` /
+`CURRENT DIRECTIVE`) and TaskProgress from the runtime `TaskManager`; production
 engines leave `MaterializedContext.focus` / `.task` empty.
 
-`CTX-11` is a bounded operational cache (`ResumePoint`) on `TaskRecord`,
-bound to `task_id + anchor_revision + workspace_revision`.
-`TaskProgressView` projects checked resources, revision-bound verification
-state, and unresolved operation failures under a total prompt hard cap. It
+`CTX-11` is a bounded operational cache (`ExecutionState`, checkpointed as
+`resume` on `TaskRecord`) bound to `task_id + anchor_revision +
+workspace_revision`. Prompt framing is `TASK ORIGIN` (historical
+`original_goal`), `PERSISTENT TASK STATE` (constraints / acceptance /
+plan / open loops), and `CURRENT DIRECTIVE` (this user turn). Temporal
+wording on the origin is not a perpetual instruction. The state algorithm
+lives in `agent-runtime/src/execution/` (`state`, `freshness`, `needs`);
+`policy.rs` maps `ExecutionNeeds` onto catalog `ToolSpec.roles`.
+NeedVerify resolves `Verify` → capability search → `EscapeHatch`;
+`InspectDiff` is not a verifier and Runtime does not know that cargo
+uses `shell.exec`. A phase-2
+semantic read memo may cache `fs.read` / `git.status` / `git.diff` /
+`search.grep` later; it must never intercept write, patch, or shell
+side-effects. `TaskProgressView` projects checked resources, revision-bound
+verification state, and unresolved operation failures under a total prompt
+hard cap. It
 does not own objective / blockers / next-actions. The durable cache still
 updates after the turn commit barrier. The prompt projection additionally
 folds persistable open-turn `TurnFrame` tool results so the current coding
 loop sees `path@revision` before that barrier. Transient retrieval results
 stay out of both. Checked files come from stamped `ResourceTouch`
 paths (`metadata.path` and `metadata.files[]`); a may-mutate observation
-without a touch still clears them. Selected historical `fs.read` bodies
+without a touch is an `Unknown` footprint: `workspace_revision` still
+advances (old PASS is omitted) but known `path@revision` facts are kept
+and marked `NeedsRevalidation` for a hash-only BeforeModel revalidate.
+Selected historical `fs.read` bodies
 and stamped-path identity logs whose path is already Checked are omitted
 from SELECTED WORKING CONTEXT (the item header keeps `path@revision`);
 the current TurnFrame still carries live tool bodies. Errors keep their

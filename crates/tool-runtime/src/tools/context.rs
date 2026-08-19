@@ -19,7 +19,7 @@
 use agent_contracts::{
     AgentError, AgentResult, CONTEXT_MANAGE, CancellationToken, ContextAction, ContextItemId,
     ContextKind, ContextScope, EngineQuery, RunId, TaskId, ToolOutcome, ToolOutput, ToolRisk,
-    ToolSpec,
+    ToolSemanticRole, ToolSpec,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -142,6 +142,7 @@ impl Tool for ContextManageTool {
             }),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::Search],
         }
     }
 

@@ -1,0 +1,143 @@
+//! E2E `fs.read` motive: why the model needed to read this path.
+
+use agent_contracts::{
+    FS_READ_MOTIVE_KEY, FsReadMotive, FsRereadClass, ResourceFreshness, ToolOutput,
+};
+
+use super::state::ResourceFact;
+
+/// Combine engine residency with the prior resource fact.
+///
+/// Priority answers "why this read":
+/// 1. `changed` — digest actually moved (legitimate).
+/// 2. `warm` / `stored` — GC dropped the body.
+/// 3. `needs-revalidation` — Runtime should have hashed instead.
+/// 4. `selected-current` — body was in the last prompt (trajectory).
+/// 5. `checked-fresh` — Runtime already knew `path@rev`.
+/// 6. `first` — first exploration.
+pub fn classify_fs_read_motive(
+    residency: FsRereadClass,
+    prior: Option<&ResourceFact>,
+    new_digest: Option<&str>,
+) -> FsReadMotive {
+    let new_digest = new_digest.filter(|digest| !digest.is_empty());
+    if let Some(fact) = prior {
+        let old = (!fact.digest.is_empty()).then_some(fact.digest.as_str());
+        if let (Some(old), Some(new)) = (old, new_digest)
+            && old != new
+        {
+            return FsReadMotive::Changed;
+        }
+    }
+    match residency {
+        FsRereadClass::Warm => return FsReadMotive::Warm,
+        FsRereadClass::Stored => return FsReadMotive::Stored,
+        FsRereadClass::FirstRead
+        | FsRereadClass::PreviouslySelected
+        | FsRereadClass::ResidentUnselected => {}
+    }
+    if let Some(fact) = prior {
+        if fact.freshness == ResourceFreshness::NeedsRevalidation {
+            return FsReadMotive::NeedsRevalidation;
+        }
+        if fact.freshness == ResourceFreshness::Fresh {
+            if residency == FsRereadClass::PreviouslySelected {
+                return FsReadMotive::SelectedCurrent;
+            }
+            return FsReadMotive::CheckedFresh;
+        }
+    }
+    match residency {
+        FsRereadClass::PreviouslySelected | FsRereadClass::ResidentUnselected => {
+            FsReadMotive::SelectedCurrent
+        }
+        FsRereadClass::FirstRead => FsReadMotive::First,
+        FsRereadClass::Warm => FsReadMotive::Warm,
+        FsRereadClass::Stored => FsReadMotive::Stored,
+    }
+}
+
+pub fn stamp_fs_read_motive(output: &mut ToolOutput, motive: FsReadMotive) {
+    if !output.metadata.is_object() {
+        output.metadata = serde_json::json!({});
+    }
+    if let Some(object) = output.metadata.as_object_mut() {
+        object.insert(
+            FS_READ_MOTIVE_KEY.to_string(),
+            serde_json::Value::String(motive.as_str().to_string()),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_contracts::ResourceFreshness;
+
+    fn fact(digest: &str, freshness: ResourceFreshness) -> ResourceFact {
+        ResourceFact {
+            path: "src/util.py".into(),
+            digest: digest.into(),
+            freshness,
+            turn: 1,
+        }
+    }
+
+    #[test]
+    fn same_hash_after_unknown_is_checked_fresh_not_first() {
+        // Engine has not ingested this turn's body yet, so residency is
+        // first-read; Runtime still holds util.py@B.
+        let motive = classify_fs_read_motive(
+            FsRereadClass::FirstRead,
+            Some(&fact("revB", ResourceFreshness::Fresh)),
+            Some("revB"),
+        );
+        assert_eq!(motive, FsReadMotive::CheckedFresh);
+    }
+
+    #[test]
+    fn body_in_last_prompt_is_selected_current() {
+        let motive = classify_fs_read_motive(
+            FsRereadClass::PreviouslySelected,
+            Some(&fact("revB", ResourceFreshness::Fresh)),
+            Some("revB"),
+        );
+        assert_eq!(motive, FsReadMotive::SelectedCurrent);
+    }
+
+    #[test]
+    fn gc_warm_wins_over_fresh_identity() {
+        let motive = classify_fs_read_motive(
+            FsRereadClass::Warm,
+            Some(&fact("revB", ResourceFreshness::Fresh)),
+            Some("revB"),
+        );
+        assert_eq!(motive, FsReadMotive::Warm);
+    }
+
+    #[test]
+    fn digest_change_is_changed() {
+        let motive = classify_fs_read_motive(
+            FsRereadClass::PreviouslySelected,
+            Some(&fact("revA", ResourceFreshness::Fresh)),
+            Some("revB"),
+        );
+        assert_eq!(motive, FsReadMotive::Changed);
+    }
+
+    #[test]
+    fn pending_revalidation_without_gc_is_needs_revalidation() {
+        let motive = classify_fs_read_motive(
+            FsRereadClass::ResidentUnselected,
+            Some(&fact("revB", ResourceFreshness::NeedsRevalidation)),
+            Some("revB"),
+        );
+        assert_eq!(motive, FsReadMotive::NeedsRevalidation);
+    }
+
+    #[test]
+    fn no_fact_first_read_is_first() {
+        let motive = classify_fs_read_motive(FsRereadClass::FirstRead, None, Some("revA"));
+        assert_eq!(motive, FsReadMotive::First);
+    }
+}

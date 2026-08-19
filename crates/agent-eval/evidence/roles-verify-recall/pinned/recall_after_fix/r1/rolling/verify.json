@@ -1,0 +1,117 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content",
+  "fixture_id": "recall_after_fix",
+  "expected_edit": "fix util, write the scratch notes, then add main.py that calls visit_all without reintroducing i + 1",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/util.py",
+      "pred": "not_contains",
+      "needles": [
+        "i + 1"
+      ],
+      "count": 0,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/util.py",
+      "pred": "contains",
+      "needles": [
+        "range(len(items))"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/scratch.md",
+      "pred": "contains",
+      "needles": [
+        "Breville"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/scratch.md",
+      "pred": "contains",
+      "needles": [
+        "200"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/scratch.md",
+      "pred": "contains",
+      "needles": [
+        "HDMI"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/scratch.md",
+      "pred": "contains",
+      "needles": [
+        "4B"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/main.py",
+      "pred": "contains",
+      "needles": [
+        "visit_all"
+      ],
+      "count": 2,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/main.py",
+      "pred": "not_contains",
+      "needles": [
+        "i + 1"
+      ],
+      "count": 0,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/main.py",
+      "exists": true,
+      "sha256": "f425e6ac7da2e77eabdc44281c709147b6e174f077292b57e2cd70f136377db5",
+      "bytes": 56,
+      "truncated": false,
+      "body": "from util import visit_all\n\nprint(visit_all([1, 2, 3]))\n"
+    },
+    {
+      "path": "src/scratch.md",
+      "exists": true,
+      "sha256": "71573e13797ec19de74ce7a591293a26c8af020deccd0ecb8de51d3d91c5643b",
+      "bytes": 152,
+      "truncated": false,
+      "body": "The office coffee machine is a Breville.\nThe staff kitchen code is 200.\nThe wifi guest password is listed on the fridge, and the printer is in room 4B.\n"
+    },
+    {
+      "path": "src/util.py",
+      "exists": true,
+      "sha256": "29518eb386a5596bf9fed563519ff96e33891c89366fe01b209e1d2eb2cbafc6",
+      "bytes": 111,
+      "truncated": false,
+      "body": "def visit_all(items):\n    out = []\n    for i in range(len(items)):\n        out.append(items[i])\n    return out\n"
+    }
+  ],
+  "commands": []
+}

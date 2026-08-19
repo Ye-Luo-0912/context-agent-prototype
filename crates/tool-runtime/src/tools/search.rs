@@ -7,7 +7,7 @@
 
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, RunId, ToolFailureClass, ToolOutcome, ToolOutput,
-    ToolRisk, ToolSpec, attach_failure_class,
+    ToolRisk, ToolSemanticRole, ToolSpec, attach_failure_class,
 };
 use agent_workspace::Workspace;
 use async_trait::async_trait;
@@ -116,6 +116,7 @@ impl Tool for SearchGrepTool {
             }),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::Search],
         }
     }
 

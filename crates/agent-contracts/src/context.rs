@@ -52,6 +52,43 @@ pub struct ResourceTouch {
     pub revision: Option<String>,
 }
 
+/// Knowledge-plane answer to "which known resource facts did this
+/// operation invalidate?" Orthogonal to [`crate::ToolOutput::may_mutate_workspace`]:
+/// a process may be allowed to write the workspace (authority) without
+/// proving that every previously observed file identity is dead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationFootprint {
+    /// No workspace write is possible.
+    None,
+    /// Writes are confined to these stamped touches.
+    Known(Vec<ResourceTouch>),
+    /// A write is possible but the touched set is unknown (`shell.exec`
+    /// without `ResourceTouch`, `__pycache__`, and so on).
+    Unknown,
+}
+
+/// Freshness of one operational resource fact. Unknown workspace mutation
+/// marks known identities `NeedsRevalidation`; it must not drop them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceFreshness {
+    #[default]
+    Fresh,
+    NeedsRevalidation,
+    Missing,
+}
+
+/// Narrow trusted hash/identity lookup. Workspace implements this;
+/// tools never see the context engine. The runtime revalidates pending
+/// facts at the BeforeModel safe point (hash only, no file body in the
+/// prompt, no extra model round).
+#[async_trait]
+pub trait ResourceVersionOracle: Send + Sync {
+    /// SHA-256 hex of the current workspace bytes, or `None` if the path
+    /// is absent. Other I/O errors propagate so the caller can skip.
+    async fn revision(&self, key: &str) -> crate::AgentResult<Option<String>>;
+}
+
 /// Slash-normalize a workspace path for identity (`\` → `/`, trim, strip
 /// a leading `./`, then cap length). Empty after trim is empty.
 pub fn normalize_resource_path(path: &str) -> String {
@@ -86,6 +123,63 @@ impl FsRereadClass {
         }
     }
 }
+
+/// Why the model issued this `fs.read`, combining engine residency with
+/// Runtime resource-fact freshness. Mutually exclusive. Engine-only
+/// [`FsRereadClass`] remains the GC/residency axis; this is the E2E
+/// "why did the model need to re-read?" axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FsReadMotive {
+    /// First exploration of this path.
+    First,
+    /// Body was in the last prompt; the model still re-read (trajectory).
+    SelectedCurrent,
+    /// Runtime already knew `path@revision` was Fresh.
+    CheckedFresh,
+    /// Runtime was uncertain; VersionOracle should have settled this.
+    NeedsRevalidation,
+    /// Body was in the warm eviction buffer (GC-induced rehydration).
+    Warm,
+    /// Body was in the store (GC-induced rehydration).
+    Stored,
+    /// File bytes actually changed; a reread is justified.
+    Changed,
+}
+
+impl FsReadMotive {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::First => "first",
+            Self::SelectedCurrent => "selected-current",
+            Self::CheckedFresh => "checked-fresh",
+            Self::NeedsRevalidation => "needs-revalidation",
+            Self::Warm => "warm",
+            Self::Stored => "stored",
+            Self::Changed => "changed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "first" => Some(Self::First),
+            "selected-current" => Some(Self::SelectedCurrent),
+            "checked-fresh" => Some(Self::CheckedFresh),
+            "needs-revalidation" => Some(Self::NeedsRevalidation),
+            "warm" => Some(Self::Warm),
+            "stored" => Some(Self::Stored),
+            "changed" => Some(Self::Changed),
+            _ => None,
+        }
+    }
+
+    pub fn gc_induced(self) -> bool {
+        matches!(self, Self::Warm | Self::Stored)
+    }
+}
+
+/// Runtime-stamped `ToolOutput.metadata` key for [`FsReadMotive`].
+pub const FS_READ_MOTIVE_KEY: &str = "fs_read_motive";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ContextScope {
@@ -760,7 +854,7 @@ impl TaskAnchorView {
     }
 }
 
-/// Bounded prompt projection of a `ResumePoint`. Operational cache only:
+/// Bounded prompt projection of an `ExecutionState`. Operational cache only:
 /// checked resources, revision-bound verification facts, failed operations.
 /// Goal/blockers/next-actions belong to `TaskAnchor`. Bodies stay in storage.
 /// Prompt projection is hard-capped by [`MAX_TASK_PROGRESS_PROMPT_CHARS`].
@@ -1798,6 +1892,14 @@ pub trait ContextEngine: Send + Sync {
     async fn close_scope(&self, scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>>;
 
     async fn diagnostics(&self) -> AgentResult<ContextDiagnostics>;
+
+    /// Where a workspace path currently lives, for `fs.read` attribution.
+    /// Read-only. Default treats the path as a first read so engines without
+    /// a catalog cannot pretend they measured GC-caused rereads.
+    async fn fs_read_residency(&self, path: &str) -> AgentResult<FsRereadClass> {
+        let _ = path;
+        Ok(FsRereadClass::FirstRead)
+    }
 
     /// Run the conservative Storage GC: permanently delete context-store
     /// entries whose semantic lifecycle ended and that nothing references

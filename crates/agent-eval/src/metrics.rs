@@ -9,7 +9,8 @@
 //! without a model and reused by the live harness.
 
 use agent_contracts::{
-    CAPABILITY_MANAGE, CONTEXT_MANAGE, ContextItemId, RuntimeEvent, RuntimeEventEnvelope,
+    CAPABILITY_MANAGE, CONTEXT_MANAGE, ContextItemId, FS_READ_MOTIVE_KEY, FsReadMotive,
+    RuntimeEvent, RuntimeEventEnvelope,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -68,6 +69,14 @@ pub struct RunMetrics {
     pub reread_warm: u64,
     pub reread_stored: u64,
     pub reread_first_read: u64,
+    /// E2E `fs.read` motive from Runtime-stamped ToolFinished metadata.
+    pub reread_motive_first: u64,
+    pub reread_motive_selected_current: u64,
+    pub reread_motive_checked_fresh: u64,
+    pub reread_motive_needs_revalidation: u64,
+    pub reread_motive_warm: u64,
+    pub reread_motive_stored: u64,
+    pub reread_motive_changed: u64,
     /// Selected-token attribution across `ContextPrepared` previews.
     pub selected_tokens_by_kind: BTreeMap<String, u64>,
     pub selected_tokens_by_reason: BTreeMap<String, u64>,
@@ -222,6 +231,27 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             RuntimeEvent::ToolFinished { output } => {
                 if !output.ok {
                     metrics.failed_tool_outputs += 1;
+                }
+                if output.tool_name == "fs.read"
+                    && let Some(motive) = output
+                        .metadata
+                        .get(FS_READ_MOTIVE_KEY)
+                        .and_then(|value| value.as_str())
+                        .and_then(FsReadMotive::parse)
+                {
+                    match motive {
+                        FsReadMotive::First => metrics.reread_motive_first += 1,
+                        FsReadMotive::SelectedCurrent => {
+                            metrics.reread_motive_selected_current += 1
+                        }
+                        FsReadMotive::CheckedFresh => metrics.reread_motive_checked_fresh += 1,
+                        FsReadMotive::NeedsRevalidation => {
+                            metrics.reread_motive_needs_revalidation += 1
+                        }
+                        FsReadMotive::Warm => metrics.reread_motive_warm += 1,
+                        FsReadMotive::Stored => metrics.reread_motive_stored += 1,
+                        FsReadMotive::Changed => metrics.reread_motive_changed += 1,
+                    }
                 }
                 if let Some(class) = output.failure_class() {
                     *metrics
@@ -592,6 +622,7 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          compaction: in={} out={}\n\
          behavior: tool_calls={} failed_outputs={} spills={} output_chars={} repeated_fs_reads={}\n\
          reread: previously_selected={} resident_unselected={} warm={} stored={} first_read={}\n\
+         reread_motive: first={} selected_current={} checked_fresh={} needs_revalidation={} warm={} stored={} changed={}\n\
          selected_attr: kind={:?} reason={:?} source={:?} reactivated={} resident={}\n\
          tool_failures: {:?}\n",
         metrics.model_input_tokens,
@@ -675,6 +706,13 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.reread_warm,
         metrics.reread_stored,
         metrics.reread_first_read,
+        metrics.reread_motive_first,
+        metrics.reread_motive_selected_current,
+        metrics.reread_motive_checked_fresh,
+        metrics.reread_motive_needs_revalidation,
+        metrics.reread_motive_warm,
+        metrics.reread_motive_stored,
+        metrics.reread_motive_changed,
         metrics.selected_tokens_by_kind,
         metrics.selected_tokens_by_reason,
         metrics.selected_tokens_by_source,
@@ -1290,5 +1328,32 @@ mod tests {
         // A single sample is both p50 and p95.
         assert_eq!(percentile(&[7u64], 50), 7);
         assert_eq!(percentile(&[7u64], 95), 7);
+    }
+
+    #[test]
+    fn fs_read_motive_is_counted_from_tool_finished_metadata() {
+        let run = RunId::new();
+        let events = vec![envelope(
+            run,
+            1,
+            RuntimeEvent::ToolFinished {
+                output: ToolOutput {
+                    call_id: "r1".into(),
+                    tool_name: "fs.read".into(),
+                    ok: true,
+                    summary: "read".into(),
+                    model_content: "body".into(),
+                    artifact_ref: None,
+                    metadata: json!({
+                        "path": "src/util.py",
+                        FS_READ_MOTIVE_KEY: "checked-fresh",
+                    }),
+                },
+            },
+        )];
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.reread_motive_checked_fresh, 1);
+        assert_eq!(metrics.reread_motive_first, 0);
+        assert!(render_metrics(&metrics).contains("checked_fresh=1"));
     }
 }

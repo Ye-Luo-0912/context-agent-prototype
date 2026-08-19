@@ -12,15 +12,41 @@ audit narrative stays in `docs/AUDIT_TODO.md`, `docs/ROADMAP.md`, and
 - Production engines leave `MaterializedContext.focus` and `.task` empty.
   Restore alignment reads `ContextDiagnostics.focus_task_id`, not
   materialized focus.
-- `PromptAssembler` renders System Policy, Runtime Facts, Focus,
-  TaskAnchor, TaskProgress, historical context, Turn Frame, and tool
-  schemas from runtime-owned state.
-- `TaskAnchor` is the only task authority. `ResumePoint` is a bounded
-  operational cache applied after the durable `TurnCompleted` barrier.
+- `PromptAssembler` renders System Policy, Runtime Facts, Focus
+  (`TASK ORIGIN`, `PERSISTENT TASK STATE`, `CURRENT DIRECTIVE`),
+  TaskProgress, historical context, Turn Frame, and tool schemas from
+  runtime-owned state.
+- `TaskAnchor` is the only task authority. `ExecutionState` (checkpointed
+  as `resume` on `TaskRecord`) is a bounded operational cache applied
+  after the durable `TurnCompleted` barrier.
   Verification facts bind to the `anchor_revision + workspace_revision`
   that produced them and never auto-promote after a later mutation.
   Verification and workspace mutation are orthogonal: a typed
   verification does not imply a non-mutating command.
+  `may_mutate_workspace` is the authority/safety fence; knowledge
+  freshness uses `MutationFootprint` (`None` / `Known(touches)` /
+  `Unknown`). An unknown process write bumps `workspace_revision` (old
+  PASS is omitted) but keeps `path@revision` facts and marks them
+  `NeedsRevalidation`. Runtime revalidates up to 8 pending facts at
+  BeforeModel by hashing through `ResourceVersionOracle` (no file body
+  in the prompt, no extra model round).
+- `TaskAnchor.original_goal` is task identity / historical origin, not
+  the current instruction. Each user turn's `FocusState.current_query`
+  is the highest-priority TurnIntent. Do not bump `anchor_revision` on
+  every user message.
+- Tool-surface policy maps `derive_needs(TurnIntent, TaskSpec, operational
+  state)` → `ToolSemanticRole` on catalog `ToolSpec.roles`. NeedVerify
+  prefers a declared `Verify` role, else catalog discovery
+  (`capability.manage`), else an `EscapeHatch`. It does not prefer
+  `InspectDiff` (`git.status` / `git.diff`) and does not encode that
+  cargo verification uses `shell.exec`. NeedVerify is due only for this
+  turn's source changes, an open failed verification, or an explicit
+  verify request — not because `acceptance_criteria` is nonempty and not
+  because an Unknown process (`__pycache__`) bumped the world clock. A
+  new user turn replaces TurnIntent and clears per-turn source-change; it
+  does not rewrite TaskSpec or bump `anchor_revision`. C-hygiene
+  (`ResourceTouch` heating, tool-hot TTL, Checked omit) stays; P3/P4
+  stay ablation-only.
 - Dead ResumePoint fields (`objective` / `blockers` / `next_actions` /
   `last_cursor` / `workspace_facts_stale`) are gone. TaskProgress prompt
   projection is hard-capped (`MAX_TASK_PROGRESS_PROMPT_CHARS`).
@@ -64,16 +90,28 @@ are frozen as operational fact. Do not retune `active_threshold` /
 `archive_threshold` / `gc_max_generation` / reactivation scoring, and
 do not change frozen Context Bench SPEC.
 
-A follow-up C-hygiene slice is in progress on this tree:
+The C-hygiene follow-up and tool semantic roles landed on this tree:
 
+- Operational state lives in `agent-runtime/src/execution/`:
+  `ExecutionState` (checkpointed as `TaskRecord.resume`), freshness
+  (`MutationFootprint` / revalidate), `derive_execution_needs`, and a
+  phase-2 read memo stub that is not wired into dispatch. `TaskAnchor`
+  remains the only task authority; there is no third task table.
+  Prompt framing is `TASK ORIGIN` / `PERSISTENT TASK STATE` /
+  `CURRENT DIRECTIVE`. `original_goal` is task origin, not a perpetual
+  current instruction. User turns replace TurnIntent and do not patch
+  the anchor.
 - `WorkingSetSignal` is a structured `ResourceTouch` (path@revision).
   Shell/process stdout does not heat entities and does not become a
   successful ToolObservation's entity signature. A stamped path on
   `shell.exec` is identity only; file-body supersession stays `fs.read`.
   Successful `fs.write` / `edit.replace` / `edit.patch` stamp
   `path@revision` (patch via `metadata.files[]`) so the coding loop heats
-  from trusted ResourceTouches. `ResumePoint` records those touches as
-  checked `path@revision` facts; a pathless mutation still clears them.
+  from trusted ResourceTouches. `ExecutionState` records those touches as
+  `ResourceFact` rows (`path`, SHA-256 revision, `Freshness`). Authority
+  still treats `shell.exec` / `process.run` as may-mutate; an unknown
+  (pathless) footprint must not `checked_files.clear()`. It marks known
+  identities `NeedsRevalidation` and the runtime re-hashes them.
   The prompt folds persistable open-turn tool results into `TaskProgress`
   so the current loop sees `path@revision` before the turn commits; the
   stored cache still updates after the durable barrier. Selected historical
@@ -97,8 +135,13 @@ A follow-up C-hygiene slice is in progress on this tree:
   ToolObservation / FileObservation items are identity cards (`path@rev`);
   file text is not a search needle. Fetch still returns the catalog body.
   This is not P3: unchecked file bodies still return.
-- `fs.read` reread classes and selected-token attribution (kind / reason /
-  reactivation / source) are measurement-only.
+- `fs.read` engine residency classes (previously-selected / resident /
+  warm / stored / first-read) stay measurement-only. Runtime also stamps
+  an E2E motive on each `fs.read` ToolFinished (`first`,
+  `selected-current`, `checked-fresh`, `needs-revalidation`, `warm`,
+  `stored`, `changed`) so eval can separate GC-induced rehydration from
+  identity-known duplicate calls. ObservationMemo (semantic read cache)
+  is phase 2 and must never dedup writes, patches, or shell side-effects.
 - Descriptor-only ToolObservation reactivation and `recent_file_bodies`
   cap/lease are ablation switches (default = current policy). Measure
   them with `agent-eval --context-hygiene` (engine-only, no provider).
@@ -120,3 +163,7 @@ SPEC / pack digest are untouched.
 - Historical C-ablation evidence remains under
   `evidence/context-bench-ablation-retry/`. Do not mix it into the frozen
   wave-1 pack.
+- `recall_after_fix` NeedVerify live compare (n=1, 2026-08-19) is under
+  `evidence/roles-verify-recall/`. C extra-round leftover vs the
+  C-hygiene diagnosis dropped (23r/35t → 14r/13t unpinned). Hidden
+  checks stay mixed. Not M15.

@@ -4,7 +4,8 @@
 //! and store the full output as an artifact when it overflows.
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk,
+    ToolSemanticRole, ToolSpec,
 };
 use agent_process::kill_process_tree;
 use agent_workspace::Workspace;
@@ -217,6 +218,7 @@ impl Tool for GitStatusTool {
             input_schema: json!({"type": "object", "properties": {}}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::InspectDiff],
         }
     }
 
@@ -265,6 +267,7 @@ impl Tool for GitDiffTool {
             }),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::InspectDiff],
         }
     }
 

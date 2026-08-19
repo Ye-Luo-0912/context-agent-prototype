@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn surface_bound_never_trims_core_or_control_tools() {
-        use agent_contracts::{ToolRisk, ToolSpec};
+        use agent_contracts::{ToolRisk, ToolSemanticRole, ToolSpec};
         use serde_json::json;
 
         let core: std::collections::HashSet<String> =
@@ -239,6 +239,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: vec![ToolSemanticRole::ReadResource],
             },
             ToolSpec {
                 name: CONTEXT_MANAGE.into(),
@@ -246,6 +247,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: vec![ToolSemanticRole::Search],
             },
         ];
         // A wall of optional tools far above the cap.
@@ -256,6 +258,7 @@ mod tests {
                 input_schema: json!({"type": "object", "properties": {"p": {"type": "string"}}}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             });
         }
         let bounded = bounded_tool_surface(specs, &core);
@@ -287,6 +290,7 @@ mod tests {
             input_schema: schema,
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         };
         // A big-schema tool and many small ones: smallest-schema-first keeps
         // the most tools visible under the cap, and the result is stable.
@@ -328,6 +332,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         };
         let mut specs = vec![
             make("core.read", "mandatory"),
@@ -355,6 +360,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         }];
         assert!(omit_largest_optional_tool(&mut specs, |_| false).is_none());
         assert_eq!(specs.len(), 1);

@@ -2,10 +2,9 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use agent_contracts::{
-    AttentionState, CONTEXT_MAP_VIEW_CAP, ContextItem, ContextItemId, ContextMapView,
-    ContextQuery, ContextRetention, ContextSelection, MaterializedContext, MaterializedItem,
-    ScopeId, ScopeKind, ScopeState, ScoreBreakdown, checked_files_cover_path,
-    normalize_resource_path,
+    AttentionState, CONTEXT_MAP_VIEW_CAP, ContextItem, ContextItemId, ContextMapView, ContextQuery,
+    ContextRetention, ContextSelection, MaterializedContext, MaterializedItem, ScopeId, ScopeKind,
+    ScopeState, ScoreBreakdown, checked_files_cover_path, normalize_resource_path,
 };
 
 use crate::diagnostics;

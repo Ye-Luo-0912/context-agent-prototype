@@ -795,6 +795,29 @@ current-file / `handle_21` slice is landed (active-task latest file body,
    calibration: frozen SWE-bench 21×3 (after-proxy is n=1). Do not
    retune scoring. Do not amend n. Do not mix P0/P1 ITT tables.
 
+### NeedVerify roles + unpinned surface (2026-08-19)
+
+`--compare-live recall_after_fix`, pinaic `gpt-5.6-luna`, n=1, dirty
+tree on `105465d` plus execution / `ToolSpec.roles`. Bundles:
+`crates/agent-eval/evidence/roles-verify-recall/` (`REPORT.md`, pinned
+vs unpinned cells). Not mixed into P0 / 403 / Context Bench.
+
+The C-hygiene leftover on this fixture was C **23r/35t** vs A 16r/17t
+(git verify + re-reads). This tree:
+
+| engine | pinned (git/shell still always_loaded) | unpinned (catalog only) |
+| --- | --- | --- |
+| append | 5/8, 70537 in, 14r, 15 tools, git+shell 7 | **8/8**, 101314, 17r, 16 tools, git+shell 0 |
+| rolling | 7/8, 78936, 15r, 19, git+shell 8 | 5/8, 75599, 14r, 16, git+shell 0 |
+| dynamic | 7/8, 87817, 15r, 19, git+shell 8 | 7/8, 70425, 14r, 13, git+shell 0 |
+
+C extra rounds/tools improved (23/35 → 15/19 pinned → **14/13**
+unpinned). Per-round schema 1578 → 1333. Hidden checks stay mixed (C
+missed `visit_all` then `4B`). Total `model_in` is not a same-trace A/B
+(append unpinned spent three extra rounds). No builtin `Verify` role
+yet; `capability.manage` is already MustSurface. Not a gate. Do not
+retune scoring.
+
 Until those artifacts and the predeclared interval exist, the live tables are
 diagnostic observations rather than independently reproducible acceptance
 evidence. M15, V2, learned/vector policy and transport-selection gates remain

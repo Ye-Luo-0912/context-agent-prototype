@@ -139,7 +139,39 @@ pub fn derive_effect_intent(call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Semantic capability a catalog tool offers. Tool-surface policy maps an
+/// execution need onto these roles, then resolves names from the catalog.
+/// `shell.exec` is an escape hatch, not a verifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSemanticRole {
+    ReadResource,
+    Search,
+    InspectDiff,
+    Verify,
+    Mutate,
+    EscapeHatch,
+}
+
+impl ToolSemanticRole {
+    /// Catalog fallback until every `ToolSpec` declares a role. Builtin
+    /// names are explicit; unknown names are escape hatches.
+    pub fn from_tool_name(name: &str) -> Self {
+        match name {
+            "fs.read" | "artifact.read" | "context.fetch" => Self::ReadResource,
+            "fs.list" | "search.grep" | "context.search" | "context.manage" | "code.symbols"
+            | CAPABILITY_MANAGE | CAPABILITY_SEARCH => Self::Search,
+            "git.diff" | "git.status" | "git.log" | "code.diagnostics" => Self::InspectDiff,
+            "fs.write" | "edit.replace" | "edit.patch" => Self::Mutate,
+            "shell.exec" | "process.run" | "process.session" => Self::EscapeHatch,
+            other if other.starts_with("git.") => Self::Mutate,
+            other if other.starts_with("fs.") => Self::ReadResource,
+            _ => Self::EscapeHatch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
@@ -153,6 +185,37 @@ pub struct ToolSpec {
     /// value, so a declaration can never exceed the hard cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_budget: Option<usize>,
+    /// Semantic capabilities this tool offers. Empty means the catalog
+    /// fallback [`ToolSemanticRole::from_tool_name`] until the producer
+    /// stamps roles. Policy matches execution needs against these roles,
+    /// never against a hard-coded tool name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<ToolSemanticRole>,
+}
+
+impl ToolSpec {
+    /// Declared roles, or the name-based fallback when the producer has
+    /// not stamped any.
+    pub fn effective_roles(&self) -> Vec<ToolSemanticRole> {
+        if self.roles.is_empty() {
+            vec![ToolSemanticRole::from_tool_name(&self.name)]
+        } else {
+            let mut roles = self.roles.clone();
+            roles.sort();
+            roles.dedup();
+            roles
+        }
+    }
+
+    pub fn has_role(&self, role: ToolSemanticRole) -> bool {
+        self.effective_roles().contains(&role)
+    }
+
+    /// Catalog-discovery control plane (`capability.manage`), not a
+    /// workspace grep.
+    pub fn is_capability_search(&self) -> bool {
+        matches!(self.name.as_str(), CAPABILITY_MANAGE | CAPABILITY_SEARCH)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,6 +412,22 @@ impl ToolOutput {
     /// Failed execution results stay on the TurnFrame and must not.
     pub fn heats_working_set(&self) -> bool {
         self.ok && self.failure_class().is_none() && !self.resource_touches().is_empty()
+    }
+
+    /// Knowledge-plane mutation footprint. Authority still uses
+    /// [`Self::may_mutate_workspace`]; this answers which known resource
+    /// facts may have gone stale. A pathless may-mutate process is
+    /// `Unknown`, not "every identity is dead".
+    pub fn mutation_footprint(&self) -> crate::MutationFootprint {
+        if !self.may_mutate_workspace() {
+            return crate::MutationFootprint::None;
+        }
+        let touches = self.resource_touches();
+        if touches.is_empty() {
+            crate::MutationFootprint::Unknown
+        } else {
+            crate::MutationFootprint::Known(touches)
+        }
     }
 }
 
@@ -1568,6 +1647,10 @@ mod tests {
         };
         assert!(!cargo.is_verification());
         assert!(cargo.may_mutate_workspace());
+        assert_eq!(
+            cargo.mutation_footprint(),
+            crate::MutationFootprint::Unknown
+        );
         let mut typed = cargo.clone();
         typed.metadata = serde_json::json!({"command": "cargo test", "verification": true});
         assert!(typed.is_verification());
@@ -1575,6 +1658,43 @@ mod tests {
         let mut opt_out = cargo;
         opt_out.metadata = serde_json::json!({"command": "ls", "mutates_workspace": false});
         assert!(!opt_out.may_mutate_workspace());
+        assert_eq!(opt_out.mutation_footprint(), crate::MutationFootprint::None);
+    }
+
+    #[test]
+    fn shell_is_an_escape_hatch_not_a_verifier() {
+        assert_eq!(
+            ToolSemanticRole::from_tool_name("shell.exec"),
+            ToolSemanticRole::EscapeHatch
+        );
+        assert_eq!(
+            ToolSemanticRole::from_tool_name("git.diff"),
+            ToolSemanticRole::InspectDiff
+        );
+        assert_eq!(
+            ToolSemanticRole::from_tool_name("fs.read"),
+            ToolSemanticRole::ReadResource
+        );
+        let stamped = ToolSpec {
+            name: "tests.run".into(),
+            roles: vec![ToolSemanticRole::Verify],
+            ..ToolSpec::default()
+        };
+        assert!(stamped.has_role(ToolSemanticRole::Verify));
+        assert!(!stamped.has_role(ToolSemanticRole::EscapeHatch));
+        let unstamped = ToolSpec {
+            name: "shell.exec".into(),
+            ..ToolSpec::default()
+        };
+        assert!(unstamped.has_role(ToolSemanticRole::EscapeHatch));
+        assert!(!unstamped.has_role(ToolSemanticRole::Verify));
+        assert!(
+            ToolSpec {
+                name: crate::CAPABILITY_MANAGE.into(),
+                ..ToolSpec::default()
+            }
+            .is_capability_search()
+        );
     }
 
     #[test]

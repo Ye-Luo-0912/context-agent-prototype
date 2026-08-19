@@ -11,8 +11,8 @@
 use std::{collections::HashMap, process::Stdio};
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
-    attach_failure_class,
+    AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk,
+    ToolSemanticRole, ToolSpec, attach_failure_class,
 };
 use agent_process::kill_process_tree;
 use agent_workspace::Workspace;
@@ -84,6 +84,7 @@ impl Tool for ProcessRunTool {
             }),
             risk: ToolRisk::ProcessExecution,
             output_budget: None,
+            roles: vec![ToolSemanticRole::EscapeHatch],
         }
     }
 

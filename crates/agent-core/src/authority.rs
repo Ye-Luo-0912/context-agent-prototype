@@ -423,6 +423,7 @@ mod tests {
             input_schema: json!({}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         }
     }
 

@@ -172,6 +172,7 @@ async fn capability_authority_is_derived_and_validated_at_registration() {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::WorkspaceWrite,
             output_budget: None,
+            roles: Vec::new(),
         }],
     );
     let error = host
@@ -195,6 +196,7 @@ async fn capability_authority_is_derived_and_validated_at_registration() {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::WorkspaceWrite,
             output_budget: None,
+            roles: Vec::new(),
         }],
     );
     let process_write = {

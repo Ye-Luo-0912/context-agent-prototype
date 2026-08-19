@@ -337,7 +337,9 @@ impl ModelEventSink for NoopSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{CancellationToken, ModelMessage, ModelTransport, ToolSpec};
+    use agent_contracts::{
+        CancellationToken, ModelMessage, ModelTransport, ToolSemanticRole, ToolSpec,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
@@ -359,6 +361,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: agent_contracts::ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: vec![ToolSemanticRole::Search],
             }],
             metadata: json!({}),
             cancel: CancellationToken::new(),
@@ -457,6 +460,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: agent_contracts::ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: vec![ToolSemanticRole::Search],
             }],
             metadata: json!({}),
             cancel: CancellationToken::new(),
@@ -473,6 +477,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             risk: agent_contracts::ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         });
         let error = provider.complete(request).await.unwrap_err().to_string();
         assert!(

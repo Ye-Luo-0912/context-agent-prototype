@@ -201,6 +201,7 @@ impl ToolDispatcher for LateValueTool {
             input_schema: serde_json::json!({"type": "object"}),
             risk: self.risk,
             output_budget: None,
+            roles: Vec::new(),
         }]
     }
 

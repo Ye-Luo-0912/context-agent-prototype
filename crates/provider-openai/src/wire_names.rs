@@ -109,6 +109,7 @@ mod tests {
                     input_schema: json!({"type": "object"}),
                     risk: agent_contracts::ToolRisk::ReadOnly,
                     output_budget: None,
+                    roles: Vec::new(),
                 })
                 .collect(),
             metadata: json!({}),

@@ -22,7 +22,7 @@ use agent_contracts::{
     ExternalizedContext, FocusState, MaterializedContext, ModelCapabilities, ModelOutput,
     ModelRequest, ModelTransport, RuntimeEvent, ScopeId, ScopeKind, StorageGcReport,
     StoreReconcileReport, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome,
-    ToolOutput, ToolRisk, ToolSpec,
+    ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec,
 };
 
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
@@ -136,6 +136,7 @@ impl ToolDispatcher for EngineQueryTools {
             }),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::Search],
         }]
     }
 

@@ -200,6 +200,7 @@ impl Capability for CheckpointCapability {
             input_schema: serde_json::json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         }]
     }
 
@@ -250,6 +251,7 @@ impl ToolDispatcher for AdmitDirectiveDispatcher {
             input_schema: serde_json::json!({ "type": "object" }),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         }]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {

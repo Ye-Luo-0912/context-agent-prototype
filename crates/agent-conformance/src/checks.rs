@@ -253,6 +253,7 @@ mod tests {
             input_schema: json!({"type": "object", "properties": {}}),
             risk: agent_contracts::ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         }
     }
 

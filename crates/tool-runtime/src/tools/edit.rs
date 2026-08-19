@@ -7,7 +7,7 @@
 
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, Effect, RunId, ToolFailureClass, ToolOutcome,
-    ToolOutput, ToolRisk, ToolSpec, tool_failure_output,
+    ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec, tool_failure_output,
 };
 use agent_workspace::Workspace;
 use async_trait::async_trait;
@@ -71,6 +71,7 @@ impl Tool for EditReplaceTool {
             }),
             risk: ToolRisk::WorkspaceWrite,
             output_budget: None,
+            roles: vec![ToolSemanticRole::Mutate],
         }
     }
 

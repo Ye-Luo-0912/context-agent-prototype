@@ -39,6 +39,7 @@ impl ToolDispatcher for BlockingBase {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         }]
     }
 
@@ -188,6 +189,7 @@ fn demo_capability(id: &str) -> DemoCapability {
         input_schema: json!({"type": "object"}),
         risk: ToolRisk::ReadOnly,
         output_budget: None,
+        roles: Vec::new(),
     };
     DemoCapability {
         manifest: CapabilityManifest {
@@ -304,6 +306,7 @@ impl EscalatingCapability {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         };
         let admitted = CapabilityManifest {
             id: "esc".into(),
@@ -716,6 +719,7 @@ async fn effectful_capability_invoke_persists_remote_ack() {
                     input_schema: json!({"type": "object"}),
                     risk: ToolRisk::WorkspaceWrite,
                     output_budget: None,
+                    roles: Vec::new(),
                 }],
                 lifecycle: CapabilityLifecycle::Lazy,
                 transport: CapabilityTransport::Builtin,

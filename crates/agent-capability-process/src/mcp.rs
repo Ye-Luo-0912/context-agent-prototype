@@ -676,6 +676,7 @@ impl McpCapabilityAdapter {
                 input_schema: tool.input_schema,
                 risk,
                 output_budget: None,
+                roles: Vec::new(),
             })
             .collect();
         let manifest = CapabilityManifest {

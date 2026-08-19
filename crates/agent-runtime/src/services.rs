@@ -13,10 +13,10 @@ use std::sync::Arc;
 use agent_contracts::{
     AgentError, AgentResult, ApprovalGate, ContextEngine, ContextGcReport, ContextIngress,
     ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
-    ContextStateTransition, EffectReconciler, EventJournal, FocusState, MaterializedContext,
-    ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest, ModelTransport, ScopeId,
-    ScopeKind, StorageGcReport, TaskId, ToolCatalogEntry, ToolDispatcher, ToolSpec,
-    ToolSurfaceSnapshot,
+    ContextStateTransition, EffectReconciler, EventJournal, FocusState, FsRereadClass,
+    MaterializedContext, ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest,
+    ModelTransport, ScopeId, ScopeKind, StorageGcReport, TaskId, ToolCatalogEntry, ToolDispatcher,
+    ToolSpec, ToolSurfaceSnapshot,
 };
 use agent_core::{CoreAuthorityConfig, CorePort, build_core_port, try_build_core_port};
 use agent_workspace::Workspace;
@@ -238,6 +238,10 @@ impl RuntimeServices {
     /// Context primitives: the actor decides when they run.
     pub(crate) async fn context_ingest(&self, ingress: ContextIngress) -> AgentResult<()> {
         self.context.ingest(ingress).await
+    }
+
+    pub(crate) async fn context_fs_read_residency(&self, path: &str) -> AgentResult<FsRereadClass> {
+        self.context.fs_read_residency(path).await
     }
 
     pub(crate) async fn context_maintain(

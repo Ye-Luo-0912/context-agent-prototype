@@ -39,6 +39,7 @@ fn manifest_with_program(program: &str) -> CapabilityManifest {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         }],
         lifecycle: CapabilityLifecycle::Lazy,
         transport: CapabilityTransport::Process {
@@ -59,6 +60,7 @@ fn write_manifest_with_program(program: &str) -> CapabilityManifest {
         input_schema: json!({"type": "object"}),
         risk: ToolRisk::WorkspaceWrite,
         output_budget: None,
+        roles: Vec::new(),
     }];
     manifest
 }

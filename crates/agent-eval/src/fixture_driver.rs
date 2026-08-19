@@ -464,7 +464,7 @@ fn render_comparison_header(runs: &[EngineRun], header: &str) -> String {
                {:8}   resident_bytes final={} peak={}\n\
                {:8}   materialize(p50/p95)={}ms/{}ms store(w/r/recalled)={}/{}/{}\n\
                {:8}   retrieval search={}/{} empty={} recovered={}/{} access(search/inspect/fetch/ack)={}/{}/{}/{}\n\
-               {:8}   reread prev/resident/warm/stored/first={}/{}/{}/{}/{} repeated_fs={} recovery_reread={}\n",
+               {:8}   reread prev/resident/warm/stored/first={}/{}/{}/{}/{} motive(first/sel/checked/reval/warm/stored/changed)={}/{}/{}/{}/{}/{}/{} repeated_fs={} recovery_reread={}\n",
             run.engine,
             run.eval.passed,
             run.eval.wall_ms,
@@ -509,6 +509,13 @@ fn render_comparison_header(runs: &[EngineRun], header: &str) -> String {
             metrics.reread_warm,
             metrics.reread_stored,
             metrics.reread_first_read,
+            metrics.reread_motive_first,
+            metrics.reread_motive_selected_current,
+            metrics.reread_motive_checked_fresh,
+            metrics.reread_motive_needs_revalidation,
+            metrics.reread_motive_warm,
+            metrics.reread_motive_stored,
+            metrics.reread_motive_changed,
             metrics.repeated_fs_reads,
             metrics.recovery_workspace_reread,
         ));
@@ -756,15 +763,16 @@ async fn run_workspace_session_ops(
         Arc::new(tool_runtime::BuiltinToolDispatcher::with_config(
             workspace.clone(),
             tool_runtime::ToolLifecycleConfig {
+                // Coding core stays loaded. InspectDiff / EscapeHatch
+                // (`git.*`, `shell.exec`) stay in the catalog but are not
+                // pinned: NeedVerify must not Prefer them, and the model
+                // loads them through `capability.manage` like any other app.
                 always_loaded: vec![
                     "fs.list".into(),
                     "fs.read".into(),
                     "fs.write".into(),
                     "edit.replace".into(),
                     "search.grep".into(),
-                    "git.status".into(),
-                    "git.diff".into(),
-                    "shell.exec".into(),
                     agent_contracts::CONTEXT_MANAGE.into(),
                     agent_contracts::CAPABILITY_MANAGE.into(),
                 ],

@@ -1341,6 +1341,11 @@ impl ContextEngine for SimpleContextEngine {
         Ok(diagnostics::compute(&state))
     }
 
+    async fn fs_read_residency(&self, path: &str) -> AgentResult<FsRereadClass> {
+        let state = self.state.lock().await;
+        Ok(classify_fs_read(&state, path))
+    }
+
     async fn inspect(&self, limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
         let state = self.state.lock().await;
         // The logical catalog, not just the resident share: the heap, the

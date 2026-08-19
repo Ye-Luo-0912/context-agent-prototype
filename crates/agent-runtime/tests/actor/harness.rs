@@ -10,7 +10,7 @@ use agent_contracts::{
     ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput, ModelRequest, ModelTransport,
     RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, SemanticState, TaskId,
     ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolRisk,
-    ToolSpec, ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceSnapshot,
+    ToolSemanticRole, ToolSpec, ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceSnapshot,
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{RuntimeHandle, RuntimeServices, spawn_runtime};
@@ -260,6 +260,7 @@ impl ToolDispatcher for OneToolDispatcher {
             input_schema: serde_json::json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::ReadResource],
         }]
     }
     async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -845,6 +846,7 @@ impl ToolDispatcher for RoundLocalToolDispatcher {
             input_schema: serde_json::json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         }];
         if self.optional_loaded() {
             specs.push(ToolSpec {
@@ -855,6 +857,7 @@ impl ToolDispatcher for RoundLocalToolDispatcher {
                 input_schema: serde_json::json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             });
         }
         specs

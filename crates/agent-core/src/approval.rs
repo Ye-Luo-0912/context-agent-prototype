@@ -559,7 +559,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{EffectIntent, GrantTarget, ToolRisk, ToolSpec};
+    use agent_contracts::{EffectIntent, GrantTarget, ToolRisk, ToolSemanticRole, ToolSpec};
     use serde_json::json;
 
     fn write_call() -> ToolCall {
@@ -577,6 +577,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::WorkspaceWrite,
             output_budget: None,
+            roles: vec![ToolSemanticRole::Mutate],
         }
     }
 
@@ -754,6 +755,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ProcessExecution,
             output_budget: None,
+            roles: vec![ToolSemanticRole::EscapeHatch],
         }
     }
 
@@ -1193,6 +1195,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::WorkspaceWrite,
             output_budget: None,
+            roles: vec![ToolSemanticRole::Mutate],
         };
         assert_eq!(
             TaskApprovalGate::derive_effect_intent(&write, &write_spec),
@@ -1227,6 +1230,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ProcessExecution,
             output_budget: None,
+            roles: vec![ToolSemanticRole::EscapeHatch],
         };
         assert_eq!(
             TaskApprovalGate::derive_effect_intent(&process, &process_spec),
@@ -1246,6 +1250,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::ReadResource],
         };
         assert_eq!(
             TaskApprovalGate::derive_effect_intent(&read, &read_spec),
@@ -1269,6 +1274,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::WorkspaceWrite,
             output_budget: None,
+            roles: vec![ToolSemanticRole::Mutate],
         };
         assert_eq!(
             TaskApprovalGate::derive_effect_intent(&missing, &write_spec),
@@ -1304,6 +1310,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::ReadResource],
         };
         let verdict = gate
             .shadow_verdict(

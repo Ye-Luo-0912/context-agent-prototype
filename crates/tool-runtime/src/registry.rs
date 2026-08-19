@@ -16,8 +16,8 @@ use std::sync::{Arc, RwLock};
 
 use agent_contracts::{
     AgentError, AgentResult, ResourceDescriptor, ToolCatalogEntry, ToolDispatcher,
-    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec, ToolSurfaceSnapshot,
-    search_tool_catalog,
+    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec,
+    ToolSurfaceSnapshot, search_tool_catalog,
 };
 use agent_workspace::Workspace;
 use serde::Deserialize;
@@ -281,6 +281,7 @@ impl BuiltinToolDispatcher {
                 }),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: vec![ToolSemanticRole::Search],
             },
         ]
     }
@@ -1210,6 +1211,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: vec![ToolSemanticRole::Search],
             },
             ToolSpec {
                 name: "fs.read".into(),
@@ -1217,6 +1219,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: vec![ToolSemanticRole::ReadResource],
             },
             ToolSpec {
                 name: "search.grep".into(),
@@ -1224,6 +1227,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: vec![ToolSemanticRole::Search],
             },
             ToolSpec {
                 name: "context.gc_hint".into(),
@@ -1231,6 +1235,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             },
             ToolSpec {
                 name: "context.tag".into(),
@@ -1238,6 +1243,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             },
             ToolSpec {
                 name: "context.lease".into(),
@@ -1245,6 +1251,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             },
             ToolSpec {
                 name: "context.collect".into(),
@@ -1252,6 +1259,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             },
             ToolSpec {
                 name: "context.search".into(),
@@ -1259,6 +1267,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             },
             ToolSpec {
                 name: "context.inspect".into(),
@@ -1266,6 +1275,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             },
             ToolSpec {
                 name: "context.fetch".into(),
@@ -1273,6 +1283,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             },
             ToolSpec {
                 name: "capability.search".into(),
@@ -1280,6 +1291,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: vec![ToolSemanticRole::Search],
             },
             ToolSpec {
                 name: "capability.inspect".into(),
@@ -1287,6 +1299,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             },
             ToolSpec {
                 name: "capability.load".into(),
@@ -1294,6 +1307,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             },
             ToolSpec {
                 name: "capability.unload".into(),
@@ -1301,6 +1315,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             },
         ];
         let merged_surface: Vec<ToolSpec> = vec![
@@ -1310,6 +1325,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: vec![ToolSemanticRole::Search],
             },
             ToolSpec {
                 name: "fs.read".into(),
@@ -1317,6 +1333,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: vec![ToolSemanticRole::ReadResource],
             },
             ToolSpec {
                 name: "search.grep".into(),
@@ -1324,6 +1341,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: vec![ToolSemanticRole::Search],
             },
             ToolSpec {
                 name: "context.manage".into(),
@@ -1331,6 +1349,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: vec![ToolSemanticRole::Search],
             },
             ToolSpec {
                 name: "capability.manage".into(),
@@ -1338,6 +1357,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: vec![ToolSemanticRole::Search],
             },
         ];
         let old_tokens: usize = old_surface

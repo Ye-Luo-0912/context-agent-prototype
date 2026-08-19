@@ -2939,16 +2939,15 @@ async fn external_view_surfaces_checked_stored_file_beyond_the_recency_tail() {
     const BODY: &str = "fn handle_secret() {}";
     let stored_id = {
         let mut state = engine.state.lock().await;
-        let reference = |id: ContextItemId, summary: String, kind: ContextKind| {
-            agent_contracts::ContextRef {
+        let reference =
+            |id: ContextItemId, summary: String, kind: ContextKind| agent_contracts::ContextRef {
                 uri: format!("context://run/{id}"),
                 item_id: id,
                 kind,
                 scope: ContextScope::Task,
                 summary,
                 created_tick: 0,
-            }
-        };
+            };
         let mut stored = crate::item::make_item(
             &state,
             &engine.config,

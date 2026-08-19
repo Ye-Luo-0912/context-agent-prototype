@@ -39,6 +39,7 @@ impl RuntimeActor {
             input_schema: serde_json::json!({ "type": "object" }),
             risk: agent_contracts::ToolRisk::WorkspaceWrite,
             output_budget: None,
+            roles: Vec::new(),
         };
         let verdict = self
             .core

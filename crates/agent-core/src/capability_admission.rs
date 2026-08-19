@@ -292,6 +292,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             risk,
             output_budget: None,
+            roles: Vec::new(),
         }
     }
 
@@ -304,6 +305,7 @@ mod tests {
             input_schema: json!({"padding": "x".repeat(5 * 1024)}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         }];
         let error = CapabilityAdmission::validate_static(&m, &specs)
             .expect_err("an oversized schema must be rejected");

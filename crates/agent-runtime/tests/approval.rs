@@ -81,6 +81,7 @@ impl ToolDispatcher for RiskToolDispatcher {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             },
             ToolSpec {
                 name: "write.tool".into(),
@@ -88,6 +89,7 @@ impl ToolDispatcher for RiskToolDispatcher {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::WorkspaceWrite,
                 output_budget: None,
+                roles: Vec::new(),
             },
             ToolSpec {
                 name: "proc.tool".into(),
@@ -95,6 +97,7 @@ impl ToolDispatcher for RiskToolDispatcher {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ProcessExecution,
                 output_budget: None,
+                roles: Vec::new(),
             },
         ]
     }

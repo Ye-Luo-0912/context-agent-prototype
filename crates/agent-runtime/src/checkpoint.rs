@@ -106,7 +106,10 @@ pub struct TaskRecordSnapshot {
     #[serde(default)]
     pub anchor: TaskAnchor,
     #[serde(default)]
-    pub resume: crate::resume::ResumePoint,
+    pub resume: crate::execution::ExecutionState,
+    /// Current user-turn directive. Empty on legacy checkpoints.
+    #[serde(default)]
+    pub turn_intent: String,
 }
 
 /// One dynamic capability's surface state: its activation and which of its
@@ -180,7 +183,7 @@ impl RuntimeCheckpoint {
                     task.id
                 ))
             })?;
-            crate::resume::validate_resume(&task.resume).map_err(|error| {
+            crate::execution::validate_resume(&task.resume).map_err(|error| {
                 AgentError::InvalidRequest(format!(
                     "checkpoint task {} has an invalid resume point: {error}",
                     task.id
@@ -318,6 +321,7 @@ impl TaskManagerSnapshot {
                     tool_requirements: task.tool_requirements.clone(),
                     anchor: task.anchor.clone(),
                     resume: task.resume.clone(),
+                    turn_intent: task.turn_intent.clone(),
                 })
                 .collect(),
             active: tasks.active(),
@@ -337,6 +341,7 @@ impl From<TaskRecordSnapshot> for TaskRecord {
             tool_requirements: snapshot.tool_requirements,
             anchor: snapshot.anchor,
             resume: snapshot.resume,
+            turn_intent: snapshot.turn_intent,
         }
     }
 }

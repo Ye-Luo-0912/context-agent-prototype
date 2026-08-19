@@ -31,6 +31,7 @@ async fn output_broker_spills_oversized_tool_output_end_to_end() {
                 input_schema: serde_json::json!({}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             }]
         }
         async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -48,6 +49,7 @@ async fn output_broker_spills_oversized_tool_output_end_to_end() {
             input_schema: serde_json::json!({}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         }],
         ..ToolSurfaceSnapshot::default()
     };

@@ -459,6 +459,7 @@ async fn effect_disconnect_quarantines_process_wire_effects() {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::WorkspaceWrite,
                 output_budget: None,
+                roles: Vec::new(),
             }],
             lifecycle: CapabilityLifecycle::Lazy,
             transport: CapabilityTransport::Process {

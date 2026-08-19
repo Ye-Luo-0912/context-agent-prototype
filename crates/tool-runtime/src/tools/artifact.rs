@@ -10,7 +10,8 @@
 //! filesystem paths.
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk,
+    ToolSemanticRole, ToolSpec,
 };
 use agent_workspace::Workspace;
 use async_trait::async_trait;
@@ -66,6 +67,7 @@ impl Tool for ArtifactReadTool {
             }),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::ReadResource],
         }
     }
 

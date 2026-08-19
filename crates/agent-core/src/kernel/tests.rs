@@ -4,8 +4,8 @@ use agent_contracts::{
     ContextIngress, ContextItem, ContextItemId, ContextItemSummary, ContextKind,
     ContextMaintenanceReport, ContextQuery, ContextRef, ContextResidency, ContextRetention,
     ContextScope, ContextStateTransition, ExternalizedContext, MaterializedContext, ScopeId,
-    ScopeKind, SemanticState, ToolRisk, ToolSpec, ToolSurfaceDemand, ToolSurfaceOmission,
-    ToolSurfaceOmissionReason, TurnId,
+    ScopeKind, SemanticState, ToolRisk, ToolSemanticRole, ToolSpec, ToolSurfaceDemand,
+    ToolSurfaceOmission, ToolSurfaceOmissionReason, TurnId,
 };
 
 fn call(name: &str) -> ToolCall {
@@ -108,6 +108,7 @@ impl ToolDispatcher for BigOutputDispatcher {
             input_schema: serde_json::json!({}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         }]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -320,6 +321,7 @@ fn surface_with(name: &str) -> ToolSurfaceSnapshot {
             input_schema: serde_json::json!({}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         }],
         ..ToolSurfaceSnapshot::default()
     }
@@ -1217,6 +1219,7 @@ async fn execute_tool_mints_a_commit_time_lease_for_side_effecting_calls() {
             input_schema: serde_json::json!({}),
             risk: ToolRisk::WorkspaceWrite,
             output_budget: None,
+            roles: vec![ToolSemanticRole::Mutate],
         }],
         ..ToolSurfaceSnapshot::default()
     };
@@ -1294,6 +1297,7 @@ async fn execute_tool_rejects_a_stale_authority_epoch_before_dispatch() {
                 input_schema: serde_json::json!({}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             }]
         }
 
@@ -1390,6 +1394,7 @@ async fn execute_tool_rechecks_epoch_after_awaiting_approval() {
                 input_schema: serde_json::json!({}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             }]
         }
         async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -1501,6 +1506,7 @@ async fn lease_is_minted_even_when_the_shadow_gate_denies() {
             input_schema: serde_json::json!({}),
             risk: ToolRisk::ProcessExecution,
             output_budget: None,
+            roles: vec![ToolSemanticRole::EscapeHatch],
         }],
         ..ToolSurfaceSnapshot::default()
     };

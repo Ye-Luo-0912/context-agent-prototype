@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, ContextItemId, RunId, ToolOutcome, ToolOutput,
-    ToolRisk, ToolSpec,
+    ToolRisk, ToolSemanticRole, ToolSpec,
 };
 use agent_process::kill_process_tree;
 use agent_workspace::{ArtifactDraft, Workspace};
@@ -158,6 +158,7 @@ impl Tool for ProcessSessionTool {
             }),
             risk: ToolRisk::ProcessExecution,
             output_budget: None,
+            roles: vec![ToolSemanticRole::EscapeHatch],
         }
     }
 

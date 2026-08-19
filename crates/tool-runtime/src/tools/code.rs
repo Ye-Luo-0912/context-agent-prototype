@@ -15,7 +15,8 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk,
+    ToolSemanticRole, ToolSpec,
 };
 use agent_workspace::Workspace;
 use async_trait::async_trait;
@@ -376,6 +377,7 @@ impl Tool for CodeSymbolsTool {
             }),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::Search],
         }
     }
 
@@ -633,6 +635,7 @@ impl Tool for CodeDiagnosticsTool {
             }),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::InspectDiff],
         }
     }
 

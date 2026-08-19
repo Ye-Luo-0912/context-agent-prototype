@@ -509,7 +509,10 @@ invalidation. A may-mutate observation (typed `mutates_workspace` /
 `_runtime.effect_intent`, else conservative builtin fallback) bumps
 `workspace_revision`; old PASS rows stay stamped to the world that
 produced them and are omitted from the prompt view. Command needles such
-as `cargo test` are not verification. Prompt packing subtracts the runtime
+as `cargo test` are not verification. Generic process invalidation bumps
+the world clock; it must not wipe the resource-fact table. Unknown
+footprints mark `NeedsRevalidation` and Runtime re-hashes up to 8
+relevant facts at BeforeModel. Prompt packing subtracts the runtime
 Focus frame before `materialize`. This slice is not an M15 close.
 Keep historical `semantic_recall.v1` as a long-protocol trajectory; do not
 keep live-running it. Mechanism V2 (`--context-mech`) is the isolated
@@ -532,7 +535,8 @@ Required closure:
   activation — never ordinary transcript history;
 - test stale file observations, failure-then-success resolution by operation
   identity, corrupt/oversized restore, thousands of inspected files, and
-  generic process invalidation. Prompt/resident/checkpoint size must remain
+  generic process invalidation (world clock advances; resource facts are
+  revalidated, not cleared). Prompt/resident/checkpoint size must remain
   bounded. Do not retune reactivation thresholds from this slice.
 - ablation (`with` vs `without` ResumePoint projection) is still required
   before claiming V1 value. `task_switch_long_b` pass does not prove it.
@@ -1243,8 +1247,9 @@ File-body supersession remains `fs.read` (a stamped `shell.exec` path is
 identity, not a new body). Stamped-path shell/process logs do not
 hot-recall; only `fs.read` file bodies auto-reactivate unless P3 is on. Successful `fs.write` / `edit.replace` /
 `edit.patch` stamp `path@revision`; `resource_touches` also reads
-`metadata.files[]`. `ResumePoint` upserts those touches into checked
-files and only wipes the cache on a pathless mutation. The prompt
+`metadata.files[]`. `ResumePoint` upserts those touches into resource
+facts. A pathless (Unknown) mutation must not wipe the table: it marks
+known identities `NeedsRevalidation` and Runtime re-hashes them. The prompt
 `TaskProgressView` additionally folds persistable open-turn tool results
 so the coding loop sees current `path@revision` before the turn commits;
 the stored `ResumePoint` still updates only after the durable barrier.
@@ -1268,6 +1273,21 @@ bodies still auto-reactivate (P3 still default-off).
 Descriptor-only ToolObservation reactivation and `recent_file_bodies` cap/lease stay off by default;
 `agent-eval --context-hygiene` is the engine-only ablation (no provider,
 no SPEC rewrite).
+
+**Follow-up 2026-08-19 (execution module).** `ResumePoint` is now
+`ExecutionState` in `agent-runtime/src/execution/` (checkpoint field
+still `resume`). Freshness, needs, and a phase-2 read-memo stub live
+there; `policy.rs` only maps `ExecutionNeeds` → tool surface. Prompt
+authority framing is `TASK ORIGIN` / `PERSISTENT TASK STATE` /
+`CURRENT DIRECTIVE`. Each `fs.read` ToolFinished is stamped with an E2E
+motive (`checked-fresh` vs `warm`/`stored` vs `selected-current`) so GC
+extra rounds can be counted separately from identity-known duplicates.
+Do not enable ObservationMemo dispatch and do not memoize writes.
+
+**Live 2026-08-19.** `recall_after_fix` n=1 compare is in
+`crates/agent-eval/evidence/roles-verify-recall/REPORT.md`. C extra
+rounds/tools vs the C-hygiene leftover dropped (23r/35t → 14r/13t
+unpinned); hidden checks stay mixed. Not M15.
 
 ### CTX-09 — Lifecycle clocks and observability need explicit semantics
 
@@ -1795,8 +1815,9 @@ Required direction:
   surface for the TaskToolRequirements slice;
 - [x] token/schema budget performs pure round-local packing and never unloads
   a tool or changes its lifecycle;
-- [x] derive typed tool roots from the complete TaskAnchor/Focus/Episode and
-  Active-call policy at the existing BeforeModel safe point;
+- [x] derive typed tool roots from execution need → `ToolSpec.roles`
+  (`Verify` → capability search → `EscapeHatch` for NeedVerify; InspectDiff
+  is not a verifier) at the existing BeforeModel safe point;
 - [x] `MustSurface` tools are selected or produce explicit unsatisfiable
   reports; `PreferSurface` omissions are observable but do not mutate
   lifecycle; `KeepReady` stays cheap to reactivate without entering prompts;

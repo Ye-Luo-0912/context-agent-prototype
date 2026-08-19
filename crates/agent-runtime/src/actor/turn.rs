@@ -117,6 +117,8 @@ impl RuntimeActor {
         self.emit_context_maintained(ContextMaintenanceTrigger::UserInput, report)
             .await?;
 
+        self.state.tasks.on_user_turn(&content);
+
         // A new turn has no active call from a previous turn: the
         // active-call policy only pins tools while the turn that issued
         // them still consumes their results.

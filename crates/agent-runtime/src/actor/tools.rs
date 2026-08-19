@@ -668,7 +668,8 @@ impl RuntimeActor {
                 // frame, context engine or event stream unbounded. Normal
                 // tools spill before this point; this guard makes a
                 // producer contract violation safe and visible.
-                let output = bound_tool_output(output);
+                let mut output = bound_tool_output(output);
+                self.stamp_fs_read_motive(&mut output).await;
                 // Execute the tool's runtime directive now, as part of the
                 // operation commit — not at turn end — so a context control
                 // request takes effect before the next model round.
@@ -748,6 +749,48 @@ impl RuntimeActor {
                 self.drain_queued_user_input(op_tx).await;
             }
         }
+    }
+
+    /// Classify this `fs.read` against engine residency + resource facts
+    /// and stamp the E2E motive onto the output before it is journaled.
+    async fn stamp_fs_read_motive(&self, output: &mut ToolOutput) {
+        if output.tool_name != "fs.read" {
+            return;
+        }
+        let Some(touch) = output.resource_touches().into_iter().next() else {
+            return;
+        };
+        if touch.path.is_empty() {
+            return;
+        }
+        let residency = self
+            .services
+            .context_fs_read_residency(&touch.path)
+            .await
+            .unwrap_or(FsRereadClass::FirstRead);
+        let prior = self.projected_resource_fact(&touch.path);
+        let motive = crate::execution::classify_fs_read_motive(
+            residency,
+            prior.as_ref(),
+            touch.revision.as_deref(),
+        );
+        crate::execution::stamp_fs_read_motive(output, motive);
+    }
+
+    fn projected_resource_fact(&self, path: &str) -> Option<crate::execution::ResourceFact> {
+        let task_id = self.state.task_id?;
+        let task = self.state.tasks.get(task_id)?;
+        let Some(turn) = self.state.turn.as_ref() else {
+            return task.resume.fact_for(path).cloned();
+        };
+        task.resume
+            .apply_open_turn(
+                &turn.turn_frame,
+                task.anchor.revision,
+                turn.model_round as u64,
+            )
+            .fact_for(path)
+            .cloned()
     }
 
     /// Poison the normal-mutation lane after an effect result proves that

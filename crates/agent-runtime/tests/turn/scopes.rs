@@ -12,7 +12,7 @@ use agent_contracts::{
     ContextMaintenanceTrigger, ContextQuery, ContextScope, ContextStateTransition, EventJournal,
     MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest, ModelRole, ModelTransport,
     RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, ToolCall, ToolDispatcher,
-    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolSpec,
+    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolSemanticRole, ToolSpec,
 };
 
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
@@ -114,6 +114,7 @@ impl ToolDispatcher for OkToolDispatcher {
             input_schema: json!({"type": "object"}),
             risk: agent_contracts::ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::ReadResource],
         }]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -799,6 +800,7 @@ impl ToolDispatcher for EntitySignalingDispatcher {
             input_schema: json!({"type": "object"}),
             risk: agent_contracts::ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::ReadResource],
         }]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -873,6 +875,7 @@ impl ToolDispatcher for FailedEntitySignalingDispatcher {
             input_schema: json!({"type": "object"}),
             risk: agent_contracts::ToolRisk::ReadOnly,
             output_budget: None,
+            roles: vec![ToolSemanticRole::ReadResource],
         }]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -973,6 +976,7 @@ impl ToolDispatcher for DirectiveToolDispatcher {
                 input_schema: json!({"type": "object"}),
                 risk: agent_contracts::ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             },
             ToolSpec {
                 name: "context.collect".into(),
@@ -980,6 +984,7 @@ impl ToolDispatcher for DirectiveToolDispatcher {
                 input_schema: json!({"type": "object"}),
                 risk: agent_contracts::ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             },
         ]
     }

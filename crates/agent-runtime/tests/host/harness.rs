@@ -117,6 +117,7 @@ impl ToolDispatcher for RequiredLargeTools {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         }]
     }
 
@@ -250,6 +251,7 @@ impl Capability for DemoCapability {
                 input_schema: json!({"type": "object"}),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             })
             .collect()
     }
@@ -330,6 +332,7 @@ impl Capability for ContextCapturingCapability {
             input_schema: json!({"type": "object"}),
             risk,
             output_budget: None,
+            roles: Vec::new(),
         }]
     }
     async fn start(&self) -> AgentResult<()> {

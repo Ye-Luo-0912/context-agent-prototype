@@ -46,10 +46,14 @@ pub struct TaskRecord {
     /// acceptance criteria, plan, open loops and typed root claims. This is
     /// task authority, not a scored ContextItem.
     pub anchor: TaskAnchor,
-    /// Operational resume facts bound to this task's current anchor
-    /// revision. Not a second authority: the assembler projects a
-    /// `TaskProgressView` and never scores it as a heap item.
-    pub resume: crate::resume::ResumePoint,
+    /// Operational execution state bound to this task's current anchor
+    /// revision. Checkpointed as `resume`. Not a second authority: the
+    /// assembler projects a `TaskProgressView` and never scores it as a
+    /// heap item.
+    pub resume: crate::execution::ExecutionState,
+    /// Current user-turn directive. Replaced on every user input; never
+    /// written into `TaskAnchor` and never bumps `anchor_revision`.
+    pub turn_intent: String,
 }
 
 /// The bounded, revisioned tool-requirement slice of a TaskAnchor.
@@ -79,9 +83,12 @@ pub struct TaskAnchor {
     /// empty anchor (goal only, stamped from the task goal at creation);
     /// every CAS replacement bumps it.
     pub revision: u64,
-    /// The user-given goal the task was created with. Immutable in practice
-    /// (the task identity keys on it) and carried so restore can re-derive
-    /// the focus goal without replaying the transcript.
+    /// The user-given origin the task was created with. This is task
+    /// identity / historical origin, not a perpetual current instruction:
+    /// temporal wording (`yet`, `for now`, `first`) does not outrank the
+    /// current user turn. Immutable in practice (the task identity keys on
+    /// it) and carried so restore can re-derive the focus goal without
+    /// replaying the transcript.
     pub original_goal: String,
     /// The runtime's current interpretation of the goal, which may have
     /// evolved as constraints and findings landed.
@@ -435,7 +442,29 @@ impl TaskManager {
         self.tasks.iter().find(|task| task.id == id)
     }
 
-    /// Record a trusted tool fact on the active task's ResumePoint.
+    pub(crate) fn get_mut(&mut self, id: TaskId) -> Option<&mut TaskRecord> {
+        self.tasks.iter_mut().find(|task| task.id == id)
+    }
+
+    /// Replace the current-turn directive. Does not touch `TaskAnchor` or
+    /// bump `anchor_revision`. Clears per-turn source-change so a note
+    /// turn does not inherit NeedVerify from an earlier edit.
+    pub fn on_user_turn(&mut self, text: &str) {
+        let intent: String = text.chars().take(MAX_TASK_ANCHOR_TEXT_CHARS).collect();
+        let Some(id) = self.active else {
+            return;
+        };
+        let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) else {
+            return;
+        };
+        if task.status == TaskStatus::Completed {
+            return;
+        }
+        task.turn_intent = intent;
+        task.resume.on_user_turn();
+    }
+
+    /// Record a trusted tool fact on the active task's execution state.
     pub fn observe_tool(&mut self, output: &agent_contracts::ToolOutput, turn: u64) {
         let Some(id) = self.active else {
             return;
@@ -740,7 +769,8 @@ impl TaskManager {
                         original_goal: goal,
                         ..TaskAnchor::default()
                     },
-                    resume: crate::resume::ResumePoint::default(),
+                    resume: crate::execution::ExecutionState::default(),
+                    turn_intent: String::new(),
                 });
                 self.active = Some(target);
             }

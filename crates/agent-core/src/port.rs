@@ -813,6 +813,7 @@ mod tests {
                 input_schema: serde_json::json!({"type": "object"}),
                 risk: self.risk,
                 output_budget: None,
+                roles: Vec::new(),
             }]
         }
 
@@ -896,6 +897,7 @@ mod tests {
                 input_schema: serde_json::json!({"type": "object"}),
                 risk: agent_contracts::ToolRisk::ReadOnly,
                 output_budget: None,
+                roles: Vec::new(),
             }]
         }
 
@@ -1753,6 +1755,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             risk: agent_contracts::ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         };
         let denied_surface = ToolSurfaceSnapshot {
             specs: vec![denied_spec],

@@ -6,8 +6,10 @@ use std::task::{Context, Poll};
 
 use agent_contracts::{
     AgentError, AgentResult, ContentDigest, Effect, EffectDurability, EffectReceipt,
-    OperationEffectContext, RunId, artifact_owner_from_prefix,
+    OperationEffectContext, ResourceVersionOracle, RunId, artifact_owner_from_prefix,
+    message_looks_like_not_found,
 };
+use async_trait::async_trait;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::fs;
@@ -573,6 +575,43 @@ impl Workspace {
             .open_existing(last)
             .map_err(|e| confined_io_error("open", &file_display, e))?;
         Ok(ConfinedFile::new(file, self.root.join(clean)))
+    }
+
+    /// SHA-256 hex of a workspace-relative file, matching `fs.read`'s
+    /// content revision. Missing paths return `None`. Files above the
+    /// ordinary read cap are skipped (`InvalidRequest`) so this never
+    /// becomes a second full-file ingest path.
+    pub async fn resource_revision(&self, key: &str) -> AgentResult<Option<String>> {
+        const MAX_REVISION_BYTES: u64 = 2 * 1024 * 1024;
+        let path = agent_contracts::normalize_resource_path(key);
+        if path.is_empty() {
+            return Ok(None);
+        }
+        match self.confined_open_read(&path).await {
+            Ok(confined) => {
+                let metadata = confined.metadata().map_err(|error| {
+                    AgentError::Io(format!(
+                        "metadata {}: {error}",
+                        confined.display().display()
+                    ))
+                })?;
+                if metadata.len() > MAX_REVISION_BYTES {
+                    return Err(AgentError::InvalidRequest(format!(
+                        "file is {} bytes; revision lookup is capped at {MAX_REVISION_BYTES}",
+                        metadata.len()
+                    )));
+                }
+                use tokio::io::AsyncReadExt;
+                let mut file = confined.into_tokio();
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).await.map_err(|error| {
+                    AgentError::Io(format!("read {path} for revision: {error}"))
+                })?;
+                Ok(Some(ContentDigest::sha256_bytes(&bytes).to_string()))
+            }
+            Err(error) if revision_lookup_missing(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Confine a mutation's parent directory with validation and open fused
@@ -1179,6 +1218,22 @@ fn display_relative(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+fn revision_lookup_missing(error: &AgentError) -> bool {
+    match error {
+        AgentError::Io(message) | AgentError::InvalidRequest(message) => {
+            message_looks_like_not_found(message)
+        }
+        _ => false,
+    }
+}
+
+#[async_trait]
+impl ResourceVersionOracle for Workspace {
+    async fn revision(&self, key: &str) -> AgentResult<Option<String>> {
+        self.resource_revision(key).await
+    }
+}
+
 /// Lexically clean a user-provided workspace-relative path: no absolute
 /// prefixes, no `..`, no `.` segments. Shared by the path-string resolver
 /// and the directory-handle-relative confined operations.
@@ -1268,6 +1323,27 @@ mod tests {
             assert!(workspace.resolve_relative("/x").await.is_err());
             assert!(workspace.resolve_relative("//x").await.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn resource_revision_matches_sha256_and_reports_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/util.py"), b"hello revision\n").unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let digest = workspace
+            .resource_revision("src/util.py")
+            .await
+            .unwrap()
+            .expect("file exists");
+        assert_eq!(
+            digest,
+            ContentDigest::sha256_bytes(b"hello revision\n").to_string()
+        );
+        assert_eq!(
+            workspace.resource_revision("src/missing.py").await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

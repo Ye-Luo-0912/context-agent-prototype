@@ -10,7 +10,7 @@ use agent_contracts::{
     AgentError, AgentResult, ContextEngine, ContextIngress, ContextItemId, Effect,
     EffectDurability, EffectReceipt, ModelCapabilities, ModelMessage, ModelOutput, ModelRequest,
     ModelTransport, RuntimeEvent, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome,
-    ToolOutput, ToolRisk, ToolSpec,
+    ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec,
 };
 
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
@@ -76,6 +76,7 @@ impl ToolDispatcher for HintToolDispatcher {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         }]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -257,6 +258,7 @@ impl ToolDispatcher for SlowWriteDispatcher {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::WorkspaceWrite,
             output_budget: None,
+            roles: vec![ToolSemanticRole::Mutate],
         }]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {

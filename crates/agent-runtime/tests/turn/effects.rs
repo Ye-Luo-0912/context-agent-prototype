@@ -13,7 +13,7 @@ use agent_contracts::{
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextStateTransition,
     Effect, EffectDurability, EffectReceipt, MaterializedContext, ModelCapabilities, ModelOutput,
     ModelRequest, ModelTransport, RuntimeEvent, ScopeId, ScopeKind, ToolCall, ToolDispatcher,
-    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSpec,
+    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec,
 };
 
 use agent_core::PolicyApprovalGate;
@@ -67,6 +67,7 @@ impl ToolDispatcher for EffectToolDispatcher {
             input_schema: json!({"type": "object"}),
             risk: agent_contracts::ToolRisk::WorkspaceWrite,
             output_budget: None,
+            roles: vec![ToolSemanticRole::ReadResource],
         }]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -300,6 +301,7 @@ impl StagingCapability {
                     input_schema: json!({"type": "object"}),
                     risk: ToolRisk::WorkspaceWrite,
                     output_budget: None,
+                    roles: Vec::new(),
                 }],
                 lifecycle: CapabilityLifecycle::Lazy,
                 transport: CapabilityTransport::Builtin,
@@ -536,6 +538,7 @@ impl ToolDispatcher for ReceiptEffectDispatcher {
             input_schema: json!({"type": "object"}),
             risk: ToolRisk::WorkspaceWrite,
             output_budget: None,
+            roles: vec![ToolSemanticRole::ReadResource],
         }]
     }
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {

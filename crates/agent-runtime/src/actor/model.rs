@@ -73,6 +73,8 @@ impl RuntimeActor {
             }
         }
 
+        self.revalidate_stored_resource_facts(&current_input).await;
+
         // Tool lifecycle safe point. The active task's tool-demand set is
         // the GC root set: a tool the task requires is never aged out by
         // idle GC, so task demand cannot silently evaporate from the
@@ -92,6 +94,19 @@ impl RuntimeActor {
             })
             .unwrap_or_default();
         self.services.tool_gc(&task_roots);
+        let verification_due = self.verification_due_for_round(&turn_frame, &current_input);
+        let turn_intent = self
+            .state
+            .task_id
+            .and_then(|task_id| self.state.tasks.get(task_id))
+            .map(|task| task.turn_intent.as_str())
+            .filter(|intent| !intent.is_empty());
+        let has_failures = self
+            .state
+            .task_id
+            .and_then(|task_id| self.state.tasks.get(task_id))
+            .map(|task| task.resume.has_failures())
+            .unwrap_or(false);
         let active_task = self
             .state
             .task_id
@@ -137,11 +152,12 @@ impl RuntimeActor {
             .map(|spec| spec.name.clone())
             .collect();
 
-        // Derive typed tool roots from the task anchor / focus goal and the
-        // active-call policy, then merge them into the explicit requirement
-        // set. Derivation is a pure function of the safe-point state and
-        // only names tools that exist in the candidate catalog; the explicit
-        // task-owned set stays the authority (higher demand ranks win).
+        // Derive typed tool roots from execution need → catalog roles
+        // (not hard-coded tool names), then merge them into the explicit
+        // requirement set. Derivation is a pure function of the safe-point
+        // state and only names tools that exist in the candidate catalog;
+        // the explicit task-owned set stays the authority (higher demand
+        // ranks win).
         let anchor = active_task.map(|task| &task.anchor);
         let active_tool = self.state.active_tool.as_deref();
         requirements.extend(crate::policy::derive_task_roots(
@@ -149,7 +165,10 @@ impl RuntimeActor {
                 anchor,
                 focus_goal: active_task.map(|task| task.goal.as_str()),
                 active_tool,
-                catalog_names: &candidate_names,
+                catalog: &candidates.specs,
+                verification_due,
+                turn_intent,
+                has_failures,
             },
         ));
 
@@ -310,7 +329,8 @@ impl RuntimeActor {
         } else {
             DEFAULT_OUTPUT_RESERVE
         };
-        let (runtime_focus, task_view, progress_view) = self.runtime_prompt_focus(&turn_frame);
+        let (runtime_focus, task_view, progress_view) =
+            self.runtime_prompt_focus(&turn_frame).await;
         let runtime_focus_frame_tokens = crate::prompt::focus_frame_tokens(
             runtime_focus.as_ref(),
             task_view.as_ref(),
@@ -377,8 +397,14 @@ impl RuntimeActor {
         // silently over-budget send.
         let max_input_budget = send_window.saturating_sub(output_reserve);
         let mut materialized = materialized;
-        let mut input =
-            self.assemble_model_input(&materialized, &turn_frame, surface_plan.specs().to_vec());
+        let mut input = self.assemble_model_input(
+            runtime_focus.as_ref(),
+            task_view.as_ref(),
+            progress_view.as_ref(),
+            &materialized,
+            &turn_frame,
+            surface_plan.specs().to_vec(),
+        );
         let assembled_total = |input: &ModelInput| {
             approx_layer_tokens(&input.into_messages()) + approx_layer_tokens(&input.tool_schemas)
         };
@@ -411,6 +437,9 @@ impl RuntimeActor {
                 .approx_tokens
                 .saturating_sub(approx_tokens(&dropped.content));
             input = self.assemble_model_input(
+                runtime_focus.as_ref(),
+                task_view.as_ref(),
+                progress_view.as_ref(),
                 &materialized,
                 &turn_frame,
                 surface_plan.specs().to_vec(),
@@ -428,6 +457,9 @@ impl RuntimeActor {
                 break;
             }
             input = self.assemble_model_input(
+                runtime_focus.as_ref(),
+                task_view.as_ref(),
+                progress_view.as_ref(),
                 &materialized,
                 &turn_frame,
                 surface_plan.specs().to_vec(),
@@ -669,22 +701,57 @@ impl RuntimeActor {
 
     fn assemble_model_input(
         &self,
+        focus: Option<&FocusState>,
+        task: Option<&TaskAnchorView>,
+        progress: Option<&TaskProgressView>,
         history: &MaterializedContext,
         turn_frame: &TurnFrame,
         tools: Vec<ToolSpec>,
     ) -> ModelInput {
-        let (focus, task, progress) = self.runtime_prompt_focus(turn_frame);
-        self.assembler.assemble(
-            focus.as_ref(),
-            task.as_ref(),
-            progress.as_ref(),
-            history,
-            turn_frame,
-            tools,
-        )
+        self.assembler
+            .assemble(focus, task, progress, history, turn_frame, tools)
     }
 
-    fn runtime_prompt_focus(
+    async fn revalidate_stored_resource_facts(&mut self, current_query: &str) {
+        let Some(oracle) = self.services.artifact_workspace() else {
+            return;
+        };
+        let Some(task_id) = self.state.task_id else {
+            return;
+        };
+        let Some(task) = self.state.tasks.get_mut(task_id) else {
+            return;
+        };
+        if task.status == crate::task::TaskStatus::Completed {
+            return;
+        }
+        task.resume
+            .revalidate(oracle as &dyn ResourceVersionOracle, current_query)
+            .await;
+    }
+
+    fn verification_due_for_round(&self, turn_frame: &TurnFrame, current_input: &str) -> bool {
+        if crate::policy::turn_requests_verify(current_input) {
+            return true;
+        }
+        let Some(task_id) = self.state.task_id else {
+            return false;
+        };
+        let Some(task) = self.state.tasks.get(task_id) else {
+            return false;
+        };
+        let turn_number = self
+            .state
+            .turn
+            .as_ref()
+            .map(|turn| turn.model_round as u64)
+            .unwrap_or(0);
+        task.resume
+            .apply_open_turn(turn_frame, task.anchor.revision, turn_number)
+            .verification_due()
+    }
+
+    async fn runtime_prompt_focus(
         &self,
         turn_frame: &TurnFrame,
     ) -> (
@@ -708,10 +775,22 @@ impl RuntimeActor {
             .as_ref()
             .map(|turn| turn.model_round as u64)
             .unwrap_or(0);
-        let progress = self.services.project_task_progress().then(|| {
-            task.resume
-                .project_from_turn(turn_frame, task.anchor.revision, turn_number)
-        });
+        let progress = if self.services.project_task_progress() {
+            let mut projected =
+                task.resume
+                    .apply_open_turn(turn_frame, task.anchor.revision, turn_number);
+            if let Some(oracle) = self.services.artifact_workspace() {
+                projected
+                    .revalidate(
+                        oracle as &dyn ResourceVersionOracle,
+                        &turn_frame.user_message,
+                    )
+                    .await;
+            }
+            Some(projected.view())
+        } else {
+            None
+        };
         (
             Some(focus),
             Some(crate::task::task_anchor_view(&task.anchor)),

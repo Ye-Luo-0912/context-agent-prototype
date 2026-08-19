@@ -193,14 +193,15 @@ pub fn prompt_layer_costs(
 }
 
 fn render_current_focus(focus: &FocusState, task: Option<&TaskAnchorView>) -> String {
-    let mut out = String::from("CURRENT FOCUS\n");
+    let mut out = String::from("CURRENT DIRECTIVE\n");
+    out.push_str(&focus.current_query);
+    out.push_str("\n\nCURRENT FOCUS\n");
     if task.is_none_or(TaskAnchorView::is_empty) {
         out.push_str(&format!("Goal: {}\n", focus.goal));
     }
     out.push_str(&format!(
-        "Phase: {}\nCurrent query: {}\nActive entities: {}",
+        "Phase: {}\nActive entities: {}",
         focus.phase,
-        focus.current_query,
         if focus.active_entities.is_empty() {
             "(none)".to_string()
         } else {
@@ -241,20 +242,33 @@ fn render_focus_frame(
 }
 
 fn render_task_anchor(task: &TaskAnchorView) -> String {
-    let mut out = format!("TASK ANCHOR rev={}\n", task.revision);
+    let mut out = String::new();
     if !task.original_goal.is_empty() {
-        out.push_str(&format!("Goal: {}\n", task.original_goal));
-    }
-    if !task.current_interpretation.is_empty() {
         out.push_str(&format!(
+            "TASK ORIGIN rev={}\n{}\n",
+            task.revision, task.original_goal
+        ));
+    } else {
+        out.push_str(&format!("TASK ORIGIN rev={}\n", task.revision));
+    }
+    let mut persistent = String::new();
+    if !task.current_interpretation.is_empty() {
+        persistent.push_str(&format!(
             "Interpretation: {}\n",
             task.current_interpretation
         ));
     }
-    append_list(&mut out, "Constraints", &task.constraints);
-    append_list(&mut out, "Acceptance", &task.acceptance_criteria);
-    append_list(&mut out, "Progress", &task.plan_progress);
-    append_list(&mut out, "Open loops", &task.open_loops);
+    append_list(&mut persistent, "Constraints:", &task.constraints);
+    append_list(&mut persistent, "Acceptance:", &task.acceptance_criteria);
+    append_list(&mut persistent, "Progress:", &task.plan_progress);
+    append_list(&mut persistent, "Open loops:", &task.open_loops);
+    while persistent.ends_with('\n') {
+        persistent.pop();
+    }
+    if !persistent.is_empty() {
+        out.push_str("\nPERSISTENT TASK STATE\n");
+        out.push_str(&persistent);
+    }
     while out.ends_with('\n') {
         out.pop();
     }
@@ -795,7 +809,8 @@ mod tests {
     fn task_anchor_view_renders_in_focus_frame_without_duplicating_goal() {
         use agent_contracts::{FocusState, TaskAnchorView, TaskId};
         let assembler = PromptAssembler::new("policy");
-        let runtime_focus = FocusState::for_task(TaskId::new(), "refactor auth");
+        let mut runtime_focus = FocusState::for_task(TaskId::new(), "refactor auth");
+        runtime_focus.current_query = "Append HDMI to scratch.md".into();
         let task = TaskAnchorView {
             revision: 3,
             original_goal: "refactor auth".into(),
@@ -823,12 +838,22 @@ mod tests {
             Vec::new(),
         );
         let focus = input.focus_frame.expect("anchor + focus must render");
-        assert!(focus.contains("TASK ANCHOR rev=3"));
-        assert!(focus.contains("Goal: refactor auth"));
+        assert!(focus.contains("TASK ORIGIN rev=3"));
+        assert!(focus.contains("refactor auth"));
+        assert!(focus.contains("PERSISTENT TASK STATE"));
+        assert!(focus.contains("Constraints:"));
+        assert!(!focus.contains("TASK ANCHOR"));
+        assert!(!focus.contains("Goal: refactor auth"));
         assert!(focus.contains("Interpretation: split the module"));
         assert!(focus.contains("- do not change public API"));
         assert!(focus.contains("- verify callers"));
+        assert!(focus.contains("CURRENT DIRECTIVE"));
+        assert!(focus.contains("Append HDMI to scratch.md"));
         assert!(focus.contains("CURRENT FOCUS"));
+        assert!(
+            !focus.contains("Current instruction (this turn, highest priority):"),
+            "directive lives under CURRENT DIRECTIVE: {focus}"
+        );
         assert!(
             !focus.contains("CURRENT FOCUS\nGoal:"),
             "goal lives on the anchor, not twice: {focus}"

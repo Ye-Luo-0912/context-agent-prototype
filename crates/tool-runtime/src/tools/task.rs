@@ -50,6 +50,7 @@ impl Tool for TaskCompleteTool {
             }),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
+            roles: Vec::new(),
         }
     }
 
