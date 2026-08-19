@@ -20,6 +20,21 @@ pub(crate) struct ReactivationTrace {
     pub consumed: bool,
 }
 
+pub(crate) fn clear_segment(state: &mut State) {
+    state.reactivation_traces.clear();
+    state.reactivation_selected = 0;
+    state.reactivation_consumed = 0;
+    state.reactivation_selected_tokens = 0;
+    state.reactivation_consumed_tokens = 0;
+    state.reactivation_events = 0;
+    state.unique_reactivated = 0;
+    state.reactivated_tokens = 0;
+    state.reactivation_tool_observation_selected = 0;
+    state.reactivation_tool_observation_consumed = 0;
+    state.reactivation_file_observation_selected = 0;
+    state.reactivation_file_observation_consumed = 0;
+}
+
 pub(crate) fn record(state: &mut State, item: &ContextItem, reason: &str) {
     let tokens = approx_tokens(&item.content);
     state.reactivation_events = state.reactivation_events.saturating_add(1);
@@ -149,5 +164,9 @@ mod tests {
         assert_eq!(state.unique_reactivated, 2);
         assert_eq!(state.reactivation_file_observation_selected, 1);
         assert_eq!(state.reactivation_file_observation_consumed, 1);
+        clear_segment(&mut state);
+        assert_eq!(state.reactivation_events, 0);
+        assert_eq!(state.unique_reactivated, 0);
+        assert!(state.reactivation_traces.is_empty());
     }
 }

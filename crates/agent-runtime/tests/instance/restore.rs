@@ -1,9 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_contracts::{
-    CapabilityActivation, ContextEngine, ContextQuery, RuntimeEvent, ToolLifecycle,
-};
+use agent_contracts::{CapabilityActivation, RuntimeEvent, ToolLifecycle};
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{
     ContextRootClaim, ModuleHost, RootClaimRole, RootClaimStrength, RuntimeInstance,
@@ -96,18 +94,9 @@ async fn runtime_checkpoint_roundtrips_tasks_context_and_capabilities() {
     // Task id alignment survives the round-trip: the restored engine's
     // focus must point at the same task the runtime restored as current,
     // so runtime and context cannot drift into a split-brain after
-    // recovery.
-    let restored_focus = fresh_context
-        .materialize(ContextQuery {
-            current_input: "resume".into(),
-            budget_tokens: 4096,
-            hints: Default::default(),
-        })
-        .await
-        .unwrap()
-        .focus;
+    // recovery. Production engines leave MaterializedContext.focus empty.
     assert_eq!(
-        restored_focus.map(|focus| focus.task_id),
+        fresh_context.focused_task_id().await,
         checkpoint.current_task_id,
         "restore must align the context focus with the runtime's current task"
     );
@@ -225,18 +214,15 @@ async fn failed_restore_keeps_the_existing_task_and_context_authority() {
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].goal, "original task");
 
-    let focus = context
-        .materialize(ContextQuery {
-            current_input: String::new(),
-            budget_tokens: 0,
-            hints: Default::default(),
-        })
-        .await
-        .unwrap()
-        .focus
-        .expect("the original context focus must survive failed restore");
-    assert_eq!(focus.task_id, tasks[0].id);
-    assert_eq!(focus.goal, "original task");
+    assert_eq!(
+        context.focused_task_id().await,
+        Some(tasks[0].id),
+        "the original context focus must survive failed restore"
+    );
+    assert_eq!(
+        context.focused_goal().await.as_deref(),
+        Some("original task")
+    );
     instance.shutdown().await.unwrap();
 }
 
@@ -285,17 +271,7 @@ async fn restore_rejects_context_focus_that_disagrees_with_task_authority() {
         "context/task disagreement must be rejected explicitly: {error}"
     );
     assert_eq!(instance.handle().list_tasks().await.unwrap(), before);
-    let focus = context
-        .materialize(ContextQuery {
-            current_input: String::new(),
-            budget_tokens: 0,
-            hints: Default::default(),
-        })
-        .await
-        .unwrap()
-        .focus
-        .unwrap();
-    assert_eq!(focus.task_id, before[0].id);
+    assert_eq!(context.focused_task_id().await, Some(before[0].id));
     instance.shutdown().await.unwrap();
 }
 

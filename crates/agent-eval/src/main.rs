@@ -13,10 +13,12 @@ mod acceptance;
 mod analysis;
 mod bundle;
 mod context_bench;
+mod context_mech;
 mod driver;
 mod envfile;
 mod fixture_driver;
 mod harvest;
+mod hygiene;
 mod metrics;
 mod mock_model;
 mod pilot;
@@ -139,6 +141,14 @@ fn usage() -> ! {
          measure search recall/latency and graded access stamps. Not the\n\
          paired real-model coding gate.\n\
          \n\
+         usage: agent-eval --context-hygiene\n\
+         \n\
+         Engine-only C-hygiene ablation: current / descriptor-only /\n\
+         one-file-body on a scripted trajectory. Measures old-tool-body\n\
+         auto-reactivation (P3) and fs.read reread classes (P4). No\n\
+         provider. Does not rewrite SPEC and does not enable those\n\
+         switches in production C.\n\
+         \n\
          usage: agent-eval --context-bench\n\
          usage: agent-eval [--repeats N] [--evidence-dir <dir>] --context-bench-run [id]\n\
          usage: agent-eval [--repeats N] [--evidence-dir <dir>] --context-bench-ablation\n\
@@ -151,6 +161,14 @@ fn usage() -> ! {
          force-compact / no-progress, default repeats=2, shuffled arm order.\n\
          It does not rewrite SPEC or the frozen pack. Default evidence dir\n\
          is crates/agent-eval/evidence/context-bench-ablation/.\n\
+         Do not keep live-running semantic_recall.v1 after CI is green.\n\
+         \n\
+         usage: agent-eval --context-mech\n\
+         usage: agent-eval [--repeats N] [--evidence-dir <dir>] --context-mech-run [id]\n\
+         \n\
+         Mechanism V2: three one-mechanism scenarios (late constraint,\n\
+         resume freshness, no-semantic episode). Dynamic engine only.\n\
+         Default repeats=2. Does not rewrite frozen context-bench.v1.\n\
          This does not close M15 and does not open the 300×3 ITT gate.\n"
     );
     std::process::exit(2);
@@ -377,6 +395,11 @@ async fn main() -> anyhow::Result<()> {
                 print!("{}", retrieval::render_retrieval(&report));
                 return Ok(());
             }
+            "--context-hygiene" => {
+                let reports = hygiene::run_hygiene_ablation().await?;
+                print!("{}", hygiene::render_hygiene(&reports));
+                return Ok(());
+            }
             "--context-bench" => {
                 let pack = context_bench::load_pack()?;
                 print!("{}", context_bench::render_pack(&pack));
@@ -391,6 +414,18 @@ async fn main() -> anyhow::Result<()> {
             "--context-bench-ablation" => {
                 let repeats = if repeats_set { repeats } else { 2 };
                 run_context_bench_ablation(repeats, evidence_dir).await?;
+                return Ok(());
+            }
+            "--context-mech" => {
+                let pack = context_mech::load_pack()?;
+                print!("{}", context_mech::render_pack(&pack));
+                print!("{}", context_mech::check_pack(&pack)?);
+                return Ok(());
+            }
+            "--context-mech-run" => {
+                let only = args.next().filter(|value| !value.starts_with('-'));
+                let repeats = if repeats_set { repeats } else { 2 };
+                run_context_mech_live(only, repeats, evidence_dir).await?;
                 return Ok(());
             }
             "--all" => engines = vec!["append", "rolling", "dynamic"],
@@ -682,6 +717,54 @@ async fn run_context_bench_ablation(
         print!("{}", fixture_driver::render_live_comparison(&runs));
         let pair_dir = pair.root.join(task.id()).join(format!("r{round}"));
         print!("{}", bundle::render_evidence(&pair_dir)?);
+    }
+    Ok(())
+}
+
+async fn run_context_mech_live(
+    only: Option<String>,
+    repeats: u32,
+    evidence_dir: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    let pack = context_mech::load_pack()?;
+    eprintln!("{}", context_mech::check_pack(&pack)?);
+    let model = driver::build_live_coding_model()?;
+    let evidence_root = evidence_dir
+        .unwrap_or_else(|| std::path::PathBuf::from("crates/agent-eval/evidence/context-mech"));
+    std::fs::create_dir_all(&evidence_root)?;
+    eprintln!("evidence dir: {}", evidence_root.display());
+    let tasks: Vec<&context_bench::BenchTask> = pack
+        .tasks
+        .iter()
+        .filter(|task| only.as_deref().is_none_or(|id| task.id() == id))
+        .collect();
+    anyhow::ensure!(!tasks.is_empty(), "no matching mechanism-v2 task");
+    for round in 1..=repeats {
+        for task in &tasks {
+            eprintln!(
+                "== context-mech {} dynamic repeat {round}/{repeats} ==",
+                task.id()
+            );
+            let dir = tempfile::tempdir()?;
+            let pair = bundle::PairSink {
+                root: evidence_root.clone(),
+                fixture_id: task.id().to_string(),
+                repeat: round,
+                repeats,
+                live: true,
+            };
+            let runs = fixture_driver::compare_mech_live(
+                &pack,
+                task,
+                dir.path(),
+                model.clone(),
+                Some(&pair),
+            )
+            .await?;
+            print!("{}", fixture_driver::render_live_comparison(&runs));
+            let pair_dir = pair.root.join(task.id()).join(format!("r{round}"));
+            print!("{}", bundle::render_evidence(&pair_dir)?);
+        }
     }
     Ok(())
 }

@@ -404,7 +404,7 @@ mod tests {
             summary: "read".into(),
             model_content: "content".into(),
             artifact_ref: None,
-            metadata: json!({}),
+            metadata: json!({"path": "src/foo.rs"}),
         }
     }
 

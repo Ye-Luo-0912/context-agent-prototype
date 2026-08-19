@@ -389,8 +389,8 @@ Since V1-P0-2 the engine never renders prompt text. It answers a
 `ContextQuery { current_input, budget_tokens, hints }` with a
 `MaterializedContext { focus, items, external, selected, approx_tokens,
 diagnostics }`; `items` are structured `MaterializedItem`s, `external` is
-a bounded refs-only view of the store (max 32 entries, never the full
-map), and the runtime-owned `PromptAssembler` is the only place that turns
+a bounded refs-only view (store hot/recency plus Warm items that are hot
+or already Checked; max 32 entries, never the full map), and the runtime-owned `PromptAssembler` is the only place that turns
 them into `ModelMessage`s.
 
 Three implementations exist behind the same contract, plus the P5
@@ -1658,12 +1658,14 @@ not trait/vtable dispatch or small-object clones. The P0 items:
   without it, and a fresh lock applies the outcomes. The state lock is
   never held across a disk read or write on the hot path.
 - **External ContextMap is never fully cloned.** `materialize` surfaces a
-  bounded view (`MAX_EXTERNAL_REFS = 32`, hot-entity/open-loop/recency
-  ranking via quickselect); `search_external` truncates to the query limit
+  bounded view (`MAX_EXTERNAL_REFS = 32`, hot-entity / open-loop /
+  checked-path / recency ranking; hot and Checked Stored hits come from
+  the entity index, Warm hot/Checked from the eviction buffer, plus a
+  recency tail — not a full-map clone); `search_external` truncates to the query limit
   before cloning (Resident/Warm hits are heap projections, not store
   clones); `inspect_external` returns one catalog descriptor. The full map
-  stays in the engine. This bounds copied/model-facing data, not CPU: ranking still
-  scans and collects O(total refs) borrowed entries pending CTX-07.
+  stays in the engine. This bounds copied/model-facing data; ranking no
+  longer walks the full map (CTX-07).
 
 ## 9f. Consistency invariant test suite
 

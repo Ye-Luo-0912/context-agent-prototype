@@ -59,10 +59,13 @@ impl<T: ModelTransport> ModelTransport for RetryingTransport<T> {
     }
 
     async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
-        retry(self.max_attempts, self.base_delay, &request.cancel, || {
-            self.inner.complete(request.clone())
-        })
-        .await
+        let (mut output, attempts) =
+            retry(self.max_attempts, self.base_delay, &request.cancel, || {
+                self.inner.complete(request.clone())
+            })
+            .await?;
+        stamp_attempt_usage(&mut output, attempts);
+        Ok(output)
     }
 
     async fn complete_stream(
@@ -78,7 +81,10 @@ impl<T: ModelTransport> ModelTransport for RetryingTransport<T> {
                 emitted: &emitted,
             };
             match self.inner.complete_stream(request.clone(), &tracking).await {
-                Ok(output) => return Ok(output),
+                Ok(mut output) => {
+                    stamp_attempt_usage(&mut output, attempt + 1);
+                    return Ok(output);
+                }
                 Err(error) => {
                     let retryable = matches!(
                         &error,
@@ -108,12 +114,17 @@ impl<T: ModelTransport> ModelTransport for RetryingTransport<T> {
     }
 }
 
+fn stamp_attempt_usage(output: &mut ModelOutput, attempts: u32) {
+    output.usage.attempts = attempts.max(1);
+    output.usage.retries = output.usage.attempts.saturating_sub(1);
+}
+
 async fn retry<T, F, Fut>(
     max_attempts: u32,
     base_delay: Duration,
     cancel: &CancellationToken,
     mut op: F,
-) -> AgentResult<T>
+) -> AgentResult<(T, u32)>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = AgentResult<T>>,
@@ -121,7 +132,7 @@ where
     let mut attempt = 0u32;
     loop {
         match op().await {
-            Ok(value) => return Ok(value),
+            Ok(value) => return Ok((value, attempt + 1)),
             Err(error) => {
                 if attempt + 1 >= max_attempts
                     || !matches!(
@@ -220,6 +231,8 @@ mod tests {
         let output = transport.complete(request()).await.unwrap();
         assert_eq!(output.content, "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 3, "2 failures then success");
+        assert_eq!(output.usage.attempts, 3);
+        assert_eq!(output.usage.retries, 2);
     }
 
     #[tokio::test]
@@ -390,6 +403,8 @@ mod tests {
         let output = transport.complete_stream(request(), &sink).await.unwrap();
         assert_eq!(output.content, "hello");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(output.usage.attempts, 2);
+        assert_eq!(output.usage.retries, 1);
         let chunks = sink.chunks.lock().unwrap();
         assert_eq!(
             &chunks[..],

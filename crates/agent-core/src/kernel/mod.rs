@@ -6,7 +6,7 @@ use std::sync::{
 use agent_contracts::{
     AgentError, AgentResult, ArgumentDigest, AuthorityLease, AuthorityRecoveryStatus,
     CONTEXT_SEARCH_MAX_LIMIT, CONTEXT_SEARCH_MAX_QUERY_CHARS, CancellationToken,
-    ContextConsumptionAck, ContextEngine, ContextItemId, ContextMaintenanceTrigger, ContextQuery,
+    ContextConsumptionAck, ContextEngine, ContextItemId, ContextMaintenanceTrigger,
     ContextResidency, ContextSearchQuery, DiscoveryMiss, EffectDurability, EffectId,
     EffectReconciler, EffectReconciliation, EngineQuery, OperationEffectContext, OperationId,
     OperationQueryResult, OperationSnapshot, OperationState, OperationTerminal, OutputBroker,
@@ -1261,8 +1261,9 @@ impl CoreAuthority {
     /// Restore and verify the context half of a runtime checkpoint before
     /// the actor exposes its task-table half. A fallible engine restore may
     /// partially mutate, so this uses the same snapshot rollback as focus
-    /// transitions. The materialized focus is the contract-level authority
-    /// check; callers cannot assume opaque context JSON has a matching task.
+    /// transitions. Engine-owned `diagnostics.focus_task_id` is the
+    /// authority check; `MaterializedContext.focus` is assembler-owned and
+    /// left empty by production engines.
     pub(crate) async fn restore(
         &self,
         data: serde_json::Value,
@@ -1270,32 +1271,20 @@ impl CoreAuthority {
     ) -> AgentResult<()> {
         self.ensure_mutation_allowed()?;
         let checkpoint = self.context.checkpoint().await?;
-        let verification_restore = data.clone();
         let restored = async {
+            // Stub engines persist `Null` and do not track focus. Production
+            // engines persist a non-null state blob; after restore their
+            // `diagnostics.focus_task_id` must match the runtime task.
+            let check_focus = !data.is_null();
             self.context.restore(data).await?;
-            let actual_task_id = self
-                .context
-                .materialize(ContextQuery {
-                    current_input: String::new(),
-                    budget_tokens: 0,
-                    hints: agent_contracts::ContextHints {
-                        max_selected_items: Some(0),
-                        ..Default::default()
-                    },
-                })
-                .await?
-                .focus
-                .map(|focus| focus.task_id);
-            if actual_task_id != expected_task_id {
-                return Err(AgentError::InvalidRequest(format!(
-                    "checkpoint context focus {actual_task_id:?} does not match current task {expected_task_id:?}"
-                )));
+            if check_focus {
+                let actual_task_id = self.context.diagnostics().await?.focus_task_id;
+                if actual_task_id != expected_task_id {
+                    return Err(AgentError::InvalidRequest(format!(
+                        "checkpoint context focus {actual_task_id:?} does not match current task {expected_task_id:?}"
+                    )));
+                }
             }
-            // `materialize` is the only implementation-agnostic way to read
-            // focus today and may stamp access/tick metadata. Re-applying
-            // the same replacement checkpoint removes that verification
-            // observation, so restore remains an exact state replacement.
-            self.context.restore(verification_restore).await?;
             Ok(())
         }
         .await;

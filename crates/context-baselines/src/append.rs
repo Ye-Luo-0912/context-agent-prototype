@@ -108,6 +108,7 @@ impl ContextEngine for AppendOnlyEngine {
                 approx_tokens: approx_tokens(&record.content),
                 reason: "append-only baseline: prior history retained".into(),
                 breakdown: ScoreBreakdown::default(),
+                ..Default::default()
             })
             .collect();
         Ok(MaterializedContext {

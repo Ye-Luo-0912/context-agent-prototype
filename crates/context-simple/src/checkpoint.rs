@@ -14,6 +14,13 @@ pub(crate) fn serialize(state: &State) -> AgentResult<Value> {
 pub(crate) fn deserialize(data: Value) -> AgentResult<State> {
     let mut state: State = serde_json::from_value(data)
         .map_err(|e| AgentError::Context(format!("checkpoint restore: {e}")))?;
+    if state.user_hot_entities.is_empty()
+        && state.tool_hot.is_empty()
+        && !state.hot_entities.is_empty()
+    {
+        state.user_hot_entities = state.hot_entities.clone();
+    }
+    state.rebuild_hot_entities();
     state.sync_catalog();
     Ok(state)
 }

@@ -18,8 +18,8 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use agent_contracts::{
-    AccessSignal, ContextItem, ContextItemId, ContextRef, ContextResidency, ContextRetention,
-    ExternalizedContext, StorageGcReport, StoreReconcileReport,
+    AccessSignal, ContextItem, ContextItemId, ContextKind, ContextRef, ContextResidency,
+    ContextRetention, ExternalizedContext, StorageGcReport, StoreReconcileReport,
 };
 
 use crate::engine::{SimpleContextConfig, State};
@@ -145,7 +145,9 @@ pub(crate) async fn read_item_async(dir: &Path, item_id: ContextItemId) -> Optio
 /// Deterministic catalog search — no vectors. Candidate generation prefers
 /// the catalog indexes (kind/scope/task/label/entity keys) across Resident,
 /// Warm, and Stored. A free-text needle that hits none of those keys
-/// residual-scans summaries/uris/bodies. Ranking is unchanged: entity
+/// residual-scans summaries/uris. Raw ToolObservation / FileObservation
+/// summaries are identity (`path@rev`) on this surface, so file text is
+/// not a search needle. Ranking is unchanged: entity
 /// matches first, then recency, bounded to `limit`. Resident/Warm hits are
 /// projected descriptors (no store read) so a live file is not an empty miss.
 pub(crate) fn search_catalog(
@@ -179,7 +181,8 @@ fn project_all_live(state: &State) -> Vec<ExternalizedContext> {
             .external
             .iter()
             .filter(|entry| externally_retrievable(entry))
-            .cloned(),
+            .cloned()
+            .map(prompt_evidence_descriptor),
     );
     rows
 }
@@ -209,11 +212,12 @@ pub(crate) fn project_search_hit(state: &State, id: ContextItemId) -> Option<Ext
         .get(id)
         .filter(|entry| externally_retrievable(entry))
         .cloned()
+        .map(prompt_evidence_descriptor)
 }
 
 /// 驻留/Warm 条目的检索投影：权威元数据来自 heap，不读 store。
 fn project_item(item: &ContextItem) -> ExternalizedContext {
-    ExternalizedContext {
+    let entry = ExternalizedContext {
         item_id: item.id,
         task_id: item.task_id,
         scope_id: item.scope_id,
@@ -247,6 +251,43 @@ fn project_item(item: &ContextItem) -> ExternalizedContext {
         evicted_at_tick: item.evicted_at_tick,
         file_path: item.file_path.clone(),
         file_revision: item.file_revision.clone(),
+    };
+    prompt_evidence_descriptor(entry)
+}
+
+/// Prompt/search/inspect identity for raw evidence. Decision / Constraint /
+/// Error keep their stored summaries; tool/file bodies become path@rev so
+/// retrieval cards do not dump stdout or file text. The store map still
+/// keeps the 120-char residual for GC classification of unsourced replay.
+pub(crate) fn prompt_evidence_descriptor(mut entry: ExternalizedContext) -> ExternalizedContext {
+    if let Some(summary) = evidence_ref_identity(&entry) {
+        entry.context_ref.summary = summary;
+    }
+    entry
+}
+
+fn evidence_ref_identity(entry: &ExternalizedContext) -> Option<String> {
+    match entry.kind {
+        ContextKind::ToolObservation | ContextKind::FileObservation => {
+            let path = entry
+                .file_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty());
+            Some(match path {
+                Some(path) => match entry
+                    .file_revision
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|revision| !revision.is_empty())
+                {
+                    Some(revision) => format!("{path}@{revision}"),
+                    None => path.to_string(),
+                },
+                None => entry.kind.as_str().to_string(),
+            })
+        }
+        _ => None,
     }
 }
 

@@ -1,0 +1,51 @@
+{
+  "id": "late_semantic_constraint",
+  "scenario": "late_constraint",
+  "variant": "wire",
+  "name": "Noise first, then a late unversioned-ping constraint, then v2 Hello",
+  "seed": "protocol",
+  "include_rolling": false,
+  "target_rounds_lo": 8,
+  "target_rounds_hi": 16,
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "ops": [
+    {
+      "op": "user",
+      "text": "Read src/protocol.rs and summarize the current message types. Do not change code yet."
+    },
+    {
+      "op": "user",
+      "text": "Add a unit-style comment-free helper encode roundtrip for Ping."
+    },
+    {
+      "op": "user",
+      "text": "List possible v2 fields you might add. Do not add them yet."
+    },
+    {
+      "op": "user",
+      "text": "Important constraint that must not be written into any file comments: old clients send an unversioned ping body and must keep working."
+    },
+    {
+      "op": "user",
+      "text": "Now add v2: Msg::Hello(String) with an explicit v:2 envelope. Leave every existing message path alone; do not recap earlier constraints."
+    }
+  ],
+  "hidden": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": ["Hello"]
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": ["ping"]
+    }
+  ],
+  "hidden_commands": [
+    {
+      "name": "wire_v1",
+      "script": "wire_v1.py"
+    }
+  ]
+}

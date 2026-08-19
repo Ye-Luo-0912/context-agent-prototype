@@ -87,6 +87,10 @@ pub struct CellSummary {
     /// `ModelStarted` 多于 `ModelUsed`，或有 round 但用量全是 0：不能把
     /// 缺 usage 当成测得的零。
     pub usage_incomplete: bool,
+    /// Successful rounds retried, or usage is incomplete. Recorded provider
+    /// tokens omit failed attempts that reported no usage.
+    #[serde(default)]
+    pub provider_tokens_lower_bound: bool,
     pub workspace_sha256: String,
     pub workspace_files: usize,
     pub tools: Vec<ToolCount>,
@@ -235,6 +239,7 @@ pub(crate) fn write_cell_parts(
         || (model_started > 0
             && metrics.model_input_tokens == 0
             && metrics.model_output_tokens == 0);
+    let provider_tokens_lower_bound = metrics.provider_tokens_lower_bound || usage_incomplete;
     let outcome = if error.is_some() {
         "error"
     } else if passed {
@@ -255,6 +260,7 @@ pub(crate) fn write_cell_parts(
         model_started,
         model_used,
         usage_incomplete,
+        provider_tokens_lower_bound,
         workspace_sha256,
         workspace_files: files.len(),
         tools: tool_histogram(events),
@@ -367,7 +373,7 @@ fn render_cell(dir: &Path) -> anyhow::Result<String> {
         serde_json::from_str(&fs::read_to_string(parent.join("manifest.json"))?)?;
     let mut out = String::new();
     out.push_str(&format!(
-        "  {:8} outcome={} passed={} wall_ms={} rounds={} tools={} search={}/{} empty={} p50_ms={} lagged={} usage_incomplete={}\n",
+        "  {:8} outcome={} passed={} wall_ms={} rounds={} tools={} search={}/{} empty={} p50_ms={} lagged={} usage_incomplete={} tokens_lower_bound={}\n",
         manifest.engine,
         summary.outcome,
         summary.passed,
@@ -380,6 +386,7 @@ fn render_cell(dir: &Path) -> anyhow::Result<String> {
         summary.metrics.get("search_ms_p50").and_then(|v| v.as_u64()).unwrap_or(0),
         summary.broadcast_lagged,
         summary.usage_incomplete,
+        summary.provider_tokens_lower_bound,
     ));
     out.push_str(&format!(
         "           forgotten={} recovered={} search={} reactivate={} reread={} failed={} compact={}/{}\n",
@@ -651,6 +658,9 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
     if let Some(map) = value.as_object_mut() {
         map.extend(
             json!({
+                "model_attempts": metrics.model_attempts,
+                "model_retries": metrics.model_retries,
+                "provider_tokens_lower_bound": metrics.provider_tokens_lower_bound,
                 "reactivation_events": metrics.reactivation_events,
                 "unique_reactivated": metrics.unique_reactivated,
                 "reactivated_tokens": metrics.reactivated_tokens,
@@ -666,6 +676,16 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
                 "prompt_historical_context_tokens": metrics.prompt_historical_context_tokens,
                 "prompt_turn_frame_tokens": metrics.prompt_turn_frame_tokens,
                 "prompt_tool_schema_tokens": metrics.prompt_tool_schema_tokens,
+                "reread_previously_selected": metrics.reread_previously_selected,
+                "reread_resident_unselected": metrics.reread_resident_unselected,
+                "reread_warm": metrics.reread_warm,
+                "reread_stored": metrics.reread_stored,
+                "reread_first_read": metrics.reread_first_read,
+                "selected_tokens_by_kind": metrics.selected_tokens_by_kind,
+                "selected_tokens_by_reason": metrics.selected_tokens_by_reason,
+                "selected_tokens_by_source": metrics.selected_tokens_by_source,
+                "selected_tokens_reactivated": metrics.selected_tokens_reactivated,
+                "selected_tokens_resident": metrics.selected_tokens_resident,
             })
             .as_object()
             .cloned()

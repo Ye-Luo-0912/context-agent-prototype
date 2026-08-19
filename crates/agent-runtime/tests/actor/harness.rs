@@ -672,6 +672,7 @@ impl ContextEngine for BigContextEngine {
                 content: format!("{}:{}", "data ".repeat(2400), i),
                 source: None,
                 file_path: None,
+                file_revision: None,
             })
             .collect();
         let approx_tokens = self.item_count.saturating_mul(3_000);

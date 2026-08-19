@@ -204,6 +204,18 @@ impl ToolOutput {
         if let Some(path) = self.file_path() {
             return Some(path);
         }
+        if let Some(path) = self
+            .metadata
+            .get("files")
+            .and_then(|value| value.as_array())
+            .and_then(|files| files.first())
+            .and_then(|file| file.get("path"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            return Some(path);
+        }
         if let Some(command) = self
             .metadata
             .get("command")
@@ -220,29 +232,99 @@ impl ToolOutput {
             .filter(|argv| !argv.is_empty())
     }
 
-    /// Explicit verification intent, never inferred from the tool name.
+    /// Explicit verification intent. Never inferred from the tool name or
+    /// from command-line needles (`cargo test` is not automatically a
+    /// verification, and a verification is not automatically non-mutating).
     pub fn is_verification(&self) -> bool {
-        if self
-            .metadata
+        self.metadata
             .get("verification")
             .and_then(|value| value.as_bool())
             == Some(true)
+            || self.metadata.get("intent").and_then(|value| value.as_str()) == Some("verify")
+    }
+
+    /// Conservative workspace-mutation upper bound. Prefer typed metadata
+    /// (`mutates_workspace`, or `_runtime.effect_intent`); builtin names
+    /// are a temporary fallback until every producer stamps the flag.
+    /// Process execution is treated as may-mutate even when it looks like a
+    /// test — verification and mutation are orthogonal.
+    pub fn may_mutate_workspace(&self) -> bool {
+        if let Some(flag) = self
+            .metadata
+            .get("mutates_workspace")
+            .and_then(|value| value.as_bool())
         {
-            return true;
+            return flag;
         }
-        if self.metadata.get("intent").and_then(|value| value.as_str()) == Some("verify") {
-            return true;
+        if let Some(intent) = self
+            .metadata
+            .get(RUNTIME_METADATA_KEY)
+            .and_then(|value| value.get("effect_intent"))
+            .and_then(|value| value.as_str())
+        {
+            return !matches!(intent, "read_only" | "ReadOnly");
         }
-        self.operation_target()
-            .is_some_and(command_looks_like_verification)
+        matches!(
+            self.tool_name.as_str(),
+            "fs.write" | "edit.replace" | "edit.patch" | "shell.exec" | "process.run"
+        ) || (self.tool_name.starts_with("git.")
+            && !matches!(
+                self.tool_name.as_str(),
+                "git.status" | "git.diff" | "git.log"
+            ))
     }
 
     /// 中轮 WorkingSetSignal 文本：路径单独一行，后面才是正文。
+    /// Legacy helper. Heating must use [`Self::resource_touches`], not this
+    /// string — stdout must not become hot entities.
     pub fn working_set_signal_text(&self) -> String {
         match self.file_path() {
             Some(path) => format!("{path}\n{}", self.model_content),
             None => self.model_content.clone(),
         }
+    }
+
+    /// Trusted structured resources this output touched. Paths come from
+    /// `metadata.path` and `metadata.files[].path` only — never from
+    /// `model_content` / stdout.
+    pub fn resource_touches(&self) -> Vec<crate::ResourceTouch> {
+        let mut touches = Vec::new();
+        let mut push = |raw: &str, revision: Option<String>| {
+            if touches.len() >= crate::MAX_RESOURCE_TOUCHES {
+                return;
+            }
+            let path = crate::normalize_resource_path(raw);
+            if path.is_empty()
+                || touches
+                    .iter()
+                    .any(|touch: &crate::ResourceTouch| touch.path == path)
+            {
+                return;
+            }
+            touches.push(crate::ResourceTouch { path, revision });
+        };
+        if let Some(raw) = self.file_path() {
+            push(raw, self.file_revision().map(str::to_owned));
+        }
+        if let Some(files) = self
+            .metadata
+            .get("files")
+            .and_then(|value| value.as_array())
+        {
+            for file in files {
+                let Some(raw) = file.get("path").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                let revision = file
+                    .get("revision")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|revision| !revision.is_empty())
+                    .map(str::to_owned);
+                push(raw, revision);
+            }
+        }
+        touches
     }
 
     /// Trusted failure class. Core writes it under `metadata._runtime`;
@@ -262,29 +344,12 @@ impl ToolOutput {
             })
     }
 
-    /// Successful semantic observations may heat the working set.
+    /// Successful observations with a stamped resource path may heat the
+    /// working set. Shell/process stdout without a path must not.
     /// Failed execution results stay on the TurnFrame and must not.
     pub fn heats_working_set(&self) -> bool {
-        self.ok && self.failure_class().is_none()
+        self.ok && self.failure_class().is_none() && !self.resource_touches().is_empty()
     }
-}
-
-fn command_looks_like_verification(command: &str) -> bool {
-    let text = command.to_ascii_lowercase();
-    const NEEDLES: &[&str] = &[
-        "cargo test",
-        "cargo check",
-        "cargo clippy",
-        "pytest",
-        "dotnet test",
-        "go test",
-        "mvn test",
-        "gradle test",
-        "npm test",
-        "rustc ",
-        "rustc.exe",
-    ];
-    NEEDLES.iter().any(|needle| text.contains(needle))
 }
 
 /// Metadata key for [`ToolFailureClass`]. Producers must not set `retryable`.
@@ -1491,6 +1556,28 @@ mod tests {
     }
 
     #[test]
+    fn verification_is_typed_metadata_not_a_command_needle() {
+        let cargo = ToolOutput {
+            call_id: "c".into(),
+            tool_name: "shell.exec".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: "ok".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({"command": "cargo test"}),
+        };
+        assert!(!cargo.is_verification());
+        assert!(cargo.may_mutate_workspace());
+        let mut typed = cargo.clone();
+        typed.metadata = serde_json::json!({"command": "cargo test", "verification": true});
+        assert!(typed.is_verification());
+        assert!(typed.may_mutate_workspace());
+        let mut opt_out = cargo;
+        opt_out.metadata = serde_json::json!({"command": "ls", "mutates_workspace": false});
+        assert!(!opt_out.may_mutate_workspace());
+    }
+
+    #[test]
     fn failure_class_is_trusted_and_strips_retryable() {
         let mut metadata = serde_json::json!({"retryable": true, "path": "lib.rs"});
         attach_failure_class(&mut metadata, ToolFailureClass::StaleRevision);
@@ -1544,6 +1631,55 @@ mod tests {
         );
         assert_eq!(forged.metadata["shell_dialect"], "pwsh");
         assert!(!forged.heats_working_set());
+        let with_path = ToolOutput {
+            call_id: "c3".into(),
+            tool_name: "fs.read".into(),
+            ok: true,
+            summary: "read".into(),
+            model_content: "     1 | fn main() {}".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({"path": "src\\foo.rs", "revision": "abc"}),
+        };
+        assert!(with_path.heats_working_set());
+        let touches = with_path.resource_touches();
+        assert_eq!(touches.len(), 1);
+        assert_eq!(touches[0].path, "src/foo.rs");
+        assert_eq!(touches[0].revision.as_deref(), Some("abc"));
+        let stdout_only = ToolOutput {
+            call_id: "c4".into(),
+            tool_name: "shell.exec".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: "compiled AuthService.rs and CacheStore.rs".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({}),
+        };
+        assert!(
+            !stdout_only.heats_working_set(),
+            "stdout without a stamped path must not heat"
+        );
+        assert!(stdout_only.resource_touches().is_empty());
+        let patch = ToolOutput {
+            call_id: "c5".into(),
+            tool_name: "edit.patch".into(),
+            ok: true,
+            summary: "applied".into(),
+            model_content: "patch applied: 2 file(s)".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({
+                "files": [
+                    {"path": "src\\a.rs", "revision": "aa"},
+                    {"path": "src/b.rs", "revision": "bb"}
+                ]
+            }),
+        };
+        let patch_touches = patch.resource_touches();
+        assert!(patch.heats_working_set());
+        assert_eq!(patch_touches.len(), 2);
+        assert_eq!(patch_touches[0].path, "src/a.rs");
+        assert_eq!(patch_touches[0].revision.as_deref(), Some("aa"));
+        assert_eq!(patch_touches[1].path, "src/b.rs");
+        assert_eq!(patch_touches[1].revision.as_deref(), Some("bb"));
     }
 
     #[test]

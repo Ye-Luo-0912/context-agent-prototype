@@ -463,7 +463,8 @@ fn render_comparison_header(runs: &[EngineRun], header: &str) -> String {
                {:8}   selected_items={} active_tokens={} residency(resident/warm/cold/ext)={}/{}/{}/{}\n\
                {:8}   resident_bytes final={} peak={}\n\
                {:8}   materialize(p50/p95)={}ms/{}ms store(w/r/recalled)={}/{}/{}\n\
-               {:8}   retrieval search={}/{} empty={} recovered={}/{} access(search/inspect/fetch/ack)={}/{}/{}/{}\n",
+               {:8}   retrieval search={}/{} empty={} recovered={}/{} access(search/inspect/fetch/ack)={}/{}/{}/{}\n\
+               {:8}   reread prev/resident/warm/stored/first={}/{}/{}/{}/{} repeated_fs={} recovery_reread={}\n",
             run.engine,
             run.eval.passed,
             run.eval.wall_ms,
@@ -502,6 +503,14 @@ fn render_comparison_header(runs: &[EngineRun], header: &str) -> String {
             metrics.access_inspects,
             metrics.access_fetches,
             metrics.access_consumption_acks,
+            "",
+            metrics.reread_previously_selected,
+            metrics.reread_resident_unselected,
+            metrics.reread_warm,
+            metrics.reread_stored,
+            metrics.reread_first_read,
+            metrics.repeated_fs_reads,
+            metrics.recovery_workspace_reread,
         ));
     }
     out
@@ -998,6 +1007,54 @@ pub async fn compare_bench_live(
     Ok(runs)
 }
 
+/// Live Mechanism V2: dynamic engine only, one mechanism per task.
+pub async fn compare_mech_live(
+    pack: &BenchPack,
+    task: &BenchTask,
+    workspace_root: &Path,
+    model: Arc<dyn ModelTransport>,
+    pair: Option<&bundle::PairSink>,
+) -> anyhow::Result<Vec<EngineRun>> {
+    let limits = LIVE_LIMITS;
+    let name = "dynamic";
+    let engine = named_engine(name, Some(model.clone()))?;
+    let root = workspace_root.join(name);
+    std::fs::create_dir_all(&root)?;
+    context_bench::seed_task(pack, task, &root)?;
+    suite::ensure_workspace_git(&root)?;
+    let eval = run_bench_with_engine(
+        pack,
+        task,
+        &root,
+        model.clone(),
+        engine.clone(),
+        limits,
+        name,
+        pair,
+        true,
+    )
+    .await?;
+    let manager_tokens = manager_token_cost(engine.as_ref()).await?;
+    let runs = vec![EngineRun {
+        engine: name,
+        eval,
+        manager_tokens,
+    }];
+    if let Some(pair) = pair {
+        bundle::write_pair_doc(
+            pair,
+            &[name],
+            crate::context_mech::SCHEMA,
+            &serde_json::json!({
+                "mechanism": task.file.scenario,
+                "spec_sha256": crate::context_mech::spec_sha256(),
+                "task_id": task.id(),
+            }),
+        )?;
+    }
+    Ok(runs)
+}
+
 pub const ABLATION_ARMS: [&str; 3] = ["current", "force-compact", "no-progress"];
 const ABLATION_ARM_SALT: &str = "agent-eval.ablation-arm.v1";
 
@@ -1365,7 +1422,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn dynamic_engine_saves_input_tokens_against_append_on_the_fixture_surface() {
         for fixture in &FIXTURES {
-            // 多轮回忆题走 live_turns，不套原四题的「五轮重读 + ≥300 token」断言。
+            // 多轮回忆题走 live_turns，不套原四题的「五轮重读 + ≥200 token」断言。
             if workload::scripted_one_tool_per_turn(fixture) {
                 continue;
             }
@@ -1426,7 +1483,8 @@ mod tests {
             // system prompt are a large per-round fixed cost (the same
             // phenomenon the live M15 measurement reported), so the
             // assertion is directional plus a noise floor, not a large
-            // ratio.
+            // ratio. C-hygiene identity cards / TaskProgress also cost a
+            // few tokens per round, so the tiny-fixture floor is 200.
             assert!(
                 dynamic.eval.metrics.model_input_tokens < append.eval.metrics.model_input_tokens,
                 "fixture '{}': dynamic model_in {} must be below append {}",
@@ -1436,7 +1494,7 @@ mod tests {
             );
             assert!(
                 append.eval.metrics.model_input_tokens - dynamic.eval.metrics.model_input_tokens
-                    >= 300,
+                    >= 200,
                 "fixture '{}': expected a material saving over append, got {}",
                 fixture.id,
                 append.eval.metrics.model_input_tokens - dynamic.eval.metrics.model_input_tokens

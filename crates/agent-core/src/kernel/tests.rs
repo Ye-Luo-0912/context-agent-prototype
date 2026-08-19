@@ -2,9 +2,9 @@ use super::*;
 use agent_contracts::{
     AccessSignal, ApprovalDecision, ApprovalGate, AttentionState, ContextDiagnostics,
     ContextIngress, ContextItem, ContextItemId, ContextItemSummary, ContextKind,
-    ContextMaintenanceReport, ContextRef, ContextResidency, ContextRetention, ContextScope,
-    ContextStateTransition, ExternalizedContext, MaterializedContext, ScopeId, ScopeKind,
-    SemanticState, ToolRisk, ToolSpec, ToolSurfaceDemand, ToolSurfaceOmission,
+    ContextMaintenanceReport, ContextQuery, ContextRef, ContextResidency, ContextRetention,
+    ContextScope, ContextStateTransition, ExternalizedContext, MaterializedContext, ScopeId,
+    ScopeKind, SemanticState, ToolRisk, ToolSpec, ToolSurfaceDemand, ToolSurfaceOmission,
     ToolSurfaceOmissionReason, TurnId,
 };
 

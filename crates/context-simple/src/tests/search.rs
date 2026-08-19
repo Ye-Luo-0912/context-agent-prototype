@@ -275,6 +275,80 @@ async fn live_fs_read_stamps_path_and_is_a_catalog_search_hit() {
     );
 }
 
+/// Search and inspect return identity for raw file/tool evidence. The
+/// 120-char body prefix stays on the store map for GC; the model-facing
+/// card is `path@rev`. Fetch still returns the catalog body.
+#[tokio::test]
+async fn search_and_inspect_file_body_are_identity_descriptors() {
+    const BODY: &str = "fn handle_secret_search() {}";
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: format!("     1 | {BODY}"),
+                artifact_ref: None,
+                metadata: serde_json::json!({
+                    "path": "AuthService.rs",
+                    "revision": "abc",
+                }),
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+
+    let hits = engine
+        .search_external(ContextSearchQuery::new("AuthService.rs", 8))
+        .await
+        .unwrap();
+    let hit = hits
+        .iter()
+        .find(|hit| hit.file_path.as_deref() == Some("AuthService.rs"))
+        .expect("path search still hits a live fs.read");
+    assert_eq!(hit.context_ref.summary, "AuthService.rs@abc");
+    assert!(
+        !hit.context_ref.summary.contains(BODY),
+        "search must not dump the file text: {}",
+        hit.context_ref.summary
+    );
+
+    let inspected = engine
+        .inspect_external(hit.item_id)
+        .await
+        .unwrap()
+        .expect("inspect returns a descriptor");
+    assert_eq!(inspected.context_ref.summary, "AuthService.rs@abc");
+    assert!(
+        !inspected.context_ref.summary.contains(BODY),
+        "inspect must not dump the file text"
+    );
+
+    let body_hits = engine
+        .search_external(ContextSearchQuery::new("handle_secret_search", 8))
+        .await
+        .unwrap();
+    assert!(
+        body_hits
+            .iter()
+            .all(|hit| hit.file_path.as_deref() != Some("AuthService.rs")),
+        "file text is not a search needle: {body_hits:?}"
+    );
+
+    let fetched = engine
+        .fetch_external(hit.item_id)
+        .await
+        .unwrap()
+        .expect("Fetch still returns the catalog body");
+    assert!(
+        fetched.content.contains(BODY),
+        "exact body stays behind Fetch"
+    );
+}
+
 #[tokio::test]
 async fn search_hits_stamp_a_bounded_recency_reinforcement() {
     let dir = tempfile::tempdir().unwrap();

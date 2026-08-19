@@ -3,11 +3,13 @@ use agent_contracts::{
     ContextCompaction, ContextConsumptionAck, ContextDiagnostics, ContextEngine, ContextGcReport,
     ContextIngress, ContextItem, ContextItemId, ContextItemSummary, ContextKind,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention,
-    ContextScope, ContextStateTransition, CoreLabel, FocusState, Label, MaterializedContext,
-    ScopeId, ScopeKind, ScopeState, StoreReconcileReport, bound_compaction_output,
+    ContextScope, ContextStateTransition, CoreLabel, FocusState, FsRereadClass, Label,
+    MAX_RESOURCE_TOUCHES, MaterializedContext, ScopeId, ScopeKind, ScopeState,
+    StoreReconcileReport, bound_compaction_output, normalize_resource_path,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -136,6 +138,19 @@ pub struct SimpleContextConfig {
     /// Ablation: pay for an LLM episode card even without a semantic delta.
     /// Default false. Do not retune production policy from this flag.
     pub force_episode_llm_distill: bool,
+    /// User-hot entities last this many *additional* user turns after a
+    /// structured resource touch. Default 2. Tool stdout never seeds this.
+    pub tool_hot_ttl_turns: u64,
+    /// Cap on "latest body of each recent file" residency roots. Default 8.
+    /// Ablation compares 8 vs 1.
+    pub recent_file_bodies: usize,
+    /// Extra expiry for those file-body roots, in user turns. `0` keeps
+    /// them until they fall out of the cap; `1` is a one-round lease.
+    pub recent_file_body_lease_turns: u64,
+    /// Ablation: ToolObservation hot matches stay Warm/Stored (descriptor
+    /// reachable). Decision / Constraint / Error / OpenLoop still
+    /// auto-reactivate bodies. Default false (current policy).
+    pub descriptor_only_tool_observation_reactivation: bool,
 }
 
 impl Default for SimpleContextConfig {
@@ -167,6 +182,10 @@ impl Default for SimpleContextConfig {
             max_ledger_records: 4096,
             gc_work_batch: 4096,
             force_episode_llm_distill: false,
+            tool_hot_ttl_turns: 2,
+            recent_file_bodies: crate::index::entity::MAX_RECENT_FILE_BODIES,
+            recent_file_body_lease_turns: 0,
+            descriptor_only_tool_observation_reactivation: false,
         }
     }
 }
@@ -237,10 +256,38 @@ pub(crate) struct State {
     /// rotation is observable as bounded runtime events.
     #[serde(default)]
     pub(crate) pending_ingest_transitions: Vec<ContextStateTransition>,
-    /// Entities named by the last user message or touched by recent tool
-    /// observations. Reset on user message / focus change, extended by tools.
+    /// Combined live hot set (non-expired tool-hot + user-hot). Rebuilt
+    /// after every mutation so GC/scoring keep using one slice.
     #[serde(default)]
     pub(crate) hot_entities: Vec<String>,
+    /// Entities named by the last user message or FocusChanged. Replaced
+    /// on those events; not extended by tools.
+    #[serde(default)]
+    pub(crate) user_hot_entities: Vec<String>,
+    /// Structured resource paths from WorkingSetSignal / file_path stamps.
+    /// Short TTL; stdout never seeds this.
+    #[serde(default)]
+    pub(crate) tool_hot: Vec<ToolHotEntity>,
+    /// Paths whose file body was selected into a materialized frame this
+    /// segment. Used for reread attribution, not GC policy.
+    #[serde(default)]
+    pub(crate) selected_file_paths: HashSet<String>,
+    #[serde(default)]
+    pub(crate) reread_previously_selected: u64,
+    #[serde(default)]
+    pub(crate) reread_resident_unselected: u64,
+    #[serde(default)]
+    pub(crate) reread_warm: u64,
+    #[serde(default)]
+    pub(crate) reread_stored: u64,
+    #[serde(default)]
+    pub(crate) reread_first_read: u64,
+    /// Copied from config at construction so `latest_file_body_ids` does
+    /// not need the config on every GC/materialize call.
+    #[serde(default = "default_recent_file_bodies")]
+    pub(crate) recent_file_bodies: usize,
+    #[serde(default)]
+    pub(crate) recent_file_body_lease_turns: u64,
     /// Runtime scope tree: one session scope, one task scope per task, one
     /// focus scope per task while it runs, one tool scope per tool call.
     /// The tree owns its id index: `push`/`by_id`/`index_of` keep lookups
@@ -307,27 +354,29 @@ pub(crate) struct State {
     pub(crate) access_admits: u64,
     #[serde(default)]
     pub(crate) access_consumption_acks: u64,
-    #[serde(default)]
+    /// Segment-local reactivation instrumentation. Skipped in checkpoints
+    /// and zeroed on restore; run-global aggregation is event-side.
+    #[serde(skip)]
     pub(crate) reactivation_selected: u64,
-    #[serde(default)]
+    #[serde(skip)]
     pub(crate) reactivation_consumed: u64,
-    #[serde(default)]
+    #[serde(skip)]
     pub(crate) reactivation_selected_tokens: u64,
-    #[serde(default)]
+    #[serde(skip)]
     pub(crate) reactivation_consumed_tokens: u64,
-    #[serde(default)]
+    #[serde(skip)]
     pub(crate) reactivation_events: u64,
-    #[serde(default)]
+    #[serde(skip)]
     pub(crate) unique_reactivated: u64,
-    #[serde(default)]
+    #[serde(skip)]
     pub(crate) reactivated_tokens: u64,
-    #[serde(default)]
+    #[serde(skip)]
     pub(crate) reactivation_tool_observation_selected: u64,
-    #[serde(default)]
+    #[serde(skip)]
     pub(crate) reactivation_tool_observation_consumed: u64,
-    #[serde(default)]
+    #[serde(skip)]
     pub(crate) reactivation_file_observation_selected: u64,
-    #[serde(default)]
+    #[serde(skip)]
     pub(crate) reactivation_file_observation_consumed: u64,
     #[serde(skip)]
     pub(crate) reactivation_traces: std::collections::HashMap<
@@ -362,6 +411,11 @@ pub(crate) struct State {
     /// `MAX_ANCHOR_ROOT_CLAIMS`; the engine never owns task authority.
     #[serde(default)]
     pub(crate) anchor_roots: Vec<agent_contracts::AnchorRootClaim>,
+    /// TaskProgress checked `path` / `path@revision` rows, projected by
+    /// the runtime via `ContextAction::CheckedFiles` before GC. File-body
+    /// auto-reactivation skips a path this set already covers. Not P3.
+    #[serde(default)]
+    pub(crate) checked_files: Vec<String>,
     /// Bounded in-engine lifecycle ledger: every item transition on any
     /// axis (attention/semantic/residency/gc) with cause, trigger, turn and
     /// related id. Oldest rows drop past the cap; export to a JSONL
@@ -375,6 +429,50 @@ pub(crate) struct State {
     /// record site only needs `&mut State`.
     #[serde(default)]
     pub(crate) ledger_cap: usize,
+}
+
+fn default_recent_file_bodies() -> usize {
+    crate::index::entity::MAX_RECENT_FILE_BODIES
+}
+
+/// A tool-hot resource with a turn expiry. User-hot is unbounded until
+/// the next user message replaces it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ToolHotEntity {
+    pub entity: String,
+    pub expires_at_turn: u64,
+}
+
+fn classify_fs_read(state: &State, path: &str) -> FsRereadClass {
+    let path = normalize_resource_path(path);
+    if path.is_empty() {
+        return FsRereadClass::FirstRead;
+    }
+    let matches_item = |item: &ContextItem| {
+        entity::observation_file_path(item)
+            .is_some_and(|observed| normalize_resource_path(observed) == path)
+    };
+    let in_heap = state.items.iter().any(matches_item);
+    let in_warm = state.eviction_buffer.iter().any(matches_item);
+    let in_store = state.external.iter().any(|entry| {
+        entry
+            .entities
+            .iter()
+            .any(|entity| normalize_resource_path(entity) == path)
+    });
+    if !in_heap && !in_warm && !in_store {
+        return FsRereadClass::FirstRead;
+    }
+    if in_heap {
+        if state.selected_file_paths.contains(&path) {
+            return FsRereadClass::PreviouslySelected;
+        }
+        return FsRereadClass::ResidentUnselected;
+    }
+    if in_warm {
+        return FsRereadClass::Warm;
+    }
+    FsRereadClass::Stored
 }
 
 impl State {
@@ -400,6 +498,64 @@ impl State {
         self.catalog_dirty.mark(id);
     }
 
+    fn expire_tool_hot(&mut self) {
+        self.tool_hot
+            .retain(|entry| entry.expires_at_turn > self.turn);
+    }
+
+    pub(crate) fn rebuild_hot_entities(&mut self) {
+        self.expire_tool_hot();
+        // Start from user-hot, then prepend tool-hot (oldest-first into
+        // merge_hot_entities so the newest tool path stays at the front).
+        // Merging user-hot *after* tool-hot would bury operational paths.
+        let mut combined = self.user_hot_entities.clone();
+        let tool_oldest_first: Vec<String> = self
+            .tool_hot
+            .iter()
+            .rev()
+            .map(|entry| entry.entity.clone())
+            .collect();
+        entity::merge_hot_entities(&mut combined, tool_oldest_first);
+        self.hot_entities = combined;
+    }
+
+    fn set_user_hot(&mut self, entities: Vec<String>) {
+        self.user_hot_entities = entities;
+        self.rebuild_hot_entities();
+    }
+
+    fn merge_tool_hot(&mut self, paths: impl IntoIterator<Item = String>, ttl_turns: u64) {
+        let expires_at_turn = self.turn.saturating_add(ttl_turns.max(1));
+        for path in paths {
+            if path.is_empty() {
+                continue;
+            }
+            if let Some(existing) = self.tool_hot.iter_mut().find(|entry| entry.entity == path) {
+                existing.expires_at_turn = expires_at_turn;
+                continue;
+            }
+            self.tool_hot.insert(
+                0,
+                ToolHotEntity {
+                    entity: path,
+                    expires_at_turn,
+                },
+            );
+        }
+        self.tool_hot.truncate(entity::MAX_HOT_ENTITIES);
+        self.rebuild_hot_entities();
+    }
+
+    fn record_fs_reread(&mut self, class: FsRereadClass) {
+        match class {
+            FsRereadClass::PreviouslySelected => self.reread_previously_selected += 1,
+            FsRereadClass::ResidentUnselected => self.reread_resident_unselected += 1,
+            FsRereadClass::Warm => self.reread_warm += 1,
+            FsRereadClass::Stored => self.reread_stored += 1,
+            FsRereadClass::FirstRead => self.reread_first_read += 1,
+        }
+    }
+
     /// 活跃任务里每个最近文件的最新成功观察。已完成任务或没有焦点时为空：
     /// 文件正文根不能把上一个任务的正文带进下一个任务。
     pub(crate) fn latest_file_body_ids(&self) -> std::collections::HashSet<ContextItemId> {
@@ -414,7 +570,17 @@ impl State {
         if completed {
             return std::collections::HashSet::new();
         }
-        entity::latest_file_body_ids(self.items.iter(), Some(task))
+        entity::latest_file_body_ids(
+            self.items.iter(),
+            Some(task),
+            if self.recent_file_bodies == 0 {
+                entity::MAX_RECENT_FILE_BODIES
+            } else {
+                self.recent_file_bodies
+            },
+            self.recent_file_body_lease_turns,
+            self.turn,
+        )
     }
 }
 
@@ -440,6 +606,8 @@ impl SimpleContextEngine {
     pub fn new(config: SimpleContextConfig) -> Self {
         let state = State {
             ledger_cap: config.max_ledger_records,
+            recent_file_bodies: config.recent_file_bodies,
+            recent_file_body_lease_turns: config.recent_file_body_lease_turns,
             ..State::default()
         };
         Self {
@@ -453,6 +621,26 @@ impl SimpleContextEngine {
     pub fn with_compactor(mut self, compactor: Arc<dyn BoundedCompactor>) -> Self {
         self.compactor = Some(compactor);
         self
+    }
+
+    /// Engine-owned focused task. Restore alignment and tests read this;
+    /// production `materialize` leaves `MaterializedContext.focus` empty.
+    pub async fn focused_task_id(&self) -> Option<agent_contracts::TaskId> {
+        self.state
+            .lock()
+            .await
+            .focus
+            .as_ref()
+            .map(|focus| focus.task_id)
+    }
+
+    pub async fn focused_goal(&self) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .focus
+            .as_ref()
+            .map(|focus| focus.goal.clone())
     }
 
     async fn run_distill(&self, job: &DistillJob) -> CompactionOutput {
@@ -573,7 +761,7 @@ impl ContextEngine for SimpleContextEngine {
                         let transitions = scope::close_focus_episode(&mut state);
                         state.pending_ingest_transitions.extend(transitions);
                     }
-                    state.hot_entities = entity::extract_entities(&content);
+                    state.set_user_hot(entity::extract_entities(&content));
                     if let Some(focus) = state.focus.as_mut() {
                         focus.current_query = content.clone();
                         focus.active_entities = entity::extract_entities(&content);
@@ -639,8 +827,16 @@ impl ContextEngine for SimpleContextEngine {
                 ContextIngress::ToolObservation { output, scope_id } => {
                     state.tool_round += 1;
                     let heats = output.heats_working_set();
-                    let file_path = output.file_path().map(str::to_owned);
-                    let file_revision = output.file_revision().map(str::to_owned);
+                    let touches = output.resource_touches();
+                    let file_path = touches.first().map(|touch| touch.path.clone());
+                    let file_revision = touches.first().and_then(|touch| touch.revision.clone());
+                    if output.tool_name == "fs.read"
+                        && let Some(path) = file_path.as_deref()
+                        && !path.is_empty()
+                    {
+                        let class = classify_fs_read(&state, path);
+                        state.record_fs_reread(class);
+                    }
                     let mut content = output.model_content;
                     if let Some(artifact_ref) = output.artifact_ref {
                         content.push_str("\nartifact: ");
@@ -671,9 +867,17 @@ impl ContextEngine for SimpleContextEngine {
                         if ok { 0.58 } else { 0.82 },
                         Some(format!("tool:{}", output.tool_name)),
                     );
-                    if let Some(path) = file_path {
+                    // Successful tool identity is the stamped resource,
+                    // never tokens mined from stdout. Failed Error items
+                    // keep content entities so verification can match.
+                    if ok {
+                        item.entities.clear();
+                    }
+                    for touch in &touches {
+                        entity::index_file_path(&mut item.entities, &touch.path);
+                    }
+                    if let Some(ref path) = file_path {
                         item.file_path = Some(path.clone());
-                        entity::index_file_path(&mut item.entities, &path);
                     }
                     if let Some(revision) = file_revision {
                         item.file_revision = Some(revision);
@@ -709,20 +913,26 @@ impl ContextEngine for SimpleContextEngine {
                         );
                     }
                     if ok {
+                        // File bodies only (`fs.read`); stamped-path shell
+                        // logs must not kill prior observations.
                         reachability::queue_file_body_supersessions(&mut state, &item);
                     }
-                    // Successful observations may extend the hot set.
-                    // Failed execution results are typed Error items and
-                    // must not generic-heat candidate paths/symbols.
+                    // Structured path stamps may extend tool-hot. Raw
+                    // observation entities (stdout) must not.
                     if self.config.entity_affinity && heats {
-                        entity::merge_hot_entities(&mut state.hot_entities, item.entities.clone());
+                        state.merge_tool_hot(
+                            touches.into_iter().map(|touch| touch.path),
+                            self.config.tool_hot_ttl_turns,
+                        );
                     }
                     dependency::push_linked(&mut state, &self.config, item);
                 }
                 ContextIngress::FocusChanged { mut focus } => {
                     focus.generation += 1;
-                    // A new focus defines the hot set from its own active entities.
-                    state.hot_entities = focus.active_entities.clone();
+                    // A new focus replaces user-hot and drops leftover
+                    // tool-hot from the previous task.
+                    state.tool_hot.clear();
+                    state.set_user_hot(focus.active_entities.clone());
                     state.focus = Some(focus);
                     // The focus (and its task) scope opens or reactivates.
                     scope::open_focus_scope(&mut state);
@@ -733,7 +943,8 @@ impl ContextEngine for SimpleContextEngine {
                     // resumes them; focus returns to None until then.
                     let task_id = state.focus.as_ref().map(|focus| focus.task_id);
                     state.focus = None;
-                    state.hot_entities.clear();
+                    state.tool_hot.clear();
+                    state.set_user_hot(Vec::new());
                     if let Some(task_id) = task_id {
                         for scope in state.scopes.iter_mut() {
                             if scope.task_id == Some(task_id) && scope.state == ScopeState::Active {
@@ -749,15 +960,19 @@ impl ContextEngine for SimpleContextEngine {
                         state.active_scope_id = Some(session.id);
                     }
                 }
-                ContextIngress::WorkingSetSignal { content } => {
-                    // Successful mid-turn tool commit only. Failures never
-                    // reach this path from the actor; keep the merge anyway
-                    // only for the signaled content.
+                ContextIngress::WorkingSetSignal {
+                    resources,
+                    content: _,
+                } => {
+                    // Successful mid-turn tool commit only. Heat from
+                    // stamped resource paths; never from legacy prose.
                     if self.config.entity_affinity {
-                        entity::merge_hot_entities(
-                            &mut state.hot_entities,
-                            entity::extract_entities(&content),
-                        );
+                        let paths = resources
+                            .into_iter()
+                            .take(MAX_RESOURCE_TOUCHES)
+                            .map(|touch| normalize_resource_path(&touch.path))
+                            .filter(|path| !path.is_empty());
+                        state.merge_tool_hot(paths, self.config.tool_hot_ttl_turns);
                     }
                 }
                 ContextIngress::Pin { content, kind } => {
@@ -1244,6 +1459,7 @@ impl ContextEngine for SimpleContextEngine {
         // ids, cross-location ownership, scope ancestry and item scope
         // references must all hold (see checkpoint::validate).
         checkpoint::validate(&state)?;
+        crate::reactivation::clear_segment(&mut state);
         // Old checkpoints predate the entity signature cache; backfill it
         // once so restored items keep scoring and dependency behavior. The
         // heap method re-indexes each backfilled signature, so the entity
@@ -1375,6 +1591,15 @@ fn apply_directive(
             state.anchor_roots = roots.clone();
             return None;
         }
+        ContextAction::CheckedFiles { files } => {
+            let mut files = files.clone();
+            if files.len() > agent_contracts::MAX_CHECKED_FILE_HINTS {
+                let drop = files.len() - agent_contracts::MAX_CHECKED_FILE_HINTS;
+                files.drain(0..drop);
+            }
+            state.checked_files = files;
+            return None;
+        }
         _ => {}
     }
 
@@ -1502,11 +1727,12 @@ fn apply_directive(
                 // The runtime owns the GC pass; `context.collect` never arrives
                 // as an ingest directive (the actor calls `ContextEngine::gc`).
                 ContextAction::Collect => {}
-                // Admit/Derive/AnchorRoots are dispatched above and never reach
-                // the in-memory directive loop.
+                // Admit/Derive/AnchorRoots/CheckedFiles are dispatched above
+                // and never reach the in-memory directive loop.
                 ContextAction::Admit { .. }
                 | ContextAction::Derive { .. }
-                | ContextAction::AnchorRoots { .. } => unreachable!(),
+                | ContextAction::AnchorRoots { .. }
+                | ContextAction::CheckedFiles { .. } => unreachable!(),
             }
         }
     }
@@ -1523,6 +1749,8 @@ fn directive_item_id(action: &ContextAction) -> ContextItemId {
         | ContextAction::Lease { item_id, .. }
         | ContextAction::Admit { item_id, .. }
         | ContextAction::Derive { item_id, .. } => *item_id,
-        ContextAction::Collect | ContextAction::AnchorRoots { .. } => ContextItemId::new(),
+        ContextAction::Collect
+        | ContextAction::AnchorRoots { .. }
+        | ContextAction::CheckedFiles { .. } => ContextItemId::new(),
     }
 }

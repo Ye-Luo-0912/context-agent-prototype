@@ -4,7 +4,10 @@ use agent_contracts::{
 };
 
 use crate::engine::State;
-use crate::index::entity::{entities_match, extract_entities, observation_file_path};
+use crate::index::entity::{
+    entities_match, extract_entities, is_file_body_entry, is_file_body_observation,
+    observation_file_path,
+};
 
 /// A user message reads as a decision when it carries a directive verb
 /// ("use X", "switch to Y", "revert", "drop Z", ...). Explicit, keyword
@@ -144,10 +147,15 @@ pub(crate) fn queue_error_verifications(
     }
 }
 
-/// 同一文件路径的更新成功观察覆盖旧正文：语义死亡，热实体也不能把过期
-/// 文件内容召回工作集。按结构化路径精确匹配，回退到正文首行；不用实体
+/// 同一文件路径的更新 **文件正文**（`fs.read` / unsourced replay header）
+/// 覆盖旧正文：语义死亡，热实体也不能把过期文件内容召回工作集。带
+/// `metadata.path` 的 `shell.exec` 只把路径写入身份索引，不是文件正文，
+/// 不得互相 supersede。按结构化路径精确匹配，回退到正文首行；不用实体
 /// 子串（`Session::start` 会把三个文件缠在一起）。
 pub(crate) fn queue_file_body_supersessions(state: &mut State, new_item: &ContextItem) {
+    if !is_file_body_observation(new_item) {
+        return;
+    }
     let Some(path) = observation_file_path(new_item).map(str::to_owned) else {
         return;
     };
@@ -158,6 +166,7 @@ pub(crate) fn queue_file_body_supersessions(state: &mut State, new_item: &Contex
             && item.kind == ContextKind::ToolObservation
             && !item.semantic.is_dead()
             && !is_excluded(item)
+            && is_file_body_observation(item)
             && observation_file_path(item) == Some(path.as_str())
     };
     for item in &mut state.items {
@@ -178,6 +187,7 @@ pub(crate) fn queue_file_body_supersessions(state: &mut State, new_item: &Contex
         if entry.item_id == by_id
             || entry.kind != ContextKind::ToolObservation
             || entry.semantic.is_dead()
+            || !is_file_body_entry(entry)
         {
             continue;
         }

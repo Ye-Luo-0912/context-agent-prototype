@@ -2,15 +2,17 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use agent_contracts::{
-    AttentionState, CONTEXT_MAP_VIEW_CAP, ContextItem, ContextItemId, ContextMapView, ContextQuery,
-    ContextRetention, ContextSelection, MaterializedContext, MaterializedItem, ScopeId, ScopeKind,
-    ScopeState, ScoreBreakdown,
+    AttentionState, CONTEXT_MAP_VIEW_CAP, ContextItem, ContextItemId, ContextMapView,
+    ContextQuery, ContextRetention, ContextSelection, MaterializedContext, MaterializedItem,
+    ScopeId, ScopeKind, ScopeState, ScoreBreakdown, checked_files_cover_path,
+    normalize_resource_path,
 };
 
 use crate::diagnostics;
 use crate::engine::{SimpleContextConfig, State};
 use crate::gc::reachability::is_excluded;
 use crate::index::dependency::MAX_DEPENDENCY_EDGES;
+use crate::index::entity::{entities_match_exact, observation_file_path};
 use crate::item::{approx_tokens, short_id};
 use crate::policy::score_item_with_breakdown;
 
@@ -20,6 +22,10 @@ const MAX_EXPANSION_ITEMS: usize = 8;
 /// actually has a Continuation (prompt-body) edge. Frames with no such
 /// edge keep the full working-set budget.
 const EXPANSION_RESERVE_TOKENS: usize = 1024;
+/// Assembler frame around a raw-evidence identity header (`[ToolObservation |
+/// ... | path=...]`). Charged when TASK PROGRESS already names the path so
+/// packing does not reserve the omitted body (file text or identity-log stdout).
+const FILE_BODY_DESCRIPTOR_FRAME_TOKENS: usize = 48;
 
 /// One dependency-expansion candidate for the bounded top-K heap: ordered
 /// by (score descending, slot ascending) so equal scores pop
@@ -195,7 +201,7 @@ pub(crate) fn materialize(
         }
         let breakdown =
             score_item_with_breakdown(item, engine_focus.as_ref(), &state.hot_entities, turn);
-        let tokens = approx_tokens(&item.content);
+        let tokens = packed_item_tokens(item, &query.hints.checked_files);
         candidates.push((index, breakdown, tokens));
     }
 
@@ -254,13 +260,19 @@ pub(crate) fn materialize(
         }
         remaining -= *tokens;
         selected_indices.push(*index);
-        selections.push(ContextSelection {
-            item_id: item.id,
-            score: breakdown.total,
-            approx_tokens: *tokens,
-            reason: selection_reason(item, breakdown, latest_file_bodies.contains(&item.id)),
-            breakdown: breakdown.clone(),
-        });
+        selections.push(selection_record(
+            state,
+            item,
+            breakdown.total,
+            *tokens,
+            selection_reason(
+                item,
+                breakdown,
+                latest_file_bodies.contains(&item.id),
+                &query.hints.checked_files,
+            ),
+            breakdown.clone(),
+        ));
     }
 
     // Anchor prompt-required 声明：优先级在 pinned 之后、打分候选之前。
@@ -281,13 +293,14 @@ pub(crate) fn materialize(
         }
         remaining -= *tokens;
         selected_indices.push(*index);
-        selections.push(ContextSelection {
-            item_id: item.id,
-            score: breakdown.total,
-            approx_tokens: *tokens,
-            reason: "anchor root requires it in the prompt".to_string(),
-            breakdown: breakdown.clone(),
-        });
+        selections.push(selection_record(
+            state,
+            item,
+            breakdown.total,
+            *tokens,
+            "anchor root requires it in the prompt".to_string(),
+            breakdown.clone(),
+        ));
     }
 
     // Then the scored candidates fill the rest of the frame.
@@ -310,13 +323,19 @@ pub(crate) fn materialize(
 
         remaining = remaining.saturating_sub(tokens);
         selected_indices.push(index);
-        selections.push(ContextSelection {
-            item_id: item.id,
-            score: breakdown.total,
-            approx_tokens: tokens,
-            reason: selection_reason(item, &breakdown, latest_file_bodies.contains(&item.id)),
+        selections.push(selection_record(
+            state,
+            item,
+            breakdown.total,
+            tokens,
+            selection_reason(
+                item,
+                &breakdown,
+                latest_file_bodies.contains(&item.id),
+                &query.hints.checked_files,
+            ),
             breakdown,
-        });
+        ));
     }
 
     // Explicit dependency expansion — pull in Continuation targets of
@@ -375,7 +394,7 @@ pub(crate) fn materialize(
                 if archived_below_cutoff(dep, &breakdown, config, &latest_file_bodies) {
                     continue;
                 }
-                let tokens = approx_tokens(&dep.content);
+                let tokens = packed_item_tokens(dep, &query.hints.checked_files);
                 expanded.push(ExpandedCandidate {
                     index: dep_index,
                     score: breakdown.total,
@@ -413,25 +432,39 @@ pub(crate) fn materialize(
             expansion_budget = expansion_budget.saturating_sub(candidate.tokens);
             selected_ids.push(item.id);
             selected_indices.push(dep_index);
-            selections.push(ContextSelection {
-                item_id: item.id,
-                score: candidate.score,
-                approx_tokens: candidate.tokens,
-                reason: format!(
+            selections.push(selection_record(
+                state,
+                item,
+                candidate.score,
+                candidate.tokens,
+                format!(
                     "included as dependency of item {}",
                     short_id(&candidate.depends_on)
                 ),
-                breakdown: candidate.breakdown,
-            });
+                candidate.breakdown,
+            ));
             added += 1;
         }
     }
 
     selected_indices.sort_by_key(|index| state.items[*index].created_tick);
+    for &index in &selected_indices {
+        if let Some(path) = crate::index::entity::observation_file_path(&state.items[index]) {
+            let path = normalize_resource_path(path);
+            if !path.is_empty() {
+                state.selected_file_paths.insert(path);
+            }
+        }
+    }
     let items: Vec<MaterializedItem> = selected_indices
         .iter()
         .map(|index| {
             let item = &state.items[*index];
+            let content = if prices_as_file_body_descriptor(item, &query.hints.checked_files) {
+                file_body_descriptor_content(item)
+            } else {
+                item.content.clone()
+            };
             MaterializedItem {
                 item_id: item.id,
                 kind: item.kind,
@@ -439,16 +472,18 @@ pub(crate) fn materialize(
                 attention: item.attention,
                 semantic: item.semantic,
                 retention: item.retention,
-                content: item.content.clone(),
+                content,
                 source: item.source.clone(),
                 file_path: item.file_path.clone(),
+                file_revision: item.file_revision.clone(),
             }
         })
         .collect();
 
     // Historical working-set tokens only. Focus/TaskAnchor rendering is
     // the runtime assembler's share and is charged after this snapshot.
-    let external = external_view(state, &state.hot_entities);
+    let checked_files = merged_checked_files(state, query);
+    let external = external_view(state, &state.hot_entities, &checked_files);
     let approx_tokens_total = items
         .iter()
         .map(|item| approx_tokens(&item.content))
@@ -469,7 +504,9 @@ pub(crate) fn materialize(
         // the engine; cloning it per materialize would grow linearly with
         // the run (10K/100K refs) and the prompt does not use it anyway.
         // The view prefers hot-entity matches, open loops, then recency —
-        // the entries the model is most likely to deliberately pull.
+        // plus Warm items that are hot or already Checked, as identity
+        // refs so skipped file bodies stay Fetch-able. The full
+        // `state.external` stays in the engine.
         external,
         selected: selections,
         approx_tokens: approx_tokens_total,
@@ -489,57 +526,79 @@ const MAX_EXTERNAL_REFS: usize = CONTEXT_MAP_VIEW_CAP;
 /// summaries would exceed this bound.
 const EXTERNAL_REF_TOKENS: usize = 512;
 
-/// Build a small, deterministic slice of the external map without walking
-/// the whole map: hot-entity matches come from the entity index (O(bucket)
-/// per hot entity), and the rest is the most-recently-externalized tail —
-/// the map stores entries in externalize order, so the tail is a bounded
-/// O(1) recency approximation (a `fetch`/`ack` stamps access but does not
-/// reorder, so exact global recency would need a second index; the tail
-/// keeps the hot path independent of total history). The union is ranked
-/// (hot-entity match, open loop, recency), capped to `CONTEXT_MAP_VIEW_CAP`
-/// refs and `EXTERNAL_REF_TOKENS` of summary tokens; the bounded
-/// `ContextMapView` enforces the cap at the type level.
-fn external_view(state: &State, hot_entities: &[String]) -> ContextMapView {
+/// Build a small, deterministic slice of reachable descriptors without
+/// walking the whole store: hot-entity matches come from the store entity
+/// index (O(bucket) per hot entity), Checked paths use the same index
+/// (O(bucket) per unique path, cap 32), Warm-buffer items that are hot or
+/// already Checked are projected as catalog refs (so skipped file bodies
+/// stay Fetch/Admit-able), and the rest is the most-recently-externalized
+/// tail. The map stores entries in externalize order, so the tail is a
+/// bounded O(1) recency approximation. Raw ToolObservation / FileObservation
+/// summaries are rewritten to path@revision identity so the prompt does not
+/// dump stdout or file text under "refs only".
+fn external_view(
+    state: &State,
+    hot_entities: &[String],
+    checked_files: &[String],
+) -> ContextMapView {
     let mut seen: HashSet<ContextItemId> = HashSet::new();
-    let mut ranked: Vec<&agent_contracts::ExternalizedContext> = Vec::new();
+    let mut ranked: Vec<agent_contracts::ExternalizedContext> = Vec::new();
     for hot in hot_entities {
-        for id in state.external.ids_for_entity(hot) {
-            if seen.insert(*id)
-                && let Some(entry) = state.external.get(*id)
-                && crate::store::externally_retrievable(entry)
-            {
-                ranked.push(entry);
-            }
+        push_store_entity_hits(state, hot, &mut seen, &mut ranked);
+    }
+    let mut seen_checked_paths = HashSet::new();
+    for row in checked_files {
+        let Some(path) = checked_row_lookup_path(row) else {
+            continue;
+        };
+        if !seen_checked_paths.insert(path.clone()) {
+            continue;
         }
+        push_store_entity_hits(state, &path, &mut seen, &mut ranked);
+    }
+    for item in &state.eviction_buffer {
+        if !item.semantic.is_live() || seen.contains(&item.id) {
+            continue;
+        }
+        let hot = !hot_entities.is_empty() && entities_match_exact(&item.entities, hot_entities);
+        let checked = observation_file_path(item)
+            .is_some_and(|path| checked_files_cover_path(checked_files, path));
+        if !(hot || checked) {
+            continue;
+        }
+        let Some(entry) = crate::store::project_search_hit(state, item.id) else {
+            continue;
+        };
+        seen.insert(item.id);
+        ranked.push(crate::store::prompt_evidence_descriptor(entry));
     }
     let total = state.external.len();
     let tail_start = total.saturating_sub(MAX_EXTERNAL_REFS);
     for entry in &state.external[tail_start..] {
         if seen.insert(entry.item_id) && crate::store::externally_retrievable(entry) {
-            ranked.push(entry);
+            ranked.push(crate::store::prompt_evidence_descriptor(entry.clone()));
         }
     }
     if ranked.is_empty() {
         return ContextMapView::default();
     }
-    // Small bounded set: sort directly (no quickselect needed), then apply
-    // the token cap in the same ranked order the model sees. A long summary
-    // costs prompt tokens, so the first-ranked refs win and the walk stops
-    // once the bound is exhausted.
     ranked.sort_by(|a, b| {
-        external_view_key(b, hot_entities)
-            .cmp(&external_view_key(a, hot_entities))
+        external_view_key(b, hot_entities, checked_files)
+            .cmp(&external_view_key(a, hot_entities, checked_files))
             .then_with(|| a.item_id.0.cmp(&b.item_id.0))
     });
     let mut ref_tokens = 0usize;
     let mut capped = Vec::with_capacity(ranked.len());
     for entry in ranked {
-        let tokens = external_ref_tokens(entry);
+        if capped.len() >= MAX_EXTERNAL_REFS {
+            break;
+        }
+        let tokens = external_ref_tokens(&entry);
         if ref_tokens.saturating_add(tokens) > EXTERNAL_REF_TOKENS {
             break;
         }
         ref_tokens += tokens;
-        capped.push(entry.clone());
+        capped.push(entry);
     }
     ContextMapView::new(capped)
 }
@@ -551,13 +610,15 @@ fn external_ref_tokens(entry: &agent_contracts::ExternalizedContext) -> usize {
     approx_tokens(&entry.context_ref.uri) + approx_tokens(&entry.context_ref.summary)
 }
 
-/// (hot-entity match, open loop, recency) — higher sorts first. Open loops
-/// are tagged items whose decision is still pending; surfacing them keeps
-/// the model's unfinished business visible even after externalization.
+/// (hot-entity match, open loop, checked path, recency) — higher sorts first.
+/// Open loops stay above Checked so unfinished business is not displaced by
+/// identity refs. Checked still beats the recency tail so a skipped Stored
+/// file body remains Fetch-able after later overflow.
 fn external_view_key(
     entry: &agent_contracts::ExternalizedContext,
     hot_entities: &[String],
-) -> (u8, u8, u64) {
+    checked_files: &[String],
+) -> (u8, u8, u8, u64) {
     let hot = u8::from(
         hot_entities
             .iter()
@@ -569,7 +630,90 @@ fn external_view_key(
             .iter()
             .any(|tag| tag.is_core(agent_contracts::CoreLabel::OpenLoop)),
     );
-    (hot, open_loop, entry.last_access_tick)
+    let checked = u8::from(entry_covers_checked_files(entry, checked_files));
+    (hot, open_loop, checked, entry.last_access_tick)
+}
+
+fn push_store_entity_hits(
+    state: &State,
+    entity: &str,
+    seen: &mut HashSet<ContextItemId>,
+    ranked: &mut Vec<agent_contracts::ExternalizedContext>,
+) {
+    for id in state.external.ids_for_entity(entity) {
+        if seen.insert(*id)
+            && let Some(entry) = state.external.get(*id)
+            && crate::store::externally_retrievable(entry)
+        {
+            ranked.push(crate::store::prompt_evidence_descriptor(entry.clone()));
+        }
+    }
+}
+
+/// Hint rows plus the engine's last `CheckedFiles` projection, so a skipped
+/// Stored body stays reachable even when this `ContextQuery` omitted the hint.
+fn merged_checked_files(state: &State, query: &ContextQuery) -> Vec<String> {
+    let mut out = query.hints.checked_files.clone();
+    for row in &state.checked_files {
+        if !out.iter().any(|existing| existing == row) {
+            out.push(row.clone());
+        }
+    }
+    out
+}
+
+fn checked_row_lookup_path(row: &str) -> Option<String> {
+    let row = normalize_resource_path(row);
+    if row.is_empty() {
+        return None;
+    }
+    let path = match row.split_once('@') {
+        Some((path, _)) => path,
+        None => row.as_str(),
+    };
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
+fn entry_covers_checked_files(
+    entry: &agent_contracts::ExternalizedContext,
+    checked_files: &[String],
+) -> bool {
+    if checked_files.is_empty() {
+        return false;
+    }
+    if let Some(path) = entry.file_path.as_deref()
+        && checked_files_cover_path(checked_files, path)
+    {
+        return true;
+    }
+    entry
+        .entities
+        .iter()
+        .any(|entity| checked_files_cover_path(checked_files, entity))
+}
+
+fn selection_record(
+    state: &State,
+    item: &ContextItem,
+    score: f32,
+    approx_tokens: usize,
+    reason: String,
+    breakdown: ScoreBreakdown,
+) -> ContextSelection {
+    ContextSelection {
+        item_id: item.id,
+        score,
+        approx_tokens,
+        reason,
+        breakdown,
+        kind: Some(item.kind),
+        source: item.source.clone(),
+        reactivated: state.reactivation_traces.contains_key(&item.id),
+    }
 }
 
 fn archived_below_cutoff(
@@ -587,12 +731,12 @@ fn selection_reason(
     item: &ContextItem,
     breakdown: &ScoreBreakdown,
     latest_file_body: bool,
+    checked_files: &[String],
 ) -> String {
-    if item.retention == ContextRetention::Pinned {
-        return "explicitly pinned".to_string();
-    }
-    if latest_file_body {
-        return format!(
+    let mut reason = if item.retention == ContextRetention::Pinned {
+        "explicitly pinned".to_string()
+    } else if latest_file_body {
+        format!(
             "latest body of a recent file in the active task; working-set score {:.2}; kind={:?}; scope={:?}; importance={:.2} focus={:.2} recency={:.2} access={:.2} scope_bonus={:.2} retention_bonus={:.2} affinity={:.2}",
             breakdown.total,
             item.kind,
@@ -604,19 +748,63 @@ fn selection_reason(
             breakdown.scope_bonus,
             breakdown.retention_bonus,
             breakdown.entity_affinity,
-        );
+        )
+    } else {
+        format!(
+            "working-set score {:.2}; kind={:?}; scope={:?}; importance={:.2} focus={:.2} recency={:.2} access={:.2} scope_bonus={:.2} retention_bonus={:.2} affinity={:.2}",
+            breakdown.total,
+            item.kind,
+            item.scope,
+            breakdown.importance,
+            breakdown.focus_match,
+            breakdown.recency,
+            breakdown.access,
+            breakdown.scope_bonus,
+            breakdown.retention_bonus,
+            breakdown.entity_affinity,
+        )
+    };
+    if prices_as_file_body_descriptor(item, checked_files) {
+        reason.push_str("; body omitted, path already checked");
     }
-    format!(
-        "working-set score {:.2}; kind={:?}; scope={:?}; importance={:.2} focus={:.2} recency={:.2} access={:.2} scope_bonus={:.2} retention_bonus={:.2} affinity={:.2}",
-        breakdown.total,
+    reason
+}
+
+fn prices_as_file_body_descriptor(item: &ContextItem, checked_files: &[String]) -> bool {
+    if item.kind == agent_contracts::ContextKind::Error || checked_files.is_empty() {
+        return false;
+    }
+    if !matches!(
         item.kind,
-        item.scope,
-        breakdown.importance,
-        breakdown.focus_match,
-        breakdown.recency,
-        breakdown.access,
-        breakdown.scope_bonus,
-        breakdown.retention_bonus,
-        breakdown.entity_affinity,
-    )
+        agent_contracts::ContextKind::ToolObservation
+            | agent_contracts::ContextKind::FileObservation
+    ) {
+        return false;
+    }
+    let Some(path) = observation_file_path(item) else {
+        return false;
+    };
+    agent_contracts::checked_files_cover_path(checked_files, path)
+}
+
+fn file_body_descriptor_content(item: &ContextItem) -> String {
+    let path = observation_file_path(item).unwrap_or("");
+    match item
+        .file_revision
+        .as_deref()
+        .map(str::trim)
+        .filter(|revision| !revision.is_empty())
+    {
+        Some(revision) => format!("{path}@{revision}"),
+        None => path.to_string(),
+    }
+}
+
+fn packed_item_tokens(item: &ContextItem, checked_files: &[String]) -> usize {
+    if prices_as_file_body_descriptor(item, checked_files) {
+        approx_tokens(&file_body_descriptor_content(item))
+            .saturating_add(FILE_BODY_DESCRIPTOR_FRAME_TOKENS)
+    } else {
+        approx_tokens(&item.content)
+    }
 }

@@ -344,6 +344,10 @@ impl RuntimeActor {
                     max_selected_items: Some(CONTEXT_CONSUMPTION_ACK_ITEM_CAP),
                     anchor_roots,
                     task: task_view.clone(),
+                    checked_files: progress_view
+                        .as_ref()
+                        .map(|view| view.checked_files.clone())
+                        .unwrap_or_default(),
                 },
             })
             .await
@@ -698,10 +702,16 @@ impl RuntimeActor {
         if !turn_frame.user_message.is_empty() {
             focus.current_query = turn_frame.user_message.clone();
         }
-        let progress = self
-            .services
-            .project_task_progress()
-            .then(|| task.resume.view());
+        let turn_number = self
+            .state
+            .turn
+            .as_ref()
+            .map(|turn| turn.model_round as u64)
+            .unwrap_or(0);
+        let progress = self.services.project_task_progress().then(|| {
+            task.resume
+                .project_from_turn(turn_frame, task.anchor.revision, turn_number)
+        });
         (
             Some(focus),
             Some(crate::task::task_anchor_view(&task.anchor)),

@@ -529,14 +529,34 @@ agent is actually touching.
 
 ### Entity affinity
 
-The engine keeps a bounded **hot-entity set** (cap 24): seeded by the last
-user message (`extract_entities(content)`), extended by entities appearing
-in successful semantic tool observations and mid-turn `WorkingSetSignal`s
-(most recent first), and reset by a new user message or `FocusChanged`.
-Failed tool results (`ok: false` or a typed `failure_class`) do not extend
-the set. An "entity" is a cheap signature — a whitespace token of
-length ≥ 3 carrying a path/name/case marker (`.`, `/`, `::`, `_` or an
-uppercase letter).
+The engine keeps a bounded **hot-entity set** (cap 24), split:
+
+- **User-hot** — replaced by the last user message (`extract_entities`) or
+  `FocusChanged.active_entities`. Cleared on `FocusCleared`.
+- **Tool-hot** — structured `ResourceTouch` paths from mid-turn
+  `WorkingSetSignal.resources` and from stamped `metadata.path` /
+  `metadata.files[]` on a successful tool observation. Short TTL
+  (`tool_hot_ttl_turns`, default 2 user turns). Shell/process stdout and
+  legacy `WorkingSetSignal.content` never seed this set.
+
+GC mark and auto-reactivation match tool/user hot with **exact**
+slash-normalized identity. Search and scoring affinity keep substring
+tolerance so `AuthService.rs` can still find `src/auth/AuthService.rs`
+when the model searches.
+
+A successful `ToolObservation`'s entity signature is the stamped
+`ResourceTouch` path only. Stdout tokens are not identity: they do not
+heat, do not mint `SharesEntities` edges, and do not auto-reactivate a
+body. Failed `Error` items still extract entities from their text so
+verification can match. Search that misses the entity index residual-scans
+summaries. File-body supersession stays `fs.read` / unsourced replay
+headers only; a stamped path on `shell.exec` is identity, not a new file
+body.
+
+Failed tool results (`ok: false` or a typed `failure_class`) do not
+extend the set. An "entity" extracted from user text is still a cheap
+signature — a whitespace token of length ≥ 3 carrying a path/name/case
+marker (`.`, `/`, `::`, `_` or an uppercase letter).
 
 Scoring gains `entity_affinity = 0.18 × (fraction of the item's entities in
 the hot set)`, zero when the item or the hot set has no entities. It is
@@ -545,11 +565,36 @@ reported in `ScoreBreakdown.entity_affinity` and the selection reason
 was just touched by a tool result".
 
 ```text
-user: "fix AuthService.rs"            -> hot = {AuthService.rs}
-tool: "tests passed in CacheStore.rs" -> hot = {CacheStore.rs, AuthService.rs}
-item "patch AuthService.rs"           -> affinity 0.18 (1/1 entity hot)
-item "work on TokenCache"             -> affinity 0 (no hot entity)
+user: "fix AuthService.rs"                 -> user-hot = {AuthService.rs}
+tool metadata.path = src/CacheStore.rs     -> tool-hot = {src/CacheStore.rs}
+fs.write / edit.replace / edit.patch files[] -> tool-hot = stamped paths
+shell stdout "tests passed in Foo.rs"      -> no heat
+item "patch AuthService.rs"                -> affinity 0.18 (fuzzy scoring)
+item "work on TokenCache"                  -> affinity 0
 ```
+
+Stamped-path shell/process logs heat the path but do **not** hot-recall
+their stdout; the log stays Warm/Stored until Fetch/Admit. Only `fs.read`
+file bodies auto-reactivate on exact path identity, and only when
+TaskProgress does not already name the path. A `CheckedFiles` projection
+(pushed by the runtime before GC) keeps a covered file body Warm/Stored;
+the same items still appear in the bounded EXTERNAL CONTEXT view as
+`context://` + `path@rev` identity (not stdout). Warm uses the eviction
+buffer; Stored uses the entity index (not a map walk) and ranks above the
+recency tail so later overflow cannot hide a Checked path. Search and
+inspect of ToolObservation / FileObservation items are the same identity
+cards; file text is not a catalog search needle. Fetch/Admit
+remains the way to recover the exact body. This is not the
+P3 descriptor-only switch.
+
+Auto-reactivation of a ToolObservation **body** can be switched to
+descriptor-only (`descriptor_only_tool_observation_reactivation`, default
+off): Decision / Constraint / Error / OpenLoop still come back with a
+body; raw tool evidence stays Warm/Stored until Fetch/Admit. The latest
+file-body residency cap (`recent_file_bodies`, default 8) and optional
+one-round lease (`recent_file_body_lease_turns`) are the P4 switch.
+Measure both with `agent-eval --context-hygiene` before enabling either
+in production C.
 
 ### Explicit dependency graph
 
@@ -739,7 +784,8 @@ durable task constraints, hot entities, explicit references, and the
 task** (capped at 8 paths; identified by a path-only first line as in
 `fs.read`, not by a log that merely mentions a file). Same-path rereads
 supersede the previous body (semantic death, so hot-entity recall cannot
-bring stale file text back). A completed or switched-away task drops those
+bring stale file text back). A stamped `metadata.path` on `shell.exec` is
+not a file body and does not enter this supersession. A completed or switched-away task drops those
 file-body roots, so pagination detail does not contaminate a later CSV
 task. Plus a bounded `+8` transitive slice of their dependency edges.
 Old turns of a long task therefore cool and evict like any other
@@ -836,12 +882,34 @@ Focus / TaskAnchor / TaskProgress from the runtime `TaskManager`; production
 engines leave `MaterializedContext.focus` / `.task` empty.
 
 `CTX-11` is a bounded operational cache (`ResumePoint`) on `TaskRecord`,
-bound to `task_id + anchor_revision`. `TaskProgressView` projects checked
-resources, verification state, and unresolved operation failures. It does
-not own objective / blockers / next-actions. Updates apply after the
-durable turn commit. Generic may-mutate processes without a resource path
-invalidate workspace file facts. This is not yet evidence that ResumePoint
-belongs in V1.
+bound to `task_id + anchor_revision + workspace_revision`.
+`TaskProgressView` projects checked resources, revision-bound verification
+state, and unresolved operation failures under a total prompt hard cap. It
+does not own objective / blockers / next-actions. The durable cache still
+updates after the turn commit barrier. The prompt projection additionally
+folds persistable open-turn `TurnFrame` tool results so the current coding
+loop sees `path@revision` before that barrier. Transient retrieval results
+stay out of both. Checked files come from stamped `ResourceTouch`
+paths (`metadata.path` and `metadata.files[]`); a may-mutate observation
+without a touch still clears them. Selected historical `fs.read` bodies
+and stamped-path identity logs whose path is already Checked are omitted
+from SELECTED WORKING CONTEXT (the item header keeps `path@revision`);
+the current TurnFrame still carries live tool bodies. Errors keep their
+body. This does not enable descriptor-only ToolObservation reactivation.
+Materialize packing prices a Checked ToolObservation / FileObservation
+item as a descriptor via `ContextHints.checked_files` so omitted bodies
+do not consume the working-set budget. Before GC the
+runtime pushes the same rows as `ContextAction::CheckedFiles` so a
+covered file body is not hot-reactivated. Verification is typed metadata, orthogonal to
+mutation: a may-mutate observation bumps `workspace_revision` and old PASS
+facts are not shown as current. Restore alignment uses engine
+`diagnostics.focus_task_id`, not `MaterializedContext.focus`. Adaptive
+episode rotation may close a long episode without paying the LLM
+compactor unless the episode left a semantic delta. Engine reactivation
+counters are segment-local (zeroed on restore); run-global unique/event
+counts come from `ContextGc` events. These are the frozen Context V1 core
+semantics; further Context feature work stops here. Main engineering
+returns to M12/M13.
 
 Producing a `RuntimeDirective` requires the `runtime:context-control`
 permission in the capability manifest; a tool without it gets its directive
@@ -889,7 +957,9 @@ read-only meta-tools (`context.search` / `context.inspect` /
 engine (invariant 3 — tools still never touch the engine). As of
 2026-08-15, search/inspect cover the live catalog (Resident/Warm
 projections plus Stored), so a file still in SELECTED WORKING CONTEXT is
-a hit with `residency=` as data, not an empty miss. `fetch_external`
+a hit with `residency=` as data, not an empty miss. Search/inspect
+summaries for ToolObservation / FileObservation are `path@rev` identity;
+file text is not a catalog search needle. `fetch_external`
 stays a store read; a Resident/Warm id states that the body is already
 in the working set. The prompt's `EXTERNAL CONTEXT` section shows refs
 only (uri + id + kind/scope + residency + summary); `fetch` stamps recency

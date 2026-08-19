@@ -179,6 +179,52 @@ impl RuntimeActor {
         }
     }
 
+    pub(super) async fn push_checked_files_for_gc(&self) {
+        let files = self.projected_checked_files();
+        if let Err(error) = self
+            .services
+            .context_ingest(ContextIngress::ContextDirective {
+                action: agent_contracts::ContextAction::CheckedFiles { files },
+            })
+            .await
+        {
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::Error {
+                    message: format!("failed to push checked files before GC: {error}"),
+                })
+                .await;
+        }
+    }
+
+    fn projected_checked_files(&self) -> Vec<String> {
+        if !self.services.project_task_progress() {
+            return Vec::new();
+        }
+        let Some(task) = self
+            .state
+            .tasks
+            .active()
+            .and_then(|task_id| self.state.tasks.get(task_id))
+        else {
+            return Vec::new();
+        };
+        let view = match self.state.turn.as_ref() {
+            Some(turn) => task.resume.project_from_turn(
+                &turn.turn_frame,
+                task.anchor.revision,
+                turn.model_round as u64,
+            ),
+            None => task.resume.view(),
+        };
+        view.checked_files
+    }
+
+    pub(super) async fn push_gc_projections(&self, force_anchor: bool) {
+        self.push_anchor_roots_for_gc(force_anchor).await;
+        self.push_checked_files_for_gc().await;
+    }
+
     /// One full GC pass after a task completed, so the finished task's
     /// records leave the resident heap and stay recallable from the
     /// reversible buffer / context store. The completion itself is already
@@ -187,7 +233,7 @@ impl RuntimeActor {
     pub(super) async fn compact_after_completion(&mut self) {
         // 完成边界前的根声明投影：完成任务后 active 通常已切换/清空，
         // 强制推送当前（或空）根集，声明不再保护已完成任务的工作集。
-        self.push_anchor_roots_for_gc(true).await;
+        self.push_gc_projections(true).await;
         match self.services.context_gc().await {
             Ok(report) => {
                 if let Err(error) = self
@@ -224,7 +270,7 @@ impl RuntimeActor {
     pub(super) async fn run_storage_gc_at_boundary(&mut self) {
         // 完成边界前推送根声明投影：StorageRequired 的声明会让 storage GC
         // 保留其指向的 store 条目（已完成任务的证据留存由声明决定）。
-        self.push_anchor_roots_for_gc(true).await;
+        self.push_gc_projections(true).await;
         match self.services.context_storage_gc().await {
             Ok(report) => {
                 if let Err(error) = self

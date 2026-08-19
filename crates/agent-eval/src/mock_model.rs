@@ -70,6 +70,7 @@ impl ModelTransport for ScriptedModel {
                 usage: ModelUsage {
                     input_tokens: Some(input_tokens),
                     output_tokens: Some(tokens::approx_tokens(&call.arguments.to_string()) as u64),
+                    ..Default::default()
                 },
             })
         } else {
@@ -113,6 +114,7 @@ fn done_output(done: &str, input_tokens: u64) -> ModelOutput {
         usage: ModelUsage {
             input_tokens: Some(input_tokens),
             output_tokens: Some(tokens::approx_tokens(done) as u64),
+            ..Default::default()
         },
     }
 }

@@ -318,5 +318,11 @@ fn describe(action: &ContextAction) -> String {
                 roots.len()
             )
         }
+        ContextAction::CheckedFiles { files } => {
+            format!(
+                "checked files: {} paths projected from task progress",
+                files.len()
+            )
+        }
     }
 }

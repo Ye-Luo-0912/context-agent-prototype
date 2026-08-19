@@ -6,8 +6,8 @@
 //! module turns those layers into the `ModelInput` sent to the provider.
 
 use agent_contracts::{
-    FocusState, MaterializedContext, ModelInput, ModelMessage, RuntimeFactsView, TaskAnchorView,
-    TaskProgressView, ToolSpec, TurnFrame,
+    ContextKind, FocusState, MaterializedContext, MaterializedItem, ModelInput, ModelMessage,
+    RuntimeFactsView, TaskAnchorView, TaskProgressView, ToolSpec, TurnFrame,
 };
 use agent_workspace::capture_host_runtime_facts;
 
@@ -98,21 +98,7 @@ impl PromptAssembler {
                 ));
             }
             for item in &history.items {
-                let path = item
-                    .file_path
-                    .as_deref()
-                    .filter(|path| !path.is_empty())
-                    .map(|path| format!(" | path={path}"))
-                    .unwrap_or_default();
-                working.push_str(&format!(
-                    "\n[{:?} | {:?} | id={}{path} | attention={:?} | semantic={:?}]\n{}\n",
-                    item.kind,
-                    item.scope,
-                    item.item_id,
-                    item.attention,
-                    item.semantic,
-                    item.content
-                ));
+                working.push_str(&render_selected_item(item, task_progress));
             }
             context_frame.push(ModelMessage::user(working));
         }
@@ -276,10 +262,56 @@ fn render_task_anchor(task: &TaskAnchorView) -> String {
 }
 
 fn render_task_progress(progress: &TaskProgressView) -> String {
-    let mut out = format!("TASK PROGRESS anchor_rev={}\n", progress.anchor_revision);
-    append_list(&mut out, "Checked", &progress.checked_files);
-    append_list(&mut out, "Verification", &progress.verifications);
-    append_list(&mut out, "Failed commands", &progress.failed_commands);
+    let mut checked = progress.checked_files.clone();
+    let mut verifications = progress.verifications.clone();
+    let mut failed = progress.failed_commands.clone();
+    let mut rendered = format_task_progress(
+        progress.anchor_revision,
+        progress.workspace_revision,
+        &checked,
+        &verifications,
+        &failed,
+    );
+    while rendered.chars().count() > agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS {
+        if !failed.is_empty() {
+            failed.remove(0);
+        } else if !checked.is_empty() {
+            checked.remove(0);
+        } else if !verifications.is_empty() {
+            verifications.remove(0);
+        } else {
+            break;
+        }
+        rendered = format_task_progress(
+            progress.anchor_revision,
+            progress.workspace_revision,
+            &checked,
+            &verifications,
+            &failed,
+        );
+    }
+    if rendered.chars().count() > agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS {
+        rendered
+            .chars()
+            .take(agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS)
+            .collect()
+    } else {
+        rendered
+    }
+}
+
+fn format_task_progress(
+    anchor_revision: u64,
+    workspace_revision: u64,
+    checked: &[String],
+    verifications: &[String],
+    failed: &[String],
+) -> String {
+    let mut out =
+        format!("TASK PROGRESS anchor_rev={anchor_revision} world_rev={workspace_revision}\n");
+    append_list(&mut out, "Checked", checked);
+    append_list(&mut out, "Verification", verifications);
+    append_list(&mut out, "Failed commands", failed);
     while out.ends_with('\n') {
         out.pop();
     }
@@ -297,6 +329,68 @@ fn append_list(out: &mut String, label: &str, items: &[String]) {
         out.push_str(item);
         out.push('\n');
     }
+}
+
+fn render_selected_item(item: &MaterializedItem, progress: Option<&TaskProgressView>) -> String {
+    let path = render_selected_path(item);
+    let body = if omit_selected_file_body(item, progress) {
+        String::new()
+    } else {
+        item.content.clone()
+    };
+    format!(
+        "\n[{:?} | {:?} | id={}{path} | attention={:?} | semantic={:?}]\n{body}\n",
+        item.kind, item.scope, item.item_id, item.attention, item.semantic
+    )
+}
+
+fn render_selected_path(item: &MaterializedItem) -> String {
+    let Some(path) = item
+        .file_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        return String::new();
+    };
+    match item
+        .file_revision
+        .as_deref()
+        .map(str::trim)
+        .filter(|revision| !revision.is_empty())
+    {
+        Some(revision) => format!(" | path={path}@{revision}"),
+        None => format!(" | path={path}"),
+    }
+}
+
+/// Historical ToolObservation / FileObservation bodies stay out of the
+/// prompt when TASK PROGRESS already names the path. That covers `fs.read`
+/// file bodies and stamped-path identity logs (`shell.exec`, writes). Live
+/// TurnFrame tool results are unchanged. Errors keep their body. No
+/// retrieval tutorial — identity is the header + Checked.
+fn omit_selected_file_body(item: &MaterializedItem, progress: Option<&TaskProgressView>) -> bool {
+    if item.kind == ContextKind::Error {
+        return false;
+    }
+    let Some(progress) = progress else {
+        return false;
+    };
+    let Some(path) = item
+        .file_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        return false;
+    };
+    if !progress.covers_path(path) {
+        return false;
+    }
+    matches!(
+        item.kind,
+        ContextKind::FileObservation | ContextKind::ToolObservation
+    )
 }
 
 #[cfg(test)]
@@ -344,6 +438,7 @@ mod tests {
             content: content.to_string(),
             source: None,
             file_path: None,
+            file_revision: None,
         }
     }
 
@@ -482,6 +577,161 @@ mod tests {
             "census and path are facts, not a retrieval tutorial: {}",
             user.content
         );
+    }
+
+    #[test]
+    fn progress_covered_fs_read_omits_historical_body() {
+        let assembler = PromptAssembler::new("policy");
+        let mut file = item("     1 | fn secret_body() {}");
+        file.kind = ContextKind::ToolObservation;
+        file.source = Some("tool:fs.read".into());
+        file.file_path = Some("src/auth.rs".into());
+        file.file_revision = Some("abc123".into());
+        let history = materialized_with(vec![file], ContextMapView::default());
+        let progress = TaskProgressView {
+            checked_files: vec!["src/auth.rs@abc123".into()],
+            ..Default::default()
+        };
+        let with_progress = assembler.assemble(
+            None,
+            None,
+            Some(&progress),
+            &history,
+            &TurnFrame::new("continue"),
+            Vec::new(),
+        );
+        let focus = with_progress.focus_frame.expect("progress renders");
+        assert!(focus.contains("src/auth.rs@abc123"));
+        let working = with_progress
+            .context_frame
+            .iter()
+            .find(|message| message.content.contains("SELECTED WORKING CONTEXT"))
+            .expect("working set");
+        assert!(working.content.contains("path=src/auth.rs@abc123"));
+        assert!(
+            !working.content.contains("fn secret_body"),
+            "covered file body must not be dumped: {}",
+            working.content
+        );
+        assert!(
+            !working.content.contains("context.fetch")
+                && !working.content.contains("Use context.manage")
+                && !working.content.contains("exact content"),
+            "omission is a fact, not a retrieval tutorial: {}",
+            working.content
+        );
+
+        let without = assemble_history(
+            &assembler,
+            &history,
+            &TurnFrame::new("continue"),
+            Vec::new(),
+        );
+        let dumped = without
+            .context_frame
+            .iter()
+            .find(|message| message.content.contains("SELECTED WORKING CONTEXT"))
+            .expect("working set");
+        assert!(
+            dumped.content.contains("fn secret_body"),
+            "without TASK PROGRESS the historical body stays: {}",
+            dumped.content
+        );
+    }
+
+    #[test]
+    fn progress_covered_stamped_shell_omits_stdout() {
+        let assembler = PromptAssembler::new("policy");
+        let mut shell = item("tests passed in src/auth.rs\nfull cargo output");
+        shell.kind = ContextKind::ToolObservation;
+        shell.source = Some("tool:shell.exec".into());
+        shell.file_path = Some("src/auth.rs".into());
+        shell.file_revision = Some("abc123".into());
+        let history = materialized_with(vec![shell], ContextMapView::default());
+        let progress = TaskProgressView {
+            checked_files: vec!["src/auth.rs@abc123".into()],
+            ..Default::default()
+        };
+        let with_progress = assembler.assemble(
+            None,
+            None,
+            Some(&progress),
+            &history,
+            &TurnFrame::new("continue"),
+            Vec::new(),
+        );
+        let working = with_progress
+            .context_frame
+            .iter()
+            .find(|message| message.content.contains("SELECTED WORKING CONTEXT"))
+            .expect("working set");
+        assert!(working.content.contains("path=src/auth.rs@abc123"));
+        assert!(
+            !working.content.contains("full cargo output"),
+            "covered identity log must not dump stdout: {}",
+            working.content
+        );
+
+        let without = assemble_history(
+            &assembler,
+            &history,
+            &TurnFrame::new("continue"),
+            Vec::new(),
+        );
+        let dumped = without
+            .context_frame
+            .iter()
+            .find(|message| message.content.contains("SELECTED WORKING CONTEXT"))
+            .expect("working set");
+        assert!(
+            dumped.content.contains("full cargo output"),
+            "without TASK PROGRESS the identity log stays: {}",
+            dumped.content
+        );
+    }
+
+    #[test]
+    fn progress_does_not_omit_errors() {
+        let assembler = PromptAssembler::new("policy");
+        let mut error = item("error in src/auth.rs: missing comma");
+        error.kind = ContextKind::Error;
+        error.source = Some("tool:fs.read".into());
+        error.file_path = Some("src/auth.rs".into());
+        let history = materialized_with(vec![error], ContextMapView::default());
+        let progress = TaskProgressView {
+            checked_files: vec!["src/auth.rs@abc123".into()],
+            ..Default::default()
+        };
+        let assembled = assembler.assemble(
+            None,
+            None,
+            Some(&progress),
+            &history,
+            &TurnFrame::new("continue"),
+            Vec::new(),
+        );
+        let working = assembled
+            .context_frame
+            .iter()
+            .find(|message| message.content.contains("SELECTED WORKING CONTEXT"))
+            .expect("working set");
+        assert!(
+            working
+                .content
+                .contains("error in src/auth.rs: missing comma")
+        );
+    }
+
+    #[test]
+    fn covers_path_is_slash_normalized_and_not_a_prefix_cousin() {
+        let progress = TaskProgressView {
+            checked_files: vec!["src/auth.rs@abc".into()],
+            ..Default::default()
+        };
+        assert!(progress.covers_path("src\\auth.rs"));
+        assert!(progress.covers_path("src/auth.rs"));
+        assert!(!progress.covers_path("src/auth.rs.bak"));
+        assert!(!progress.covers_path("src/auth"));
     }
 
     #[test]
@@ -658,6 +908,38 @@ mod tests {
         );
         assert_eq!(layers_off.task_progress_tokens, 0);
         assert_eq!(layers_off.task_anchor_tokens, layers.task_anchor_tokens);
+    }
+
+    #[test]
+    fn task_progress_prompt_is_hard_capped() {
+        use agent_contracts::{MAX_TASK_PROGRESS_PROMPT_CHARS, TaskProgressView};
+        let assembler = PromptAssembler::new("policy");
+        let long = "x".repeat(200);
+        let progress = TaskProgressView {
+            checked_files: (0..32).map(|i| format!("src/f{i}.rs@{long}")).collect(),
+            verifications: (0..8).map(|i| format!("ok:{long}{i}")).collect(),
+            failed_commands: (0..8).map(|i| format!("shell.exec {long}{i}")).collect(),
+            ..Default::default()
+        };
+        let history = materialized_with(Vec::new(), ContextMapView::default());
+        let assembled = assembler.assemble(
+            None,
+            None,
+            Some(&progress),
+            &history,
+            &TurnFrame::new("continue"),
+            Vec::new(),
+        );
+        let focus = assembled.focus_frame.expect("progress must render");
+        assert!(
+            render_task_progress(&progress).chars().count() <= MAX_TASK_PROGRESS_PROMPT_CHARS,
+            "TASK PROGRESS render must stay under the hard cap, got {}",
+            render_task_progress(&progress).chars().count()
+        );
+        assert!(
+            focus.contains("TASK PROGRESS"),
+            "assembled focus must still carry the capped progress block"
+        );
     }
 
     #[test]

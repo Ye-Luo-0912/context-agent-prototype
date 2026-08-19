@@ -1,0 +1,51 @@
+{
+  "id": "no_semantic_episode",
+  "scenario": "no_semantic_rotate",
+  "variant": "chatter",
+  "name": "Long file-observation chatter, then a local index fix; must not auto-pay LLM distill",
+  "seed": "noise",
+  "include_rolling": false,
+  "target_rounds_lo": 8,
+  "target_rounds_hi": 16,
+  "expected_edit": "fix items[i + 1] in visit_all",
+  "ops": [
+    {
+      "op": "user",
+      "text": "Read src/dump.rs and summarize what noisy_log prints. Do not change files yet."
+    },
+    {
+      "op": "user",
+      "text": "Read src/parse.rs and list the functions. Still no edits."
+    },
+    {
+      "op": "user",
+      "text": "Skim dump.rs again and count how many chatter lines you noticed. Do not recap a design constraint."
+    },
+    {
+      "op": "user",
+      "text": "There are two real errors about visit_all / items[i + 1]. Fix src/parse.rs."
+    },
+    {
+      "op": "user",
+      "text": "Do not delete dump.rs. Keep the noisy helper."
+    }
+  ],
+  "hidden": [
+    {
+      "path": "src/parse.rs",
+      "pred": "not_contains",
+      "needles": ["items[i + 1]"]
+    },
+    {
+      "path": "src/dump.rs",
+      "pred": "contains",
+      "needles": ["unrelated compiler chatter"]
+    }
+  ],
+  "hidden_commands": [
+    {
+      "name": "index_fix",
+      "script": "index_fix.py"
+    }
+  ]
+}

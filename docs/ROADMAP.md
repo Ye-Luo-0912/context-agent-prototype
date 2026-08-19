@@ -1206,12 +1206,10 @@ root transfer with fault injection coverage, and completed-task records are
    storage roots so 1,000 completions stay bounded. The completion ref/digest
    identify the bounded summary; when artifact storage is wired, the full
    assistant response is written before ContextItem truncation and attached
-   separately. A raw-body digest, `CTX-11` (bounded `ResumePoint` /
-   TaskProgress under `TaskAnchor`; not a second authority), and typed
-   `EpisodeOutcome` per rotated episode remain before M15 can claim
-   long-task continuity. Do not land `CTX-11` until the tool-quality
-   preflight below has a cleaner baseline; design detail lives in
-   `docs/AUDIT_TODO.md` (`CTX-11`) and optimization-order item 2.
+   separately. `CTX-11` ResumePoint/TaskProgress core is frozen (2026-08-18);
+   do not add further Context features (including sourced `EpisodeOutcome`).
+   Main engineering returns to M12/M13. Formal large-scale M15 waits for a
+   V1 candidate. Contract: `docs/STATUS.md`, `docs/AUDIT_TODO.md` (`CTX-11`).
 
 The detailed milestone notes below retain implementation landing order, not
 the required gate order; the numbered list and table above are authoritative.
@@ -1332,9 +1330,8 @@ end-to-end success, rounds, latency and cost.
    checkpoint + restore-commit audit (`CORE-03`).
 2. **Continue the context target after M10/M11.** Move lifecycle metadata
    into one canonical catalog, project the implemented TaskAnchor into prompt
-   and GC roots, and (only after the tool-quality preflight + frozen-cell
-   rerun) add the bounded `CTX-11` ResumePoint/TaskProgress projection, then
-   sourced EpisodeOutcome cards. Historical content has left the System role
+   and GC roots. Do not add further Context features after the frozen
+   `CTX-11` ResumePoint/TaskProgress core. Historical content has left the System role
    (`CORE-05`): observations render as low-authority `user` messages, so
    retrieved history cannot gain system precedence. **Done:** TaskAnchor,
    `CompletionRecord`, atomic completion root transfer and verifiable
@@ -1347,15 +1344,33 @@ end-to-end success, rounds, latency and cost.
    `item_id -> location` directory plus query indexes) is landed
    (2026-08-14); bodies remain in the three stores. `TaskAnchorView` and
    independent prompt/residency/storage root reporting landed 2026-08-15.
-   **Next context slice (`CTX-11`):** queued behind the tool-quality
-   preflight for causal measurement. `TaskAnchor` stays the sole task
-   authority; `ResumePoint` is a revision-bound actor subrecord (objective,
-   blockers, checked refs, verification facts, failed commands, next
-   actions — refs only, no body/output/dialogue copies). Validate first on
-   task-switch / failed-tool residuals after the preflight rerun. Do not
-   retune scoring or treat likely-target as implementation authority.
-   Contract detail: `docs/AUDIT_TODO.md` (`CTX-11`). Sourced EpisodeOutcome
-   remains after this slice.
+   **Context V1 core frozen (2026-08-18):** `ResumePoint` is
+   `task_id + anchor_revision + workspace_revision`; verification is typed
+   and orthogonal to mutation; TaskProgress has a total prompt hard cap;
+   dead objective/blockers/next_actions/last_cursor/workspace_facts_stale
+   fields are gone; reactivation counters are segment-local (eval aggregates
+   `ContextGc` events); adaptive compaction pays LLM only on semantic delta
+   (   `generation >= 4` is not a trigger); transport retries are accounted as
+   a token lower bound. Mechanism V2 (`--context-mech`) is the isolated
+   structural gate. Frozen `context-bench.v1` SPEC / pack digest stay
+   untouched. A follow-up C-hygiene slice is in progress: structured
+   `ResourceTouch` working-set signals, user/tool hot split with tool-hot
+   TTL, exact auto-reactivation, reread/selected-token attribution,
+   ResumePoint `path@revision` from `metadata.files[]`, prompt projection
+   of open-turn persistable tools into TaskProgress, omission of
+   progress-covered historical `fs.read` bodies and stamped-path identity
+   logs from SELECTED WORKING CONTEXT (packing prices them as descriptors
+   via `ContextHints.checked_files`), stamped-path shell/process logs not
+   hot-recalling, checked TaskProgress paths not hot-recalling their
+   `fs.read` bodies (`ContextAction::CheckedFiles` before GC; Warm/Stored
+   identity still reachable as EXTERNAL CONTEXT `path@rev` refs, Stored
+   via the entity index past the recency tail; search/inspect of raw
+   file/tool evidence are identity cards, not body prefixes), and
+   ablation switches for descriptor-only ToolObservation recall and
+   recent-file-body caps (`agent-eval --context-hygiene`, engine-only). Do not retune scoring thresholds. Main
+   engineering still returns to item 4 (M12/M13) after this slice. Keep
+   `semantic_recall.v1` as a long-protocol trajectory only.
+   Contract: `docs/STATUS.md`, `docs/AUDIT_TODO.md` (`CTX-11`).
 3. **Contain current protocol boundaries (`PLAT-00`, P0a).** Before designing
    a new envelope, fix current codecs, bidirectional frame/exchange caps,
    known decoded-large-field caps, and MCP child ownership/cancellation.

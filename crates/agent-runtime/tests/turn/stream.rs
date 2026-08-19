@@ -215,6 +215,7 @@ impl ModelTransport for UsageModel {
             usage: agent_contracts::ModelUsage {
                 input_tokens: Some(self.0),
                 output_tokens: Some(self.1),
+                ..Default::default()
             },
         })
     }
@@ -239,6 +240,7 @@ async fn actor_reports_provider_usage_via_model_used() {
                 RuntimeEvent::ModelUsed {
                     input_tokens,
                     output_tokens,
+                    ..
                 } => used = Some((input_tokens, output_tokens)),
                 RuntimeEvent::TurnCompleted => turn_completed = true,
                 _ => {}

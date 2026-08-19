@@ -330,6 +330,15 @@ pub struct ModelRequest {
 pub struct ModelUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Transport attempts that produced this output. `0` on legacy events
+    /// means unknown (treat as one successful attempt). Failed attempts
+    /// usually report no usage, so recorded tokens are a lower bound when
+    /// `retries > 0`.
+    #[serde(default)]
+    pub attempts: u32,
+    /// `attempts.saturating_sub(1)` when known.
+    #[serde(default)]
+    pub retries: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -7,8 +7,8 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentError, AgentResult, AttentionState, ContextDiagnostics, ContextEngine, ContextIngress,
-    ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
+    AgentError, AgentResult, AttentionState, ContextAction, ContextDiagnostics, ContextEngine,
+    ContextIngress, ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
     ContextMaintenanceTrigger, ContextQuery, ContextScope, ContextStateTransition, EventJournal,
     MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest, ModelRole, ModelTransport,
     RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, ToolCall, ToolDispatcher,
@@ -46,7 +46,12 @@ impl ContextEngine for RecordingContextEngine {
             ContextIngress::FocusCleared => "FocusCleared",
             ContextIngress::Pin { .. } => "Pin",
             ContextIngress::TaskCompleted { .. } => "TaskCompleted",
-            ContextIngress::ContextDirective { .. } => "ContextDirective",
+            ContextIngress::ContextDirective { action } => match action {
+                ContextAction::CheckedFiles { .. } => "CheckedFiles",
+                ContextAction::Collect => "Collect",
+                ContextAction::AnchorRoots { .. } => "AnchorRoots",
+                _ => "ContextDirective",
+            },
             ContextIngress::WorkingSetSignal { .. } => "WorkingSetSignal",
         };
         self.ingests.lock().await.push(label.to_string());
@@ -168,13 +173,19 @@ async fn turn_frame_is_execution_stack_not_long_term_memory() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // First model round: policy + Runtime Facts + user; no tool frame yet.
+    // First model round: policy + Runtime Facts + Focus frame + user; no
+    // tool frame yet. The implicit task's focus is a third System message.
     let requests = model.requests.lock().await;
     assert_eq!(requests.len(), 2, "two model rounds expected");
     let first = &requests[0];
     assert_eq!(
         first.iter().map(|message| message.role).collect::<Vec<_>>(),
-        vec![ModelRole::System, ModelRole::System, ModelRole::User]
+        vec![
+            ModelRole::System,
+            ModelRole::System,
+            ModelRole::System,
+            ModelRole::User
+        ]
     );
     assert!(
         first[1].content.starts_with("runtime_facts/v1"),
@@ -201,19 +212,19 @@ async fn turn_frame_is_execution_stack_not_long_term_memory() {
 
     // The observation reached the context engine only after the turn ended,
     // in ingest order: the implicit task's focus (established before the
-    // message), then the user message, then the mid-turn working-set signal
-    // from the tool commit (the tool's discovered entities become hot for
-    // the next round), then the persisted tool observation, then the final
-    // assistant message.
+    // message), then the user message, then the persisted tool observation,
+    // then the final assistant message, then the TaskProgress CheckedFiles
+    // projection before the turn-boundary GC. This dispatcher does not
+    // stamp a resource path, so there is no mid-turn WorkingSetSignal.
     let ingests = context.ingests.lock().await;
     assert_eq!(
         ingests.as_slice(),
         &[
             "FocusChanged",
             "UserMessage",
-            "WorkingSetSignal",
             "ToolObservation",
-            "AssistantMessage"
+            "AssistantMessage",
+            "CheckedFiles"
         ]
     );
     drop(ingests);
@@ -798,7 +809,7 @@ impl ToolDispatcher for EntitySignalingDispatcher {
             summary: "found it".into(),
             model_content: "discovered AuthService.rs".into(),
             artifact_ref: None,
-            metadata: json!({}),
+            metadata: json!({"path": "src/AuthService.rs"}),
         }))
     }
 }
@@ -824,13 +835,15 @@ async fn tool_commit_signals_discovered_entities_before_the_next_round() {
     let signal = ingests
         .iter()
         .find_map(|ingress| match ingress {
-            ContextIngress::WorkingSetSignal { content } => Some(content.clone()),
+            ContextIngress::WorkingSetSignal { resources, .. } => {
+                resources.first().map(|touch| touch.path.clone())
+            }
             _ => None,
         })
         .expect("a WorkingSetSignal must be sent at tool commit");
     assert!(
         signal.contains("AuthService.rs"),
-        "the tool's discovered entity must be signaled, got: {signal}"
+        "the tool's stamped path must be signaled, got: {signal}"
     );
     let signal_pos = ingests
         .iter()
@@ -1103,10 +1116,11 @@ async fn actor_routes_collect_directive_into_a_full_gc_pass() {
     );
 
     // `context.collect` bypasses ingest entirely: it is the one directive
-    // the runtime executes itself (it owns the GC pass).
+    // the runtime executes itself (it owns the GC pass). The turn-boundary
+    // CheckedFiles projection is a different ingest.
     let ingests = context.ingests.lock().await;
     assert!(
-        !ingests.iter().any(|label| label == "ContextDirective"),
+        !ingests.iter().any(|label| label == "Collect"),
         "collect is not an ingest directive, got: {ingests:?}"
     );
     drop(ingests);

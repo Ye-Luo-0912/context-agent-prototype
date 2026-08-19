@@ -89,6 +89,8 @@ pub(crate) fn plan_episode_distill(
     }
     // Short episodes with no durable semantic payload are not worth a
     // provider round: raw tool dumps stay retrievable without an LLM card.
+    // Long episodes may still rotate; generation count is not a distill
+    // trigger. Ablation-only `force_episode_llm_distill` overrides this.
     if !config.force_episode_llm_distill && !episode_worth_llm_distill(state, opened_tick, task) {
         return None;
     }
@@ -122,14 +124,6 @@ pub(crate) fn plan_episode_distill(
 }
 
 fn episode_worth_llm_distill(state: &State, opened_tick: u64, task: TaskId) -> bool {
-    let generation = state
-        .focus
-        .as_ref()
-        .map(|focus| focus.generation)
-        .unwrap_or(0);
-    if generation >= 4 {
-        return true;
-    }
     state
         .items
         .iter()

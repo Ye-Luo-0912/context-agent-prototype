@@ -45,7 +45,12 @@ async fn admit_externalized_item_preserves_identity_and_produces_one_transition(
     for (i, content) in contents.iter().enumerate() {
         engine
             .ingest(ContextIngress::ToolObservation {
-                output: observation_output(&format!("step-{i}"), true, content),
+                output: super::harness::observation_touching(
+                    &format!("step-{i}"),
+                    true,
+                    content,
+                    Some("AuthService.rs"),
+                ),
                 scope_id: None,
             })
             .await
@@ -66,7 +71,7 @@ async fn admit_externalized_item_preserves_identity_and_produces_one_transition(
     let refs = engine
         .search_external(agent_contracts::ContextSearchQuery {
             query: "AuthService".into(),
-            kind: None,
+            kind: Some(ContextKind::ToolObservation),
             scope: None,
             task_id: None,
             label: None,
@@ -241,18 +246,30 @@ async fn admit_refused_for_terminal_semantic_item() {
         .unwrap();
     // Two long observations overflow the buffer of 1, forcing the store to
     // externalize (a single evicted item would stay warm instead).
-    tool_observation(
-        &engine,
-        "1",
-        &format!("step 0: fix AuthService.rs {}", "z".repeat(200)),
-    )
-    .await;
-    tool_observation(
-        &engine,
-        "2",
-        &format!("step 1: fix CacheStore.rs {}", "z".repeat(200)),
-    )
-    .await;
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: observation_touching(
+                "1",
+                true,
+                &format!("step 0: fix AuthService.rs {}", "z".repeat(200)),
+                Some("AuthService.rs"),
+            ),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: observation_touching(
+                "2",
+                true,
+                &format!("step 1: fix CacheStore.rs {}", "z".repeat(200)),
+                Some("CacheStore.rs"),
+            ),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
     engine
         .maintain(ContextMaintenanceTrigger::AfterModel)
         .await
@@ -261,7 +278,7 @@ async fn admit_refused_for_terminal_semantic_item() {
     let refs = engine
         .search_external(agent_contracts::ContextSearchQuery {
             query: "AuthService".into(),
-            kind: None,
+            kind: Some(ContextKind::ToolObservation),
             scope: None,
             task_id: None,
             label: None,
@@ -498,7 +515,7 @@ async fn admit_of_a_disappeared_store_blob_is_a_silent_no_op() {
     let content = format!("step 0: fix AuthService.rs {}", "x".repeat(160));
     engine
         .ingest(ContextIngress::ToolObservation {
-            output: observation_output("step-0", true, &content),
+            output: observation_touching("step-0", true, &content, Some("AuthService.rs")),
             scope_id: None,
         })
         .await
@@ -506,7 +523,7 @@ async fn admit_of_a_disappeared_store_blob_is_a_silent_no_op() {
     let content = format!("step 1: fix AuthService.rs {}", "y".repeat(160));
     engine
         .ingest(ContextIngress::ToolObservation {
-            output: observation_output("step-1", true, &content),
+            output: observation_touching("step-1", true, &content, Some("AuthService.rs")),
             scope_id: None,
         })
         .await
@@ -521,18 +538,15 @@ async fn admit_of_a_disappeared_store_blob_is_a_silent_no_op() {
         "buffer overflow must externalize"
     );
 
-    let refs = engine
-        .search_external(ContextSearchQuery {
-            query: "AuthService".into(),
-            kind: None,
-            scope: None,
-            task_id: None,
-            label: None,
-            limit: 16,
-        })
-        .await
-        .unwrap();
-    let target = refs[0].item_id;
+    let target = {
+        let state = engine.state.lock().await;
+        state
+            .external
+            .iter()
+            .find(|entry| entry.residency == ContextResidency::Cold)
+            .map(|entry| entry.item_id)
+            .expect("gc must leave a Cold store entry")
+    };
     assert!(
         engine.fetch_external(target).await.unwrap().is_some(),
         "the blob must be readable before removal"
@@ -748,7 +762,7 @@ async fn reconcile_store_converges_a_crash_injected_directory() {
     let search = engine
         .search_external(ContextSearchQuery {
             query: "AuthService".into(),
-            kind: None,
+            kind: Some(ContextKind::ToolObservation),
             scope: None,
             task_id: None,
             label: None,
@@ -2012,6 +2026,91 @@ async fn short_episode_without_semantic_outcome_skips_llm_compactor() {
 }
 
 #[tokio::test]
+async fn long_episode_without_semantic_delta_rotates_without_paying_llm() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CountingCompactor(AtomicUsize);
+    #[async_trait::async_trait]
+    impl BoundedCompactor for CountingCompactor {
+        async fn compact(
+            &self,
+            request: CompactionRequest,
+        ) -> agent_contracts::AgentResult<CompactionOutput> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(CompactionOutput {
+                text: format!("[distilled] {}", request.source),
+                input_tokens: 9,
+                output_tokens: 3,
+            })
+        }
+    }
+
+    let counter = Arc::new(CountingCompactor(AtomicUsize::new(0)));
+    let config = SimpleContextConfig {
+        episode_rotate_threshold: 0.0,
+        episode_max_user_turns: 5,
+        ..SimpleContextConfig::default()
+    };
+    let engine = SimpleContextEngine::new(config).with_compactor(counter.clone());
+    open_focus(&engine, "keep AuthService.rs").await;
+    for turn in 1..=5 {
+        ingest_related(&engine, turn).await;
+    }
+    let report = engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    assert!(
+        report
+            .transitions
+            .iter()
+            .any(|row| row.reason.contains("episode rotated")),
+        "the turn budget must still rotate a long related episode"
+    );
+    assert_eq!(
+        counter.0.load(Ordering::SeqCst),
+        0,
+        "generation >= 4 must not auto-pay the LLM distiller without a semantic delta"
+    );
+}
+
+#[tokio::test]
+async fn late_constraint_survives_episode_rotation() {
+    let engine = SimpleContextEngine::new(episode_budget_config())
+        .with_compactor(Arc::new(TaskDistillCompactor));
+    open_focus(&engine, "keep AuthService.rs").await;
+    ingest_related(&engine, 1).await;
+    ingest_related(&engine, 2).await;
+    ingest_semantic_outcome(&engine).await;
+    ingest_related(&engine, 3).await;
+    let state = engine.state.lock().await;
+    assert!(
+        state.items.iter().any(|item| {
+            item.kind == ContextKind::Constraint
+                && item.content.contains("unversioned ping")
+                && item.semantic.is_live()
+        }),
+        "a late durable constraint must survive the next episode rotation"
+    );
+}
+
+#[tokio::test]
+async fn restore_zeros_segment_local_reactivation_counters() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    {
+        let mut state = engine.state.lock().await;
+        state.reactivation_events = 9;
+        state.unique_reactivated = 4;
+        state.reactivation_selected = 3;
+    }
+    let blob = engine.checkpoint().await.unwrap();
+    engine.restore(blob).await.unwrap();
+    let diagnostics = engine.diagnostics().await.unwrap();
+    assert_eq!(diagnostics.reactivation_events, 0);
+    assert_eq!(diagnostics.unique_reactivated, 0);
+    assert_eq!(diagnostics.reactivation_selected, 0);
+}
+
+#[tokio::test]
 async fn file_observation_alone_does_not_pay_for_episode_compaction() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct CountingCompactor(AtomicUsize);
@@ -2146,6 +2245,12 @@ async fn dependency_reserve_is_not_taken_when_expansion_is_disabled() {
             None,
         );
         item.scope_id = None;
+        // Reserve is taken only when a candidate actually has a Continuation
+        // edge; the flag alone does not tax frames with no such edge.
+        item.dependencies
+            .push(agent_contracts::DependencyEdge::continuation(
+                ContextItemId::new(),
+            ));
         state.items.push(item);
     }
     let with_on = on
@@ -2528,6 +2633,15 @@ async fn materialize_preview_is_a_read_that_advances_no_clock() {
         })
         .await
         .unwrap();
+    // The current-turn user message is TurnFrame-owned and skipped in the
+    // historical working set. A second ingest makes the first message
+    // historical so the preview has something to see.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "still looking at AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
     let before = engine.diagnostics().await.unwrap().event_seq;
     // Preview three times: a read must not advance the event sequence, so
     // merely looking at the context never ages TTLs or recency scores.
@@ -2813,6 +2927,112 @@ async fn external_view_surfaces_hot_matches_beyond_the_recency_tail() {
     );
 }
 
+/// A Checked file body that overflowed to the store still appears as a
+/// `path@rev` descriptor even when it is not hot and sits far past the
+/// recency tail. Lookup is the entity index (same O(bucket) as hot), and
+/// ranking keeps Checked identity above later fillers so the 32-ref cap
+/// does not hide it. The engine's `CheckedFiles` projection is enough;
+/// this query does not re-name the file.
+#[tokio::test]
+async fn external_view_surfaces_checked_stored_file_beyond_the_recency_tail() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    const BODY: &str = "fn handle_secret() {}";
+    let stored_id = {
+        let mut state = engine.state.lock().await;
+        let reference = |id: ContextItemId, summary: String, kind: ContextKind| {
+            agent_contracts::ContextRef {
+                uri: format!("context://run/{id}"),
+                item_id: id,
+                kind,
+                scope: ContextScope::Task,
+                summary,
+                created_tick: 0,
+            }
+        };
+        let mut stored = crate::item::make_item(
+            &state,
+            &engine.config,
+            BODY.into(),
+            ContextKind::ToolObservation,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.9,
+            None,
+        );
+        stored.scope_id = None;
+        stored.entities = vec!["AuthService.rs".into()];
+        stored.file_path = Some("AuthService.rs".into());
+        stored.file_revision = Some("abc".into());
+        let stored_id = stored.id;
+        state.external.push(crate::store::to_external_entry(
+            &stored,
+            reference(stored_id, BODY.into(), ContextKind::ToolObservation),
+            1,
+            1,
+            None,
+        ));
+        for i in 0..1_000 {
+            let mut filler = crate::item::make_item(
+                &state,
+                &engine.config,
+                format!("filler {i}"),
+                ContextKind::Note,
+                ContextScope::Task,
+                ContextRetention::Working,
+                0.2,
+                None,
+            );
+            filler.scope_id = None;
+            let filler_id = filler.id;
+            state.external.push(crate::store::to_external_entry(
+                &filler,
+                reference(filler_id, format!("filler {i}"), ContextKind::Note),
+                i + 2,
+                1,
+                None,
+            ));
+        }
+        stored_id
+    };
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::CheckedFiles {
+                files: vec!["AuthService.rs@abc".into()],
+            },
+        })
+        .await
+        .unwrap();
+
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 8_192,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        materialized
+            .items
+            .iter()
+            .all(|item| !item.content.contains(BODY)),
+        "the skipped Stored body must not re-enter SELECTED WORKING CONTEXT"
+    );
+    let descriptor = materialized
+        .external
+        .iter()
+        .find(|entry| entry.item_id == stored_id)
+        .expect(
+            "a Checked Stored file body far past the recency tail must surface \
+             through the entity index",
+        );
+    assert_eq!(descriptor.context_ref.summary, "AuthService.rs@abc");
+    assert!(
+        !descriptor.context_ref.summary.contains(BODY),
+        "refs only: identity, not the file text"
+    );
+}
+
 /// A mid-turn working-set signal extends the hot-entity set so the next
 /// model round can recall evidence, without creating an item — the body is
 /// persisted later, at turn end, by the runtime.
@@ -2829,6 +3049,16 @@ async fn working_set_signal_extends_hot_entities_without_creating_a_body() {
 
     engine
         .ingest(ContextIngress::WorkingSetSignal {
+            resources: vec![
+                agent_contracts::ResourceTouch {
+                    path: "src/AuthService.rs".into(),
+                    revision: None,
+                },
+                agent_contracts::ResourceTouch {
+                    path: "src/CacheStore.rs".into(),
+                    revision: None,
+                },
+            ],
             content: "discovered AuthService.rs and CacheStore.rs".into(),
         })
         .await
@@ -2836,12 +3066,14 @@ async fn working_set_signal_extends_hot_entities_without_creating_a_body() {
 
     let state = engine.state.lock().await;
     assert!(
-        state.hot_entities.iter().any(|e| e == "AuthService.rs"),
-        "the signal's entities must become hot for the next round"
+        state.hot_entities.iter().any(|e| e == "src/AuthService.rs"),
+        "the signal's resource paths must become hot for the next round: {:?}",
+        state.hot_entities
     );
     assert!(
-        state.hot_entities.iter().any(|e| e == "CacheStore.rs"),
-        "every signal entity must be merged"
+        state.hot_entities.iter().any(|e| e == "src/CacheStore.rs"),
+        "every signaled resource must be merged: {:?}",
+        state.hot_entities
     );
     assert_eq!(
         state.items.len(),
@@ -3162,7 +3394,7 @@ async fn prompt_required_anchor_roots_force_selection() {
                     source_field_id: "constraints".into(),
                     ..Default::default()
                 }],
-                task: None,
+                ..Default::default()
             },
         })
         .await

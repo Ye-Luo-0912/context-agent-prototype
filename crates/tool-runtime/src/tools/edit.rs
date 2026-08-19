@@ -224,7 +224,12 @@ impl Tool for EditReplaceTool {
                 summary: "no-op: replacement text equals original".into(),
                 model_content: format!("no change: {}", display_relative(&self.workspace, &path)),
                 artifact_ref: None,
-                metadata: json!({"changed": false, "occurrences": count}),
+                metadata: json!({
+                    "path": relative,
+                    "changed": false,
+                    "occurrences": count,
+                    "revision": current_revision,
+                }),
             }));
         }
 
@@ -264,7 +269,14 @@ impl Tool for EditReplaceTool {
                     updated.len()
                 ),
                 artifact_ref: None,
-                metadata: json!({"changed": true, "occurrences": count, "bytes_before": metadata.len(), "bytes_after": updated.len(), "revision": content_digest(updated.as_bytes())}),
+                metadata: json!({
+                    "path": relative,
+                    "changed": true,
+                    "occurrences": count,
+                    "bytes_before": metadata.len(),
+                    "bytes_after": updated.len(),
+                    "revision": content_digest(updated.as_bytes()),
+                }),
             },
             effect,
         })
@@ -347,6 +359,13 @@ mod tests {
             panic!("edit.replace must prepare a committed effect");
         };
         assert!(output.ok);
+        assert!(output.heats_working_set());
+        assert_eq!(output.metadata["path"], "lib.rs");
+        assert_eq!(
+            output.metadata["revision"].as_str().unwrap().len(),
+            64,
+            "replace stamps a content revision"
+        );
         assert!(
             matches!(
                 effect.commit().await,

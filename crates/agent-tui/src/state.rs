@@ -577,13 +577,18 @@ impl AppState {
             RuntimeEvent::ModelUsed {
                 input_tokens,
                 output_tokens,
+                attempts,
+                retries,
             } => {
-                // A token meter for the live run: the provider-reported
-                // cost of the last model round, surfaced in the status line.
                 self.input_tokens += input_tokens;
                 self.output_tokens += output_tokens;
+                let retry_note = if retries > 0 {
+                    format!(" attempts={attempts} retries={retries} (tokens lower-bound)")
+                } else {
+                    String::new()
+                };
                 self.push_system(format!(
-                    "model used: {input_tokens} in + {output_tokens} out (run: {} in + {} out)",
+                    "model used: {input_tokens} in + {output_tokens} out (run: {} in + {} out){retry_note}",
                     self.input_tokens, self.output_tokens
                 ));
             }

@@ -94,7 +94,7 @@ mod tests {
                     summary: "ok".into(),
                     model_content: "tests passed in AuthService.rs".into(),
                     artifact_ref: None,
-                    metadata: json!({}),
+                    metadata: json!({"path": "AuthService.rs"}),
                 },
                 scope_id: None,
             })

@@ -114,6 +114,7 @@ mod tests {
                 usage: ModelUsage {
                     input_tokens: Some(11),
                     output_tokens: Some(7),
+                    ..Default::default()
                 },
             })
         }

@@ -14,6 +14,10 @@ async fn gc_externalizes_overflow_and_recalls_via_the_store() {
     let engine = SimpleContextEngine::new(SimpleContextConfig {
         gc_buffer_capacity: 1,
         gc_reactivate_per_pass: 8,
+        // Keep only the newest file body as a residency root so an older
+        // live body can overflow into the store (same-path fs.read would
+        // supersede instead; stamped shell logs must not auto-recall).
+        recent_file_bodies: 1,
         context_store_dir: Some(dir.path().to_path_buf()),
         ..SimpleContextConfig::default()
     });
@@ -24,13 +28,14 @@ async fn gc_externalizes_overflow_and_recalls_via_the_store() {
         })
         .await
         .unwrap();
-    for i in 0..3 {
+    let files = ["AuthService.rs", "CacheStore.rs", "TokenCache.rs"];
+    for (i, path) in files.iter().enumerate() {
         engine
             .ingest(ContextIngress::ToolObservation {
-                output: observation_output(
+                output: fs_read_touching(
                     &format!("step-{i}"),
-                    true,
-                    &format!("step {i}: fix AuthService.rs"),
+                    path,
+                    &format!("     1 | step {i}: fix {path}"),
                 ),
                 scope_id: None,
             })
@@ -42,12 +47,11 @@ async fn gc_externalizes_overflow_and_recalls_via_the_store() {
         .await
         .unwrap();
 
-    // The buffer is capped at 1, so two of the three consumed observations
-    // overflow into the store — without the lock being held during the
-    // writes (the plan/commit split keeps disk IO outside the state lock).
+    // TokenCache.rs stays as the latest-file root. The other two bodies
+    // evict; the buffer holds one and the oldest overflows to the store.
     let report = engine.gc().await.unwrap();
     assert_eq!(
-        report.externalized, 2,
+        report.externalized, 1,
         "buffer overflow must externalize to the store: {report:?}"
     );
     let stored = std::fs::read_dir(dir.path()).unwrap().count();
@@ -107,7 +111,12 @@ async fn fetch_external_recovers_the_exact_original_content() {
     for (i, content) in contents.iter().enumerate() {
         engine
             .ingest(ContextIngress::ToolObservation {
-                output: observation_output(&format!("step-{i}"), true, content),
+                output: observation_touching(
+                    &format!("step-{i}"),
+                    true,
+                    content,
+                    Some("AuthService.rs"),
+                ),
                 scope_id: None,
             })
             .await
@@ -133,7 +142,7 @@ async fn fetch_external_recovers_the_exact_original_content() {
     let refs = engine
         .search_external(agent_contracts::ContextSearchQuery {
             query: "AuthService".into(),
-            kind: None,
+            kind: Some(ContextKind::ToolObservation),
             scope: None,
             task_id: None,
             label: None,
@@ -190,10 +199,11 @@ async fn context_store_never_writes_outside_the_state_directory() {
     for i in 0..3 {
         engine
             .ingest(ContextIngress::ToolObservation {
-                output: observation_output(
+                output: observation_touching(
                     &format!("step-{i}"),
                     true,
                     &format!("step {i}: fix AuthService.rs"),
+                    Some("AuthService.rs"),
                 ),
                 scope_id: None,
             })

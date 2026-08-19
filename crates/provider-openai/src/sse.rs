@@ -88,6 +88,7 @@ impl StreamAccumulator {
             self.usage = Some(ModelUsage {
                 input_tokens: usage.prompt_tokens,
                 output_tokens: usage.completion_tokens,
+                ..Default::default()
             });
         }
 

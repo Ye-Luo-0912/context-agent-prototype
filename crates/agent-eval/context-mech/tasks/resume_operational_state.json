@@ -1,0 +1,49 @@
+{
+  "id": "resume_operational_state",
+  "scenario": "resume_freshness",
+  "variant": "switch",
+  "name": "Verify-then-mutate on A, switch to B, resume A without treating the old PASS as current",
+  "seed": "switch",
+  "include_rolling": false,
+  "target_rounds_lo": 10,
+  "target_rounds_hi": 20,
+  "expected_edit": "auth rate_limit + operator allow; billing index fix",
+  "ops": [
+    {
+      "op": "user",
+      "text": "Task A: in src/auth.rs allow operator as well as admin. Do not touch billing."
+    },
+    {
+      "op": "user",
+      "text": "Still on A: add pub fn rate_limit(user: &str) -> u32 that returns 30. If you already ran a check, the tree may have changed since that result."
+    },
+    {
+      "op": "suspend"
+    },
+    {
+      "op": "user",
+      "text": "Task B: src/billing.rs total() indexes one past the end. Fix it. Do not change auth."
+    },
+    {
+      "op": "activate",
+      "slot": "first"
+    },
+    {
+      "op": "user",
+      "text": "Resume A. rate_limit must still return 30. Do not treat an earlier test PASS as proof of the current tree; re-read the file if needed. Do not recap the original A spec."
+    }
+  ],
+  "hidden": [
+    {
+      "path": "src/billing.rs",
+      "pred": "not_contains",
+      "needles": ["items[i + 1]"]
+    }
+  ],
+  "hidden_commands": [
+    {
+      "name": "switch_resume",
+      "script": "switch_resume.py"
+    }
+  ]
+}

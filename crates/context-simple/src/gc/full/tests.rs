@@ -2,8 +2,9 @@ use super::*;
 use crate::engine::SimpleContextEngine;
 use crate::index::entity::extract_entities;
 use agent_contracts::{
-    ContextEngine, ContextHints, ContextIngress, ContextItemId, ContextKind,
-    ContextMaintenanceTrigger, ContextQuery, ContextRetention, FocusState, TaskId, ToolOutput,
+    ContextAction, ContextEngine, ContextHints, ContextIngress, ContextItemId, ContextKind,
+    ContextMaintenanceTrigger, ContextQuery, ContextResidency, ContextRetention, FocusState,
+    TaskId, ToolOutput,
 };
 use serde_json::json;
 
@@ -256,8 +257,8 @@ async fn gc_marks_roots_and_evicts_stale_archived_items_by_generation() {
 #[tokio::test]
 async fn gc_reactivates_warm_items_whose_entities_become_hot_again() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
-    // Round 1: the agent works on AuthService.rs; the successful
-    // observation drops after the turn and gc evicts it.
+    // Round 1: the agent reads AuthService.rs; the successful file body
+    // drops after the turn and gc evicts it.
     engine
         .ingest(ContextIngress::UserMessage {
             content: "fix AuthService.rs".into(),
@@ -268,12 +269,12 @@ async fn gc_reactivates_warm_items_whose_entities_become_hot_again() {
         .ingest(ContextIngress::ToolObservation {
             output: ToolOutput {
                 call_id: "1".into(),
-                tool_name: "shell.exec".into(),
+                tool_name: "fs.read".into(),
                 ok: true,
-                summary: "ok".into(),
-                model_content: "touched AuthService.rs".into(),
+                summary: "read".into(),
+                model_content: "     1 | fn handle() {}".into(),
                 artifact_ref: None,
-                metadata: json!({}),
+                metadata: json!({"path": "AuthService.rs"}),
             },
             scope_id: None,
         })
@@ -309,6 +310,315 @@ async fn gc_reactivates_warm_items_whose_entities_become_hot_again() {
     assert_eq!(
         diagnostics.gc_reactivated_total as usize, report.reactivated,
         "cumulative counter matches"
+    );
+}
+
+#[tokio::test]
+async fn pathless_tool_stdout_does_not_auto_reactivate() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "fix AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "shell.exec".into(),
+                ok: true,
+                summary: "ok".into(),
+                model_content: "touched AuthService.rs".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(report.evicted >= 1, "something must be evicted first");
+
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "what did we change in AuthService.rs?".into(),
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.reactivations.iter().all(|row| {
+            row.kind != ContextKind::ToolObservation || !row.reason.contains("hot again")
+        }),
+        "pathless stdout must not be a GC identity: {:?}",
+        report.reactivations
+    );
+}
+
+#[tokio::test]
+async fn stamped_shell_path_does_not_auto_reactivate() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "fix AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "shell.exec".into(),
+                ok: true,
+                summary: "ok".into(),
+                model_content: "touched AuthService.rs".into(),
+                artifact_ref: None,
+                metadata: json!({"path": "AuthService.rs"}),
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(report.evicted >= 1, "something must be evicted first");
+
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "what did we change in AuthService.rs?".into(),
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.reactivations.iter().all(|row| {
+            row.kind != ContextKind::ToolObservation || !row.reason.contains("hot again")
+        }),
+        "stamped-path shell stdout is identity, not a hot-recall body: {:?}",
+        report.reactivations
+    );
+}
+
+#[tokio::test]
+async fn checked_file_body_does_not_auto_reactivate() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "fix AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "     1 | fn handle() {}".into(),
+                artifact_ref: None,
+                metadata: json!({"path": "AuthService.rs", "revision": "abc"}),
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(report.evicted >= 1, "something must be evicted first");
+
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::CheckedFiles {
+                files: vec!["AuthService.rs@abc".into()],
+            },
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "what did we change in AuthService.rs?".into(),
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.reactivations.iter().all(|row| {
+            row.kind != ContextKind::ToolObservation || !row.reason.contains("hot again")
+        }),
+        "a Checked path must not hot-recall its fs.read body: {:?}",
+        report.reactivations
+    );
+
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::CheckedFiles { files: vec![] },
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report
+            .reactivations
+            .iter()
+            .any(|r| r.reason.contains("hot again")),
+        "clearing the projection must restore file-body recall: {:?}",
+        report.reactivations
+    );
+}
+
+#[tokio::test]
+async fn checked_files_directive_replaces_and_caps() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::CheckedFiles {
+                files: vec!["src/a.rs@1".into(), "src/b.rs@2".into()],
+            },
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(state.checked_files.len(), 2);
+        assert_eq!(state.checked_files[0], "src/a.rs@1");
+    }
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::CheckedFiles {
+                files: vec!["src/c.rs@3".into()],
+            },
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(state.checked_files, vec!["src/c.rs@3".to_string()]);
+    }
+    let overflow: Vec<String> = (0..40).map(|i| format!("src/f{i}.rs@{i}")).collect();
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::CheckedFiles {
+                files: overflow.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(
+            state.checked_files.len(),
+            agent_contracts::MAX_CHECKED_FILE_HINTS
+        );
+        assert_eq!(
+            state.checked_files[0],
+            overflow[overflow.len() - agent_contracts::MAX_CHECKED_FILE_HINTS]
+        );
+    }
+}
+
+#[tokio::test]
+async fn skipped_warm_file_body_is_a_prompt_descriptor() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    const BODY: &str = "fn handle_secret() {}";
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "fix AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: format!("     1 | {BODY}"),
+                artifact_ref: None,
+                metadata: json!({"path": "AuthService.rs", "revision": "abc"}),
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    assert!(engine.gc().await.unwrap().evicted >= 1);
+
+    engine
+        .ingest(ContextIngress::ContextDirective {
+            action: ContextAction::CheckedFiles {
+                files: vec!["AuthService.rs@abc".into()],
+            },
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "what did we change in AuthService.rs?".into(),
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report.reactivations.iter().all(|row| {
+            row.kind != ContextKind::ToolObservation || !row.reason.contains("hot again")
+        }),
+        "Checked path must stay Warm: {:?}",
+        report.reactivations
+    );
+
+    let snapshot = engine
+        .materialize(ContextQuery {
+            current_input: "what did we change in AuthService.rs?".into(),
+            budget_tokens: 8_000,
+            hints: ContextHints {
+                checked_files: vec!["AuthService.rs@abc".into()],
+                ..ContextHints::default()
+            },
+        })
+        .await
+        .unwrap();
+    assert!(
+        snapshot
+            .items
+            .iter()
+            .all(|item| !item.content.contains(BODY)),
+        "the skipped body must not re-enter SELECTED WORKING CONTEXT"
+    );
+    let descriptor = snapshot
+        .external
+        .iter()
+        .find(|entry| entry.file_path.as_deref() == Some("AuthService.rs"))
+        .expect("a Warm checked file body must be a reachable descriptor");
+    assert_eq!(descriptor.residency, ContextResidency::Warm);
+    assert_eq!(descriptor.context_ref.summary, "AuthService.rs@abc");
+    assert!(
+        !descriptor.context_ref.summary.contains(BODY),
+        "refs only: identity, not the file text"
+    );
+    let fetched = engine
+        .fetch_external(descriptor.item_id)
+        .await
+        .unwrap()
+        .expect("Fetch must still return the Warm catalog body");
+    assert!(
+        fetched.content.contains(BODY),
+        "exact body stays behind Fetch"
     );
 }
 
@@ -446,7 +756,7 @@ async fn gc_protects_dependencies_of_roots_forward_along_the_edges() {
                 summary: "ok".into(),
                 model_content: "touched AuthService.rs".into(),
                 artifact_ref: None,
-                metadata: json!({}),
+                metadata: json!({"path": "AuthService.rs"}),
             },
             scope_id: None,
         })
@@ -529,7 +839,7 @@ async fn gc_does_not_treat_shares_entities_as_a_residency_root() {
                 summary: "ok".into(),
                 model_content: "touched AuthService.rs".into(),
                 artifact_ref: None,
-                metadata: json!({}),
+                metadata: json!({"path": "AuthService.rs"}),
             },
             scope_id: None,
         })
@@ -768,4 +1078,145 @@ fn dependency_edges_resolve_across_heap_buffer_and_store() {
         "an external entry's captured edges must be traversable"
     );
     assert!(dependency_edges(&state, ContextItemId::new()).is_none());
+}
+
+#[tokio::test]
+async fn hot_reactivation_requires_exact_entity_identity() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        tool_hot_ttl_turns: 1,
+        // Isolate the hot-identity gate from the score fallback.
+        active_threshold: 10.0,
+        ..SimpleContextConfig::default()
+    });
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "touch src/auth/AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "     1 | fn run() {}".into(),
+                artifact_ref: None,
+                metadata: json!({"path": "src/auth/AuthService.rs"}),
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let _ = engine.gc().await.unwrap();
+
+    // Expire the path-shaped tool-hot from the observation so the next
+    // user message only carries the basename cousin.
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "unrelated pause".into(),
+        })
+        .await
+        .unwrap();
+
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "what about AuthService.rs?".into(),
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report
+            .reactivations
+            .iter()
+            .all(|r| !r.reason.contains("hot again")),
+        "substring cousins must not auto-reactivate: {:?}",
+        report.reactivations
+    );
+
+    engine
+        .ingest(ContextIngress::WorkingSetSignal {
+            resources: vec![agent_contracts::ResourceTouch {
+                path: "src/auth/AuthService.rs".into(),
+                revision: None,
+            }],
+            content: String::new(),
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report
+            .reactivations
+            .iter()
+            .any(|r| r.reason.contains("hot again")),
+        "exact path identity must auto-reactivate: {:?}",
+        report.reactivations
+    );
+}
+
+#[tokio::test]
+async fn descriptor_only_tool_observation_skips_body_reactivation() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        descriptor_only_tool_observation_reactivation: true,
+        ..SimpleContextConfig::default()
+    });
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "fix AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "     1 | fn handle() {}".into(),
+                artifact_ref: None,
+                metadata: json!({"path": "AuthService.rs"}),
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let _ = engine.gc().await.unwrap();
+
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "what did we change in AuthService.rs?".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::WorkingSetSignal {
+            resources: vec![agent_contracts::ResourceTouch {
+                path: "AuthService.rs".into(),
+                revision: None,
+            }],
+            content: String::new(),
+        })
+        .await
+        .unwrap();
+    let report = engine.gc().await.unwrap();
+    assert!(
+        report
+            .reactivations
+            .iter()
+            .all(|r| r.kind != ContextKind::ToolObservation || !r.reason.contains("hot again")),
+        "ablation must leave fs.read bodies Warm/Stored: {:?}",
+        report.reactivations
+    );
 }

@@ -500,8 +500,7 @@ async fn max_selected_items_hint_caps_the_working_set() {
             budget_tokens: 8192,
             hints: ContextHints {
                 max_selected_items: Some(2),
-                anchor_roots: Vec::new(),
-                task: None,
+                ..Default::default()
             },
         })
         .await
@@ -752,7 +751,7 @@ async fn closed_tool_scopes_are_not_candidates_but_hot_entities_still_reach_them
                 summary: "ok".into(),
                 model_content: "touched AuthService.rs".into(),
                 artifact_ref: None,
-                metadata: serde_json::Value::Null,
+                metadata: serde_json::json!({"path": "AuthService.rs"}),
             },
             scope_id: Some(tool_scope),
         })

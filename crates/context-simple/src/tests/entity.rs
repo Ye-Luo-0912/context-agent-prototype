@@ -24,7 +24,8 @@ async fn hot_entities_follow_user_then_tool_then_reset() {
         );
     }
 
-    // A tool observation touching a new file extends it (newest first).
+    // A structured resource touch extends tool-hot (newest first). Stdout
+    // in model_content must not.
     engine
         .ingest(ContextIngress::ToolObservation {
             output: ToolOutput {
@@ -34,7 +35,7 @@ async fn hot_entities_follow_user_then_tool_then_reset() {
                 summary: "read".into(),
                 model_content: "CacheStore.rs is hot now".into(),
                 artifact_ref: None,
-                metadata: serde_json::Value::Null,
+                metadata: serde_json::json!({"path": "src/CacheStore.rs"}),
             },
             scope_id: None,
         })
@@ -44,13 +45,13 @@ async fn hot_entities_follow_user_then_tool_then_reset() {
         let state = engine.state.lock().await;
         assert_eq!(
             state.hot_entities.first().map(String::as_str),
-            Some("CacheStore.rs"),
-            "most recently touched entity must lead"
+            Some("src/CacheStore.rs"),
+            "most recently touched resource must lead"
         );
         assert!(state.hot_entities.contains(&"AuthService.rs".to_string()));
     }
 
-    // The next user message resets the hot set.
+    // The next user message replaces user-hot; tool-hot survives until TTL.
     engine
         .ingest(ContextIngress::UserMessage {
             content: "unrelated plain words".into(),
@@ -60,8 +61,30 @@ async fn hot_entities_follow_user_then_tool_then_reset() {
     {
         let state = engine.state.lock().await;
         assert!(
+            state
+                .hot_entities
+                .contains(&"src/CacheStore.rs".to_string()),
+            "tool-hot must survive the next user turn (ttl=2): {:?}",
+            state.hot_entities
+        );
+        assert!(
+            !state.hot_entities.contains(&"AuthService.rs".to_string()),
+            "user-hot must reset on a new user message"
+        );
+    }
+
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "still unrelated".into(),
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(
             state.hot_entities.is_empty(),
-            "a new user message must reset the hot set"
+            "tool-hot expires after its ttl: {:?}",
+            state.hot_entities
         );
     }
 }
@@ -131,7 +154,7 @@ async fn ingest_links_items_sharing_entities() {
                 summary: "ok".into(),
                 model_content: "tests passed in AuthService.rs".into(),
                 artifact_ref: None,
-                metadata: serde_json::Value::Null,
+                metadata: serde_json::json!({"path": "AuthService.rs"}),
             },
             scope_id: None,
         })
@@ -736,4 +759,573 @@ async fn derived_from_does_not_reexpand_compacted_sources() {
         !snapshot.items.iter().any(|item| item.item_id == dep_id),
         "compaction sources must not re-enter through DerivedFrom"
     );
+}
+
+fn fs_read(call_id: &str, path: &str) -> ToolOutput {
+    ToolOutput {
+        call_id: call_id.into(),
+        tool_name: "fs.read".into(),
+        ok: true,
+        summary: "read".into(),
+        model_content: "     1 | fn body() {}".into(),
+        artifact_ref: None,
+        metadata: serde_json::json!({"path": path}),
+    }
+}
+
+#[tokio::test]
+async fn shell_stdout_does_not_heat_entities() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "run tests".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "1".into(),
+                tool_name: "shell.exec".into(),
+                ok: true,
+                summary: "ok".into(),
+                model_content: "compiled AuthService.rs and CacheStore.rs".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({}),
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    let state = engine.state.lock().await;
+    assert!(
+        !state.hot_entities.iter().any(|e| e.contains("AuthService")),
+        "stdout must not seed tool-hot: {:?}",
+        state.hot_entities
+    );
+    let observation = state
+        .items
+        .iter()
+        .find(|item| item.kind == ContextKind::ToolObservation)
+        .expect("observation");
+    assert!(
+        observation.entities.is_empty(),
+        "pathless stdout must not become the observation's entity signature: {:?}",
+        observation.entities
+    );
+}
+
+#[tokio::test]
+async fn stamped_shell_path_does_not_supersede_prior_shell_observation() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "touch AuthService.rs".into(),
+        })
+        .await
+        .unwrap();
+    for (id, body) in [("1", "first shell log"), ("2", "second shell log")] {
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                output: ToolOutput {
+                    call_id: id.into(),
+                    tool_name: "shell.exec".into(),
+                    ok: true,
+                    summary: "ok".into(),
+                    model_content: body.into(),
+                    artifact_ref: None,
+                    metadata: serde_json::json!({ "path": "AuthService.rs" }),
+                },
+                scope_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    engine
+        .maintain(agent_contracts::ContextMaintenanceTrigger::AfterModel)
+        .await
+        .unwrap();
+    let state = engine.state.lock().await;
+    let tools: Vec<_> = state
+        .items
+        .iter()
+        .filter(|item| item.kind == ContextKind::ToolObservation)
+        .collect();
+    assert_eq!(tools.len(), 2, "both shell observations stay in the heap");
+    assert!(
+        tools.iter().all(|item| item.semantic.is_live()),
+        "a stamped path is identity, not a file-body supersession: {:?}",
+        tools.iter().map(|item| &item.semantic).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn patch_files_array_stamps_all_paths_into_identity() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "apply the split".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: ToolOutput {
+                call_id: "patch-1".into(),
+                tool_name: "edit.patch".into(),
+                ok: true,
+                summary: "applied".into(),
+                model_content: "patch applied: 2 file(s)".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({
+                    "files": [
+                        {"path": "src/auth.rs", "revision": "aa"},
+                        {"path": "src/billing.rs", "revision": "bb"}
+                    ]
+                }),
+            },
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    let state = engine.state.lock().await;
+    assert!(
+        state.hot_entities.iter().any(|e| e == "src/auth.rs")
+            && state.hot_entities.iter().any(|e| e == "src/billing.rs"),
+        "multi-file patch must heat every stamped path: {:?}",
+        state.hot_entities
+    );
+    let observation = state
+        .items
+        .iter()
+        .find(|item| item.kind == ContextKind::ToolObservation)
+        .expect("observation");
+    assert_eq!(observation.file_path.as_deref(), Some("src/auth.rs"));
+    assert!(
+        observation.entities.iter().any(|e| e == "src/auth.rs")
+            && observation.entities.iter().any(|e| e == "src/billing.rs"),
+        "identity is every stamped path, not stdout: {:?}",
+        observation.entities
+    );
+}
+
+#[tokio::test]
+async fn working_set_prose_does_not_heat_entities() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "start".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::WorkingSetSignal {
+            resources: Vec::new(),
+            content: "discovered AuthService.rs and CacheStore.rs".into(),
+        })
+        .await
+        .unwrap();
+    let state = engine.state.lock().await;
+    assert!(
+        state.hot_entities.is_empty(),
+        "legacy WorkingSetSignal content must not heat: {:?}",
+        state.hot_entities
+    );
+}
+
+#[tokio::test]
+async fn fs_read_reread_classes_and_selected_attribution() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    super::harness::open_focus(&engine, "fix files").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "inspect src/a.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: fs_read("1", "src/a.rs"),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(state.reread_first_read, 1);
+        assert_eq!(state.reread_resident_unselected, 0);
+    }
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: fs_read("2", "src/a.rs"),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(state.reread_resident_unselected, 1);
+        assert_eq!(state.reread_previously_selected, 0);
+    }
+    let snapshot = engine
+        .materialize(ContextQuery {
+            current_input: "inspect src/a.rs".into(),
+            budget_tokens: 10_000,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        snapshot
+            .selected
+            .iter()
+            .any(|sel| sel.kind == Some(ContextKind::ToolObservation)
+                && sel.source.as_deref() == Some("tool:fs.read")),
+        "selected tokens must carry kind/source: {:?}",
+        snapshot.selected
+    );
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: fs_read("3", "src/a.rs"),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(
+            state.reread_previously_selected, 1,
+            "a selected file body reread is previously-selected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fs_read_reread_warm_and_stored() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    super::harness::open_focus(&engine, "fix files").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "inspect src/warm.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: fs_read("1", "src/warm.rs"),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    {
+        let mut state = engine.state.lock().await;
+        let mut items = state.items.take_all();
+        let Some(pos) = items
+            .iter()
+            .position(|item| item.file_path.as_deref() == Some("src/warm.rs"))
+        else {
+            panic!("the read must be resident");
+        };
+        let item = items.remove(pos);
+        state.items.replace_all(items);
+        state.eviction_buffer.push(item);
+    }
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: fs_read("2", "src/warm.rs"),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(state.reread_warm, 1);
+    }
+
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: fs_read("3", "src/stored.rs"),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    {
+        let mut state = engine.state.lock().await;
+        let mut items = state.items.take_all();
+        let Some(pos) = items
+            .iter()
+            .position(|item| item.file_path.as_deref() == Some("src/stored.rs"))
+        else {
+            panic!("the stored-path read must be resident");
+        };
+        let item = items.remove(pos);
+        state.items.replace_all(items);
+        let entry = crate::store::to_external_entry(
+            &item,
+            agent_contracts::ContextRef {
+                uri: format!("context://run/{}", item.id),
+                item_id: item.id,
+                kind: item.kind,
+                scope: item.scope,
+                summary: "stored".into(),
+                created_tick: item.created_tick,
+            },
+            0,
+            0,
+            None,
+        );
+        state.external.push(entry);
+    }
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: fs_read("4", "src/stored.rs"),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    let state = engine.state.lock().await;
+    assert_eq!(state.reread_stored, 1);
+}
+
+#[tokio::test]
+async fn recent_file_bodies_cap_and_one_round_lease() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        recent_file_bodies: 1,
+        recent_file_body_lease_turns: 1,
+        ..SimpleContextConfig::default()
+    });
+    super::harness::open_focus(&engine, "fix files").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "read files".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: fs_read("1", "src/old.rs"),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: fs_read("2", "src/new.rs"),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    let new_id;
+    let old_id;
+    {
+        let state = engine.state.lock().await;
+        old_id = state
+            .items
+            .iter()
+            .find(|item| item.file_path.as_deref() == Some("src/old.rs"))
+            .map(|item| item.id)
+            .expect("old body");
+        new_id = state
+            .items
+            .iter()
+            .find(|item| item.file_path.as_deref() == Some("src/new.rs"))
+            .map(|item| item.id)
+            .expect("new body");
+        let latest = state.latest_file_body_ids();
+        assert!(latest.contains(&new_id), "cap=1 keeps the newest body");
+        assert!(
+            !latest.contains(&old_id),
+            "cap=1 drops the older path: {latest:?}"
+        );
+    }
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "next turn".into(),
+        })
+        .await
+        .unwrap();
+    let state = engine.state.lock().await;
+    assert!(
+        state.latest_file_body_ids().is_empty(),
+        "one-round lease expires at the next user turn"
+    );
+}
+
+#[tokio::test]
+async fn checked_file_body_is_priced_as_a_descriptor() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        dependency_expansion: false,
+        ..SimpleContextConfig::default()
+    });
+    let (body_id, heap_body) = {
+        let mut state = engine.state.lock().await;
+        let mut body = crate::item::make_item(
+            &state,
+            &engine.config,
+            "x".repeat(4_000),
+            ContextKind::ToolObservation,
+            ContextScope::Session,
+            ContextRetention::Working,
+            0.58,
+            Some("tool:fs.read".into()),
+        );
+        body.scope_id = None;
+        body.file_path = Some("src/big.rs".into());
+        body.file_revision = Some("aaa".into());
+        let mut note = crate::item::make_item(
+            &state,
+            &engine.config,
+            "keep this Constraint about the public API".into(),
+            ContextKind::Constraint,
+            ContextScope::Session,
+            ContextRetention::Working,
+            0.9,
+            None,
+        );
+        note.scope_id = None;
+        let id = body.id;
+        let heap_body = body.content.clone();
+        state.items.push(body);
+        state.items.push(note);
+        (id, heap_body)
+    };
+    let without = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 200,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !without.items.iter().any(|item| item.item_id == body_id),
+        "full file body must not fit a 200-token budget"
+    );
+    assert!(
+        without
+            .items
+            .iter()
+            .any(|item| item.kind == ContextKind::Constraint),
+        "the small constraint must still fit"
+    );
+
+    let with = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 200,
+            hints: ContextHints {
+                checked_files: vec!["src/big.rs@aaa".into()],
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let selected = with
+        .items
+        .iter()
+        .find(|item| item.item_id == body_id)
+        .expect("descriptor-priced file body must fit");
+    assert_eq!(selected.content, "src/big.rs@aaa");
+    assert!(
+        with.items
+            .iter()
+            .any(|item| item.kind == ContextKind::Constraint),
+        "descriptor pricing must leave room for the constraint"
+    );
+    assert!(
+        with.selected
+            .iter()
+            .any(|sel| sel.item_id == body_id && sel.reason.contains("path already checked")),
+        "reason must say the body was omitted: {:?}",
+        with.selected
+    );
+    let state = engine.state.lock().await;
+    let heap = state
+        .items
+        .iter()
+        .find(|item| item.id == body_id)
+        .expect("heap row");
+    assert_eq!(heap.content, heap_body, "heap body stays intact");
+}
+
+#[tokio::test]
+async fn checked_stamped_shell_is_priced_as_a_descriptor() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        dependency_expansion: false,
+        ..SimpleContextConfig::default()
+    });
+    let (log_id, heap_body) = {
+        let mut state = engine.state.lock().await;
+        let mut log = crate::item::make_item(
+            &state,
+            &engine.config,
+            "x".repeat(4_000),
+            ContextKind::ToolObservation,
+            ContextScope::Session,
+            ContextRetention::Working,
+            0.58,
+            Some("tool:shell.exec".into()),
+        );
+        log.scope_id = None;
+        log.file_path = Some("src/big.rs".into());
+        log.file_revision = Some("aaa".into());
+        let mut note = crate::item::make_item(
+            &state,
+            &engine.config,
+            "keep this Constraint about the public API".into(),
+            ContextKind::Constraint,
+            ContextScope::Session,
+            ContextRetention::Working,
+            0.9,
+            None,
+        );
+        note.scope_id = None;
+        let id = log.id;
+        let heap_body = log.content.clone();
+        state.items.push(log);
+        state.items.push(note);
+        (id, heap_body)
+    };
+    let without = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 200,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !without.items.iter().any(|item| item.item_id == log_id),
+        "full identity-log stdout must not fit a 200-token budget"
+    );
+    let with = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 200,
+            hints: ContextHints {
+                checked_files: vec!["src/big.rs@aaa".into()],
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let selected = with
+        .items
+        .iter()
+        .find(|item| item.item_id == log_id)
+        .expect("descriptor-priced identity log must fit");
+    assert_eq!(selected.content, "src/big.rs@aaa");
+    assert!(
+        with.items
+            .iter()
+            .any(|item| item.kind == ContextKind::Constraint),
+        "descriptor pricing must leave room for the constraint"
+    );
+    let state = engine.state.lock().await;
+    let heap = state
+        .items
+        .iter()
+        .find(|item| item.id == log_id)
+        .expect("heap row");
+    assert_eq!(heap.content, heap_body, "heap body stays intact");
 }

@@ -497,6 +497,11 @@ mod tests {
             panic!("edit.patch must prepare a committed effect");
         };
         assert!(output.ok);
+        assert!(
+            output.heats_working_set(),
+            "patch files[] must be trusted ResourceTouches"
+        );
+        assert_eq!(output.metadata["files"][0]["path"], "lib.rs");
         assert_eq!(output.metadata["files"][0]["hunks"], 2);
         assert!(
             matches!(

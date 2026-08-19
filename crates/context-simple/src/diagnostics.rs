@@ -20,6 +20,7 @@ pub(crate) fn compute(state: &State) -> ContextDiagnostics {
             .saturating_add(state.eviction_buffer.len())
             .saturating_add(state.external.len()),
         focus_generation: state.focus.as_ref().map_or(0, |f| f.generation),
+        focus_task_id: state.focus.as_ref().map(|f| f.task_id),
         turn: state.turn,
         event_seq: state.event_seq,
         tool_round: state.tool_round,
@@ -52,6 +53,11 @@ pub(crate) fn compute(state: &State) -> ContextDiagnostics {
         reactivation_file_observation_consumed: state.reactivation_file_observation_consumed,
         compaction_input_tokens: state.compaction_input_tokens,
         compaction_output_tokens: state.compaction_output_tokens,
+        reread_previously_selected: state.reread_previously_selected,
+        reread_resident_unselected: state.reread_resident_unselected,
+        reread_warm: state.reread_warm,
+        reread_stored: state.reread_stored,
+        reread_first_read: state.reread_first_read,
         ..ContextDiagnostics::default()
     };
 

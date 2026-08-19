@@ -317,6 +317,7 @@ impl ContextEngine for RollingSummaryEngine {
                 approx_tokens: approx_tokens(&summary.content),
                 reason: "rolling summary (baseline B)".into(),
                 breakdown: ScoreBreakdown::default(),
+                ..Default::default()
             });
         }
         selected.extend(
@@ -330,6 +331,7 @@ impl ContextEngine for RollingSummaryEngine {
                     approx_tokens: approx_tokens(&record.content),
                     reason: "append + rolling summary baseline: prior history".into(),
                     breakdown: ScoreBreakdown::default(),
+                    ..Default::default()
                 }),
         );
         Ok(MaterializedContext {

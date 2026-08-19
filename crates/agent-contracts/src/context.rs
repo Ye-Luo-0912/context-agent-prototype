@@ -21,6 +21,72 @@ pub enum ContextKind {
     Note,
 }
 
+impl ContextKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Goal => "goal",
+            Self::Constraint => "constraint",
+            Self::Decision => "decision",
+            Self::UserMessage => "user_message",
+            Self::AssistantMessage => "assistant_message",
+            Self::ToolObservation => "tool_observation",
+            Self::FileObservation => "file_observation",
+            Self::Error => "error",
+            Self::Summary => "summary",
+            Self::Note => "note",
+        }
+    }
+}
+
+/// Cap on structured resource touches in one `WorkingSetSignal`.
+pub const MAX_RESOURCE_TOUCHES: usize = 8;
+/// Cap on a single resource path (UTF-8 chars) after slash-normalization.
+pub const MAX_RESOURCE_PATH_CHARS: usize = 256;
+
+/// A trusted, path-shaped resource the runtime observed. Heating and
+/// residency hints consume this, never raw tool stdout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceTouch {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+}
+
+/// Slash-normalize a workspace path for identity (`\` → `/`, trim, strip
+/// a leading `./`, then cap length). Empty after trim is empty.
+pub fn normalize_resource_path(path: &str) -> String {
+    let trimmed = path.trim().replace('\\', "/");
+    let stripped = trimmed
+        .strip_prefix("./")
+        .unwrap_or(trimmed.as_str())
+        .trim_start_matches('/');
+    stripped.chars().take(MAX_RESOURCE_PATH_CHARS).collect()
+}
+
+/// Why this `fs.read` happened, given the engine's current catalog.
+/// Mutually exclusive; classified against current residency, not history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FsRereadClass {
+    PreviouslySelected,
+    ResidentUnselected,
+    Warm,
+    Stored,
+    FirstRead,
+}
+
+impl FsRereadClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreviouslySelected => "previously-selected",
+            Self::ResidentUnselected => "resident-unselected",
+            Self::Warm => "warm",
+            Self::Stored => "stored",
+            Self::FirstRead => "first-read",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ContextScope {
     Message,
@@ -517,13 +583,15 @@ pub enum ContextIngress {
         #[serde(default)]
         scope_id: Option<ScopeId>,
     },
-    /// A lightweight, bounded mid-turn working-set signal from the runtime:
-    /// a *successful* tool observation named entities the next model round
-    /// should treat as hot, before the body is persisted at turn end. Failed
-    /// execution results stay on the TurnFrame and must not extend
-    /// `hot_entities`. No item is created — the signal only extends the hot
-    /// set so Warm/Cold evidence can be recalled without duplicating the body.
+    /// A lightweight, bounded mid-turn working-set signal from the runtime.
+    /// Heating consumes `resources` (trusted path@revision touches) only.
+    /// `content` is a legacy prose field: old JSON still deserializes, but
+    /// engines must not extract hot entities from it. No item is created.
     WorkingSetSignal {
+        #[serde(default)]
+        resources: Vec<ResourceTouch>,
+        /// Legacy prose. Ignored for heating.
+        #[serde(default)]
         content: String,
     },
     /// A structured context directive from a tool's output (gc hint, tag,
@@ -600,6 +668,11 @@ pub enum ContextAction {
     /// ever owning task authority. Not per-claim add/remove: the anchor is
     /// CAS authority, and this is a bounded replacement of its projection.
     AnchorRoots { roots: Vec<AnchorRootClaim> },
+    /// Replace the TaskProgress checked-file projection (`path` /
+    /// `path@revision` rows). The runtime pushes this before a GC pass so
+    /// file-body auto-reactivation can skip paths the operational cache
+    /// already names. Not a model-facing `context.manage` op; not P3.
+    CheckedFiles { files: Vec<String> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -642,12 +715,23 @@ pub struct ContextHints {
     /// ignore it.
     #[serde(default)]
     pub task: Option<TaskAnchorView>,
+    /// Checked `path` / `path@revision` rows from the runtime TaskProgress
+    /// projection. Engines may price historical file-body items as
+    /// descriptors when a row covers the path. They must not copy this
+    /// onto `MaterializedContext` for prompt rendering.
+    #[serde(default)]
+    pub checked_files: Vec<String>,
 }
 
 /// Hard cap on the anchor-root projection the runtime pushes into one
 /// materialization or GC pass. The model cannot grow the root set without
 /// bound through anchor patches.
 pub const MAX_ANCHOR_ROOT_CLAIMS: usize = 64;
+
+/// Hard cap on the checked-file projection the runtime pushes into one
+/// GC pass. Matches the ResumePoint file cache; extra rows are dropped
+/// from the front (oldest) so the engine never sees an unbounded set.
+pub const MAX_CHECKED_FILE_HINTS: usize = 32;
 
 /// Bounded prompt projection of a `TaskAnchor`. Raw refs and bodies stay
 /// out: the assembler renders this contract in the focus frame, while
@@ -677,30 +761,51 @@ impl TaskAnchorView {
 }
 
 /// Bounded prompt projection of a `ResumePoint`. Operational cache only:
-/// checked resources, verification facts, failed operations. Goal/blockers/
-/// next-actions belong to `TaskAnchor` and are not independent writable
-/// state. Bodies stay in storage.
+/// checked resources, revision-bound verification facts, failed operations.
+/// Goal/blockers/next-actions belong to `TaskAnchor`. Bodies stay in storage.
+/// Prompt projection is hard-capped by [`MAX_TASK_PROGRESS_PROMPT_CHARS`].
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct TaskProgressView {
     pub anchor_revision: u64,
-    pub objective: String,
-    pub blockers: Vec<String>,
-    pub next_actions: Vec<String>,
+    #[serde(default)]
+    pub workspace_revision: u64,
     pub checked_files: Vec<String>,
     pub verifications: Vec<String>,
     pub failed_commands: Vec<String>,
 }
 
+/// Hard cap on the assembled TASK PROGRESS prompt block. List-length caps
+/// on ResumePoint are not enough: 32 × 200-char rows still overflow.
+pub const MAX_TASK_PROGRESS_PROMPT_CHARS: usize = 2_048;
+
 impl TaskProgressView {
     pub fn is_empty(&self) -> bool {
-        self.objective.is_empty()
-            && self.blockers.is_empty()
-            && self.next_actions.is_empty()
-            && self.checked_files.is_empty()
+        self.checked_files.is_empty()
             && self.verifications.is_empty()
             && self.failed_commands.is_empty()
     }
+
+    /// Whether `Checked` already names this workspace path (`path` or
+    /// `path@revision`). Slash-normalized; a prefix cousin (`src/a.rs.bak`)
+    /// is not a hit.
+    pub fn covers_path(&self, path: &str) -> bool {
+        checked_files_cover_path(&self.checked_files, path)
+    }
+}
+
+/// Whether a TaskProgress `Checked` row already names `path` (`path` or
+/// `path@revision`). Shared by the assembler and engine packing.
+pub fn checked_files_cover_path(checked_files: &[String], path: &str) -> bool {
+    let path = crate::normalize_resource_path(path);
+    if path.is_empty() {
+        return false;
+    }
+    let prefix = format!("{path}@");
+    checked_files.iter().any(|row| {
+        let row = crate::normalize_resource_path(row);
+        row == path || row.starts_with(&prefix)
+    })
 }
 
 /// Why a record is a root. Independent of `AnchorRootStrength` (how strongly
@@ -880,13 +985,13 @@ pub struct ScoreBreakdown {
     pub scope_bonus: f32,
     pub retention_bonus: f32,
     /// Reward for an item whose entities are hot in the current working
-    /// set (user message + recent tool observations).
+    /// set (user message + recent structured resource touches).
     #[serde(default)]
     pub entity_affinity: f32,
     pub total: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ContextSelection {
     pub item_id: ContextItemId,
     pub score: f32,
@@ -894,6 +999,15 @@ pub struct ContextSelection {
     pub reason: String,
     #[serde(default)]
     pub breakdown: ScoreBreakdown,
+    /// Structured kind of the selected item. Measurement only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ContextKind>,
+    /// Producer / source stamp (`user`, `tool:fs.read`, …). Measurement only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// True when this id has a reactivation trace this engine segment.
+    #[serde(default)]
+    pub reactivated: bool,
 }
 
 /// A single observed lifecycle state transition produced by one maintenance pass.
@@ -962,6 +1076,11 @@ pub struct ContextDiagnostics {
     pub tombstoned_items: usize,
     pub approx_active_tokens: usize,
     pub focus_generation: u64,
+    /// Engine-owned focused task. Used for restore alignment. Production
+    /// engines leave `MaterializedContext.focus` empty; this is the
+    /// implementation-agnostic read of engine focus authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_task_id: Option<TaskId>,
     #[serde(default)]
     pub turn: u64,
     /// Monotonic event-sequence clock: advances on every state-changing
@@ -1032,10 +1151,13 @@ pub struct ContextDiagnostics {
     pub reactivation_selected_tokens: u64,
     #[serde(default)]
     pub reactivation_consumed_tokens: u64,
-    /// Reactivation *events* (a later GC pass on the same id counts again).
+    /// Engine-local reactivation *events* this segment (a later GC pass on
+    /// the same id counts again). Zeroed on restore; eval sums `ContextGc`
+    /// events for the run-global count.
     #[serde(default)]
     pub reactivation_events: u64,
-    /// Distinct ids that entered a reactivation trace this run.
+    /// Distinct ids that entered a reactivation trace this engine segment.
+    /// Zeroed on restore; eval unions `ContextGc` reactivation ids.
     #[serde(default)]
     pub unique_reactivated: u64,
     #[serde(default)]
@@ -1054,6 +1176,19 @@ pub struct ContextDiagnostics {
     /// 有界压缩器累计的 provider 输出 token。
     #[serde(default)]
     pub compaction_output_tokens: u64,
+    /// Cumulative `fs.read` classifications this engine segment.
+    /// `warm` + `stored` approximate GC-caused rereads; `previously-selected`
+    /// approximates prompt-ignored rereads.
+    #[serde(default)]
+    pub reread_previously_selected: u64,
+    #[serde(default)]
+    pub reread_resident_unselected: u64,
+    #[serde(default)]
+    pub reread_warm: u64,
+    #[serde(default)]
+    pub reread_stored: u64,
+    #[serde(default)]
+    pub reread_first_read: u64,
 }
 
 /// One structured entry of the materialized working set. The engine returns
@@ -1078,6 +1213,10 @@ pub struct MaterializedItem {
     /// 选中条目若是文件正文观察，装配器用它标路径，不从 content 猜。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_path: Option<String>,
+    /// Stamped content revision for `file_path`. Prompt identity is
+    /// `path@revision`; the assembler must not parse it out of `content`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_revision: Option<String>,
 }
 
 /// Missing `retention` on old wire/checkpoint data means a normal working

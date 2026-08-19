@@ -1,14 +1,18 @@
 use std::collections::HashSet;
 
 use agent_contracts::{
-    AttentionState, ContextEviction, ContextGcReport, ContextItem, ContextItemId,
-    ContextReactivation, ContextRef, ContextResidency, ContextRetention, ContextScope,
-    DependencyEdge, FocusState, LifecycleAxis, ScopeId, ScopeKind, ScopeState, TaskId,
+    AttentionState, ContextEviction, ContextGcReport, ContextItem, ContextItemId, ContextKind,
+    ContextReactivation, ContextRef, ContextResidency, ContextRetention, ContextScope, CoreLabel,
+    DependencyEdge, FocusState, Label, LifecycleAxis, ScopeId, ScopeKind, ScopeState, TaskId,
+    checked_files_cover_path,
 };
 
 use crate::diagnostics;
 use crate::engine::{SimpleContextConfig, State};
-use crate::index::entity::entities_match;
+use crate::index::entity::{
+    entities_match_exact, is_file_body_entry, is_file_body_observation, observation_file_path,
+    observation_file_path_entry,
+};
 use crate::policy::score_item_with_breakdown;
 use crate::store;
 
@@ -138,7 +142,7 @@ pub(crate) fn plan_full_gc(
         .filter(|item| {
             !task_completed(state, item.task_id)
                 && !hot_entities.is_empty()
-                && entities_match(&item.entities, &hot_entities)
+                && entities_match_exact(&item.entities, &hot_entities)
         })
         .map(|item| item.id)
         .collect();
@@ -563,7 +567,7 @@ fn mark_roots(
         // after completion.
         let hot = !task_completed(state, item.task_id)
             && !hot_entities.is_empty()
-            && entities_match(&item.entities, hot_entities);
+            && entities_match_exact(&item.entities, hot_entities);
         // Model/operator-directed protection (`context.gc_hint` /
         // `context.lease`): the model asked for this item to stay, so GC
         // treats it as a root until the hint is cleared or the lease runs
@@ -870,7 +874,8 @@ fn reactivate(
             claim.strength.requires_residency()
                 && crate::engine::anchor_claim_matches_item(claim, item)
         });
-        let hot_now = !hot_entities.is_empty() && entities_match(&item.entities, &hot_entities);
+        let hot_now =
+            !hot_entities.is_empty() && entities_match_exact(&item.entities, &hot_entities);
         if !anchor_rooted && aged_ordinary_dialogue(item, config, state.turn, hot_now) {
             continue;
         }
@@ -888,6 +893,7 @@ fn reactivate(
                 },
                 live_root_dep,
                 anchor_rooted,
+                checked_files: &state.checked_files,
             },
         ) else {
             continue;
@@ -1005,8 +1011,18 @@ fn reactivate(
                     if entry.semantic.is_live()
                         && store::recallable(entry)
                         && !task_completed(state, entry.task_id)
-                        && entities_match(&entry.entities, &hot_entities)
+                        && entities_match_exact(&entry.entities, &hot_entities)
                     {
+                        if skip_raw_evidence_reactivation(
+                            config,
+                            entry.kind,
+                            &entry.tags,
+                            is_file_body_entry(entry),
+                            observation_file_path_entry(entry),
+                            &state.checked_files,
+                        ) {
+                            continue;
+                        }
                         plan.recall_candidates.push(*id);
                         remaining -= 1;
                     }
@@ -1023,8 +1039,18 @@ fn reactivate(
                     if entry.semantic.is_live()
                         && store::recallable(entry)
                         && !task_completed(state, entry.task_id)
-                        && entities_match(&entry.entities, &hot_entities)
+                        && entities_match_exact(&entry.entities, &hot_entities)
                     {
+                        if skip_raw_evidence_reactivation(
+                            config,
+                            entry.kind,
+                            &entry.tags,
+                            is_file_body_entry(entry),
+                            observation_file_path_entry(entry),
+                            &state.checked_files,
+                        ) {
+                            continue;
+                        }
                         plan.recall_candidates.push(entry.item_id);
                         remaining -= 1;
                     }
@@ -1032,6 +1058,49 @@ fn reactivate(
             }
         }
     }
+}
+
+fn skip_raw_evidence_reactivation(
+    config: &SimpleContextConfig,
+    kind: ContextKind,
+    tags: &[Label],
+    file_body: bool,
+    path: Option<&str>,
+    checked_files: &[String],
+) -> bool {
+    if keep_semantic_body_reactivation(kind, tags) {
+        return false;
+    }
+    match kind {
+        ContextKind::ToolObservation => {
+            // Stamped-path shell/process is identity, not a file body.
+            if !file_body {
+                return true;
+            }
+            if config.descriptor_only_tool_observation_reactivation {
+                return true;
+            }
+            // Production C: TaskProgress already names the path, so the
+            // historical body stays Warm/Stored until Fetch/Admit. Unchecked
+            // file bodies still hot-reactivate. This is not P3.
+            path.is_some_and(|path| checked_files_cover_path(checked_files, path))
+        }
+        ContextKind::FileObservation => {
+            path.is_some_and(|path| checked_files_cover_path(checked_files, path))
+        }
+        _ => false,
+    }
+}
+
+fn keep_semantic_body_reactivation(kind: ContextKind, tags: &[Label]) -> bool {
+    matches!(
+        kind,
+        ContextKind::Decision | ContextKind::Constraint | ContextKind::Error
+    ) || tags.iter().any(|tag| {
+        tag.is_core(CoreLabel::Decision)
+            || tag.is_core(CoreLabel::Constraint)
+            || tag.is_core(CoreLabel::OpenLoop)
+    })
 }
 
 /// Whether the item's task has completed: its Task scope is closed. A
@@ -1073,6 +1142,8 @@ struct ReactivationInput<'a> {
     /// The item is targeted by a ResidentRequired/PromptRequired anchor
     /// root claim — task authority says it must be resident.
     anchor_rooted: bool,
+    /// TaskProgress checked paths; covered file bodies stay Warm/Stored.
+    checked_files: &'a [String],
 }
 
 /// Why an evicted item earns a second chance. `None` keeps it in the buffer.
@@ -1110,7 +1181,17 @@ fn reactivation_reason(item: &ContextItem, input: &ReactivationInput) -> Option<
     {
         return Some(format!("leased by the model until turn {until}"));
     }
-    if !input.hot_entities.is_empty() && entities_match(&item.entities, input.hot_entities) {
+    if skip_raw_evidence_reactivation(
+        input.config,
+        item.kind,
+        &item.tags,
+        is_file_body_observation(item),
+        observation_file_path(item),
+        input.checked_files,
+    ) {
+        return None;
+    }
+    if !input.hot_entities.is_empty() && entities_match_exact(&item.entities, input.hot_entities) {
         if input.guard.completed_task {
             // Automatic recall of a completed task's record is forbidden
             // without a new explicit reason: the hot set alone is

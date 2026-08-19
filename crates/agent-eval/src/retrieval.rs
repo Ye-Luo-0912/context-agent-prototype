@@ -57,6 +57,8 @@ pub fn render_retrieval(report: &RetrievalReport) -> String {
 
 /// 写入独特事实，迫使缓冲溢出外置，再按 needle 搜索。
 /// 召回按 GC 报告的 `externalized_ids` 计，不按 needle 条数计。
+/// ToolObservation 的检索面是 identity（stamped `path@rev`），不是 stdout；
+/// 基线把 needle 挂在 `metadata.path` 上，Fetch 仍读回正文。
 pub async fn run_retrieval_baseline() -> anyhow::Result<RetrievalReport> {
     let dir = tempfile::tempdir()?;
     // 配方对齐 `fetch_external_recovers_the_exact_original_content`：
@@ -96,7 +98,10 @@ pub async fn run_retrieval_baseline() -> anyhow::Result<RetrievalReport> {
                     summary: "ok".into(),
                     model_content: format!("step {index}: {needle}"),
                     artifact_ref: None,
-                    metadata: serde_json::Value::Null,
+                    metadata: serde_json::json!({
+                        "path": needle,
+                        "revision": format!("rev-{index}"),
+                    }),
                 },
                 scope_id: None,
             })
@@ -121,7 +126,7 @@ pub async fn run_retrieval_baseline() -> anyhow::Result<RetrievalReport> {
     let mut recovered_ids = std::collections::HashSet::new();
     for needle in needles {
         let started = Instant::now();
-        // 不按 kind 过滤：与现有 fetch 回归同一条残差/实体检索路径。
+        // 不按 kind 过滤：命中 stamped path / identity 卡，不扫 stdout。
         let hits = engine
             .search_external(ContextSearchQuery::new(needle, 8))
             .await?;

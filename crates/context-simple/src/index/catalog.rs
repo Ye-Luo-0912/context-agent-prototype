@@ -257,7 +257,7 @@ impl ContextCatalog {
     ///
     /// `Some(ids)` means the catalog indexes bounded the set. `None` means
     /// the free-text needle did not hit an entity/label key and no filter
-    /// was set, so the caller must residual-scan summaries/uris/bodies.
+    /// was set, so the caller must residual-scan summaries/uris.
     pub(crate) fn search_ids(&self, query: &ContextSearchQuery) -> Option<Vec<ContextItemId>> {
         let mut candidates: Option<HashSet<ContextItemId>> = None;
         let mut intersect = |bucket: &[ContextItemId]| {

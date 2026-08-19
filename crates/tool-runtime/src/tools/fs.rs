@@ -428,7 +428,11 @@ impl FsWriteTool {
             summary: format!("wrote {} bytes to {}", args.content.len(), relative),
             model_content: format!("file updated: {relative}"),
             artifact_ref: None,
-            metadata: json!({"bytes": args.content.len()}),
+            metadata: json!({
+                "path": relative,
+                "bytes": args.content.len(),
+                "revision": content_digest(args.content.as_bytes()),
+            }),
         };
         Ok(ToolOutcome::PreparedEffect { output, effect })
     }
@@ -511,6 +515,13 @@ mod tests {
             panic!("fs.write must prepare a committed effect");
         };
         assert!(output.ok);
+        assert!(output.heats_working_set());
+        assert_eq!(output.metadata["path"], "notes.txt");
+        assert_eq!(
+            output.metadata["revision"].as_str().unwrap().len(),
+            64,
+            "write stamps a content revision"
+        );
         assert!(
             matches!(
                 effect.commit().await,

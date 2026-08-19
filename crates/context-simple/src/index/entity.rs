@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use agent_contracts::{ContextItem, ContextItemId, ContextKind, TaskId};
+use agent_contracts::{ContextItem, ContextItemId, ContextKind, ExternalizedContext, TaskId};
 
 /// Cap for the hot-entity set, matching `extract_entities`'s per-text cap.
 pub(crate) const MAX_HOT_ENTITIES: usize = 24;
@@ -12,12 +12,14 @@ pub(crate) const MAX_RECENT_FILE_BODIES: usize = 8;
 /// Entity extraction shared across the crate (hot-set maintenance, dependency
 /// linking, supersession, scoring). "Entity" is a cheap, explicit signature: a
 /// whitespace-separated token of length >= 3 that carries a path/name/case
-/// marker (`.`, `/`, `::`, `_` or an uppercase letter). Sorted,
+/// marker (`.`, `/`, `::`, `_` or an uppercase letter). Surrounding
+/// punctuation (including `?` / `!`) is stripped so a user question about
+/// `AuthService.rs` still exact-matches the observation entity. Sorted,
 /// deduplicated, bounded to 24 per text.
 pub(crate) fn extract_entities(text: &str) -> Vec<String> {
     let mut entities: Vec<String> = text
         .split_whitespace()
-        .map(|s| s.trim_matches(|c: char| ",;()[]{}<>\"'`".contains(c)))
+        .map(|s| s.trim_matches(|c: char| ",;()[]{}<>\"'`?!".contains(c)))
         .filter(|s| {
             s.len() >= 3
                 && (s.contains('.')
@@ -36,11 +38,23 @@ pub(crate) fn extract_entities(text: &str) -> Vec<String> {
 
 /// Whether any entity of `left` overlaps any of `right`, with a substring
 /// tolerance so `AuthService.rs` matches `src/auth/AuthService.rs`.
+/// Search and scoring affinity keep this; auto-reactivation does not.
 pub(crate) fn entities_match(left: &[String], right: &[String]) -> bool {
     left.iter().any(|entity| {
         right
             .iter()
             .any(|prior| prior.contains(entity) || entity.contains(prior))
+    })
+}
+
+/// Slash-normalized equality. Auto-reactivation and hot GC roots use this
+/// so `src/foo.rs` does not resurrect substring cousins.
+pub(crate) fn entities_match_exact(left: &[String], right: &[String]) -> bool {
+    left.iter().any(|entity| {
+        let entity = agent_contracts::normalize_resource_path(entity);
+        right
+            .iter()
+            .any(|prior| agent_contracts::normalize_resource_path(prior) == entity)
     })
 }
 
@@ -81,21 +95,20 @@ pub(crate) fn primary_file_path(content: &str) -> Option<&str> {
 /// （replay `path:\nbody` 夹具）。live `fs.read` 正文是 `     1 | …`，
 /// 没有路径，必须走字段。
 pub(crate) fn observation_file_path(item: &ContextItem) -> Option<&str> {
-    if let Some(path) = item.file_path.as_deref() {
-        let path = path.trim();
-        if !path.is_empty() && is_file_path_entity(path) {
-            return Some(path);
-        }
-    }
-    primary_file_path(&item.content)
+    observation_file_path_parts(item.file_path.as_deref(), &item.content)
+}
+
+pub(crate) fn observation_file_path_entry(entry: &ExternalizedContext) -> Option<&str> {
+    observation_file_path_parts(entry.file_path.as_deref(), &entry.context_ref.summary)
 }
 
 /// 把路径写入实体索引，供 catalog search 按路径命中。
 pub(crate) fn index_file_path(entities: &mut Vec<String>, path: &str) {
-    if path.is_empty() || entities.iter().any(|existing| existing == path) {
+    let path = agent_contracts::normalize_resource_path(path);
+    if path.is_empty() || entities.iter().any(|existing| existing == &path) {
         return;
     }
-    entities.insert(0, path.to_string());
+    entities.insert(0, path);
     entities.truncate(MAX_HOT_ENTITIES);
 }
 
@@ -105,11 +118,15 @@ pub(crate) fn index_file_path(entities: &mut Vec<String>, path: &str) {
 pub(crate) fn latest_file_body_ids<'a>(
     items: impl IntoIterator<Item = &'a ContextItem>,
     active_task: Option<TaskId>,
+    max_bodies: usize,
+    lease_turns: u64,
+    current_turn: u64,
 ) -> HashSet<ContextItemId> {
     let Some(task) = active_task else {
         return HashSet::new();
     };
-    let mut latest: HashMap<&str, (u64, ContextItemId)> = HashMap::new();
+    let cap = max_bodies.max(1);
+    let mut latest: HashMap<&str, (u64, u64, ContextItemId)> = HashMap::new();
     for item in items {
         if item.task_id != Some(task)
             || item.kind != ContextKind::ToolObservation
@@ -118,31 +135,64 @@ pub(crate) fn latest_file_body_ids<'a>(
         {
             continue;
         }
+        if lease_turns > 0 && current_turn.saturating_sub(item.created_turn) >= lease_turns {
+            continue;
+        }
         let Some(path) = observation_file_path(item) else {
             continue;
         };
         match latest.get(path) {
-            Some((tick, _)) if *tick >= item.created_tick => {}
+            Some((tick, _, _)) if *tick >= item.created_tick => {}
             _ => {
-                latest.insert(path, (item.created_tick, item.id));
+                latest.insert(path, (item.created_tick, item.created_turn, item.id));
             }
         }
     }
-    let mut ranked: Vec<(u64, ContextItemId)> = latest.into_values().collect();
+    let mut ranked: Vec<(u64, ContextItemId)> = latest
+        .into_values()
+        .map(|(tick, _, id)| (tick, id))
+        .collect();
     ranked.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    ranked
-        .into_iter()
-        .take(MAX_RECENT_FILE_BODIES)
-        .map(|(_, id)| id)
-        .collect()
+    ranked.into_iter().take(cap).map(|(_, id)| id).collect()
 }
 
-fn is_file_body_observation(item: &ContextItem) -> bool {
-    match item.source.as_deref() {
-        Some("tool:fs.read") => observation_file_path(item).is_some(),
+/// File body (`fs.read` or unsourced replay `path:\nbody`), not a tool that
+/// merely stamped a resource path onto a log.
+pub(crate) fn is_file_body_observation(item: &ContextItem) -> bool {
+    is_file_body(
+        item.source.as_deref(),
+        item.file_path.as_deref(),
+        &item.content,
+    )
+}
+
+pub(crate) fn is_file_body_entry(entry: &ExternalizedContext) -> bool {
+    is_file_body(
+        entry.source.as_deref(),
+        entry.file_path.as_deref(),
+        &entry.context_ref.summary,
+    )
+}
+
+fn is_file_body(source: Option<&str>, file_path: Option<&str>, content: &str) -> bool {
+    match source {
+        Some("tool:fs.read") => observation_file_path_parts(file_path, content).is_some(),
         Some(_) => false,
-        None => primary_file_path(&item.content).is_some(),
+        None => primary_file_path(content).is_some(),
     }
+}
+
+fn observation_file_path_parts<'a>(
+    file_path: Option<&'a str>,
+    content: &'a str,
+) -> Option<&'a str> {
+    if let Some(path) = file_path {
+        let path = path.trim();
+        if !path.is_empty() && is_file_path_entity(path) {
+            return Some(path);
+        }
+    }
+    primary_file_path(content)
 }
 
 /// Merge tool-touched entities into the hot set: most recent first,
@@ -166,6 +216,10 @@ mod tests {
         assert_eq!(
             extract_entities("fix AuthService.rs and check src/auth/mod.rs"),
             vec!["AuthService.rs".to_string(), "src/auth/mod.rs".to_string()]
+        );
+        assert_eq!(
+            extract_entities("what did we change in AuthService.rs?"),
+            vec!["AuthService.rs".to_string()]
         );
         assert!(
             extract_entities("all lowercase words without markers").is_empty(),
@@ -196,6 +250,21 @@ mod tests {
             &["AuthService.rs".to_string()],
             &["CacheStore.rs".to_string()]
         ));
+    }
+
+    #[test]
+    fn entities_match_exact_requires_slash_normalized_identity() {
+        assert!(entities_match_exact(
+            &["src/foo.rs".to_string()],
+            &["src\\foo.rs".to_string()]
+        ));
+        assert!(
+            !entities_match_exact(
+                &["AuthService.rs".to_string()],
+                &["src/auth/AuthService.rs".to_string()]
+            ),
+            "substring cousins must not auto-reactivate"
+        );
     }
 
     #[test]

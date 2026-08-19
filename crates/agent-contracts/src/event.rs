@@ -274,10 +274,16 @@ pub enum RuntimeEvent {
     /// turn-commit time, so live consumers (the eval harness, a token meter)
     /// can measure the true cost of a turn without parsing provider
     /// internals. `input_tokens`/`output_tokens` are `0` when the provider
-    /// did not report them.
+    /// did not report them. `attempts`/`retries` come from the transport;
+    /// failed attempts usually have no usage, so tokens are a lower bound
+    /// whenever `retries > 0`.
     ModelUsed {
         input_tokens: u64,
         output_tokens: u64,
+        #[serde(default)]
+        attempts: u32,
+        #[serde(default)]
+        retries: u32,
     },
     /// A shadow-mode approval decision (ACI v2 compatibility order step 4):
     /// the v2 intent-derived verdict recorded beside the legacy gate. Only

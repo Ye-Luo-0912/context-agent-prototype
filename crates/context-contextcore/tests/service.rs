@@ -678,7 +678,7 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
                     source_field_id: "constraints".into(),
                     ..Default::default()
                 }],
-                task: None,
+                ..Default::default()
             },
         })
         .await

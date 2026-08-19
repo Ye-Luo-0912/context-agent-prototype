@@ -200,6 +200,7 @@ async fn wait_for_turn(
                 RuntimeEvent::ModelUsed {
                     input_tokens,
                     output_tokens,
+                    ..
                 } => {
                     summary.input_tokens += input_tokens;
                     summary.output_tokens += output_tokens;

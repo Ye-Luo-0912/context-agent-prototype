@@ -205,7 +205,7 @@ impl RuntimeActor {
                 // 的条目在本次 pass 中受保护/召回，store 声明保护留存。
                 // 推送失败不阻塞 collect——引擎仍按已推送的根集运行。
                 // 空投影跳过（collect 本身不是 ingest directive）。
-                self.push_anchor_roots_for_gc(false).await;
+                self.push_gc_projections(false).await;
                 match self.services.context_gc().await {
                     Ok(report) => {
                         if let Err(error) = self
@@ -606,7 +606,9 @@ impl RuntimeActor {
         }
         // Turn boundary: the full GC pass compacts what the per-event
         // residency machine demoted. Eviction is reversible, and the report
-        // explains every eviction and reactivation.
+        // explains every eviction and reactivation. Push TaskProgress
+        // checked paths first so covered file bodies stay Warm/Stored.
+        self.push_gc_projections(false).await;
         let report = match self.services.context_gc().await {
             Ok(report) => report,
             Err(error) => {

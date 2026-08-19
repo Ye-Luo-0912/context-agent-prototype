@@ -496,19 +496,24 @@ Regressions: `task_anchor_update_publishes_a_bounded_event`,
 
 ### CTX-11 — Task progress is not yet a bounded, sourced resume contract
 
-**NARROWED (2026-08-18).** `ResumePoint` is an actor-owned operational cache
-on `TaskRecord`, bound to `task_id + anchor_revision`. It is **not** a
-second task authority: objective / blockers / next-actions are not written
-here. `TaskProgressView` projects checked resources, verification facts, and
-unresolved operation failures only. Updates apply **after** the durable
-`TurnCompleted` barrier. Successful file observations become checked
-resources; failed observations become failed operations. Verification is
-typed (`metadata.verification` / `intent=verify` / test-or-compiler
-command), never `shell.exec` by name. Failure identity is tool + command
-or resource target. A generic may-mutate process without a path invalidates
-workspace file facts. Prompt packing subtracts the runtime Focus frame
-before `materialize`. This slice is not an M15 close and does not prove
-ResumePoint value on `task_switch_long_b`; keep historical `semantic_recall.v1`.
+**NARROWED (2026-08-18), freshness (2026-08-18).** `ResumePoint` is an actor-owned
+operational cache on `TaskRecord`, bound to
+`task_id + anchor_revision + workspace_revision`. It is **not** a second
+task authority: objective / blockers / next-actions / last_cursor /
+workspace_facts_stale are deleted. `TaskProgressView` projects checked
+resources, revision-bound verification facts, and unresolved operation
+failures only, under `MAX_TASK_PROGRESS_PROMPT_CHARS`. Updates apply
+**after** the durable `TurnCompleted` barrier. Verification is typed
+(`metadata.verification` / `intent=verify`) and does not skip mutation
+invalidation. A may-mutate observation (typed `mutates_workspace` /
+`_runtime.effect_intent`, else conservative builtin fallback) bumps
+`workspace_revision`; old PASS rows stay stamped to the world that
+produced them and are omitted from the prompt view. Command needles such
+as `cargo test` are not verification. Prompt packing subtracts the runtime
+Focus frame before `materialize`. This slice is not an M15 close.
+Keep historical `semantic_recall.v1` as a long-protocol trajectory; do not
+keep live-running it. Mechanism V2 (`--context-mech`) is the isolated
+gate: late constraint, resume freshness, no-semantic episode.
 
 Required closure:
 
@@ -519,7 +524,9 @@ Required closure:
   context/artifact storage and carry only path/entity, digest/revision, bounded
   status and evidence refs;
 - update only from trusted tool/verification facts after the durable turn
-  commit; model-generated progress is non-authoritative;
+  commit; model-generated progress is non-authoritative. The prompt
+  `TaskProgressView` may fold persistable open-turn tool results without
+  writing the stored `ResumePoint`;
 - restore the exact bounded record through checkpoint, downgrade suspended refs
   to storage retention, and rematerialize only Anchor + ResumePoint refs on
   activation — never ordinary transcript history;
@@ -1174,8 +1181,17 @@ materializer subissues are closed:
   matches come from the entity index (O(bucket) per hot entity) and the
   rest is the most-recently-externalized tail (the map stores in
   externalize order, so the tail is a bounded O(1) recency approximation),
-  keeping the view independent of total history. Regression:
-  `external_view_surfaces_hot_matches_beyond_the_recency_tail`.
+  keeping the view independent of total history. Warm items that are hot
+  or already Checked project into the same bounded view as identity
+  descriptors. Checked Stored file bodies use the same entity index
+  (O(bucket) per unique path) and rank above the recency tail so later
+  overflow cannot hide them. Regression:
+  `external_view_surfaces_hot_matches_beyond_the_recency_tail`,
+  `skipped_warm_file_body_is_a_prompt_descriptor`,
+  `external_view_surfaces_checked_stored_file_beyond_the_recency_tail`.
+  Search/inspect of ToolObservation / FileObservation items are the same
+  identity cards; file text is not a residual-scan needle. Regression:
+  `search_and_inspect_file_body_are_identity_descriptors`.
 
 CTX-07 closed.
 
@@ -1216,6 +1232,42 @@ that discovers `AuthService.rs` signals it, and the turn-boundary GC
 recalls the seeded Warm/Cold entries into the resident heap under their
 original ids — while the fetch/search/inspect results themselves are never
 persisted as new ToolObservations.
+
+**Follow-up 2026-08-19.** Heating is now a trusted `ResourceTouch`
+(path@revision), not entity extraction from stdout. User-hot and tool-hot
+are split; tool-hot has a short TTL; auto-reactivation is exact identity;
+search/scoring stay fuzzy. `WorkingSetSignal.content` remains for wire
+compat and is ignored for heating. A successful ToolObservation's entity
+signature is the stamped path only; stdout is not GC identity.
+File-body supersession remains `fs.read` (a stamped `shell.exec` path is
+identity, not a new body). Stamped-path shell/process logs do not
+hot-recall; only `fs.read` file bodies auto-reactivate unless P3 is on. Successful `fs.write` / `edit.replace` /
+`edit.patch` stamp `path@revision`; `resource_touches` also reads
+`metadata.files[]`. `ResumePoint` upserts those touches into checked
+files and only wipes the cache on a pathless mutation. The prompt
+`TaskProgressView` additionally folds persistable open-turn tool results
+so the coding loop sees current `path@revision` before the turn commits;
+the stored `ResumePoint` still updates only after the durable barrier.
+Selected historical `fs.read` / FileObservation bodies whose path is
+already in `TaskProgressView.checked_files` are omitted from SELECTED
+WORKING CONTEXT; stamped-path identity logs (`shell.exec` / writes) omit
+stdout the same way. The item header still carries `path@revision`. Live
+TurnFrame tool results still include the exact body. This is prompt
+projection, not P3 descriptor-only reactivation. Materialize packing
+reads `ContextHints.checked_files` and prices a covered ToolObservation /
+FileObservation item as a path@revision descriptor so the working-set
+budget can take other items; the heap body is unchanged. Before a GC pass the runtime also
+pushes that same projection as `ContextAction::CheckedFiles`, so a
+covered file-body ToolObservation / FileObservation does not
+hot-reactivate — identity is already in TaskProgress. Those skipped Warm
+and Stored bodies still surface as EXTERNAL CONTEXT `path@rev` refs
+(Stored via the entity index, including past the recency tail);
+`context.search` / `inspect` of those kinds are identity cards, not
+120-char body prefixes; Fetch returns the catalog body. Unchecked file
+bodies still auto-reactivate (P3 still default-off).
+Descriptor-only ToolObservation reactivation and `recent_file_bodies` cap/lease stay off by default;
+`agent-eval --context-hygiene` is the engine-only ablation (no provider,
+no SPEC rewrite).
 
 ### CTX-09 — Lifecycle clocks and observability need explicit semantics
 

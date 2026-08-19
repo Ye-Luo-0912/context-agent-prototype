@@ -27,6 +27,13 @@ pub struct RunMetrics {
     pub model_input_tokens: u64,
     /// Provider-reported output tokens (`ModelUsed`).
     pub model_output_tokens: u64,
+    /// Transport attempts that produced a `ModelUsed` (successful round).
+    pub model_attempts: u64,
+    /// Retries inside those successful rounds (`attempts - 1` per event).
+    pub model_retries: u64,
+    /// True when any successful round retried. Recorded tokens omit failed
+    /// attempts that reported no usage, so they are a lower bound.
+    pub provider_tokens_lower_bound: bool,
     /// Cumulative tool-schema tokens of every round surface
     /// (`ToolSurfacePlanned.selected_schema_tokens`).
     pub schema_tokens_total: u64,
@@ -55,6 +62,18 @@ pub struct RunMetrics {
     /// Repeated `fs.read` of the same workspace path (the second and later
     /// reads of one path — a proxy for search/re-read inefficiency).
     pub repeated_fs_reads: u64,
+    /// Engine-classified `fs.read` attribution (last diagnostics snapshot).
+    pub reread_previously_selected: u64,
+    pub reread_resident_unselected: u64,
+    pub reread_warm: u64,
+    pub reread_stored: u64,
+    pub reread_first_read: u64,
+    /// Selected-token attribution across `ContextPrepared` previews.
+    pub selected_tokens_by_kind: BTreeMap<String, u64>,
+    pub selected_tokens_by_reason: BTreeMap<String, u64>,
+    pub selected_tokens_by_source: BTreeMap<String, u64>,
+    pub selected_tokens_reactivated: u64,
+    pub selected_tokens_resident: u64,
     /// Counts of trusted `metadata.failure_class` values (`TOOL-ERROR-01`).
     /// Includes classified no-match searches that still have `ok: true`.
     pub tool_failure_classes: BTreeMap<String, u64>,
@@ -164,6 +183,7 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     let mut forgotten: HashSet<ContextItemId> = HashSet::new();
     let mut recovered: HashSet<ContextItemId> = HashSet::new();
     let mut recovered_path: HashMap<ContextItemId, RecoverPath> = HashMap::new();
+    let mut unique_reactivated: HashSet<ContextItemId> = HashSet::new();
     let mut seen_context_compacted = false;
 
     for envelope in events {
@@ -323,6 +343,8 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                         reactivation.item_id,
                         RecoverPath::Reactivate,
                     );
+                    unique_reactivated.insert(reactivation.item_id);
+                    metrics.reactivation_events = metrics.reactivation_events.saturating_add(1);
                 }
                 snapshot_access(&mut metrics, &report.diagnostics);
             }
@@ -359,9 +381,17 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             RuntimeEvent::ModelUsed {
                 input_tokens,
                 output_tokens,
+                attempts,
+                retries,
             } => {
                 metrics.model_input_tokens += input_tokens;
                 metrics.model_output_tokens += output_tokens;
+                let attempts = (*attempts).max(1) as u64;
+                metrics.model_attempts = metrics.model_attempts.saturating_add(attempts);
+                metrics.model_retries = metrics.model_retries.saturating_add(*retries as u64);
+                if *retries > 0 {
+                    metrics.provider_tokens_lower_bound = true;
+                }
             }
             RuntimeEvent::ContextPrepared {
                 diagnostics,
@@ -370,10 +400,30 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             } => {
                 metrics.materialize_rounds += 1;
                 metrics.selected_items_total += selected.len() as u64;
-                metrics.selected_tokens_total += selected
-                    .iter()
-                    .map(|item| item.approx_tokens as u64)
-                    .sum::<u64>();
+                for item in selected {
+                    let tokens = item.approx_tokens as u64;
+                    metrics.selected_tokens_total += tokens;
+                    let kind = item
+                        .kind
+                        .map(|kind| kind.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    *metrics.selected_tokens_by_kind.entry(kind).or_default() += tokens;
+                    let reason = selection_reason_class(&item.reason).to_string();
+                    *metrics.selected_tokens_by_reason.entry(reason).or_default() += tokens;
+                    let source = item
+                        .source
+                        .as_deref()
+                        .filter(|source| !source.is_empty())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    *metrics.selected_tokens_by_source.entry(source).or_default() += tokens;
+                    if item.reactivated {
+                        metrics.selected_tokens_reactivated += tokens;
+                    } else {
+                        metrics.selected_tokens_resident += tokens;
+                    }
+                }
                 metrics.active_tokens_total += diagnostics.approx_active_tokens as u64;
                 if *materialize_ms > 0 {
                     materialize_ms_samples.push(*materialize_ms);
@@ -414,6 +464,7 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
         .count() as u64;
     metrics.recovery_workspace_reread = metrics.repeated_fs_reads;
     metrics.recovery_failed = forgotten.difference(&recovered).count() as u64;
+    metrics.unique_reactivated = unique_reactivated.len() as u64;
     metrics
 }
 
@@ -480,8 +531,9 @@ fn snapshot_access(metrics: &mut RunMetrics, diagnostics: &agent_contracts::Cont
     metrics.reactivation_consumed = diagnostics.reactivation_consumed;
     metrics.reactivation_selected_tokens = diagnostics.reactivation_selected_tokens;
     metrics.reactivation_consumed_tokens = diagnostics.reactivation_consumed_tokens;
-    metrics.reactivation_events = diagnostics.reactivation_events;
-    metrics.unique_reactivated = diagnostics.unique_reactivated;
+    // reactivation_events / unique_reactivated are summed from ContextGc
+    // events (run-global). Engine diagnostics are segment-local and reset
+    // on restore, so they must not overwrite the event aggregate.
     metrics.reactivated_tokens = diagnostics.reactivated_tokens;
     metrics.reactivation_tool_observation_selected =
         diagnostics.reactivation_tool_observation_selected;
@@ -491,6 +543,11 @@ fn snapshot_access(metrics: &mut RunMetrics, diagnostics: &agent_contracts::Cont
         diagnostics.reactivation_file_observation_selected;
     metrics.reactivation_file_observation_consumed =
         diagnostics.reactivation_file_observation_consumed;
+    metrics.reread_previously_selected = diagnostics.reread_previously_selected;
+    metrics.reread_resident_unselected = diagnostics.reread_resident_unselected;
+    metrics.reread_warm = diagnostics.reread_warm;
+    metrics.reread_stored = diagnostics.reread_stored;
+    metrics.reread_first_read = diagnostics.reread_first_read;
 }
 
 /// The nearest-rank percentile of a sorted sample: index
@@ -501,10 +558,24 @@ fn percentile(sorted: &[u64], pct: u64) -> u64 {
     sorted[index.min(sorted.len() - 1)]
 }
 
+fn selection_reason_class(reason: &str) -> &'static str {
+    if reason.starts_with("explicitly pinned") {
+        "pinned"
+    } else if reason.starts_with("anchor root") {
+        "anchor_prompt"
+    } else if reason.starts_with("included as dependency") {
+        "dependency"
+    } else if reason.starts_with("latest body") {
+        "latest_file_body"
+    } else {
+        "scored"
+    }
+}
+
 /// Human-readable metric block for one run.
 pub fn render_metrics(metrics: &RunMetrics) -> String {
     format!(
-        "cost: model_in={} model_out={} schema_tokens={} rounds={} turns={} lifecycle_transitions={}\n\
+        "cost: model_in={} model_out={} attempts={} retries={} tokens_lower_bound={} schema_tokens={} rounds={} turns={} lifecycle_transitions={}\n\
          gc: evictions={} reactivations={} externalizations={}\n\
          materialize: rounds={} selected_items={} selected_tokens={} active_tokens={}\n\
          materialize_latency: p50={}ms p95={}ms\n\
@@ -520,9 +591,14 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          prompt_layers: system={} facts={} anchor={} progress={} focus={} history={} turn={} tools={}\n\
          compaction: in={} out={}\n\
          behavior: tool_calls={} failed_outputs={} spills={} output_chars={} repeated_fs_reads={}\n\
+         reread: previously_selected={} resident_unselected={} warm={} stored={} first_read={}\n\
+         selected_attr: kind={:?} reason={:?} source={:?} reactivated={} resident={}\n\
          tool_failures: {:?}\n",
         metrics.model_input_tokens,
         metrics.model_output_tokens,
+        metrics.model_attempts,
+        metrics.model_retries,
+        metrics.provider_tokens_lower_bound,
         metrics.schema_tokens_total,
         metrics.rounds,
         metrics.turns,
@@ -594,6 +670,16 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.artifact_spills,
         metrics.output_chars_total,
         metrics.repeated_fs_reads,
+        metrics.reread_previously_selected,
+        metrics.reread_resident_unselected,
+        metrics.reread_warm,
+        metrics.reread_stored,
+        metrics.reread_first_read,
+        metrics.selected_tokens_by_kind,
+        metrics.selected_tokens_by_reason,
+        metrics.selected_tokens_by_source,
+        metrics.selected_tokens_reactivated,
+        metrics.selected_tokens_resident,
         metrics.tool_failure_classes,
     )
 }
@@ -812,6 +898,8 @@ mod tests {
             RuntimeEvent::ModelUsed {
                 input_tokens: 9_000,
                 output_tokens: 120,
+                attempts: 1,
+                retries: 0,
             },
         ));
         seq += 1;
@@ -839,6 +927,7 @@ mod tests {
                         approx_tokens: 300,
                         reason: "focus".into(),
                         breakdown: ScoreBreakdown::default(),
+                        ..Default::default()
                     },
                     ContextSelection {
                         item_id: ContextItemId::new(),
@@ -846,6 +935,7 @@ mod tests {
                         approx_tokens: 200,
                         reason: "recall".into(),
                         breakdown: ScoreBreakdown::default(),
+                        ..Default::default()
                     },
                 ],
                 materialize_ms: 10,
@@ -883,6 +973,7 @@ mod tests {
                     approx_tokens: 250,
                     reason: "focus".into(),
                     breakdown: ScoreBreakdown::default(),
+                    ..Default::default()
                 }],
                 materialize_ms: 20,
             },
@@ -909,15 +1000,22 @@ mod tests {
         assert_eq!(metrics.schema_tokens_total, 512);
         assert_eq!(metrics.model_input_tokens, 9_000);
         assert_eq!(metrics.model_output_tokens, 120);
+        assert_eq!(metrics.model_attempts, 1);
+        assert!(!metrics.provider_tokens_lower_bound);
         assert_eq!(metrics.prompt_task_progress_tokens, 40);
         assert_eq!(metrics.prompt_historical_context_tokens, 800);
-        assert_eq!(metrics.reactivation_events, 42);
-        assert_eq!(metrics.unique_reactivated, 32);
+        assert_eq!(metrics.reactivation_events, 0);
+        assert_eq!(metrics.unique_reactivated, 0);
         assert_eq!(metrics.reactivation_selected, 10);
         assert_eq!(metrics.reactivation_tool_observation_selected, 6);
         assert_eq!(metrics.materialize_rounds, 2);
         assert_eq!(metrics.selected_items_total, 3);
         assert_eq!(metrics.selected_tokens_total, 750);
+        assert_eq!(metrics.selected_tokens_resident, 750);
+        assert_eq!(
+            metrics.selected_tokens_by_reason.get("scored").copied(),
+            Some(750)
+        );
         assert_eq!(metrics.active_tokens_total, 9_000);
         assert_eq!(metrics.final_total_items, 11);
         assert_eq!(metrics.final_resident_items, 7);
@@ -946,7 +1044,7 @@ mod tests {
         assert!(rendered.contains("store: write_bytes=512 read_bytes=128 recalled_items=2"));
         assert!(rendered.contains("retrieval: search_calls=0"));
         assert!(rendered.contains("recovery: forgotten=0 recovered=0"));
-        assert!(rendered.contains("events=42 unique=32"));
+        assert!(rendered.contains("events=0 unique=0"));
         assert!(rendered.contains("progress=40"));
         assert!(rendered.contains("history=800"));
         assert!(rendered.contains("tool_obs selected/consumed=6/4"));
@@ -1091,6 +1189,8 @@ mod tests {
         assert_eq!(metrics.recovery_auto_reactivation, 1);
         assert_eq!(metrics.recovery_explicit_search, 0);
         assert_eq!(metrics.recovery_failed, 0);
+        assert_eq!(metrics.reactivation_events, 1);
+        assert_eq!(metrics.unique_reactivated, 1);
     }
 
     #[test]

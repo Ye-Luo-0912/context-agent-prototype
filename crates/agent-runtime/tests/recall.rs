@@ -104,10 +104,10 @@ fn observation_output(id: &str, ok: bool, content: &str) -> ToolOutput {
         call_id: id.into(),
         tool_name: "shell.exec".into(),
         ok,
-        summary: "ok".into(),
+        summary: if ok { "ok" } else { "failed" }.into(),
         model_content: content.into(),
         artifact_ref: None,
-        metadata: json!({}),
+        metadata: json!({"path": "AuthService.rs"}),
     }
 }
 
@@ -559,10 +559,11 @@ async fn recall_turn_pulls_external_content_back_without_polluting_the_prompt() 
     // through the turn frame, but finalization must not persist them as
     // new observations — the turn's own user + assistant messages are
     // expected to persist, and a retrieval result would show up as an
-    // extra ToolObservation. The mid-turn WorkingSetSignal, however, made
-    // the fetched content's entities hot again, so the turn-boundary GC
-    // *recalls* the seeded entries (same ids, from warm/cold back to the
-    // resident heap) — that is the CTX-08 behavior, not a new observation.
+    // extra ToolObservation. Fetch stdout is not a ResourceTouch, so it
+    // must not heat tool-hot or auto-reactivate old raw evidence; the
+    // model already has the body in the turn frame. Bring a stored body
+    // back into the heap with Fetch/Admit when the exact body is needed
+    // as working-set residency.
     let after = engine.diagnostics().await.unwrap();
     let summaries = engine.inspect(100).await.unwrap();
     assert_eq!(
@@ -574,10 +575,7 @@ async fn recall_turn_pulls_external_content_back_without_polluting_the_prompt() 
         catalog_before,
         after.total_items
     );
-    assert!(
-        reactivated >= 1,
-        "the signaled entities must recall the seeded warm/cold evidence"
-    );
+    let _ = reactivated;
     // The ToolObservations in the catalog are the *seeded* ones — recalled
     // with their original ids, not new items. A fetch/search/inspect result
     // persisted as a fresh observation would carry the turn's own
@@ -600,34 +598,33 @@ async fn recall_turn_pulls_external_content_back_without_polluting_the_prompt() 
             .map(|s| (s.created_turn, s.source.as_deref()))
             .collect::<Vec<_>>()
     );
-    // The signaled entities recalled the seeded entry into the working set
-    // (same id, warm/cold -> resident — the CTX-08 acceptance). It is no
-    // longer an external ref; it must be resident with its original id.
+    // Fetch did not auto-reactivate the seeded body into the heap. It
+    // stays reachable as a catalog entry (Cold/External); the exact body
+    // already rode the turn-frame tool result.
     assert!(
         summaries.iter().any(|s| s.id == target_id),
-        "the recalled entry must be resident with its original id"
+        "the seeded entry must remain in the logical catalog"
     );
     let recalled = engine
         .inspect_external(target_id)
         .await
         .unwrap()
-        .expect("catalog inspect covers the heap after recall");
-    assert_eq!(
-        recalled.residency,
-        ContextResidency::Resident,
-        "recall is a location move into the working set, not a store miss"
+        .expect("catalog inspect covers stored entries");
+    assert!(
+        matches!(
+            recalled.residency,
+            ContextResidency::Cold | ContextResidency::External | ContextResidency::Warm
+        ),
+        "fetch stdout must not move the seeded body to Resident, got {:?}",
+        recalled.residency
     );
     let fetched = engine
         .fetch_external(target_id)
         .await
         .unwrap()
-        .expect("Resident fetch returns the catalog body");
+        .expect("stored fetch still returns the catalog body");
     assert_eq!(fetched.id, target_id);
-    assert_eq!(
-        fetched.residency,
-        ContextResidency::Resident,
-        "recall is a catalog body, not a store miss"
-    );
+    assert_eq!(fetched.content, expected_content);
 }
 
 /// End to end for the directive half: `admit` re-enters the item under its

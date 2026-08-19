@@ -104,9 +104,9 @@ boundedness, and integrity rather than replace it with transcript history.
 | Store integrity | Implemented crash-recovery baseline (`CTX-04`) | Atomic write/rename, checksums, bounded I/O, post-commit recall deletion, startup reconcile, quarantine, and process-service parity are implemented. Canonical record ownership and the documented quarantine/operator workflow remain broader structural work. |
 | Strong provenance graph | Implemented storage-safety baseline (`CTX-05`); prompt/residency consumers landed | `DerivedFrom`, `EvidenceFor`, `VerifiedBy`, `ArtifactOf`, and `Continuation` protect storage (`is_strong` / `protects_storage`). `SharesEntities` remains weak affinity. Prompt expansion and full-GC mark/reactivate follow `requires_prompt_body` / `requires_residency` (Continuation only), so a compact `DerivedFrom` card does not re-select or resurrect its sources. Provenance admission/authority policy remains incomplete. |
 | Incremental GC work | Partial | `ContextCatalog` applies a dirty-id upsert on ingest/maintain/tag instead of rebuilding every event; heap `replace_all` / restore still rebuild. Minor residency and Cold→External aging walk a `gc_work_batch` (default 4096) cursor so a heap at or below the batch keeps the previous full stable-order pass. |
-| Immediate tool signal | Implemented (`CTX-08`) | Successful tool commit emits a bounded, body-free `WorkingSetSignal`; discovered entities heat related context before the immediately following model round while the tool body remains in `TurnFrame` until finalization. Failed execution results stay on the TurnFrame and do not heat `hot_entities`. |
+| Immediate tool signal | Implemented (`CTX-08`) | Successful tool commit emits a bounded, body-free `WorkingSetSignal` of stamped `ResourceTouch` paths from `metadata.path` and `metadata.files[]` (not stdout). `fs.write` / `edit.replace` / `edit.patch` stamp `path@revision`. User-hot and tool-hot are split; tool-hot has a short TTL. Failed execution results stay on the TurnFrame and do not heat `hot_entities`. Prompt `TaskProgressView` folds persistable open-turn results into `path@revision` without writing the stored `ResumePoint` until the durable turn commit. Stamped-path shell/process logs do not hot-recall; only `fs.read` file bodies auto-reactivate unless the path is already Checked (`ContextAction::CheckedFiles` before GC) or P3 is on. |
 | Final model-consumption acknowledgement | Implemented (`CTX-07`) | `materialize` returns a non-consuming preview. After final packing, only a successful non-stale ModelOutput commits a bounded `ContextConsumptionAck` with the exact inline/external ids; failure paths do not reinforce. Fit-before-top-K, bounded/charged external refs, and bounded candidate generation are covered; workload cost evaluation remains separate. |
-| Prompt authority separation | Implemented (`CORE-05`) | `PromptAssembler` keeps policy in System, renders selected history/external refs as delimited low-authority User observations, and preserves live file/tool output as Tool-role content. Injection regressions cover all three paths. |
+| Prompt authority separation | Implemented (`CORE-05`) | `PromptAssembler` keeps policy in System, renders selected history/external refs as delimited low-authority User observations, and preserves live file/tool output as Tool-role content. Injection regressions cover all three paths. Historical `fs.read` bodies and stamped-path identity logs whose path is already Checked in TaskProgress are omitted from SELECTED WORKING CONTEXT (header keeps `path@revision`); packing prices those items as descriptors via `ContextHints.checked_files`. Errors keep their body. GC also skips auto-reactivation of those covered file bodies (`ContextAction::CheckedFiles`). Skipped Warm and Stored bodies still surface as EXTERNAL CONTEXT identity refs (`context://` + `path@rev`); Stored uses the entity index past the recency tail. Search/inspect of ToolObservation / FileObservation items are the same identity cards; file text is not a search needle. Fetch returns the catalog body. This is not P3 reactivation. |
 | Real evaluation | Partial | EVAL-02 Context Bench (`agent-eval --context-bench`) is the current M15 decision instrument; 300×3 parked. Unit/property coverage is strong and the 10,000-turn residency regression exists. `agent-eval --compare-live` is the live paired coding harness (real model, independent workspaces, hidden verify). EVAL-01.1 writes per-cell bundles; EVAL-01.1b persists replayable file-content hidden asserts. EVAL-01.2 freezes the clustered C−A estimator; EVAL-01.3 re-freezes the gate at 300×3 / −5 pp (historical 30×3 is underpowered). EVAL-01.4e freezes the 509-task pack; EVAL-01.3b sets `SUITE_FROZEN=true` and declares retrieval secondaries in SPEC (no gate n/margin change). EVAL-01.3c locks the exact 300 acceptance ids and makes token diagnostics honor `cost_eligible`. EVAL-01.5 freezes the 30-task calibration sample; a file-only 9×3 live spend is in `crates/agent-eval/evidence/pilot-30` (`decision=pilot`). EVAL-01.5.p1 splits send vs pack and raises the shared live round cap to 48; remaining P0 SWE-bench (24k/12) is skipped as a floor-effect host. EVAL-01.5.p1b lands the shared model-backed bounded compactor for live B and C `TaskCompleted` distillation (CI keeps the scripted digest). EVAL-01.5.p1c is the retrieval-trust slice (catalog-wide search/inspect, trusted packed-set prompt); extra C rounds are still a treatment effect. P1 n=1 file-only + recall is collected (`rehydration-diag`); leftover extra rounds are mixed, not gone. Compaction cell harvest now sums `ContextMaintained` pass costs. P1 SWE-bench n=1 (`p1-swebench-diag`, pre-path-stamp): C 3/3 pass, A 0/3 at 48-round cap, B mixed. P1 after-path n=1: js-ms-negative C extra rounds gone this cell; recall extra rounds remain. Do not mix P0/P1 ITT tables. P1 file-only 9×3 on the current binary (`target/eval-evidence/p1-file-only-calibrate`, not `pilot-30`): ITT A=B=C=0.889, `decision=pilot`, analyze ineligible n=9 LCL=0 `degenerate=true`; `uuid-parity-keys` 0/9 hidden `cargo test`. Frozen SWE-bench 21×3 is still missing (after-proxy is n=1). The 300×3 non-inferiority run is still open. |
 
 This table is the baseline for the work queue below. A checked defect in
@@ -242,7 +242,7 @@ cadences.
 | Implemented | `TaskToolRequirementSet` retains exact-name `MustSurface`/`PreferSurface`/`KeepReady` demand. `RoundSurfacePlan` is the bounded per-round projection; loading remains lifecycle, never activation or permission. |
 | Implemented | Live restore rebases focus/surface/requirement revisions, applies capability state fail-closed, and publishes a bounded durable `RuntimeRestored` event before clearing the recovery fence. |
 | Implemented | Task completion atomically closes context/task authority and commits exactly one immutable typed `CompletionRecord`. With an artifact workspace, the complete final assistant response is persisted before bounded context ingest and its ref is attached to the record. |
-| Still open | `CTX-11`: Active/Suspended root downgrade; `ResumePoint` is a bounded operational cache (checked resources / verification / failed operations) applied after turn commit — not a second TaskAnchor. Sourced `EpisodeOutcome`; ack/obligation-driven episode root release remain. `TaskAnchor` remains the only task-authority owner. |
+| Frozen | `CTX-11` core (2026-08-18): `ResumePoint` is a bounded operational cache bound to `task_id + anchor_revision + workspace_revision`; verification is typed and orthogonal to mutation; TaskProgress is prompt-capped. Do not add Context features. Active/Suspended root downgrade, sourced `EpisodeOutcome`, and ack/obligation-driven episode root release stay deferred. `TaskAnchor` remains the only task-authority owner. |
 
 Tool-demand semantics remain intentionally narrow:
 
@@ -375,13 +375,14 @@ trajectory, not as a GC-forget-and-recall test.
   unrelated task's prompt; its refs are storage-retention roots and their
   bodies may cool/externalize. A bounded sourced `ResumePoint` captures the
   operational progress needed to continue without reconstructing it from
-  dialogue. It is an actor-owned subrecord bound to `task_id + anchor_revision`,
-  not a second task-authority store. `TaskProgressView` contains:
+  dialogue. It is an actor-owned subrecord bound to
+  `task_id + anchor_revision + workspace_revision`, not a second
+  task-authority store. `TaskProgressView` contains:
   - checked file/entity refs with the observed content digest or revision;
-  - recent verification facts from typed verify intent, never every shell;
-  - known failed-command facts keyed by tool + command/resource target;
-  - last execution cursor.
-  Objective / blockers / next-actions stay on `TaskAnchor`.
+  - revision-bound verification facts from typed verify intent, never every shell;
+  - known failed-command facts keyed by tool + command/resource target.
+  Objective / blockers / next-actions stay on `TaskAnchor`. Last cursor and
+  workspace_facts_stale are not part of this view.
   Every collection and string gets a named hard cap; overflow content is stored
   once as an artifact/context body and represented only by a typed ref. Runtime
   updates this record only from trusted safe-point facts (successful tool
@@ -1848,26 +1849,14 @@ current slice above.)
   and is not a residency root. GC/Storage GC reports list bounded
   `anchor_root_protections`. Active/Suspended downgrade and replacing the
   whole Focus subtree as a root remain the next items.
-- [ ] `CTX-11`: implement Active/Suspended root downgrade and precise
-  rehydration from `TaskAnchor + ResumePoint` without restoring the old
-  transcript. Keep `TaskAnchor` as the only task-authority owner; store one
-  actor-owned, revision-bound `ResumePoint` subrecord and expose only its
-  bounded `TaskProgressView` to model context. The contract must cover current
-  objective, unresolved constraints/blockers, next actions, checked file/entity
-  refs with observed digest/revision, recent verification results, known failed
-  commands, and evidence refs. Raw file bodies, command output and dialogue stay
-  in artifacts/context storage and enter the view only through typed refs.
-  Updates occur only at trusted safe points and must be idempotent/revisioned.
-  Acceptance: oversized/corrupt restore fails closed; stale file digests are
-  marked stale rather than reported as checked; a later successful verification
-  resolves the matching failure; suspend -> unrelated work/GC -> resume restores
-  the exact anchor revision and bounded progress while ordinary dialogue remains
-  absent; repeated failures and thousands of inspected files cannot grow the
-  checkpoint, resident heap or prompt without bound. Add a dedicated
-  `task_switch`/failed-tool regression, then compare only after the tool
-  preflight rerun establishes a clean baseline. Do not attribute reduced M15
-  rounds to this change while wrong-shell, stale-edit or workspace-noise
-  failures dominate; scoring remains frozen.
+- [x] `CTX-11` core frozen (2026-08-18): `ResumePoint` is
+  `task_id + anchor_revision + workspace_revision`; verification is typed
+  metadata orthogonal to mutation; TaskProgress has a total prompt hard cap;
+  dead objective/blockers/next_actions/last_cursor/workspace_facts_stale
+  fields are gone. Mechanism V2 (`--context-mech`) is the isolated
+  structural gate. Do not add further Context features. Active/Suspended
+  root downgrade and sourced `EpisodeOutcome` stay deferred. Main
+  engineering returns to M12/M13.
 - [ ] After Anchor/root-claim properties pass, replace “entire active Focus
   subtree is a root” with Anchor claims + unresolved obligations + a bounded
   recent/TurnFrame lease, so continuous GC also works inside a long episode.

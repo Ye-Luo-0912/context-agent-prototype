@@ -1,0 +1,8 @@
+{
+  "schema": "agent-eval.context-mech.v2",
+  "tasks": [
+    "tasks/late_semantic_constraint.json",
+    "tasks/resume_operational_state.json",
+    "tasks/no_semantic_episode.json"
+  ]
+}

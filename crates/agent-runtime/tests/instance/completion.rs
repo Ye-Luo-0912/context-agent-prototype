@@ -50,7 +50,7 @@ async fn context_manage_admit_routes_end_to_end() {
                     summary: "ok".into(),
                     model_content: format!("step {index}: fix AuthService.rs {}", ch.repeat(160)),
                     artifact_ref: None,
-                    metadata: serde_json::json!({}),
+                    metadata: serde_json::json!({"path": "AuthService.rs"}),
                 },
                 scope_id: None,
             })

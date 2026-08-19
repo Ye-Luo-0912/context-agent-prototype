@@ -49,14 +49,38 @@ pub(crate) async fn open_focus(engine: &SimpleContextEngine, goal: &str) -> Task
 // ---------------------------------------------------------------------------
 
 pub(crate) fn observation_output(id: &str, ok: bool, content: &str) -> ToolOutput {
+    observation_touching(id, ok, content, None)
+}
+
+pub(crate) fn observation_touching(
+    id: &str,
+    ok: bool,
+    content: &str,
+    path: Option<&str>,
+) -> ToolOutput {
     ToolOutput {
         call_id: id.into(),
         tool_name: "shell.exec".into(),
         ok,
-        summary: "ok".into(),
+        summary: if ok { "ok" } else { "failed" }.into(),
         model_content: content.into(),
         artifact_ref: None,
-        metadata: serde_json::json!({}),
+        metadata: match path {
+            Some(path) => serde_json::json!({ "path": path }),
+            None => serde_json::json!({}),
+        },
+    }
+}
+
+pub(crate) fn fs_read_touching(id: &str, path: &str, body: &str) -> ToolOutput {
+    ToolOutput {
+        call_id: id.into(),
+        tool_name: "fs.read".into(),
+        ok: true,
+        summary: "read".into(),
+        model_content: body.into(),
+        artifact_ref: None,
+        metadata: serde_json::json!({ "path": path, "revision": "test-rev" }),
     }
 }
 
