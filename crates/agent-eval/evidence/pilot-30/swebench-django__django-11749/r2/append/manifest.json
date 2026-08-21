@@ -1,0 +1,14 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "fixture_id": "swebench-django__django-11749",
+  "engine": "append",
+  "repeat": 2,
+  "repeats": 3,
+  "live": true,
+  "fixture_sha256": "4177616e021ed6700f0ccd2f9ca566ba898a507550d6e4e7035e351814c6cf4b",
+  "git_head": "848f8a7e0b754b432a7e30099555d6bd8f2a1962",
+  "git_dirty": true,
+  "git_dirty_sha256": "058d6dcfd3a5e6280408e78d5cc6ecf901bafee90505164030039b4a6816b35b",
+  "openai_model": "gpt-5.6-luna",
+  "openai_base_url": "https://api.pinaic.com/v1"
+}

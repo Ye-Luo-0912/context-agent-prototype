@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 6,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 3,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "799b48f323f40915463696ae9335af5033224970dbb8fcecd186408358972b25",
+      "bytes": 2318,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    if let Some(body) = bytes.strip_prefix(\"{\\\"v\\\":2,\\\"hello\\\":\\\"\") {\n        if let Some(body) = body.strip_suffix(\"\\\"}\") {\n            return Ok(Msg::Hello(unescape(body)?));\n        }\n    }\n    if bytes.contains(\"ping\") {\n        return Ok(Msg::Ping);\n    }\n    Err(\"unknown\".into())\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"ping\".into(),\n        Msg::Hello(value) => format!(r#\"{{\"v\":2,\"hello\":\"{}\"}}\"#, escape(value)),\n    }\n}\n\nfn escape(value: &str) -> String {\n    let mut escaped = String::with_capacity(value.len());\n    for character in value.chars() {\n        match character {\n            '\\\\' => escaped.push_str(\"\\\\\\\\\"),\n            '\"' => escaped.push_str(\"\\\\\\\"\"),\n            '\\n' => escaped.push_str(\"\\\\n\"),\n            '\\r' => escaped.push_str(\"\\\\r\"),\n            '\\t' => escaped.push_str(\"\\\\t\"),\n            character => escaped.push(character),\n        }\n    }\n    escaped\n}\n\nfn unescape(value: &str) -> Result<String, String> {\n    let mut result = String::with_capacity(value.len());\n    let mut escaped = false;\n    for character in value.chars() {\n        if escaped {\n            result.push(match character {\n                '\\\\' => '\\\\',\n                '\"' => '\"',\n                'n' => '\\n',\n                'r' => '\\r',\n                't' => '\\t',\n                _ => return Err(\"unknown\".into()),\n            });\n            escaped = false;\n        } else if character == '\\\\' {\n            escaped = true;\n        } else {\n            result.push(character);\n        }\n    }\n    if escaped {\n        return Err(\"unknown\".into());\n    }\n    Ok(result)\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn ping_encode_roundtrip() {\n        let encoded = encode(&Msg::Ping);\n        assert!(matches!(decode(&encoded), Ok(Msg::Ping)));\n    }\n\n    #[test]\n    fn hello_uses_v2_envelope() {\n        assert_eq!(encode(&Msg::Hello(\"world\".into())), r#\"{\"v\":2,\"hello\":\"world\"}\"#);\n    }\n\n    #[test]\n    fn hello_encode_roundtrip() {\n        let message = Msg::Hello(\"hello, \\\"world\\\"\".into());\n        let encoded = encode(&message);\n        assert!(matches!(decode(&encoded), Ok(Msg::Hello(value)) if value == \"hello, \\\"world\\\"\"));\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmp9PHzgv\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

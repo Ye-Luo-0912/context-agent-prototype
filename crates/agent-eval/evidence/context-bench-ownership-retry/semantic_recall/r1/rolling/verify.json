@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 2,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "5fb28ca7e3bdf1e8e8417fdaa52416575bf3d5fe9c052badf59c284244c6551a",
+      "bytes": 290,
+      "truncated": false,
+      "body": "pub enum Msg {\r\n    Ping,\r\n}\r\n\r\npub fn decode(bytes: &str) -> Result<Msg, String> {\r\n    if bytes.contains(\"ping\") {\r\n        return Ok(Msg::Ping);\r\n    }\r\n    Err(\"unknown\".into())\r\n}\r\n\r\npub fn encode(msg: &Msg) -> String {\r\n    match msg {\r\n        Msg::Ping => \"ping\".into(),\r\n    }\r\n}\r\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpWW1NFl\\rolling"
+      ],
+      "expect_exit": 0,
+      "exit": 1,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "wire_v1 failed",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

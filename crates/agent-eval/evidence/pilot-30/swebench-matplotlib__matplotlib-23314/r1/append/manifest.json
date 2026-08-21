@@ -1,0 +1,14 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "fixture_id": "swebench-matplotlib__matplotlib-23314",
+  "engine": "append",
+  "repeat": 1,
+  "repeats": 3,
+  "live": true,
+  "fixture_sha256": "73618457d1716d615cf311ae9e4b7c8ed4fe5705f77a6d424d30c3219e0687d1",
+  "git_head": "848f8a7e0b754b432a7e30099555d6bd8f2a1962",
+  "git_dirty": true,
+  "git_dirty_sha256": "41789802117d691ad0b04d4db61b758f237ea4940fb1c466598aa4db82bb756d",
+  "openai_model": "gpt-5.6-luna",
+  "openai_base_url": "https://api.pinaic.com/v1"
+}

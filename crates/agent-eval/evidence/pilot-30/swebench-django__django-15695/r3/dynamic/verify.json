@@ -1,0 +1,25 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "hidden_command",
+  "fixture_id": "swebench-django__django-15695",
+  "expected_edit": "",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [],
+  "files": [],
+  "commands": [
+    {
+      "argv": [
+        "evaluate"
+      ],
+      "expect_exit": 0,
+      "exit": null,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "skipped swebench docker: turn 1 failed: live model-round cap (12) exceeded",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

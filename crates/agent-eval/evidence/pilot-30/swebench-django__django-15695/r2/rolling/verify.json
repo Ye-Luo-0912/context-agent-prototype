@@ -1,0 +1,25 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "hidden_command",
+  "fixture_id": "swebench-django__django-15695",
+  "expected_edit": "",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [],
+  "files": [],
+  "commands": [
+    {
+      "argv": [
+        "evaluate"
+      ],
+      "expect_exit": 0,
+      "exit": null,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "skipped swebench docker: turn 1 failed: runtime error: model input exceeds the provider window even with the context frame emptied and optional tool schemas omitted for this round (21659 > 19904 input tokens); refusing to send",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

@@ -1,0 +1,113 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "error",
+  "error": "op 3 failed: runtime error: transport error (retryable=true): stream error: error decoding response body",
+  "passed": false,
+  "wall_ms": 372244,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 367,
+  "model_started": 11,
+  "model_used": 10,
+  "usage_incomplete": true,
+  "workspace_sha256": "d2f05c942e67336b1d37411c22d76f55dce5cf17cb6096b92ed240310c4ce736",
+  "workspace_files": 30,
+  "tools": [
+    {
+      "name": "context.manage",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "edit.replace",
+      "calls": 2,
+      "failed": 2
+    },
+    {
+      "name": "fs.list",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 5,
+      "failed": 2
+    },
+    {
+      "name": "git.status",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 5,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 24,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 4,
+    "fetch_calls": 0,
+    "final_resident_bytes": 1649,
+    "forgotten_items": 13,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 35,
+    "materialize_rounds": 11,
+    "model_input_tokens": 67109,
+    "model_output_tokens": 2370,
+    "peak_resident_bytes": 1649,
+    "prompt_current_focus_tokens": 503,
+    "prompt_historical_context_tokens": 2804,
+    "prompt_runtime_facts_tokens": 297,
+    "prompt_system_tokens": 781,
+    "prompt_task_anchor_tokens": 550,
+    "prompt_task_progress_tokens": 0,
+    "prompt_tool_schema_tokens": 16764,
+    "prompt_turn_frame_tokens": 6829,
+    "provider_tokens_total": 69479,
+    "reactivated_tokens": 220,
+    "reactivation_consumed": 4,
+    "reactivation_consumed_tokens": 220,
+    "reactivation_events": 4,
+    "reactivation_file_observation_consumed": 0,
+    "reactivation_file_observation_selected": 0,
+    "reactivation_selected": 4,
+    "reactivation_selected_tokens": 220,
+    "reactivation_tool_observation_consumed": 4,
+    "reactivation_tool_observation_selected": 4,
+    "recovered_items": 4,
+    "recovery_auto_reactivation": 4,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 9,
+    "recovery_workspace_reread": 2,
+    "repeated_fs_reads": 2,
+    "rounds": 11,
+    "schema_tokens_total": 16764,
+    "search_calls": 2,
+    "search_empty": 2,
+    "search_hits": 0,
+    "search_ms_p50": 3,
+    "search_ms_p95": 3,
+    "tool_calls": 21,
+    "tool_failure_classes": {
+      "no_exact_match": 1,
+      "path_not_found": 2,
+      "stale_revision": 1
+    },
+    "turns": 3,
+    "unique_reactivated": 4
+  }
+}

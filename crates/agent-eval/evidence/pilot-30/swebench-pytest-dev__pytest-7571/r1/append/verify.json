@@ -1,0 +1,40 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "hidden_command",
+  "fixture_id": "swebench-pytest-dev__pytest-7571",
+  "expected_edit": "",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [],
+  "files": [],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\scripts/run_swebench_gold.py",
+        "--dataset_name",
+        "princeton-nlp/SWE-bench_Verified",
+        "--predictions_path",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\../../target/swebench-eval\\pilot-pytest-dev__pytest-7571-append-r1.jsonl",
+        "--max_workers",
+        "1",
+        "--instance_ids",
+        "pytest-dev__pytest-7571",
+        "--run_id",
+        "pilot-pytest-dev__pytest-7571-append-r1",
+        "--cache_level",
+        "env",
+        "--namespace",
+        "swebench"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "No instances to run.\r\nCleaning cached images...\r\nRemoved 0 images.\r\nTotal instances: 1\r\nInstances submitted: 1\r\nInstances completed: 0\r\nInstances incomplete: 0\r\nInstances resolved: 0\r\nInstances unresolved: 0\r\nInstances with empty patches: 1\r\nInstances with errors: 0\r\nUnstopped containers: 0\r\nUnremoved images: 0\r\nReport written to agent-eval-pilot.pilot-pytest-dev__pytest-7571-append-r1.json\r\n",
+      "stderr": "<frozen runpy>:128: RuntimeWarning: 'swebench.harness.run_evaluation' found in sys.modules after import of package 'swebench.harness', but prior to execution of 'swebench.harness.run_evaluation'; this may result in unpredictable behaviour\r\n2026-08-15 05:23:36,856 - httpx - INFO - HTTP Request: HEAD https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified/resolve/main/README.md \"HTTP/1.1 307 Temporary Redirect\"\r\n2026-08-15 05:23:36,901 - httpx - INFO - HTTP Request: HEAD https://huggingface.co/api/resolve-cache/datasets/princeton-nlp/SWE-bench_Verified/c104f840cc67f8b6eec6f759ebc8b2693d585d4a/README.md \"HTTP/1.1 200 OK\"\r\n2026-08-15 05:23:37,155 - httpx - INFO - HTTP Request: HEAD https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified/resolve/c104f840cc67f8b6eec6f759ebc8b2693d585d4a/SWE-bench_Verified.py \"HTTP/1.1 404 Not Found\"\r\n2026-08-15 05:23:37,976 - httpx - INFO - HTTP Request: HEAD https://s3.amazonaws.com/datasets.huggingface.co/datasets/datasets/princeton-nlp/SWE-bench_Verified/princeton-nlp/SWE-bench_Verified.py \"HTTP/1.1 404 Not Found\"\r\n2026-08-15 05:23:38,225 - httpx - INFO - HTTP Request: GET https://huggingface.co/api/datasets/princeton-nlp/SWE-bench_Verified/revision/c104f840cc67f8b6eec6f759ebc8b2693d585d4a \"HTTP/1.1 200 OK\"\r\n2026-08-15 05:23:38,479 - httpx - INFO - HTTP Request: HEAD https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified/resolve/c104f840cc67f8b6eec6f759ebc8b2693d585d4a/.huggingface.yaml \"HTTP/1.1 404 Not Found\"\r\nWarning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\r\n2026-08-15 05:23:38,480 - huggingface_hub.utils._http - WARNING - Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\r\n2026-08-15 05:23:38,882 - httpx - INFO - HTTP Request: GET https://datasets-server.huggingface.co/info?dataset=princeton-nlp/SWE-bench_Verified \"HTTP/1.1 200 OK\"\r\n2026-08-15 05:23:39,147 - httpx - INFO - HTTP Request: GET https://huggingface.co/api/datasets/princeton-nlp/SWE-bench_Verified/tree/c104f840cc67f8b6eec6f759ebc8b2693d585d4a/data?recursive=true&expand=false \"HTTP/1.1 200 OK\"\r\n2026-08-15 05:23:39,402 - httpx - INFO - HTTP Request: GET https://huggingface.co/api/datasets/princeton-nlp/SWE-bench_Verified/tree/c104f840cc67f8b6eec6f759ebc8b2693d585d4a?recursive=false&expand=false \"HTTP/1.1 200 OK\"\r\n2026-08-15 05:23:39,690 - httpx - INFO - HTTP Request: HEAD https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified/resolve/c104f840cc67f8b6eec6f759ebc8b2693d585d4a/dataset_infos.json \"HTTP/1.1 404 Not Found\"\r\n2026-08-15 05:23:40,175 - httpx - INFO - HTTP Request: HEAD https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified/resolve/main/README.md \"HTTP/1.1 307 Temporary Redirect\"\r\n2026-08-15 05:23:40,220 - httpx - INFO - HTTP Request: HEAD https://huggingface.co/api/resolve-cache/datasets/princeton-nlp/SWE-bench_Verified/c104f840cc67f8b6eec6f759ebc8b2693d585d4a/README.md \"HTTP/1.1 200 OK\"\r\n2026-08-15 05:23:40,479 - httpx - INFO - HTTP Request: HEAD https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified/resolve/c104f840cc67f8b6eec6f759ebc8b2693d585d4a/SWE-bench_Verified.py \"HTTP/1.1 404 Not Found\"\r\n2026-08-15 05:23:40,734 - httpx - INFO - HTTP Request: HEAD https://s3.amazonaws.com/datasets.huggingface.co/datasets/datasets/princeton-nlp/SWE-bench_Verified/princeton-nlp/SWE-bench_Verified.py \"HTTP/1.1 404 Not Found\"\r\n2026-08-15 05:23:41,046 - httpx - INFO - HTTP Request: HEAD https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified/resolve/c104f840cc67f8b6eec6f759ebc8b2693d585d4a/.huggingface.yaml \"HTTP/1.1 404 Not Found\"\r\n2026-08-15 05:23:41,311 - httpx - INFO - HTTP Request: GET https://datasets-server.huggingface.co/info?dataset=princeton-nlp/SWE-bench_Verified \"HTTP/1.1 200 OK\"\r\n2026-08-15 05:23:41,567 - httpx - INFO - HTTP Request: HEAD https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified/resolve/c104f840cc67f8b6eec6f759ebc8b2693d585d4a/dataset_infos.json \"HTTP/1.1 404 Not Found\"\r\n",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

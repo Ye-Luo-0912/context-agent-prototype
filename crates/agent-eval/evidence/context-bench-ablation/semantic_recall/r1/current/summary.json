@@ -1,0 +1,109 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "error",
+  "error": "op 2 failed: runtime error: transport error (retryable=false): HTTP 400: {\"error\":{\"message\":\"Upstream request failed\",\"type\":\"invalid_request_error\"}}",
+  "passed": false,
+  "wall_ms": 56974,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 276,
+  "model_started": 8,
+  "model_used": 7,
+  "usage_incomplete": true,
+  "workspace_sha256": "f0e949776d8c623b951ffcd2a836e41e59a4d3942d46152fa20777d6f96af1ec",
+  "workspace_files": 30,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "context.manage",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "fs.list",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 5,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 0,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 1,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 0,
+    "fetch_calls": 0,
+    "final_resident_bytes": 819,
+    "forgotten_items": 10,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 25,
+    "materialize_rounds": 8,
+    "model_input_tokens": 50932,
+    "model_output_tokens": 1582,
+    "peak_resident_bytes": 819,
+    "prompt_current_focus_tokens": 460,
+    "prompt_historical_context_tokens": 224,
+    "prompt_runtime_facts_tokens": 216,
+    "prompt_system_tokens": 568,
+    "prompt_task_anchor_tokens": 400,
+    "prompt_task_progress_tokens": 0,
+    "prompt_tool_schema_tokens": 12192,
+    "prompt_turn_frame_tokens": 10280,
+    "provider_tokens_total": 52514,
+    "reactivated_tokens": 0,
+    "reactivation_consumed": 0,
+    "reactivation_consumed_tokens": 0,
+    "reactivation_events": 0,
+    "reactivation_file_observation_consumed": 0,
+    "reactivation_file_observation_selected": 0,
+    "reactivation_selected": 0,
+    "reactivation_selected_tokens": 0,
+    "reactivation_tool_observation_consumed": 0,
+    "reactivation_tool_observation_selected": 0,
+    "recovered_items": 0,
+    "recovery_auto_reactivation": 0,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 10,
+    "recovery_workspace_reread": 0,
+    "repeated_fs_reads": 0,
+    "rounds": 8,
+    "schema_tokens_total": 12192,
+    "search_calls": 3,
+    "search_empty": 1,
+    "search_hits": 5,
+    "search_ms_p50": 3,
+    "search_ms_p95": 4,
+    "tool_calls": 14,
+    "tool_failure_classes": {},
+    "turns": 2,
+    "unique_reactivated": 0
+  }
+}

@@ -1,0 +1,111 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "error",
+  "error": "op 8 failed: runtime error: transport error (retryable=true): HTTP 502: {\"error\":{\"message\":\"Upstream service temporarily unavailable\",\"type\":\"upstream_error\"}}",
+  "passed": false,
+  "wall_ms": 550571,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 2645,
+  "model_started": 73,
+  "model_used": 72,
+  "usage_incomplete": true,
+  "workspace_sha256": "c709c20874f72a78c3dd8c4e9c72eae76f2cd558e458650494a336338998862b",
+  "workspace_files": 30,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "context.manage",
+      "calls": 8,
+      "failed": 0
+    },
+    {
+      "name": "edit.replace",
+      "calls": 16,
+      "failed": 9
+    },
+    {
+      "name": "fs.list",
+      "calls": 11,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 17,
+      "failed": 0
+    },
+    {
+      "name": "fs.write",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 6,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 7,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 6,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 20,
+      "failed": 4
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 758,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 3,
+    "admit_calls": 0,
+    "compaction_input_tokens": 33320,
+    "compaction_output_tokens": 921,
+    "failed_tool_outputs": 13,
+    "fetch_calls": 0,
+    "final_resident_bytes": 7115,
+    "forgotten_items": 63,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 208,
+    "materialize_rounds": 73,
+    "model_input_tokens": 818591,
+    "model_output_tokens": 16573,
+    "peak_resident_bytes": 7115,
+    "provider_tokens_total": 869405,
+    "recovered_items": 22,
+    "recovery_auto_reactivation": 21,
+    "recovery_explicit_search": 1,
+    "recovery_failed": 41,
+    "recovery_workspace_reread": 16,
+    "repeated_fs_reads": 16,
+    "rounds": 73,
+    "schema_tokens_total": 111252,
+    "search_calls": 9,
+    "search_empty": 6,
+    "search_hits": 7,
+    "search_ms_p50": 3,
+    "search_ms_p95": 4,
+    "tool_calls": 96,
+    "tool_failure_classes": {
+      "missing_project_marker": 3,
+      "no_exact_match": 1,
+      "no_search_match": 2,
+      "process_exit": 1,
+      "stale_revision": 8
+    },
+    "turns": 8
+  }
+}

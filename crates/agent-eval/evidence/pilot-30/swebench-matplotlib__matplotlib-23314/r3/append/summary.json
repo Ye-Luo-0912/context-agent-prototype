@@ -1,0 +1,77 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "error",
+  "error": "turn 1 failed: live model-round cap (12) exceeded",
+  "passed": false,
+  "wall_ms": 123711,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 587,
+  "model_started": 13,
+  "model_used": 12,
+  "usage_incomplete": true,
+  "workspace_sha256": "14a4f6df3be6b86ef475b5107f086bc2517a09b50052970bda06f68188333ffb",
+  "workspace_files": 4474,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "edit.patch",
+      "calls": 1,
+      "failed": 1
+    },
+    {
+      "name": "edit.replace",
+      "calls": 1,
+      "failed": 1
+    },
+    {
+      "name": "fs.list",
+      "calls": 5,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 8,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 8,
+      "failed": 2
+    },
+    {
+      "name": "shell.exec",
+      "calls": 1,
+      "failed": 1
+    }
+  ],
+  "metrics": {
+    "failed_tool_outputs": 5,
+    "final_resident_bytes": 1891,
+    "forgotten_items": 0,
+    "lifecycle_transitions": 0,
+    "materialize_rounds": 13,
+    "model_input_tokens": 183813,
+    "model_output_tokens": 2255,
+    "peak_resident_bytes": 1891,
+    "recovered_items": 0,
+    "repeated_fs_reads": 2,
+    "rounds": 13,
+    "schema_tokens_total": 19958,
+    "search_calls": 2,
+    "search_empty": 1,
+    "search_hits": 16,
+    "tool_calls": 28,
+    "turns": 1
+  }
+}

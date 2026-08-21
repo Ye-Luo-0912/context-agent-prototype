@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "error",
+  "error": "turn 1 failed: runtime error: model input exceeds the provider window even with the context frame emptied and optional tool schemas omitted for this round (20361 > 19904 input tokens); refusing to send",
+  "passed": false,
+  "wall_ms": 51018,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 190,
+  "model_started": 7,
+  "model_used": 7,
+  "usage_incomplete": false,
+  "workspace_sha256": "fffa245b8f33cb5884962bfb24697fa0d218d16613b780fb503a4d89c8845d91",
+  "workspace_files": 6424,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 2,
+      "failed": 1
+    },
+    {
+      "name": "fs.list",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 7,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 6,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "failed_tool_outputs": 1,
+    "final_resident_bytes": 1362,
+    "forgotten_items": 0,
+    "lifecycle_transitions": 0,
+    "materialize_rounds": 8,
+    "model_input_tokens": 81093,
+    "model_output_tokens": 986,
+    "peak_resident_bytes": 1362,
+    "recovered_items": 0,
+    "repeated_fs_reads": 2,
+    "rounds": 8,
+    "schema_tokens_total": 11488,
+    "search_calls": 1,
+    "search_empty": 1,
+    "search_hits": 0,
+    "tool_calls": 16,
+    "turns": 1
+  }
+}

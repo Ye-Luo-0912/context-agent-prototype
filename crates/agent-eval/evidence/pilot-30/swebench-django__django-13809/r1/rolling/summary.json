@@ -1,0 +1,62 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "error",
+  "error": "turn 1 failed: live model-round cap (12) exceeded",
+  "passed": false,
+  "wall_ms": 141505,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 676,
+  "model_started": 13,
+  "model_used": 12,
+  "usage_incomplete": true,
+  "workspace_sha256": "50c19fa15fdc89f9ae969fda169e4c837af4c885de9fa4becdec7631a9173d1e",
+  "workspace_files": 6444,
+  "tools": [
+    {
+      "name": "edit.replace",
+      "calls": 6,
+      "failed": 6
+    },
+    {
+      "name": "fs.list",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 12,
+      "failed": 2
+    },
+    {
+      "name": "search.grep",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 1,
+      "failed": 1
+    }
+  ],
+  "metrics": {
+    "failed_tool_outputs": 9,
+    "final_resident_bytes": 559,
+    "forgotten_items": 0,
+    "lifecycle_transitions": 1,
+    "materialize_rounds": 13,
+    "model_input_tokens": 214091,
+    "model_output_tokens": 3161,
+    "peak_resident_bytes": 559,
+    "recovered_items": 0,
+    "repeated_fs_reads": 6,
+    "rounds": 13,
+    "schema_tokens_total": 18668,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "tool_calls": 23,
+    "turns": 1
+  }
+}

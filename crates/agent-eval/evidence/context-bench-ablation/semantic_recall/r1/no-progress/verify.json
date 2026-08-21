@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "66fec32b88468626d5839023a3afe60d227e40d6ed0aa1b80cdfd4e12ca1cad6",
+      "bytes": 561,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n}\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    if bytes.contains(\"ping\") {\n        return Ok(Msg::Ping);\n    }\n    Err(\"unknown\".into())\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"ping\".into(),\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{decode, encode, Msg};\n\n    fn ping_encode_roundtrip() {\n        let encoded = encode(&Msg::Ping);\n        assert!(matches!(decode(&encoded), Ok(Msg::Ping)));\n    }\n\n    #[test]\n    fn ping_roundtrips() {\n        ping_encode_roundtrip();\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpfSxxpD\\no-progress"
+      ],
+      "expect_exit": 0,
+      "exit": 1,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "wire_v1 failed",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

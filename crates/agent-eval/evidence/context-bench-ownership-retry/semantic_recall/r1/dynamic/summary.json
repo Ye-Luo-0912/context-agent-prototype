@@ -1,0 +1,77 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "error",
+  "error": "op 1 failed: runtime error: transport error (retryable=true): HTTP 503: {\"error\":{\"message\":\"Service temporarily unavailable\",\"type\":\"api_error\"}}",
+  "passed": false,
+  "wall_ms": 20492,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 69,
+  "model_started": 3,
+  "model_used": 2,
+  "usage_incomplete": true,
+  "workspace_sha256": "b376500a7f4d452315a092a3048a35f97f33cb58e384475e08c3d7120f5b0bb2",
+  "workspace_files": 28,
+  "tools": [
+    {
+      "name": "fs.list",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 2,
+      "failed": 1
+    },
+    {
+      "name": "git.status",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 2,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 0,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 1,
+    "fetch_calls": 0,
+    "final_resident_bytes": 176,
+    "forgotten_items": 0,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 0,
+    "materialize_rounds": 3,
+    "model_input_tokens": 11946,
+    "model_output_tokens": 319,
+    "peak_resident_bytes": 176,
+    "provider_tokens_total": 12265,
+    "recovered_items": 0,
+    "recovery_auto_reactivation": 0,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 0,
+    "recovery_workspace_reread": 0,
+    "repeated_fs_reads": 0,
+    "rounds": 3,
+    "schema_tokens_total": 4572,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "search_ms_p50": 0,
+    "search_ms_p95": 0,
+    "tool_calls": 7,
+    "tool_failure_classes": {
+      "path_not_found": 1
+    },
+    "turns": 1
+  }
+}

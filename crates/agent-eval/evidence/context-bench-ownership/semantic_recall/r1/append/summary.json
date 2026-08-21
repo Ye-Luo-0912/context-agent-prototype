@@ -1,0 +1,70 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "error",
+  "error": "op 1 failed: runtime error: transport error (retryable=true): HTTP 502: {\"error\":{\"message\":\"Upstream service temporarily unavailable\",\"type\":\"upstream_error\"}}",
+  "passed": false,
+  "wall_ms": 10191,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 31,
+  "model_started": 2,
+  "model_used": 1,
+  "usage_incomplete": true,
+  "workspace_sha256": "1c58a1c21797a8e91aa231c1f0d63e0097c0a7a93b532b9cee006b07fd254e1d",
+  "workspace_files": 28,
+  "tools": [
+    {
+      "name": "fs.list",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 1,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 0,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 0,
+    "fetch_calls": 0,
+    "final_resident_bytes": 176,
+    "forgotten_items": 0,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 0,
+    "materialize_rounds": 2,
+    "model_input_tokens": 5889,
+    "model_output_tokens": 129,
+    "peak_resident_bytes": 176,
+    "provider_tokens_total": 6018,
+    "recovered_items": 0,
+    "recovery_auto_reactivation": 0,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 0,
+    "recovery_workspace_reread": 0,
+    "repeated_fs_reads": 0,
+    "rounds": 2,
+    "schema_tokens_total": 3048,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "search_ms_p50": 0,
+    "search_ms_p95": 0,
+    "tool_calls": 3,
+    "tool_failure_classes": {},
+    "turns": 1
+  }
+}

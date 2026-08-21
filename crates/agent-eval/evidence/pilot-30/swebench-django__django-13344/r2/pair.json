@@ -1,0 +1,27 @@
+{
+  "analysis_schema": "agent-eval.analysis.v2",
+  "arm_order": [
+    "rolling",
+    "append",
+    "dynamic"
+  ],
+  "cells": [
+    {
+      "dir": "rolling",
+      "engine": "rolling"
+    },
+    {
+      "dir": "append",
+      "engine": "append"
+    },
+    {
+      "dir": "dynamic",
+      "engine": "dynamic"
+    }
+  ],
+  "fixture_id": "swebench-django__django-13344",
+  "live": true,
+  "repeat": 2,
+  "repeats": 3,
+  "schema": "agent-eval.pair.v1"
+}

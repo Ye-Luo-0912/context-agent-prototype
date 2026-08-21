@@ -1,0 +1,27 @@
+{
+  "analysis_schema": "agent-eval.analysis.v2",
+  "arm_order": [
+    "append",
+    "rolling",
+    "dynamic"
+  ],
+  "cells": [
+    {
+      "dir": "append",
+      "engine": "append"
+    },
+    {
+      "dir": "rolling",
+      "engine": "rolling"
+    },
+    {
+      "dir": "dynamic",
+      "engine": "dynamic"
+    }
+  ],
+  "fixture_id": "swebench-pytest-dev__pytest-6202",
+  "live": true,
+  "repeat": 3,
+  "repeats": 3,
+  "schema": "agent-eval.pair.v1"
+}

@@ -1,0 +1,124 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "error",
+  "error": "op 6 failed: runtime error: transport error (retryable=false): HTTP 400: {\"error\":{\"message\":\"Upstream request failed\",\"type\":\"invalid_request_error\"}}",
+  "passed": false,
+  "wall_ms": 117375,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 1069,
+  "model_started": 19,
+  "model_used": 18,
+  "usage_incomplete": true,
+  "workspace_sha256": "e07f65841eafce3fe4729f744f91f06bf12f8ff2acc838b132bf205f2fd7a524",
+  "workspace_files": 30,
+  "tools": [
+    {
+      "name": "context.manage",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "edit.replace",
+      "calls": 2,
+      "failed": 2
+    },
+    {
+      "name": "fs.list",
+      "calls": 4,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 5,
+      "failed": 1
+    },
+    {
+      "name": "fs.write",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 7,
+      "failed": 1
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 55,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 4,
+    "fetch_calls": 0,
+    "final_resident_bytes": 1397,
+    "forgotten_items": 30,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 80,
+    "materialize_rounds": 19,
+    "model_input_tokens": 123648,
+    "model_output_tokens": 3778,
+    "peak_resident_bytes": 1856,
+    "prompt_current_focus_tokens": 793,
+    "prompt_historical_context_tokens": 5508,
+    "prompt_runtime_facts_tokens": 513,
+    "prompt_system_tokens": 1349,
+    "prompt_task_anchor_tokens": 950,
+    "prompt_task_progress_tokens": 0,
+    "prompt_tool_schema_tokens": 28956,
+    "prompt_turn_frame_tokens": 11336,
+    "provider_tokens_total": 127426,
+    "reactivated_tokens": 404,
+    "reactivation_consumed": 4,
+    "reactivation_consumed_tokens": 220,
+    "reactivation_events": 8,
+    "reactivation_file_observation_consumed": 0,
+    "reactivation_file_observation_selected": 0,
+    "reactivation_selected": 4,
+    "reactivation_selected_tokens": 220,
+    "reactivation_tool_observation_consumed": 4,
+    "reactivation_tool_observation_selected": 4,
+    "recovered_items": 8,
+    "recovery_auto_reactivation": 8,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 22,
+    "recovery_workspace_reread": 2,
+    "repeated_fs_reads": 2,
+    "rounds": 19,
+    "schema_tokens_total": 28956,
+    "search_calls": 1,
+    "search_empty": 1,
+    "search_hits": 0,
+    "search_ms_p50": 3,
+    "search_ms_p95": 3,
+    "tool_calls": 27,
+    "tool_failure_classes": {
+      "missing_project_marker": 1,
+      "no_exact_match": 1,
+      "path_not_found": 1,
+      "stale_revision": 1
+    },
+    "turns": 6,
+    "unique_reactivated": 8
+  }
+}

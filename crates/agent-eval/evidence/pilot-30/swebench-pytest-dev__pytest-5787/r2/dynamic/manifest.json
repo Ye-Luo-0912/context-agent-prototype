@@ -1,0 +1,14 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "fixture_id": "swebench-pytest-dev__pytest-5787",
+  "engine": "dynamic",
+  "repeat": 2,
+  "repeats": 3,
+  "live": true,
+  "fixture_sha256": "dcdfb35029e44cb276408fc0644813c3214011f697eb9bbac79f4d77d95d6944",
+  "git_head": "b7ba25c203afdc85df0b8bf4c820c622a35f069d",
+  "git_dirty": true,
+  "git_dirty_sha256": "58040b548b3828783da4d0778c09f519a720ff2f4ac93f7f3b2699691cc238d9",
+  "openai_model": "gpt-5.6-luna",
+  "openai_base_url": "https://api.pinaic.com/v1"
+}

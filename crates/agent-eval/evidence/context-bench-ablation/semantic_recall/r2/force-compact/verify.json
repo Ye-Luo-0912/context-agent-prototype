@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "semantic_recall",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 3,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "2d8cd53431c31c28b4cfad50f27c496d4fedcbae6bbed1db510cdb1df66f8199",
+      "bytes": 1041,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    if bytes == \"ping\" {\n        return Ok(Msg::Ping);\n    }\n    if let Some(name) = bytes.strip_prefix(\"v:2|hello:\") {\n        return Ok(Msg::Hello(name.into()));\n    }\n    Err(\"unknown\".into())\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"ping\".into(),\n        Msg::Hello(name) => format!(\"v:2|hello:{name}\"),\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn ping_encode_roundtrip() {\n        let encoded = encode(&Msg::Ping);\n        assert!(matches!(decode(&encoded), Ok(Msg::Ping)));\n    }\n\n    #[test]\n    fn hello_encode_roundtrip() {\n        let message = Msg::Hello(\"client\".into());\n        let encoded = encode(&message);\n        assert_eq!(encoded, \"v:2|hello:client\");\n        assert!(matches!(decode(&encoded), Ok(Msg::Hello(name)) if name == \"client\"));\n    }\n\n    #[test]\n    fn unversioned_hello_is_unknown() {\n        assert!(decode(\"hello:client\").is_err());\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-bench\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmp9nrqM9\\force-compact"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}
