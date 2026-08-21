@@ -54,12 +54,33 @@ happen: no tool was retried more than a handful of times, and **no
 deterministic duplicate refusal never had an identical retry to
 refuse).
 
+## Post-run edit-contract audit (2026-08-22)
+
+The edit failures above were not all stochastic. A trace+seed replay
+across these four cells found `edit.patch` **5/5 failed** and
+`edit.replace` **8/21 failed**. All 11 `no_exact_match` refusals
+(`edit.patch` 5 + `edit.replace` 6) used a multi-line `old` value. The
+seed `src/protocol.rs` is CRLF (290 bytes; 16 CR + 16 LF), while
+`fs.read` rendered it through `str::lines()` and therefore showed the
+model LF-only text. The edit tools then matched that LF text against
+the raw CRLF string. Raw match count was zero; treating only LF/CRLF as
+equivalent made every single hunk unique, and the four-hunk patch
+applied fully in order.
+
+This is a deterministic Tool Surface contract defect, not a Context
+or GC result. The post-evidence fix preserves raw-byte revisions and
+exact whitespace matching, adapts LF/CRLF only for uniform target
+files, and preserves the target EOL on write. It was not present in
+these recorded cells; a later Tool Surface rerun is required before
+claiming a first-attempt-success improvement.
+
 ## Reading (bounded)
 
-1. The op5 loop is **stochastic model behavior, not a deterministic
-   runtime defect**: with the same task, the same production surface,
-   and the same engine, 4/4 cells completed and the previously failing
-   repeat passed at 29 rounds.
+1. Persistence of the op5 loop is stochastic: with the same task,
+   surface and engine, 4/4 cells completed and the previously failing
+   repeat passed at 29 rounds. That does **not** make the failure
+   environment clean: the LF/CRLF `no_exact_match` path above was a
+   deterministic runtime defect.
 2. These 4 cells **did not exercise the new convergence machinery**:
    no duplicate refusals fired, and no stall signature accumulated 3
    consecutive no-progress rounds. The machinery stays unproven by

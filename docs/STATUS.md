@@ -77,9 +77,28 @@ refusal), turn checkpointing (`TURN_FRAME_KEEP_EXCHANGES`). The
 late-semantic op5 reproduction ran 2026-08-21 (4 live A/C cells under
 `crates/agent-eval/evidence/context-mech-convergence/REPORT.md`): the
 48-round loop did not recur (r2 C passed in 29 rounds) and the new
-machinery fired zero times — the loop is stochastic model behavior,
-not a deterministic runtime defect. Remaining: a deterministic harness
-where the loop actually forms, not more live cells.
+machinery fired zero times. Loop persistence is stochastic, but a
+2026-08-22 replay proved the edit failure environment was not clean:
+all 11 multi-line `no_exact_match` refusals in those four cells were
+the deterministic LF-view/CRLF-raw mismatch. Remaining convergence
+work is still a deterministic harness where the loop actually forms,
+not more Context live cells.
+
+**P1 — Tool Surface edit reliability.** `edit.patch` stays the only
+production-always-loaded mutation primitive; no fuzzy matcher or
+parallel edit schema was added. The 2026-08-22 first slice landed:
+uniform LF/CRLF-aware exact matching with target-style preservation,
+constant-memory occurrence scanning, projected and workspace-enforced
+4 MiB result caps, duplicate resolved-target rejection, bounded actual
+reads, typed missing-path topology, one 1200-char multi-file success
+echo cap, and compare-before-swap conflict refusal. Existing confined
+opens, journal/durability truth, Core generation/authority fences, and
+honest partial multi-file recovery remain unchanged. Unit coverage is
+green; product acceptance is still open until versioned Tool Surface
+fixtures show higher valid-call first-attempt success and edit-to-green
+without increasing task failures, shell fallback, rounds, or latency.
+This is a V1-candidate gate in parallel with — not a replacement for —
+the M12 → M13 mainline.
 
 ## Next milestone
 
