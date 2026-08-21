@@ -73,11 +73,13 @@ Do not retune GC from it. `add_test` is Tool Surface
 **P1 — open-turn convergence evidence.** Execution Convergence first
 cut landed 2026-08-21: MOD-OBS-01 (a refused mutation is still an
 observation), MOD-PROG-01 (stall advisory + deterministic duplicate
-refusal), turn checkpointing (`TURN_FRAME_KEEP_EXCHANGES`). The open
-P1 is the live tool-loop / convergence failure the 12-cell run
-exposed; next evidence is production-surface late-semantic op5
-reproduction aimed at Tool/Execution Convergence — not 12 → 24 → 48
-context cells.
+refusal), turn checkpointing (`TURN_FRAME_KEEP_EXCHANGES`). The
+late-semantic op5 reproduction ran 2026-08-21 (4 live A/C cells under
+`crates/agent-eval/evidence/context-mech-convergence/REPORT.md`): the
+48-round loop did not recur (r2 C passed in 29 rounds) and the new
+machinery fired zero times — the loop is stochastic model behavior,
+not a deterministic runtime defect. Remaining: a deterministic harness
+where the loop actually forms, not more live cells.
 
 ## Next milestone
 

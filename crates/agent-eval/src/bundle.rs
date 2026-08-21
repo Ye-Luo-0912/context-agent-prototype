@@ -754,9 +754,16 @@ fn git_head() -> Option<String> {
     }
 }
 
+/// Pathspec that excludes the eval evidence outputs from source-identity
+/// scans: evidence bundles are run *outputs*, not tested sources. Without
+/// this, the first cell of a live run writes its own untracked evidence and
+/// every later cell's manifest would report `git_dirty=true` with a digest
+/// that changes as the run progresses (self-pollution).
+const EVIDENCE_EXCLUDE_PATHSPEC: &str = ":!crates/agent-eval/evidence";
+
 fn git_porcelain() -> Option<Vec<u8>> {
     let output = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--", EVIDENCE_EXCLUDE_PATHSPEC])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -789,8 +796,15 @@ pub(crate) fn source_tree_digest() -> Option<String> {
     }
     let head_tree = git_bytes(&["rev-parse", "HEAD^{tree}"])?;
     let tracked_diff = git_bytes(&["diff", "HEAD"]).unwrap_or_default();
-    let untracked = git_bytes(&["ls-files", "--others", "--exclude-standard", "--", "crates"])
-        .unwrap_or_default();
+    let untracked = git_bytes(&[
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "--",
+        "crates",
+        EVIDENCE_EXCLUDE_PATHSPEC,
+    ])
+    .unwrap_or_default();
     let mut hasher = Sha256::new();
     hasher.update(b"head-tree\0");
     hasher.update(&head_tree);

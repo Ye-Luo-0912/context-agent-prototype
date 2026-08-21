@@ -1,0 +1,154 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 293454,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 1457,
+  "model_started": 29,
+  "model_used": 29,
+  "usage_incomplete": false,
+  "provider_tokens_lower_bound": true,
+  "workspace_sha256": "a6c6b6ceae86fd8381a4d31e8cad4a34b7495551f3984b583c5b4f027b5d4ccd",
+  "workspace_files": 30,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 4,
+      "failed": 0
+    },
+    {
+      "name": "edit.patch",
+      "calls": 4,
+      "failed": 4
+    },
+    {
+      "name": "edit.replace",
+      "calls": 5,
+      "failed": 4
+    },
+    {
+      "name": "fs.list",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 8,
+      "failed": 1
+    },
+    {
+      "name": "fs.write",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "process.run",
+      "calls": 2,
+      "failed": 2
+    },
+    {
+      "name": "search.grep",
+      "calls": 2,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 105,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 11,
+    "fetch_calls": 0,
+    "final_resident_bytes": 1934,
+    "forgotten_items": 32,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 60,
+    "materialize_rounds": 29,
+    "model_attempts": 31,
+    "model_input_tokens": 213145,
+    "model_output_tokens": 5960,
+    "model_retries": 2,
+    "peak_resident_bytes": 1990,
+    "prompt_current_focus_tokens": 1231,
+    "prompt_historical_context_tokens": 8842,
+    "prompt_runtime_facts_tokens": 754,
+    "prompt_system_tokens": 2059,
+    "prompt_task_anchor_tokens": 754,
+    "prompt_task_progress_tokens": 2014,
+    "prompt_tool_catalog_index_tokens": 6393,
+    "prompt_tool_schema_tokens": 24237,
+    "prompt_turn_frame_tokens": 29292,
+    "provider_tokens_lower_bound": true,
+    "provider_tokens_total": 219105,
+    "reactivated_tokens": 0,
+    "reactivation_consumed": 0,
+    "reactivation_consumed_tokens": 0,
+    "reactivation_events": 0,
+    "reactivation_file_observation_consumed": 0,
+    "reactivation_file_observation_selected": 0,
+    "reactivation_selected": 0,
+    "reactivation_selected_tokens": 0,
+    "reactivation_tool_observation_consumed": 0,
+    "reactivation_tool_observation_selected": 0,
+    "recovered_items": 0,
+    "recovery_auto_reactivation": 0,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 32,
+    "recovery_workspace_reread": 6,
+    "repeated_fs_reads": 6,
+    "reread_external_descriptor": 0,
+    "reread_first_read": 2,
+    "reread_motive_body_visible_current": 0,
+    "reread_motive_changed": 0,
+    "reread_motive_checked_fresh": 0,
+    "reread_motive_descriptor_only": 6,
+    "reread_motive_first": 2,
+    "reread_motive_needs_revalidation": 0,
+    "reread_motive_stored": 0,
+    "reread_motive_warm": 0,
+    "reread_previously_selected": 0,
+    "reread_resident_unselected": 0,
+    "reread_selected_descriptor": 6,
+    "reread_stored": 0,
+    "reread_warm": 0,
+    "rounds": 29,
+    "schema_tokens_total": 24237,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "search_ms_p50": 0,
+    "search_ms_p95": 0,
+    "selected_tokens_by_kind": {
+      "assistant_message": 3856,
+      "tool_observation": 1836,
+      "user_message": 572
+    },
+    "selected_tokens_by_reason": {
+      "latest_file_body": 1836,
+      "scored": 4428
+    },
+    "selected_tokens_by_source": {
+      "assistant": 3856,
+      "tool:fs.read": 1836,
+      "user": 572
+    },
+    "selected_tokens_reactivated": 0,
+    "selected_tokens_resident": 6264,
+    "tool_calls": 28,
+    "tool_failure_classes": {
+      "missing_project_marker": 2,
+      "no_exact_match": 8,
+      "path_not_found": 1
+    },
+    "turns": 5,
+    "unique_reactivated": 0
+  }
+}

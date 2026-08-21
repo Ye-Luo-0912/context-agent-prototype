@@ -1,0 +1,143 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 120082,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 895,
+  "model_started": 17,
+  "model_used": 17,
+  "usage_incomplete": false,
+  "provider_tokens_lower_bound": false,
+  "workspace_sha256": "e04b99d0c63a9e5d523ddc7f7e0d8548e84d7185f0f84f33c7cde4ae01996dd6",
+  "workspace_files": 30,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "edit.replace",
+      "calls": 1,
+      "failed": 1
+    },
+    {
+      "name": "fs.list",
+      "calls": 4,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 6,
+      "failed": 0
+    },
+    {
+      "name": "fs.write",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "process.run",
+      "calls": 1,
+      "failed": 1
+    },
+    {
+      "name": "search.grep",
+      "calls": 1,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 0,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 2,
+    "fetch_calls": 0,
+    "final_resident_bytes": 4849,
+    "forgotten_items": 0,
+    "inspect_calls": 1,
+    "lifecycle_transitions": 0,
+    "materialize_rounds": 17,
+    "model_attempts": 17,
+    "model_input_tokens": 125255,
+    "model_output_tokens": 3401,
+    "model_retries": 0,
+    "peak_resident_bytes": 4849,
+    "prompt_current_focus_tokens": 679,
+    "prompt_historical_context_tokens": 12499,
+    "prompt_runtime_facts_tokens": 442,
+    "prompt_system_tokens": 1207,
+    "prompt_task_anchor_tokens": 442,
+    "prompt_task_progress_tokens": 949,
+    "prompt_tool_catalog_index_tokens": 3812,
+    "prompt_tool_schema_tokens": 13129,
+    "prompt_turn_frame_tokens": 10549,
+    "provider_tokens_lower_bound": false,
+    "provider_tokens_total": 128656,
+    "reactivated_tokens": 0,
+    "reactivation_consumed": 0,
+    "reactivation_consumed_tokens": 0,
+    "reactivation_events": 0,
+    "reactivation_file_observation_consumed": 0,
+    "reactivation_file_observation_selected": 0,
+    "reactivation_selected": 0,
+    "reactivation_selected_tokens": 0,
+    "reactivation_tool_observation_consumed": 0,
+    "reactivation_tool_observation_selected": 0,
+    "recovered_items": 0,
+    "recovery_auto_reactivation": 0,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 0,
+    "recovery_workspace_reread": 5,
+    "repeated_fs_reads": 5,
+    "reread_external_descriptor": 0,
+    "reread_first_read": 0,
+    "reread_motive_body_visible_current": 0,
+    "reread_motive_changed": 0,
+    "reread_motive_checked_fresh": 5,
+    "reread_motive_descriptor_only": 0,
+    "reread_motive_first": 1,
+    "reread_motive_needs_revalidation": 0,
+    "reread_motive_stored": 0,
+    "reread_motive_warm": 0,
+    "reread_previously_selected": 0,
+    "reread_resident_unselected": 0,
+    "reread_selected_descriptor": 0,
+    "reread_stored": 0,
+    "reread_warm": 0,
+    "rounds": 17,
+    "schema_tokens_total": 13129,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "search_ms_p50": 0,
+    "search_ms_p95": 0,
+    "selected_tokens_by_kind": {
+      "unknown": 8792
+    },
+    "selected_tokens_by_reason": {
+      "scored": 8792
+    },
+    "selected_tokens_by_source": {
+      "unknown": 8792
+    },
+    "selected_tokens_reactivated": 0,
+    "selected_tokens_resident": 8792,
+    "tool_calls": 18,
+    "tool_failure_classes": {
+      "missing_project_marker": 1,
+      "no_exact_match": 1
+    },
+    "turns": 5,
+    "unique_reactivated": 0
+  }
+}

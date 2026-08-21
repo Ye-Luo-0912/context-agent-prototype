@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "late_semantic_constraint",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 3,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "82a7d27aba3316f106b49518d4fe1bb100fc5f60c0adbf4712b288df4c4dca13",
+      "bytes": 1088,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    if bytes.contains(\"ping\") {\n        return Ok(Msg::Ping);\n    }\n    if let Some(value) = bytes.strip_prefix(r#\"{\"v\":2,\"hello\":\"#) {\n        if let Some(value) = value.strip_suffix(r#\"}\"#) {\n            if let Some(value) = value.strip_suffix('\"') {\n                return Ok(Msg::Hello(value.to_string()));\n            }\n        }\n    }\n    Err(\"unknown\".into())\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"ping\".into(),\n        Msg::Hello(value) => format!(r#\"{{\"v\":2,\"hello\":\"{}\"}}\"#, value),\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{decode, encode, Msg};\n\n    #[test]\n    fn ping_encode_roundtrip() {\n        assert!(matches!(decode(&encode(&Msg::Ping)), Ok(Msg::Ping)));\n    }\n\n    #[test]\n    fn hello_v2_encode_roundtrip() {\n        let msg = Msg::Hello(\"world\".into());\n        assert_eq!(encode(&msg), r#\"{\"v\":2,\"hello\":\"world\"}\"#);\n        assert!(matches!(decode(&encode(&msg)), Ok(Msg::Hello(value)) if value == \"world\"));\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-mech\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpPo2wWj\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}
