@@ -39,6 +39,7 @@ use agent_process::kill_process_tree;
 use agent_workspace::Workspace;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::path::Path;
 use tokio::fs as tokio_fs;
 use tokio::io::AsyncReadExt;
@@ -146,6 +147,140 @@ pub(crate) fn content_digest(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// The line-ending shape of the current on-disk text. Exact edits preserve
+/// a uniform target style, but deliberately leave mixed/legacy files
+/// byte-exact instead of guessing how they should be rewritten.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LineEnding {
+    None,
+    Lf,
+    CrLf,
+    Mixed,
+}
+
+impl LineEnding {
+    pub(crate) fn detect(text: &str) -> Self {
+        let bytes = text.as_bytes();
+        let mut lf = 0usize;
+        let mut crlf = 0usize;
+        let mut lone_cr = 0usize;
+        let mut index = 0usize;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\r' if bytes.get(index + 1) == Some(&b'\n') => {
+                    crlf += 1;
+                    index += 2;
+                }
+                b'\r' => {
+                    lone_cr += 1;
+                    index += 1;
+                }
+                b'\n' => {
+                    lf += 1;
+                    index += 1;
+                }
+                _ => index += 1,
+            }
+        }
+        match (lf, crlf, lone_cr) {
+            (0, 0, 0) => Self::None,
+            (0, _, 0) => Self::CrLf,
+            (_, 0, 0) => Self::Lf,
+            _ => Self::Mixed,
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Lf => "lf",
+            Self::CrLf => "crlf",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
+/// Normalize only the representation of line breaks in model-provided edit
+/// text. This is not fuzzy matching: every non-line-ending byte must still
+/// match exactly, and mixed target files stay fully byte-exact. A uniform
+/// target keeps its existing style so an LF-formatted tool argument can edit
+/// a CRLF Windows file without producing a mixed-ending result.
+pub(crate) fn normalize_edit_line_endings(text: &str, target: LineEnding) -> Cow<'_, str> {
+    match target {
+        LineEnding::CrLf => {
+            if text.contains('\n') && LineEnding::detect(text) != LineEnding::CrLf {
+                Cow::Owned(text.replace("\r\n", "\n").replace('\n', "\r\n"))
+            } else {
+                Cow::Borrowed(text)
+            }
+        }
+        LineEnding::Lf => {
+            if text.contains("\r\n") {
+                Cow::Owned(text.replace("\r\n", "\n"))
+            } else {
+                Cow::Borrowed(text)
+            }
+        }
+        LineEnding::None | LineEnding::Mixed => Cow::Borrowed(text),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExactMatch {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExactMatchError {
+    NoMatch { count: usize },
+    Ambiguous { count: usize },
+}
+
+/// Locate an exact (non-overlapping) occurrence in one scan and constant
+/// auxiliary memory. The previous implementation collected every match,
+/// which could allocate millions of offsets for a small needle in a 4 MiB
+/// file even though only one offset was needed.
+pub(crate) fn exact_match(
+    text: &str,
+    needle: &str,
+    occurrence: Option<usize>,
+) -> Result<ExactMatch, ExactMatchError> {
+    let mut count = 0usize;
+    let mut selected = None;
+    for (start, matched) in text.match_indices(needle) {
+        count += 1;
+        if occurrence == Some(count) || (occurrence.is_none() && count == 1) {
+            selected = Some((start, start + matched.len()));
+        }
+    }
+    match (occurrence, selected, count) {
+        (Some(requested), Some((start, end)), _) if requested > 0 => {
+            Ok(ExactMatch { start, end, count })
+        }
+        (Some(_), _, _) | (None, None, 0) => Err(ExactMatchError::NoMatch { count }),
+        (None, Some((start, end)), 1) => Ok(ExactMatch { start, end, count }),
+        (None, _, _) => Err(ExactMatchError::Ambiguous { count }),
+    }
+}
+
+/// Project a replacement before allocating the result. All text mutators
+/// use the same file-size ceiling for both input and output, preventing a
+/// small replace-all request from expanding into an unbounded allocation.
+pub(crate) fn projected_replacement_len(
+    current: usize,
+    old: usize,
+    new: usize,
+    replacements: usize,
+) -> Option<usize> {
+    if new >= old {
+        current.checked_add(new.checked_sub(old)?.checked_mul(replacements)?)
+    } else {
+        current.checked_sub(old.checked_sub(new)?.checked_mul(replacements)?)
+    }
+}
+
 const MAX_EDIT_CANDIDATES: usize = 3;
 const CANDIDATE_CONTEXT_LINES: usize = 2;
 const CANDIDATE_MAX_CHARS: usize = 400;
@@ -204,6 +339,99 @@ fn window_at(lines: &[&str], center: usize) -> String {
     } else {
         block
     }
+}
+
+/// Context lines shown around the changed region of an after-edit echo.
+const EDIT_ECHO_CONTEXT_LINES: usize = 3;
+/// Hard char cap for one after-edit echo. The echo is transient
+/// per-decision information — it replaces a confirm `fs.read` round, and
+/// a later same-path echo supersedes it — so the bound keeps even a
+/// whole-file rewrite from turning the success line into a second file
+/// dump. `fs.read` stays the full-body path.
+pub(crate) const EDIT_ECHO_MAX_CHARS: usize = 1200;
+
+/// Keep a model-facing fragment inside a hard character budget, including
+/// the truncation marker itself. This is shared by single- and multi-file
+/// edit receipts so adding files can never multiply an advertised cap.
+pub(crate) fn bound_chars_with_marker(text: &str, max_chars: usize, marker: &str) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let marker_len = marker.chars().count();
+    if marker_len >= max_chars {
+        return marker.chars().take(max_chars).collect();
+    }
+    let mut bounded: String = text.chars().take(max_chars - marker_len).collect();
+    bounded.push_str(marker);
+    bounded
+}
+
+/// Byte span `[start, end)` of the region that differs between the
+/// original and the updated content, expressed in the updated text.
+/// Common prefix/suffix, snapped to char boundaries.
+fn changed_span(original: &str, updated: &str) -> (usize, usize) {
+    let a = original.as_bytes();
+    let b = updated.as_bytes();
+    let mut prefix = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+    let max_suffix = a.len().min(b.len()).saturating_sub(prefix);
+    let mut suffix = 0usize;
+    while suffix < max_suffix && a[a.len() - 1 - suffix] == b[b.len() - 1 - suffix] {
+        suffix += 1;
+    }
+    while prefix > 0 && !updated.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    while suffix > 0 && !updated.is_char_boundary(updated.len() - suffix) {
+        suffix -= 1;
+    }
+    (prefix, updated.len() - suffix)
+}
+
+/// Bounded after-edit echo: a line-numbered window of the *updated*
+/// content covering everything the edit changed (plus context), rendered
+/// like the refusal candidate windows. A successful edit currently tells
+/// the model nothing about the new text, which forces a confirm
+/// `fs.read` before the next chained edit; the echo removes that round
+/// while staying transient — it is superseded by the next same-path echo
+/// and compacted with the exchange, never a residency commitment.
+pub(crate) fn edit_echo(original: &str, updated: &str, max_chars: usize) -> String {
+    let (span_start, span_end) = changed_span(original, updated);
+    if updated.lines().next().is_none() {
+        return "(file is now empty)".to_string();
+    }
+    let first_line = updated[..span_start].matches('\n').count();
+    let last_line = if span_end > span_start {
+        // Probe the byte just before the span end, snapped down to a
+        // char boundary (the span end itself may sit mid-character).
+        let mut probe = span_end - 1;
+        while probe > 0 && !updated.is_char_boundary(probe) {
+            probe -= 1;
+        }
+        updated[..probe].matches('\n').count()
+    } else {
+        first_line
+    };
+    let window_start = first_line.saturating_sub(EDIT_ECHO_CONTEXT_LINES);
+    let take = last_line + 1 + EDIT_ECHO_CONTEXT_LINES - window_start;
+    let mut out = String::new();
+    for (index, line) in updated.lines().enumerate().skip(window_start).take(take) {
+        let number = index + 1;
+        let clipped: String = line.chars().take(120).collect();
+        let rendered = format!("{number:>6} | {clipped}\n");
+        if out.chars().count() + rendered.chars().count() > max_chars {
+            out.push_str(&rendered);
+            return bound_chars_with_marker(
+                &out,
+                max_chars,
+                "… (echo truncated at cap; fs.read the path for the full body)\n",
+            );
+        }
+        out.push_str(&rendered);
+    }
+    out
 }
 
 pub(crate) fn classify_process_outcome(
@@ -613,6 +841,133 @@ mod persist_tests {
         assert!(
             child.try_wait().unwrap().is_some(),
             "a mismatched-identity child must not be left running"
+        );
+    }
+}
+
+#[cfg(test)]
+mod echo_tests {
+    use super::*;
+
+    #[test]
+    fn echo_covers_the_changed_region_with_context_and_numbers() {
+        let original = "l1\nl2\nl3\nl4\nfn b() {}\nl6\nl7\nl8\nl9\nl10\n";
+        let updated = original.replace("fn b() {}", "fn b() -> u8 { 1 }");
+        let echo = edit_echo(original, &updated, EDIT_ECHO_MAX_CHARS);
+        // The changed line (5) and its ±3 context appear, line-numbered
+        // like the fs.read / refusal renderers.
+        assert!(echo.contains("     2 | l2"), "{echo}");
+        assert!(echo.contains("     5 | fn b() -> u8 { 1 }"), "{echo}");
+        assert!(echo.contains("     8 | l8"), "{echo}");
+        // Context is bounded: lines 1 and 9 stay out of the one-line edit.
+        assert!(!echo.contains("     1 | l1"), "{echo}");
+        assert!(!echo.contains("     9 | l9"), "{echo}");
+    }
+
+    #[test]
+    fn echo_marks_truncation_and_points_to_fs_read() {
+        // One long line stays under a 200-char budget after the 120-char
+        // per-line clip, so truncation needs many changed lines to bite.
+        let original = "one\n";
+        let updated = original.replace(
+            "one",
+            &(0..60)
+                .map(|index| format!("line {index} padding padding padding\n"))
+                .collect::<String>(),
+        );
+        let echo = edit_echo(original, &updated, 200);
+        assert!(
+            echo.contains("fs.read the path for the full body"),
+            "a capped echo must point at the full-body path: {echo}"
+        );
+        assert!(
+            echo.chars().count() <= 200,
+            "the hard cap must hold: {} chars",
+            echo.chars().count()
+        );
+    }
+
+    #[test]
+    fn echo_handles_deletion_insertion_and_empty_results() {
+        // Deletion: the window centers on the point where text vanished.
+        let echo = edit_echo("a\nXX\nb\n", "a\nb\n", EDIT_ECHO_MAX_CHARS);
+        assert!(echo.contains("     2 | b"), "{echo}");
+
+        // Insertion into an empty file shows the new line.
+        let echo = edit_echo("", "hello\n", EDIT_ECHO_MAX_CHARS);
+        assert!(echo.contains("     1 | hello"), "{echo}");
+
+        // Everything deleted: no lines to show, say so.
+        let echo = edit_echo("gone\n", "", EDIT_ECHO_MAX_CHARS);
+        assert_eq!(echo, "(file is now empty)");
+    }
+
+    #[test]
+    fn echo_spans_multi_line_changes_and_multibyte_boundaries() {
+        // A multi-line replacement is covered end to end.
+        let original = "header\nbody-1\nbody-2\nbody-3\nfooter\n";
+        let updated = original.replace("body-1\nbody-2\nbody-3", "body-A\nbody-B");
+        let echo = edit_echo(original, &updated, EDIT_ECHO_MAX_CHARS);
+        assert!(echo.contains("body-A"), "{echo}");
+        assert!(echo.contains("body-B"), "{echo}");
+        assert!(echo.contains("footer"), "{echo}");
+
+        // Multibyte content never panics on char boundaries.
+        let original = "ααα\nβββ\n";
+        let updated = original.replace("βββ", "βγδ");
+        let echo = edit_echo(original, &updated, EDIT_ECHO_MAX_CHARS);
+        assert!(echo.contains("βγδ"), "{echo}");
+    }
+
+    #[test]
+    fn line_ending_normalization_is_exact_and_preserves_uniform_targets() {
+        assert_eq!(LineEnding::detect("a\r\nb\r\n"), LineEnding::CrLf);
+        assert_eq!(LineEnding::detect("a\nb\n"), LineEnding::Lf);
+        assert_eq!(LineEnding::detect("a\r\nb\n"), LineEnding::Mixed);
+        assert_eq!(LineEnding::detect("plain"), LineEnding::None);
+
+        assert_eq!(
+            normalize_edit_line_endings("a\nb\n", LineEnding::CrLf),
+            "a\r\nb\r\n"
+        );
+        assert_eq!(
+            normalize_edit_line_endings("a\r\nb\r\n", LineEnding::Lf),
+            "a\nb\n"
+        );
+        // Mixed targets are never guessed at or silently rewritten.
+        assert!(matches!(
+            normalize_edit_line_endings("a\nb", LineEnding::Mixed),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn exact_match_uses_constant_state_and_keeps_ambiguity_explicit() {
+        assert_eq!(
+            exact_match("a b a", "a", Some(2)).unwrap(),
+            ExactMatch {
+                start: 4,
+                end: 5,
+                count: 2
+            }
+        );
+        assert_eq!(
+            exact_match("a b a", "a", None),
+            Err(ExactMatchError::Ambiguous { count: 2 })
+        );
+        assert_eq!(
+            exact_match("abc", "z", None),
+            Err(ExactMatchError::NoMatch { count: 0 })
+        );
+    }
+
+    #[test]
+    fn projected_replacement_size_is_checked_before_allocation() {
+        assert_eq!(projected_replacement_len(10, 1, 3, 2), Some(14));
+        assert_eq!(projected_replacement_len(10, 3, 1, 2), Some(6));
+        assert_eq!(
+            projected_replacement_len(usize::MAX, 1, usize::MAX, 2),
+            None
         );
     }
 }

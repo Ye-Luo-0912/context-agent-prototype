@@ -981,7 +981,11 @@ to 96 chars and nested JSON-schema `description` keys are stripped.
 `capability.manage inspect` still returns the producer spec. Search ranks
 by token overlap plus a whole-phrase bonus so `"patch edit file"` hits
 `edit.patch`; it no longer requires every token *and* the concatenated
-phrase as a substring.
+phrase as a substring. Search rows are compact one-liners
+(`state<TAB>name<TAB>purpose`, purpose = first sentence of the
+description clipped to 96 chars), so one search answers "what does this
+tool do" and the model chains straight to load/invoke without a
+follow-up `inspect` per candidate.
 
 `shell.exec` binds one dialect for the whole run and names it in the schema.
 Windows prefers detected/pinned PowerShell 7, then Windows PowerShell 5.1,
@@ -995,10 +999,40 @@ Ordinary `fs.list` / `fs.read` / search / code-navigation calls hide
 `artifact.read` and VCS through `git.*`. Missing paths return a bounded
 parent/topology hint without inventing manifests.
 
-`edit.replace` accepts the `fs.read` revision as `base_revision`. Refusals
-distinguish `stale_revision`, `no_exact_match` and `ambiguous_match` and
-return the current revision plus at most three candidate regions. Matching
-stays exact. `edit.patch` remains the revision-aware multi-hunk form.
+`fs.read` reports the SHA-256 revision of the exact raw bytes plus
+`line_ending = none | lf | crlf | mixed`. `edit.replace` accepts that
+revision as `base_revision`; `edit.patch` is the revision-aware multi-hunk
+form and the single canonical mutation. Refusals distinguish
+`stale_revision`, `no_exact_match` and `ambiguous_match` and return the
+current revision plus at most three candidate regions.
+
+The matching contract is **exact after declared EOL adaptation**, never
+fuzzy. For a uniformly LF or CRLF target, model-provided `old`/`new` line
+breaks are adapted to the target style; every other byte (including spaces,
+indentation and case) must match exactly, and the written region retains the
+file's style. Mixed/legacy EOL files remain byte-exact rather than guessed.
+Matching streams positions in constant auxiliary memory; output length is
+projected before allocation and both the tool and `agent-workspace`
+enforce the 4 MiB mutation ceiling.
+
+`edit.patch` resolves and rejects duplicate target aliases, reads and
+transforms every file, and validates every hunk before staging any one of
+them. It then verifies that each transaction's captured SHA-256 still equals
+the transformed snapshot. A prepared mutation re-hashes the current target
+immediately before replace; drift returns `NotApplied` with
+`stale_revision` instead of overwriting the winner. Each replace remains
+per-file atomic. A multi-file effect still commits sequentially — it is not
+a cross-file transaction — and a later conflict/failure truthfully reports
+already-applied files as recovery work.
+
+Both edit success paths carry the new revision plus a bounded after-edit
+echo: a line-numbered window of the changed region in the *updated* bytes
+(±3 context lines, 120-char per-line clip). `edit.patch` applies one hard
+1200-character cap to the combined multi-file echo, including its
+truncation marker, so adding files cannot multiply the bound. This can
+remove a confirm `fs.read` round while remaining transient observation text
+— superseded by the next same-path echo and compacted with the exchange,
+never a residency commitment.
 
 Trusted tool results are projected at the Core output boundary. Producers may
 pass a typed class as a top-level hint; they cannot author `metadata._runtime`.
@@ -1071,17 +1105,21 @@ After the model consumes the observation, `context-simple` can drop it during `A
 
 ### P2 tool set
 
-`tool-runtime` registers eight tools behind the `Tool` trait
-(`execute(run_id, call_id, arguments, cancel)`). Every tool defines an
-explicit model-content budget and artifact policy:
+`tool-runtime` registers a bounded builtin catalog behind the `Tool` trait
+(`execute(run_id, call_id, arguments, effect_context, cancel)`). The
+round surface is the smaller always-loaded set described in §9c; catalog
+tools load on demand. Every tool defines an explicit model-content budget
+and artifact policy:
 
 | Tool | Risk | Model sees | Raw output |
 | --- | --- | --- | --- |
 | `fs.list` / `fs.read` / `fs.write` | read / write | bounded listing/content | file |
+| `artifact.read` | read | bounded artifact page | immutable artifact |
 | `search.grep` | read | ≤ 100 hits (`file:line: content`) | artifact when more |
-| `edit.replace` | write | diff + result summary | change journal |
+| `edit.patch` | write | result + revisions + one globally bounded changed-region echo | change journal |
+| `edit.replace` | write | result + revision + bounded changed-region echo | change journal |
 | `git.status` / `git.diff` | read | ≤ 12 K chars tail | artifact when truncated |
-| `shell.exec` | process | 200-line ring tail, ≤ 12 K chars | artifact (incremental append) |
+| `shell.exec` / `process.run` / `process.session` | process | bounded ring tail / session page | artifact (incremental append) |
 
 `search.grep` skips `.git`, `.focus-agent`, `target`, `node_modules`, `vendor`,
 `dist`, `build`, `.idea`, `.vscode` and caps files scanned (5000) and bytes per

@@ -22,7 +22,7 @@ use agent_contracts::{
     CapabilityTransport, Effect, RUNTIME_CONTEXT_CONTROL, ResourceDescriptor, ToolCatalogEntry,
     ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolSemanticRole,
     ToolSpec, ToolSurfaceSnapshot, WORKSPACE_READ, WORKSPACE_WRITE, WorkspaceHandle,
-    derive_effect_intent, search_tool_catalog_filtered,
+    compact_tool_purpose, derive_effect_intent, search_tool_catalog_filtered,
 };
 use agent_core::{CapabilityAdmission, CapabilityState, CapabilityStateAuthority};
 use agent_workspace::{ArtifactStoreHandle, ConfinedWorkspaceHandle, RemoteEffectAck, Workspace};
@@ -1518,6 +1518,21 @@ struct SearchArgs {
     cursor: Option<String>,
 }
 
+/// One model-facing catalog row: `state\tname\tpurpose`. The purpose
+/// line lets one search answer "what does this tool do" — the model
+/// chains straight to load/invoke instead of an extra `inspect` round
+/// per candidate. Owner stays in the metadata descriptors and the
+/// inspect card; the name keeps its position (second tab field) for
+/// cursor paging.
+fn catalog_row_line(entry: &ToolCatalogEntry) -> String {
+    format!(
+        "{}\t{}\t{}",
+        entry.state.as_str(),
+        entry.name,
+        compact_tool_purpose(&entry.description)
+    )
+}
+
 impl CapabilityAwareDispatcher {
     async fn run_search(
         &self,
@@ -1551,14 +1566,7 @@ impl CapabilityAwareDispatcher {
                 Some(workspace) => {
                     let all: String = entries
                         .iter()
-                        .map(|entry| {
-                            format!(
-                                "{}\t{}\t[{}]",
-                                entry.state.as_str(),
-                                entry.name,
-                                entry.owner
-                            )
-                        })
+                        .map(catalog_row_line)
                         .collect::<Vec<_>>()
                         .join("\n");
                     Some(
@@ -1583,17 +1591,7 @@ impl CapabilityAwareDispatcher {
         let remaining = entries.len();
         let page: Vec<_> = entries.into_iter().take(page_size).collect();
         let has_more = remaining > page.len();
-        let lines: Vec<String> = page
-            .iter()
-            .map(|entry| {
-                format!(
-                    "{}\t{}\t[{}]",
-                    entry.state.as_str(),
-                    entry.name,
-                    entry.owner
-                )
-            })
-            .collect();
+        let lines: Vec<String> = page.iter().map(catalog_row_line).collect();
         Ok(ToolOutput {
             call_id: request.call.id,
             tool_name: CAPABILITY_MANAGE.into(),

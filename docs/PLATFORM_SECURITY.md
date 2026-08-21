@@ -80,6 +80,16 @@ tool arguments → HostToolPolicy → approved intent
   → Core checks approved ⊇ actual → commit
 ```
 
+The same commit boundary carries a content TOCTOU guard. The existing
+journal keeps its bounded recovery hashes; separately,
+`Workspace::begin_mutation` captures the target's exact SHA-256 in the
+in-memory transaction. Edit tools compare it with the raw snapshot they
+transformed, and the prepared effect re-hashes the target immediately
+before atomic rename. A detected intervening write cleans the staged file
+and settles as `NotApplied` (`stale_revision`) instead of clobbering the
+winner. This content precondition complements, but does not replace, the
+generation fence or Actual ⊆ Approved authority check.
+
 `process.session` start is `ExecArgv`. Poll/stop do not spawn and cannot
 spend an argv-prefix grant. Session recovery is keyed by the **start**
 identity.

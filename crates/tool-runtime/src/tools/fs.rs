@@ -4,18 +4,19 @@ use agent_contracts::{
     AgentError, AgentResult, CancellationToken, Effect, RunId, ToolOutcome, ToolOutput, ToolRisk,
     ToolSemanticRole, ToolSpec,
 };
-use agent_workspace::Workspace;
+use agent_workspace::{MAX_MUTATION_BYTES, Workspace};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::fs;
 
 use super::{
-    Tool, content_digest, hidden_path_output, is_hidden_name, is_not_found_error,
+    LineEnding, Tool, content_digest, hidden_path_output, is_hidden_name, is_not_found_error,
     missing_path_output, ordinary_view_blocked,
 };
 
 const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_WRITE_BYTES: usize = MAX_MUTATION_BYTES;
 const MAX_READ_LINES: usize = 400;
 const MAX_LIST_ENTRIES: usize = 2_000;
 
@@ -277,7 +278,7 @@ impl Tool for FsReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "fs.read".into(),
-            description: "Read UTF-8 workspace file lines (not .focus-agent or .git).".into(),
+            description: "Read UTF-8 workspace file lines (not .focus-agent or .git), with an exact byte revision and line-ending style for safe follow-up edits.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path"],
@@ -342,11 +343,18 @@ impl Tool for FsReadTool {
 
         use tokio::io::AsyncReadExt;
         let display_path = confined.display().to_path_buf();
-        let mut file = confined.into_tokio();
+        let file = confined.into_tokio();
         let mut text = String::new();
-        file.read_to_string(&mut text)
+        file.take(MAX_READ_BYTES + 1)
+            .read_to_string(&mut text)
             .await
             .map_err(|e| AgentError::Io(format!("read {}: {e}", display_path.display())))?;
+        if text.len() as u64 > MAX_READ_BYTES {
+            return Err(AgentError::InvalidRequest(format!(
+                "file grew beyond the fs.read limit of {MAX_READ_BYTES} bytes while it was read"
+            )));
+        }
+        let line_ending = LineEnding::detect(&text);
         let lines: Vec<&str> = text.lines().collect();
         let start = args.start_line.saturating_sub(1).min(lines.len());
         let end = args.end_line.min(lines.len());
@@ -372,7 +380,8 @@ impl Tool for FsReadTool {
             metadata: json!({
                 "path": display_relative(&self.workspace, &display_path),
                 "line_count": lines.len(),
-                "bytes": metadata.len(),
+                "bytes": text.len(),
+                "line_ending": line_ending.as_str(),
                 // The content revision (SHA-256 hex): stable for the same
                 // bytes, changes with any edit — the patch tool's
                 // `base_revision` precondition is checked against this.
@@ -399,6 +408,12 @@ impl FsWriteTool {
     ) -> AgentResult<ToolOutcome> {
         let args: WriteArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("fs.write args: {e}")))?;
+        if args.content.len() > MAX_WRITE_BYTES {
+            return Err(AgentError::InvalidRequest(format!(
+                "fs.write content is {} bytes; the limit is {MAX_WRITE_BYTES} bytes",
+                args.content.len()
+            )));
+        }
         if ordinary_view_blocked(&args.path) {
             return Ok(ToolOutcome::Value(hidden_path_output(
                 call_id, "fs.write", &args.path,
@@ -434,6 +449,7 @@ impl FsWriteTool {
                 "path": relative,
                 "bytes": args.content.len(),
                 "revision": content_digest(args.content.as_bytes()),
+                "line_ending": LineEnding::detect(&args.content).as_str(),
             }),
         };
         Ok(ToolOutcome::PreparedEffect { output, effect })
@@ -451,7 +467,7 @@ impl Tool for FsWriteTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "fs.write".into(),
-            description: "Write/replace a UTF-8 text file inside the workspace.".into(),
+            description: "Write/replace a UTF-8 text file inside the workspace (maximum 4 MiB). Prefer edit.patch for existing files.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path", "content"],
@@ -666,6 +682,52 @@ mod tests {
             output.metadata["revision"].as_str().unwrap(),
             content_digest(&bytes)
         );
+    }
+
+    #[tokio::test]
+    async fn fs_read_reports_crlf_without_exposing_carriage_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("windows.txt"), b"one\r\ntwo\r\n").unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = FsReadTool::new(workspace);
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"path": "windows.txt"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("fs.read returns a value");
+        };
+        assert_eq!(output.metadata["line_ending"], "crlf");
+        assert!(!output.model_content.contains('\r'));
+        assert_eq!(
+            output.metadata["revision"],
+            content_digest(b"one\r\ntwo\r\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_write_rejects_content_over_the_real_byte_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = FsWriteTool::new(workspace);
+        let result = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"path": "too-large.txt", "content": "x".repeat(MAX_WRITE_BYTES + 1)}),
+                None,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(!dir.path().join("too-large.txt").exists());
+        assert!(!dir.path().join(".focus-agent/changes.jsonl").exists());
     }
 
     #[tokio::test]

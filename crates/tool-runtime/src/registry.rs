@@ -478,7 +478,14 @@ impl BuiltinToolDispatcher {
         let artifact_ref = if total > page_size {
             let all: String = entries
                 .iter()
-                .map(|entry| format!("{}\t{}", entry.state.as_str(), entry.name))
+                .map(|entry| {
+                    format!(
+                        "{}\t{}\t{}",
+                        entry.state.as_str(),
+                        entry.name,
+                        agent_contracts::compact_tool_purpose(&entry.description)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             Some(
@@ -495,9 +502,20 @@ impl BuiltinToolDispatcher {
         let remaining = entries.len();
         let page: Vec<_> = entries.into_iter().take(page_size).collect();
         let has_more = remaining > page.len();
+        // `state\tname\tpurpose` — the purpose line lets one search answer
+        // "what does this tool do", collapsing the browse-then-inspect
+        // round trip. The name keeps its position (second tab field) for
+        // cursor paging.
         let lines: Vec<String> = page
             .iter()
-            .map(|entry| format!("{}\t{}", entry.state.as_str(), entry.name))
+            .map(|entry| {
+                format!(
+                    "{}\t{}\t{}",
+                    entry.state.as_str(),
+                    entry.name,
+                    agent_contracts::compact_tool_purpose(&entry.description)
+                )
+            })
             .collect();
         Ok(ToolOutput {
             call_id: request.call.id,

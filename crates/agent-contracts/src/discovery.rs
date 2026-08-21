@@ -555,6 +555,20 @@ pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// One-line model-facing purpose for a catalog row: the first sentence of
+/// the description, truncated. Shared by `capability.manage` search so a
+/// discovery hit answers "what does this tool do" inline — the model
+/// chains straight to load/invoke instead of spending an `inspect` round.
+/// `capability.manage op=inspect` remains the full-card path.
+pub fn compact_tool_purpose(description: &str) -> String {
+    let trimmed = description.trim();
+    let purpose = match trimmed.find(". ") {
+        Some(idx) => &trimmed[..idx + 1],
+        None => trimmed,
+    };
+    truncate_chars(purpose, crate::MAX_TOOL_SURFACE_DESCRIPTION_CHARS)
+}
+
 /// Parse a manage-tool call into an internal discovery search, if it is
 /// one. Inspect/load/admit/fetch are not searches.
 pub fn discovery_search_from_call(

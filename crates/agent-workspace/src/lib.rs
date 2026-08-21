@@ -72,6 +72,10 @@ pub enum ChangeRecord {
 /// Old-content capture limit for `ChangeRecord::MutationPrepared` (bounded
 /// journal).
 pub const CHANGE_CAPTURE_LIMIT: usize = 256 * 1024;
+/// Hard ceiling for one ordinary workspace mutation. Large raw results
+/// belong in the artifact store; no builtin or capability handle may bypass
+/// this boundary by calling `MutationTransaction::prepare` directly.
+pub const MAX_MUTATION_BYTES: usize = 4 * 1024 * 1024;
 
 /// FNV-1a 64-bit content hash: deterministic across runs and platforms, so
 /// a journaled `before_hash`/`after_hash` can be re-derived later without a
@@ -688,6 +692,7 @@ impl Workspace {
         let mut bytes_before = 0u64;
         let mut target_existed = false;
         let mut before_hash = content_hash(&[]);
+        let mut before_revision = None;
         let mut old_content = None;
         match parent.open_existing(target_name) {
             Ok(file) => {
@@ -706,6 +711,7 @@ impl Workspace {
                     let mut file = file;
                     use std::io::Read;
                     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+                    let mut revision_hasher = Sha256::new();
                     let mut captured = if meta.len() <= CHANGE_CAPTURE_LIMIT as u64 {
                         Some(Vec::with_capacity(meta.len() as usize))
                     } else {
@@ -723,11 +729,14 @@ impl Workspace {
                             hash ^= u64::from(*byte);
                             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
                         }
+                        revision_hasher.update(&buffer[..read]);
                         if let Some(bytes) = &mut captured {
                             bytes.extend_from_slice(&buffer[..read]);
                         }
                     }
                     before_hash = format!("{hash:016x}");
+                    before_revision =
+                        Some(ContentDigest::from_bytes(revision_hasher.finalize().into()));
                     old_content = captured.and_then(|bytes| String::from_utf8(bytes).ok());
                 }
             }
@@ -746,6 +755,7 @@ impl Workspace {
             bytes_before,
             target_existed,
             before_hash,
+            before_revision,
             old_content,
             tx_id: Uuid::new_v4().to_string(),
         })
@@ -915,11 +925,22 @@ pub struct MutationTransaction {
     /// backup copy is truncated — recovery integrity must not depend on the
     /// capture limit).
     before_hash: String,
+    /// SHA-256 of the regular file captured by `begin_mutation`. Tools use
+    /// this to prove that the snapshot they transformed is the same bytes
+    /// the transaction journaled; the prepared effect retains it for a
+    /// commit-time compare-before-swap guard.
+    before_revision: Option<ContentDigest>,
     old_content: Option<String>,
     tx_id: String,
 }
 
 impl MutationTransaction {
+    /// Exact byte revision observed while beginning this transaction.
+    /// `None` means the target did not exist or was not a regular file.
+    pub fn before_revision(&self) -> Option<ContentDigest> {
+        self.before_revision
+    }
+
     /// Stage `content`: write the temporary file and record
     /// `MutationPrepared`. The target is not touched. Returns the prepared
     /// mutation the runtime commits or rolls back.
@@ -941,6 +962,12 @@ impl MutationTransaction {
         content: &[u8],
         effect_context: Option<OperationEffectContext>,
     ) -> AgentResult<PreparedMutation> {
+        if content.len() > MAX_MUTATION_BYTES {
+            return Err(AgentError::InvalidRequest(format!(
+                "workspace mutation is {} bytes; the limit is {MAX_MUTATION_BYTES} bytes",
+                content.len()
+            )));
+        }
         // The parent is already confined (with missing components created
         // through the pinned handle chain); the staged file is created
         // exclusively under that handle, so a link swap cannot redirect it.
@@ -1015,6 +1042,8 @@ impl MutationTransaction {
             finished: false,
             relative_target: self.relative,
             staged_bytes: content.len() as u64,
+            target_existed: self.target_existed,
+            before_revision: self.before_revision,
         })
     }
 
@@ -1064,6 +1093,8 @@ pub struct PreparedMutation {
     /// Core for the commit-time Actual ⊆ Approved check (MOD-AUTH-02).
     relative_target: String,
     staged_bytes: u64,
+    target_existed: bool,
+    before_revision: Option<ContentDigest>,
 }
 
 impl PreparedMutation {
@@ -1101,6 +1132,27 @@ impl PreparedMutation {
             .temp_file
             .as_ref()
             .expect("prepare created the staged file");
+        match self.target_still_matches_snapshot() {
+            Ok(true) => {}
+            Ok(false) => {
+                let reason = "stale_revision: target changed after mutation preflight; staged content was not applied";
+                if self.cleanup_staged(&temp_name) {
+                    self.record_rolled_back(reason.into()).await;
+                }
+                return EffectReceipt::NotApplied {
+                    error: reason.into(),
+                };
+            }
+            Err(error) => {
+                let reason = format!(
+                    "commit precondition could not inspect current target; staged content was not applied: {error}"
+                );
+                if self.cleanup_staged(&temp_name) {
+                    self.record_rolled_back(reason.clone()).await;
+                }
+                return EffectReceipt::NotApplied { error: reason };
+            }
+        }
         if let Err(e) = self
             .parent
             .replace_file(from, &temp_name, &self.target_name)
@@ -1144,6 +1196,40 @@ impl PreparedMutation {
         EffectReceipt::Applied {
             durability: EffectDurability::Durable,
             evidence: Some(self.tx_id.clone()),
+        }
+    }
+
+    /// Re-open through the pinned parent immediately before replace and
+    /// compare the current bytes with the snapshot captured by
+    /// `begin_mutation`. This closes the common lost-update window between
+    /// prepare and commit; a conflicting prepared edit becomes NotApplied
+    /// instead of overwriting the winner.
+    fn target_still_matches_snapshot(&self) -> io::Result<bool> {
+        use std::io::Read;
+
+        match self.parent.open_existing(&self.target_name) {
+            Ok(mut file) => {
+                if !self.target_existed {
+                    return Ok(false);
+                }
+                let metadata = file.metadata()?;
+                if !metadata.is_file() {
+                    return Ok(self.before_revision.is_none());
+                }
+                let mut hasher = Sha256::new();
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+                let current = ContentDigest::from_bytes(hasher.finalize().into());
+                Ok(self.before_revision == Some(current))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(!self.target_existed),
+            Err(error) => Err(error),
         }
     }
 
@@ -1670,6 +1756,88 @@ mod tests {
             "original",
             "the target is untouched"
         );
+    }
+
+    #[tokio::test]
+    async fn later_prepared_edit_cannot_overwrite_an_earlier_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let target = workspace.resolve_relative("notes.txt").await.unwrap();
+        fs::write(&target, "base").await.unwrap();
+
+        // Both operations observe the same base snapshot and prepare before
+        // either one commits, reproducing two concurrent agent edits.
+        let first = workspace
+            .begin_mutation("edit.patch", "patch", "notes.txt")
+            .await
+            .unwrap()
+            .prepare(b"first")
+            .await
+            .unwrap();
+        let second = workspace
+            .begin_mutation("edit.patch", "patch", "notes.txt")
+            .await
+            .unwrap()
+            .prepare(b"second")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            first.commit().await,
+            EffectReceipt::Applied { .. }
+        ));
+        let receipt = second.commit().await;
+        assert!(
+            matches!(receipt, EffectReceipt::NotApplied { ref error } if error.contains("stale_revision")),
+            "the losing prepared edit must be a typed non-application: {receipt:?}"
+        );
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "first");
+    }
+
+    #[tokio::test]
+    async fn external_change_after_prepare_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let target = workspace.resolve_relative("notes.txt").await.unwrap();
+        fs::write(&target, "base").await.unwrap();
+
+        let prepared = workspace
+            .begin_mutation("edit.patch", "patch", "notes.txt")
+            .await
+            .unwrap()
+            .prepare(b"agent")
+            .await
+            .unwrap();
+        fs::write(&target, "external").await.unwrap();
+
+        let receipt = prepared.commit().await;
+        assert!(
+            matches!(receipt, EffectReceipt::NotApplied { ref error } if error.contains("stale_revision")),
+            "external drift must prevent the replace: {receipt:?}"
+        );
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "external");
+    }
+
+    #[tokio::test]
+    async fn mutation_boundary_rejects_oversized_content_before_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let transaction = workspace
+            .begin_mutation("capability.write", "write", "large.bin")
+            .await
+            .unwrap();
+        let result = transaction
+            .prepare(&vec![b'x'; MAX_MUTATION_BYTES + 1])
+            .await;
+        assert!(result.is_err());
+        assert!(!dir.path().join("large.bin").exists());
+        assert!(!workspace.state_dir().join("changes.jsonl").exists());
+        let temp_files = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(temp_files, 0);
     }
 
     #[tokio::test]
