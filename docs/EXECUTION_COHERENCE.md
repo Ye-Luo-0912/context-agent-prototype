@@ -1,7 +1,11 @@
 # Execution Coherence V1
 
-Freeze candidate. Code: `crates/agent-runtime/src/execution/`.
-Checkpoint field is still `resume` on `TaskRecord` so old snapshots load.
+RC (release candidate). Code: `crates/agent-runtime/src/execution/`.
+The 2026-08-21 blockers — MOD-OBS-01 (refusal-as-observation),
+MOD-PROG-01 (progress / stall), turn checkpointing — landed; freeze
+re-designation waits for the next live evidence pass (production-surface
+convergence), not for new code here. Checkpoint field is still `resume`
+on `TaskRecord` so old snapshots load.
 Do not add a second task table and do not reimplement `ResumePoint`.
 
 Context packing, GC, and retrieval live in
@@ -69,11 +73,22 @@ World Facts (path@rev / errors)
 
 ### ResourceFact
 
-Bounded `path` + SHA-256 digest + `ResourceFreshness` + turn. Cap 32.
-Stamped from trusted `ResourceTouch` (`metadata.path` and
-`metadata.files[]`). Successful `fs.write` / `edit.replace` / `edit.patch`
-heat from those touches. A stamped `shell.exec` path is identity, not a
-new file body.
+Bounded `path` + SHA-256 digest + `ResourceFreshness` + turn + diagnostic
+`provenance` (`Read` / `MutationResult` / `MutationRefusal` /
+`Verification`). Cap 32. Stamped from trusted `ResourceTouch`
+(`metadata.path` and `metadata.files[]`). Successful `fs.write` /
+`edit.replace` / `edit.patch` heat from those touches. A stamped
+`shell.exec` path is identity, not a new file body.
+
+**MOD-OBS-01 — a refused mutation is still an observation.** Effect,
+observation, and attention are separate truths. A deterministic edit
+refusal (`stale_revision` / `no_exact_match` / `ambiguous_match`) read
+the target to refuse it, so its trusted `path`+`revision` stamp upserts
+a Fresh fact with provenance `MutationRefusal` — this resolves
+`NeedsRevalidation` without a model-driven re-read and updates the
+digest honestly (a real drift marks the source changed). A failed
+*read* saw nothing and stays out of the fact table. Attention is
+unchanged: failed outputs never heat the working set.
 
 ### Freshness
 
@@ -81,6 +96,10 @@ new file body.
 `MutationFootprint` (`None` / `Known(touches)` / `Unknown`).
 
 - Known touches upsert Fresh facts.
+- A deterministic refusal (`ToolFailureClass::nothing_executed()`) is
+  `NotApplied`: footprint `None`, no `workspace_revision` bump, no fact
+  staled (MOD-OBS-01). Process/timeout/cancellation/io failures keep
+  the conservative `Unknown` bump.
 - Unknown marks known facts NeedsRevalidation and may set
   `unknown_pending` on the obligation. It must not `checked_files.clear()`.
 - BeforeModel revalidates up to 8 pending facts through
@@ -130,6 +149,47 @@ When CURRENT DIRECTIVE exactly names an ExecutionState-known path
 `MaterializedContext.foreground` for this request only: Warm stays Warm,
 Stored is not Admitted. Engine packing rules are in
 [`CONTEXT_LIFECYCLE.md`](CONTEXT_LIFECYCLE.md).
+
+### Progress / stall detection (MOD-PROG-01)
+
+Every persistable tool result gets one deterministic classification in
+`observe_tool`: `Meaningful` (world changed) > `Evidence` (new/updated
+fact or verification evidence; a repeated identical verification row is
+not evidence) > `Control` (a failure row cleared) > `None`. There is no
+planner — the runtime only states what the world can prove changed.
+
+A consecutive `None` counter per operation signature
+(tool + target + failure class) resets on any progress or signature
+change. At 3 consecutive no-progress rounds, `TaskProgressView`
+carries a bounded `EXECUTION STALL` advisory line (rendered under the
+TASK PROGRESS header, never trimmed away). It is advice, not an
+execution block: the model still chooses.
+
+**Deterministic duplicate refusal.** An identical retry of a refused
+`edit.replace` / `edit.patch` — same argument digest, and every refusal
+target `path@digest` still Fresh and unchanged — is provably
+deterministic. The actor refuses it before admission with failure class
+`duplicate_no_progress` (`nothing_executed`, counts toward the stall).
+The attempt ledger is turn-scoped (`ActiveTurn`, cap 8): a new user
+directive may legitimately ask for the same edit, and facts not Fresh
+fail open to dispatch. Process/shell tools are never deduplicated —
+time and environment make them non-deterministic.
+
+### Protocol working set (turn checkpointing)
+
+The current turn is itself a working set. The wire view of `TurnFrame`
+keeps only the last `TURN_FRAME_KEEP_EXCHANGES` (6) completed tool
+exchanges; older ones compact to a bounded deterministic
+`TURN CHECKPOINT` note injected right after the user directive. Whole
+call+result groups are dropped so the wire protocol keeps every tool
+call paired with its result; the trailing (possibly in-flight) region is
+always retained. The runtime's full frame is never mutated — audit,
+`ToolFinished` events, and turn-end persistence still see every step.
+`ModelInput.turn_checkpoint` records the compacted count; token
+accounting (`PromptLayerCosts.turn_frame_tokens`) measures the wire
+view. No LLM summary is involved anywhere: the checkpoint is a pointer
+to TASK PROGRESS / artifacts / the run journal, where the compacted
+exchanges' reliable facts already live.
 
 ## ObservationMemo
 

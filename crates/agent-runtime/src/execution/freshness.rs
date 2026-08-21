@@ -7,14 +7,28 @@
 
 use agent_contracts::{MutationFootprint, ResourceFreshness, ResourceVersionOracle, ToolOutput};
 
+use super::ResourceProvenance;
 use super::state::{
-    ExecutionState, MAX_REVALIDATE_PER_ROUND, VerificationCause, VerificationCoverage, bound_item,
-    is_command_tool, operation_identity, path_mentioned_in_query, same_operation,
+    ExecutionState, MAX_REVALIDATE_PER_ROUND, RoundProgress, VerificationCause,
+    VerificationCoverage, bound_item, is_command_tool, operation_identity, path_mentioned_in_query,
+    same_operation,
 };
 
 impl ExecutionState {
     pub fn observe_tool(&mut self, output: &ToolOutput, anchor_revision: u64, turn: u64) {
         self.anchor_revision = anchor_revision;
+        // MOD-PROG-01 progress probe: capture the before-state so one
+        // deterministic classification can answer "did this round move
+        // the world or our knowledge of it?"
+        let before_world_revision = self.workspace_revision;
+        let before_files = self.checked_files.len();
+        let before_failures = self.failed_commands.len();
+        let before_verifications = self.verifications.len();
+        let before_last_evidence = self
+            .verifications
+            .last()
+            .map(|row| (row.ok, row.summary.clone()));
+        let mut observation_changed = false;
         let footprint = output.mutation_footprint();
         match &footprint {
             MutationFootprint::None => {}
@@ -36,11 +50,21 @@ impl ExecutionState {
         let identity = operation_identity(output);
         if output.ok {
             let touches = output.resource_touches();
+            // Provenance is diagnostic only: which kind of trusted
+            // observation last stamped this fact.
+            let provenance = if output.is_verification() {
+                ResourceProvenance::Verification
+            } else if output.may_mutate_workspace() {
+                ResourceProvenance::MutationResult
+            } else {
+                ResourceProvenance::Read
+            };
             for touch in &touches {
-                self.upsert_file(
+                observation_changed |= self.upsert_file(
                     &touch.path,
                     touch.revision.clone().unwrap_or_default(),
                     turn,
+                    provenance,
                 );
             }
             self.failed_commands
@@ -64,14 +88,39 @@ impl ExecutionState {
                     self.verification.coverage = VerificationCoverage::Workspace;
                 }
             }
-        } else if let Some(touch) = output.resource_touches().first() {
-            self.push_failure(
-                &identity,
-                format!("failed observation {}", touch.path),
-                turn,
-            );
-        } else if is_command_tool(&output.tool_name) {
-            self.push_failure(&identity, output.summary.clone(), turn);
+        } else {
+            // MOD-OBS-01: a refused mutation still observed the world —
+            // the tool read the target to refuse it, so its trusted
+            // path+revision stamp is real world truth even though the
+            // write did not apply. Consuming it here clears
+            // NeedsRevalidation without a model-driven re-read. A
+            // failed *read* saw nothing and stays out of the fact
+            // table.
+            if output.may_mutate_workspace() {
+                for touch in output.resource_touches() {
+                    if let Some(revision) = touch
+                        .revision
+                        .clone()
+                        .filter(|revision| !revision.is_empty())
+                    {
+                        observation_changed |= self.upsert_file(
+                            &touch.path,
+                            revision,
+                            turn,
+                            ResourceProvenance::MutationRefusal,
+                        );
+                    }
+                }
+            }
+            if let Some(touch) = output.resource_touches().first() {
+                self.push_failure(
+                    &identity,
+                    format!("failed observation {}", touch.path),
+                    turn,
+                );
+            } else if is_command_tool(&output.tool_name) {
+                self.push_failure(&identity, output.summary.clone(), turn);
+            }
         }
         if output.is_verification() && !output.ok {
             self.push_verification(
@@ -86,6 +135,28 @@ impl ExecutionState {
         }
         self.cap();
         self.refresh_validity();
+        // Deterministic progress classification (MOD-PROG-01): world
+        // change > fact/evidence gain > failure recovery > nothing.
+        // A repeated identical verification row is not new evidence.
+        let world_changed = self.workspace_revision > before_world_revision;
+        let facts_gained = observation_changed || self.checked_files.len() > before_files;
+        let evidence_gained = self.verifications.len() > before_verifications
+            && self
+                .verifications
+                .last()
+                .map(|row| (row.ok, row.summary.clone()))
+                != before_last_evidence;
+        let failure_resolved = self.failed_commands.len() < before_failures;
+        let progress = if world_changed {
+            RoundProgress::Meaningful
+        } else if facts_gained || evidence_gained {
+            RoundProgress::Evidence
+        } else if failure_resolved {
+            RoundProgress::Control
+        } else {
+            RoundProgress::None
+        };
+        self.update_stall(&identity, output.failure_class(), progress);
     }
 
     /// Runtime hash check at BeforeModel. Cap N=8; no file body enters the
@@ -125,6 +196,7 @@ impl ExecutionState {
                     }
                     self.checked_files[index].digest = bound_item(&revision);
                     self.checked_files[index].freshness = ResourceFreshness::Fresh;
+                    self.checked_files[index].provenance = ResourceProvenance::Read;
                 }
                 Ok(None) => {
                     self.checked_files[index].freshness = ResourceFreshness::Missing;

@@ -374,6 +374,34 @@ impl TaskApprovalGate {
                 }
                 true
             }
+            EffectIntent::WorkspaceWriteSet { writes } => {
+                let Some(prefix) = &grant.target.workspace_path_prefix else {
+                    return false;
+                };
+                // Every write target must be inside the grant's prefix:
+                // the first file matching a grant must never widen
+                // authority to the remaining files of the same call
+                // (MOD-AUTH-01). An empty set fails closed, and each
+                // entry's byte estimate plus the total must respect a
+                // content cap.
+                if writes.is_empty()
+                    || !writes
+                        .iter()
+                        .all(|bound| path_within_prefix(&bound.path, prefix))
+                {
+                    return false;
+                }
+                if let Some(max) = grant.constraint.max_content_bytes {
+                    let total: u64 = writes
+                        .iter()
+                        .map(|bound| bound.max_bytes)
+                        .fold(0u64, u64::saturating_add);
+                    if total > max || writes.iter().any(|bound| bound.max_bytes > max) {
+                        return false;
+                    }
+                }
+                true
+            }
             EffectIntent::ExecArgv { program, argv } => {
                 let Some(prefix) = grant.target.exec_argv_prefix.as_ref() else {
                     return false;
@@ -421,6 +449,16 @@ fn intent_label(intent: &EffectIntent) -> String {
         EffectIntent::ReadOnly => "read-only".to_string(),
         EffectIntent::WorkspaceWrite { path, .. } => {
             format!("workspace write to '{path}'")
+        }
+        EffectIntent::WorkspaceWriteSet { writes, .. } => {
+            format!(
+                "workspace write set [{}]",
+                writes
+                    .iter()
+                    .map(|bound| bound.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         }
         EffectIntent::ExecArgv { program, argv } => {
             format!("exec {program} {argv:?}")
@@ -1211,6 +1249,119 @@ mod tests {
             decision,
             ApprovalDecision::Deny,
             "the content cap is part of the effect scope"
+        );
+    }
+
+    fn patch_spec() -> ToolSpec {
+        ToolSpec {
+            name: "edit.patch".into(),
+            description: "patch".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::WorkspaceWrite,
+            output_budget: None,
+            roles: vec![ToolSemanticRole::Mutate],
+        }
+    }
+
+    fn multi_file_patch_call(entries: &[(&str, &str, &str)]) -> ToolCall {
+        let files: Vec<_> = entries
+            .iter()
+            .map(|(path, old, new)| json!({"path": path, "hunks": [{"old": old, "new": new}]}))
+            .collect();
+        ToolCall {
+            id: "c".into(),
+            name: "edit.patch".into(),
+            arguments: json!({"files": files}),
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_file_patch_grant_covers_every_target_not_just_the_first() {
+        // MOD-AUTH-01 regression: `edit.patch files[]` used to derive a
+        // single-path intent from the first file, so a `src/` standing
+        // grant authorized writes to every other file in the set. The
+        // intent now carries the whole target set and the grant must
+        // cover each path.
+        let inner = RecordingGate::denying();
+        let gate = TaskApprovalGate::new(inner.clone());
+        gate.grant(write_grant("g-src", "src/", u64::MAX))
+            .await
+            .unwrap();
+
+        let widened = multi_file_patch_call(&[("src/a.rs", "a", "aa"), ("secret/b.rs", "b", "bb")]);
+        assert_eq!(
+            TaskApprovalGate::derive_effect_intent(&widened, &patch_spec()),
+            EffectIntent::WorkspaceWriteSet {
+                writes: vec![
+                    agent_contracts::WorkspaceWriteBound {
+                        path: "src/a.rs".into(),
+                        max_bytes: 2,
+                    },
+                    agent_contracts::WorkspaceWriteBound {
+                        path: "secret/b.rs".into(),
+                        max_bytes: 2,
+                    },
+                ],
+            },
+            "multi-file edit.patch must carry every target in its intent"
+        );
+        assert_eq!(
+            gate.authorize(&widened, &patch_spec(), &CancellationToken::new())
+                .await
+                .unwrap(),
+            ApprovalDecision::Deny,
+            "a src/ grant must not be widened to secret/ by the second file"
+        );
+
+        let all_inside = multi_file_patch_call(&[("src/a.rs", "a", "aa"), ("src/b.rs", "b", "bb")]);
+        assert_eq!(
+            gate.authorize(&all_inside, &patch_spec(), &CancellationToken::new())
+                .await
+                .unwrap(),
+            ApprovalDecision::Allow,
+            "every target inside the prefix stays granted"
+        );
+
+        // One `files[]` entry keeps the single-resource intent shape, so
+        // grants minted from single-file calls still match exactly.
+        let single = multi_file_patch_call(&[("src/a.rs", "a", "aa")]);
+        assert_eq!(
+            TaskApprovalGate::derive_effect_intent(&single, &patch_spec()),
+            EffectIntent::WorkspaceWrite {
+                path: "src/a.rs".into(),
+                content_bytes: 2,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_file_patch_content_cap_counts_the_whole_set() {
+        let inner = RecordingGate::denying();
+        let gate = TaskApprovalGate::new(inner.clone());
+        gate.grant(StandingGrant {
+            id: "g-small".into(),
+            risk: ToolRisk::WorkspaceWrite,
+            target: GrantTarget {
+                workspace_path_prefix: Some("src/".into()),
+                ..Default::default()
+            },
+            constraint: agent_contracts::GrantConstraint {
+                max_content_bytes: Some(3),
+                max_runs: None,
+            },
+            expires_at_ms: u64::MAX,
+        })
+        .await
+        .unwrap();
+
+        let oversized =
+            multi_file_patch_call(&[("src/a.rs", "a", "aaaa"), ("src/b.rs", "b", "bb")]);
+        assert_eq!(
+            gate.authorize(&oversized, &patch_spec(), &CancellationToken::new())
+                .await
+                .unwrap(),
+            ApprovalDecision::Deny,
+            "the byte cap sums the whole set, not the first file"
         );
     }
 

@@ -45,6 +45,204 @@ fn failed_file_observation_is_not_checked() {
     assert_eq!(resume.failed_commands[0].target, "src/auth.rs");
 }
 
+/// A refused mutation observed the file it refused to write: the trusted
+/// path+revision stamp is a real observation (MOD-OBS-01).
+fn refused_edit(path: &str, revision: &str, class: &str) -> ToolOutput {
+    let mut refusal = output("edit.replace", false, "edit refused");
+    refusal.metadata = json!({
+        "path": path,
+        "revision": revision,
+        "failure_class": class,
+    });
+    refusal
+}
+
+#[test]
+fn refused_mutation_stamps_the_observed_fact_without_bumping_the_world() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(
+        &refused_edit("src/auth.rs", "abc123", "stale_revision"),
+        1,
+        2,
+    );
+    // The observation is trusted world truth: the fact table knows
+    // src/auth.rs@abc123 is Fresh.
+    assert_eq!(resume.checked_files.len(), 1);
+    assert_eq!(resume.checked_files[0].path, "src/auth.rs");
+    assert_eq!(resume.checked_files[0].digest, "abc123");
+    assert_eq!(resume.checked_files[0].freshness, ResourceFreshness::Fresh);
+    assert_eq!(
+        resume.checked_files[0].provenance,
+        ResourceProvenance::MutationRefusal
+    );
+    // The mutation did not apply: the world revision must not advance.
+    assert_eq!(resume.workspace_revision, 0);
+    // The failure itself is still recorded.
+    assert_eq!(resume.failed_commands.len(), 1);
+}
+
+#[test]
+fn refusal_observation_resolves_needs_revalidation_without_a_reread() {
+    // MOD-OBS-01 headline: after an unknown mutation, a stale_revision
+    // refusal already carries the current revision — NeedsRevalidation
+    // resolves without the model burning an fs.read.
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
+    let mut unknown = output("shell.exec", true, "exit 0");
+    unknown.metadata = json!({"command": "cargo build"});
+    resume.observe_tool(&unknown, 1, 2);
+    assert_eq!(
+        resume.checked_files[0].freshness,
+        ResourceFreshness::NeedsRevalidation
+    );
+
+    resume.observe_tool(
+        &refused_edit("src/auth.rs", "abc123", "stale_revision"),
+        1,
+        3,
+    );
+    assert_eq!(
+        resume.checked_files[0].freshness,
+        ResourceFreshness::Fresh,
+        "the refusal's revision stamp revalidates the fact"
+    );
+    assert!(
+        resume
+            .view()
+            .checked_files
+            .contains(&"src/auth.rs@abc123".to_string())
+    );
+}
+
+#[test]
+fn refusal_observation_of_a_changed_digest_marks_the_source_changed() {
+    // The file really moved on: the observation updates the digest, the
+    // source-changed flag is set, and a verification obligation now
+    // exists (Pending — there is no prior PASS evidence to mark Stale).
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
+    resume.observe_tool(
+        &refused_edit("src/auth.rs", "def456", "stale_revision"),
+        1,
+        2,
+    );
+    assert_eq!(resume.checked_files[0].digest, "def456");
+    assert!(resume.verification.source_changed);
+    assert_eq!(resume.validity(), VerificationState::Pending);
+}
+
+#[test]
+fn failed_process_execution_still_bumps_the_world_revision() {
+    // process_exit may have partial side effects: it stays conservative
+    // (Unknown footprint) and must not be deduplicated away.
+    let mut resume = ExecutionState::default();
+    let mut failed = output("shell.exec", false, "exit 1");
+    failed.metadata = json!({"command": "cargo test", "failure_class": "process_exit"});
+    resume.observe_tool(&failed, 1, 1);
+    assert_eq!(resume.workspace_revision, 1);
+    assert_eq!(
+        resume.checked_files.len(),
+        0,
+        "a failed process produced no trusted resource observation"
+    );
+}
+
+#[test]
+fn repeated_identical_refusals_surface_the_stall_warning() {
+    // MOD-PROG-01: the fact is already known at the stamped revision, so
+    // each identical refusal is provably no-progress; three in a row
+    // surface EXECUTION STALL.
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
+    for turn in 2..=3 {
+        resume.observe_tool(
+            &refused_edit("src/auth.rs", "abc123", "stale_revision"),
+            1,
+            turn,
+        );
+        assert!(
+            resume.view().stall_warning.is_none(),
+            "no warning before the threshold (turn {turn})"
+        );
+    }
+    resume.observe_tool(
+        &refused_edit("src/auth.rs", "abc123", "stale_revision"),
+        1,
+        4,
+    );
+    let warning = resume.view().stall_warning.expect("stall at 3 consecutive");
+    assert!(warning.contains("EXECUTION STALL"));
+    assert!(warning.contains("edit.replace"));
+    assert!(warning.contains("stale_revision"));
+}
+
+#[test]
+fn progress_resets_the_stall_counter() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
+    resume.observe_tool(
+        &refused_edit("src/auth.rs", "abc123", "stale_revision"),
+        1,
+        2,
+    );
+    resume.observe_tool(
+        &refused_edit("src/auth.rs", "abc123", "stale_revision"),
+        1,
+        3,
+    );
+    assert_eq!(resume.stall.consecutive_no_progress, 2);
+    // A successful write moves the world: progress resets the counter.
+    let mut write = output("fs.write", true, "wrote");
+    write.metadata = json!({"path": "src/auth.rs", "revision": "def456"});
+    resume.observe_tool(&write, 1, 4);
+    assert_eq!(resume.stall.consecutive_no_progress, 0);
+    // The next refusal (against the new revision) starts counting again.
+    resume.observe_tool(
+        &refused_edit("src/auth.rs", "def456", "stale_revision"),
+        1,
+        5,
+    );
+    assert_eq!(resume.stall.consecutive_no_progress, 1);
+    assert!(resume.view().stall_warning.is_none());
+}
+
+#[test]
+fn stall_signature_change_resets_the_counter() {
+    // Alternating targets never accumulate: each signature counts alone.
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
+    resume.observe_tool(&refused_edit("src/a.rs", "rev-a", "stale_revision"), 1, 2);
+    resume.observe_tool(&refused_edit("src/b.rs", "rev-b", "stale_revision"), 1, 3);
+    resume.observe_tool(&refused_edit("src/a.rs", "rev-a", "stale_revision"), 1, 4);
+    assert!(resume.view().stall_warning.is_none());
+    assert_eq!(resume.stall.consecutive_no_progress, 1);
+    assert_eq!(resume.stall.target, "src/a.rs");
+}
+
+#[test]
+fn duplicate_no_progress_refusal_counts_toward_the_stall_counter() {
+    // The runtime's own dedup refusal (nothing executed, no fresh
+    // observation) is honest NoProgress: it strengthens the stall signal
+    // instead of looping forever at zero cost.
+    let mut resume = ExecutionState::default();
+    let mut duplicate = output("edit.replace", false, "duplicate");
+    duplicate.metadata = json!({
+        "path": "src/auth.rs",
+        "failure_class": "duplicate_no_progress",
+        "executed": false,
+    });
+    for turn in 1..=3 {
+        resume.observe_tool(&duplicate, 1, turn);
+    }
+    let warning = resume
+        .view()
+        .stall_warning
+        .expect("dedup refusals must accumulate toward the stall");
+    assert!(warning.contains("duplicate_no_progress"));
+    // Nothing executed: the world never moved.
+    assert_eq!(resume.workspace_revision, 0);
+}
+
 #[test]
 fn success_clears_only_the_matching_failed_command() {
     let mut resume = ExecutionState::default();

@@ -118,6 +118,14 @@ impl OpenAiProvider {
             .expect("build reqwest client");
         Self { config, client }
     }
+
+    /// Build with an injected HTTP client. The composition root owns
+    /// transport policy (timeouts, proxies, connection pools); tests use
+    /// this to pin a `no_proxy` client so a machine-wide proxy can never
+    /// intercept loopback mock servers.
+    pub fn with_client(config: OpenAiConfig, client: Client) -> Self {
+        Self { config, client }
+    }
 }
 
 #[async_trait]
@@ -489,6 +497,11 @@ mod tests {
     #[tokio::test]
     async fn dotted_core_tool_ids_round_trip_on_the_wire() {
         // 上游看到 fs_list；内核仍收到 fs.list。
+        // A machine-wide proxy (Clash/V2Ray WinINET settings — the reason
+        // this workspace enables reqwest's `system-proxy` feature) must
+        // not intercept the loopback mock server: a proxied request never
+        // carries the wire body this test asserts on and comes back as a
+        // gateway 502. The injected client pins `no_proxy`.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -515,7 +528,10 @@ mod tests {
             let _ = socket.write_all(response.as_bytes()).await;
         });
 
-        let provider = OpenAiProvider::new(dummy_config(format!("http://{addr}/v1")));
+        let provider = OpenAiProvider::with_client(
+            dummy_config(format!("http://{addr}/v1")),
+            Client::builder().no_proxy().build().unwrap(),
+        );
         let output = provider.complete(fs_list_request()).await.unwrap();
         assert_eq!(output.tool_calls.len(), 1);
         assert_eq!(output.tool_calls[0].id, "c1");

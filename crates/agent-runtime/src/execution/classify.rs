@@ -82,6 +82,7 @@ pub fn stamp_fs_read_motive(output: &mut ToolOutput, motive: FsReadMotive) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::ResourceProvenance;
     use agent_contracts::ResourceFreshness;
 
     fn fact(digest: &str, freshness: ResourceFreshness) -> ResourceFact {
@@ -90,6 +91,7 @@ mod tests {
             digest: digest.into(),
             freshness,
             turn: 1,
+            provenance: ResourceProvenance::Read,
         }
     }
 

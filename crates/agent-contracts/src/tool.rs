@@ -70,6 +70,24 @@ impl ToolRisk {
     }
 }
 
+/// One approved workspace write target: the canonical workspace-relative
+/// path plus an approval-time byte estimate of what the call will write.
+/// For `fs.write` / `edit.replace` the estimate is exact (the full new
+/// content); for `edit.patch` it is the per-file hunk delta — the final
+/// body size is unknown at approval time, so the estimate is a lower
+/// bound on the real write and real-byte resource caps are enforced by
+/// the workspace mutation itself (`MAX_FILE_BYTES`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceWriteBound {
+    pub path: String,
+    pub max_bytes: u64,
+}
+
+/// Hard cap on entries in one [`EffectIntent::WorkspaceWriteSet`]:
+/// one multi-file operation may name at most this many targets
+/// (matches `edit.patch`'s per-call file cap).
+pub const MAX_WORKSPACE_WRITE_SET: usize = 16;
+
 /// The normalized side effect one tool call intends to perform, derived from
 /// a trusted [`crate::HostToolPolicy`] — never from the tool's self-declared
 /// risk or argument names alone. Approval matches this concrete intent, and
@@ -81,6 +99,12 @@ pub enum EffectIntent {
     /// A workspace write: the workspace-relative target path and a
     /// conservative byte estimate of the content being written.
     WorkspaceWrite { path: String, content_bytes: u64 },
+    /// A multi-resource workspace write: every target of one operation,
+    /// each with its own approval-time byte estimate (MOD-AUTH-01). A
+    /// single-path intent never covers this variant — one approved file
+    /// must not widen into the other files of the same call
+    /// (`edit.patch` `files[]`). Capped at [`MAX_WORKSPACE_WRITE_SET`].
+    WorkspaceWriteSet { writes: Vec<WorkspaceWriteBound> },
     /// Direct spawn with intact argument boundaries. Standing grants may
     /// match an argv prefix (`program` plus leading `argv` entries).
     ExecArgv { program: String, argv: Vec<String> },
@@ -98,8 +122,27 @@ impl EffectIntent {
     pub fn risk(&self) -> ToolRisk {
         match self {
             Self::ReadOnly => ToolRisk::ReadOnly,
-            Self::WorkspaceWrite { .. } => ToolRisk::WorkspaceWrite,
+            Self::WorkspaceWrite { .. } | Self::WorkspaceWriteSet { .. } => {
+                ToolRisk::WorkspaceWrite
+            }
             Self::ExecArgv { .. } | Self::ShellExec { .. } => ToolRisk::ProcessExecution,
+        }
+    }
+
+    /// Every canonical workspace path this intent approves, in one set.
+    /// Empty for non-write intents. Used by the commit-time
+    /// Actual ⊆ Approved check: an effect may only write paths the
+    /// approved intent named.
+    pub fn approved_workspace_paths(&self) -> Vec<String> {
+        match self {
+            Self::WorkspaceWrite { path, .. } => canonical_workspace_relative_path(path)
+                .map(|path| vec![path])
+                .unwrap_or_default(),
+            Self::WorkspaceWriteSet { writes } => writes
+                .iter()
+                .filter_map(|bound| canonical_workspace_relative_path(&bound.path))
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -123,13 +166,45 @@ impl EffectIntent {
                     content_bytes,
                 },
             ) => {
-                let Some(approved) = canonical_relative_path(approved) else {
+                let Some(approved) = canonical_workspace_relative_path(approved) else {
                     return false;
                 };
-                let Some(path) = canonical_relative_path(path) else {
+                let Some(path) = canonical_workspace_relative_path(path) else {
                     return false;
                 };
                 approved == path && *content_bytes <= *max_bytes
+            }
+            (
+                Self::WorkspaceWriteSet {
+                    writes: approved_writes,
+                },
+                Self::WorkspaceWriteSet { writes },
+            ) => {
+                // Per-entry coverage after canonicalization: same target
+                // set, and each actual entry's bytes stay within the
+                // approved entry's estimate. Any path that cannot be
+                // canonicalized fails closed.
+                write_set_covers(approved_writes, writes)
+            }
+            (
+                Self::WorkspaceWriteSet {
+                    writes: approved_writes,
+                },
+                Self::WorkspaceWrite {
+                    path,
+                    content_bytes,
+                },
+            ) => {
+                // A multi-file approved bound still covers a single write
+                // to one of its named files; the reverse direction (a
+                // single approved path covering a set) is impossible.
+                write_set_covers(
+                    approved_writes,
+                    &[WorkspaceWriteBound {
+                        path: path.clone(),
+                        max_bytes: *content_bytes,
+                    }],
+                )
             }
             (
                 Self::ExecArgv {
@@ -164,7 +239,9 @@ impl EffectIntent {
 
 /// Slash-normalized relative path with no `.` / `..` / prefix / root.
 /// `None` means the path cannot be an approved workspace-write target.
-fn canonical_relative_path(path: &str) -> Option<String> {
+/// Public so Core's commit-time Actual ⊆ Approved check canonicalizes
+/// actual writes with exactly the same rules the approved intent used.
+pub fn canonical_workspace_relative_path(path: &str) -> Option<String> {
     use std::path::{Component, Path};
     if path.is_empty() {
         return None;
@@ -182,6 +259,26 @@ fn canonical_relative_path(path: &str) -> Option<String> {
     } else {
         Some(parts.join("/"))
     }
+}
+
+/// Per-entry set coverage for write bounds: every actual target must be
+/// one the approved set named (subset, not equality — approving three
+/// files and writing one is safe; writing a fourth is not), and each
+/// actual entry's bytes must stay within the matching approved entry's
+/// estimate. Empty or uncanonicalizable sets fail closed.
+fn write_set_covers(approved: &[WorkspaceWriteBound], actual: &[WorkspaceWriteBound]) -> bool {
+    if approved.is_empty() || actual.is_empty() {
+        return false;
+    }
+    actual.iter().all(|entry| {
+        let Some(path) = canonical_workspace_relative_path(&entry.path) else {
+            return false;
+        };
+        approved
+            .iter()
+            .find(|bound| canonical_workspace_relative_path(&bound.path).is_some_and(|p| p == path))
+            .is_some_and(|bound| entry.max_bytes <= bound.max_bytes)
+    })
 }
 
 /// Structured argv intent. `argv[0]` is the program; the rest is argv.
@@ -587,8 +684,21 @@ impl ToolOutput {
     /// [`Self::may_mutate_workspace`]; this answers which known resource
     /// facts may have gone stale. A pathless may-mutate process is
     /// `Unknown`, not "every identity is dead".
+    ///
+    /// A deterministic refusal executed nothing: the mutation is
+    /// `NotApplied`, so no fact went stale and the workspace revision
+    /// must not advance (MOD-OBS-01: mutation outcome and observation
+    /// are separate truths — the refusal's `path`+`revision` stamp is
+    /// still a trusted observation).
     pub fn mutation_footprint(&self) -> crate::MutationFootprint {
         if !self.may_mutate_workspace() {
+            return crate::MutationFootprint::None;
+        }
+        if !self.ok
+            && self
+                .failure_class()
+                .is_some_and(|class| class.nothing_executed())
+        {
             return crate::MutationFootprint::None;
         }
         let touches = self.resource_touches();
@@ -637,6 +747,10 @@ pub enum ToolFailureClass {
     HiddenPath,
     PathNotFound,
     InvalidRequest,
+    /// The runtime refused to dispatch: this call is byte-identical to a
+    /// deterministic refusal against unchanged file identities, so
+    /// executing it again cannot produce a new result (MOD-PROG-01).
+    DuplicateNoProgress,
     Io,
 }
 
@@ -657,6 +771,7 @@ impl ToolFailureClass {
             Self::HiddenPath => "hidden_path",
             Self::PathNotFound => "path_not_found",
             Self::InvalidRequest => "invalid_request",
+            Self::DuplicateNoProgress => "duplicate_no_progress",
             Self::Io => "io",
         }
     }
@@ -693,6 +808,9 @@ impl ToolFailureClass {
                 "Use a path that exists in the parent listing; do not invent manifests."
             }
             Self::InvalidRequest => "Fix the arguments against the tool schema.",
+            Self::DuplicateNoProgress => {
+                "This exact call already failed deterministically and the files are unchanged. Change the arguments, re-read the target, or finish with the current state."
+            }
             Self::Io => "Retry only after checking the path and workspace confinement.",
         }
     }
@@ -713,9 +831,32 @@ impl ToolFailureClass {
             "hidden_path" => Self::HiddenPath,
             "path_not_found" => Self::PathNotFound,
             "invalid_request" => Self::InvalidRequest,
+            "duplicate_no_progress" => Self::DuplicateNoProgress,
             "io" => Self::Io,
             _ => return None,
         })
+    }
+
+    /// Whether this failure class proves the tool never touched the
+    /// world: the operation was refused before any side effect. Such a
+    /// refusal is `NotApplied` — no fact went stale — while its stamped
+    /// `path`+`revision` stays a trusted observation (MOD-OBS-01).
+    /// Process/verification/timeout/cancellation/io classes may have
+    /// partial side effects and stay conservative.
+    pub const fn nothing_executed(self) -> bool {
+        matches!(
+            self,
+            Self::ShellDialectMismatch
+                | Self::CommandUnavailable
+                | Self::MissingProjectMarker
+                | Self::StaleRevision
+                | Self::NoExactMatch
+                | Self::AmbiguousMatch
+                | Self::PathNotFound
+                | Self::InvalidRequest
+                | Self::HiddenPath
+                | Self::DuplicateNoProgress
+        )
     }
 }
 
@@ -1039,6 +1180,16 @@ impl ToolExecutionRequest {
     }
 }
 
+/// One canonical actual workspace write a prepared effect will perform:
+/// the real relative path and the real byte count of the content being
+/// written (MOD-AUTH-02). Unlike [`WorkspaceWriteBound::max_bytes`] this
+/// is not an estimate — it is measured from what was actually staged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActualWorkspaceWrite {
+    pub path: String,
+    pub bytes: u64,
+}
+
 /// A side effect a tool prepared but did not yet apply.
 ///
 /// The tool's *computation* (reading, diffing, staging a temp file) happens
@@ -1052,6 +1203,15 @@ impl ToolExecutionRequest {
 pub trait Effect: Send + Sync {
     /// Human-readable description for events and logs.
     fn describe(&self) -> String;
+    /// Canonical actual workspace writes this effect will perform
+    /// (MOD-AUTH-02: Actual ⊆ Approved at commit). `None` (the default)
+    /// means this effect cannot conservatively describe its targets, so
+    /// the commit-time containment check is skipped for it; trusted
+    /// builtin write effects report `Some`. Bytes are the *real* staged
+    /// sizes, not approval-time estimates.
+    fn actual_workspace_writes(&self) -> Option<Vec<ActualWorkspaceWrite>> {
+        None
+    }
     /// Apply the prepared effect (atomic rename, outbox send, ...) and
     /// return the ACI v2 receipt: what happened to the world, how durably
     /// it is recorded, and the evidence reference. `NotApplied` leaves the
@@ -1149,6 +1309,16 @@ impl From<EffectCommitError> for EffectReceipt {
 impl Effect for Vec<Box<dyn Effect>> {
     fn describe(&self) -> String {
         format!("composite of {} staged effects", self.len())
+    }
+
+    fn actual_workspace_writes(&self) -> Option<Vec<ActualWorkspaceWrite>> {
+        // Aggregate children; one non-reporting child makes the whole
+        // composite non-reporting (never guess a partial target set).
+        let mut writes = Vec::new();
+        for effect in self {
+            writes.extend(effect.actual_workspace_writes()?);
+        }
+        Some(writes)
     }
 
     async fn commit(self: Box<Self>) -> EffectReceipt {
@@ -1953,6 +2123,114 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn write_set_intent_covers_only_the_exact_set() {
+        let approved = EffectIntent::WorkspaceWriteSet {
+            writes: vec![
+                WorkspaceWriteBound {
+                    path: "src/a.rs".into(),
+                    max_bytes: 60,
+                },
+                WorkspaceWriteBound {
+                    path: "src/b.rs".into(),
+                    max_bytes: 40,
+                },
+            ],
+        };
+        let bound = |path: &str, max_bytes: u64| WorkspaceWriteBound {
+            path: path.into(),
+            max_bytes,
+        };
+        // Same set — order-insensitive — each entry within its bound.
+        assert!(approved.covers(&EffectIntent::WorkspaceWriteSet {
+            writes: vec![bound("src/b.rs", 40), bound("src/a.rs", 60)],
+        }));
+        // Subset is covered: approving two files and writing one is safe
+        // (the danger is the reverse — writing files outside the set).
+        assert!(approved.covers(&EffectIntent::WorkspaceWriteSet {
+            writes: vec![bound("src/a.rs", 60)],
+        }));
+        // A different second file is never covered (MOD-AUTH-01).
+        assert!(!approved.covers(&EffectIntent::WorkspaceWriteSet {
+            writes: vec![bound("src/a.rs", 1), bound("secret/b.rs", 1)],
+        }));
+        // One entry over its per-entry bound is not covered, even when
+        // the other entries are small.
+        assert!(!approved.covers(&EffectIntent::WorkspaceWriteSet {
+            writes: vec![bound("src/a.rs", 61), bound("src/b.rs", 1)],
+        }));
+        // A single write to one member file stays covered within that
+        // entry's bound.
+        assert!(approved.covers(&EffectIntent::WorkspaceWrite {
+            path: "src/b.rs".into(),
+            content_bytes: 40,
+        }));
+        assert!(!approved.covers(&EffectIntent::WorkspaceWrite {
+            path: "src/b.rs".into(),
+            content_bytes: 41,
+        }));
+        // The reverse direction can never hold: one approved path must
+        // not widen into a multi-file set.
+        assert!(
+            !EffectIntent::WorkspaceWrite {
+                path: "src/a.rs".into(),
+                content_bytes: 100,
+            }
+            .covers(&EffectIntent::WorkspaceWriteSet {
+                writes: vec![bound("src/a.rs", 1), bound("src/b.rs", 1)],
+            })
+        );
+        // An uncanonicalizable member fails closed.
+        assert!(
+            !EffectIntent::WorkspaceWriteSet {
+                writes: vec![bound("src/a.rs", 1), bound("../escape", 1)],
+            }
+            .covers(&EffectIntent::WorkspaceWriteSet {
+                writes: vec![bound("src/a.rs", 1), bound("../escape", 1)],
+            })
+        );
+    }
+
+    #[test]
+    fn approved_workspace_paths_and_actual_reporting() {
+        // The commit-time Actual ⊆ Approved seam: the intent exposes its
+        // canonical path set; a reporting effect exposes real writes.
+        let set = EffectIntent::WorkspaceWriteSet {
+            writes: vec![
+                WorkspaceWriteBound {
+                    path: r"src\a.rs".into(),
+                    max_bytes: 10,
+                },
+                WorkspaceWriteBound {
+                    path: "src/b.rs".into(),
+                    max_bytes: 10,
+                },
+            ],
+        };
+        let mut paths = set.approved_workspace_paths();
+        paths.sort();
+        assert_eq!(paths, vec!["src/a.rs".to_string(), "src/b.rs".to_string()]);
+        assert_eq!(
+            EffectIntent::WorkspaceWrite {
+                path: "src/a.rs".into(),
+                content_bytes: 5,
+            }
+            .approved_workspace_paths(),
+            vec!["src/a.rs".to_string()]
+        );
+        assert!(EffectIntent::ReadOnly.approved_workspace_paths().is_empty());
+        // Uncanonicalizable paths drop out; an intent that cannot name a
+        // single canonical path approves nothing.
+        assert!(
+            EffectIntent::WorkspaceWrite {
+                path: "../escape".into(),
+                content_bytes: 5,
+            }
+            .approved_workspace_paths()
+            .is_empty()
+        );
+    }
+
     fn process_spec(name: &str) -> ToolSpec {
         ToolSpec {
             name: name.into(),
@@ -2318,6 +2596,54 @@ mod tests {
         assert_eq!(patch_touches[0].revision.as_deref(), Some("aa"));
         assert_eq!(patch_touches[1].path, "src/b.rs");
         assert_eq!(patch_touches[1].revision.as_deref(), Some("bb"));
+    }
+
+    #[test]
+    fn deterministic_refusal_has_no_mutation_footprint() {
+        // MOD-OBS-01: a refusal executed nothing, so no known fact went
+        // stale — while its trusted path+revision stamp remains a usable
+        // observation.
+        let refused = tool_failure_output(
+            "c1",
+            "edit.replace",
+            ToolFailureClass::StaleRevision,
+            "refused",
+            "stale_revision",
+            serde_json::json!({"path": "src/a.rs", "revision": "rev2"}),
+        );
+        assert_eq!(refused.mutation_footprint(), crate::MutationFootprint::None);
+
+        // A failed process may have partial side effects: Unknown.
+        let crashed = tool_failure_output(
+            "c2",
+            "shell.exec",
+            ToolFailureClass::ProcessExit,
+            "failed",
+            "exit 1",
+            serde_json::json!({"command": "cargo test"}),
+        );
+        assert_eq!(
+            crashed.mutation_footprint(),
+            crate::MutationFootprint::Unknown
+        );
+
+        // A successful write keeps its Known footprint.
+        let applied = ToolOutput {
+            call_id: "c3".into(),
+            tool_name: "fs.write".into(),
+            ok: true,
+            summary: "wrote".into(),
+            model_content: "wrote".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({"path": "src/a.rs", "revision": "rev3"}),
+        };
+        assert_eq!(
+            applied.mutation_footprint(),
+            crate::MutationFootprint::Known(vec![crate::ResourceTouch {
+                path: "src/a.rs".into(),
+                revision: Some("rev3".into()),
+            }])
+        );
     }
 
     #[test]

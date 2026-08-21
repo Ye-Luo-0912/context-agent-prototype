@@ -49,11 +49,38 @@ first cut.
 Named pipes/UDS are not a fix for CORE-01. V1 still trusts Runtime in
 the same address space.
 
+### CORE-11 — HostToolPolicy registry & plugin admission (open, M12 next)
+
+`agent-contracts/src/host_policy.rs` statically enumerates builtin
+names (`fs.read`, `edit.patch`, `process.run`, ...). The fail-closed
+direction is right — ToolSpec cannot self-authorize, and unknown names
+get an empty `WorkspaceWrite` (no grant) — but the layering is wrong
+long-term: contracts should define the vocabulary (`EffectIntent`,
+`HostEffectBinding`, `HostToolPolicy` types); trusted composition
+should own a `BuiltinHostPolicyRegistry`; `tool-runtime` provides the
+implementations. Plugin admission (required before Self-Iteration)
+must install operator-reviewed `HostToolPolicy` bindings — a manifest
+schema is not an authority mapping. Until the registry exists,
+external write plugins stay safely non-functional.
+
+### CORE-12 — M13 attestation depth (open)
+
+`SandboxCapabilities` booleans are the v1 floor. M13 acceptance should
+upgrade to `SandboxAttestation { capabilities, backend,
+backend_version, evidence }` so each enforced capability is
+explainable (`fs_write_confined` → landlock ABI, `memory_quota` →
+rlimit_as bytes). A boolean must not claim a stronger OS guarantee
+than it delivers — `process_count_quota` was renamed from
+`process_spawn_controlled` for exactly that (serde alias keeps the
+wire compatible).
+
 ## Freeze (not a defect)
 
 ### CTX-11 — Execution Coherence V1
 
-**Status: freeze candidate.** Do not reimplement `ResumePoint`.
+**Status: RC** (MOD-OBS-01 / MOD-PROG-01 / turn checkpointing landed
+2026-08-21; freeze waits for the next live evidence pass). Do not
+reimplement `ResumePoint`.
 Contract: [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md).
 
 ## Open P2 — evaluation
@@ -88,6 +115,14 @@ Full text: git history of this file.
 | CORE-02..CORE-09 | Turn durability, checkpoint, output broker, System-role leak, cancel/process cleanup, TOCTOU opens, standing grants, schema budget |
 | TOOL-01 | `search.grep` cancellation |
 | TOOL-ENV-01, TOOL-EDIT-01, TOOL-VIEW-01, TOOL-ERROR-01 | Tool-quality preflight 2026-08-17 |
+| MOD-AUTH-01 | `edit.patch files[]` multi-file authority widening → `EffectIntent::WorkspaceWriteSet` + all-paths `grant_matches` (2026-08-21; see PLATFORM_SECURITY.md) |
+| MOD-AUTH-02 | Prepared effects report canonical `ActualWorkspaceWrite` (real path + real staged bytes); Core commit rejects `ActualExceedsApproved` outside the approved set (2026-08-21) |
+| Sandbox floor | `UntrustedGenerated.required` now includes `fs_read_confined` + `cpu_quota` (still fail-closed on native until provable); `process_spawn_controlled` → `process_count_quota` with a wire-compat serde alias (2026-08-21) |
+| Foreground ack | `ContextConsumptionAck.foreground_item_ids` + engine counter: foreground bodies the model saw are observable (weak signal; no residency / admission change) (2026-08-21) |
+| TOOL-02 | `search.grep` `path` accepts a file target (file-or-directory), removing a class of `path_not_found` tool failures (2026-08-21) |
+| EVAL identity | Live evidence runs refuse a dirty workspace by default (`--allow-dirty` opt-in); the manifest records `source_tree_digest` over HEAD tree + tracked diff + untracked `crates/` sources (2026-08-21) |
+| CTX-12 | Not a code divergence: the parity tests had spawned a 9-day-stale `target/debug/agent-context-service.exe` (cargo test never refreshes that artifact; `serde(default)` hid the wire drift). Fixed with a test freshness guard that fails closed with a rebuild hint (2026-08-21). Scoped test runs need `cargo build -p agent-context-service` first. |
+| PROV-01 | `provider-openai` loopback wire test failed through machine-wide proxies (Clash/V2Ray WinINET interception → gateway 502). Fixed with `OpenAiProvider::with_client` + a `no_proxy` test client (2026-08-21); production `new` keeps auto system proxy. |
 
 Do not start sourced `EpisodeOutcome`, GC retune, or a second ResumePoint
 from this index.

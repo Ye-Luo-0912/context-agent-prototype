@@ -334,6 +334,7 @@ async fn materialize_is_preview_and_ack_reinforces_only_the_final_subset() {
             materialization_id: preview.materialization_id,
             item_ids: vec![kept],
             external_item_ids: Vec::new(),
+            foreground_item_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -381,6 +382,7 @@ async fn invalid_consumption_ack_is_atomic_and_the_exact_retry_can_commit() {
         materialization_id: preview.materialization_id,
         item_ids: vec![real_id, ContextItemId::new()],
         external_item_ids: Vec::new(),
+        foreground_item_ids: Vec::new(),
     };
     assert!(engine.acknowledge_consumption(invalid).await.is_err());
     assert_eq!(engine.inspect(usize::MAX).await.unwrap()[0].access_count, 0);
@@ -421,11 +423,98 @@ async fn consumption_ack_rejects_cross_residency_duplicate_ownership() {
             materialization_id: preview.materialization_id,
             item_ids: preview.items.iter().map(|item| item.item_id).collect(),
             external_item_ids: Vec::new(),
+            foreground_item_ids: Vec::new(),
         })
         .await
         .unwrap_err();
     assert!(error.to_string().contains("exactly one residency owner"));
     assert_eq!(engine.inspect(usize::MAX).await.unwrap()[0].access_count, 0);
+}
+
+#[tokio::test]
+async fn foreground_consumption_is_recorded_without_reinforcing_access() {
+    // MOD-FG-01: the prompt rendered a foreground body, so the ack carries
+    // its id. The engine records the consumption observably (diagnostics)
+    // but must not reinforce access, Admit, or change residency —
+    // foreground rehydration is transient by contract.
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    engine
+        .ingest(ContextIngress::Pin {
+            content: "pinned constraint".into(),
+            kind: ContextKind::Constraint,
+        })
+        .await
+        .unwrap();
+    let preview = engine
+        .materialize(ContextQuery {
+            current_input: String::new(),
+            budget_tokens: 8_192,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    assert!(!preview.items.is_empty());
+    // Simulate one foreground body the materializer projected: the same
+    // item, rehydrated transiently. Record it on the pending preview the
+    // way `materialize` would have (the projection itself is driven by
+    // runtime hints, not exercised here).
+    let foreground_id = preview.items[0].item_id;
+    {
+        let mut state = engine.state.lock().await;
+        let pending = state
+            .pending_materialization
+            .as_mut()
+            .expect("materialize leaves a pending preview");
+        pending.foreground_item_ids.insert(foreground_id);
+    }
+    let access_before = engine.inspect(usize::MAX).await.unwrap()[0].access_count;
+
+    engine
+        .acknowledge_consumption(ContextConsumptionAck {
+            turn_id: TurnId::new(),
+            operation_id: OperationId::new(),
+            model_round: 1,
+            materialization_id: preview.materialization_id,
+            item_ids: Vec::new(),
+            external_item_ids: Vec::new(),
+            foreground_item_ids: vec![foreground_id],
+        })
+        .await
+        .unwrap();
+
+    let diagnostics = engine.diagnostics().await.unwrap();
+    assert_eq!(
+        diagnostics.foreground_consumed_acks, 1,
+        "foreground consumption must be observable"
+    );
+    assert_eq!(
+        engine.inspect(usize::MAX).await.unwrap()[0].access_count,
+        access_before,
+        "foreground consumption is a weak signal: no access reinforcement"
+    );
+
+    // A foreground id outside the referenced preview fails closed.
+    let preview = engine
+        .materialize(ContextQuery {
+            current_input: String::new(),
+            budget_tokens: 8_192,
+            hints: ContextHints::default(),
+        })
+        .await
+        .unwrap();
+    let error = engine
+        .acknowledge_consumption(ContextConsumptionAck {
+            turn_id: TurnId::new(),
+            operation_id: OperationId::new(),
+            model_round: 1,
+            materialization_id: preview.materialization_id,
+            item_ids: Vec::new(),
+            external_item_ids: Vec::new(),
+            foreground_item_ids: vec![ContextItemId::new()],
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("foreground"));
 }
 
 #[tokio::test]

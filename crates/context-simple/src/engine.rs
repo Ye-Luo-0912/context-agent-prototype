@@ -220,6 +220,7 @@ pub(crate) struct PendingMaterialization {
     id: u64,
     item_ids: std::collections::HashSet<ContextItemId>,
     external_item_ids: std::collections::HashSet<ContextItemId>,
+    pub(crate) foreground_item_ids: std::collections::HashSet<ContextItemId>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -370,6 +371,10 @@ pub(crate) struct State {
     pub(crate) access_admits: u64,
     #[serde(default)]
     pub(crate) access_consumption_acks: u64,
+    /// Foreground bodies consumed by successful model rounds (weak
+    /// observational signal; never reinforces access or changes residency).
+    #[serde(default)]
+    pub(crate) foreground_consumed_acks: u64,
     /// Segment-local reactivation instrumentation. Skipped in checkpoints
     /// and zeroed on restore; run-global aggregation is event-side.
     #[serde(skip)]
@@ -1320,6 +1325,11 @@ impl ContextEngine for SimpleContextEngine {
                 .iter()
                 .map(|entry| entry.item_id)
                 .collect(),
+            foreground_item_ids: materialized
+                .foreground
+                .iter()
+                .map(|item| item.item_id)
+                .collect(),
         });
         drop(state);
         Ok(materialized)
@@ -1355,6 +1365,16 @@ impl ContextEngine for SimpleContextEngine {
             ));
         }
         if ack
+            .foreground_item_ids
+            .iter()
+            .any(|id| !pending.foreground_item_ids.contains(id))
+        {
+            return Err(AgentError::InvalidRequest(
+                "context consumption ack contains a foreground body outside the referenced preview"
+                    .into(),
+            ));
+        }
+        if ack
             .item_ids
             .iter()
             .chain(&ack.external_item_ids)
@@ -1385,6 +1405,14 @@ impl ContextEngine for SimpleContextEngine {
                 gc_epoch
             ));
         }
+        // Foreground bodies were seen by the model but never changed
+        // residency: they are recorded as a weak observational signal only
+        // (no access reinforcement, no Admit, no residency transition), so
+        // the "model turn N consumed it" invariant covers them without
+        // letting transient rehydration reshape the working set.
+        state.foreground_consumed_acks = state
+            .foreground_consumed_acks
+            .saturating_add(ack.foreground_item_ids.len() as u64);
         state.pending_materialization = None;
         Ok(())
     }

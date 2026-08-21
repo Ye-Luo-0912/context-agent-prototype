@@ -451,6 +451,7 @@ mod tests {
                     materialization_id: model_round as u64,
                     item_ids: Vec::new(),
                     external_item_ids: Vec::new(),
+                    foreground_item_ids: Vec::new(),
                 },
             },
         )

@@ -183,12 +183,21 @@ impl PromptAssembler {
             system_policy.push(ModelMessage::system(index));
         }
 
+        // Deterministic turn checkpointing: the model-facing protocol
+        // view keeps only the last TURN_FRAME_KEEP_EXCHANGES exchanges;
+        // older ones collapse to a bounded note. The runtime's full
+        // frame (audit, turn-end persistence) is never mutated here.
+        let (turn_frame, compacted_exchanges) =
+            turn.checkpoint_tail(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
         ModelInput {
             system_policy,
             focus_frame: render_focus_frame(runtime_focus, task_anchor, task_progress),
             context_frame,
-            turn_frame: turn.clone(),
+            turn_frame,
             tool_schemas: tools,
+            turn_checkpoint: (compacted_exchanges > 0).then_some(agent_contracts::TurnCheckpoint {
+                compacted_exchanges,
+            }),
         }
     }
 }
@@ -247,7 +256,7 @@ pub fn prompt_layer_costs_with_catalog(
             })
             .unwrap_or(0),
         historical_context_tokens: historical,
-        turn_frame_tokens: crate::budget::approx_layer_tokens(&assembled.turn_frame.messages())
+        turn_frame_tokens: crate::budget::approx_layer_tokens(&assembled.turn_frame_wire_messages())
             as u64,
         tool_schema_tokens: crate::budget::approx_layer_tokens(&assembled.tool_schemas) as u64,
         tool_catalog_index_tokens: assembled
@@ -352,6 +361,7 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
         &checked,
         &verifications,
         &failed,
+        progress.stall_warning.as_deref(),
     );
     while rendered.chars().count() > agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS {
         if !failed.is_empty() {
@@ -369,6 +379,7 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
             &checked,
             &verifications,
             &failed,
+            progress.stall_warning.as_deref(),
         );
     }
     if rendered.chars().count() > agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS {
@@ -387,9 +398,16 @@ fn format_task_progress(
     checked: &[String],
     verifications: &[String],
     failed: &[String],
+    stall_warning: Option<&str>,
 ) -> String {
     let mut out =
         format!("TASK PROGRESS anchor_rev={anchor_revision} world_rev={workspace_revision}\n");
+    // The deterministic stall signal is the one line the model must not
+    // lose to list trimming, so it renders directly under the header.
+    if let Some(warning) = stall_warning {
+        out.push_str(warning);
+        out.push('\n');
+    }
     append_list(&mut out, "Checked", checked);
     append_list(&mut out, "Verification", verifications);
     append_list(&mut out, "Failed commands", failed);
@@ -1082,6 +1100,96 @@ mod tests {
             focus.contains("TASK PROGRESS"),
             "assembled focus must still carry the capped progress block"
         );
+    }
+
+    #[test]
+    fn assembler_checkpoints_long_turn_frames_to_the_retained_tail() {
+        // Deterministic turn checkpointing: the wire view keeps the last
+        // TURN_FRAME_KEEP_EXCHANGES exchanges; older ones collapse to a
+        // bounded note and the source frame is never mutated.
+        let assembler = PromptAssembler::new("policy");
+        let mut turn = TurnFrame::new("fix the bug");
+        for index in 0..9 {
+            turn.push_tool_calls(vec![agent_contracts::ToolCall {
+                id: format!("call-{index}"),
+                name: "fs.read".into(),
+                arguments: serde_json::json!({"path": "src/main.rs"}),
+            }]);
+            turn.push_tool_result(
+                agent_contracts::ToolOutput {
+                    call_id: format!("call-{index}"),
+                    tool_name: "fs.read".into(),
+                    ok: true,
+                    summary: "read".into(),
+                    model_content: format!("content {index}"),
+                    artifact_ref: None,
+                    metadata: serde_json::json!({}),
+                },
+                None,
+            );
+        }
+        let assembled = assembler.assemble(
+            None,
+            None,
+            None,
+            &materialized_with(Vec::new(), ContextMapView::default()),
+            &turn,
+            Vec::new(),
+        );
+        let checkpoint = assembled
+            .turn_checkpoint
+            .expect("9 exchanges over the keep threshold must compact");
+        assert_eq!(checkpoint.compacted_exchanges, 3);
+        assert_eq!(
+            assembled.turn_frame.steps.len(),
+            12,
+            "the wire frame is the 6-exchange tail"
+        );
+        assert_eq!(turn.steps.len(), 18, "the source frame is untouched");
+        let wire = assembled.turn_frame_wire_messages();
+        assert!(wire[1].content.starts_with("TURN CHECKPOINT: 3 earlier"));
+
+        // A short frame renders unchanged with no checkpoint.
+        let mut short = TurnFrame::new("quick question");
+        short.push_tool_calls(vec![agent_contracts::ToolCall {
+            id: "call-0".into(),
+            name: "fs.read".into(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+        }]);
+        let assembled = assembler.assemble(
+            None,
+            None,
+            None,
+            &materialized_with(Vec::new(), ContextMapView::default()),
+            &short,
+            Vec::new(),
+        );
+        assert!(assembled.turn_checkpoint.is_none());
+        assert_eq!(assembled.turn_frame.steps.len(), 1);
+    }
+
+    #[test]
+    fn stall_warning_renders_and_survives_list_trimming() {
+        let warning = "EXECUTION STALL: edit.replace on src/a.rs repeated 3 time(s) without world progress (last failure: stale_revision). Choose another strategy or finish with the current state.";
+        let progress = TaskProgressView {
+            stall_warning: Some(warning.into()),
+            failed_commands: (0..12)
+                .map(|i| format!("shell.exec cargo test --long-argument-{i}"))
+                .collect(),
+            ..Default::default()
+        };
+        let rendered = render_task_progress(&progress);
+        assert!(
+            rendered.contains("EXECUTION STALL"),
+            "the stall signal must render: {rendered}"
+        );
+        assert!(
+            rendered.contains("stale_revision"),
+            "the stall signal names its failure class: {rendered}"
+        );
+        // Overflowing lists are trimmed away; the deterministic stall
+        // signal is the one line that must survive.
+        assert!(rendered.chars().count() <= agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS);
     }
 
     #[test]

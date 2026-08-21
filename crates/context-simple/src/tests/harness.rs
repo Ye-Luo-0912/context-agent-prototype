@@ -22,6 +22,11 @@ pub(crate) async fn acknowledge_all(
                 .iter()
                 .map(|entry| entry.item_id)
                 .collect(),
+            foreground_item_ids: materialized
+                .foreground
+                .iter()
+                .map(|item| item.item_id)
+                .collect(),
         })
         .await
         .unwrap();

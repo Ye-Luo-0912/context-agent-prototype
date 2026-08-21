@@ -117,6 +117,10 @@ pub enum EffectCommitRejection {
     MissingLease,
     InvalidLease,
     InvalidOperation,
+    /// MOD-AUTH-02: the effect itself reported an actual workspace write
+    /// to a path the leased intent never approved. Authority widening at
+    /// commit time — rollback, never commit.
+    ActualExceedsApproved,
 }
 
 /// Atomic Core result for Runtime's exact-current-operation cancellation.
@@ -523,6 +527,45 @@ impl CorePort for CoreAuthority {
             }
             EffectCommitDisposition::Rejected(rejection)
         } else {
+            // MOD-AUTH-02 — Actual ⊆ Approved at commit: when the leased
+            // intent is a workspace write and the prepared effect reports
+            // its canonical actual writes, every actual path must be one
+            // the intent approved. An effect that cannot report its
+            // targets (`None`) keeps the legacy identity-only check; a
+            // reporting effect can never widen a single-path or set intent
+            // into paths the approval never named. Bytes are *not*
+            // compared here: patch intents carry delta estimates by
+            // design, and real-byte caps are enforced by the workspace
+            // mutation itself.
+            if let Some(lease) = lease.as_ref() {
+                let approved_paths = lease.intent.approved_workspace_paths();
+                if !approved_paths.is_empty()
+                    && let Some(actual) = effect.actual_workspace_writes()
+                    && let Some(stray) = actual.iter().find(|write| {
+                        agent_contracts::canonical_workspace_relative_path(&write.path)
+                            .is_none_or(|path| !approved_paths.contains(&path))
+                    })
+                {
+                    effect
+                        .rollback(&format!(
+                            "actual workspace write '{}' is outside the approved intent",
+                            stray.path
+                        ))
+                        .await;
+                    if let Err(error) =
+                        self.abort_prepared_operation(operation_id, effect_id, argument_digest)
+                    {
+                        tracing::debug!(
+                            %error,
+                            %operation_id,
+                            "actual-exceeds-approved effect was not a matching prepared registry entry"
+                        );
+                    }
+                    return EffectCommitDisposition::Rejected(
+                        EffectCommitRejection::ActualExceedsApproved,
+                    );
+                }
+            }
             if let Err(error) = self.begin_operation_commit_if_current(
                 generation,
                 operation_id,
@@ -803,13 +846,19 @@ mod tests {
     struct PreparedEffectTools {
         state: Arc<Mutex<String>>,
         risk: agent_contracts::ToolRisk,
+        /// Actual writes the staged effect reports to Core
+        /// (`None` = the legacy non-reporting behavior).
+        actual: Option<Vec<agent_contracts::ActualWorkspaceWrite>>,
+        /// Tool name the dispatcher advertises; tests use a builtin name
+        /// (`fs.write`) when the host policy must derive a real intent.
+        name: &'static str,
     }
 
     #[async_trait]
     impl ToolDispatcher for PreparedEffectTools {
         fn specs(&self) -> Vec<ToolSpec> {
             vec![ToolSpec {
-                name: "prepared.effect".into(),
+                name: self.name.into(),
                 description: "stages one recording effect".into(),
                 input_schema: serde_json::json!({"type": "object"}),
                 risk: self.risk,
@@ -843,6 +892,7 @@ mod tests {
                 },
                 effect: Box::new(RecordingEffect {
                     state: self.state.clone(),
+                    actual: self.actual.clone(),
                 }),
             })
         }
@@ -959,12 +1009,17 @@ mod tests {
 
     struct RecordingEffect {
         state: Arc<Mutex<String>>,
+        actual: Option<Vec<agent_contracts::ActualWorkspaceWrite>>,
     }
 
     #[async_trait]
     impl Effect for RecordingEffect {
         fn describe(&self) -> String {
             "recording effect".into()
+        }
+
+        fn actual_workspace_writes(&self) -> Option<Vec<agent_contracts::ActualWorkspaceWrite>> {
+            self.actual.clone()
         }
 
         async fn commit(self: Box<Self>) -> EffectReceipt {
@@ -1358,7 +1413,10 @@ mod tests {
             argument_digest,
             generation,
             lease,
-            effect: Box::new(RecordingEffect { state }),
+            effect: Box::new(RecordingEffect {
+                state,
+                actual: None,
+            }),
         }
     }
 
@@ -1623,6 +1681,8 @@ mod tests {
         let tools = Arc::new(PreparedEffectTools {
             state: state.clone(),
             risk: agent_contracts::ToolRisk::WorkspaceWrite,
+            actual: None,
+            name: "prepared.effect",
         });
         let port = build_core_port(
             CoreAuthorityConfig::default(),
@@ -1684,6 +1744,103 @@ mod tests {
                 terminal: OperationTerminal::CancelledBeforeCommit,
             } if recorded == effect_id
         ));
+    }
+
+    /// Drive one `fs.write`-shaped prepared effect to a commit decision,
+    /// with the effect reporting the given actual workspace writes.
+    async fn actual_vs_approved_commit(
+        actual: Option<Vec<agent_contracts::ActualWorkspaceWrite>>,
+    ) -> (EffectCommitDisposition, Arc<Mutex<String>>) {
+        let state = Arc::new(Mutex::new(String::new()));
+        let tools = Arc::new(PreparedEffectTools {
+            state: state.clone(),
+            risk: agent_contracts::ToolRisk::WorkspaceWrite,
+            actual,
+            name: "fs.write",
+        });
+        let port = build_core_port(
+            CoreAuthorityConfig::default(),
+            Arc::new(StubContext),
+            tools.clone(),
+            Arc::new(Allow),
+            None,
+        );
+        // A builtin name so the host policy derives a real intent from
+        // the arguments: WorkspaceWrite { path: "src/lib.rs" }.
+        let call = ToolCall {
+            id: "fs-write".into(),
+            name: "fs.write".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs", "content": "x"}),
+        };
+        let surface = ToolSurfaceSnapshot {
+            specs: tools.specs(),
+            ..ToolSurfaceSnapshot::default()
+        };
+        let generation = port.current_authority_epoch();
+        let operation_id = OperationId::new();
+        let argument_digest = ArgumentDigest::from_json(&call.arguments);
+        let execution = admit_and_execute(
+            port.as_ref(),
+            operation_identity(port.as_ref(), &call, operation_id, generation),
+            call,
+            CancellationToken::new(),
+            &surface,
+        )
+        .await;
+        let ToolOutcome::PreparedEffect { effect, .. } = execution.outcome else {
+            panic!("fixture must prepare an effect");
+        };
+        let result = port
+            .commit_effect(EffectCommitRequest {
+                run_id: port.run_id(),
+                turn_id: TurnId::new(),
+                operation_id,
+                effect_id: execution.effect_id.expect("Core assigns an effect id"),
+                argument_digest,
+                generation,
+                lease: execution.lease.clone(),
+                effect,
+            })
+            .await;
+        (result, state)
+    }
+
+    #[tokio::test]
+    async fn commit_refuses_an_actual_write_outside_the_approved_intent() {
+        // MOD-AUTH-02: the approved intent names `src/lib.rs`; the staged
+        // effect reports a write to `secret/other.rs`. Authority widened
+        // between approval and commit — rollback, never commit.
+        let (result, state) =
+            actual_vs_approved_commit(Some(vec![agent_contracts::ActualWorkspaceWrite {
+                path: "secret/other.rs".into(),
+                bytes: 1,
+            }]))
+            .await;
+        assert!(matches!(
+            result,
+            EffectCommitDisposition::Rejected(EffectCommitRejection::ActualExceedsApproved)
+        ));
+        assert!(state.lock().unwrap().starts_with("rolled back:"));
+    }
+
+    #[tokio::test]
+    async fn commit_allows_an_actual_write_inside_the_approved_intent() {
+        // The same path the intent approved, slash-form differences
+        // canonicalized away: the check must not reject honest effects.
+        let (result, state) =
+            actual_vs_approved_commit(Some(vec![agent_contracts::ActualWorkspaceWrite {
+                path: r"src\lib.rs".into(),
+                bytes: 1,
+            }]))
+            .await;
+        assert!(
+            !matches!(
+                result,
+                EffectCommitDisposition::Rejected(EffectCommitRejection::ActualExceedsApproved)
+            ),
+            "an in-bounds actual write must pass the containment check: {result:?}"
+        );
+        assert_eq!(*state.lock().unwrap(), "committed");
     }
 
     #[tokio::test]
@@ -1824,6 +1981,7 @@ mod tests {
                 lease: None,
                 effect: Box::new(RecordingEffect {
                     state: state.clone(),
+                    actual: None,
                 }),
                 reason: "stale".into(),
             })
@@ -1841,6 +1999,8 @@ mod tests {
             Arc::new(PreparedEffectTools {
                 state: state.clone(),
                 risk: agent_contracts::ToolRisk::ReadOnly,
+                actual: None,
+                name: "prepared.effect",
             }),
             Arc::new(Allow),
             None,
@@ -1854,6 +2014,8 @@ mod tests {
             specs: PreparedEffectTools {
                 state: state.clone(),
                 risk: agent_contracts::ToolRisk::ReadOnly,
+                actual: None,
+                name: "prepared.effect",
             }
             .specs(),
             ..ToolSurfaceSnapshot::default()
@@ -1909,6 +2071,8 @@ mod tests {
             Arc::new(PreparedEffectTools {
                 state: state.clone(),
                 risk: agent_contracts::ToolRisk::WorkspaceWrite,
+                actual: None,
+                name: "prepared.effect",
             }),
             Arc::new(Allow),
             None,
@@ -1922,6 +2086,8 @@ mod tests {
             specs: PreparedEffectTools {
                 state: state.clone(),
                 risk: agent_contracts::ToolRisk::WorkspaceWrite,
+                actual: None,
+                name: "prepared.effect",
             }
             .specs(),
             ..ToolSurfaceSnapshot::default()
@@ -1980,6 +2146,8 @@ mod tests {
             Arc::new(PreparedEffectTools {
                 state: state.clone(),
                 risk: agent_contracts::ToolRisk::WorkspaceWrite,
+                actual: None,
+                name: "prepared.effect",
             }),
             Arc::new(Allow),
             None,
@@ -1993,6 +2161,8 @@ mod tests {
             specs: PreparedEffectTools {
                 state: state.clone(),
                 risk: agent_contracts::ToolRisk::WorkspaceWrite,
+                actual: None,
+                name: "prepared.effect",
             }
             .specs(),
             ..ToolSurfaceSnapshot::default()
@@ -2069,6 +2239,7 @@ mod tests {
                 lease: Some(lease),
                 effect: Box::new(RecordingEffect {
                     state: duplicate_state.clone(),
+                    actual: None,
                 }),
             })
             .await;

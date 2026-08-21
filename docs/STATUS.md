@@ -18,10 +18,14 @@ and sandbox contracts live elsewhere. Experiment facts live in
 ## Now
 
 - M10, M11, and M14 are closed at their named gates.
-- Context V1 operational core and Execution Coherence V1 are **freeze
-  candidates**. Code still runs; do not retune or extend them as product
-  work.
-- M12 first cut: structured `EffectIntent` + trusted `HostToolPolicy`.
+- Context V1 operational core is a **freeze candidate**; Execution
+  Coherence V1 is **RC** (its blockers — MOD-OBS-01 observation,
+  MOD-PROG-01 progress/stall, turn checkpointing — landed 2026-08-21;
+  freeze re-designation waits for the next live evidence pass). Code
+  still runs; do not retune or extend them as product work.
+- M12 first cut: structured `EffectIntent` + trusted `HostToolPolicy`,
+  multi-file `WorkspaceWriteSet` bounds, and commit-time
+  Actual ⊆ Approved (`MOD-AUTH-01`/`02`).
 - M13 first cut: `SandboxProfile` vs post-spawn `SandboxCapabilities`.
 - PLAT-06 slices 1–2 (lifecycle / cancel-ACK) landed. Multiplexing is
   not in v0.
@@ -51,9 +55,13 @@ and sandbox contracts live elsewhere. Experiment facts live in
 
 **P0 — trusted execution.** Finish M12/M13 gates in
 [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md): one brokerable
-`EffectRequest` path; attestation is actual enforced capabilities;
-generic process tools stay non-transactional. UntrustedGenerated stays
-fail-closed on native.
+`EffectRequest` path; a `HostToolPolicyRegistry` so plugin admission
+can install operator-reviewed bindings (external write plugins fail
+closed today — safely non-functional); attestation is actual enforced
+capabilities; generic process tools stay non-transactional.
+UntrustedGenerated stays fail-closed on native. Multi-file
+`EffectIntent` and commit-time Actual ⊆ Approved (`MOD-AUTH-01`/`02`)
+landed 2026-08-21 — do not reopen them without new authority evidence.
 
 **P1 — Context live evidence, not Context retune.** `context-mech.v2`
 12-cell A/C live ran 2026-08-21; facts in
@@ -61,6 +69,15 @@ fail-closed on native.
 Do not retune GC from it. `add_test` is Tool Surface
 (`historical_context=0`), not Context. Engine packs foreground first
 (actual tokens). GC-induced reread is `Warm` + `Stored` only.
+
+**P1 — open-turn convergence evidence.** Execution Convergence first
+cut landed 2026-08-21: MOD-OBS-01 (a refused mutation is still an
+observation), MOD-PROG-01 (stall advisory + deterministic duplicate
+refusal), turn checkpointing (`TURN_FRAME_KEEP_EXCHANGES`). The open
+P1 is the live tool-loop / convergence failure the 12-cell run
+exposed; next evidence is production-surface late-semantic op5
+reproduction aimed at Tool/Execution Convergence — not 12 → 24 → 48
+context cells.
 
 ## Next milestone
 

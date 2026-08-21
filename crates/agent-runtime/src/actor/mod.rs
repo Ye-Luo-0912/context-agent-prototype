@@ -22,14 +22,14 @@ use agent_contracts::{
     FsRereadClass, InputAuthority, InputKind, InputLifecycle, InputSource,
     MAX_COMPLETION_ARTIFACTS, MaterializedContext, ModelCompletionValidity, ModelInput,
     ModelRequest, OperationId, OperationOutcome, OperationQueryResult, OperationResult,
-    OperationState, OperationTerminal, ResourceKey, ResourceVersionOracle, RestoreRevision, RunId,
-    RuntimeDirective, RuntimeEvent, RuntimeInputEnvelope, RuntimeInputId, ScopeId, ScopeKind,
-    StatePatchProposal, TaskAnchorView, TaskId, TaskProgressView, ToolCall, ToolOperationIdentity,
-    ToolOutcome, ToolOutput, ToolResultDisposition, ToolSpec, ToolSurfaceBlock,
-    ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceSnapshot, TurnCancelAck,
-    TurnCancellationReason, TurnFrame, TurnFrameStep, TurnId, USER_INPUT_ARTIFACT_OWNER,
-    USER_INPUT_PREVIEW_CHARS, USER_INPUT_QUEUE_CAP, bounded_preview, context_maintenance_events,
-    discovery_search_from_call,
+    OperationState, OperationTerminal, ResourceFreshness, ResourceKey, ResourceVersionOracle,
+    RestoreRevision, RunId, RuntimeDirective, RuntimeEvent, RuntimeInputEnvelope, RuntimeInputId,
+    ScopeId, ScopeKind, StatePatchProposal, TaskAnchorView, TaskId, TaskProgressView, ToolCall,
+    ToolOperationIdentity, ToolOutcome, ToolOutput, ToolResultDisposition, ToolSpec,
+    ToolSurfaceBlock, ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceSnapshot,
+    TurnCancelAck, TurnCancellationReason, TurnFrame, TurnFrameStep, TurnId,
+    USER_INPUT_ARTIFACT_OWNER, USER_INPUT_PREVIEW_CHARS, USER_INPUT_QUEUE_CAP, bounded_preview,
+    context_maintenance_events, discovery_search_from_call,
 };
 use agent_core::{
     ApprovalVerdict, CorePort, EffectCommitDisposition, EffectCommitRejection, EffectCommitRequest,
@@ -206,6 +206,11 @@ struct ActiveTurn {
     /// results; installed back onto the task only after TurnCompleted.
     /// Cancel / fail / stale drops this value.
     execution: ExecutionState,
+    /// MOD-PROG-01: deterministically-refused edit attempts this turn.
+    /// An identical retry (same argument digest) against unchanged file
+    /// identities is refused without dispatch. Turn-scoped on purpose:
+    /// a new user directive may legitimately ask for the same edit.
+    edit_attempts: Vec<EditAttemptFact>,
     /// Captured once per BeforeModel after revalidate. Prompt, ContextHints,
     /// and tool-surface policy all read this — not per-consumer clones.
     round_snapshot: Option<RoundExecutionSnapshot>,
@@ -231,6 +236,247 @@ struct AssistantArtifactEvidence {
     task_id: TaskId,
     turn_id: TurnId,
     reference: String,
+}
+
+/// MOD-PROG-01: one deterministically-refused edit attempt. The
+/// `OperationAttemptKey` is tool + argument digest; the trusted target
+/// observations (`path@digest`) captured at refusal time prove the retry
+/// would hit identical file identities.
+#[derive(Debug, Clone)]
+struct EditAttemptFact {
+    tool_name: String,
+    argument_digest: String,
+    targets: Vec<String>,
+    failure_class: agent_contracts::ToolFailureClass,
+}
+
+/// Bounded attempt ledger: the retry loop the runtime cares about is
+/// recent, not historical.
+const MAX_EDIT_ATTEMPTS: usize = 8;
+
+impl ActiveTurn {
+    /// Whether `call` repeats a deterministic edit refusal whose target
+    /// identities are all still Fresh and unchanged. Such a call is
+    /// provably going to fail the same way, so the runtime refuses it
+    /// without dispatch. Process/shell tools are never deduplicated:
+    /// time and environment make them non-deterministic.
+    fn duplicate_edit_attempt(&self, call: &ToolCall) -> Option<EditAttemptFact> {
+        if !matches!(call.name.as_str(), "edit.replace" | "edit.patch") {
+            return None;
+        }
+        let digest = ArgumentDigest::from_json(&call.arguments).to_string();
+        self.edit_attempts
+            .iter()
+            .find(|attempt| {
+                attempt.tool_name == call.name
+                    && attempt.argument_digest == digest
+                    && attempt.targets.iter().all(|target| {
+                        target.split_once('@').is_some_and(|(path, digest)| {
+                            self.execution.fact_for(path).is_some_and(|fact| {
+                                fact.freshness == ResourceFreshness::Fresh && fact.digest == digest
+                            })
+                        })
+                    })
+            })
+            .cloned()
+    }
+
+    /// Record (or clear) the attempt for one completed edit call.
+    fn record_edit_attempt(&mut self, output: &ToolOutput, digest: &ArgumentDigest) {
+        if !matches!(output.tool_name.as_str(), "edit.replace" | "edit.patch") {
+            return;
+        }
+        let digest = digest.to_string();
+        // A success consumed the attempt: the world moved enough for the
+        // same arguments to apply, so a later retry is not a duplicate.
+        if output.ok {
+            self.edit_attempts.retain(|attempt| {
+                !(attempt.tool_name == output.tool_name && attempt.argument_digest == digest)
+            });
+            return;
+        }
+        let Some(class) = output.failure_class() else {
+            return;
+        };
+        if !matches!(
+            class,
+            agent_contracts::ToolFailureClass::StaleRevision
+                | agent_contracts::ToolFailureClass::NoExactMatch
+                | agent_contracts::ToolFailureClass::AmbiguousMatch
+        ) {
+            return;
+        }
+        // MOD-OBS-01: the refusal's trusted path+revision stamps are the
+        // file identities a retry must still match to be a duplicate.
+        let targets: Vec<String> = output
+            .resource_touches()
+            .into_iter()
+            .filter_map(|touch| {
+                touch
+                    .revision
+                    .filter(|revision| !revision.is_empty())
+                    .map(|revision| format!("{}@{}", touch.path, revision))
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        self.edit_attempts.retain(|attempt| {
+            !(attempt.tool_name == output.tool_name && attempt.argument_digest == digest)
+        });
+        self.edit_attempts.push(EditAttemptFact {
+            tool_name: output.tool_name.clone(),
+            argument_digest: digest,
+            targets,
+            failure_class: class,
+        });
+        let excess = self.edit_attempts.len().saturating_sub(MAX_EDIT_ATTEMPTS);
+        self.edit_attempts.drain(0..excess);
+    }
+}
+
+#[cfg(test)]
+mod edit_attempt_tests {
+    use super::*;
+    use agent_contracts::ToolFailureClass;
+
+    fn turn_with_fact(path: &str, digest: &str, freshness: ResourceFreshness) -> ActiveTurn {
+        let mut turn = ActiveTurn {
+            turn_id: TurnId::new(),
+            turn_frame: TurnFrame::new("edit the file"),
+            model_round: 1,
+            pending_tools: VecDeque::new(),
+            tool_surface: None,
+            turn_state: TurnState::Running,
+            op: None,
+            execution: ExecutionState::default(),
+            edit_attempts: Vec::new(),
+            round_snapshot: None,
+            pending_completion: None,
+            applied_input: None,
+            input_consumed: false,
+            structurally_empty_retries: 0,
+        };
+        turn.execution
+            .checked_files
+            .push(crate::execution::ResourceFact {
+                path: path.into(),
+                digest: digest.into(),
+                freshness,
+                turn: 1,
+                provenance: crate::execution::ResourceProvenance::Read,
+            });
+        turn
+    }
+
+    fn refused_output(path: &str, revision: &str, class: ToolFailureClass) -> ToolOutput {
+        ToolOutput {
+            call_id: "c".into(),
+            tool_name: "edit.replace".into(),
+            ok: false,
+            summary: "refused".into(),
+            model_content: "refused".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({
+                "path": path,
+                "revision": revision,
+                "failure_class": class.as_str(),
+            }),
+        }
+    }
+
+    fn edit_call(arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "c".into(),
+            name: "edit.replace".into(),
+            arguments,
+        }
+    }
+
+    #[test]
+    fn identical_retry_against_unchanged_facts_is_a_duplicate() {
+        let args = serde_json::json!({"path": "src/a.rs", "old": "x", "new": "y"});
+        let call = edit_call(args.clone());
+        let mut turn = turn_with_fact("src/a.rs", "rev1", ResourceFreshness::Fresh);
+        assert!(
+            turn.duplicate_edit_attempt(&call).is_none(),
+            "no recorded attempt yet"
+        );
+
+        turn.record_edit_attempt(
+            &refused_output("src/a.rs", "rev1", ToolFailureClass::NoExactMatch),
+            &ArgumentDigest::from_json(&args),
+        );
+        assert!(
+            turn.duplicate_edit_attempt(&call).is_some(),
+            "identical arguments against an unchanged Fresh fact is a duplicate"
+        );
+
+        // Different arguments: the model changed strategy — dispatch.
+        let mut changed_args = args.clone();
+        changed_args["new"] = serde_json::json!("z");
+        assert!(
+            turn.duplicate_edit_attempt(&edit_call(changed_args))
+                .is_none()
+        );
+
+        // The file moved on: the retry would see different content.
+        turn.execution.checked_files[0].digest = "rev2".into();
+        assert!(turn.duplicate_edit_attempt(&call).is_none());
+
+        // The fact identity is unproven (NeedsRevalidation): fail open.
+        turn.execution.checked_files[0].digest = "rev1".into();
+        turn.execution.checked_files[0].freshness = ResourceFreshness::NeedsRevalidation;
+        assert!(turn.duplicate_edit_attempt(&call).is_none());
+    }
+
+    #[test]
+    fn a_later_success_consumes_the_attempt() {
+        let args = serde_json::json!({"path": "src/a.rs", "old": "x", "new": "y"});
+        let digest = ArgumentDigest::from_json(&args);
+        let mut turn = turn_with_fact("src/a.rs", "rev1", ResourceFreshness::Fresh);
+        turn.record_edit_attempt(
+            &refused_output("src/a.rs", "rev1", ToolFailureClass::StaleRevision),
+            &digest,
+        );
+        assert!(
+            turn.duplicate_edit_attempt(&edit_call(args.clone()))
+                .is_some()
+        );
+        // The same arguments now succeed (the world moved enough): the
+        // attempt is consumed so a later retry dispatches again.
+        let mut success = refused_output("src/a.rs", "rev1", ToolFailureClass::StaleRevision);
+        success.ok = true;
+        turn.record_edit_attempt(&success, &digest);
+        assert!(turn.duplicate_edit_attempt(&edit_call(args)).is_none());
+    }
+
+    #[test]
+    fn non_dedupable_failures_and_tools_stay_out_of_the_ledger() {
+        let mut turn = turn_with_fact("src/a.rs", "rev1", ResourceFreshness::Fresh);
+        let args = serde_json::json!({"path": "src/a.rs", "old": "x", "new": "y"});
+        let digest = ArgumentDigest::from_json(&args);
+        // A process failure never enters the ledger.
+        let mut process_failure =
+            refused_output("src/a.rs", "rev1", ToolFailureClass::NoExactMatch);
+        process_failure.tool_name = "shell.exec".into();
+        process_failure.metadata = serde_json::json!({
+            "command": "cargo test",
+            "failure_class": "process_exit",
+        });
+        turn.record_edit_attempt(&process_failure, &digest);
+        assert!(turn.edit_attempts.is_empty());
+        // An edit failure without a stamped revision cannot be proven
+        // deterministic: no ledger entry.
+        let mut no_revision = refused_output("src/a.rs", "", ToolFailureClass::NoExactMatch);
+        no_revision
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("revision");
+        turn.record_edit_attempt(&no_revision, &digest);
+        assert!(turn.edit_attempts.is_empty());
+    }
 }
 
 /// The commit lifecycle of a turn. `ModelFinished` means the model has

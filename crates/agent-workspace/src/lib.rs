@@ -1013,6 +1013,8 @@ impl MutationTransaction {
             temp_file: Some(file),
             effect_context,
             finished: false,
+            relative_target: self.relative,
+            staged_bytes: content.len() as u64,
         })
     }
 
@@ -1058,6 +1060,10 @@ pub struct PreparedMutation {
     temp_file: Option<std::fs::File>,
     effect_context: Option<OperationEffectContext>,
     finished: bool,
+    /// Canonical actual write target + real staged byte count, reported to
+    /// Core for the commit-time Actual ⊆ Approved check (MOD-AUTH-02).
+    relative_target: String,
+    staged_bytes: u64,
 }
 
 impl PreparedMutation {
@@ -1200,6 +1206,16 @@ impl Drop for PreparedMutation {
 impl Effect for PreparedMutation {
     fn describe(&self) -> String {
         format!("workspace mutation {}", self.tx_id)
+    }
+
+    fn actual_workspace_writes(&self) -> Option<Vec<agent_contracts::ActualWorkspaceWrite>> {
+        // The real staged target and the real byte count — not an
+        // approval-time estimate. Core compares these against the leased
+        // intent's approved path set before committing (MOD-AUTH-02).
+        Some(vec![agent_contracts::ActualWorkspaceWrite {
+            path: self.relative_target.clone(),
+            bytes: self.staged_bytes,
+        }])
     }
 
     async fn commit(self: Box<Self>) -> EffectReceipt {

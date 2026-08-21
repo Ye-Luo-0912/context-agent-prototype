@@ -207,7 +207,7 @@ fn workspace_write_intent(
     path_arg: &str,
     content_args: &[&str],
 ) -> EffectIntent {
-    let mut path = string_arg(arguments, path_arg);
+    let path = string_arg(arguments, path_arg);
     let mut content_bytes = 0u64;
     for key in content_args {
         if let Some(content) = arguments.get(*key).and_then(Value::as_str) {
@@ -215,16 +215,50 @@ fn workspace_write_intent(
         }
     }
     if let Some(files) = arguments.get("files").and_then(Value::as_array) {
+        // The multi-file form (`edit.patch` `files[]`) authorizes the
+        // whole target set, never the first entry: a standing grant for
+        // `src/` must not be widened by a second file outside it. The
+        // trusted knowledge-plane touch set (`metadata.files[].path`)
+        // already carries every target — the authority intent must carry
+        // them too (MOD-AUTH-01). Each entry carries its own per-file
+        // byte estimate (the hunk delta); the cap is
+        // [`crate::MAX_WORKSPACE_WRITE_SET`].
+        let mut writes: Vec<crate::WorkspaceWriteBound> = Vec::new();
         for file in files {
-            if path.is_empty() {
-                path = file
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+            if let Some(file_path) = file.get("path").and_then(Value::as_str) {
+                let file_path = file_path.trim();
+                if file_path.is_empty() {
+                    continue;
+                }
+                match writes.iter_mut().find(|bound| bound.path == file_path) {
+                    Some(existing) => {
+                        existing.max_bytes =
+                            existing.max_bytes.saturating_add(patch_file_bytes(file));
+                    }
+                    None => writes.push(crate::WorkspaceWriteBound {
+                        path: file_path.to_string(),
+                        max_bytes: patch_file_bytes(file),
+                    }),
+                }
             }
             content_bytes = content_bytes.saturating_add(patch_file_bytes(file));
         }
+        writes.truncate(crate::MAX_WORKSPACE_WRITE_SET);
+        return match writes.len() {
+            // No usable target: keep the (possibly empty) single-path
+            // form so the intent can never match a grant.
+            0 => EffectIntent::WorkspaceWrite {
+                path,
+                content_bytes,
+            },
+            // One file keeps the single-resource shape so grants minted
+            // from single-file calls still match exactly.
+            1 => EffectIntent::WorkspaceWrite {
+                path: writes.remove(0).path,
+                content_bytes,
+            },
+            _ => EffectIntent::WorkspaceWriteSet { writes },
+        };
     }
     if let Some(hunks) = arguments.get("hunks") {
         content_bytes = content_bytes.saturating_add(patch_hunk_bytes(hunks));
@@ -303,6 +337,64 @@ mod tests {
             EffectIntent::WorkspaceWrite {
                 path: String::new(),
                 content_bytes: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn edit_patch_multi_file_intent_is_the_whole_target_set() {
+        // MOD-AUTH-01 regression: the intent used to carry only the first
+        // `files[].path`, so one granted path widened authority over the
+        // rest of the set. Every distinct target must be in the intent,
+        // each with its own per-file byte estimate (duplicate paths merge
+        // their hunks into one bound).
+        let policy = builtin_host_tool_policy("edit.patch").unwrap();
+        let intent = policy.intent_from(&json!({
+            "files": [
+                {"path": "src/a.rs", "hunks": [{"old": "a", "new": "aa"}]},
+                {"path": "secret/b.rs", "hunks": [{"old": "b", "new": "bb"}]},
+                {"path": "src/a.rs", "hunks": [{"old": "c", "new": "cc"}]}
+            ]
+        }));
+        assert_eq!(
+            intent,
+            EffectIntent::WorkspaceWriteSet {
+                writes: vec![
+                    crate::WorkspaceWriteBound {
+                        path: "src/a.rs".into(),
+                        max_bytes: 4,
+                    },
+                    crate::WorkspaceWriteBound {
+                        path: "secret/b.rs".into(),
+                        max_bytes: 2,
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn edit_patch_single_file_forms_stay_single_resource() {
+        let policy = builtin_host_tool_policy("edit.patch").unwrap();
+        // One `files[]` entry keeps the single-resource shape.
+        assert_eq!(
+            policy.intent_from(&json!({
+                "files": [{"path": "src/a.rs", "hunks": [{"old": "a", "new": "aa"}]}]
+            })),
+            EffectIntent::WorkspaceWrite {
+                path: "src/a.rs".into(),
+                content_bytes: 2,
+            }
+        );
+        // The `path`+`hunks` shortcut is unchanged.
+        assert_eq!(
+            policy.intent_from(&json!({
+                "path": "src/a.rs",
+                "hunks": [{"old": "a", "new": "aa"}]
+            })),
+            EffectIntent::WorkspaceWrite {
+                path: "src/a.rs".into(),
+                content_bytes: 2,
             }
         );
     }

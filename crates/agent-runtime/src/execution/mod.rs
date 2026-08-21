@@ -60,7 +60,8 @@ pub use needs::{
 pub use snapshot::RoundExecutionSnapshot;
 pub use snapshot::VerificationProjection;
 pub use state::{
-    ExecutionState, ResourceFact, VerificationCause, VerificationCoverage, VerificationState,
+    ExecutionState, ResourceFact, ResourceProvenance, VerificationCause, VerificationCoverage,
+    VerificationState,
 };
 
 /// Checkpoint/wire name for [`ExecutionState`]. The `TaskRecord` field is

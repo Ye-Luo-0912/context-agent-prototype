@@ -947,6 +947,18 @@ Focus/TaskAnchor plus the engine's historical `MaterializedContext`. The
 engine could not format a prompt even if it wanted to — it never sees the
 system prompt or the tool schemas.
 
+#### Turn Frame wire checkpointing (the Protocol Working Set)
+
+The turn's own protocol history is a working set too, not an append-only
+log: the wire view keeps only the last `TURN_FRAME_KEEP_EXCHANGES`
+completed tool exchanges and replaces older whole call+result groups with
+one bounded deterministic `TURN CHECKPOINT` note (no LLM summary). The
+runtime's full `TurnFrame` is never mutated — audit, events, and
+turn-end persistence still see every step; only the model-facing wire
+projection is bounded. Details and the progress/stall machinery that
+motivate it are in
+[`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md).
+
 #### Runtime Facts layer (`TOOL-ENV-01`)
 
 `PromptAssembler` places a bounded system-owned facts block immediately after

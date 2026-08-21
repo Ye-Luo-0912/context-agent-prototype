@@ -329,8 +329,12 @@ impl RuntimeActor {
         // 发送窗口与打包窗口分离：SWE-bench 工具轮的 turn frame 必须
         // 能发出去；C 的 working set 仍按内核 pack cap 收。未声明
         // provider 窗口时两者都回退到内核 budget（旧行为）。
+        // Token 计量的是确定性 checkpointing 之后真正上线的协议视图
+        // （保留尾部 + 有界 checkpoint 注记），与装配器一致。
         let capabilities = self.services.model_capabilities();
-        let turn_frame_tokens = approx_layer_tokens(&turn_frame.messages());
+        let turn_frame_tokens = approx_layer_tokens(
+            &turn_frame.checkpointed_messages(agent_contracts::TURN_FRAME_KEEP_EXCHANGES),
+        );
         let active_tools_tokens = approx_layer_tokens(&surface_plan.specs());
         let kernel_budget = self.services.context_budget_tokens();
         let send_window = provider_send_window(capabilities.context_window, kernel_budget);
@@ -599,6 +603,14 @@ impl RuntimeActor {
                 .external
                 .iter()
                 .map(|entry| entry.item_id)
+                .collect(),
+            // Foreground bodies the prompt rendered this round: the model
+            // saw them, so consumption observability must record them
+            // (weak signal only; engines must not change residency).
+            foreground_item_ids: materialized
+                .foreground
+                .iter()
+                .map(|item| item.item_id)
                 .collect(),
         };
         let generation = self.state.generation;

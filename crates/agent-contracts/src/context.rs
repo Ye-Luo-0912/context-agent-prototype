@@ -1008,6 +1008,11 @@ pub struct TaskProgressView {
     pub checked_files: Vec<String>,
     pub verifications: Vec<String>,
     pub failed_commands: Vec<String>,
+    /// Deterministic stall signal (MOD-PROG-01): the same operation
+    /// signature has produced no world progress for consecutive rounds.
+    /// Advisory prompt line, never an execution block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_warning: Option<String>,
 }
 
 /// Hard cap on the assembled TASK PROGRESS prompt block. List-length caps
@@ -1178,6 +1183,13 @@ pub struct ContextConsumptionAck {
     /// request. These are ids, not copied summaries/bodies.
     #[serde(default)]
     pub external_item_ids: Vec<ContextItemId>,
+    /// Foreground evidence bodies the prompt actually rendered
+    /// (`MaterializedContext.foreground`): transient rehydration the model
+    /// saw even though it never changed residency. Observability only —
+    /// engines record it as a weak access signal and must not Admit,
+    /// reinforce scoring, or change residency from it.
+    #[serde(default)]
+    pub foreground_item_ids: Vec<ContextItemId>,
 }
 
 impl ContextConsumptionAck {
@@ -1205,6 +1217,19 @@ impl ContextConsumptionAck {
         if self.external_item_ids.iter().any(|id| !seen.insert(*id)) {
             return Err(AgentError::InvalidRequest(
                 "context consumption ack contains a duplicate item identity".into(),
+            ));
+        }
+        // Foreground identities only need distinctness among themselves:
+        // the same body may legitimately be both selected and foreground
+        // rehydrated in one frame, and that overlap is not an error.
+        let mut foreground_seen = HashSet::with_capacity(self.foreground_item_ids.len());
+        if self
+            .foreground_item_ids
+            .iter()
+            .any(|id| !foreground_seen.insert(*id))
+        {
+            return Err(AgentError::InvalidRequest(
+                "context consumption ack contains duplicate foreground identities".into(),
             ));
         }
         Ok(())
@@ -1376,6 +1401,10 @@ pub struct ContextDiagnostics {
     pub access_admits: u64,
     #[serde(default)]
     pub access_consumption_acks: u64,
+    /// Foreground bodies consumed by successful model rounds (weak
+    /// observational signal; never reinforces access or changes residency).
+    #[serde(default)]
+    pub foreground_consumed_acks: u64,
     /// Hot-reactivation utility: reactivated items later selected into a
     /// materialized frame. Measurement only; does not change GC policy.
     #[serde(default)]
@@ -2271,6 +2300,7 @@ mod tests {
             materialization_id: 1,
             item_ids: vec![ContextItemId::new()],
             external_item_ids: vec![ContextItemId::new()],
+            foreground_item_ids: vec![ContextItemId::new()],
         };
         valid.validate().unwrap();
 
@@ -2300,7 +2330,26 @@ mod tests {
                 .contains("duplicate item identity")
         );
 
+        // Duplicate foreground identities are rejected; an overlap between
+        // a foreground body and a selected item is not (the same body can
+        // legitimately appear in both roles in one frame).
+        let foreground_duplicate = ContextItemId::new();
         invalid.item_ids.clear();
+        invalid.external_item_ids.clear();
+        invalid.foreground_item_ids = vec![foreground_duplicate, foreground_duplicate];
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate foreground")
+        );
+        invalid.foreground_item_ids = vec![duplicate];
+        invalid.item_ids = vec![duplicate];
+        assert!(invalid.validate().is_ok());
+
+        invalid.item_ids.clear();
+        invalid.foreground_item_ids.clear();
         invalid.external_item_ids = (0..=CONTEXT_MAP_VIEW_CAP)
             .map(|_| ContextItemId::new())
             .collect();

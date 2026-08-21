@@ -25,14 +25,60 @@ Code: `crates/agent-contracts/src/host_policy.rs`.
 
 ```text
 ReadOnly
-WorkspaceWrite { path, content_bytes }
+WorkspaceWrite { path, content_bytes }          // one exact target
+WorkspaceWriteSet { writes }                    // MOD-AUTH-01: every target of one multi-file call
 ExecArgv { program, argv }     // argv prefix; intact argument boundaries
 ShellExec { dialect, command_digest }  // exact JCS+sha256 of {"command"}
 ```
 
+`WorkspaceWriteSet` carries one `WorkspaceWriteBound { path, max_bytes }`
+per target — each file gets its own approval-time byte estimate — and is
+hard-capped at `MAX_WORKSPACE_WRITE_SET` (16 entries, matching
+`edit.patch`'s per-call file cap). For `edit.patch` the estimate is the
+per-file hunk delta: a *lower bound* on the final body, never the real
+write size; real-byte resource caps are enforced by the workspace
+mutation itself, and commit-time path containment by MOD-AUTH-02 below.
+
 Whitespace token prefixes are not a grant. A standing `git status` grant
 must not cover `git status && …`. `process.run` must not join argv and
 re-split: `["git", "status && evil"]` is one argument, not three tokens.
+
+**MOD-AUTH-01 (multi-resource authority widening, fixed 2026-08-21).**
+`edit.patch files[]` used to derive a single-path intent from the first
+entry, so a `src/` standing grant authorized writes to every other file
+in the set while the executor staged up to 16 real write targets. The
+host policy now derives `WorkspaceWriteSet` (every distinct
+`files[].path`, each with its own byte estimate) whenever a call names
+more than one target; a single-file call keeps the single-resource
+shape so existing grants still match exactly. `grant_matches` requires
+**every** path inside the grant prefix; a content cap must cover both
+the summed per-entry estimates and each entry individually. `covers`
+accepts set equality (or one member for a single write) — one approved
+path never widens into a set, and `covers` is fail-closed on any
+uncanonicalizable member. Knowledge-plane touches
+(`metadata.files[].path`) already carried every target; the authority
+intent now matches that shape.
+
+**MOD-AUTH-02 (commit-time Actual ⊆ Approved, fixed 2026-08-21).**
+Approval bounds are estimates; commit is checked against what was
+actually staged. Trusted builtin write effects implement
+`Effect::actual_workspace_writes()`, returning canonical
+`ActualWorkspaceWrite { path, bytes }` — the real relative path and the
+real staged byte count (for `edit.patch`, the final body size, not the
+hunk delta). Composite `Vec<Box<dyn Effect>>` aggregates children and
+reports `None` if any child cannot describe its targets (never a
+guessed partial set). Core `commit_effect` compares the actual set
+against the lease's approved paths (slash/backslash canonicalized) and
+rejects with `ActualExceedsApproved` + rollback when an actual path
+falls outside the approved intent. Effects that cannot conservatively
+describe their targets (default `None`) skip the check — only trusted
+builtins report `Some`. The flow is prompt-soft / runtime-hard:
+
+```text
+tool arguments → HostToolPolicy → approved intent
+  → tool computes → actual effect set
+  → Core checks approved ⊇ actual → commit
+```
 
 `process.session` start is `ExecArgv`. Poll/stop do not spawn and cannot
 spend an argv-prefix grant. Session recovery is keyed by the **start**
@@ -71,8 +117,15 @@ Activation: `required ⊆ actual`.
 | Profile | Start rule |
 | --- | --- |
 | `Trusted` | Empty required set. Operator-installed. Missing OS fences may degrade. |
-| `Restricted` | Write + memory + spawn must be attested. |
-| `UntrustedGenerated` | Write, TCP, UDP, Unix, spawn, signal, memory, fd. Native process cannot prove UDP / pathname-Unix / OS-read today → **fail-closed**. WASI is the V2 candidate for this profile. |
+| `Restricted` | Write + memory + process count quota must be attested. |
+| `UntrustedGenerated` | Read, write, TCP, UDP, Unix, spawn, signal, CPU, memory, fd — all ten flags. Native process cannot prove fs-read confinement / UDP / pathname-Unix today → **fail-closed**. WASI is the V2 candidate for this profile. |
+
+`fs_read_confined` and `cpu_quota` are part of the untrusted floor
+*now* (2026-08-21), before the OS planes can prove them: once UDP /
+pathname-Unix denials land, a profile that forgot fs-read/CPU would
+pass activation with absolute host reads and unlimited CPU still open —
+a containment hole rented from the future. Requiring them today keeps
+the fail-closed posture honest.
 
 Attestation is computed from what was applied (landlock actually applied,
 Windows job assigned, rlimits > 0). `false` means "not proven".
@@ -88,7 +141,7 @@ What v0 can currently *attest* as true. Blank / false = not proven.
 | `tcp_connect_denied` | Landlock ABI v4+ when write roots set (`MOD-07`) | — | — |
 | `udp_denied` | — | — | — |
 | `unix_socket_denied` | — | n/a | — |
-| `process_spawn_controlled` | `RLIMIT_NPROC` | Job Object assigned | `RLIMIT_NPROC` |
+| `process_count_quota` | `RLIMIT_NPROC` (user-level count quota) | Job Object assigned | `RLIMIT_NPROC` (user-level count quota) |
 | `signal_scoped` | Landlock ABI v6 (`MOD-11`) | — | — |
 | `cpu_quota` | `RLIMIT_CPU` | — | `RLIMIT_CPU` |
 | `memory_quota` | `RLIMIT_AS` (`MOD-09`) | Job commit cap (`MOD-14`) | `RLIMIT_AS` |
@@ -101,6 +154,20 @@ workspace opens (`CORE-07`), mid-invoke `fs.read` brokered under
 deny (`MOD-12`), `RLIMIT_FSIZE` (`MOD-10`), `RLIMIT_CORE=0` (`MOD-15`),
 Linux NICE/RTPRIO + `no_new_privs` (`MOD-16`), Windows Job
 `PRIORITY_CLASS=NORMAL` (`MOD-17`).
+
+`process_count_quota` was renamed from `process_spawn_controlled`
+(2026-08-21; a serde alias keeps the wire compatible). `RLIMIT_NPROC`
+is a user-level *count quota*, not proof that arbitrary spawning is
+impossible and not a per-sandbox process namespace. A boolean must not
+claim a stronger OS guarantee than it delivers; a true
+spawn-denied/brokered floor is a separate future item.
+
+Booleans are the v1 attestation floor. M13 acceptance should upgrade
+them to `SandboxAttestation { capabilities, backend, backend_version,
+evidence }` so each enforced capability is explainable
+(`fs_write_confined` → landlock ABI, `memory_quota` → rlimit_as bytes,
+`tcp_connect_denied` → landlock ABI v4+). Same principle as context
+lifecycle: state why you believe the state is true.
 
 ## Residual (out of v0; not MOD-18)
 

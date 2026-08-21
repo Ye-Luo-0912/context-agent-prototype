@@ -109,7 +109,7 @@ impl Tool for SearchGrepTool {
                 "required": ["pattern"],
                 "properties": {
                     "pattern": {"type": "string", "description": "Regular expression"},
-                    "path": {"type": "string", "description": "Optional workspace-relative directory"},
+                    "path": {"type": "string", "description": "Optional workspace-relative file or directory: a file is searched directly, a directory is searched recursively"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
                     "cursor": {"type": "string", "description": "Opaque token from a previous search.grep result; serves the next page from that call's snapshot"}
                 }
@@ -156,9 +156,22 @@ impl Tool for SearchGrepTool {
             Err(error) => return Err(error),
         };
 
+        // `path` is grep(file-or-directory): a file is searched directly,
+        // a directory recursively. (A file handed to the directory walker
+        // used to surface as a confusing `directory invalid` failure.)
         let mut files = Vec::new();
-        let mut budget = MAX_FILES_SCANNED;
-        walk_files(&root, &mut files, &mut budget, Some(&cancel)).await?;
+        match fs::metadata(&root).await {
+            Ok(metadata) if metadata.is_file() => files.push(root),
+            Ok(_) => {
+                let mut budget = MAX_FILES_SCANNED;
+                walk_files(&root, &mut files, &mut budget, Some(&cancel)).await?;
+            }
+            Err(_) => {
+                return Ok(ToolOutcome::Value(
+                    missing_path_output(&self.workspace, call_id, "search.grep", &args.path).await,
+                ));
+            }
+        }
         if cancel.is_cancelled() {
             return Ok(cancelled_outcome(call_id, &args.pattern, Vec::new(), 0));
         }
@@ -375,6 +388,42 @@ mod tests {
             effect_context: None,
             cancel: CancellationToken::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn grep_accepts_a_single_file_path() {
+        // grep(file-or-directory): an explicit file target must search that
+        // one file, not fail with a directory-walker error (and not leak
+        // matches from sibling files).
+        let (workspace, _dir) = temp_workspace().await;
+        let root = workspace.root().to_path_buf();
+        write(&root, "src/protocol.rs", "handle_auth() {}\n").await;
+        write(&root, "src/other.rs", "handle_auth() leak\n").await;
+
+        let tool = SearchGrepTool::new(workspace);
+        let output = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"pattern": "handle_auth", "path": "src/protocol.rs"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let output = value(output);
+        assert!(output.ok, "a file target must search the file: {output:?}");
+        assert!(
+            output.model_content.contains("src/protocol.rs:1"),
+            "hit inside the named file: {}",
+            output.model_content
+        );
+        assert!(
+            !output.model_content.contains("other.rs"),
+            "sibling files must not leak: {}",
+            output.model_content
+        );
+        assert_eq!(output.metadata["files_scanned"], 1);
     }
 
     #[tokio::test]

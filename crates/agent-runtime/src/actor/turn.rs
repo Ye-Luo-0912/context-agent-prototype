@@ -139,6 +139,7 @@ impl RuntimeActor {
             turn_state: TurnState::Running,
             op: None,
             execution,
+            edit_attempts: Vec::new(),
             round_snapshot: None,
             pending_completion: None,
             applied_input: Some(applied),

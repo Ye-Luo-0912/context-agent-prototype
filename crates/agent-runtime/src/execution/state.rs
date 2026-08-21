@@ -4,7 +4,7 @@ use std::path::Path;
 
 use agent_contracts::{
     MAX_FOREGROUND_RESOURCES, MAX_TASK_ANCHOR_ITEM_CHARS, ResourceFreshness, ResourceKey,
-    TaskProgressView, ToolOutput, path_exactly_in_directive,
+    TaskProgressView, ToolFailureClass, ToolOutput, path_exactly_in_directive,
 };
 #[cfg(test)]
 use agent_contracts::{ToolResultDisposition, TurnFrame, TurnFrameStep};
@@ -13,6 +13,40 @@ pub(crate) const MAX_RESUME_FILES: usize = 32;
 pub(super) const MAX_RESUME_FAILURES: usize = 8;
 pub(super) const MAX_REVALIDATE_PER_ROUND: usize = 8;
 pub(super) const MAX_COVERAGE_PATHS: usize = 8;
+/// Consecutive identical no-progress rounds before the runtime tells the
+/// model its repeated behavior is not moving the world (MOD-PROG-01).
+pub(super) const STALL_THRESHOLD: u32 = 3;
+
+/// Deterministic progress classification of one tool result. Not a
+/// planner: it only states what the world can prove changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RoundProgress {
+    /// A successful mutation changed the world.
+    Meaningful,
+    /// New or updated facts/evidence without a world change.
+    Evidence,
+    /// A previously failed operation now succeeds (or a failure row
+    /// cleared) without new facts.
+    Control,
+    /// Nothing above: the round produced no provable change.
+    None,
+}
+
+/// Consecutive no-progress counter for one operation signature
+/// (tool + target + failure class). Reset by any progress or by a
+/// signature change.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StallState {
+    #[serde(default)]
+    pub consecutive_no_progress: u32,
+    #[serde(default)]
+    pub tool: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub failure: Option<ToolFailureClass>,
+}
 
 /// Bounded operational cache bound to `task_id + anchor_revision +
 /// workspace_revision`. Serialized as `resume` on `TaskRecord`.
@@ -29,6 +63,28 @@ pub struct ExecutionState {
     pub failed_commands: Vec<FailedCommandFact>,
     #[serde(default)]
     pub verification: VerificationObligation,
+    #[serde(default)]
+    pub stall: StallState,
+}
+
+/// How one [`ResourceFact`] was last observed. Observability only: it
+/// never gates freshness, authority, or selection — it explains why the
+/// fact is believed (MOD-OBS-01: effect, observation, and attention are
+/// separate truths).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceProvenance {
+    /// Observed by a successful read-only tool (or runtime revalidation).
+    #[default]
+    Read,
+    /// Observed by a successful mutation's own result stamp.
+    MutationResult,
+    /// Observed by a refused mutation: the tool read the target to
+    /// refuse it, so the stamped path+revision is trusted world truth
+    /// even though the write did not apply.
+    MutationRefusal,
+    /// Observed by a verification result.
+    Verification,
 }
 
 /// One bounded operational fact about a workspace path.
@@ -40,6 +96,8 @@ pub struct ResourceFact {
     #[serde(default)]
     pub freshness: ResourceFreshness,
     pub turn: u64,
+    #[serde(default)]
+    pub provenance: ResourceProvenance,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -395,7 +453,59 @@ impl ExecutionState {
                     }
                 })
                 .collect(),
+            stall_warning: self.stall_warning(),
         }
+    }
+
+    /// Bounded deterministic stall message when the same operation
+    /// signature produced no world progress for
+    /// [`STALL_THRESHOLD`] consecutive rounds. Advisory only: the model
+    /// still chooses the next action.
+    pub(super) fn stall_warning(&self) -> Option<String> {
+        if self.stall.consecutive_no_progress < STALL_THRESHOLD {
+            return None;
+        }
+        let target = if self.stall.target.is_empty() {
+            "unknown target"
+        } else {
+            &self.stall.target
+        };
+        let failure = self
+            .stall
+            .failure
+            .map(|class| class.as_str().to_string())
+            .unwrap_or_else(|| "no failure class".into());
+        Some(format!(
+            "EXECUTION STALL: {} on {} repeated {} time(s) without world progress (last failure: {}). Choose another strategy or finish with the current state.",
+            self.stall.tool, target, self.stall.consecutive_no_progress, failure
+        ))
+    }
+
+    /// MOD-PROG-01 stall accounting: any progress resets the counter; a
+    /// no-progress round increments it when the operation signature
+    /// (tool + target + failure class) repeats.
+    pub(super) fn update_stall(
+        &mut self,
+        identity: &OperationIdentity,
+        failure: Option<ToolFailureClass>,
+        progress: RoundProgress,
+    ) {
+        if progress != RoundProgress::None {
+            self.stall = StallState::default();
+            return;
+        }
+        if self.stall.tool != identity.tool_name
+            || self.stall.target != identity.target
+            || self.stall.failure != failure
+        {
+            self.stall = StallState {
+                consecutive_no_progress: 0,
+                tool: identity.tool_name.clone(),
+                target: identity.target.clone(),
+                failure,
+            };
+        }
+        self.stall.consecutive_no_progress = self.stall.consecutive_no_progress.saturating_add(1);
     }
 
     pub(super) fn mark_facts_needs_revalidation(&mut self) {
@@ -406,7 +516,16 @@ impl ExecutionState {
         }
     }
 
-    pub(super) fn upsert_file(&mut self, path: &str, digest: String, turn: u64) {
+    /// Upsert one resource fact. Returns whether the observation changed
+    /// anything (new row, new digest, or freshness improvement) — the
+    /// deterministic progress vector consumes that signal.
+    pub(super) fn upsert_file(
+        &mut self,
+        path: &str,
+        digest: String,
+        turn: u64,
+        provenance: ResourceProvenance,
+    ) -> bool {
         let path = bound_item(path);
         let digest = bound_item(&digest);
         let digest_changed = self.checked_files.iter().any(|row| {
@@ -416,17 +535,23 @@ impl ExecutionState {
             self.mark_source_changed(&path);
         }
         if let Some(existing) = self.checked_files.iter_mut().find(|row| row.path == path) {
+            let changed = digest_changed
+                || existing.digest != digest
+                || existing.freshness != ResourceFreshness::Fresh;
             existing.digest = digest;
             existing.turn = turn;
             existing.freshness = ResourceFreshness::Fresh;
-            return;
+            existing.provenance = provenance;
+            return changed;
         }
         self.checked_files.push(ResourceFact {
             path,
             digest,
             freshness: ResourceFreshness::Fresh,
             turn,
+            provenance,
         });
+        true
     }
 
     pub(super) fn push_failure(

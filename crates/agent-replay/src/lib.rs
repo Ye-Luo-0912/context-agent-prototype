@@ -337,6 +337,11 @@ pub(crate) async fn run_engine_observing(
                             .iter()
                             .map(|entry| entry.item_id)
                             .collect(),
+                        foreground_item_ids: materialized
+                            .foreground
+                            .iter()
+                            .map(|item| item.item_id)
+                            .collect(),
                     };
                     engine.acknowledge_consumption(ack).await?;
                     observe(current_turn, &materialized.items);
@@ -378,6 +383,11 @@ pub(crate) async fn run_engine_observing(
                         .iter()
                         .map(|entry| entry.item_id)
                         .collect(),
+                    // Historical journals predate foreground accounting;
+                    // the pending preview recorded none, so the ack carries
+                    // none either (engine validation would reject a
+                    // foreground id outside the preview).
+                    foreground_item_ids: Vec::new(),
                 };
                 engine.acknowledge_consumption(local_ack).await?;
 
@@ -881,6 +891,7 @@ mod tests {
                         materialization_id: preview.materialization_id,
                         item_ids: vec![recorded.item_id],
                         external_item_ids: Vec::new(),
+                        foreground_item_ids: Vec::new(),
                     },
                 },
             ),
@@ -957,6 +968,7 @@ mod tests {
                         materialization_id: 2,
                         item_ids: Vec::new(),
                         external_item_ids: Vec::new(),
+                        foreground_item_ids: Vec::new(),
                     },
                 },
             ),

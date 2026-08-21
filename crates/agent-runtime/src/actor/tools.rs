@@ -76,6 +76,46 @@ impl RuntimeActor {
             }
             break;
         }
+        // MOD-PROG-01: an identical retry of a deterministic edit
+        // refusal against unchanged file identities cannot produce a
+        // different result — refuse it before admission so no operation
+        // is spawned for a provably no-progress round.
+        let duplicate_attempt = self
+            .state
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.duplicate_edit_attempt(&call));
+        if let Some(attempt) = duplicate_attempt {
+            let target = call
+                .arguments
+                .get("path")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+                .or_else(|| {
+                    call.arguments
+                        .get("files")
+                        .and_then(|value| value.as_array())
+                        .and_then(|files| files.first())
+                        .and_then(|file| file.get("path"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            let output =
+                duplicate_no_progress_output(&call.id, &call.name, &target, attempt.failure_class);
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::ToolFinished {
+                    output: output.clone(),
+                })
+                .await;
+            if let Some(turn) = self.state.turn.as_mut() {
+                turn.turn_frame.push_tool_result(output.clone(), None);
+            }
+            self.observe_persistable_tool(&output, ToolResultDisposition::PersistObservation);
+            self.spawn_next_model_or_end(op_tx).await;
+            return;
+        }
         let Some(turn) = self.state.turn.as_mut() else {
             return;
         };
@@ -684,6 +724,9 @@ impl RuntimeActor {
                                 EffectCommitRejection::InvalidOperation => {
                                     "Core rejected the operation or prepared-effect identity"
                                 }
+                                EffectCommitRejection::ActualExceedsApproved => {
+                                    "the prepared effect reported a workspace write to a path the approved intent never named"
+                                }
                             };
                             ToolOutput {
                                 ok: false,
@@ -731,6 +774,13 @@ impl RuntimeActor {
                     );
                 }
                 self.observe_persistable_tool(&output, completion.disposition);
+                // MOD-PROG-01: remember deterministic edit refusals so an
+                // identical retry can be refused without dispatch.
+                if let Some(digest) = completion.argument_digest
+                    && let Some(turn) = self.state.turn.as_mut()
+                {
+                    turn.record_edit_attempt(&output, &digest);
+                }
                 let _ = self
                     .core
                     .emit_event(RuntimeEvent::ToolFinished { output })
@@ -871,5 +921,39 @@ impl RuntimeActor {
                 || op.turn_id != completion.operation.turn_id
                 || op.generation != completion.operation.generation
         })
+    }
+}
+
+/// MOD-PROG-01: the deterministic duplicate-refusal result. Nothing was
+/// executed, so this is `NotApplied` by construction; the message names
+/// the original failure so the model can change strategy instead of
+/// resubmitting the same arguments.
+fn duplicate_no_progress_output(
+    call_id: &str,
+    tool_name: &str,
+    target: &str,
+    original_failure: agent_contracts::ToolFailureClass,
+) -> ToolOutput {
+    let target_line = if target.is_empty() {
+        String::new()
+    } else {
+        format!("\ntarget={target}")
+    };
+    ToolOutput {
+        call_id: call_id.into(),
+        tool_name: tool_name.into(),
+        ok: false,
+        summary: "duplicate_no_progress: identical edit retry refused without dispatch".into(),
+        model_content: format!(
+            "duplicate_no_progress: this exact call already failed with {} and the target files are unchanged, so the result would be identical. Change the arguments, re-read the target, or finish with the current state.{target_line}",
+            original_failure.as_str(),
+        ),
+        artifact_ref: None,
+        metadata: serde_json::json!({
+            "path": target,
+            "failure_class": agent_contracts::ToolFailureClass::DuplicateNoProgress.as_str(),
+            "original_failure_class": original_failure.as_str(),
+            "executed": false,
+        }),
     }
 }

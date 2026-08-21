@@ -282,7 +282,12 @@ pub struct SandboxCapabilities {
     pub tcp_connect_denied: bool,
     pub udp_denied: bool,
     pub unix_socket_denied: bool,
-    pub process_spawn_controlled: bool,
+    /// `RLIMIT_NPROC` / Windows JobObject: a *count quota*, not proof that
+    /// arbitrary spawning is impossible. Named for the guarantee it
+    /// actually provides; a true spawn-denied/brokered floor is a separate
+    /// future item, not this flag.
+    #[serde(alias = "process_spawn_controlled")]
+    pub process_count_quota: bool,
     pub signal_scoped: bool,
     pub cpu_quota: bool,
     pub memory_quota: bool,
@@ -297,10 +302,7 @@ impl SandboxCapabilities {
             && flag_subset(self.tcp_connect_denied, actual.tcp_connect_denied)
             && flag_subset(self.udp_denied, actual.udp_denied)
             && flag_subset(self.unix_socket_denied, actual.unix_socket_denied)
-            && flag_subset(
-                self.process_spawn_controlled,
-                actual.process_spawn_controlled,
-            )
+            && flag_subset(self.process_count_quota, actual.process_count_quota)
             && flag_subset(self.signal_scoped, actual.signal_scoped)
             && flag_subset(self.cpu_quota, actual.cpu_quota)
             && flag_subset(self.memory_quota, actual.memory_quota)
@@ -319,19 +321,28 @@ impl SandboxProfile {
             Self::Restricted => SandboxCapabilities {
                 fs_write_confined: true,
                 memory_quota: true,
-                process_spawn_controlled: true,
+                process_count_quota: true,
                 ..SandboxCapabilities::default()
             },
             Self::UntrustedGenerated => SandboxCapabilities {
+                // Read confinement and CPU are part of the untrusted floor
+                // *now*, before the OS planes can prove them: once UDP /
+                // pathname-Unix denials land, a profile that forgot
+                // fs-read/CPU would pass activation with absolute host
+                // reads and unlimited CPU still open — a containment hole
+                // rented from the future. Requiring them today keeps the
+                // fail-closed posture honest (native cannot attest either
+                // yet, so UntrustedGenerated still refuses to start).
+                fs_read_confined: true,
                 fs_write_confined: true,
                 tcp_connect_denied: true,
                 udp_denied: true,
                 unix_socket_denied: true,
-                process_spawn_controlled: true,
+                process_count_quota: true,
                 signal_scoped: true,
+                cpu_quota: true,
                 memory_quota: true,
                 fd_quota: true,
-                ..SandboxCapabilities::default()
             },
         }
     }
@@ -613,7 +624,7 @@ mod tests {
         let trusted_actual = SandboxCapabilities {
             fs_write_confined: true,
             memory_quota: true,
-            process_spawn_controlled: true,
+            process_count_quota: true,
             ..SandboxCapabilities::default()
         };
         assert!(SandboxProfile::Trusted.allows_start(SandboxCapabilities::default()));
@@ -623,16 +634,61 @@ mod tests {
             "native process without UDP/Unix/TCP proof must not start untrusted generated code"
         );
         let full = SandboxCapabilities {
+            fs_read_confined: true,
             fs_write_confined: true,
             tcp_connect_denied: true,
             udp_denied: true,
             unix_socket_denied: true,
-            process_spawn_controlled: true,
+            process_count_quota: true,
             signal_scoped: true,
+            cpu_quota: true,
             memory_quota: true,
             fd_quota: true,
-            ..SandboxCapabilities::default()
         };
         assert!(SandboxProfile::UntrustedGenerated.allows_start(full));
+
+        // The floor includes fs-read confinement and CPU *now*, so a future
+        // native plane that proves UDP/Unix denial still cannot activate
+        // untrusted generated code while absolute host reads or unlimited
+        // CPU remain open.
+        let without_fs_read = SandboxCapabilities {
+            fs_read_confined: false,
+            ..full
+        };
+        assert!(
+            !SandboxProfile::UntrustedGenerated.allows_start(without_fs_read),
+            "missing fs-read confinement must keep the profile fail-closed"
+        );
+        let without_cpu = SandboxCapabilities {
+            cpu_quota: false,
+            ..full
+        };
+        assert!(
+            !SandboxProfile::UntrustedGenerated.allows_start(without_cpu),
+            "missing CPU quota must keep the profile fail-closed"
+        );
+    }
+
+    #[test]
+    fn process_count_quota_field_name_keeps_wire_compatibility() {
+        // The flag was renamed from `process_spawn_controlled`; frames a
+        // pre-rename peer sent (full-field attestations under the old
+        // name) must still deserialize.
+        let full = SandboxCapabilities {
+            process_count_quota: true,
+            memory_quota: true,
+            ..SandboxCapabilities::default()
+        };
+        let legacy = serde_json::to_string(&full)
+            .unwrap()
+            .replace("process_count_quota", "process_spawn_controlled");
+        let decoded: SandboxCapabilities = serde_json::from_str(&legacy).unwrap();
+        assert!(decoded.process_count_quota);
+        assert!(decoded.memory_quota);
+        let encoded = serde_json::to_string(&full).unwrap();
+        assert!(
+            encoded.contains("process_count_quota"),
+            "new frames carry the honest name: {encoded}"
+        );
     }
 }

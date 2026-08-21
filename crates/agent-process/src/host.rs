@@ -283,12 +283,15 @@ fn attest_sandbox(
         actual.cpu_quota = sandbox.cpu_time_limit_secs > 0;
         actual.memory_quota = sandbox.max_memory_bytes > 0;
         actual.fd_quota = sandbox.max_open_files > 0;
-        actual.process_spawn_controlled = sandbox.process_limit > 0;
+        // RLIMIT_NPROC is a user-level *count quota*, not proof that
+        // arbitrary spawning is impossible; the attestation field is
+        // named for exactly that guarantee.
+        actual.process_count_quota = sandbox.process_limit > 0;
     }
     #[cfg(windows)]
     {
         actual.fs_write_confined = !sandbox.integrity_write_roots.is_empty();
-        actual.process_spawn_controlled = windows_job;
+        actual.process_count_quota = windows_job;
         actual.memory_quota = windows_job && sandbox.job_max_memory_bytes > 0;
     }
     let _ = (sandbox, landlock_applied, windows_job);

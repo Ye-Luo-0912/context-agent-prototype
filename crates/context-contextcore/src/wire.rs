@@ -254,6 +254,7 @@ mod tests {
             materialization_id: 17,
             item_ids: vec![item_id],
             external_item_ids: vec![external_id],
+            foreground_item_ids: Vec::new(),
         };
         let request = ServiceRequest {
             id: 19,

@@ -185,6 +185,44 @@ impl TurnFrame {
         })
     }
 
+    /// Deterministic turn checkpointing (the Protocol Working Set):
+    /// split the frame into the retained tail and the number of older
+    /// completed exchanges compacted away from the model-facing wire
+    /// view. An exchange is one assistant tool-call group plus the
+    /// results answering it; whole groups are dropped so the wire
+    /// protocol keeps every tool call paired with its result. The
+    /// trailing region is always retained in full — including an
+    /// in-flight last group. The full frame stays untouched for audit
+    /// and turn-end persistence; only the wire projection shrinks.
+    pub fn checkpoint_tail(&self, keep: usize) -> (TurnFrame, usize) {
+        let group_starts: Vec<usize> = self
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| matches!(step, TurnFrameStep::AssistantToolCalls { .. }))
+            .map(|(index, _)| index)
+            .collect();
+        let total = group_starts.len();
+        if total <= keep {
+            return (self.clone(), 0);
+        }
+        let retain_from = group_starts[total - keep];
+        let mut tail = TurnFrame::new(self.user_message.clone());
+        tail.steps = self.steps[retain_from..].to_vec();
+        (tail, total - keep)
+    }
+
+    /// The wire view for one model request: the retained tail plus the
+    /// bounded checkpoint note when older exchanges were compacted.
+    pub fn checkpointed_messages(&self, keep: usize) -> Vec<ModelMessage> {
+        let (tail, compacted) = self.checkpoint_tail(keep);
+        let mut messages = tail.messages();
+        if compacted > 0 {
+            messages.insert(1, ModelMessage::user(turn_checkpoint_note(compacted)));
+        }
+        messages
+    }
+
     /// Render the stack as protocol messages: the user message first, then
     /// assistant(tool_calls) / tool(tool_call_id) pairs in execution order.
     pub fn messages(&self) -> Vec<ModelMessage> {
@@ -207,6 +245,20 @@ impl TurnFrame {
     }
 }
 
+/// How many completed tool exchanges of the current turn stay in the
+/// model-facing protocol view. Older exchanges are compacted to a
+/// bounded deterministic note; their reliable facts already live in
+/// TASK PROGRESS, artifacts, and the run journal.
+pub const TURN_FRAME_KEEP_EXCHANGES: usize = 6;
+
+/// The bounded deterministic checkpoint note injected into the wire
+/// view when older exchanges are compacted away.
+pub fn turn_checkpoint_note(compacted_exchanges: usize) -> String {
+    format!(
+        "TURN CHECKPOINT: {compacted_exchanges} earlier tool exchange(s) were compacted from this protocol view. Their reliable facts are reflected in TASK PROGRESS and workspace state; the full audit trail remains in the run journal. Do not assume the compacted exchanges are still pending."
+    )
+}
+
 /// The five-layer model input assembled by the runtime for one model request:
 ///
 /// ```text
@@ -226,9 +278,38 @@ pub struct ModelInput {
     pub context_frame: Vec<ModelMessage>,
     pub turn_frame: TurnFrame,
     pub tool_schemas: Vec<ToolSpec>,
+    /// Deterministic turn checkpointing: when present, `turn_frame` is
+    /// already the retained tail and this many older completed
+    /// exchanges were compacted out of the wire view (audit and
+    /// turn-end persistence still see the full frame).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_checkpoint: Option<TurnCheckpoint>,
+}
+
+/// How many completed exchanges a model input's turn frame compacted
+/// away. `Default` is meaningful: an absent checkpoint is the
+/// nothing-compacted case for pre-checkpoint traces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TurnCheckpoint {
+    pub compacted_exchanges: usize,
 }
 
 impl ModelInput {
+    /// The wire turn-frame view: the retained tail plus the bounded
+    /// checkpoint note when older exchanges were compacted.
+    pub fn turn_frame_wire_messages(&self) -> Vec<ModelMessage> {
+        let mut messages = self.turn_frame.messages();
+        if let Some(checkpoint) = self.turn_checkpoint
+            && checkpoint.compacted_exchanges > 0
+        {
+            messages.insert(
+                1,
+                ModelMessage::user(turn_checkpoint_note(checkpoint.compacted_exchanges)),
+            );
+        }
+        messages
+    }
+
     /// Flatten the layers into the wire message sequence. Order matters for
     /// OpenAI-style protocols: policy and context first, then the turn stack
     /// (user -> assistant tool calls -> tool results), so the model sees the
@@ -240,7 +321,7 @@ impl ModelInput {
             messages.push(ModelMessage::system(focus));
         }
         messages.extend(self.context_frame.iter().cloned());
-        messages.extend(self.turn_frame.messages());
+        messages.extend(self.turn_frame_wire_messages());
         messages
     }
 }
@@ -504,6 +585,7 @@ mod tests {
             context_frame: vec![ModelMessage::user("SELECTED WORKING CONTEXT")],
             turn_frame: turn,
             tool_schemas: Vec::new(),
+            turn_checkpoint: None,
         };
 
         let messages = input.into_messages();
@@ -521,6 +603,124 @@ mod tests {
                 (ModelRole::Tool, "content"),
             ]
         );
+    }
+
+    /// A frame with `groups` complete exchanges (call + result pairs).
+    fn framed_turn(groups: usize) -> TurnFrame {
+        let mut turn = TurnFrame::new("fix the bug");
+        for index in 0..groups {
+            let id = format!("call-{index}");
+            turn.push_tool_calls(vec![tool_call(&id)]);
+            turn.push_tool_result(
+                ToolOutput {
+                    call_id: id,
+                    tool_name: "fs.read".into(),
+                    ok: true,
+                    summary: "read".into(),
+                    model_content: format!("content {index}"),
+                    artifact_ref: None,
+                    metadata: json!({}),
+                },
+                None,
+            );
+        }
+        turn
+    }
+
+    #[test]
+    fn checkpoint_tail_keeps_the_last_exchanges_and_counts_the_rest() {
+        let turn = framed_turn(10);
+        let (tail, compacted) = turn.checkpoint_tail(6);
+        assert_eq!(compacted, 4);
+        assert_eq!(tail.user_message, "fix the bug");
+        // Six exchanges remain: 6 calls + 6 results.
+        assert_eq!(tail.steps.len(), 12);
+        // The retained tail starts at exchange 4, not 0.
+        match &tail.steps[0] {
+            TurnFrameStep::AssistantToolCalls { calls } => {
+                assert_eq!(calls[0].id, "call-4");
+            }
+            other => panic!("tail must start with an assistant tool-call group: {other:?}"),
+        }
+        // The source frame is untouched (audit/persistence view).
+        assert_eq!(turn.steps.len(), 20);
+
+        // At or below the keep threshold nothing is compacted.
+        let (same, compacted) = framed_turn(6).checkpoint_tail(6);
+        assert_eq!(compacted, 0);
+        assert_eq!(same.steps.len(), 12);
+    }
+
+    #[test]
+    fn checkpointed_wire_view_pairs_every_tool_call_with_its_result() {
+        let turn = framed_turn(9);
+        let messages = turn.checkpointed_messages(6);
+        // user message + checkpoint note + 6 × (assistant + tool).
+        assert_eq!(messages.len(), 2 + 12);
+        assert_eq!(messages[0].content, "fix the bug");
+        assert!(
+            messages[1]
+                .content
+                .starts_with("TURN CHECKPOINT: 3 earlier"),
+            "the bounded note must render right after the directive: {}",
+            messages[1].content
+        );
+        // Protocol invariant: every assistant tool call keeps its result.
+        let mut open_calls: Vec<String> = Vec::new();
+        for message in &messages {
+            match message.role {
+                ModelRole::Assistant => {
+                    open_calls.extend(message.tool_calls.iter().map(|c| c.id.clone()))
+                }
+                ModelRole::Tool => {
+                    let id = message
+                        .tool_call_id
+                        .clone()
+                        .expect("tool result carries its call id");
+                    assert!(
+                        open_calls.contains(&id),
+                        "result {id} must answer a retained call"
+                    );
+                    open_calls.retain(|open| open != &id);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            open_calls.is_empty(),
+            "no retained call may lose its result: {open_calls:?}"
+        );
+    }
+
+    #[test]
+    fn model_input_wire_view_renders_the_checkpoint_note() {
+        let full = framed_turn(8);
+        let (tail, compacted) = full.checkpoint_tail(TURN_FRAME_KEEP_EXCHANGES);
+        assert_eq!(compacted, 2);
+        let input = ModelInput {
+            system_policy: Vec::new(),
+            focus_frame: None,
+            context_frame: Vec::new(),
+            turn_frame: tail,
+            tool_schemas: Vec::new(),
+            turn_checkpoint: Some(TurnCheckpoint {
+                compacted_exchanges: compacted,
+            }),
+        };
+        let messages = input.turn_frame_wire_messages();
+        assert_eq!(messages.len(), 1 + 1 + 12);
+        assert!(
+            messages[1]
+                .content
+                .starts_with("TURN CHECKPOINT: 2 earlier")
+        );
+        // An input without a checkpoint renders the plain frame.
+        let plain = ModelInput {
+            turn_frame: framed_turn(2),
+            turn_checkpoint: None,
+            ..Default::default()
+        };
+        assert_eq!(plain.turn_frame_wire_messages().len(), 5);
     }
 
     #[test]

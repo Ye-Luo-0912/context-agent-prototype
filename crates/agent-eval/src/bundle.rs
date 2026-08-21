@@ -58,6 +58,12 @@ pub struct CellManifest {
     /// `git status --porcelain` 的 sha256；干净树是空输入的哈希。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_dirty_sha256: Option<String>,
+    /// Content digest over what the run actually executed: the HEAD tree,
+    /// the tracked working-tree diff, and every untracked source file
+    /// under `crates/`. `git_head` alone does not identify a dirty tree's
+    /// sources (EVAL identity rule: same digest ⇒ same tested sources).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tree_digest: Option<String>,
     pub openai_model: Option<String>,
     pub openai_base_url: Option<String>,
 }
@@ -209,6 +215,7 @@ pub(crate) fn write_cell_parts(
         git_head: git_head(),
         git_dirty: git_dirty(),
         git_dirty_sha256: git_dirty_sha256(),
+        source_tree_digest: source_tree_digest(),
         openai_model: crate::envfile::get("OPENAI_MODEL"),
         openai_base_url: crate::envfile::get("OPENAI_BASE_URL"),
     };
@@ -766,6 +773,69 @@ fn git_dirty_sha256() -> Option<String> {
     let bytes = git_porcelain()?;
     let digest = Sha256::digest(&bytes);
     Some(hex_encode(digest))
+}
+
+/// Content digest of the sources a live run executes: the HEAD tree hash,
+/// the tracked working-tree diff, and every untracked source file under
+/// `crates/`. Two runs with the same digest ran the same source tree even
+/// when `git_head` is identical but the trees differ (the dirty-diff trap).
+pub(crate) fn source_tree_digest() -> Option<String> {
+    fn git_bytes(args: &[&str]) -> Option<Vec<u8>> {
+        let output = std::process::Command::new("git").args(args).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(output.stdout)
+    }
+    let head_tree = git_bytes(&["rev-parse", "HEAD^{tree}"])?;
+    let tracked_diff = git_bytes(&["diff", "HEAD"]).unwrap_or_default();
+    let untracked = git_bytes(&["ls-files", "--others", "--exclude-standard", "--", "crates"])
+        .unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(b"head-tree\0");
+    hasher.update(&head_tree);
+    hasher.update(b"\0tracked-diff\0");
+    hasher.update(&tracked_diff);
+    hasher.update(b"\0untracked-files\0");
+    for line in untracked.split(|b| *b == b'\n') {
+        let path = std::str::from_utf8(line).ok()?.trim();
+        if path.is_empty() {
+            continue;
+        }
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+        if let Ok(content) = std::fs::read(path) {
+            hasher.update(Sha256::digest(&content));
+        } else {
+            hasher.update(b"<unreadable>");
+        }
+        hasher.update(b"\0");
+    }
+    Some(hex_encode(hasher.finalize()))
+}
+
+/// EVAL identity gate (EVAL-03): a dirty workspace must not silently
+/// produce formal evidence, because the dirty diff is not part of the
+/// `git_head` identity and the bundle becomes unreproducible. Refuse
+/// unless the operator explicitly passes `--allow-dirty` (the digest is
+/// still recorded either way, for honest diagnostics).
+pub(crate) fn require_clean_tree(allow_dirty: bool) -> anyhow::Result<()> {
+    match git_dirty() {
+        Some(false) | None => Ok(()),
+        Some(true) if allow_dirty => {
+            eprintln!(
+                "warning: --allow-dirty: the workspace is dirty; the manifest records \
+                 source_tree_digest instead of a clean git_head identity"
+            );
+            Ok(())
+        }
+        Some(true) => anyhow::bail!(
+            "the workspace is dirty: formal eval evidence must be reproducible from \
+             its git identity, and a dirty diff is not part of git_head. Commit or \
+             stash your changes, or pass --allow-dirty to record a source_tree_digest \
+             diagnostic bundle instead"
+        ),
+    }
 }
 
 #[cfg(test)]

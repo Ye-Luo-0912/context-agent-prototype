@@ -68,9 +68,12 @@ fn usage() -> ! {
          engine must pass the fixture while feeding the model fewer input\n\
          tokens — the deterministic CI proxy of the M15 acceptance.\n\
          \n\
-         usage: agent-eval [--repeats N] [--evidence-dir <dir>] --compare-live <id>\n\
-         usage: agent-eval [--repeats N] [--evidence-dir <dir>] --compare-live-all\n\
-         usage: agent-eval [--repeats N] [--evidence-dir <dir>] --compare-live-reasonable\n\
+         usage: agent-eval [--repeats N] [--evidence-dir <dir>] --compare-live <id>
+         usage: agent-eval [--repeats N] [--evidence-dir <dir>] --compare-live-all
+         usage: agent-eval [--repeats N] [--evidence-dir <dir>] --compare-live-reasonable
+         (all live evidence runs refuse a dirty workspace unless --allow-dirty;
+         the manifest records source_tree_digest covering HEAD tree + tracked
+         diff + untracked crates sources either way)\n\
          \n\
          Same three engines and hidden verification as --compare-arm, but\n\
          each cell uses a real model (OPENAI_*) on a fresh workspace.\n\
@@ -196,6 +199,9 @@ async fn main() -> anyhow::Result<()> {
     let mut include_swebench = false;
     let mut file_only = false;
     let mut pilot_id: Option<String> = None;
+    // EVAL-03 identity gate: live evidence runs refuse a dirty tree unless
+    // the operator explicitly accepts a source_tree_digest diagnostic.
+    let mut allow_dirty = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -325,6 +331,9 @@ async fn main() -> anyhow::Result<()> {
             "--file-only" => {
                 file_only = true;
             }
+            "--allow-dirty" => {
+                allow_dirty = true;
+            }
             "--pilot-id" => {
                 let Some(id) = args.next() else {
                     usage();
@@ -337,7 +346,14 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             "--pilot-run" => {
-                run_pilot_live(pilot_id, repeats, evidence_dir, include_swebench).await?;
+                run_pilot_live(
+                    pilot_id,
+                    repeats,
+                    evidence_dir,
+                    include_swebench,
+                    allow_dirty,
+                )
+                .await?;
                 return Ok(());
             }
             "--pilot-calibrate" => {
@@ -367,13 +383,13 @@ async fn main() -> anyhow::Result<()> {
                     .iter()
                     .find(|fixture| fixture.id == id)
                     .ok_or_else(|| anyhow::anyhow!("unknown fixture: {id} (see --fixtures)"))?;
-                run_live_compare(&[fixture], repeats, evidence_dir).await?;
+                run_live_compare(&[fixture], repeats, evidence_dir, allow_dirty).await?;
                 return Ok(());
             }
             "--compare-live-all" => {
                 let fixtures: Vec<&workload::CodingFixture> =
                     workload::live_coding_compare_fixtures().collect();
-                run_live_compare(&fixtures, repeats, evidence_dir).await?;
+                run_live_compare(&fixtures, repeats, evidence_dir, allow_dirty).await?;
                 return Ok(());
             }
             "--compare-live-reasonable" => {
@@ -381,7 +397,7 @@ async fn main() -> anyhow::Result<()> {
                     .iter()
                     .filter(|fixture| fixture.id == "add_test")
                     .collect();
-                run_live_compare(&fixtures, repeats, evidence_dir).await?;
+                run_live_compare(&fixtures, repeats, evidence_dir, allow_dirty).await?;
                 return Ok(());
             }
             "--compare-arm" => {
@@ -425,12 +441,12 @@ async fn main() -> anyhow::Result<()> {
             }
             "--context-bench-run" => {
                 let only = args.next().filter(|value| !value.starts_with('-'));
-                run_context_bench_live(only, repeats, evidence_dir).await?;
+                run_context_bench_live(only, repeats, evidence_dir, allow_dirty).await?;
                 return Ok(());
             }
             "--context-bench-ablation" => {
                 let repeats = if repeats_set { repeats } else { 2 };
-                run_context_bench_ablation(repeats, evidence_dir).await?;
+                run_context_bench_ablation(repeats, evidence_dir, allow_dirty).await?;
                 return Ok(());
             }
             "--context-mech" => {
@@ -442,7 +458,7 @@ async fn main() -> anyhow::Result<()> {
             "--context-mech-run" => {
                 let only = args.next().filter(|value| !value.starts_with('-'));
                 let repeats = if repeats_set { repeats } else { 2 };
-                run_context_mech_live(only, repeats, evidence_dir).await?;
+                run_context_mech_live(only, repeats, evidence_dir, allow_dirty).await?;
                 return Ok(());
             }
             "--all" => engines = vec!["append", "rolling", "dynamic"],
@@ -509,7 +525,9 @@ async fn run_live_compare(
     fixtures: &[&workload::CodingFixture],
     repeats: u32,
     evidence_dir: Option<std::path::PathBuf>,
+    allow_dirty: bool,
 ) -> anyhow::Result<()> {
+    bundle::require_clean_tree(allow_dirty)?;
     let model = driver::build_live_coding_model()?;
     let evidence_root = evidence_dir.unwrap_or_else(default_evidence_dir);
     std::fs::create_dir_all(&evidence_root)?;
@@ -554,7 +572,9 @@ async fn run_pilot_live(
     repeats: u32,
     evidence_dir: Option<std::path::PathBuf>,
     include_swebench: bool,
+    allow_dirty: bool,
 ) -> anyhow::Result<()> {
+    bundle::require_clean_tree(allow_dirty)?;
     let pack = suite::load_pack()?;
     let sample = pilot::select_pilot(&pack)?;
     let mut tasks: Vec<&suite::SuiteTask> = sample.tasks.iter().collect();
@@ -644,7 +664,9 @@ async fn run_context_bench_live(
     only_id: Option<String>,
     repeats: u32,
     evidence_dir: Option<std::path::PathBuf>,
+    allow_dirty: bool,
 ) -> anyhow::Result<()> {
+    bundle::require_clean_tree(allow_dirty)?;
     let pack = context_bench::load_pack()?;
     eprintln!("{}", context_bench::check_pack(&pack)?);
     let model = driver::build_live_coding_model()?;
@@ -696,7 +718,9 @@ async fn run_context_bench_live(
 async fn run_context_bench_ablation(
     repeats: u32,
     evidence_dir: Option<std::path::PathBuf>,
+    allow_dirty: bool,
 ) -> anyhow::Result<()> {
+    bundle::require_clean_tree(allow_dirty)?;
     let pack = context_bench::load_pack()?;
     eprintln!("{}", context_bench::check_pack(&pack)?);
     let task = pack
@@ -742,7 +766,9 @@ async fn run_context_mech_live(
     only: Option<String>,
     repeats: u32,
     evidence_dir: Option<std::path::PathBuf>,
+    allow_dirty: bool,
 ) -> anyhow::Result<()> {
+    bundle::require_clean_tree(allow_dirty)?;
     let pack = context_mech::load_pack()?;
     eprintln!("{}", context_mech::check_pack(&pack)?);
     let model = driver::build_live_coding_model()?;
