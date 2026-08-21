@@ -140,6 +140,27 @@ const RECALL_TURN_NOTE_2: &str =
 const RECALL_TURN_NOTE_3: &str = "Append to src/scratch.md: the wifi guest password is listed on the fridge, and the printer is in room 4B.";
 const RECALL_TURN_REUSE: &str = "Create src/main.py that imports visit_all from util (the module is src/util.py) and prints visit_all([1, 2, 3]). Use the already-fixed visit_all; do not reintroduce the off-by-one (`i + 1`). Do not change src/util.py.";
 
+/// `recall_after_fix` finished its diagnostic mission (Execution Coherence
+/// item 28). Keep scripted `--compare-arm`. Next mechanism live is
+/// `--context-mech-run`.
+pub fn live_coding_refused(id: &str) -> Option<&'static str> {
+    if id == "recall_after_fix" {
+        Some(
+            "recall_after_fix diagnostic mission is complete; use --compare-arm for scripted tests and --context-mech-run for the next mechanism live",
+        )
+    } else {
+        None
+    }
+}
+
+/// Live coding compare cells. Excludes fixtures whose live diagnostic is
+/// complete so `--compare-live-all` cannot grind them by accident.
+pub fn live_coding_compare_fixtures() -> impl Iterator<Item = &'static CodingFixture> {
+    FIXTURES
+        .iter()
+        .filter(|fixture| live_coding_refused(fixture.id).is_none())
+}
+
 /// Deterministic, cross-platform coding fixtures. Each one is a small real
 /// task whose acceptance is a file-content property, so the same fixture
 /// runs on the CI runner and on a laptop.
@@ -721,6 +742,20 @@ mod tests {
             }
         }
         assert_eq!(FIXTURES.len(), 5);
+        assert_eq!(
+            live_coding_refused("recall_after_fix").map(|_| "recall_after_fix"),
+            Some("recall_after_fix")
+        );
+        assert!(live_coding_refused("add_test").is_none());
+        let live: Vec<&str> = live_coding_compare_fixtures()
+            .map(|fixture| fixture.id)
+            .collect();
+        assert!(
+            !live.contains(&"recall_after_fix"),
+            "item 28: live coding compare must not grind recall_after_fix"
+        );
+        assert!(live.contains(&"add_test"));
+        assert_eq!(live.len(), FIXTURES.len() - 1);
         for fixture in &FIXTURES {
             assert_ne!(
                 fixture_class(fixture.id),

@@ -119,6 +119,7 @@ impl ContextEngine for AppendOnlyEngine {
             external: agent_contracts::ContextMapView::default(),
             selected,
             approx_tokens: approx_tokens_total,
+            foreground: Vec::new(),
             diagnostics: active_diagnostics(&state.records, None, 0),
         })
     }

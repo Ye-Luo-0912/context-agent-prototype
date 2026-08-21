@@ -447,8 +447,8 @@ impl TaskManager {
     }
 
     /// Replace the current-turn directive. Does not touch `TaskAnchor` or
-    /// bump `anchor_revision`. Clears per-turn source-change so a note
-    /// turn does not inherit NeedVerify from an earlier edit.
+    /// bump `anchor_revision`. Verification obligation is not wiped; due
+    /// this round is computed from TurnIntent + ledger.
     pub fn on_user_turn(&mut self, text: &str) {
         let intent: String = text.chars().take(MAX_TASK_ANCHOR_TEXT_CHARS).collect();
         let Some(id) = self.active else {
@@ -811,6 +811,9 @@ impl TaskManager {
                 replacement,
             } => {
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == target) {
+                    if task.anchor.revision != replacement.revision {
+                        task.resume.mark_spec_changed();
+                    }
                     task.resume.anchor_revision = replacement.revision;
                     task.anchor = replacement;
                 }

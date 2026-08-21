@@ -17,7 +17,7 @@ use agent_contracts::{
     AgentError, AgentResult, BoundedRead, CancellationToken, Capability,
     CapabilityInvocationContext, CapabilityKind, CapabilityLifecycle, CapabilityManifest,
     CapabilityOutcome, CapabilityStatus, CapabilityTransport, Effect, EffectDurability,
-    EffectReceipt, ToolCall, ToolRisk, ToolSpec, WORKSPACE_WRITE, WorkspaceHandle,
+    EffectIntent, EffectReceipt, ToolCall, ToolRisk, ToolSpec, WORKSPACE_WRITE, WorkspaceHandle,
 };
 use agent_platform_protocol::{ActiveFeatures, FEATURE_LEGACY_INVOKE_OUTPUT};
 use agent_process::ProcessHostConfig;
@@ -254,6 +254,7 @@ async fn process_capability_round_trips_an_invoke_over_the_host() {
                 granted_permissions: vec!["workspace:read".into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -314,6 +315,7 @@ async fn cancellation_aborts_a_long_running_invoke_and_kills_the_child() {
                 granted_permissions: vec!["workspace:read".into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: cancel.clone(),
             },
         )
@@ -337,6 +339,7 @@ async fn cancellation_aborts_a_long_running_invoke_and_kills_the_child() {
                 granted_permissions: vec!["workspace:read".into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -420,6 +423,7 @@ async fn cancellation_terminates_the_child_process() {
                 granted_permissions: vec!["workspace:read".into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: cancel.clone(),
             },
         )
@@ -494,6 +498,7 @@ async fn mcp_cancel_after_spawn_terminates_the_server_tree() {
                     granted_permissions: vec!["workspace:read".into()],
                     workspace: None,
                     artifacts: None,
+                    approved_intent: None,
                     cancel: invoke_cancel,
                 },
             )
@@ -545,6 +550,7 @@ async fn mcp_cancel_after_spawn_terminates_the_server_tree() {
                 granted_permissions: vec!["workspace:read".into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -618,6 +624,7 @@ async fn strict_sandbox_scrubs_parent_secrets_across_the_wire() {
                 granted_permissions: vec!["workspace:read".into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -669,6 +676,7 @@ async fn granted_permissions_reach_the_child_intact() {
                 granted_permissions: granted.clone(),
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -767,6 +775,7 @@ async fn invoke_before_start_fails_with_a_clear_error() {
                 granted_permissions: Vec::new(),
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -824,6 +833,7 @@ async fn nonempty_wire_effects_fail_closed_before_workspace_mutation() {
                 granted_permissions: vec![WORKSPACE_WRITE.into()],
                 workspace: Some(workspace.clone()),
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -844,6 +854,158 @@ async fn nonempty_wire_effects_fail_closed_before_workspace_mutation() {
         std::fs::read_to_string(dir.path().join("staged.txt")).unwrap(),
         "original content",
         "a rejected wire effect must not replace existing workspace state"
+    );
+    capability.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn proven_wire_effect_stages_when_actual_intent_matches_approved_path() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("staged.txt"), "original content").unwrap();
+    let prepare_calls = Arc::new(AtomicUsize::new(0));
+    let program = common::locate_mock_host().expect("mock_host built");
+    let capability: Arc<dyn Capability> = Arc::new(ProcessCapabilityAdapter::with_config(
+        write_manifest_with_program(&program.to_string_lossy()),
+        ProcessHostConfig {
+            program: program.to_string_lossy().into_owned(),
+            args: vec!["--serve".into()],
+            env: vec![("MOCK_MARKER".into(), "1".into())],
+            startup_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+            max_frame_bytes: 1024 * 1024,
+            max_call_bytes: 4 * 1024 * 1024,
+            max_system_answer_bytes: 512 * 1024,
+            offered_features: Default::default(),
+            sandbox: Default::default(),
+        },
+    ));
+    capability.start().await.unwrap();
+    let workspace: Arc<dyn WorkspaceHandle> = Arc::new(TestWorkspace {
+        root: dir.path().to_path_buf(),
+        prepare_calls: Some(prepare_calls.clone()),
+    });
+    let content = "staged content";
+    let outcome = capability
+        .invoke(
+            ToolCall {
+                id: "c6-proven".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({
+                    "path": "staged.txt",
+                    "content": content,
+                    "stage_write": {
+                        "path": "staged.txt",
+                        "content": content,
+                    }
+                }),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec![WORKSPACE_WRITE.into()],
+                workspace: Some(workspace.clone()),
+                artifacts: None,
+                approved_intent: Some(EffectIntent::WorkspaceWrite {
+                    path: "staged.txt".into(),
+                    content_bytes: content.len() as u64,
+                }),
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("a covered actual intent must stage");
+    let CapabilityOutcome::EffectRequest { effect, .. } = outcome else {
+        panic!("proven wire effects must return EffectRequest, got {outcome:?}");
+    };
+    assert_eq!(
+        prepare_calls.load(Ordering::SeqCst),
+        1,
+        "the adapter must stage through prepare_write after proving coverage"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("staged.txt")).unwrap(),
+        "original content",
+        "staging must not apply the write before Core commit"
+    );
+    let receipt = effect.commit().await;
+    assert!(
+        matches!(
+            receipt,
+            EffectReceipt::Applied {
+                durability: EffectDurability::Durable,
+                ..
+            }
+        ),
+        "test write effect must apply on commit: {receipt:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("staged.txt")).unwrap(),
+        content
+    );
+    capability.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn wire_effect_for_a_different_path_fails_closed_before_prepare_write() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("staged.txt"), "original content").unwrap();
+    let prepare_calls = Arc::new(AtomicUsize::new(0));
+    let program = common::locate_mock_host().expect("mock_host built");
+    let capability: Arc<dyn Capability> = Arc::new(ProcessCapabilityAdapter::with_config(
+        write_manifest_with_program(&program.to_string_lossy()),
+        ProcessHostConfig {
+            program: program.to_string_lossy().into_owned(),
+            args: vec!["--serve".into()],
+            env: vec![("MOCK_MARKER".into(), "1".into())],
+            startup_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+            max_frame_bytes: 1024 * 1024,
+            max_call_bytes: 4 * 1024 * 1024,
+            max_system_answer_bytes: 512 * 1024,
+            offered_features: Default::default(),
+            sandbox: Default::default(),
+        },
+    ));
+    capability.start().await.unwrap();
+    let workspace: Arc<dyn WorkspaceHandle> = Arc::new(TestWorkspace {
+        root: dir.path().to_path_buf(),
+        prepare_calls: Some(prepare_calls.clone()),
+    });
+    let error = capability
+        .invoke(
+            ToolCall {
+                id: "c6-widen".into(),
+                name: "process-demo.invoke".into(),
+                arguments: json!({
+                    "path": "staged.txt",
+                    "content": "ok",
+                    "stage_write": {
+                        "path": "other.txt",
+                        "content": "widened",
+                    }
+                }),
+            },
+            CapabilityInvocationContext {
+                granted_permissions: vec![WORKSPACE_WRITE.into()],
+                workspace: Some(workspace.clone()),
+                artifacts: None,
+                approved_intent: Some(EffectIntent::WorkspaceWrite {
+                    path: "staged.txt".into(),
+                    content_bytes: 64,
+                }),
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .expect_err("a widened path must stay fail-closed");
+    let message = error.to_string();
+    assert!(
+        message.contains("process wire effects are disabled")
+            && message.contains("no workspace mutation was staged"),
+        "widening must keep the unproven-intent refusal: {message}"
+    );
+    assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("staged.txt")).unwrap(),
+        "original content"
     );
     capability.stop().await.unwrap();
 }
@@ -885,6 +1047,7 @@ async fn wire_effect_quarantine_precedes_legacy_grant_matching() {
                 granted_permissions: vec!["workspace:read".into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -935,6 +1098,7 @@ async fn wire_effect_quarantine_does_not_require_a_workspace_handle() {
                 granted_permissions: vec![WORKSPACE_WRITE.into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -992,6 +1156,7 @@ async fn invoke_broker_read(
                 granted_permissions: vec!["workspace:read".into()],
                 workspace: Some(workspace.clone()),
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -1114,6 +1279,7 @@ async fn brokered_fs_read_without_the_grant_is_refused() {
                 granted_permissions: Vec::new(),
                 workspace: Some(workspace),
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -1144,6 +1310,7 @@ async fn unknown_system_ops_are_refused() {
                 granted_permissions: vec!["workspace:read".into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -1177,6 +1344,7 @@ async fn brokered_network_requests_are_refused_by_default() {
                 granted_permissions: vec!["workspace:read".into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -1213,6 +1381,7 @@ async fn network_requests_are_refused_even_with_a_networkish_grant() {
                 granted_permissions: vec!["net:fetch".into(), "workspace:read".into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -1247,6 +1416,7 @@ async fn a_refused_system_request_does_not_poison_the_connection() {
                 granted_permissions: vec!["workspace:read".into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -1273,6 +1443,7 @@ async fn a_refused_system_request_does_not_poison_the_connection() {
                 granted_permissions: vec!["workspace:read".into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -1307,6 +1478,7 @@ async fn a_system_request_flood_poisons_and_kills_the_connection() {
                 granted_permissions: vec!["workspace:read".into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -1333,6 +1505,7 @@ async fn a_system_request_flood_poisons_and_kills_the_connection() {
                 granted_permissions: vec!["workspace:read".into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )
@@ -1365,6 +1538,7 @@ fn invoke_ctx() -> CapabilityInvocationContext {
         granted_permissions: vec!["workspace:read".into()],
         workspace: None,
         artifacts: None,
+        approved_intent: None,
         cancel: CancellationToken::new(),
     }
 }

@@ -421,6 +421,12 @@ impl IntentShadowGate for TaskApprovalGate {
             };
         }
         let intent = Self::derive_effect_intent(call, spec);
+        if matches!(intent, EffectIntent::ReadOnly) {
+            return ShadowVerdict::Granted {
+                grant_id: "session-control".into(),
+                reason: "process.session poll/stop do not spawn a new command".into(),
+            };
+        }
         let now = (self.now)();
         let mut book = self.grants.lock().await;
         book.retain(|_, entry| entry.grant.expires_at_ms > now);
@@ -475,6 +481,14 @@ impl ApprovalGate for TaskApprovalGate {
         // Approval is effect-derived: derive the concrete intent from the
         // validated arguments and match grants against it.
         let intent = Self::derive_effect_intent(call, spec);
+        // `process.session` poll/stop keep ProcessExecution dispatch
+        // identity but do not spawn. They must not consume a command-prefix
+        // grant and must not fall through as an empty `ProcessRun`.
+        if matches!(intent, EffectIntent::ReadOnly) {
+            drop(book);
+            self.record(&call.name, spec.risk, None).await;
+            return Ok(ApprovalDecision::Allow);
+        }
 
         let mut matched_id: Option<String> = None;
         for (id, entry) in book.iter_mut() {
@@ -756,6 +770,44 @@ mod tests {
             risk: ToolRisk::ProcessExecution,
             output_budget: None,
             roles: vec![ToolSemanticRole::EscapeHatch],
+        }
+    }
+
+    fn process_run_spec() -> ToolSpec {
+        ToolSpec {
+            name: "process.run".into(),
+            description: "run argv".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ProcessExecution,
+            output_budget: None,
+            roles: vec![ToolSemanticRole::EscapeHatch],
+        }
+    }
+
+    fn process_run_call(argv: &[&str]) -> ToolCall {
+        ToolCall {
+            id: "c2".into(),
+            name: "process.run".into(),
+            arguments: json!({"argv": argv}),
+        }
+    }
+
+    fn process_session_spec() -> ToolSpec {
+        ToolSpec {
+            name: "process.session".into(),
+            description: "session".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ProcessExecution,
+            output_budget: None,
+            roles: vec![ToolSemanticRole::EscapeHatch],
+        }
+    }
+
+    fn process_session_call(arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "c2".into(),
+            name: "process.session".into(),
+            arguments,
         }
     }
 
@@ -1258,6 +1310,132 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn process_run_grant_matches_argv_not_an_unused_command_field() {
+        let inner = RecordingGate::denying();
+        let gate = TaskApprovalGate::new(inner);
+        gate.grant(StandingGrant {
+            id: "g-cargo".into(),
+            risk: ToolRisk::ProcessExecution,
+            target: GrantTarget {
+                workspace_path_prefix: None,
+                process_command_prefix: Some("cargo".into()),
+            },
+            constraint: Default::default(),
+            expires_at_ms: u64::MAX,
+        })
+        .await
+        .unwrap();
+
+        let decision = gate
+            .authorize(
+                &process_run_call(&["cargo", "test"]),
+                &process_run_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            ApprovalDecision::Allow,
+            "process.run argv must be the grant bound"
+        );
+
+        let widened = ToolCall {
+            id: "c2".into(),
+            name: "process.run".into(),
+            arguments: json!({"command": "cargo test", "argv": ["rm", "-rf", "."]}),
+        };
+        let decision = gate
+            .authorize(&widened, &process_run_spec(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            ApprovalDecision::Deny,
+            "an unused command field must not cover a different argv"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_session_poll_does_not_consume_a_process_grant() {
+        let inner = RecordingGate::denying();
+        let gate = TaskApprovalGate::new(inner);
+        gate.grant(StandingGrant {
+            id: "g-cargo".into(),
+            risk: ToolRisk::ProcessExecution,
+            target: GrantTarget {
+                workspace_path_prefix: None,
+                process_command_prefix: Some("cargo".into()),
+            },
+            constraint: agent_contracts::GrantConstraint {
+                max_runs: Some(1),
+                ..Default::default()
+            },
+            expires_at_ms: u64::MAX,
+        })
+        .await
+        .unwrap();
+
+        let start = process_session_call(json!({
+            "action": "start",
+            "argv": ["cargo", "test"]
+        }));
+        assert_eq!(
+            gate.authorize(&start, &process_session_spec(), &CancellationToken::new())
+                .await
+                .unwrap(),
+            ApprovalDecision::Allow
+        );
+
+        let poll = process_session_call(json!({
+            "action": "poll",
+            "session_id": "s1",
+            "argv": ["cargo", "test"]
+        }));
+        assert_eq!(
+            gate.authorize(&poll, &process_session_spec(), &CancellationToken::new())
+                .await
+                .unwrap(),
+            ApprovalDecision::Allow,
+            "poll must not need a second command-prefix grant"
+        );
+        let shadow = gate.shadow_verdict(&poll, &process_session_spec()).await;
+        assert!(
+            matches!(shadow, ShadowVerdict::Granted { .. }),
+            "shadow must not be stricter than legacy Allow for poll: {shadow:?}"
+        );
+
+        let stop = process_session_call(json!({
+            "action": "stop",
+            "session_id": "s1",
+            "argv": ["cargo", "test"]
+        }));
+        assert_eq!(
+            gate.authorize(&stop, &process_session_spec(), &CancellationToken::new())
+                .await
+                .unwrap(),
+            ApprovalDecision::Allow,
+            "stop must not consume a command-prefix grant"
+        );
+
+        let second_start = process_session_call(json!({
+            "action": "start",
+            "argv": ["cargo", "test"]
+        }));
+        assert_eq!(
+            gate.authorize(
+                &second_start,
+                &process_session_spec(),
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap(),
+            ApprovalDecision::Deny,
+            "poll must not have refunded the start's run cap"
+        );
+    }
+
     #[test]
     fn derive_effect_intent_is_fail_closed_on_missing_arguments() {
         // A write without a path yields an empty-path intent, which can
@@ -1446,6 +1624,14 @@ mod tests {
             (write_call_at("elsewhere/x.rs", "x"), write_spec()),
             (process_call("cargo test"), process_spec()),
             (process_call("npm install"), process_spec()),
+            (
+                process_session_call(json!({
+                    "action": "poll",
+                    "session_id": "s1",
+                    "argv": ["cargo", "test"]
+                })),
+                process_session_spec(),
+            ),
         ];
         for (call, spec) in cases {
             let shadow = gate.shadow_verdict(&call, &spec).await;

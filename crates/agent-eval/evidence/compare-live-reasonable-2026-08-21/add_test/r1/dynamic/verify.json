@@ -1,0 +1,42 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content",
+  "fixture_id": "add_test",
+  "expected_edit": "append a `def test_add():` block asserting `add` in `src/calc.py`",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/calc.py",
+      "pred": "contains_any",
+      "needles": [
+        "def test_add",
+        "assert add("
+      ],
+      "count": 2,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/calc.py",
+      "pred": "not_contains",
+      "needles": [
+        "# TODO"
+      ],
+      "count": 0,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/calc.py",
+      "exists": true,
+      "sha256": "4d05bd1e3c2948511ab3aa864d5c52e57bc5fdae7593b7fd84f2d5ec94814323",
+      "bytes": 79,
+      "truncated": false,
+      "body": "def add(a, b):\n    return a + b\n\n\ndef test_add():\n    assert add(17, 25) == 42\n"
+    }
+  ],
+  "commands": []
+}

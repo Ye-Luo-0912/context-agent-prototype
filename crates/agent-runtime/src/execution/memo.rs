@@ -1,14 +1,17 @@
 //! Phase-2 semantic read memo. Not wired into dispatch.
 //!
-//! After Execution Coherence, identical read/query operations can reuse a
-//! prior observation when `world_revision` and the resource identity still
-//! match. That saves tool cost; it cannot replace the state algorithm,
-//! because the model round has already happened.
+//! Keep it that way through Execution Coherence V1. Memo fires *after* the
+//! model has already chosen a tool, so it saves I/O, not a model round.
+//! Foreground Evidence is the cheaper path: the model never issues the
+//! extra `fs.read`.
 //!
-//! Write, patch, and shell side-effects must never be memoized.
+//! First wired version: `fs.read` only, keyed by path + line range +
+//! content revision. Do not memo `search.grep` / `git.diff` / `git.status`
+//! until a workspace snapshot identity exists. Write, patch, and shell
+//! side-effects must never be memoized.
 #![allow(dead_code)]
 
-/// Identity of a read/query observation. Arguments must be normalized.
+/// Identity of a read observation. Arguments must be normalized.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticOperationKey {
     pub tool_name: String,
@@ -22,12 +25,9 @@ pub struct ObservationMemo {
     pub result_ref: String,
 }
 
-/// Tools that may later be memoized. Never includes writers or shells.
+/// Tools that may later be memoized. First version is `fs.read` only.
 pub fn is_memoizable_read(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "fs.read" | "fs.list" | "git.status" | "git.diff" | "git.log" | "search.grep"
-    )
+    tool_name == "fs.read"
 }
 
 /// Phase 2 is not enabled. Always miss.
@@ -46,8 +46,10 @@ mod tests {
     #[test]
     fn writers_and_shells_are_never_memoizable() {
         assert!(is_memoizable_read("fs.read"));
-        assert!(is_memoizable_read("git.status"));
-        assert!(is_memoizable_read("search.grep"));
+        assert!(!is_memoizable_read("fs.list"));
+        assert!(!is_memoizable_read("git.status"));
+        assert!(!is_memoizable_read("git.diff"));
+        assert!(!is_memoizable_read("search.grep"));
         assert!(!is_memoizable_read("fs.write"));
         assert!(!is_memoizable_read("edit.replace"));
         assert!(!is_memoizable_read("edit.patch"));

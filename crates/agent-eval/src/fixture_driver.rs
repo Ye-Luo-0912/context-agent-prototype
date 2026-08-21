@@ -53,6 +53,40 @@ const LIVE_LIMITS: TurnLimits = TurnLimits {
     max_model_rounds: Some(LIVE_MAX_MODEL_ROUNDS),
 };
 
+/// Which builtin tool surface this eval cell measures.
+///
+/// Scripted fixtures, `--compare-arm`, and context-bench/mech ops pin
+/// `fs.write` / `edit.replace` / `context.manage` so a scripted model can
+/// edit and recall without `capability.load`. Live coding compare uses
+/// production `ToolLifecycleConfig::default()` so the cell is the product
+/// surface, not an Eval Tool Surface pin. Item 24: production keeps
+/// `context.manage` catalog-only except NeedEvidence / EXTERNAL CONTEXT.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvalToolSurface {
+    ScriptedPin,
+    Production,
+}
+
+impl EvalToolSurface {
+    fn lifecycle_config(self) -> tool_runtime::ToolLifecycleConfig {
+        match self {
+            Self::Production => tool_runtime::ToolLifecycleConfig::default(),
+            Self::ScriptedPin => tool_runtime::ToolLifecycleConfig {
+                always_loaded: vec![
+                    "fs.list".into(),
+                    "fs.read".into(),
+                    "fs.write".into(),
+                    "edit.replace".into(),
+                    "search.grep".into(),
+                    agent_contracts::CONTEXT_MANAGE.into(),
+                    agent_contracts::CAPABILITY_MANAGE.into(),
+                ],
+                ..tool_runtime::ToolLifecycleConfig::default()
+            },
+        }
+    }
+}
+
 /// CI 确定性压缩器：live 注入 `ModelBackedCompactor`。
 pub struct ScriptedCompactor;
 
@@ -294,6 +328,11 @@ async fn compare_suite_with_model(
     let prompts = suite::live_turns(task);
     let turns: Vec<&str> = prompts.iter().map(String::as_str).collect();
     let limits = if live { LIVE_LIMITS } else { SCRIPTED_LIMITS };
+    let tool_surface = if live {
+        EvalToolSurface::Production
+    } else {
+        EvalToolSurface::ScriptedPin
+    };
     let repeat = pair.map(|p| p.repeat).unwrap_or(1);
     let order = if live {
         crate::analysis::arm_order(&task.id, repeat)
@@ -317,6 +356,7 @@ async fn compare_suite_with_model(
             engine.clone(),
             &turns,
             limits,
+            tool_surface,
             name,
             pair,
         )
@@ -353,6 +393,11 @@ async fn compare_engines_with_model(
     };
     let turns: Vec<&str> = prompts.iter().map(String::as_str).collect();
     let limits = if live { LIVE_LIMITS } else { SCRIPTED_LIMITS };
+    let tool_surface = if live {
+        EvalToolSurface::Production
+    } else {
+        EvalToolSurface::ScriptedPin
+    };
     let repeat = pair.map(|p| p.repeat).unwrap_or(1);
     let order = if live {
         crate::analysis::arm_order(fixture.id, repeat)
@@ -379,6 +424,7 @@ async fn compare_engines_with_model(
             engine.clone(),
             &turns,
             limits,
+            tool_surface,
             name,
             pair,
         )
@@ -464,7 +510,7 @@ fn render_comparison_header(runs: &[EngineRun], header: &str) -> String {
                {:8}   resident_bytes final={} peak={}\n\
                {:8}   materialize(p50/p95)={}ms/{}ms store(w/r/recalled)={}/{}/{}\n\
                {:8}   retrieval search={}/{} empty={} recovered={}/{} access(search/inspect/fetch/ack)={}/{}/{}/{}\n\
-               {:8}   reread prev/resident/warm/stored/first={}/{}/{}/{}/{} motive(first/sel/checked/reval/warm/stored/changed)={}/{}/{}/{}/{}/{}/{} repeated_fs={} recovery_reread={}\n",
+               {:8}   reread prev/desc/ext/resident/warm/stored/first={}/{}/{}/{}/{}/{}/{} motive(first/body/desc/checked/reval/warm/stored/changed)={}/{}/{}/{}/{}/{}/{}/{} repeated_fs={} recovery_reread={}\n",
             run.engine,
             run.eval.passed,
             run.eval.wall_ms,
@@ -505,12 +551,15 @@ fn render_comparison_header(runs: &[EngineRun], header: &str) -> String {
             metrics.access_consumption_acks,
             "",
             metrics.reread_previously_selected,
+            metrics.reread_selected_descriptor,
+            metrics.reread_external_descriptor,
             metrics.reread_resident_unselected,
             metrics.reread_warm,
             metrics.reread_stored,
             metrics.reread_first_read,
             metrics.reread_motive_first,
-            metrics.reread_motive_selected_current,
+            metrics.reread_motive_body_visible_current,
+            metrics.reread_motive_descriptor_only,
             metrics.reread_motive_checked_fresh,
             metrics.reread_motive_needs_revalidation,
             metrics.reread_motive_warm,
@@ -557,6 +606,7 @@ pub async fn run_fixture(
         context_engine,
         &turns,
         SCRIPTED_LIMITS,
+        EvalToolSurface::ScriptedPin,
         "dynamic",
         None,
     )
@@ -583,6 +633,7 @@ pub async fn run_fixture_with_model(
         context_engine,
         &turns,
         LIVE_LIMITS,
+        EvalToolSurface::Production,
         "dynamic",
         None,
     )
@@ -603,11 +654,19 @@ async fn run_fixture_with_engine(
     context_engine: Arc<dyn ContextEngine>,
     turns: &[&str],
     limits: TurnLimits,
+    tool_surface: EvalToolSurface,
     engine: &'static str,
     pair: Option<&bundle::PairSink>,
 ) -> anyhow::Result<FixtureEval> {
-    let session =
-        run_workspace_session(workspace_root, model, context_engine, turns, limits).await?;
+    let session = run_workspace_session(
+        workspace_root,
+        model,
+        context_engine,
+        turns,
+        limits,
+        tool_surface,
+    )
+    .await?;
     let passed = session.error.is_none() && workload::fixture_passes(fixture, workspace_root);
     let eval = FixtureEval {
         fixture_id: fixture.id.to_string(),
@@ -643,11 +702,19 @@ async fn run_suite_with_engine(
     context_engine: Arc<dyn ContextEngine>,
     turns: &[&str],
     limits: TurnLimits,
+    tool_surface: EvalToolSurface,
     engine: &'static str,
     pair: Option<&bundle::PairSink>,
 ) -> anyhow::Result<FixtureEval> {
-    let session =
-        run_workspace_session(workspace_root, model, context_engine, turns, limits).await?;
+    let session = run_workspace_session(
+        workspace_root,
+        model,
+        context_engine,
+        turns,
+        limits,
+        tool_surface,
+    )
+    .await?;
     let run_tag = format!(
         "pilot-{}-{}-r{}",
         harvest::instance_id_from_suite_id(&task.id).unwrap_or(&task.id),
@@ -737,6 +804,7 @@ async fn run_workspace_session(
     context_engine: Arc<dyn ContextEngine>,
     turns: &[&str],
     limits: TurnLimits,
+    tool_surface: EvalToolSurface,
 ) -> anyhow::Result<WorkspaceSession> {
     let ops: Vec<TurnOp> = turns
         .iter()
@@ -744,9 +812,19 @@ async fn run_workspace_session(
             text: (*text).to_string(),
         })
         .collect();
-    run_workspace_session_ops(workspace_root, model, context_engine, &ops, limits, true).await
+    run_workspace_session_ops(
+        workspace_root,
+        model,
+        context_engine,
+        &ops,
+        limits,
+        true,
+        tool_surface,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_workspace_session_ops(
     workspace_root: &Path,
     model: Arc<dyn ModelTransport>,
@@ -754,6 +832,7 @@ async fn run_workspace_session_ops(
     ops: &[TurnOp],
     limits: TurnLimits,
     project_task_progress: bool,
+    tool_surface: EvalToolSurface,
 ) -> anyhow::Result<WorkspaceSession> {
     let started = Instant::now();
     let approval: Arc<dyn ApprovalGate> = Arc::new(AllowAllGate);
@@ -762,22 +841,7 @@ async fn run_workspace_session_ops(
     let tools: Arc<dyn ToolDispatcher> =
         Arc::new(tool_runtime::BuiltinToolDispatcher::with_config(
             workspace.clone(),
-            tool_runtime::ToolLifecycleConfig {
-                // Coding core stays loaded. InspectDiff / EscapeHatch
-                // (`git.*`, `shell.exec`) stay in the catalog but are not
-                // pinned: NeedVerify must not Prefer them, and the model
-                // loads them through `capability.manage` like any other app.
-                always_loaded: vec![
-                    "fs.list".into(),
-                    "fs.read".into(),
-                    "fs.write".into(),
-                    "edit.replace".into(),
-                    "search.grep".into(),
-                    agent_contracts::CONTEXT_MANAGE.into(),
-                    agent_contracts::CAPABILITY_MANAGE.into(),
-                ],
-                ..tool_runtime::ToolLifecycleConfig::default()
-            },
+            tool_surface.lifecycle_config(),
         ));
 
     let composed = agent_compose::compose(agent_compose::ComposeConfig {
@@ -1171,6 +1235,7 @@ async fn run_bench_with_engine(
         &task.file.ops,
         limits,
         project_task_progress,
+        EvalToolSurface::ScriptedPin,
     )
     .await?;
     let report = context_bench::evaluate_task(pack, task, workspace_root);
@@ -1216,6 +1281,60 @@ mod tests {
     }
 
     #[test]
+    fn live_coding_compare_uses_production_tool_surface() {
+        let production = EvalToolSurface::Production.lifecycle_config();
+        let product = tool_runtime::ToolLifecycleConfig::default();
+        assert_eq!(production.always_loaded, product.always_loaded);
+        assert_eq!(
+            production.always_loaded,
+            vec![
+                "fs.list".to_string(),
+                "fs.read".to_string(),
+                "search.grep".to_string(),
+                "artifact.read".to_string(),
+                "task.complete".to_string(),
+                agent_contracts::CAPABILITY_MANAGE.to_string(),
+            ],
+            "item 24: live coding compare matches production; context.manage is catalog-only"
+        );
+        assert!(
+            !production
+                .always_loaded
+                .iter()
+                .any(|name| name == agent_contracts::CONTEXT_MANAGE),
+            "production must not always-load context.manage"
+        );
+        assert!(
+            !production
+                .always_loaded
+                .iter()
+                .any(|name| name == "fs.write"),
+            "production must not pin fs.write"
+        );
+        assert!(
+            !production
+                .always_loaded
+                .iter()
+                .any(|name| name == "edit.replace"),
+            "production must not pin edit.replace"
+        );
+        let pin = EvalToolSurface::ScriptedPin.lifecycle_config();
+        assert_eq!(
+            pin.always_loaded,
+            vec![
+                "fs.list".to_string(),
+                "fs.read".to_string(),
+                "fs.write".to_string(),
+                "edit.replace".to_string(),
+                "search.grep".to_string(),
+                agent_contracts::CONTEXT_MANAGE.to_string(),
+                agent_contracts::CAPABILITY_MANAGE.to_string(),
+            ],
+            "item 24: --compare-arm / fixtures / context-bench/mech pin write/edit and context.manage; not production default"
+        );
+    }
+
+    #[test]
     fn ablation_arm_order_is_a_salted_permutation() {
         for repeat in 1..=8 {
             let mut seen = ablation_arm_order(repeat);
@@ -1252,10 +1371,17 @@ mod tests {
         ];
         let model = Arc::new(ScriptedModel::new(Vec::new(), "ok"));
         let engine = named_engine("append", None).unwrap();
-        let session =
-            run_workspace_session_ops(dir.path(), model, engine, &ops, SCRIPTED_LIMITS, true)
-                .await
-                .unwrap();
+        let session = run_workspace_session_ops(
+            dir.path(),
+            model,
+            engine,
+            &ops,
+            SCRIPTED_LIMITS,
+            true,
+            EvalToolSurface::ScriptedPin,
+        )
+        .await
+        .unwrap();
         assert!(session.error.is_none(), "{:?}", session.error);
         assert!(
             session
@@ -1282,6 +1408,7 @@ mod tests {
                 &task.file.ops,
                 SCRIPTED_LIMITS,
                 true,
+                EvalToolSurface::ScriptedPin,
             )
             .await
             .unwrap();

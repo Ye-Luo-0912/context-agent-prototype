@@ -507,6 +507,56 @@ async fn server_loop() {
                 // request's answer).
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
+            "ack_cancel" => {
+                // Wait for the host's peer cancel frame, then ACK. Tests
+                // that cancel-ACK is observed before kill-then-reap.
+                loop {
+                    let Ok(Some(line)) = lines.next_line().await else {
+                        return;
+                    };
+                    let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    if msg.get("op").and_then(Value::as_str) == Some("cancel")
+                        && msg.get("id").and_then(Value::as_u64) == Some(id)
+                    {
+                        let ack = json!({
+                            "id": id,
+                            "version": PROTOCOL_VERSION,
+                            "cancelled": true,
+                        });
+                        write_raw_response(&mut writer, &ack).await;
+                        break;
+                    }
+                }
+            }
+            "progress" => {
+                // Several progress frames then the real answer. The host
+                // must coalesce (drop intermediates) and admit only the
+                // final value — progress is not a second inflight call.
+                for seq in 0..4u32 {
+                    let frame = json!({
+                        "progress": true,
+                        "id": id,
+                        "seq": seq,
+                        "note": format!("step {seq}"),
+                    });
+                    write_raw_response(&mut writer, &frame).await;
+                }
+                reply(&mut writer, id, json!("done")).await;
+            }
+            "progress_flood" => {
+                let cap = agent_process::MAX_PROGRESS_FRAMES_PER_CALL;
+                for seq in 0..=cap {
+                    let frame = json!({
+                        "progress": true,
+                        "id": id,
+                        "seq": seq,
+                    });
+                    write_raw_response(&mut writer, &frame).await;
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
             "system_abuse" => {
                 // Answer a request with a system frame instead of the normal
                 // `{id, version, ok, value}` response: a host call without
@@ -553,6 +603,7 @@ async fn reply_ping(writer: &mut BufWriter<tokio::io::Stdout>, id: u64, request:
         "version": PROTOCOL_VERSION,
         "ok": true,
         "value": "pong",
+        "epoch": 1u64,
     });
     let features = if std::env::var("MOCK_BAD_FEATURES").ok().as_deref() == Some("1") {
         json!(["z.v1", "a.v1"])

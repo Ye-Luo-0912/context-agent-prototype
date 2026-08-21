@@ -82,6 +82,18 @@ impl PromptAssembler {
         // files, tools or the store cannot gain system precedence over the
         // operator's instructions (prompt injection defense).
         let mut context_frame = Vec::new();
+        if !history.foreground.is_empty() {
+            // Passive transient rehydration: file bodies the current
+            // directive exactly named. Not GC reactivation — Warm stays
+            // Warm and Stored is not Admitted. Checked omit does not
+            // apply here; identity-only SELECTED WORKING CONTEXT is not
+            // enough to append.
+            let mut foreground = String::from("CURRENT FOREGROUND EVIDENCE");
+            for item in &history.foreground {
+                foreground.push_str(&render_selected_item(item, None));
+            }
+            context_frame.push(ModelMessage::user(foreground));
+        }
         if !history.items.is_empty() {
             let mut working = String::from("SELECTED WORKING CONTEXT");
             let diagnostics = &history.diagnostics;
@@ -429,6 +441,7 @@ mod tests {
             selected: Vec::new(),
             approx_tokens: 0,
             diagnostics: Default::default(),
+            foreground: Vec::new(),
         }
     }
 
@@ -590,6 +603,52 @@ mod tests {
                 && !user.content.contains("bounded cache"),
             "census and path are facts, not a retrieval tutorial: {}",
             user.content
+        );
+    }
+
+    #[test]
+    fn foreground_evidence_keeps_the_body_even_when_checked() {
+        let assembler = PromptAssembler::new("policy");
+        let mut file = item("     1 | fn secret_body() {}");
+        file.kind = ContextKind::ToolObservation;
+        file.source = Some("tool:fs.read".into());
+        file.file_path = Some("src/scratch.md".into());
+        file.file_revision = Some("r3".into());
+        let mut history = materialized_with(vec![file.clone()], ContextMapView::default());
+        history.foreground = vec![file];
+        history.items[0].content = "src/scratch.md@r3".into();
+        let progress = TaskProgressView {
+            checked_files: vec!["src/scratch.md@r3".into()],
+            ..Default::default()
+        };
+        let assembled = assembler.assemble(
+            None,
+            None,
+            Some(&progress),
+            &history,
+            &TurnFrame::new("Append to src/scratch.md"),
+            Vec::new(),
+        );
+        let user_texts: Vec<&str> = assembled
+            .context_frame
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        let foreground = user_texts
+            .iter()
+            .find(|text| text.contains("CURRENT FOREGROUND EVIDENCE"))
+            .expect("foreground section");
+        assert!(
+            foreground.contains("fn secret_body"),
+            "Checked omit must not strip foreground bodies: {foreground}"
+        );
+        let selected = user_texts
+            .iter()
+            .find(|text| text.contains("SELECTED WORKING CONTEXT"))
+            .expect("selected section");
+        assert!(
+            !selected.contains("fn secret_body"),
+            "selected working set still omits the checked body: {selected}"
         );
     }
 

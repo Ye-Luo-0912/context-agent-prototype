@@ -79,6 +79,7 @@ impl ContextEngine for RecordingContextEngine {
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
+            foreground: Vec::new(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -285,6 +286,7 @@ impl ContextEngine for ScopeRecordingEngine {
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
+            foreground: Vec::new(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -562,6 +564,7 @@ impl ContextEngine for PublishingScopeEngine {
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
+            foreground: Vec::new(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -620,6 +623,7 @@ impl ContextEngine for FailingCloseScopeEngine {
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
+            foreground: Vec::new(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -764,6 +768,7 @@ impl ContextEngine for IngestRecordingEngine {
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
+            foreground: Vec::new(),
             diagnostics: ContextDiagnostics::default(),
         })
     }

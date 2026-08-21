@@ -97,6 +97,66 @@ impl EffectIntent {
             Self::ProcessRun { .. } => ToolRisk::ProcessExecution,
         }
     }
+
+    /// Whether `actual` is the same class and inside this approved upper
+    /// bound. Empty path/command never covers anything. Workspace writes
+    /// require an exact canonical relative path (`src/a.rs` ≠ `src/ab.rs`)
+    /// and `actual.content_bytes <= approved`. A process-run bound cannot
+    /// cover a workspace write: that is the path-widening hole the process
+    /// wire-effect quarantine exists to close.
+    pub fn covers(&self, actual: &EffectIntent) -> bool {
+        match (self, actual) {
+            (Self::ReadOnly, Self::ReadOnly) => true,
+            (
+                Self::WorkspaceWrite {
+                    path: approved,
+                    content_bytes: max_bytes,
+                },
+                Self::WorkspaceWrite {
+                    path,
+                    content_bytes,
+                },
+            ) => {
+                let Some(approved) = canonical_relative_path(approved) else {
+                    return false;
+                };
+                let Some(path) = canonical_relative_path(path) else {
+                    return false;
+                };
+                approved == path && *content_bytes <= *max_bytes
+            }
+            (Self::ProcessRun { command: approved }, Self::ProcessRun { command }) => {
+                let approved_tokens: Vec<&str> = approved.split_whitespace().collect();
+                let command_tokens: Vec<&str> = command.split_whitespace().collect();
+                !approved_tokens.is_empty()
+                    && command_tokens.len() >= approved_tokens.len()
+                    && command_tokens[..approved_tokens.len()] == approved_tokens[..]
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Slash-normalized relative path with no `.` / `..` / prefix / root.
+/// `None` means the path cannot be an approved workspace-write target.
+fn canonical_relative_path(path: &str) -> Option<String> {
+    use std::path::{Component, Path};
+    if path.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
 }
 
 /// Derive the conservative `EffectIntent` upper bound from validated tool
@@ -105,6 +165,9 @@ impl EffectIntent {
 /// approval matches the concrete intent, never the tool name. Fail-closed:
 /// a missing argument yields the empty/zero bound, which can never match a
 /// grant (an empty path has no prefix, an empty command has no tokens).
+/// Process tools: `argv` for `process.run` / `process.session` start,
+/// `command` for `shell.exec`, and `ReadOnly` for `process.session`
+/// poll/stop (no new child).
 pub fn derive_effect_intent(call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
     match spec.risk {
         ToolRisk::ReadOnly => EffectIntent::ReadOnly,
@@ -127,16 +190,108 @@ pub fn derive_effect_intent(call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
                 content_bytes,
             }
         }
-        ToolRisk::ProcessExecution => {
-            let command = call
-                .arguments
-                .get("command")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            EffectIntent::ProcessRun { command }
+        ToolRisk::ProcessExecution => process_effect_intent(&call.name, &call.arguments),
+    }
+}
+
+/// Process-tool intent: a new child is a `ProcessRun` bound; session
+/// poll/stop do not spawn and must not consume a command-prefix grant.
+/// Unknown `process.session` actions are an empty `ProcessRun` (fail-closed).
+fn process_effect_intent(tool_name: &str, arguments: &Value) -> EffectIntent {
+    if tool_name == "process.session" {
+        return match session_action(arguments) {
+            Some("poll" | "stop") => EffectIntent::ReadOnly,
+            Some("start") => EffectIntent::ProcessRun {
+                command: argv_command(arguments),
+            },
+            _ => EffectIntent::ProcessRun {
+                command: String::new(),
+            },
+        };
+    }
+    EffectIntent::ProcessRun {
+        command: lexical_process_command(tool_name, arguments),
+    }
+}
+
+fn session_action(arguments: &Value) -> Option<&str> {
+    arguments
+        .get("action")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|action| !action.is_empty())
+}
+
+/// Lexical process command used as the `EffectIntent::ProcessRun` bound.
+///
+/// The bound must name the arguments the tool will actually spawn:
+/// `shell.exec` reads `command`; `process.run` and `process.session`
+/// **start** read `argv`. Poll/stop are not spawn paths — see
+/// [`derive_effect_intent`]. An unused sibling field must not become the
+/// bound (that is the process-run analogue of path widening). Unknown
+/// process tools: one present shape is used; both present and unequal is
+/// empty (fail-closed).
+pub fn lexical_process_command(tool_name: &str, arguments: &Value) -> String {
+    match tool_name {
+        "shell.exec" => command_argument(arguments),
+        "process.run" | "process.session" => argv_command(arguments),
+        _ => {
+            let command = command_argument(arguments);
+            let argv = argv_command(arguments);
+            match (command.is_empty(), argv.is_empty()) {
+                (false, true) => command,
+                (true, false) => argv,
+                (false, false) if command == argv => command,
+                _ => String::new(),
+            }
         }
     }
+}
+
+fn command_argument(arguments: &Value) -> String {
+    arguments
+        .get("command")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn argv_command(arguments: &Value) -> String {
+    let Some(argv) = arguments.get("argv").and_then(|value| value.as_array()) else {
+        return String::new();
+    };
+    if argv.is_empty() {
+        return String::new();
+    }
+    let mut tokens = Vec::with_capacity(argv.len());
+    for item in argv {
+        let Some(token) = item.as_str() else {
+            return String::new();
+        };
+        if token.is_empty() {
+            return String::new();
+        }
+        tokens.push(token);
+    }
+    tokens.join(" ")
+}
+
+/// Whether the command about to be spawned sits inside the approved
+/// `ProcessRun` bound derived from the same tool call. Empty approved
+/// bounds never cover a spawn.
+pub fn process_spawn_command_is_covered(
+    tool_name: &str,
+    arguments: &Value,
+    actual_command: &str,
+) -> bool {
+    EffectIntent::ProcessRun {
+        command: lexical_process_command(tool_name, arguments),
+    }
+    .covers(&EffectIntent::ProcessRun {
+        command: actual_command.to_string(),
+    })
 }
 
 /// Semantic capability a catalog tool offers. Tool-surface policy maps an
@@ -154,19 +309,19 @@ pub enum ToolSemanticRole {
 }
 
 impl ToolSemanticRole {
-    /// Catalog fallback until every `ToolSpec` declares a role. Builtin
-    /// names are explicit; unknown names are escape hatches.
-    pub fn from_tool_name(name: &str) -> Self {
+    /// Name fallback for unstamped *legacy builtin* specs. Unknown
+    /// external/plugin names have no role — the producer must declare.
+    /// Do not default to [`Self::EscapeHatch`] and do not treat `fs.*` /
+    /// `git.*` prefixes as a family.
+    pub fn from_tool_name(name: &str) -> Option<Self> {
         match name {
-            "fs.read" | "artifact.read" | "context.fetch" => Self::ReadResource,
+            "fs.read" | "artifact.read" | "context.fetch" => Some(Self::ReadResource),
             "fs.list" | "search.grep" | "context.search" | "context.manage" | "code.symbols"
-            | CAPABILITY_MANAGE | CAPABILITY_SEARCH => Self::Search,
-            "git.diff" | "git.status" | "git.log" | "code.diagnostics" => Self::InspectDiff,
-            "fs.write" | "edit.replace" | "edit.patch" => Self::Mutate,
-            "shell.exec" | "process.run" | "process.session" => Self::EscapeHatch,
-            other if other.starts_with("git.") => Self::Mutate,
-            other if other.starts_with("fs.") => Self::ReadResource,
-            _ => Self::EscapeHatch,
+            | CAPABILITY_MANAGE | CAPABILITY_SEARCH => Some(Self::Search),
+            "git.diff" | "git.status" | "git.log" | "code.diagnostics" => Some(Self::InspectDiff),
+            "fs.write" | "edit.replace" | "edit.patch" => Some(Self::Mutate),
+            "shell.exec" | "process.run" | "process.session" => Some(Self::EscapeHatch),
+            _ => None,
         }
     }
 }
@@ -186,19 +341,21 @@ pub struct ToolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_budget: Option<usize>,
     /// Semantic capabilities this tool offers. Empty means the catalog
-    /// fallback [`ToolSemanticRole::from_tool_name`] until the producer
-    /// stamps roles. Policy matches execution needs against these roles,
-    /// never against a hard-coded tool name.
+    /// may apply [`ToolSemanticRole::from_tool_name`] for known legacy
+    /// builtins; unknown names stay role-less until the producer stamps
+    /// them. Policy never guesses plugin semantics from the tool name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<ToolSemanticRole>,
 }
 
 impl ToolSpec {
-    /// Declared roles, or the name-based fallback when the producer has
-    /// not stamped any.
+    /// Declared roles, or the legacy-builtin name fallback when the
+    /// producer has not stamped any. Unknown names yield an empty set.
     pub fn effective_roles(&self) -> Vec<ToolSemanticRole> {
         if self.roles.is_empty() {
-            vec![ToolSemanticRole::from_tool_name(&self.name)]
+            ToolSemanticRole::from_tool_name(&self.name)
+                .into_iter()
+                .collect()
         } else {
             let mut roles = self.roles.clone();
             roles.sort();
@@ -801,12 +958,41 @@ impl OperationEffectContext {
     }
 }
 
+/// Builtin tools that mutate the world inside a child before the operation
+/// completes. They are an explicit M12 non-transactional exception:
+/// Core identity is required before spawn, spawn/exit is journaled,
+/// cancellation kills the tree, and mutations already performed are never
+/// rolled back. They must return [`ToolOutcome::Value`], never a prepared
+/// effect.
+pub fn is_non_transactional_process_tool(name: &str) -> bool {
+    matches!(name, "shell.exec" | "process.run" | "process.session")
+}
+
+/// Process tools already mutate inside the child. Staging a prepared effect
+/// would lie that Core can still roll the world back.
+pub fn reject_staged_effect_for_process_tool(
+    tool_name: &str,
+    outcome: ToolOutcome,
+) -> AgentResult<ToolOutcome> {
+    if is_non_transactional_process_tool(tool_name)
+        && matches!(outcome, ToolOutcome::PreparedEffect { .. })
+    {
+        return Err(AgentError::InvalidRequest(
+            "non-transactional process tools cannot stage a prepared effect; child mutations are not rolled back".into(),
+        ));
+    }
+    Ok(outcome)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolExecutionRequest {
     pub run_id: RunId,
     pub call: ToolCall,
     /// Stable identity for a side-effecting operation, issued and persisted
-    /// by Core before dispatch. Legacy/read-only calls carry `None`.
+    /// by Core before dispatch. Read-only calls carry `None`.
+    /// `shell.exec` / `process.run` / `process.session` must carry `Some`
+    /// ([`is_non_transactional_process_tool`]); a missing identity fails
+    /// closed before spawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect_context: Option<OperationEffectContext>,
     /// Cooperative cancellation handle for this execution (kill long-running
@@ -821,6 +1007,11 @@ impl ToolExecutionRequest {
     /// intentionally not inferred here.
     pub fn validate(&self) -> Result<(), String> {
         let Some(context) = &self.effect_context else {
+            if is_non_transactional_process_tool(&self.call.name) {
+                return Err(
+                    "non-transactional process tools require a Core-issued effect context".into(),
+                );
+            }
             return Ok(());
         };
         context.validate()?;
@@ -934,9 +1125,8 @@ impl From<EffectCommitError> for EffectReceipt {
 
 /// Several trusted, already-prepared effects committed in order as one
 /// operation. Multi-file builtin edits use this today. Process wire effects
-/// remain fail-closed until their actual intent can be proved against the
-/// invocation lease; if that path is later re-enabled it may reuse this
-/// composite only after every child effect is safely staged.
+/// may reuse this composite only after the host has proved each child's
+/// actual intent is covered by the approved invocation bound.
 /// Each sub-effect is itself atomic; a mid-list failure stops the rest and
 /// rolls back every unattempted preparation. Effects already committed stay
 /// committed (they are separate atomic operations, not one transaction), so
@@ -1173,6 +1363,9 @@ pub const RUNTIME_CONTEXT_CONTROL: &str = "runtime:context-control";
 /// context engine (tools never touch the engine — invariant 3).
 pub enum ToolOutcome {
     /// The execution produced only an output; there is nothing to commit.
+    /// Non-transactional process tools (`shell.exec` / `process.run` /
+    /// `process.session`) must use this arm: the child may already have
+    /// mutated the world.
     Value(ToolOutput),
     /// The computation finished and a side effect is staged. `output` is
     /// what the model sees after the runtime commits the effect.
@@ -1635,6 +1828,194 @@ mod tests {
     }
 
     #[test]
+    fn approved_workspace_write_covers_the_same_canonical_path_only() {
+        let approved = EffectIntent::WorkspaceWrite {
+            path: r"src\util.py".into(),
+            content_bytes: 32,
+        };
+        assert!(approved.covers(&EffectIntent::WorkspaceWrite {
+            path: "src/util.py".into(),
+            content_bytes: 32,
+        }));
+        assert!(approved.covers(&EffectIntent::WorkspaceWrite {
+            path: "src/util.py".into(),
+            content_bytes: 8,
+        }));
+        assert!(!approved.covers(&EffectIntent::WorkspaceWrite {
+            path: "src/utils.py".into(),
+            content_bytes: 8,
+        }));
+        assert!(!approved.covers(&EffectIntent::WorkspaceWrite {
+            path: "src/util.py".into(),
+            content_bytes: 33,
+        }));
+        assert!(!approved.covers(&EffectIntent::ProcessRun {
+            command: "echo hi".into(),
+        }));
+        assert!(
+            !EffectIntent::WorkspaceWrite {
+                path: String::new(),
+                content_bytes: 32,
+            }
+            .covers(&EffectIntent::WorkspaceWrite {
+                path: "src/util.py".into(),
+                content_bytes: 1,
+            })
+        );
+        assert!(
+            !EffectIntent::ProcessRun {
+                command: "cargo test".into(),
+            }
+            .covers(&EffectIntent::WorkspaceWrite {
+                path: "src/lib.rs".into(),
+                content_bytes: 1,
+            })
+        );
+    }
+
+    fn process_spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: "p".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            risk: ToolRisk::ProcessExecution,
+            output_budget: None,
+            roles: vec![ToolSemanticRole::EscapeHatch],
+        }
+    }
+
+    #[test]
+    fn process_run_intent_comes_from_argv_not_an_unused_command_field() {
+        let call = ToolCall {
+            id: "c".into(),
+            name: "process.run".into(),
+            arguments: serde_json::json!({
+                "command": "cargo test",
+                "argv": ["echo", "hi"]
+            }),
+        };
+        assert_eq!(
+            derive_effect_intent(&call, &process_spec("process.run")),
+            EffectIntent::ProcessRun {
+                command: "echo hi".into()
+            }
+        );
+        assert!(process_spawn_command_is_covered(
+            "process.run",
+            &call.arguments,
+            "echo hi"
+        ));
+        assert!(!process_spawn_command_is_covered(
+            "process.run",
+            &call.arguments,
+            "cargo test"
+        ));
+    }
+
+    #[test]
+    fn shell_exec_intent_comes_from_command_not_argv() {
+        let call = ToolCall {
+            id: "c".into(),
+            name: "shell.exec".into(),
+            arguments: serde_json::json!({
+                "command": "cargo test",
+                "argv": ["rm", "-rf", "."]
+            }),
+        };
+        assert_eq!(
+            derive_effect_intent(&call, &process_spec("shell.exec")),
+            EffectIntent::ProcessRun {
+                command: "cargo test".into()
+            }
+        );
+        assert!(process_spawn_command_is_covered(
+            "shell.exec",
+            &call.arguments,
+            "cargo test --all"
+        ));
+        assert!(!process_spawn_command_is_covered(
+            "shell.exec",
+            &call.arguments,
+            "rm -rf ."
+        ));
+    }
+
+    #[test]
+    fn process_session_start_intent_comes_from_argv() {
+        let call = ToolCall {
+            id: "c".into(),
+            name: "process.session".into(),
+            arguments: serde_json::json!({
+                "action": "start",
+                "command": "rm -rf .",
+                "argv": ["python", "-m", "http.server"]
+            }),
+        };
+        assert_eq!(
+            derive_effect_intent(&call, &process_spec("process.session")),
+            EffectIntent::ProcessRun {
+                command: "python -m http.server".into()
+            }
+        );
+        assert!(process_spawn_command_is_covered(
+            "process.session",
+            &call.arguments,
+            "python -m http.server --bind 127.0.0.1"
+        ));
+        assert!(!process_spawn_command_is_covered(
+            "process.session",
+            &call.arguments,
+            "rm -rf ."
+        ));
+    }
+
+    #[test]
+    fn process_session_poll_and_stop_are_not_a_new_process_run() {
+        for action in ["poll", "stop"] {
+            let call = ToolCall {
+                id: "c".into(),
+                name: "process.session".into(),
+                arguments: serde_json::json!({
+                    "action": action,
+                    "session_id": "s1",
+                    "argv": ["cargo", "test"]
+                }),
+            };
+            assert_eq!(
+                derive_effect_intent(&call, &process_spec("process.session")),
+                EffectIntent::ReadOnly,
+                "{action} must ignore a leftover argv and not look like a new spawn"
+            );
+        }
+
+        let unknown = ToolCall {
+            id: "c".into(),
+            name: "process.session".into(),
+            arguments: serde_json::json!({"action": "exec", "argv": ["cargo", "test"]}),
+        };
+        assert_eq!(
+            derive_effect_intent(&unknown, &process_spec("process.session")),
+            EffectIntent::ProcessRun {
+                command: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_process_tool_refuses_disagreeing_command_and_argv() {
+        let arguments = serde_json::json!({
+            "command": "echo safe",
+            "argv": ["rm", "-rf", "."]
+        });
+        assert!(lexical_process_command("plugin.process", &arguments).is_empty());
+        assert!(!process_spawn_command_is_covered(
+            "plugin.process",
+            &arguments,
+            "rm -rf ."
+        ));
+    }
+
+    #[test]
     fn verification_is_typed_metadata_not_a_command_needle() {
         let cargo = ToolOutput {
             call_id: "c".into(),
@@ -1665,16 +2046,18 @@ mod tests {
     fn shell_is_an_escape_hatch_not_a_verifier() {
         assert_eq!(
             ToolSemanticRole::from_tool_name("shell.exec"),
-            ToolSemanticRole::EscapeHatch
+            Some(ToolSemanticRole::EscapeHatch)
         );
         assert_eq!(
             ToolSemanticRole::from_tool_name("git.diff"),
-            ToolSemanticRole::InspectDiff
+            Some(ToolSemanticRole::InspectDiff)
         );
         assert_eq!(
             ToolSemanticRole::from_tool_name("fs.read"),
-            ToolSemanticRole::ReadResource
+            Some(ToolSemanticRole::ReadResource)
         );
+        assert_eq!(ToolSemanticRole::from_tool_name("fs.delete"), None);
+        assert_eq!(ToolSemanticRole::from_tool_name("plugin.generated"), None);
         let stamped = ToolSpec {
             name: "tests.run".into(),
             roles: vec![ToolSemanticRole::Verify],
@@ -1688,6 +2071,24 @@ mod tests {
         };
         assert!(unstamped.has_role(ToolSemanticRole::EscapeHatch));
         assert!(!unstamped.has_role(ToolSemanticRole::Verify));
+        assert!(
+            ToolSpec {
+                name: "fs.delete".into(),
+                ..ToolSpec::default()
+            }
+            .effective_roles()
+            .is_empty(),
+            "unknown fs.* names are not ReadResource"
+        );
+        assert!(
+            ToolSpec {
+                name: "plugin.generated".into(),
+                ..ToolSpec::default()
+            }
+            .effective_roles()
+            .is_empty(),
+            "plugins must declare roles; they are not an escape hatch"
+        );
         assert!(
             ToolSpec {
                 name: crate::CAPABILITY_MANAGE.into(),
@@ -1868,6 +2269,85 @@ mod tests {
         assert_eq!(
             nil_effect.validate().unwrap_err(),
             "operation effect context contains a nil effect id"
+        );
+    }
+
+    #[test]
+    fn non_transactional_process_tools_are_the_named_builtins() {
+        assert!(is_non_transactional_process_tool("shell.exec"));
+        assert!(is_non_transactional_process_tool("process.run"));
+        assert!(is_non_transactional_process_tool("process.session"));
+        assert!(!is_non_transactional_process_tool("fs.write"));
+        assert!(!is_non_transactional_process_tool("git.status"));
+        assert!(!is_non_transactional_process_tool("capability.manage"));
+    }
+
+    #[test]
+    fn process_tool_requests_require_core_effect_identity() {
+        let cases = [
+            ("shell.exec", serde_json::json!({"command": "echo hi"})),
+            ("process.run", serde_json::json!({"argv": ["echo", "hi"]})),
+            (
+                "process.session",
+                serde_json::json!({"action": "start", "argv": ["sleep", "1"]}),
+            ),
+            (
+                "process.session",
+                serde_json::json!({"action": "poll", "session_id": "s1"}),
+            ),
+            (
+                "process.session",
+                serde_json::json!({"action": "stop", "session_id": "s1"}),
+            ),
+        ];
+        for (name, arguments) in cases {
+            let request = ToolExecutionRequest {
+                run_id: RunId::new(),
+                call: ToolCall {
+                    id: "call-1".into(),
+                    name: name.into(),
+                    arguments,
+                },
+                effect_context: None,
+                cancel: CancellationToken::new(),
+            };
+            assert_eq!(
+                request.validate().unwrap_err(),
+                "non-transactional process tools require a Core-issued effect context",
+                "{name} still requires Core-issued effect identity at dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn process_tools_cannot_disguise_child_mutations_as_prepared_effects() {
+        let output = ToolOutput {
+            call_id: "c".into(),
+            tool_name: "shell.exec".into(),
+            ok: true,
+            summary: "ran".into(),
+            model_content: "ran".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({}),
+        };
+        let value =
+            reject_staged_effect_for_process_tool("shell.exec", ToolOutcome::Value(output.clone()))
+                .unwrap();
+        assert!(matches!(value, ToolOutcome::Value(_)));
+
+        let staged = reject_staged_effect_for_process_tool(
+            "shell.exec",
+            ToolOutcome::PreparedEffect {
+                output,
+                effect: Box::new(Vec::<Box<dyn Effect>>::new()),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            staged
+                .to_string()
+                .contains("cannot stage a prepared effect"),
+            "{staged}"
         );
     }
 

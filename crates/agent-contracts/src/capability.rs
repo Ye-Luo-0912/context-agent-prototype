@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentResult, CancellationToken, Effect, RUNTIME_CONTEXT_CONTROL, RuntimeDirective, ToolCall,
-    ToolOutput, ToolSpec,
+    AgentResult, CancellationToken, Effect, EffectIntent, RUNTIME_CONTEXT_CONTROL,
+    RuntimeDirective, ToolCall, ToolOutput, ToolSpec,
 };
 
 /// A prefix read whose allocation is bounded before I/O begins.
@@ -311,6 +311,12 @@ pub struct CapabilityInvocationContext {
     /// Cooperative cancellation for this invocation (the execution
     /// request's token), so long-running capability calls can be aborted.
     pub cancel: CancellationToken,
+    /// Approved concrete intent for this invocation (upper bound from
+    /// [`crate::derive_effect_intent`]). Process wire effects may stage
+    /// only when the host-canonical actual intent is [`EffectIntent::covers`]
+    /// by this bound. `None` means the host cannot prove coverage, so
+    /// non-empty wire effects stay fail-closed.
+    pub approved_intent: Option<EffectIntent>,
 }
 
 /// What a capability invocation produced. The core owns *all* side-effect

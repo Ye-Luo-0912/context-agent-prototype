@@ -1,6 +1,9 @@
 //! Algorithm tests for ExecutionState (formerly ResumePoint).
 
-use super::state::{MAX_RESUME_FILES, VerificationState};
+use super::state::{
+    MAX_RESUME_FILES, MAX_REVALIDATE_PER_ROUND, VerificationCause, VerificationCoverage,
+    VerificationState,
+};
 use super::*;
 use agent_contracts::{
     ResourceFreshness, ResourceVersionOracle, ToolOutput, ToolResultDisposition, TurnFrame,
@@ -84,13 +87,11 @@ fn ls_is_not_a_verification_and_keeps_resource_facts() {
         ResourceFreshness::NeedsRevalidation
     );
     assert!(
-        resume
-            .view()
-            .checked_files
-            .iter()
-            .any(|row| row == "src/auth.rs@abc123")
+        resume.view().checked_files.is_empty(),
+        "NeedsRevalidation must not render as Checked: {:?}",
+        resume.view().checked_files
     );
-    assert!(!resume.verification_due());
+    assert!(!resume.verification_due_now(""));
 }
 
 #[test]
@@ -237,16 +238,19 @@ fn open_turn_unknown_mutation_keeps_projected_checked_files() {
     turn.push_tool_result(ls, None);
     let view = resume.project_from_turn(&turn, 1, 2);
     assert!(
-        view.checked_files
-            .iter()
-            .any(|row| row == "src/auth.rs@abc123"),
-        "Unknown mutation must not wipe identity: {view:?}"
+        view.checked_files.is_empty(),
+        "NeedsRevalidation must not enter Checked: {view:?}"
     );
     assert_eq!(resume.checked_files.len(), 1);
     assert_eq!(
         resume.checked_files[0].freshness,
         ResourceFreshness::Fresh,
         "projection must not persist"
+    );
+    let projected = resume.apply_open_turn(&turn, 1, 2);
+    assert_eq!(
+        projected.checked_files[0].freshness,
+        ResourceFreshness::NeedsRevalidation
     );
     assert_eq!(view.workspace_revision, 1);
 }
@@ -296,7 +300,7 @@ async fn unknown_shell_then_same_hash_is_fresh_again() {
         .await;
     assert_eq!(resume.checked_files[0].freshness, ResourceFreshness::Fresh);
     assert_eq!(resume.checked_files[0].digest, "abc123");
-    assert!(!resume.verification_due());
+    assert!(!resume.verification_due_now(""));
     assert!(
         resume
             .view()
@@ -323,7 +327,13 @@ async fn revalidate_changed_hash_marks_verification_stale() {
     assert_eq!(resume.checked_files[0].digest, "changed");
     assert_eq!(resume.checked_files[0].freshness, ResourceFreshness::Fresh);
     assert_eq!(resume.verification.state, VerificationState::Stale);
-    assert!(resume.verification_due());
+    assert!(resume.has_unmet_obligation());
+    assert!(
+        !resume.verification_due_now(""),
+        "obligation is not automatically due"
+    );
+    assert!(resume.verification_due_now("src/auth.rs"));
+    assert!(resume.verification_due_now("run the tests"));
 }
 
 #[tokio::test]
@@ -355,7 +365,7 @@ fn known_write_of_a_new_file_does_not_stale_current_verification() {
     write.metadata = json!({"path": "src/scratch.md", "revision": "note1"});
     resume.observe_tool(&write, 1, 2);
     assert_eq!(resume.verification.state, VerificationState::Current);
-    assert!(!resume.verification_due());
+    assert!(!resume.verification_due_now(""));
     assert_eq!(resume.checked_files.len(), 2);
 }
 
@@ -370,7 +380,13 @@ fn known_write_of_an_existing_digest_stales_verification() {
     write.metadata = json!({"path": "src/auth.rs", "revision": "zzz"});
     resume.observe_tool(&write, 1, 2);
     assert_eq!(resume.verification.state, VerificationState::Stale);
-    assert!(resume.verification_due());
+    assert!(resume.has_unmet_obligation());
+    assert!(
+        !resume.verification_due_now("Append to src/scratch.md"),
+        "a note turn must not Prefer-verify"
+    );
+    assert!(resume.verification_due_now("src/auth.rs"));
+    assert!(resume.verification_due_now("run the tests"));
 }
 
 #[tokio::test]
@@ -385,13 +401,16 @@ async fn unknown_after_current_pass_stales_fact_but_same_hash_is_not_due() {
     resume.observe_tool(&py, 1, 2);
     assert_eq!(resume.verification.state, VerificationState::Stale);
     assert!(resume.verification.unknown_pending);
-    assert!(!resume.verification_due(), "identity not known-changed");
+    assert!(
+        !resume.verification_due_now(""),
+        "identity not known-changed"
+    );
     let mut map = std::collections::HashMap::new();
     map.insert("src/auth.rs".into(), Some("abc123".into()));
     resume.revalidate(&MapOracle(map), "").await;
     assert_eq!(resume.checked_files[0].freshness, ResourceFreshness::Fresh);
     assert!(!resume.verification.unknown_pending);
-    assert!(!resume.verification_due());
+    assert!(!resume.verification_due_now(""));
 }
 
 #[tokio::test]
@@ -401,7 +420,12 @@ async fn recall_after_fix_note_turn_does_not_inherit_need_verify() {
     let mut edit = output("fs.write", true, "fixed");
     edit.metadata = json!({"path": "src/auth.rs", "revision": "revB"});
     resume.observe_tool(&edit, 1, 1);
-    assert!(resume.verification_due());
+    assert!(resume.has_unmet_obligation());
+    assert!(
+        !resume.verification_due_now("Append to src/scratch.md"),
+        "notes are not due"
+    );
+    assert!(resume.verification_due_now("src/auth.rs"));
     let mut py = output("shell.exec", true, "exit 0");
     py.metadata = json!({"command": "python -c import visit_all"});
     resume.observe_tool(&py, 1, 1);
@@ -415,20 +439,125 @@ async fn recall_after_fix_note_turn_does_not_inherit_need_verify() {
     assert_eq!(resume.checked_files[0].digest, "revB");
     assert_eq!(resume.checked_files[0].freshness, ResourceFreshness::Fresh);
     assert!(
-        resume.verification_due(),
-        "same turn still saw a Known edit"
+        resume.has_unmet_obligation(),
+        "Known edit still unmet after same-hash revalidate"
     );
 
     resume.on_user_turn();
     assert!(
-        !resume.verification_due(),
-        "T2 note turn must not inherit NeedVerify(util)"
+        resume.has_unmet_obligation(),
+        "on_user_turn must not wipe the obligation"
     );
+    assert!(
+        !resume.verification_due_now("Append to src/scratch.md: HDMI is in drawer 3"),
+        "T2 note turn must not Prefer-verify"
+    );
+    assert!(resume.verification_due_now("run the tests"));
     assert!(
         resume
             .view()
             .checked_files
             .iter()
             .any(|row| row == "src/auth.rs@revB")
+    );
+}
+
+#[tokio::test]
+async fn pending_revalidation_past_the_round_cap_is_not_checked() {
+    let mut resume = ExecutionState::default();
+    for index in 0..20 {
+        let mut row = output("fs.read", true, "read");
+        row.metadata = json!({
+            "path": format!("src/f{index}.rs"),
+            "revision": format!("rev{index}")
+        });
+        resume.observe_tool(&row, 1, index);
+    }
+    let mut ls = output("shell.exec", true, "listed");
+    ls.metadata = json!({"command": "python -c import visit_all"});
+    resume.observe_tool(&ls, 1, 20);
+    assert_eq!(resume.checked_files.len(), 20);
+    assert!(
+        resume
+            .checked_files
+            .iter()
+            .all(|row| row.freshness == ResourceFreshness::NeedsRevalidation)
+    );
+    assert!(resume.view().checked_files.is_empty());
+
+    let mut map = std::collections::HashMap::new();
+    for index in 0..20 {
+        map.insert(format!("src/f{index}.rs"), Some(format!("rev{index}")));
+    }
+    resume.revalidate(&MapOracle(map), "").await;
+    let fresh = resume
+        .checked_files
+        .iter()
+        .filter(|row| row.freshness == ResourceFreshness::Fresh)
+        .count();
+    let pending = resume
+        .checked_files
+        .iter()
+        .filter(|row| row.freshness == ResourceFreshness::NeedsRevalidation)
+        .count();
+    assert_eq!(fresh, MAX_REVALIDATE_PER_ROUND);
+    assert_eq!(pending, 20 - MAX_REVALIDATE_PER_ROUND);
+    assert_eq!(resume.view().checked_files.len(), MAX_REVALIDATE_PER_ROUND);
+}
+
+#[test]
+fn spec_change_keeps_obligation_without_due_on_notes() {
+    let mut resume = ExecutionState::default();
+    let mut test = output("shell.exec", true, "exit 0");
+    test.metadata = json!({"command": "cargo test", "verification": true});
+    resume.observe_tool(&test, 1, 1);
+    resume.mark_spec_changed();
+    resume.anchor_revision = 2;
+    assert_eq!(resume.verification.state, VerificationState::Stale);
+    assert_eq!(resume.verification.cause, VerificationCause::SpecChanged);
+    assert_eq!(
+        resume.verification.coverage,
+        VerificationCoverage::Workspace
+    );
+    assert!(resume.has_unmet_obligation());
+    assert!(!resume.verification_due_now("Append to src/scratch.md"));
+    assert!(resume.verification_due_now("run the tests"));
+    assert!(resume.verification_due_now("complete the task"));
+}
+
+#[test]
+fn nl_verify_without_obligation_is_not_due() {
+    let resume = ExecutionState::default();
+    assert!(ExecutionState::turn_requests_verify("run the tests"));
+    assert!(ExecutionState::turn_requests_verify(
+        "check that tests pass"
+    ));
+    assert!(!resume.verification_due_now("run the tests"));
+    assert!(!resume.verification_due_now("verify that"));
+}
+
+#[test]
+fn foreground_resources_are_exact_mentions_of_known_paths() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&output("fs.read", true, "read auth"), 1, 3);
+    let mut scratch = output("fs.read", true, "read scratch");
+    scratch.metadata = json!({"path": "src/scratch.md", "revision": "r3"});
+    resume.observe_tool(&scratch, 1, 4);
+    let keys = resume.foreground_resources("Append to src/scratch.md");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].path, "src/scratch.md");
+    assert_eq!(keys[0].revision.as_deref(), Some("r3"));
+    assert!(
+        resume
+            .foreground_resources("Append to src/scratch.md")
+            .iter()
+            .all(|key| key.path != "src/auth.rs")
+    );
+    resume.checked_files[0].freshness = ResourceFreshness::Missing;
+    assert!(
+        resume
+            .foreground_resources("inspect src/auth.rs")
+            .is_empty(),
+        "Missing paths are not known resources"
     );
 }

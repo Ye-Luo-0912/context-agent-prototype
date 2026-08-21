@@ -1001,6 +1001,51 @@ async fn fs_read_reread_classes_and_selected_attribution() {
 }
 
 #[tokio::test]
+async fn fs_read_of_a_descriptorized_body_is_selected_descriptor() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    super::harness::open_focus(&engine, "fix files").await;
+    engine
+        .ingest(ContextIngress::UserMessage {
+            content: "inspect src/a.rs".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: fs_read("1", "src/a.rs"),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .materialize(ContextQuery {
+            current_input: "inspect src/a.rs".into(),
+            budget_tokens: 10_000,
+            hints: ContextHints {
+                checked_files: vec!["src/a.rs@rev".into()],
+                ..ContextHints::default()
+            },
+        })
+        .await
+        .unwrap();
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: fs_read("2", "src/a.rs"),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(
+            state.reread_selected_descriptor, 1,
+            "a packed path@rev is selected-descriptor, not body-visible"
+        );
+        assert_eq!(state.reread_previously_selected, 0);
+    }
+}
+
+#[tokio::test]
 async fn fs_read_reread_warm_and_stored() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());
     super::harness::open_focus(&engine, "fix files").await;

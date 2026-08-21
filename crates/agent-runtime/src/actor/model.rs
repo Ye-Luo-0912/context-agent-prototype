@@ -38,12 +38,14 @@ impl RuntimeActor {
             )
         };
 
-        match self
+        let has_external_context = match self
             .services
             .context_maintain(ContextMaintenanceTrigger::BeforeModel)
             .await
         {
             Ok(report) => {
+                let has_external_context =
+                    crate::execution::catalog_has_external_context(&report.diagnostics);
                 if let Err(error) = self
                     .emit_context_maintained(ContextMaintenanceTrigger::BeforeModel, report)
                     .await
@@ -60,6 +62,7 @@ impl RuntimeActor {
                     self.state.turn = None;
                     return;
                 }
+                has_external_context
             }
             Err(error) => {
                 let _ = self
@@ -71,7 +74,7 @@ impl RuntimeActor {
                 self.state.turn = None;
                 return;
             }
-        }
+        };
 
         self.revalidate_stored_resource_facts(&current_input).await;
 
@@ -81,10 +84,11 @@ impl RuntimeActor {
         // surface. Task demand is declarative only: reload can restore
         // catalog/schema readiness, but cannot enable a disabled
         // capability, grant a permission or bypass approval/effect policy.
-        let task_roots: Vec<String> = self
+        let active_task = self
             .state
             .task_id
-            .and_then(|task_id| self.state.tasks.get(task_id))
+            .and_then(|task_id| self.state.tasks.get(task_id));
+        let mut task_roots: Vec<String> = active_task
             .map(|task| {
                 task.tool_requirements
                     .entries
@@ -93,24 +97,21 @@ impl RuntimeActor {
                     .collect()
             })
             .unwrap_or_default();
+        let need_evidence = has_external_context
+            || active_task
+                .map(|task| !task.anchor.evidence_refs.is_empty())
+                .unwrap_or(false);
+        if need_evidence {
+            task_roots.push(CONTEXT_MANAGE.to_string());
+        }
         self.services.tool_gc(&task_roots);
         let verification_due = self.verification_due_for_round(&turn_frame, &current_input);
-        let turn_intent = self
-            .state
-            .task_id
-            .and_then(|task_id| self.state.tasks.get(task_id))
+        let turn_intent = active_task
             .map(|task| task.turn_intent.as_str())
             .filter(|intent| !intent.is_empty());
-        let has_failures = self
-            .state
-            .task_id
-            .and_then(|task_id| self.state.tasks.get(task_id))
+        let has_failures = active_task
             .map(|task| task.resume.has_failures())
             .unwrap_or(false);
-        let active_task = self
-            .state
-            .task_id
-            .and_then(|task_id| self.state.tasks.get(task_id));
         let (task_requirement_revision, mut requirements) = active_task
             .map(|task| {
                 (
@@ -141,6 +142,11 @@ impl RuntimeActor {
                 let _ = self.services.tool_load(&requirement.tool_name);
             }
         }
+        // Item 24: `context.manage` is catalog-only until NeedEvidence.
+        // Load it before the candidate snapshot so policy can PreferSurface it.
+        if need_evidence && !visible_names.contains(CONTEXT_MANAGE) {
+            let _ = self.services.tool_load(CONTEXT_MANAGE);
+        }
 
         // Dispatcher snapshot is the complete currently-loaded candidate
         // set. Runtime owns the sole bounded projection so Task MustSurface
@@ -169,6 +175,7 @@ impl RuntimeActor {
                 verification_due,
                 turn_intent,
                 has_failures,
+                has_external_context,
             },
         ));
 
@@ -355,11 +362,19 @@ impl RuntimeActor {
             .and_then(|task_id| self.state.tasks.get(task_id))
             .map(|task| crate::task::anchor_root_claims(&task.anchor))
             .unwrap_or_default();
+        let foreground_resources = self.foreground_resource_hints(&turn_frame, &current_input);
+        let context_budget = if foreground_resources.is_empty() {
+            model_budget.context_frame_budget
+        } else {
+            model_budget
+                .context_frame_budget
+                .saturating_sub(MAX_FOREGROUND_TOKENS)
+        };
         let materialized = match self
             .services
             .context_materialize(ContextQuery {
                 current_input: current_input.clone(),
-                budget_tokens: model_budget.context_frame_budget,
+                budget_tokens: context_budget,
                 hints: ContextHints {
                     max_selected_items: Some(CONTEXT_CONSUMPTION_ACK_ITEM_CAP),
                     anchor_roots,
@@ -368,6 +383,7 @@ impl RuntimeActor {
                         .as_ref()
                         .map(|view| view.checked_files.clone())
                         .unwrap_or_default(),
+                    foreground_resources,
                 },
             })
             .await
@@ -436,6 +452,26 @@ impl RuntimeActor {
             materialized.approx_tokens = materialized
                 .approx_tokens
                 .saturating_sub(approx_tokens(&dropped.content));
+            input = self.assemble_model_input(
+                runtime_focus.as_ref(),
+                task_view.as_ref(),
+                progress_view.as_ref(),
+                &materialized,
+                &turn_frame,
+                surface_plan.specs().to_vec(),
+            );
+        }
+        while assembled_total(&input) > max_input_budget && !materialized.foreground.is_empty() {
+            let drop_index = materialized
+                .foreground
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, item)| approx_tokens(&item.content))
+                .map(|(index, _)| index);
+            let Some(drop_index) = drop_index else {
+                break;
+            };
+            materialized.foreground.remove(drop_index);
             input = self.assemble_model_input(
                 runtime_focus.as_ref(),
                 task_view.as_ref(),
@@ -731,9 +767,6 @@ impl RuntimeActor {
     }
 
     fn verification_due_for_round(&self, turn_frame: &TurnFrame, current_input: &str) -> bool {
-        if crate::policy::turn_requests_verify(current_input) {
-            return true;
-        }
         let Some(task_id) = self.state.task_id else {
             return false;
         };
@@ -748,7 +781,29 @@ impl RuntimeActor {
             .unwrap_or(0);
         task.resume
             .apply_open_turn(turn_frame, task.anchor.revision, turn_number)
-            .verification_due()
+            .verification_due_now(current_input)
+    }
+
+    fn foreground_resource_hints(
+        &self,
+        turn_frame: &TurnFrame,
+        current_input: &str,
+    ) -> Vec<ResourceKey> {
+        let Some(task_id) = self.state.task_id else {
+            return Vec::new();
+        };
+        let Some(task) = self.state.tasks.get(task_id) else {
+            return Vec::new();
+        };
+        let turn_number = self
+            .state
+            .turn
+            .as_ref()
+            .map(|turn| turn.model_round as u64)
+            .unwrap_or(0);
+        task.resume
+            .apply_open_turn(turn_frame, task.anchor.revision, turn_number)
+            .foreground_resources(current_input)
     }
 
     async fn runtime_prompt_focus(

@@ -97,7 +97,7 @@ boundedness, and integrity rather than replace it with transcript history.
 | User input envelope | Partial (`CTX-EVENT`) | Dialogue goes through `RuntimeInputEnvelope`. `/focus` `/done` `/cancel` stay direct commands. `UserMessageAccepted` is a 240-char preview; the exact body is sealed as `user-input` when a workspace is wired. Busy dialogue uses a 1-slot in-memory `Queued` (overflow `Rejected`). Cancel publishes `InterruptCommitted` after `TurnCancelled`. Applied → Consumed → Archived on a successful turn. Replay resolves `body_ref` when given a workspace. Dialogue `proposal` is still `None`. |
 | Admission/derivation | Partial | `admit` and `derive` operations, quotas and identity/non-duplication tests exist, but authority/taint, richer provenance, storage-root, and canonical-catalog semantics remain open. Do not infer their full lifecycle contract from the closed transient-retrieval defect. |
 | Task anchor | Implemented baseline (`CTX-10`) | Each `TaskRecord` owns a bounded, versioned `TaskAnchor` (goal interpretation, constraints, acceptance criteria, plan progress, open loops, typed root claims) with whole-set CAS, a bounded `TaskAnchorChanged` audit event, and RuntimeCheckpoint v4 persistence + restore validation. The tool-demand slice (`TaskToolRequirementSet`) remains its own bounded CAS surface. `PromptAssembler` renders `TaskAnchorView` and Focus from `TaskManager`; production engines leave `MaterializedContext.focus`/`task` empty. `ContextHints.task` still projects the view for engine-internal roots. Typed claims split prompt/residency/storage and report `anchor_revision + source_field + RootReason`. Active/Suspended downgrade and sourced `EpisodeOutcome` remain. |
-| Structured episode outcome | Partial | Task completion now commits an immutable typed `CompletionRecord` (task id, anchor revision, summary, final-output ref/digest, artifacts) atomically with the status flip (`CTX-10`). Episode rotation still does not derive a typed, sourced `EpisodeOutcome` per rotated focus episode. |
+| Structured episode outcome | Deferred — freeze candidate | Task completion now commits an immutable typed `CompletionRecord` (task id, anchor revision, summary, final-output ref/digest, artifacts) atomically with the status flip (`CTX-10`). Episode rotation still does not derive a typed, sourced `EpisodeOutcome` per rotated focus episode. **Do not start.** |
 | Task completion output | Implemented baseline (`CTX-10`) | `/done`/`task.complete` commit one task-owned `CompletionRecord`; `TaskCompleted` carries task/result identity, and completed records are storage rather than residency roots. When an artifact workspace is wired, the actor writes the complete final assistant response before `ContextItem` truncation and attaches its artifact ref to the record. The dedicated `final_output_ref`/digest still identify the bounded completion summary, so richer outcome/evidence fields remain open. |
 | Canonical catalog | Implemented navigation directory + incremental dirty sync | `ContextCatalog` is the `item_id -> location` directory plus task/scope/kind/entity/label/lifecycle indexes. Bodies remain in heap / warm / store; GC moves location, it does not copy authority. Checkpoints serialize the three stores and rebuild the directory. Hot-path updates are dirty-id upserts; unmarked length changes still rebuild. |
 | Immutable raw evidence | Partial | The final-assistant path stores the full response once as an artifact before bounded context ingest and makes it reachable from `CompletionRecord`. General user/tool/context ingress still preserves only bounded bodies (or tool artifacts where explicitly brokered); a uniform immutable `EvidenceBody` contract is not implemented. |
@@ -120,12 +120,16 @@ scope close, tool-scope audit propagation, crash-safe store ownership,
 operation serialization, logical-catalog diagnostics, and replay isolation all
 have regression coverage. Do not reopen them here under stale baseline text.
 
-The remaining context-runtime gaps are structural or evaluative:
+The remaining context-runtime gaps are freeze-deferred or evaluative.
+Do not start a 17th Context heuristic:
 
-- sourced `EpisodeOutcome` and atomic episode close/root release;
+- sourced `EpisodeOutcome` and atomic episode close/root release
+  (**do not start**; freeze candidate, no evidence);
 - bounded incremental minor-GC work and an explicit Storage-GC schedule;
 - uniform immutable evidence/provenance beyond the final-response special path;
 - real long-task A/B/C quality, cost, latency, and recovery evaluation.
+
+After Execution Coherence V1, main engineering is M12/M13.
 
 ## Target model: navigation plane plus evidence plane
 
@@ -242,7 +246,7 @@ cadences.
 | Implemented | `TaskToolRequirementSet` retains exact-name `MustSurface`/`PreferSurface`/`KeepReady` demand. `RoundSurfacePlan` is the bounded per-round projection; loading remains lifecycle, never activation or permission. |
 | Implemented | Live restore rebases focus/surface/requirement revisions, applies capability state fail-closed, and publishes a bounded durable `RuntimeRestored` event before clearing the recovery fence. |
 | Implemented | Task completion atomically closes context/task authority and commits exactly one immutable typed `CompletionRecord`. With an artifact workspace, the complete final assistant response is persisted before bounded context ingest and its ref is attached to the record. |
-| Frozen | `CTX-11` core (2026-08-18): `ResumePoint` is a bounded operational cache bound to `task_id + anchor_revision + workspace_revision`; verification is typed and orthogonal to mutation; TaskProgress is prompt-capped. Do not add Context features. Active/Suspended root downgrade, sourced `EpisodeOutcome`, and ack/obligation-driven episode root release stay deferred. `TaskAnchor` remains the only task-authority owner. |
+| Frozen | `CTX-11` core (2026-08-18) plus Execution Coherence V1 freeze candidate (2026-08-19): `ResumePoint`/`ExecutionState` is a bounded operational cache bound to `task_id + anchor_revision + workspace_revision`; verification is typed and orthogonal to mutation; TaskProgress is prompt-capped. Do not add Context features. Do not retune GC thresholds. Active/Suspended root downgrade, sourced `EpisodeOutcome`, and ack/obligation-driven episode root release stay deferred — **do not start**. `TaskAnchor` remains the only task-authority owner. |
 
 Tool-demand semantics remain intentionally narrow:
 
@@ -1073,12 +1077,13 @@ in AUDIT; this list does not duplicate checkbox state):
    semantic recall, supersession, task switch, noise). Wave 1 is 12×A/C
    plus rolling only on `horizon_long` / `semantic_recall` /
    `task_switch` (27 cells at repeats=1). Pack/SPEC are hash-frozen;
-   wave-1 live is under `evidence/context-bench-wave1/`. Before another
-   live wave, finish the tool-quality preflight (`TOOL-ENV-01` →
-   `TOOL-ERROR-01`; owning specs in TOOL_ECOSYSTEM / AUDIT). `CTX-11` is
-   queued behind that cleaner baseline. Do not continue the 30-task
-   pilot or mix P0/P1 ITT tables. analysis.v2 stays frozen. Do not close
-   M15.
+   wave-1 live is under `evidence/context-bench-wave1/`. Tool-quality
+   preflight (`TOOL-ENV-01` → `TOOL-ERROR-01`; owning specs in
+   TOOL_ECOSYSTEM / AUDIT) closed in code 2026-08-17. Another live wave
+   is a later-milestone frozen-cell rerun, not v0 engineering. `CTX-11`
+   incremental value is measured only after that cleaner baseline. Do
+   not continue the 30-task pilot or mix P0/P1 ITT tables. analysis.v2
+   stays frozen. Do not close M15.
 
 1. Freeze the 300-task suite (`EVAL-01` closure item 2). Heterogeneous
    real coding tasks with executable hidden verification; treat the
@@ -1849,21 +1854,29 @@ current slice above.)
   and is not a residency root. GC/Storage GC reports list bounded
   `anchor_root_protections`. Active/Suspended downgrade and replacing the
   whole Focus subtree as a root remain the next items.
-- [x] `CTX-11` core frozen (2026-08-18): `ResumePoint` is
+- [x] `CTX-11` core frozen (2026-08-18) and Execution Coherence V1 freeze
+  candidate (2026-08-19): `ResumePoint` is
   `task_id + anchor_revision + workspace_revision`; verification is typed
   metadata orthogonal to mutation; TaskProgress has a total prompt hard cap;
   dead objective/blockers/next_actions/last_cursor/workspace_facts_stale
   fields are gone. Mechanism V2 (`--context-mech`) is the isolated
-  structural gate. Do not add further Context features. Active/Suspended
-  root downgrade and sourced `EpisodeOutcome` stay deferred. Main
-  engineering returns to M12/M13.
+  structural gate. Do not add further Context features. Do not retune
+  GC thresholds or the reactivation scorer. Active/Suspended
+  root downgrade and sourced `EpisodeOutcome` stay deferred (**do not
+  start**). Main engineering returns to M12/M13.
+  **Closeout 2026-08-21 (items 21–29):** durable list is
+  `docs/STATUS.md` § Execution Coherence closeout. Item 24
+  (`context.manage` catalog-only except NeedEvidence / EXTERNAL CONTEXT)
+  is closed.
+  Live `recall_after_fix` is refused. M12/M13/PLAT-06 remain open.
 - [ ] After Anchor/root-claim properties pass, replace “entire active Focus
   subtree is a root” with Anchor claims + unresolved obligations + a bounded
   recent/TurnFrame lease, so continuous GC also works inside a long episode.
 - [ ] Formalize Focus `ScopeId` as the v0 episode identity and emit episode
   open/continue/close reasons.
 - [ ] Add sourced `EpisodeOutcome` and atomic `ClosePending -> Closed`
-  transition before roots are released.
+  transition before roots are released. **Do not start.** Freeze candidate;
+  no evidence requires this.
 - [ ] Keep lexical overlap and turn cap as fallback guards; add explicit
   runtime/subgoal/verification boundary signals and measure false rotations.
 - [x] Separate `event_seq`, `user_turn`, `gc_epoch`, and

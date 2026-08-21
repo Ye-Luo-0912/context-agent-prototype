@@ -2,6 +2,9 @@
 //!
 //! 不能证明子进程改了哪些文件；只能证明是否启动、是否看到退出、
 //! 以及仍存活的 PID 是否还是当时那个孩子。恢复不得回放命令。
+//! Spawn 记录按启动那次的 `OperationEffectContext` 键控：`process.session`
+//! poll/stop 不 spawn，它们自己的身份即使已经按 PID 记过 exit，仍是
+//! `NotApplied`。
 
 use std::{
     collections::HashMap,
@@ -14,6 +17,7 @@ use std::{
 
 use agent_contracts::{
     AgentError, AgentResult, EffectId, EffectReconciliation, OperationEffectContext,
+    is_non_transactional_process_tool,
 };
 use agent_process::{
     capture_process_identity, kill_matching_process_tree, process_identity_matches,
@@ -29,10 +33,6 @@ const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_RECORDS: usize = 65_536;
 const MAX_IDENTITY_TOKEN_BYTES: usize = 128;
 const MAX_REASON_BYTES: usize = 4_000;
-
-pub(crate) fn is_process_effect_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "shell.exec" | "process.run" | "process.session")
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -154,6 +154,13 @@ impl ProcessEffectJournal {
         context: &OperationEffectContext,
         pid: u32,
     ) -> AgentResult<()> {
+        context.validate().map_err(AgentError::InvalidRequest)?;
+        if !is_non_transactional_process_tool(&context.identity.tool_name) {
+            return Err(AgentError::InvalidRequest(format!(
+                "'{}' is not a non-transactional process tool",
+                context.identity.tool_name
+            )));
+        }
         let identity =
             capture_process_identity(pid).unwrap_or_else(|_| agent_process::ProcessIdentity {
                 pid,
@@ -211,7 +218,7 @@ impl ProcessEffectJournal {
         context: &OperationEffectContext,
     ) -> AgentResult<EffectReconciliation> {
         context.validate().map_err(AgentError::InvalidRequest)?;
-        if !is_process_effect_tool(&context.identity.tool_name) {
+        if !is_non_transactional_process_tool(&context.identity.tool_name) {
             return Ok(EffectReconciliation::NotManaged);
         }
         let writer = self.writer.lock().expect("process journal poisoned");
@@ -630,6 +637,18 @@ mod tests {
             workspace.reconcile(&context).unwrap(),
             EffectReconciliation::NotManaged
         ));
+    }
+
+    #[tokio::test]
+    async fn process_journal_refuses_to_record_a_non_process_tool() {
+        let (workspace, _directory) = workspace().await;
+        let context = process_context("fs.write");
+        let err = workspace.record_process_spawn(&context, 1).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("is not a non-transactional process tool"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

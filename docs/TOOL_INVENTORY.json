@@ -3,8 +3,8 @@
   "purpose": "TOOLS-01 machine-readable matrix: inventory of the current tool schemas, limits, context dispositions, effects and platform behavior as of this commit. The code remains authoritative; this file is the ACI specification input for TOOLS-02/03/04.",
   "surface": {
     "core": ["fs.list", "fs.read", "artifact.read", "search.grep", "task.complete"],
-    "control": ["context.manage", "capability.manage"],
-    "catalog_optional": ["fs.write", "edit.replace", "edit.patch", "git.status", "git.diff", "shell.exec", "process.run", "process.session", "code.symbols", "code.diagnostics"]
+    "control": ["capability.manage"],
+    "catalog_optional": ["fs.write", "edit.replace", "edit.patch", "git.status", "git.diff", "shell.exec", "process.run", "process.session", "code.symbols", "code.diagnostics", "context.manage"]
   },
   "global_limits": {
     "MAX_TOOL_MODEL_CONTENT_CHARS": 16000,
@@ -191,8 +191,8 @@
       "effects": ["process:exec"],
       "context_disposition": "PersistObservation",
       "platform": {
-        "unix": "RLIMIT_CPU / RLIMIT_NPROC applied; process-group tree kill on cancel",
-        "windows": "Job Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE); taskkill /T /F tree kill"
+        "unix": "RLIMIT_CPU / RLIMIT_NPROC / RLIMIT_AS / RLIMIT_FSIZE / RLIMIT_NOFILE applied; RLIMIT_CORE forced to 0 on sandbox pre_exec; inherited fds other than stdio closed after landlock; process-group tree kill on cancel",
+        "windows": "Job Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE, DIE_ON_UNHANDLED_EXCEPTION); integrity wrap 512 MiB PROCESS_MEMORY on the real child; taskkill /T /F tree kill"
       }
     },
     "process.run": {
@@ -250,7 +250,7 @@
     },
     "context.manage": {
       "risk": "ReadOnly",
-      "surface_class": "control",
+      "surface_class": "catalog_optional",
       "schema": {
         "op": {"type": "string", "enum": ["gc_hint", "tag", "lease", "collect", "search", "inspect", "fetch", "admit", "derive"], "required": true},
         "item_id": {"type": "string"},

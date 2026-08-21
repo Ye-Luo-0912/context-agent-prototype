@@ -43,7 +43,10 @@ changing architecture.
 7. **Raw traces are filesystem artifacts.** Use JSONL/artifact files; do not
    add a database merely to store traces or learning data.
 8. **Keep v0 non-vector.** No embeddings, vector DB, graph retrieval, or RAG
-   until the dynamic working-set baseline is measured.
+   until the dynamic working-set baseline is measured. Context operational
+   core is a freeze candidate: do not retune GC thresholds or reactivation
+   scoring; do not add a learned router. After Execution Coherence V1,
+   main engineering is M12/M13.
 
 ## Architecture and dependencies
 
@@ -101,7 +104,10 @@ reconciles builtin workspace effects before reopening mutation. Stale,
 duplicate, corrupt, unmanaged or ambiguous work fails closed behind
 `RecoveryRequired`; it is never blindly replayed. Generic shell/process
 spawn/exit recovery is landed (identity-safe leftover kill; no rollback of
-child mutations). Out-of-process capability/MCP invoke recovery is landed
+child mutations; `process.session` recovery is keyed by the start identity). Generic `shell.exec` / `process.run` / `process.session`
+require Core-issued effect identity before spawn and return a plain value;
+they remain a non-transactional exception, not a prepared-effect commit.
+Out-of-process capability/MCP invoke recovery is landed
 (durable reserved/dispatch/ack journal; in-flight idempotency keys refuse a
 second send; no rollback of peer mutations; not a general HTTP exactly-once
 broker). WAL compaction is landed. The semantic query/cancel DTOs,
@@ -115,7 +121,35 @@ alone is never upgraded to a replayed ACK. Partial WAL failure fences both
 layers. In-process authenticated operation-control session/grant installation
 is landed. Framed JSON-lines operation-control over an inherited-pipe
    analogue (`agent_process::FramedProtocolSession` + the authenticated adapter)
-is landed; Named Pipe/UDS remain PLAT-08. Local transport identity is never
+is landed; Named Pipe/UDS remain PLAT-08. `ProcessHost` composes
+`ProcessSupervisor` and `DuplexTransport` (stdio first backend); MCP stdio
+owns the same supervisor (kill then await reap on poison/timeout/cancel).
+`ProcessHost` advertises `host_epoch` on ping; adapters expose
+`ConnectionHealth` (Ready/Degraded/NotServing/Quarantined) and a bounded
+`RestartCircuit` (PLAT-06 slice 1; first connect is not a restart). Peer
+cancel-ACK frames and coalescible bounded progress are landed (PLAT-06
+slice 2; settlement is still kill-then-reap). Multiplexing remains later
+PLAT-06. Connection state is never task or Core authority.
+Linux landlock write fencing is landed; TCP bind/connect is denied on ABI
+v4+ (`MOD-07`) when write roots are configured. ABI v5 denies device ioctl
+(`MOD-12`). ABI v6 also scopes
+outbound signals (`MOD-11`). Windows Low-IL write
+confinement is landed (`MOD-08`). Unix `RLIMIT_AS` is landed (`MOD-09`;
+capability default 2 GiB VAS). Unix `RLIMIT_FSIZE` is landed (`MOD-10`;
+capability default 256 MiB). Unix `RLIMIT_NOFILE` and inherited-fd close
+are landed (`MOD-13`; capability default 1024 fds). The Windows integrity
+wrap Job-Object now also caps the real child's commit at 512 MiB (`MOD-14`).
+Unix `RLIMIT_CORE` is forced to zero when sandbox `pre_exec` runs (`MOD-15`;
+not a `0` = unlimited field). Linux `RLIMIT_NICE`/`RLIMIT_RTPRIO` are
+clamped to zero and `no_new_privs` is set in that same hook (`MOD-16`).
+Windows Job-Objects pin `PRIORITY_CLASS=NORMAL` and leave breakaway
+default-deny (`MOD-17`). UDP, raw sockets, pathname Unix, Windows
+OS-level network fences, and I/O bandwidth quotas remain. After MOD-17
+there is no further allowed v0 sandbox slice; do not invent `MOD-18`
+from that residual or from multiplexing / Named Pipe/UDS. Do not claim M13
+closed. HANDLE_LIST and Job UI restrictions stay skipped (Command
+inheritance is not clean; UI tests are flaky).
+Local transport identity is never
 itself a Core grant. Parse-time decoded JSON budgets (`JsonDecodeBudget`) are
 landed in `agent-platform-protocol` and applied at process, MCP, context-service
 and operation-control parse sites; they bound the DOM while visiting so a
@@ -240,7 +274,8 @@ M12 and M13 must still finish before Self-Iteration:
    permission Core authority.
 8. **Evidence-gated later:** smarter non-vector lifecycle policy, ContextCore,
    vector/learned retrieval, and cross-session memory only after baseline
-   measurement.
+   measurement. None of these are in evidence; do not start them to chase
+   extra rounds.
 
 ## Definition of done for architectural changes
 

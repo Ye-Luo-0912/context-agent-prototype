@@ -56,7 +56,10 @@ pub(crate) fn anchor_claim_matches_entry(
 
 #[derive(Debug, Clone)]
 pub struct SimpleContextConfig {
+    /// Frozen Context V1 operational knob. Do not retune to chase extra
+    /// rounds; auto-reactivation is no longer the live extra-round driver.
     pub active_threshold: f32,
+    /// Frozen Context V1 operational knob. Do not retune to chase extra rounds.
     pub archive_threshold: f32,
     pub turn_ttl_ticks: u64,
     pub max_item_chars: usize,
@@ -75,7 +78,8 @@ pub struct SimpleContextConfig {
     /// `ContextEngine::gc` is invoked.
     pub gc_enabled: bool,
     /// Items surviving this many full passes without root reachability are
-    /// eviction candidates (the generational dimension of GC).
+    /// eviction candidates (the generational dimension of GC). Frozen
+    /// Context V1 operational knob. Do not retune to chase extra rounds.
     pub gc_max_generation: u32,
     /// Cap on the reversible eviction buffer; overflow no longer purges —
     /// items are externalized to the context store instead.
@@ -155,6 +159,9 @@ pub struct SimpleContextConfig {
 
 impl Default for SimpleContextConfig {
     fn default() -> Self {
+        // Freeze-pinned 2026-08-21 (Execution Coherence item 21). Auto-
+        // reactivation left the extra-round problem; do not retune these
+        // three knobs or the reactivation scorer to chase live rounds.
         Self {
             active_threshold: 0.58,
             archive_threshold: 0.24,
@@ -268,12 +275,22 @@ pub(crate) struct State {
     /// Short TTL; stdout never seeds this.
     #[serde(default)]
     pub(crate) tool_hot: Vec<ToolHotEntity>,
-    /// Paths whose file body was selected into a materialized frame this
-    /// segment. Used for reread attribution, not GC policy.
+    /// Last-prompt file exposure. Cleared and rewritten each materialize;
+    /// used for reread attribution, not GC policy. Selecting an item is
+    /// not the same as packing its body — Checked identities pack as
+    /// `path@rev`.
     #[serde(default)]
-    pub(crate) selected_file_paths: HashSet<String>,
+    pub(crate) selected_body_paths: HashSet<String>,
+    #[serde(default)]
+    pub(crate) selected_descriptor_paths: HashSet<String>,
+    #[serde(default)]
+    pub(crate) external_descriptor_paths: HashSet<String>,
     #[serde(default)]
     pub(crate) reread_previously_selected: u64,
+    #[serde(default)]
+    pub(crate) reread_selected_descriptor: u64,
+    #[serde(default)]
+    pub(crate) reread_external_descriptor: u64,
     #[serde(default)]
     pub(crate) reread_resident_unselected: u64,
     #[serde(default)]
@@ -463,10 +480,16 @@ fn classify_fs_read(state: &State, path: &str) -> FsRereadClass {
     if !in_heap && !in_warm && !in_store {
         return FsRereadClass::FirstRead;
     }
+    if state.selected_body_paths.contains(&path) {
+        return FsRereadClass::PreviouslySelected;
+    }
+    if state.selected_descriptor_paths.contains(&path) {
+        return FsRereadClass::SelectedDescriptor;
+    }
+    if state.external_descriptor_paths.contains(&path) {
+        return FsRereadClass::ExternalDescriptor;
+    }
     if in_heap {
-        if state.selected_file_paths.contains(&path) {
-            return FsRereadClass::PreviouslySelected;
-        }
         return FsRereadClass::ResidentUnselected;
     }
     if in_warm {
@@ -549,6 +572,8 @@ impl State {
     fn record_fs_reread(&mut self, class: FsRereadClass) {
         match class {
             FsRereadClass::PreviouslySelected => self.reread_previously_selected += 1,
+            FsRereadClass::SelectedDescriptor => self.reread_selected_descriptor += 1,
+            FsRereadClass::ExternalDescriptor => self.reread_external_descriptor += 1,
             FsRereadClass::ResidentUnselected => self.reread_resident_unselected += 1,
             FsRereadClass::Warm => self.reread_warm += 1,
             FsRereadClass::Stored => self.reread_stored += 1,
@@ -1248,6 +1273,7 @@ impl ContextEngine for SimpleContextEngine {
         let materialization_id = state.materialization_revision;
         let mut materialized = materializer::materialize(&mut state, &self.config, &query);
         materialized.materialization_id = materialization_id;
+        let foreground_plan = materializer::plan_foreground(&state, &query, &materialized.items);
         state.pending_materialization = Some(PendingMaterialization {
             id: materialization_id,
             item_ids: materialized.items.iter().map(|item| item.item_id).collect(),
@@ -1257,6 +1283,11 @@ impl ContextEngine for SimpleContextEngine {
                 .map(|entry| entry.item_id)
                 .collect(),
         });
+        drop(state);
+        if !foreground_plan.is_empty() {
+            let dir = crate::store::store_dir(&self.config);
+            materialized.foreground = materializer::realize_foreground(foreground_plan, &dir).await;
+        }
         Ok(materialized)
     }
 
@@ -1757,5 +1788,29 @@ fn directive_item_id(action: &ContextAction) -> ContextItemId {
         ContextAction::Collect
         | ContextAction::AnchorRoots { .. }
         | ContextAction::CheckedFiles { .. } => ContextItemId::new(),
+    }
+}
+
+#[cfg(test)]
+mod freeze_pin {
+    use super::SimpleContextConfig;
+
+    #[test]
+    fn gc_thresholds_are_freeze_pinned() {
+        let config = SimpleContextConfig::default();
+        assert!(
+            (config.active_threshold - 0.58).abs() < f32::EPSILON,
+            "do not retune active_threshold (item 21); got {}",
+            config.active_threshold
+        );
+        assert!(
+            (config.archive_threshold - 0.24).abs() < f32::EPSILON,
+            "do not retune archive_threshold (item 21); got {}",
+            config.archive_threshold
+        );
+        assert_eq!(
+            config.gc_max_generation, 3,
+            "do not retune gc_max_generation (item 21)"
+        );
     }
 }

@@ -135,6 +135,7 @@ impl RuntimeActor {
             pending_completion: None,
             applied_input: Some(applied),
             input_consumed: false,
+            structurally_empty_retries: 0,
         });
         self.advance_turn(op_tx).await;
         Ok(())

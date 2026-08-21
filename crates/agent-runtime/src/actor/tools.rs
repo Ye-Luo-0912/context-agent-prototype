@@ -474,6 +474,15 @@ impl RuntimeActor {
                 tool_calls,
                 usage,
             } => {
+                let persistable_delta = self
+                    .state
+                    .turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.turn_frame.has_persistable_tool_delta());
+                let structurally_empty =
+                    agent_contracts::completion_validity(&content, &tool_calls, &usage)
+                        == ModelCompletionValidity::StructurallyEmpty
+                        && !persistable_delta;
                 if let Some(ack) = context_ack
                     && let Err(error) = self.core.acknowledge_context_consumption(ack).await
                 {
@@ -487,10 +496,6 @@ impl RuntimeActor {
                     self.state.turn = None;
                     return;
                 }
-                self.emit_input_consumed().await;
-                // Report the round's true provider usage to live consumers
-                // (the eval harness, a token meter). Best-effort: a journal
-                // failure here must not abort the turn commit.
                 let _ = self
                     .core
                     .emit_event(RuntimeEvent::ModelUsed {
@@ -500,6 +505,32 @@ impl RuntimeActor {
                         retries: usage.retries,
                     })
                     .await;
+                if structurally_empty {
+                    let retries = self
+                        .state
+                        .turn
+                        .as_ref()
+                        .map(|turn| turn.structurally_empty_retries)
+                        .unwrap_or(MAX_STRUCTURALLY_EMPTY_RETRIES);
+                    if retries < MAX_STRUCTURALLY_EMPTY_RETRIES {
+                        if let Some(turn) = self.state.turn.as_mut() {
+                            turn.structurally_empty_retries =
+                                turn.structurally_empty_retries.saturating_add(1);
+                        }
+                        self.advance_turn(op_tx).await;
+                        return;
+                    }
+                    let _ = self
+                        .core
+                        .emit_event(RuntimeEvent::Error {
+                            message: "provider returned a structurally empty completion (empty content, no tool calls, 0/0 usage); refusing to complete the turn".into(),
+                        })
+                        .await;
+                    self.state.turn = None;
+                    self.drain_queued_user_input(op_tx).await;
+                    return;
+                }
+                self.emit_input_consumed().await;
                 if tool_calls.is_empty() {
                     self.finalize_turn(content).await;
                     self.drain_queued_user_input(op_tx).await;

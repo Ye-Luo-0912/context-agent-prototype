@@ -170,11 +170,11 @@ impl Tool for ProcessSessionTool {
         effect_context: Option<agent_contracts::OperationEffectContext>,
         cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
-        let args: SessionArgs = serde_json::from_value(arguments)
+        let args: SessionArgs = serde_json::from_value(arguments.clone())
             .map_err(|e| AgentError::InvalidRequest(format!("process.session args: {e}")))?;
         match args.action.as_str() {
             "start" => {
-                self.start(run_id, call_id, args, effect_context, cancel)
+                self.start(run_id, call_id, &arguments, args, effect_context, cancel)
                     .await
             }
             "poll" => self.poll(call_id, args).await,
@@ -191,6 +191,7 @@ impl ProcessSessionTool {
         &self,
         run_id: RunId,
         call_id: &str,
+        arguments: &Value,
         args: SessionArgs,
         effect_context: Option<agent_contracts::OperationEffectContext>,
         _cancel: CancellationToken,
@@ -255,10 +256,18 @@ impl ProcessSessionTool {
         #[cfg(unix)]
         command.process_group(0);
 
+        super::require_process_effect_context(&effect_context, "process.session")?;
+        super::require_covered_process_command("process.session", arguments, &args.argv.join(" "))?;
+
         let mut child = command
             .spawn()
             .map_err(|e| AgentError::Tool(format!("spawn {}: {e}", args.argv[0])))?;
-        let pid = match super::persist_spawned_process(&self.workspace, &effect_context, &child) {
+        let pid = match super::persist_spawned_process(
+            &self.workspace,
+            &effect_context,
+            &child,
+            "process.session",
+        ) {
             Ok(pid) => pid,
             Err(error) => {
                 super::abandon_spawned_process(&mut child);
@@ -463,6 +472,7 @@ impl ProcessSessionTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_contracts::{EffectReconciler, EffectReconciliation};
     use serde_json::json;
 
     fn value(outcome: ToolOutcome) -> ToolOutput {
@@ -494,6 +504,228 @@ mod tests {
         }
     }
 
+    fn start_ctx(run_id: RunId, arguments: &Value) -> agent_contracts::OperationEffectContext {
+        crate::tools::test_process_effect_context(run_id, "c", "process.session", arguments)
+    }
+
+    fn write_marker_argv() -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec!["cmd".into(), "/C".into(), "echo spawned> marker.txt".into()]
+        }
+        #[cfg(not(windows))]
+        {
+            vec!["sh".into(), "-c".into(), "echo spawned > marker.txt".into()]
+        }
+    }
+
+    #[tokio::test]
+    async fn session_start_without_effect_identity_does_not_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ProcessSessionTool::new(
+            Workspace::open(dir.path()).await.unwrap(),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let marker = dir.path().join("marker.txt");
+        let error = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"action": "start", "argv": write_marker_argv()}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot spawn without Core-issued effect identity"),
+            "{error}"
+        );
+        assert!(
+            !marker.exists(),
+            "fail-closed admission must happen before the child can mutate"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_rejects_a_mismatched_identity_before_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ProcessSessionTool::new(
+            Workspace::open(dir.path()).await.unwrap(),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let marker = dir.path().join("marker.txt");
+        let run_id = RunId::new();
+        let arguments = json!({"action": "start", "argv": write_marker_argv()});
+        let stolen =
+            crate::tools::test_process_effect_context(run_id, "c", "process.run", &arguments);
+        let error = tool
+            .execute(
+                run_id,
+                "c",
+                arguments,
+                Some(stolen),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("process spawn identity is for 'process.run'"),
+            "{error}"
+        );
+        assert!(
+            !marker.exists(),
+            "a process.run lease must not start a session child"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_rejects_escaping_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ProcessSessionTool::new(
+            Workspace::open(dir.path()).await.unwrap(),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let error = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({
+                    "action": "start",
+                    "argv": write_marker_argv(),
+                    "cwd": "../escape"
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("path must stay inside workspace"),
+            "cwd confinement must fail before spawn, not as a missing identity: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_ignores_an_unused_command_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ProcessSessionTool::new(workspace, Arc::new(Mutex::new(HashMap::new())));
+        let marker = dir.path().join("marker.txt");
+        let unused = dir.path().join("unused.txt");
+        let run_id = RunId::new();
+        let arguments = json!({
+            "action": "start",
+            "command": "echo unused> unused.txt",
+            "argv": write_marker_argv()
+        });
+        let context = start_ctx(run_id, &arguments);
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                arguments,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let session_id = output.metadata["session_id"].as_str().unwrap().to_string();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = tool
+            .execute(
+                run_id,
+                "c",
+                json!({"action": "stop", "session_id": session_id}),
+                None,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(
+            marker.exists(),
+            "spawn must follow argv, not an unused command field"
+        );
+        assert!(
+            !unused.exists(),
+            "the unused command field must not be executed"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_stop_settles_start_as_completed_value_not_unapplied() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ProcessSessionTool::new(workspace.clone(), Arc::new(Mutex::new(HashMap::new())));
+        let run_id = RunId::new();
+        let start_args = json!({"action": "start", "argv": long_argv()});
+        let start_context = start_ctx(run_id, &start_args);
+        let reconcile_start = start_context.clone();
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                start_args,
+                Some(start_context),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(output.ok, "session start failed: {}", output.summary);
+        let session_id = output.metadata["session_id"].as_str().unwrap().to_string();
+
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                json!({"action": "stop", "session_id": session_id}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(output.metadata["status"], "stopped");
+
+        match workspace.reconcile(&reconcile_start).unwrap() {
+            EffectReconciliation::CompletedValue { .. } => {}
+            EffectReconciliation::NotApplied { .. } => {
+                panic!(
+                    "stop records exit against the start spawn; recovery must not treat start as never spawned"
+                )
+            }
+            EffectReconciliation::NotManaged => {
+                panic!("process.session start is a managed non-transactional process effect")
+            }
+            other => {
+                panic!("session start after stop should settle as CompletedValue, got {other:?}")
+            }
+        }
+
+        let poll_context = start_ctx(run_id, &json!({"action": "poll", "session_id": session_id}));
+        match workspace.reconcile(&poll_context).unwrap() {
+            EffectReconciliation::NotApplied { .. } => {}
+            other => {
+                panic!("poll never spawned; its own identity must stay NotApplied, got {other:?}")
+            }
+        }
+    }
+
     #[tokio::test]
     async fn session_start_poll_stop_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
@@ -504,12 +736,14 @@ mod tests {
         let run_id = RunId::new();
 
         // start
+        let start_args = json!({"action": "start", "argv": long_argv()});
+        let context = start_ctx(run_id, &start_args);
         let output = tool
             .execute(
                 run_id,
                 "c",
-                json!({"action": "start", "argv": long_argv()}),
-                None,
+                start_args,
+                Some(context),
                 CancellationToken::new(),
             )
             .await
@@ -574,12 +808,14 @@ mod tests {
         #[cfg(not(windows))]
         let argv: Vec<String> = vec!["echo".into(), "hello session".into()];
 
+        let start_args = json!({"action": "start", "argv": argv});
+        let context = start_ctx(run_id, &start_args);
         let output = tool
             .execute(
                 run_id,
                 "c",
-                json!({"action": "start", "argv": argv}),
-                None,
+                start_args,
+                Some(context),
                 CancellationToken::new(),
             )
             .await

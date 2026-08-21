@@ -881,6 +881,43 @@ The same materialize request also carries a bounded `TaskAnchorView` on
 `CURRENT DIRECTIVE`) and TaskProgress from the runtime `TaskManager`; production
 engines leave `MaterializedContext.focus` / `.task` empty.
 
+**Execution Coherence V1 (freeze candidate).** Ownership is:
+
+```text
+Task authority          → Runtime / TaskAnchor
+Operational state       → ExecutionState
+Historical selected     → ContextEngine
+Exact old evidence      → Catalog / Search / Fetch
+Body residency          → GC
+Prompt                  → Runtime assembler
+```
+
+The algorithm is four phases. There is no planner. The LLM still decides
+actions. Runtime only maintains provable world state:
+
+```text
+World Facts (path@rev / errors)
+  → Freshness Engine (Fresh / NeedsRevalidation / Missing)
+  → Obligation Ledger (verify / failure / unresolved evidence)
+  → Round Projection (due_now / foreground refs / missing evidence)
+       → Prompt and Tool roles → LLM
+```
+
+Invariants: (1) Unknown ≠ False, and NeedsRevalidation ≠ Fresh — do not
+delete facts to hide uncertainty; (2) Obligation exists ≠ Due now — do
+not wipe a real obligation just to avoid surfacing Verify; (3) Resource
+identity known ≠ body available in prompt. Do not add Typed
+EpisodeOutcome, a smarter reactivation scorer, vectors, embeddings, RAG,
+a learned router, or a new GC generation algorithm. Do not retune
+`active_threshold` / `archive_threshold` / `gc_max_generation`. Latest C
+live (`reactivation_events=1`, selected/consumed 0, 48 reactivated
+tokens) shows auto-reactivation has left the extra-round problem. After
+this contract, main engineering is M12/M13.
+**Closeout 2026-08-21 (items 21–29)** is in `docs/STATUS.md`. Item 24
+(`context.manage` catalog-only except NeedEvidence / EXTERNAL CONTEXT)
+is closed. This does not
+close M12/M13/PLAT-06.
+
 `CTX-11` is a bounded operational cache (`ExecutionState`, checkpointed as
 `resume` on `TaskRecord`) bound to `task_id + anchor_revision +
 workspace_revision`. Prompt framing is `TASK ORIGIN` (historical
@@ -891,10 +928,22 @@ lives in `agent-runtime/src/execution/` (`state`, `freshness`, `needs`);
 `policy.rs` maps `ExecutionNeeds` onto catalog `ToolSpec.roles`.
 NeedVerify resolves `Verify` → capability search → `EscapeHatch`;
 `InspectDiff` is not a verifier and Runtime does not know that cargo
-uses `shell.exec`. A phase-2
-semantic read memo may cache `fs.read` / `git.status` / `git.diff` /
-`search.grep` later; it must never intercept write, patch, or shell
-side-effects. `TaskProgressView` projects checked resources, revision-bound
+uses `shell.exec`. Unstamped specs fall back to *known legacy builtin
+names only*; unknown plugins have no role and are not an EscapeHatch.
+No builtin currently declares `Verify`. Do not add `verify.run(command)`.
+Verification obligation (Pending/Stale/Failed plus
+cause/coverage) is not the same as `verification_due_now`. A later note
+turn does not wipe an unmet source/spec change; it simply is not due
+until a complete/coverage signal or the frozen NL verify hint *and* an
+obligation already exists. Natural-language verify is not a dictionary.
+`NeedMutate`
+is not inferred from a non-empty user instruction. ObservationMemo stays
+unwired (`lookup()` is always a miss). When it is wired, the first
+version caches only `fs.read` keyed by path + line range + content
+revision. Do not memo `search.grep` / `git.diff` / `git.status` until a
+workspace snapshot identity exists. Memo never intercepts write, patch,
+or shell side-effects, and it cannot replace Foreground Evidence.
+`TaskProgressView` projects checked resources, revision-bound
 verification state, and unresolved operation failures under a total prompt
 hard cap. It
 does not own objective / blockers / next-actions. The durable cache still
@@ -906,6 +955,9 @@ paths (`metadata.path` and `metadata.files[]`); a may-mutate observation
 without a touch is an `Unknown` footprint: `workspace_revision` still
 advances (old PASS is omitted) but known `path@revision` facts are kept
 and marked `NeedsRevalidation` for a hash-only BeforeModel revalidate.
+TaskProgress `Checked` and that body-omission / GC suppression consume
+only `Fresh` identities; pending revalidation and Missing stay off the
+projection (cap 8 hashes per BeforeModel round).
 Selected historical `fs.read` bodies
 and stamped-path identity logs whose path is already Checked are omitted
 from SELECTED WORKING CONTEXT (the item header keeps `path@revision`);
@@ -915,15 +967,42 @@ Materialize packing prices a Checked ToolObservation / FileObservation
 item as a descriptor via `ContextHints.checked_files` so omitted bodies
 do not consume the working-set budget. Before GC the
 runtime pushes the same rows as `ContextAction::CheckedFiles` so a
-covered file body is not hot-reactivated. Verification is typed metadata, orthogonal to
+covered file body is not hot-reactivated.
+
+When CURRENT DIRECTIVE *exactly* names an ExecutionState-known path
+(path-token match, no embeddings, no classifier), Runtime fills
+`ContextHints.foreground_resources` (max 2). The engine may copy the
+latest matching file body into `MaterializedContext.foreground` for this
+request only: Warm stays Warm, Stored is not Admitted, consumption ack
+does not stamp those ids. Assembler renders `CURRENT FOREGROUND EVIDENCE`
+before SELECTED WORKING CONTEXT; Checked omit does not apply there.
+Total body budget is ~2048 tokens. This is Meaning/state resident; body
+on demand — not a long-term `recent_file_bodies = 8` safety net. P3/P4
+stay ablation-only until this projection is measured against extra
+rereads.
+
+Verification is typed metadata, orthogonal to
 mutation: a may-mutate observation bumps `workspace_revision` and old PASS
 facts are not shown as current. Restore alignment uses engine
 `diagnostics.focus_task_id`, not `MaterializedContext.focus`. Adaptive
 episode rotation may close a long episode without paying the LLM
 compactor unless the episode left a semantic delta. Engine reactivation
 counters are segment-local (zeroed on restore); run-global unique/event
-counts come from `ContextGc` events. These are the frozen Context V1 core
-semantics; further Context feature work stops here. Main engineering
+counts come from `ContextGc` events. Context V1 still does not enable
+P3/P4 by default. Do not add further Context heuristics. Production
+`ToolLifecycleConfig::default()` always-loads `fs.list` / `fs.read` /
+`search.grep` / `artifact.read` / `task.complete` /
+`capability.manage`; git / shell / write / edit / `context.manage` are catalog-only. Eval
+fixtures and scripted `--compare-arm` that pin `fs.write` / `edit.replace`
+and `context.manage` are not a product-surface isomorph. Live coding
+compare now reuses production
+`ToolLifecycleConfig::default()`. Runtime PreferSurfaces `context.manage`
+when Warm/Cold/Stored catalog entries or TaskAnchor `evidence_refs`
+exist (NeedEvidence / EXTERNAL CONTEXT); otherwise it stays catalog-only
+and loads through `capability.manage`. The
+remaining product gap is a structured Verify capability
+(`verify.project` / `verify.tests` after M12/M13), not a
+`verify.run(command)` rename of `shell.exec`. Main engineering
 returns to M12/M13.
 
 Producing a `RuntimeDirective` requires the `runtime:context-control`

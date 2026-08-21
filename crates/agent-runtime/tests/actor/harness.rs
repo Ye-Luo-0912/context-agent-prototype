@@ -8,7 +8,7 @@ use agent_contracts::{
     ContextMaintenanceTrigger, ContextQuery, ContextRetention, ContextScope,
     ContextStateTransition, EventJournal, FocusState, MaterializedContext, MaterializedItem,
     ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput, ModelRequest, ModelTransport,
-    RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, SemanticState, TaskId,
+    ModelUsage, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, SemanticState, TaskId,
     ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolRisk,
     ToolSemanticRole, ToolSpec, ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceSnapshot,
 };
@@ -38,6 +38,7 @@ impl ContextEngine for TestContextEngine {
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
+            foreground: Vec::new(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -189,6 +190,7 @@ impl ContextEngine for RecordingContextEngine {
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
+            foreground: Vec::new(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -303,6 +305,7 @@ impl ContextEngine for RecordingFocusEngine {
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
+            foreground: Vec::new(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -357,6 +360,7 @@ impl ContextEngine for FailingFocusContextEngine {
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
+            foreground: Vec::new(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -380,6 +384,27 @@ impl ContextEngine for FailingFocusContextEngine {
     }
 }
 
+/// Always-empty 0/0 completion. Transport/parser anomaly, not a real stop.
+#[derive(Debug, Default)]
+pub(crate) struct StructurallyEmptyModel {
+    pub(crate) calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for StructurallyEmptyModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ModelOutput {
+            content: String::new(),
+            tool_calls: Vec::new(),
+            usage: Default::default(),
+        })
+    }
+}
+
 /// Finishes a model round immediately with an empty reply.
 #[derive(Debug)]
 pub(crate) struct SilentModel;
@@ -393,7 +418,12 @@ impl ModelTransport for SilentModel {
         Ok(ModelOutput {
             content: String::new(),
             tool_calls: Vec::new(),
-            usage: Default::default(),
+            usage: ModelUsage {
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                attempts: 1,
+                retries: 0,
+            },
         })
     }
 }
@@ -441,6 +471,7 @@ impl ContextEngine for MutatingThenFailingFocusEngine {
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
+            foreground: Vec::new(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -550,6 +581,7 @@ impl ContextEngine for FailingClearFocusContextEngine {
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
+            foreground: Vec::new(),
             diagnostics: ContextDiagnostics::default(),
         })
     }
@@ -685,6 +717,7 @@ impl ContextEngine for BigContextEngine {
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens,
+            foreground: Vec::new(),
             diagnostics: ContextDiagnostics::default(),
         })
     }

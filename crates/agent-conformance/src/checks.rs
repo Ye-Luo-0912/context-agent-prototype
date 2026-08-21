@@ -169,8 +169,9 @@ pub fn check_error_envelope(error: &AgentError) -> Vec<ConformanceViolation> {
 }
 
 /// Check a dispatcher's surface and lifecycle rules against the runtime
-/// contract: the core tools and both control tools are always visible,
-/// omission is fail-closed for them, and core tools cannot be unloaded.
+/// contract: core tools and `capability.manage` are always visible and
+/// fail-closed against round omission; core tools cannot be unloaded.
+/// `context.manage` is catalog-only on the production default (item 24).
 pub async fn check_tool_surface(dispatcher: &dyn ToolDispatcher) -> Vec<ConformanceViolation> {
     let mut violations = Vec::new();
     let mut report = ConformanceReport::default();
@@ -181,10 +182,7 @@ pub async fn check_tool_surface(dispatcher: &dyn ToolDispatcher) -> Vec<Conforma
         .map(|spec| spec.name)
         .collect();
 
-    for core in CONFORMANCE_CORE_TOOLS
-        .iter()
-        .chain(&[CONTEXT_MANAGE, CAPABILITY_MANAGE])
-    {
+    for core in CONFORMANCE_CORE_TOOLS.iter().chain(&[CAPABILITY_MANAGE]) {
         if !surface.iter().any(|name| name == core) {
             violations.push(ConformanceViolation::new(
                 "surface",
@@ -199,6 +197,19 @@ pub async fn check_tool_surface(dispatcher: &dyn ToolDispatcher) -> Vec<Conforma
                 format!("core/control tool '{core}' must be fail-closed against round omission"),
             ));
         }
+    }
+
+    if dispatcher.inspect_tool(CONTEXT_MANAGE).is_none()
+        && !dispatcher
+            .catalog()
+            .iter()
+            .any(|entry| entry.name == CONTEXT_MANAGE)
+    {
+        violations.push(ConformanceViolation::new(
+            "surface",
+            "surface",
+            "context.manage must remain in the catalog so capability.manage can load it",
+        ));
     }
 
     for core in CONFORMANCE_CORE_TOOLS {

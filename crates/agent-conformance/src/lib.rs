@@ -15,8 +15,9 @@
 //! - `check_error_envelope`: a tool error is a structured `AgentError`
 //!   category, never an unbounded internal leak;
 //! - `check_tool_surface`: the dispatcher's default surface and lifecycle
-//!   rules match the runtime contract (core + control always visible,
-//!   fail-closed omission, core tools cannot be unloaded).
+//!   rules match the runtime contract (core + `capability.manage` always
+//!   visible and fail-closed; `context.manage` stays catalog-loadable;
+//!   core tools cannot be unloaded).
 //!
 //! The library side depends only on the contracts and the workspace broker;
 //! concrete dispatchers (builtin catalog, capability-aware composite) are

@@ -268,9 +268,12 @@ impl Tool for ShellExecTool {
         effect_context: Option<agent_contracts::OperationEffectContext>,
         cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
-        let args: ShellArgs = serde_json::from_value(arguments)
+        let args: ShellArgs = serde_json::from_value(arguments.clone())
             .map_err(|e| AgentError::InvalidRequest(format!("shell.exec args: {e}")))?;
         let timeout_ms = args.timeout_ms.clamp(100, MAX_TIMEOUT_MS);
+
+        super::require_process_effect_context(&effect_context, "shell.exec")?;
+        super::require_covered_process_command("shell.exec", &arguments, &args.command)?;
 
         let mut command = self.dialect.spawn_command(&args.command);
 
@@ -289,7 +292,12 @@ impl Tool for ShellExecTool {
         let mut child = command
             .spawn()
             .map_err(|e| AgentError::Tool(format!("spawn command: {e}")))?;
-        let pid = match super::persist_spawned_process(&self.workspace, &effect_context, &child) {
+        let pid = match super::persist_spawned_process(
+            &self.workspace,
+            &effect_context,
+            &child,
+            "shell.exec",
+        ) {
             Ok(pid) => pid,
             Err(error) => {
                 super::abandon_spawned_process(&mut child);
@@ -464,7 +472,7 @@ impl Tool for ShellExecTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::ToolExecutionRequest;
+    use agent_contracts::{EffectReconciler, EffectReconciliation};
     use serde_json::json;
 
     use crate::tools::stream::MODEL_OUTPUT_CHARS;
@@ -490,6 +498,10 @@ mod tests {
         }
     }
 
+    fn ctx(run_id: RunId, arguments: &Value) -> agent_contracts::OperationEffectContext {
+        crate::tools::test_process_effect_context(run_id, "c", "shell.exec", arguments)
+    }
+
     fn long_command() -> String {
         #[cfg(windows)]
         {
@@ -507,19 +519,17 @@ mod tests {
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let tool = ShellExecTool::with_dialect(workspace.clone(), test_dialect());
         let run_id = RunId::new();
+        let arguments = json!({"command": long_command(), "timeout_ms": 20000});
+        let context = ctx(run_id, &arguments);
 
-        let request = ToolExecutionRequest {
-            run_id,
-            call: agent_contracts::ToolCall {
-                id: "c".into(),
-                name: "shell.exec".into(),
-                arguments: json!({"command": long_command(), "timeout_ms": 20000}),
-            },
-            effect_context: None,
-            cancel: CancellationToken::new(),
-        };
         let output = tool
-            .execute(run_id, "c", request.call.arguments, None, request.cancel)
+            .execute(
+                run_id,
+                "c",
+                arguments,
+                Some(context),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         let output = value(output);
@@ -555,16 +565,13 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
+        let run_id = RunId::new();
+        let arguments = json!({"command": command, "timeout_ms": 60000});
+        let context = ctx(run_id, &arguments);
         let handle = tokio::spawn(async move {
             let started = std::time::Instant::now();
             let output = tool
-                .execute(
-                    RunId::new(),
-                    "c",
-                    json!({"command": command, "timeout_ms": 60000}),
-                    None,
-                    cancel_for_task,
-                )
+                .execute(run_id, "c", arguments, Some(context), cancel_for_task)
                 .await
                 .unwrap();
             (output, started.elapsed())
@@ -623,16 +630,13 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
+        let run_id = RunId::new();
+        let arguments = json!({"command": command, "timeout_ms": 60000});
+        let context = ctx(run_id, &arguments);
         let handle = tokio::spawn(async move {
-            tool.execute(
-                RunId::new(),
-                "c",
-                json!({"command": command, "timeout_ms": 60000}),
-                None,
-                cancel_for_task,
-            )
-            .await
-            .unwrap()
+            tool.execute(run_id, "c", arguments, Some(context), cancel_for_task)
+                .await
+                .unwrap()
         });
 
         // Wait until the descendant's heartbeat visibly advances: the
@@ -706,12 +710,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let tool = ShellExecTool::with_dialect(workspace, test_dialect());
+        let run_id = RunId::new();
+        let arguments = json!({"command": "definitely-not-a-command-xyz-9f3a", "timeout_ms": 8000});
+        let context = ctx(run_id, &arguments);
         let output = value(
             tool.execute(
-                RunId::new(),
+                run_id,
                 "c",
-                json!({"command": "definitely-not-a-command-xyz-9f3a", "timeout_ms": 8000}),
-                None,
+                arguments,
+                Some(context),
                 CancellationToken::new(),
             )
             .await
@@ -737,12 +744,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let tool = ShellExecTool::with_dialect(workspace, test_dialect());
+        let run_id = RunId::new();
+        let arguments = json!({"command": "cargo test", "timeout_ms": 8000});
+        let context = ctx(run_id, &arguments);
         let output = value(
             tool.execute(
-                RunId::new(),
+                run_id,
                 "c",
-                json!({"command": "cargo test", "timeout_ms": 8000}),
-                None,
+                arguments,
+                Some(context),
                 CancellationToken::new(),
             )
             .await
@@ -761,12 +771,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let tool = ShellExecTool::with_dialect(workspace, test_dialect());
+        let run_id = RunId::new();
+        let arguments = json!({"command": "rustc --test src/protocol.rs", "timeout_ms": 8000});
+        let context = ctx(run_id, &arguments);
         let output = value(
             tool.execute(
-                RunId::new(),
+                run_id,
                 "c",
-                json!({"command": "rustc --test src/protocol.rs", "timeout_ms": 8000}),
-                None,
+                arguments,
+                Some(context),
                 CancellationToken::new(),
             )
             .await
@@ -779,5 +792,98 @@ mod tests {
             "rustc must not be attributed to a missing Cargo.toml, got {:?}",
             output.failure_class()
         );
+    }
+
+    #[tokio::test]
+    async fn shell_without_effect_identity_does_not_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ShellExecTool::with_dialect(workspace, test_dialect());
+        let marker = dir.path().join("marker.txt");
+        #[cfg(windows)]
+        let command = "echo spawned> marker.txt".to_string();
+        #[cfg(not(windows))]
+        let command = "echo spawned > marker.txt".to_string();
+        let error = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"command": command, "timeout_ms": 8000}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot spawn without Core-issued effect identity"),
+            "{error}"
+        );
+        assert!(
+            !marker.exists(),
+            "fail-closed admission must happen before the child can mutate"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_shell_does_not_roll_back_a_file_the_child_already_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ShellExecTool::with_dialect(workspace.clone(), test_dialect());
+        let marker = dir.path().join("landed.txt");
+
+        #[cfg(windows)]
+        let command = "echo landed> landed.txt & ping -n 20 127.0.0.1".to_string();
+        #[cfg(not(windows))]
+        let command = "echo landed > landed.txt; sleep 30".to_string();
+
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let run_id = RunId::new();
+        let arguments = json!({"command": command, "timeout_ms": 60000});
+        let context = ctx(run_id, &arguments);
+        let reconcile_context = context.clone();
+        let handle = tokio::spawn(async move {
+            tool.execute(run_id, "c", arguments, Some(context), cancel_for_task)
+                .await
+                .unwrap()
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        cancel.cancel();
+        assert!(
+            marker.exists(),
+            "the child must write the file before cancellation"
+        );
+
+        let output = value(
+            tokio::time::timeout(Duration::from_secs(10), handle)
+                .await
+                .expect("tool did not stop after cancellation")
+                .unwrap(),
+        );
+        assert!(!output.ok, "cancelled command must report failure");
+        assert!(
+            marker.exists(),
+            "cancellation kills the tree; it does not roll back mutations the child already performed"
+        );
+        match workspace.reconcile(&reconcile_context).unwrap() {
+            EffectReconciliation::NotApplied { .. } => {
+                panic!("a spawned process must not look like it never started")
+            }
+            EffectReconciliation::NotManaged => {
+                panic!("shell.exec is a managed non-transactional process effect")
+            }
+            EffectReconciliation::CompletedValue { .. }
+            | EffectReconciliation::Ambiguous { .. }
+            | EffectReconciliation::Applied { .. } => {}
+        }
     }
 }

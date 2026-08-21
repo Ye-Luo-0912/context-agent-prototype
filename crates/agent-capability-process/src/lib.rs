@@ -6,7 +6,8 @@
 //!
 //! The crate also carries the MCP adapter: an MCP server over stdio
 //! (JSON-RPC 2.0) as a `Capability`, behind the same capability/effect/
-//! output boundary.
+//! output boundary. Child lifecycle is [`agent_process::ProcessSupervisor`];
+//! JSON-RPC framing stays in this crate.
 
 mod capability_host;
 mod mcp;
@@ -17,6 +18,6 @@ pub use capability_host::{
 pub use mcp::{
     DEFAULT_MAX_SKIPPED_BYTES_PER_REQUEST, DEFAULT_MAX_SKIPPED_FRAMES_PER_REQUEST,
     DEFAULT_MCP_MAX_FRAME_BYTES, DEFAULT_MCP_REQUEST_TIMEOUT, MAX_MCP_TOOL_TEXT_CHARS,
-    MCP_PROTOCOL_VERSION, McpCallResult, McpCapabilityAdapter, McpClient, McpServerDecl,
-    McpStdioClient, McpTool,
+    MCP_CANCEL_NOTIFICATION, MCP_PROTOCOL_VERSION, McpCallResult, McpCapabilityAdapter, McpClient,
+    McpServerDecl, McpStdioClient, McpTool,
 };

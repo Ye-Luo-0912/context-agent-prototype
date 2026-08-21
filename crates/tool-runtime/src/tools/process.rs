@@ -96,7 +96,7 @@ impl Tool for ProcessRunTool {
         effect_context: Option<agent_contracts::OperationEffectContext>,
         cancel: CancellationToken,
     ) -> AgentResult<ToolOutcome> {
-        let args: ProcessArgs = serde_json::from_value(arguments)
+        let args: ProcessArgs = serde_json::from_value(arguments.clone())
             .map_err(|e| AgentError::InvalidRequest(format!("process.run args: {e}")))?;
         if args.argv.is_empty() {
             return Err(AgentError::InvalidRequest(
@@ -141,6 +141,9 @@ impl Tool for ProcessRunTool {
             None => self.workspace.root().to_path_buf(),
         };
 
+        super::require_process_effect_context(&effect_context, "process.run")?;
+        super::require_covered_process_command("process.run", &arguments, &args.argv.join(" "))?;
+
         let mut command = Command::new(&args.argv[0]);
         command
             .args(&args.argv[1..])
@@ -161,7 +164,12 @@ impl Tool for ProcessRunTool {
         let mut child = command
             .spawn()
             .map_err(|e| AgentError::Tool(format!("spawn {}: {e}", args.argv[0])))?;
-        let pid = match super::persist_spawned_process(&self.workspace, &effect_context, &child) {
+        let pid = match super::persist_spawned_process(
+            &self.workspace,
+            &effect_context,
+            &child,
+            "process.run",
+        ) {
             Ok(pid) => pid,
             Err(error) => {
                 super::abandon_spawned_process(&mut child);
@@ -328,7 +336,7 @@ impl Tool for ProcessRunTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::ToolExecutionRequest;
+    use agent_contracts::{EffectReconciler, EffectReconciliation};
     use serde_json::json;
 
     fn value(outcome: ToolOutcome) -> ToolOutput {
@@ -352,24 +360,26 @@ mod tests {
         }
     }
 
+    fn ctx(run_id: RunId, arguments: &Value) -> agent_contracts::OperationEffectContext {
+        crate::tools::test_process_effect_context(run_id, "c", "process.run", arguments)
+    }
+
     #[tokio::test]
     async fn process_run_executes_argv_without_a_shell() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let tool = ProcessRunTool::new(workspace.clone());
         let run_id = RunId::new();
-        let request = ToolExecutionRequest {
-            run_id,
-            call: agent_contracts::ToolCall {
-                id: "c".into(),
-                name: "process.run".into(),
-                arguments: json!({"argv": echo_argv("argv no shell")}),
-            },
-            effect_context: None,
-            cancel: CancellationToken::new(),
-        };
+        let arguments = json!({"argv": echo_argv("argv no shell")});
+        let context = ctx(run_id, &arguments);
         let output = tool
-            .execute(run_id, "c", request.call.arguments, None, request.cancel)
+            .execute(
+                run_id,
+                "c",
+                arguments,
+                Some(context),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         let output = value(output);
@@ -380,6 +390,112 @@ mod tests {
             output.model_content
         );
         assert_eq!(output.metadata["cwd"], ".");
+    }
+
+    fn write_marker_argv() -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec!["cmd".into(), "/C".into(), "echo spawned> marker.txt".into()]
+        }
+        #[cfg(not(windows))]
+        {
+            vec!["sh".into(), "-c".into(), "echo spawned > marker.txt".into()]
+        }
+    }
+
+    #[tokio::test]
+    async fn process_run_without_effect_identity_does_not_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ProcessRunTool::new(workspace);
+        let marker = dir.path().join("marker.txt");
+        let error = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"argv": write_marker_argv()}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot spawn without Core-issued effect identity"),
+            "{error}"
+        );
+        assert!(
+            !marker.exists(),
+            "fail-closed admission must happen before the child can mutate"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_run_rejects_a_mismatched_identity_before_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ProcessRunTool::new(workspace);
+        let marker = dir.path().join("marker.txt");
+        let run_id = RunId::new();
+        let arguments = json!({"argv": write_marker_argv()});
+        let stolen =
+            crate::tools::test_process_effect_context(run_id, "c", "shell.exec", &arguments);
+        let error = tool
+            .execute(
+                run_id,
+                "c",
+                arguments,
+                Some(stolen),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("process spawn identity is for 'shell.exec'"),
+            "{error}"
+        );
+        assert!(
+            !marker.exists(),
+            "a shell.exec lease must not start a process.run child"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_run_ignores_an_unused_command_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ProcessRunTool::new(workspace.clone());
+        let run_id = RunId::new();
+        let arguments = json!({
+            "command": "this must not run",
+            "argv": echo_argv("argv wins")
+        });
+        let context = ctx(run_id, &arguments);
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                arguments,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(output.ok, "command failed: {}", output.summary);
+        assert!(
+            output.model_content.contains("argv wins"),
+            "spawn must follow argv, not an unused command field: {}",
+            output.model_content
+        );
+        assert!(
+            !output.model_content.contains("this must not run"),
+            "the unused command field must not be executed: {}",
+            output.model_content
+        );
     }
 
     #[tokio::test]
@@ -400,23 +516,21 @@ mod tests {
         #[cfg(not(windows))]
         let argv: Vec<String> = vec!["sh".into(), "-c".into(), "pwd && echo $TOOLS_06_VAR".into()];
 
-        let request = ToolExecutionRequest {
-            run_id,
-            call: agent_contracts::ToolCall {
-                id: "c".into(),
-                name: "process.run".into(),
-                arguments: json!({
-                    "argv": argv,
-                    "cwd": "sub",
-                    "env": {"TOOLS_06_VAR": "injected"},
-                    "timeout_ms": 15000
-                }),
-            },
-            effect_context: None,
-            cancel: CancellationToken::new(),
-        };
+        let arguments = json!({
+            "argv": argv,
+            "cwd": "sub",
+            "env": {"TOOLS_06_VAR": "injected"},
+            "timeout_ms": 15000
+        });
+        let context = ctx(run_id, &arguments);
         let output = tool
-            .execute(run_id, "c", request.call.arguments, None, request.cancel)
+            .execute(
+                run_id,
+                "c",
+                arguments,
+                Some(context),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         let output = value(output);
@@ -435,18 +549,14 @@ mod tests {
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let tool = ProcessRunTool::new(workspace.clone());
         let run_id = RunId::new();
-        let request = ToolExecutionRequest {
-            run_id,
-            call: agent_contracts::ToolCall {
-                id: "c".into(),
-                name: "process.run".into(),
-                arguments: json!({"argv": echo_argv("x"), "cwd": "../escape"}),
-            },
-            effect_context: None,
-            cancel: CancellationToken::new(),
-        };
         let result = tool
-            .execute(run_id, "c", request.call.arguments, None, request.cancel)
+            .execute(
+                run_id,
+                "c",
+                json!({"argv": echo_argv("x"), "cwd": "../escape"}),
+                None,
+                CancellationToken::new(),
+            )
             .await;
         assert!(
             result.is_err(),
@@ -472,16 +582,13 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
+        let run_id = RunId::new();
+        let arguments = json!({"argv": argv, "timeout_ms": 60000});
+        let context = ctx(run_id, &arguments);
         let handle = tokio::spawn(async move {
             let started = std::time::Instant::now();
             let output = tool
-                .execute(
-                    RunId::new(),
-                    "c",
-                    json!({"argv": argv, "timeout_ms": 60000}),
-                    None,
-                    cancel_for_task,
-                )
+                .execute(run_id, "c", arguments, Some(context), cancel_for_task)
                 .await
                 .unwrap();
             (output, started.elapsed())
@@ -505,5 +612,74 @@ mod tests {
             elapsed < Duration::from_secs(8),
             "cancellation took too long: {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_process_run_does_not_roll_back_a_file_the_child_already_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ProcessRunTool::new(workspace.clone());
+        let marker = dir.path().join("landed.txt");
+
+        #[cfg(windows)]
+        let argv: Vec<String> = vec![
+            "cmd".into(),
+            "/C".into(),
+            "echo landed> landed.txt & ping -n 20 127.0.0.1".into(),
+        ];
+        #[cfg(not(windows))]
+        let argv: Vec<String> = vec![
+            "sh".into(),
+            "-c".into(),
+            "echo landed > landed.txt; sleep 30".into(),
+        ];
+
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let run_id = RunId::new();
+        let arguments = json!({"argv": argv, "timeout_ms": 60000});
+        let context = ctx(run_id, &arguments);
+        let reconcile_context = context.clone();
+        let handle = tokio::spawn(async move {
+            tool.execute(run_id, "c", arguments, Some(context), cancel_for_task)
+                .await
+                .unwrap()
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        cancel.cancel();
+        assert!(
+            marker.exists(),
+            "the child must write the file before cancellation"
+        );
+
+        let output = value(
+            tokio::time::timeout(Duration::from_secs(10), handle)
+                .await
+                .expect("tool did not stop after cancellation")
+                .unwrap(),
+        );
+        assert!(!output.ok, "cancelled process must report failure");
+        assert!(
+            marker.exists(),
+            "cancellation kills the tree; it does not roll back mutations the child already performed"
+        );
+        match workspace.reconcile(&reconcile_context).unwrap() {
+            EffectReconciliation::NotApplied { .. } => {
+                panic!("a spawned process must not look like it never started")
+            }
+            EffectReconciliation::NotManaged => {
+                panic!("process.run is a managed non-transactional process effect")
+            }
+            EffectReconciliation::CompletedValue { .. }
+            | EffectReconciliation::Ambiguous { .. }
+            | EffectReconciliation::Applied { .. } => {}
+        }
     }
 }

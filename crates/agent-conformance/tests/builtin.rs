@@ -11,8 +11,9 @@ use agent_conformance::{
     check_catalog, check_error_envelope, check_output_envelope, check_schema_contract,
 };
 use agent_contracts::{
-    CancellationToken, OutputBroker, RunId, ToolCall, ToolDispatcher, ToolExecutionRequest,
-    ToolOutcome, ToolOutput,
+    ArgumentDigest, CancellationToken, EffectId, OperationEffectContext, OperationId, OutputBroker,
+    RunId, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOperationIdentity, ToolOutcome,
+    ToolOutput, TurnId, is_non_transactional_process_tool,
 };
 use agent_workspace::{Workspace, WorkspaceOutputBroker};
 use serde_json::{Value, json};
@@ -23,14 +24,30 @@ fn request(name: &str, arguments: Value) -> ToolExecutionRequest {
 }
 
 fn request_for_run(run_id: RunId, name: &str, arguments: Value) -> ToolExecutionRequest {
+    let call = ToolCall {
+        id: "conformance".into(),
+        name: name.into(),
+        arguments,
+    };
+    let effect_context =
+        is_non_transactional_process_tool(&call.name).then(|| OperationEffectContext {
+            identity: ToolOperationIdentity {
+                run_id,
+                task_id: None,
+                turn_id: TurnId::new(),
+                scope_id: None,
+                operation_id: OperationId::new(),
+                generation: 1,
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest: ArgumentDigest::from_json(&call.arguments),
+            },
+            effect_id: EffectId::new(),
+        });
     ToolExecutionRequest {
         run_id,
-        call: ToolCall {
-            id: "conformance".into(),
-            name: name.into(),
-            arguments,
-        },
-        effect_context: None,
+        call,
+        effect_context,
         cancel: CancellationToken::new(),
     }
 }

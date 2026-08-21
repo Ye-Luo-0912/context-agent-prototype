@@ -4,10 +4,15 @@
 //! 入站帧错误会毒化会话，避免半消耗的字节流被当成下一帧。
 //! 出站在写之前被拒绝时连接仍同步，与 [`encode_frame`] 一致。
 //!
+//! [`DuplexTransport`] is the byte-duplex seam; [`StdioDuplexTransport`] is
+//! the inherited anonymous-pipe backend (PLAT-05). Named Pipe/UDS remain
+//! PLAT-08 and must implement the same trait, not a second codec.
+//!
 //! 与 `AuthenticatedOperationControlAdapter::handle_frame` 的组合是：
 //! 读一帧 → 把正文交给适配器 → 把返回的 JSON 正文 `send_bytes` 写回。
 //! 本地传输身份本身不是 Core 授权。
 
+use async_trait::async_trait;
 use tokio::io::{
     AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
 };
@@ -16,6 +21,23 @@ use agent_contracts::{AgentError, AgentResult};
 
 use crate::frame::{FrameError, FrameErrorKind, encode_frame, encode_frame_bytes, read_frame};
 
+/// Bounded framed byte duplex used by [`crate::ProcessHost`].
+///
+/// This is the PLAT-05 transport seam: protocol ping-pong talks to this
+/// trait, not to `ChildStdout`. [`FramedProtocolSession`] is the
+/// implementation; [`StdioDuplexTransport`] is the first backend.
+/// Local transport identity is never a Core grant.
+#[async_trait]
+pub trait DuplexTransport: Send {
+    fn is_poisoned(&self) -> bool;
+    fn poison_reason(&self) -> Option<&str>;
+    fn poison(&mut self, reason: String);
+    async fn recv(&mut self) -> Result<Vec<u8>, FrameError>;
+    /// Write a frame the protocol layer already capped (`encode_frame`).
+    /// Encoding failure is not this method's job; a partial write poisons.
+    async fn send_encoded_line(&mut self, line: &[u8]) -> AgentResult<()>;
+}
+
 /// 一条已经分好读写端的有界帧会话。单飞行：调用方必须 `recv` 后再 `send`。
 pub struct FramedProtocolSession<R, W> {
     reader: R,
@@ -23,6 +45,11 @@ pub struct FramedProtocolSession<R, W> {
     max_frame_bytes: usize,
     poisoned: Option<String>,
 }
+
+/// Inherited anonymous-pipe backend of [`DuplexTransport`].
+/// Named Pipe/UDS remain PLAT-08.
+pub type StdioDuplexTransport =
+    FramedProtocolSession<BufReader<tokio::process::ChildStdout>, tokio::process::ChildStdin>;
 
 impl<R, W> FramedProtocolSession<R, W>
 where
@@ -97,6 +124,14 @@ where
         self.write_line(&line).await
     }
 
+    /// Write a frame that the protocol layer already capped (`encode_frame`).
+    /// Encoding already happened, so this only fails on a poisoned session
+    /// or a partial write.
+    pub async fn send_encoded_line(&mut self, line: &[u8]) -> AgentResult<()> {
+        self.ensure_writable()?;
+        self.write_line(line).await
+    }
+
     fn ensure_writable(&self) -> AgentResult<()> {
         if let Some(reason) = &self.poisoned {
             return Err(AgentError::InvalidRequest(format!(
@@ -116,6 +151,33 @@ where
             return Err(AgentError::Io(error.to_string()));
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl<R, W> DuplexTransport for FramedProtocolSession<R, W>
+where
+    R: AsyncBufRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    fn is_poisoned(&self) -> bool {
+        FramedProtocolSession::is_poisoned(self)
+    }
+
+    fn poison_reason(&self) -> Option<&str> {
+        FramedProtocolSession::poison_reason(self)
+    }
+
+    fn poison(&mut self, reason: String) {
+        FramedProtocolSession::poison(self, reason);
+    }
+
+    async fn recv(&mut self) -> Result<Vec<u8>, FrameError> {
+        FramedProtocolSession::recv(self).await
+    }
+
+    async fn send_encoded_line(&mut self, line: &[u8]) -> AgentResult<()> {
+        FramedProtocolSession::send_encoded_line(self, line).await
     }
 }
 
@@ -219,5 +281,37 @@ mod tests {
             "a rejected outbound encode must leave the session usable"
         );
         server.send_json(&json!({"ok": 1})).await.unwrap();
+    }
+
+    async fn echo_encoded(transport: &mut impl DuplexTransport, max_frame_bytes: usize) {
+        let frame = transport.recv().await.unwrap();
+        let line = encode_frame_bytes(&frame, max_frame_bytes).unwrap();
+        transport.send_encoded_line(&line).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplex_backend_satisfies_duplex_transport() {
+        let (client, server) = tokio::io::duplex(4096);
+        let mut server = FramedProtocolSession::from_stream(server, 1024).unwrap();
+        let mut client = FramedProtocolSession::from_stream(client, 1024).unwrap();
+        let server_task = tokio::spawn(async move {
+            echo_encoded(&mut server, 1024).await;
+            assert!(!DuplexTransport::is_poisoned(&server));
+            server
+        });
+
+        let line = encode_frame(&json!({"ping": true}), 1024).unwrap();
+        DuplexTransport::send_encoded_line(&mut client, &line)
+            .await
+            .unwrap();
+        let reply = DuplexTransport::recv(&mut client).await.unwrap();
+        assert_eq!(reply, br#"{"ping":true}"#);
+        server_task.await.unwrap();
+
+        DuplexTransport::poison(&mut client, "test fence".into());
+        assert!(DuplexTransport::is_poisoned(&client));
+        assert_eq!(DuplexTransport::poison_reason(&client), Some("test fence"));
+        let reuse = DuplexTransport::recv(&mut client).await.unwrap_err();
+        assert!(matches!(reuse.kind, FrameErrorKind::Poisoned { .. }));
     }
 }

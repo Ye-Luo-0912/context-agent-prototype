@@ -8,8 +8,8 @@
 use agent_contracts::{MutationFootprint, ResourceFreshness, ResourceVersionOracle, ToolOutput};
 
 use super::state::{
-    ExecutionState, MAX_REVALIDATE_PER_ROUND, VerificationState, bound_item, is_command_tool,
-    operation_identity, path_mentioned_in_query, same_operation,
+    ExecutionState, MAX_REVALIDATE_PER_ROUND, VerificationCause, VerificationState, bound_item,
+    is_command_tool, operation_identity, path_mentioned_in_query, same_operation,
 };
 
 impl ExecutionState {
@@ -50,6 +50,7 @@ impl ExecutionState {
                 self.push_verification(output.summary.clone(), true, turn);
                 self.verification.state = VerificationState::Current;
                 self.verification.spec_revision = self.anchor_revision;
+                self.verification.cause = VerificationCause::None;
                 self.verification.source_changed = false;
                 self.verification.unknown_pending = false;
                 self.verification.failed_open = false;
@@ -64,7 +65,8 @@ impl ExecutionState {
             self.push_failure(&identity, output.summary.clone(), turn);
         }
         if output.is_verification() && !output.ok {
-            self.verification.state = VerificationState::Stale;
+            self.verification.state = VerificationState::Failed;
+            self.verification.cause = VerificationCause::FailureRepair;
             self.verification.spec_revision = self.anchor_revision;
             self.verification.failed_open = true;
         }
@@ -97,9 +99,8 @@ impl ExecutionState {
             match oracle.revision(&key).await {
                 Ok(Some(revision)) => {
                     if !prior.is_empty() && revision != prior {
-                        self.verification.source_changed = true;
+                        self.mark_source_changed(&key);
                         self.verification.unknown_pending = false;
-                        self.stale_current_verification();
                     }
                     self.checked_files[index].digest = bound_item(&revision);
                     self.checked_files[index].freshness = ResourceFreshness::Fresh;
@@ -117,7 +118,10 @@ impl ExecutionState {
         if self.verification.unknown_pending && !still_pending && !self.verification.source_changed
         {
             self.verification.unknown_pending = false;
-            if self.verification.state == VerificationState::Stale && !self.verification.failed_open
+            if self.verification.state == VerificationState::Stale
+                && !self.verification.failed_open
+                && self.verification.cause != VerificationCause::SpecChanged
+                && self.verification.cause != VerificationCause::SourceChanged
             {
                 self.verification.state = VerificationState::Current;
             }

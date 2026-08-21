@@ -1,7 +1,7 @@
-//! The generic JSON-lines process host: spawning the child, the startup
-//! handshake, bounded framed request/response, per-request deadlines,
-//! cancellation, and a poisoned-connection policy so a wedged or malicious
-//! child can never be reused or grow the parent's memory without bound.
+//! The generic JSON-lines process host: protocol ping-pong on top of
+//! [`crate::ProcessSupervisor`] (child lifecycle) and
+//! [`crate::DuplexTransport`] (bounded framed bytes; stdio is the first
+//! backend).
 //!
 //! Both the context-service adapter (`ContextEngine` over a process, in
 //! `context-contextcore`) and the process capability adapter (a `Capability`
@@ -9,20 +9,23 @@
 //! on top of this host — the framing, deadline, sandbox and failure policy
 //! lives here once.
 
-use std::io::ErrorKind;
 use std::sync::{
     Arc,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
 use agent_contracts::{AgentError, AgentResult};
 use agent_platform_protocol::{ActiveFeatures, JsonDecodeBudget, decode_value};
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncReadExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::Mutex;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
+
+use crate::health::{ConnectionEpoch, ConnectionHealth, ConnectionStatus};
+use crate::session::{DuplexTransport, FramedProtocolSession, StdioDuplexTransport};
+use crate::supervisor::ProcessSupervisor;
 
 /// Client protocol version echoed by every request; a mismatched child is
 /// poisoned instead of misparsed.
@@ -33,6 +36,19 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// child that spams system frames instead of answering is killed instead
 /// of grown into the parent's time budget.
 pub const MAX_SYSTEM_REQUESTS_PER_CALL: usize = 256;
+
+/// Bound on waiting for a peer cancel-ACK after the host writes `op=cancel`.
+/// Settlement is still kill-then-reap: a silent peer cannot delay cancel
+/// past this window. Connection ACK is not Core `OperationCancelAck`.
+pub const DEFAULT_CANCEL_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Coalesced progress notes stay tiny. The latest frame wins; earlier notes
+/// are dropped. This is connection backpressure, never task or Core state.
+pub const MAX_PROGRESS_NOTE_CHARS: usize = 128;
+
+/// How many progress frames one call may emit. They are coalesced, so more
+/// than this is a flood, not extra meaning.
+pub const MAX_PROGRESS_FRAMES_PER_CALL: usize = 64;
 
 /// A broker for the child's *system requests*: mid-invoke frames tagged
 /// `{"system": <op>, ...}` that ask the host to perform access on the
@@ -72,22 +88,58 @@ pub struct ProcessSandbox {
     /// Hard process-count limit via `RLIMIT_NPROC` (Unix only; ignored
     /// elsewhere). `0` = unlimited.
     pub process_limit: u64,
-    /// Linux landlock write confinement (kernel 5.13+): the child may
-    /// create, modify or destroy filesystem state only under these roots —
-    /// enforced by the kernel in the child before `exec`, inherited by
-    /// every descendant. Reads are deliberately unhandled (the executable
-    /// and loader must stay readable; reads are gated by the app-level
-    /// broker), so this is the OS-level write/destroy/exfil-by-write
-    /// fence. Empty = no landlock. Unsupported kernels degrade to a
-    /// warning (the app-level broker remains); a configured root that
-    /// cannot be opened fails the spawn.
+    /// Linux landlock confinement (kernel 5.13+): the child may create,
+    /// modify or destroy filesystem state only under these roots, and on
+    /// ABI v4+ (kernel 6.7+) it cannot bind or connect TCP, on ABI v5+
+    /// (kernel 6.10+) newly opened devices cannot ioctl, and on ABI v6
+    /// (kernel 6.12+) it cannot signal processes outside its landlock
+    /// domain. Enforced by
+    /// the kernel in the child before `exec`, inherited by every
+    /// descendant. Reads are deliberately unhandled (the executable and
+    /// loader must stay readable; reads are gated by the app-level
+    /// broker). UDP, raw sockets and pathname Unix stay unhandled.
+    /// Empty = no landlock. Unsupported kernels degrade to a warning
+    /// (the app-level broker remains); a configured root that cannot be
+    /// opened fails the spawn.
     #[cfg(target_os = "linux")]
     pub landlock_write_roots: Vec<std::path::PathBuf>,
-    /// Per-process memory ceiling in bytes enforced by the Windows
-    /// Job-Object (`JOB_OBJECT_LIMIT_PROCESS_MEMORY`). `0` = unlimited.
-    /// Unix has no equivalent yet.
+    /// Per-process memory ceiling (`MOD-09`). `0` = unlimited.
+    /// Windows: Job-Object `JOB_OBJECT_LIMIT_PROCESS_MEMORY` (committed).
+    /// Unix: `RLIMIT_AS` (virtual address space, including mappings; this
+    /// is coarser than the Windows commit charge). Combined with landlock
+    /// in one `pre_exec` so a second hook cannot replace the rlimits.
     #[cfg(windows)]
     pub job_max_memory_bytes: u64,
+    #[cfg(unix)]
+    pub max_memory_bytes: u64,
+    /// Unix `RLIMIT_FSIZE` (`MOD-10`): the largest file the child may
+    /// create or extend. `0` = unlimited. A write past this limit fails
+    /// with `EFBIG` (and `SIGXFSZ` unless ignored). This is a per-file
+    /// size cap, not I/O bandwidth and not a Windows Job-Object feature.
+    #[cfg(unix)]
+    pub max_file_bytes: u64,
+    /// Unix `RLIMIT_NOFILE` (`MOD-13`): how many file descriptors the
+    /// child may have open. `0` = unlimited. Combined with
+    /// [`close_inherited_fds`] in the same `pre_exec` so a parent fd
+    /// without `O_CLOEXEC` cannot leak across exec. The close scan is
+    /// capped (see that function); this is not I/O bandwidth.
+    #[cfg(unix)]
+    pub max_open_files: u64,
+    // Unix `RLIMIT_CORE` (`MOD-15`) is not a field: other rlimit fields
+    // use `0` = unlimited, so a `max_core_bytes: 0` would be ambiguous.
+    // Whenever `apply_unix_rlimits` runs (capability / MCP `pre_exec`),
+    // core dumps are forced to zero so a crash cannot leak sandbox
+    // secrets into a dump file. Probe via `getrlimit`, not by crashing.
+    // Linux also clamps `RLIMIT_NICE` / `RLIMIT_RTPRIO` to zero and sets
+    // `no_new_privs` (`MOD-16`); those are not fields either.
+    /// Windows integrity write confinement (Low IL, `MOD-08`): the child
+    /// may create/modify/destroy filesystem state only under these roots.
+    /// The parent labels each root Low and re-spawns through this process
+    /// as a wrap that drops to Low IL before CreateProcess of the real
+    /// program. Empty = no integrity wrap. A root that cannot be labeled
+    /// fails the spawn. Reads and TCP stay unhandled.
+    #[cfg(windows)]
+    pub integrity_write_roots: Vec<std::path::PathBuf>,
     /// How many bytes of the child's stderr to capture into a bounded tail
     /// (surfaced on connection errors and diagnostics). `0` inherits the
     /// parent's stderr instead — the context-service default. A sandboxed
@@ -129,48 +181,109 @@ pub struct ProcessHostConfig {
     pub offered_features: ActiveFeatures,
 }
 
-/// A live child process speaking JSON-lines on stdio. Strict ping-pong:
-/// one request in flight at a time (the `Mutex`), because the callers are
-/// `&self` traits.
-pub struct ProcessHost {
-    /// Held in a `Mutex` so `poison` can kill the child from `&self` (a
-    /// timed-out or broken exchange must never leave the process running).
-    child: Mutex<Child>,
-    config: ProcessHostConfig,
-    io: Mutex<HostIo>,
-    /// Sticky first session fault, independent of the IO mutex. Timeout and
-    /// cancellation paths must fence every later call even while the
-    /// cancelled exchange still owns the async IO guard.
-    poisoned: std::sync::Mutex<Option<String>>,
-    next_id: AtomicU32,
-    /// The child's pid, kept outside the child lock so a cancellation can
-    /// kill the process *tree* (process group / taskkill) without touching
-    /// the io lock.
-    pid: AtomicU32,
-    /// The Windows Job-Object holding the child tree: kernel-enforced
-    /// quotas (active-process ceiling from `process_limit`, per-process
-    /// memory ceiling from `job_max_memory_bytes`) and
-    /// `KILL_ON_JOB_CLOSE`, so closing the handle (host drop) terminates
-    /// every descendant. `None` when the sandbox asked for no Windows
-    /// quotas; the platform has no equivalent on other OSes.
-    #[cfg(windows)]
-    job: Mutex<Option<JobObject>>,
-    /// The bounded tail of the child's stderr, fed by a drainer task when
-    /// `ProcessSandbox::stderr_capture_bytes > 0`; `None` when stderr is
-    /// inherited. The tail is surfaced on errors so a failing child says
-    /// *why* without ever buffering unbounded stderr in the parent.
-    stderr_tail: Arc<Mutex<std::collections::VecDeque<u8>>>,
-    /// ping 握手交叉后的特性。缺省为空：历史纯 ToolOutput 默认关闭。
-    negotiated_features: ActiveFeatures,
+/// Apply hard rlimits in the child after `fork`, before `exec`.
+///
+/// Only `setrlimit` / `prctl` (via `syscall`) are used (async-signal-safe).
+/// For CPU / NPROC / AS / FSIZE / NOFILE, `0` leaves that resource
+/// unchanged (unlimited). `RLIMIT_CORE` is always set to zero when this
+/// function runs (`MOD-15`) so a crash cannot dump sandbox secrets; that
+/// is not expressed as a sixth `0` = unlimited argument. On Linux the
+/// same hook also clamps `RLIMIT_NICE` / `RLIMIT_RTPRIO` to zero and
+/// sets `PR_SET_NO_NEW_PRIVS` (`MOD-16`) so a parent with a raised
+/// priority ceiling cannot leak into the child and a setuid exec cannot
+/// escalate even when landlock is skipped. Linux GNU types the resource
+/// id as `u32`; macOS uses `c_int` — calling `setrlimit` with the
+/// `RLIMIT_*` constants keeps both compiling.
+#[cfg(unix)]
+pub fn apply_unix_rlimits(
+    cpu_secs: u64,
+    nproc: u64,
+    memory_bytes: u64,
+    file_bytes: u64,
+    open_files: u64,
+) -> std::io::Result<()> {
+    macro_rules! set {
+        ($resource:expr, $value:expr) => {{
+            if $value > 0 {
+                let limit = libc::rlimit {
+                    rlim_cur: $value as libc::rlim_t,
+                    rlim_max: $value as libc::rlim_t,
+                };
+                if unsafe { libc::setrlimit($resource, &limit) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+        }};
+    }
+    set!(libc::RLIMIT_CPU, cpu_secs);
+    set!(libc::RLIMIT_NPROC, nproc);
+    set!(libc::RLIMIT_AS, memory_bytes);
+    set!(libc::RLIMIT_FSIZE, file_bytes);
+    set!(libc::RLIMIT_NOFILE, open_files);
+    // Always-zero: unlike the five arguments above, 0 here means no core
+    // file, not "leave unlimited". Fail closed if the kernel refuses.
+    let core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &core) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Same always-zero meaning as CORE: pin the child's nice/rtprio
+        // ceiling so a raised parent limit cannot leak across exec.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NICE, &core) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::setrlimit(libc::RLIMIT_RTPRIO, &core) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // `PR_SET_NO_NEW_PRIVS` (38). libc 0.2 does not export `prctl` /
+        // the `PR_*` constants on gnu, so use the syscall directly.
+        const PR_SET_NO_NEW_PRIVS: libc::c_long = 38;
+        if unsafe { libc::syscall(libc::SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
-struct HostIo {
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    /// `Some(reason)` once the connection is unusable. Poisoned hosts reject
-    /// every further call, so a timed-out or half-read exchange can never
-    /// corrupt a later request/response pair.
-    poisoned: Option<String>,
+/// Close inherited descriptors other than stdin/stdout/stderr.
+///
+/// Call this *after* landlock `apply_in_child`: the write-root `O_PATH`
+/// fds must stay open through `landlock_restrict_self`. Only `close` is
+/// used (async-signal-safe). The scan is a fixed `MAX_INHERITED_FD_SCAN`
+/// so an unlimited `RLIMIT_NOFILE` cannot turn this into an unbounded
+/// loop, and so fds already open above a newly applied `RLIMIT_NOFILE`
+/// are still closed. Fds at or above the cap are not closed; the parent
+/// is trusted and Rust typically sets `O_CLOEXEC` on new files.
+#[cfg(unix)]
+pub fn close_inherited_fds() {
+    const MAX_INHERITED_FD_SCAN: libc::c_int = 4096;
+    for fd in 3..MAX_INHERITED_FD_SCAN {
+        let _ = unsafe { libc::close(fd) };
+    }
+}
+
+/// A live child process speaking JSON-lines on stdio. Strict ping-pong:
+/// one request in flight at a time (the `Mutex`), because the callers are
+/// `&self` traits. Supervision ([`ProcessSupervisor`]) and framed bytes
+/// ([`DuplexTransport`], stdio backend [`StdioDuplexTransport`]) are
+/// separate from the protocol exchange.
+pub struct ProcessHost {
+    supervisor: ProcessSupervisor,
+    config: ProcessHostConfig,
+    transport: Mutex<StdioDuplexTransport>,
+    /// Sticky first session fault, independent of the transport mutex.
+    /// Timeout and cancellation paths must fence every later call even while
+    /// the cancelled exchange still owns the async IO guard.
+    poisoned: std::sync::Mutex<Option<String>>,
+    next_id: AtomicU32,
+    peer_epoch: AtomicU64,
+    stderr_saturated: Arc<AtomicBool>,
+    /// ping 握手交叉后的特性。缺省为空：历史纯 ToolOutput 默认关闭。
+    negotiated_features: ActiveFeatures,
 }
 
 impl ProcessHost {
@@ -178,9 +291,26 @@ impl ProcessHost {
     /// deadline, so a missing or broken program fails at connect time, not
     /// on the first real call.
     pub async fn connect(config: ProcessHostConfig) -> AgentResult<Self> {
-        let mut command = Command::new(&config.program);
+        #[cfg(windows)]
+        let (spawn_program, spawn_args) = if config.sandbox.integrity_write_roots.is_empty() {
+            (config.program.clone(), config.args.clone())
+        } else {
+            if let Some(cwd) = &config.sandbox.cwd {
+                std::fs::create_dir_all(cwd).map_err(|e| {
+                    AgentError::Context(format!("create sandbox cwd '{}': {e}", cwd.display()))
+                })?;
+            }
+            crate::integrity::label_write_roots(&config.sandbox.integrity_write_roots)
+                .map_err(|e| AgentError::Context(format!("integrity sandbox setup: {e}")))?;
+            crate::integrity::wrap_command(&config.program, &config.args)
+                .map_err(|e| AgentError::Context(format!("integrity wrap: {e}")))?
+        };
+        #[cfg(not(windows))]
+        let (spawn_program, spawn_args) = (config.program.clone(), config.args.clone());
+
+        let mut command = Command::new(&spawn_program);
         command
-            .args(&config.args)
+            .args(&spawn_args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(if config.sandbox.stderr_capture_bytes > 0 {
@@ -211,54 +341,23 @@ impl ProcessHost {
             command.current_dir(cwd);
         }
 
-        // Sandbox (Unix): hard CPU-time and process-count ceilings enforced
-        // by the kernel via rlimits, applied right after fork.
-        #[cfg(unix)]
-        {
-            let cpu = config.sandbox.cpu_time_limit_secs;
-            let nproc = config.sandbox.process_limit;
-            if cpu > 0 || nproc > 0 {
-                unsafe {
-                    command.pre_exec(move || {
-                        if cpu > 0 {
-                            let limit = libc::rlimit {
-                                rlim_cur: cpu as libc::rlim_t,
-                                rlim_max: cpu as libc::rlim_t,
-                            };
-                            if libc::setrlimit(libc::RLIMIT_CPU, &limit) != 0 {
-                                return Err(std::io::Error::last_os_error());
-                            }
-                        }
-                        if nproc > 0 {
-                            let limit = libc::rlimit {
-                                rlim_cur: nproc as libc::rlim_t,
-                                rlim_max: nproc as libc::rlim_t,
-                            };
-                            if libc::setrlimit(libc::RLIMIT_NPROC, &limit) != 0 {
-                                return Err(std::io::Error::last_os_error());
-                            }
-                        }
-                        Ok(())
-                    });
-                }
-            }
-        }
-
-        // Sandbox (Linux): landlock write confinement — the child may
-        // create/modify/destroy filesystem state only under its write
-        // roots. The roots are opened as O_PATH fds in the parent (raw
-        // fds, no allocation) and the restriction is applied in the child
-        // right before exec, so it is irrevocable and inherited by every
-        // descendant. A kernel without landlock degrades to a warning (the
-        // app-level broker still gates reads); once wired, a child that
-        // cannot be confined fails the spawn (never runs unconfined).
+        // Sandbox (Unix): hard CPU / process / address-space / file-size /
+        // open-file ceilings via rlimits, applied right after fork. The
+        // same hook always zeros RLIMIT_CORE (`MOD-15`) so a crash cannot
+        // dump secrets, and on Linux clamps NICE/RTPRIO and sets
+        // no_new_privs (`MOD-16`) even when landlock is skipped. On Linux
+        // the same pre_exec also applies landlock so a second closure
+        // cannot replace this one on toolchains that keep only the last
+        // hook. Inherited fds other than stdio are closed after landlock
+        // so a parent descriptor without O_CLOEXEC cannot leak across
+        // exec (`MOD-13`).
         #[cfg(target_os = "linux")]
         let landlock_rules = if config.sandbox.landlock_write_roots.is_empty() {
             None
         } else if !crate::landlock::available() {
             eprintln!(
                 "landlock sandbox skipped: kernel support unavailable \
-                 (OS-level write confinement off for '{}')",
+                 (OS-level write/TCP confinement off for '{}')",
                 config.program
             );
             None
@@ -268,10 +367,29 @@ impl ProcessHost {
                     .map_err(|e| AgentError::Context(format!("landlock sandbox setup: {e}")))?,
             )
         };
-        #[cfg(target_os = "linux")]
-        if let Some(rules) = landlock_rules {
-            unsafe {
-                command.pre_exec(move || crate::landlock::apply_in_child(&rules));
+        #[cfg(unix)]
+        {
+            let cpu = config.sandbox.cpu_time_limit_secs;
+            let nproc = config.sandbox.process_limit;
+            let memory = config.sandbox.max_memory_bytes;
+            let file = config.sandbox.max_file_bytes;
+            let nofile = config.sandbox.max_open_files;
+            #[cfg(target_os = "linux")]
+            let apply_landlock = landlock_rules.is_some();
+            #[cfg(not(target_os = "linux"))]
+            let apply_landlock = false;
+            if cpu > 0 || nproc > 0 || memory > 0 || file > 0 || nofile > 0 || apply_landlock {
+                unsafe {
+                    command.pre_exec(move || {
+                        apply_unix_rlimits(cpu, nproc, memory, file, nofile)?;
+                        #[cfg(target_os = "linux")]
+                        if let Some(rules) = landlock_rules.as_ref() {
+                            crate::landlock::apply_in_child(rules)?;
+                        }
+                        close_inherited_fds();
+                        Ok(())
+                    });
+                }
             }
         }
 
@@ -319,14 +437,17 @@ impl ProcessHost {
             .ok_or_else(|| AgentError::Context("child stdout unavailable".into()))?;
 
         let stderr_tail = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let stderr_saturated = Arc::new(AtomicBool::new(false));
         // Bounded stderr: when the sandbox asks for capture, a dedicated
         // drainer task reads the pipe into a ring that keeps only the last
         // `stderr_capture_bytes`. The child can stream forever without the
         // parent buffering it all — the tail is the only memory it ever
-        // occupies, and it is surfaced on connection errors.
+        // occupies, and it is surfaced on connection errors. A full ring
+        // marks the connection Degraded; it does not poison.
         if let Some(stderr) = child.stderr.take() {
             let cap = config.sandbox.stderr_capture_bytes;
             let tail = Arc::clone(&stderr_tail);
+            let saturated = Arc::clone(&stderr_saturated);
             tokio::spawn(async move {
                 let mut reader = stderr;
                 let mut buf = [0u8; 4096];
@@ -339,55 +460,107 @@ impl ProcessHost {
                             while ring.len() > cap {
                                 ring.pop_front();
                             }
+                            if cap > 0 && ring.len() >= cap {
+                                saturated.store(true, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
             });
         }
 
+        let max_frame_bytes = config.max_frame_bytes;
         let mut host = Self {
-            child: Mutex::new(child),
+            supervisor: ProcessSupervisor::new(
+                child,
+                pid,
+                #[cfg(windows)]
+                job,
+                Arc::clone(&stderr_tail),
+            ),
             config,
-            io: Mutex::new(HostIo {
+            transport: Mutex::new(FramedProtocolSession::new(
+                BufReader::new(stdout),
                 stdin,
-                stdout: BufReader::new(stdout),
-                poisoned: None,
-            }),
+                max_frame_bytes,
+            )?),
             poisoned: std::sync::Mutex::new(None),
             next_id: AtomicU32::new(1),
-            pid: AtomicU32::new(pid),
-            #[cfg(windows)]
-            job: Mutex::new(job),
-            stderr_tail,
+            peer_epoch: AtomicU64::new(0),
+            stderr_saturated,
             negotiated_features: ActiveFeatures::default(),
         };
-        let mut ping = json!({ "op": "ping" });
+        let mut ping = json!({ "op": "ping", "host_epoch": 1u64 });
         if !host.config.offered_features.is_empty() {
             ping["features"] = json!(host.config.offered_features.as_slice());
         }
-        let response = timeout(
+        let response = match timeout(
             host.config.startup_timeout,
-            host.exchange_response(ping, None),
+            host.exchange_response(ping, None, None),
         )
         .await
-        .map_err(|_| {
-            host.poison("handshake ping timed out".into());
-            AgentError::Context(format!(
-                "process '{}' did not respond to ping within {:?}",
-                host.config.program, host.config.startup_timeout
-            ))
-        })?
-        .map_err(|e| AgentError::Context(format!("process handshake: {e}")))?;
-        let advertised =
-            ActiveFeatures::from_json_value(response.get("features")).map_err(|error| {
-                host.poison(format!("handshake features: {error}"));
-                AgentError::Context(format!(
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                host.poison_and_reap(format!("process handshake: {error}"))
+                    .await;
+                return Err(AgentError::Context(format!("process handshake: {error}")));
+            }
+            Err(_) => {
+                host.poison_and_reap("handshake ping timed out".into())
+                    .await;
+                return Err(AgentError::Context(format!(
+                    "process '{}' did not respond to ping within {:?}",
+                    host.config.program, host.config.startup_timeout
+                )));
+            }
+        };
+        let advertised = match ActiveFeatures::from_json_value(response.get("features")) {
+            Ok(features) => features,
+            Err(error) => {
+                host.poison_and_reap(format!("handshake features: {error}"))
+                    .await;
+                return Err(AgentError::Context(format!(
                     "process '{}' handshake features: {error}",
                     host.config.program
-                ))
-            })?;
+                )));
+            }
+        };
         host.negotiated_features = host.config.offered_features.intersect(&advertised);
+        if let Some(peer) = response.get("epoch").and_then(Value::as_u64) {
+            host.peer_epoch.store(peer, Ordering::Relaxed);
+        }
         Ok(host)
+    }
+
+    /// Connection health and epochs. Never task or Core authority.
+    pub fn status(&self) -> ConnectionStatus {
+        if let Some(reason) = self.poison_reason() {
+            return ConnectionStatus {
+                health: ConnectionHealth::Quarantined,
+                epoch: self.epoch(),
+                reason: Some(reason),
+            };
+        }
+        if self.stderr_saturated.load(Ordering::Relaxed) {
+            return ConnectionStatus {
+                health: ConnectionHealth::Degraded,
+                epoch: self.epoch(),
+                reason: Some("stderr capture saturated".into()),
+            };
+        }
+        ConnectionStatus {
+            health: ConnectionHealth::Ready,
+            epoch: self.epoch(),
+            reason: None,
+        }
+    }
+
+    pub fn epoch(&self) -> ConnectionEpoch {
+        ConnectionEpoch {
+            host: 1,
+            peer: self.peer_epoch.load(Ordering::Relaxed),
+        }
     }
 
     /// 握手交叉后的特性。子端不能单方面打开未提供的项。
@@ -403,56 +576,60 @@ impl ProcessHost {
     /// connection: the request may have been written, so the response — if
     /// it ever arrives — must not be mistaken for a later request's answer.
     pub async fn call(&self, op: Value) -> AgentResult<Value> {
-        timeout(self.config.request_timeout, self.call_unbounded(op))
-            .await
-            .map_err(|_| {
-                self.poison(format!(
+        match timeout(self.config.request_timeout, self.call_unbounded(op)).await {
+            Ok(inner) => inner,
+            Err(_) => {
+                self.poison_and_reap(format!(
                     "request timed out after {:?}",
                     self.config.request_timeout
-                ));
-                AgentError::Context(format!(
+                ))
+                .await;
+                Err(AgentError::Context(format!(
                     "process '{}' request timed out after {:?}; connection poisoned",
                     self.config.program, self.config.request_timeout
-                ))
-            })?
+                )))
+            }
+        }
     }
 
     /// One framed call that also aborts when `cancel` fires (a user
     /// `/cancel` or a superseded operation must stop the subprocess
-    /// *now*, not at the request deadline). Cancellation poisons the
-    /// connection and kills the child's whole process tree — a cancelled
-    /// capability must not keep producing side effects in the background.
+    /// *now*, not at the request deadline). If the request was already
+    /// written, the host sends a peer `op=cancel` and waits a bounded
+    /// cancel-ACK; settlement is still kill-then-reap so a silent child
+    /// cannot stall cancel. A late value is never admitted. Cancel before
+    /// any write leaves the connection usable.
     pub async fn call_with_cancel(
         &self,
         op: Value,
         cancel: &agent_contracts::CancellationToken,
     ) -> AgentResult<Value> {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                self.poison("cancelled by the runtime".into());
-                Err(AgentError::Cancelled)
-            }
-            result = timeout(self.config.request_timeout, self.call_unbounded(op)) => {
-                match result {
-                    Ok(inner) => inner,
-                    Err(_) => {
-                        self.poison(format!(
-                            "request timed out after {:?}",
-                            self.config.request_timeout
-                        ));
-                        Err(AgentError::Context(format!(
-                            "process '{}' request timed out after {:?}; connection poisoned",
-                            self.config.program, self.config.request_timeout
-                        )))
-                    }
-                }
+        match timeout(
+            self.config.request_timeout,
+            self.exchange(op, None, Some(cancel)),
+        )
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_) => {
+                self.poison_and_reap(format!(
+                    "request timed out after {:?}",
+                    self.config.request_timeout
+                ))
+                .await;
+                Err(AgentError::Context(format!(
+                    "process '{}' request timed out after {:?}; connection poisoned",
+                    self.config.program, self.config.request_timeout
+                )))
             }
         }
     }
 
     /// One framed call with the per-request deadline and a broker for
     /// mid-invoke system requests (a brokered filesystem read). A timeout
-    /// or cancellation poisons the connection and kills the child tree.
+    /// or a cancel after write poisons the connection and kills the child
+    /// tree. Peer cancel-ACK is bounded; kill-then-reap remains the
+    /// settlement.
     pub async fn call_with_cancel_and_broker<B>(
         &self,
         op: Value,
@@ -462,31 +639,29 @@ impl ProcessHost {
     where
         B: SystemBroker,
     {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                self.poison("cancelled by the runtime".into());
-                Err(AgentError::Cancelled)
-            }
-            result = timeout(self.config.request_timeout, self.exchange(op, Some(broker))) => {
-                match result {
-                    Ok(inner) => inner,
-                    Err(_) => {
-                        self.poison(format!(
-                            "request timed out after {:?}",
-                            self.config.request_timeout
-                        ));
-                        Err(AgentError::Context(format!(
-                            "process '{}' request timed out after {:?}; connection poisoned",
-                            self.config.program, self.config.request_timeout
-                        )))
-                    }
-                }
+        match timeout(
+            self.config.request_timeout,
+            self.exchange(op, Some(broker), Some(cancel)),
+        )
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_) => {
+                self.poison_and_reap(format!(
+                    "request timed out after {:?}",
+                    self.config.request_timeout
+                ))
+                .await;
+                Err(AgentError::Context(format!(
+                    "process '{}' request timed out after {:?}; connection poisoned",
+                    self.config.program, self.config.request_timeout
+                )))
             }
         }
     }
 
     async fn call_unbounded(&self, op: Value) -> AgentResult<Value> {
-        self.exchange(op, None).await
+        self.exchange(op, None, None).await
     }
 
     /// Write one request frame, then read frames until the final response.
@@ -497,6 +672,12 @@ impl ProcessHost {
     /// response, exactly as before — a system frame with no broker to
     /// answer it poisons the connection instead of being misparsed.
     ///
+    /// Mid-call `progress` frames are coalesced (latest wins, extras
+    /// dropped) and never become task or Core state. After a written
+    /// request is cancelled the host sends `op=cancel` and waits a bounded
+    /// peer ACK; a late `{ok, value}` is discarded. Settlement is still
+    /// kill-then-reap.
+    ///
     /// Every direction is bounded: the request and the system answers are
     /// capped before a byte is written (`encode_frame`), response frames are
     /// capped while reading, and the total bytes moved by one call are
@@ -505,9 +686,14 @@ impl ProcessHost {
     /// poisons the connection and terminates the child tree, so a
     /// half-consumed exchange can never corrupt a later request/response
     /// pair.
-    async fn exchange(&self, op: Value, broker: Option<&dyn SystemBroker>) -> AgentResult<Value> {
+    async fn exchange(
+        &self,
+        op: Value,
+        broker: Option<&dyn SystemBroker>,
+        cancel: Option<&agent_contracts::CancellationToken>,
+    ) -> AgentResult<Value> {
         Ok(self
-            .exchange_response(op, broker)
+            .exchange_response(op, broker, cancel)
             .await?
             .get("value")
             .cloned()
@@ -518,6 +704,20 @@ impl ProcessHost {
         &self,
         op: Value,
         broker: Option<&dyn SystemBroker>,
+        cancel: Option<&agent_contracts::CancellationToken>,
+    ) -> AgentResult<Value> {
+        let result = self.exchange_once(op, broker, cancel).await;
+        if self.poison_reason().is_some() {
+            self.supervisor.reap().await;
+        }
+        result
+    }
+
+    async fn exchange_once(
+        &self,
+        op: Value,
+        broker: Option<&dyn SystemBroker>,
+        cancel: Option<&agent_contracts::CancellationToken>,
     ) -> AgentResult<Value> {
         if let Some(reason) = self.poison_reason() {
             return Err(AgentError::Context(format!(
@@ -525,16 +725,20 @@ impl ProcessHost {
                 self.config.program
             )));
         }
-        let mut io = self.io.lock().await;
-        if let Some(reason) = &io.poisoned {
+        let mut transport = self.transport.lock().await;
+        if let Some(reason) = transport.poison_reason() {
             return Err(AgentError::Context(format!(
                 "process '{}' connection poisoned: {reason}",
                 self.config.program
             )));
         }
+        if cancel.is_some_and(agent_contracts::CancellationToken::is_cancelled) {
+            // Nothing was written; the pipe is still in sync.
+            return Err(AgentError::Cancelled);
+        }
         let sequence = self.next_id.fetch_add(1, Ordering::Relaxed);
         if sequence == u32::MAX {
-            return Err(self.frame_violation(&mut io, "request id space exhausted".into()));
+            return Err(self.frame_violation(&mut *transport, "request id space exhausted".into()));
         }
         // UUID v4 supplies an unpredictable per-request correlation id.
         // The child cannot pre-send the next response merely by observing
@@ -559,155 +763,231 @@ impl ProcessHost {
             crate::frame::encode_frame(&Value::Object(request), self.config.max_frame_bytes)?;
         let mut exchanged = request_line.len();
 
-        // Write the frame, then the newline, then flush. Any failure poisons
-        // the connection (the child may have read a partial frame).
-        if let Err(e) = io.stdin.write_all(&request_line).await {
-            return Err(self.io_error(&mut io, "write", e));
-        }
-        if let Err(e) = io.stdin.flush().await {
-            return Err(self.io_error(&mut io, "write", e));
+        if let Err(error) = transport.send_encoded_line(&request_line).await {
+            return Err(self.transport_error(&mut *transport, "write", error));
         }
 
-        // Bounded frame read loop. Every frame is read incrementally with
-        // the in-flight cap (oversize is rejected while reading, never
-        // buffered in full), and any framing violation ends the session.
         let mut system_calls = 0usize;
+        let mut progress_frames = 0usize;
+        let mut cancel_sent = false;
+        let mut ack_deadline: Option<Instant> = None;
         loop {
-            let frame =
-                match crate::frame::read_frame(&mut io.stdout, self.config.max_frame_bytes).await {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        return Err(self.frame_violation(&mut io, error.to_string()));
+            tokio::select! {
+                biased;
+                _ = async {
+                    match cancel {
+                        Some(token) => token.cancelled().await,
+                        None => std::future::pending::<()>().await,
                     }
-                };
-            exchanged = match exchanged.checked_add(frame.len() + 1) {
-                Some(total) => total,
-                None => {
-                    return Err(
-                        self.frame_violation(&mut io, "call byte accounting overflowed".into())
-                    );
-                }
-            };
-            if exchanged > self.config.max_call_bytes {
-                return Err(self.frame_violation(
-                    &mut io,
-                    format!(
-                        "call exchanged {exchanged} bytes, above the {} byte per-call bound",
-                        self.config.max_call_bytes
-                    ),
-                ));
-            }
-
-            // 帧必须是一份合法 JSON。解析失败（含 UTF-8 / DOM 预算）说明
-            // 组帧已不可信，会话毒化并杀掉子树，而不是猜测剩余字节。
-            let budget = JsonDecodeBudget::for_frame_bytes(self.config.max_frame_bytes);
-            let response: Value = match decode_value(&frame, &budget) {
-                Ok(response) => response,
-                Err(error) => {
-                    return Err(self.frame_violation(&mut io, format!("parse response: {error}")));
-                }
-            };
-
-            if response.get("system").and_then(Value::as_str).is_some() {
-                // A system request from the child. Without a broker there is
-                // no sanctioned way to answer it: poison (fail-closed) so a
-                // child asking for undeclared access is never silently
-                // satisfied. With a broker the request is bounded: the
-                // child cannot grow the parent's time budget by spamming
-                // system frames instead of answering.
-                let Some(broker) = broker else {
-                    return Err(self.frame_violation(
-                        &mut io,
-                        "child sent a system request with no broker installed".into(),
-                    ));
-                };
-                system_calls += 1;
-                if system_calls > MAX_SYSTEM_REQUESTS_PER_CALL {
-                    return Err(self.frame_violation(
-                        &mut io,
-                        format!(
-                            "too many system requests in one call (>{MAX_SYSTEM_REQUESTS_PER_CALL})"
-                        ),
-                    ));
-                }
-                let answer = match broker.handle(response).await {
-                    Ok(value) => json!({ "system_ok": true, "value": value }),
-                    Err(error) => json!({ "system_ok": false, "error": error.to_string() }),
-                };
-                // Control-plane bound: a broker value above the system
-                // answer cap degrades to a refusal (the broker is trusted
-                // and bounded, this is a backstop) — it never crosses the
-                // wire in full. An answer that cannot even fit one frame is
-                // a hard framing violation.
-                let encoded = serde_json::to_string(&answer)
-                    .map_err(|e| AgentError::Context(format!("serialize system answer: {e}")))?;
-                let answer = if encoded.len() > self.config.max_system_answer_bytes {
-                    json!({
-                        "system_ok": false,
-                        "error": format!(
-                            "system answer exceeds the {} byte control-plane bound",
-                            self.config.max_system_answer_bytes
-                        ),
-                    })
-                } else {
-                    answer
-                };
-                let answer_line = crate::frame::encode_frame(&answer, self.config.max_frame_bytes)
-                    .map_err(|e| self.frame_violation(&mut io, e.to_string()))?;
-                exchanged = match exchanged.checked_add(answer_line.len()) {
-                    Some(total) => total,
-                    None => {
-                        return Err(
-                            self.frame_violation(&mut io, "call byte accounting overflowed".into())
-                        );
+                }, if !cancel_sent && cancel.is_some() => {
+                    let cancel_frame = json!({
+                        "id": id,
+                        "version": PROTOCOL_VERSION,
+                        "op": "cancel",
+                    });
+                    if let Ok(line) =
+                        crate::frame::encode_frame(&cancel_frame, self.config.max_frame_bytes)
+                        && let Some(total) = exchanged.checked_add(line.len())
+                        && total <= self.config.max_call_bytes
+                    {
+                        exchanged = total;
+                        let _ = transport.send_encoded_line(&line).await;
                     }
-                };
-                if exchanged > self.config.max_call_bytes {
-                    return Err(self.frame_violation(
-                        &mut io,
-                        format!(
-                            "call exchanged {exchanged} bytes, above the {} byte per-call bound",
-                            self.config.max_call_bytes
-                        ),
-                    ));
+                    cancel_sent = true;
+                    ack_deadline = Some(Instant::now() + DEFAULT_CANCEL_ACK_TIMEOUT);
                 }
-                if let Err(e) = io.stdin.write_all(&answer_line).await {
-                    return Err(self.io_error(&mut io, "write", e));
+                _ = async {
+                    if let Some(deadline) = ack_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if ack_deadline.is_some() => {
+                    return Err(self.settle_cancelled(&mut *transport));
                 }
-                if let Err(e) = io.stdin.flush().await {
-                    return Err(self.io_error(&mut io, "write", e));
-                }
-                continue;
-            }
+                recv = transport.recv() => {
+                    let frame = match recv {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            return Err(self.frame_violation(&mut *transport, error.to_string()));
+                        }
+                    };
+                    exchanged = match exchanged.checked_add(frame.len() + 1) {
+                        Some(total) => total,
+                        None => {
+                            return Err(self.frame_violation(
+                                &mut *transport,
+                                "call byte accounting overflowed".into(),
+                            ));
+                        }
+                    };
+                    if exchanged > self.config.max_call_bytes {
+                        return Err(self.frame_violation(
+                            &mut *transport,
+                            format!(
+                                "call exchanged {exchanged} bytes, above the {} byte per-call bound",
+                                self.config.max_call_bytes
+                            ),
+                        ));
+                    }
 
-            // The final response: identity + protocol version + error flag.
-            if response.get("id").and_then(Value::as_u64) != Some(id) {
-                return Err(self.frame_violation(
-                    &mut io,
-                    format!(
-                        "response id mismatch: got {:?}, expected {id}",
-                        response.get("id")
-                    ),
-                ));
-            }
-            if response.get("version").and_then(Value::as_u64) != Some(PROTOCOL_VERSION as u64) {
-                return Err(self.frame_violation(&mut io, "protocol version mismatch".into()));
-            }
-            match response.get("ok").and_then(Value::as_bool) {
-                Some(true) => {}
-                Some(false) => {
-                    let error = response
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown child error");
-                    return Err(AgentError::Context(format!("process error: {error}")));
+                    let budget = JsonDecodeBudget::for_frame_bytes(self.config.max_frame_bytes);
+                    let response: Value = match decode_value(&frame, &budget) {
+                        Ok(response) => response,
+                        Err(error) => {
+                            return Err(self.frame_violation(
+                                &mut *transport,
+                                format!("parse response: {error}"),
+                            ));
+                        }
+                    };
+
+                    if response.get("system").and_then(Value::as_str).is_some() {
+                        if cancel_sent {
+                            // Do not extend the child's work after cancel.
+                            continue;
+                        }
+                        let Some(broker) = broker else {
+                            return Err(self.frame_violation(
+                                &mut *transport,
+                                "child sent a system request with no broker installed".into(),
+                            ));
+                        };
+                        system_calls += 1;
+                        if system_calls > MAX_SYSTEM_REQUESTS_PER_CALL {
+                            return Err(self.frame_violation(
+                                &mut *transport,
+                                format!(
+                                    "too many system requests in one call (>{MAX_SYSTEM_REQUESTS_PER_CALL})"
+                                ),
+                            ));
+                        }
+                        let answer = match broker.handle(response).await {
+                            Ok(value) => json!({ "system_ok": true, "value": value }),
+                            Err(error) => json!({ "system_ok": false, "error": error.to_string() }),
+                        };
+                        let encoded = serde_json::to_string(&answer).map_err(|e| {
+                            AgentError::Context(format!("serialize system answer: {e}"))
+                        })?;
+                        let answer = if encoded.len() > self.config.max_system_answer_bytes {
+                            json!({
+                                "system_ok": false,
+                                "error": format!(
+                                    "system answer exceeds the {} byte control-plane bound",
+                                    self.config.max_system_answer_bytes
+                                ),
+                            })
+                        } else {
+                            answer
+                        };
+                        let answer_line =
+                            crate::frame::encode_frame(&answer, self.config.max_frame_bytes)
+                                .map_err(|e| self.frame_violation(&mut *transport, e.to_string()))?;
+                        exchanged = match exchanged.checked_add(answer_line.len()) {
+                            Some(total) => total,
+                            None => {
+                                return Err(self.frame_violation(
+                                    &mut *transport,
+                                    "call byte accounting overflowed".into(),
+                                ));
+                            }
+                        };
+                        if exchanged > self.config.max_call_bytes {
+                            return Err(self.frame_violation(
+                                &mut *transport,
+                                format!(
+                                    "call exchanged {exchanged} bytes, above the {} byte per-call bound",
+                                    self.config.max_call_bytes
+                                ),
+                            ));
+                        }
+                        if let Err(error) = transport.send_encoded_line(&answer_line).await {
+                            return Err(self.transport_error(&mut *transport, "write", error));
+                        }
+                        continue;
+                    }
+
+                    if response.get("cancelled").and_then(Value::as_bool) == Some(true) {
+                        if response.get("id").and_then(Value::as_u64) != Some(id) {
+                            return Err(self.frame_violation(
+                                &mut *transport,
+                                format!(
+                                    "cancel-ACK id mismatch: got {:?}, expected {id}",
+                                    response.get("id")
+                                ),
+                            ));
+                        }
+                        if !cancel_sent {
+                            return Err(self.frame_violation(
+                                &mut *transport,
+                                "peer sent cancel-ACK with no host cancel".into(),
+                            ));
+                        }
+                        return Err(self.settle_cancelled(&mut *transport));
+                    }
+
+                    if response.get("progress").and_then(Value::as_bool) == Some(true) {
+                        if response.get("id").and_then(Value::as_u64) != Some(id) {
+                            return Err(self.frame_violation(
+                                &mut *transport,
+                                format!(
+                                    "progress id mismatch: got {:?}, expected {id}",
+                                    response.get("id")
+                                ),
+                            ));
+                        }
+                        progress_frames += 1;
+                        if progress_frames > MAX_PROGRESS_FRAMES_PER_CALL {
+                            return Err(self.frame_violation(
+                                &mut *transport,
+                                format!(
+                                    "too many progress frames in one call (>{MAX_PROGRESS_FRAMES_PER_CALL})"
+                                ),
+                            ));
+                        }
+                        let _ = bounded_progress_note(&response);
+                        continue;
+                    }
+
+                    if response.get("id").and_then(Value::as_u64) != Some(id) {
+                        return Err(self.frame_violation(
+                            &mut *transport,
+                            format!(
+                                "response id mismatch: got {:?}, expected {id}",
+                                response.get("id")
+                            ),
+                        ));
+                    }
+                    if response.get("version").and_then(Value::as_u64) != Some(PROTOCOL_VERSION as u64)
+                    {
+                        return Err(self.frame_violation(
+                            &mut *transport,
+                            "protocol version mismatch".into(),
+                        ));
+                    }
+                    if cancel_sent {
+                        // A late value after cancel is not this call's result.
+                        return Err(self.settle_cancelled(&mut *transport));
+                    }
+                    match response.get("ok").and_then(Value::as_bool) {
+                        Some(true) => {}
+                        Some(false) => {
+                            let error = response
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown child error");
+                            return Err(AgentError::Context(format!("process error: {error}")));
+                        }
+                        None => {
+                            return Err(self.frame_violation(
+                                &mut *transport,
+                                "response field 'ok' must be a boolean".into(),
+                            ));
+                        }
+                    }
+                    return Ok(response);
                 }
-                None => {
-                    return Err(self
-                        .frame_violation(&mut io, "response field 'ok' must be a boolean".into()));
-                }
             }
-            return Ok(response);
         }
     }
 
@@ -715,38 +995,57 @@ impl ProcessHost {
     /// reader may hold a half-consumed frame or a wrong response for a
     /// later request), so it is poisoned *and* the child tree is terminated
     /// — fail closed, never guessed past.
-    fn frame_violation(&self, io: &mut HostIo, reason: String) -> AgentError {
+    fn frame_violation(&self, transport: &mut impl DuplexTransport, reason: String) -> AgentError {
         let reason = self.record_poison(reason);
-        io.poisoned.get_or_insert_with(|| reason.clone());
-        self.kill_tree();
+        transport.poison(reason.clone());
+        self.supervisor.kill_tree();
         AgentError::Context(format!(
             "process '{}' {reason}; connection poisoned and terminated",
             self.config.program
         ))
     }
 
+    /// Cancel after a write: poison so a late value cannot be reused, kill
+    /// the tree, return `Cancelled`. Peer ACK is optional evidence, not Core
+    /// truth and not permission to keep the connection.
+    fn settle_cancelled(&self, transport: &mut impl DuplexTransport) -> AgentError {
+        let reason = self.record_poison("cancelled by the runtime".into());
+        transport.poison(reason);
+        self.supervisor.kill_tree();
+        AgentError::Cancelled
+    }
+
     /// Ask the child to exit gracefully, then reap it. The host is consumed,
     /// so no further calls can ride a closing pipe.
     pub async fn shutdown(self) {
         let _ = self.call(json!({ "op": "shutdown" })).await;
-        let child = self.child;
-        let _ = child.lock().await.wait().await;
+        self.supervisor.reap().await;
     }
 
-    fn io_error(&self, io: &mut HostIo, stage: &str, e: std::io::Error) -> AgentError {
-        let reason = self.record_poison(format!("{stage} failed: {e}"));
-        io.poisoned.get_or_insert(reason);
-        // A failed write/flush may have delivered only a prefix of the
-        // request. The peer's framing state is therefore unknown, so the
-        // owned child tree must not remain alive and continue side effects.
-        self.kill_tree();
-        if e.kind() == ErrorKind::BrokenPipe || e.kind() == ErrorKind::UnexpectedEof {
+    fn transport_error(
+        &self,
+        transport: &mut impl DuplexTransport,
+        stage: &str,
+        error: AgentError,
+    ) -> AgentError {
+        let message = error.to_string();
+        let reason = self.record_poison(format!("{stage} failed: {message}"));
+        transport.poison(reason);
+        self.supervisor.kill_tree();
+        let closed = message.contains("broken pipe")
+            || message.contains("BrokenPipe")
+            || message.contains("unexpected eof")
+            || message.contains("UnexpectedEof");
+        if closed {
             AgentError::Context(format!(
-                "process '{}' connection closed: {e}",
+                "process '{}' connection closed: {message}",
                 self.config.program
             ))
         } else {
-            AgentError::Io(format!("process '{}' {stage}: {e}", self.config.program))
+            AgentError::Io(format!(
+                "process '{}' {stage}: {message}",
+                self.config.program
+            ))
         }
     }
 
@@ -755,8 +1054,7 @@ impl ProcessHost {
     /// errors so a failing child says *why* without the parent ever
     /// buffering unbounded stderr.
     pub async fn stderr_tail(&self) -> String {
-        let mut ring = self.stderr_tail.lock().await;
-        String::from_utf8_lossy(ring.make_contiguous()).into_owned()
+        self.supervisor.stderr_tail().await
     }
 
     /// Mark the connection poisoned and kill the child's process tree.
@@ -764,10 +1062,15 @@ impl ProcessHost {
     /// deadlocking on a guard that the cancelled future still holds.
     fn poison(&self, reason: String) {
         let reason = self.record_poison(reason);
-        if let Ok(mut io) = self.io.try_lock() {
-            io.poisoned.get_or_insert(reason);
+        if let Ok(mut transport) = self.transport.try_lock() {
+            transport.poison(reason);
         }
-        self.kill_tree();
+        self.supervisor.kill_tree();
+    }
+
+    async fn poison_and_reap(&self, reason: String) {
+        self.poison(reason);
+        self.supervisor.reap().await;
     }
 
     fn record_poison(&self, reason: String) -> String {
@@ -781,51 +1084,11 @@ impl ProcessHost {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+}
 
-    /// Kill the child and every descendant. A cancelled or timed-out call
-    /// must not leave a runaway subtree alive — the child's own side
-    /// effects (spawned subprocesses, writers) die with it.
-    fn kill_tree(&self) {
-        let pid = self.pid.load(Ordering::Relaxed);
-        #[cfg(windows)]
-        {
-            // The Job-Object is the authoritative tree kill: every
-            // descendant was assigned at connect, so terminating the job
-            // reaches them all in one kernel call. Fall back to taskkill
-            // when no job exists.
-            let terminated = if let Ok(guard) = self.job.try_lock()
-                && let Some(job) = guard.as_ref()
-            {
-                job.terminate()
-            } else {
-                false
-            };
-            if !terminated {
-                kill_process_tree(pid);
-            }
-        }
-        #[cfg(not(windows))]
-        kill_process_tree(pid);
-        // Defense in depth: on Unix, a `kill(-pgid)` ESRCH (group already
-        // gone) must not leave the direct child alive; on other platforms
-        // without a tree kill, the direct child is the whole kill.
-        #[cfg(unix)]
-        {
-            let pid = self.pid.load(Ordering::Relaxed);
-            if pid != 0
-                && unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } != 0
-                && let Ok(mut child) = self.child.try_lock()
-            {
-                let _ = child.start_kill();
-            }
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            if let Ok(mut child) = self.child.try_lock() {
-                let _ = child.start_kill();
-            }
-        }
-    }
+fn bounded_progress_note(response: &Value) -> String {
+    let note = response.get("note").and_then(Value::as_str).unwrap_or("");
+    note.chars().take(MAX_PROGRESS_NOTE_CHARS).collect()
 }
 
 /// Kill a process and every descendant, without touching the caller's own
@@ -879,20 +1142,24 @@ pub fn kill_process_tree(pid: u32) {
 
 /// The Windows Job-Object machinery behind the process sandbox:
 /// kernel-enforced quotas (active-process ceiling, per-process memory
-/// ceiling) and `KILL_ON_JOB_CLOSE`, so closing the handle — the host's
-/// drop — terminates every assigned process even if no explicit kill ran.
+/// ceiling), `KILL_ON_JOB_CLOSE`, `DIE_ON_UNHANDLED_EXCEPTION`, and
+/// `PRIORITY_CLASS=NORMAL` (`MOD-17`) so the child cannot raise
+/// HIGH/REALTIME. Breakaway stays default-deny. Closing the handle — the
+/// host's drop — terminates every assigned process even if no explicit
+/// kill ran.
 #[cfg(windows)]
 mod job_object {
     use super::{AgentError, AgentResult, ProcessSandbox};
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_PRIORITY_CLASS, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
         SetInformationJobObject, TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        NORMAL_PRIORITY_CLASS, OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
     };
 
     /// RAII handle: the drop closes the handle, and `KILL_ON_JOB_CLOSE`
@@ -956,7 +1223,13 @@ mod job_object {
                 ));
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            let mut flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // PRIORITY_CLASS pins NORMAL so the child cannot raise to
+            // HIGH/REALTIME (`MOD-17`). BREAKAWAY_OK / SILENT_BREAKAWAY_OK
+            // stay unset (default-deny). Not a rate limit and not UI.
+            let mut flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+                | JOB_OBJECT_LIMIT_PRIORITY_CLASS;
+            info.BasicLimitInformation.PriorityClass = NORMAL_PRIORITY_CLASS;
             if sandbox.process_limit > 0 {
                 flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
                 info.BasicLimitInformation.ActiveProcessLimit = sandbox.process_limit as u32;
@@ -979,6 +1252,63 @@ mod job_object {
                 ));
             }
             Ok(Some(JobObject(job)))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::System::JobObjects::{
+            JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+            QueryInformationJobObject,
+        };
+
+        #[test]
+        fn created_job_pins_normal_priority_and_denies_breakaway() {
+            let sandbox = ProcessSandbox {
+                process_limit: 1,
+                ..ProcessSandbox::default()
+            };
+            let job = create_job_object(&sandbox)
+                .expect("create the job")
+                .expect("a quota was requested");
+            unsafe {
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                let mut returned = 0u32;
+                let ok = QueryInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_mut(&mut info).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    &mut returned,
+                );
+                assert_ne!(
+                    ok,
+                    0,
+                    "query job limits: {}",
+                    std::io::Error::last_os_error()
+                );
+                assert_eq!(
+                    info.BasicLimitInformation.PriorityClass, NORMAL_PRIORITY_CLASS,
+                    "sandbox jobs must pin NORMAL so the child cannot raise HIGH/REALTIME"
+                );
+                let flags = info.BasicLimitInformation.LimitFlags;
+                assert_ne!(
+                    flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS,
+                    0,
+                    "PRIORITY_CLASS must be in LimitFlags"
+                );
+                assert_eq!(
+                    flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+                    0,
+                    "BREAKAWAY_OK must stay unset (default-deny)"
+                );
+                assert_eq!(
+                    flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+                    0,
+                    "SILENT_BREAKAWAY_OK must stay unset"
+                );
+            }
         }
     }
 }
@@ -1014,7 +1344,7 @@ pub fn probe_siblings(current_exe: &std::path::Path, name: &str) -> Option<std::
 }
 
 #[cfg(windows)]
-use job_object::JobObject;
+pub(crate) use job_object::JobObject;
 
 #[cfg(test)]
 mod tests {

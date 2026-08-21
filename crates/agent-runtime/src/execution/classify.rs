@@ -6,15 +6,16 @@ use agent_contracts::{
 
 use super::state::ResourceFact;
 
-/// Combine engine residency with the prior resource fact.
+/// Combine last-prompt exposure with the prior resource fact.
 ///
 /// Priority answers "why this read":
 /// 1. `changed` — digest actually moved (legitimate).
 /// 2. `warm` / `stored` — GC dropped the body.
 /// 3. `needs-revalidation` — Runtime should have hashed instead.
-/// 4. `selected-current` — body was in the last prompt (trajectory).
-/// 5. `checked-fresh` — Runtime already knew `path@rev`.
-/// 6. `first` — first exploration.
+/// 4. `body-visible-current` — file body was in the last prompt.
+/// 5. `descriptor-only` — last prompt only had `path@rev`.
+/// 6. `checked-fresh` — Runtime already knew `path@rev`.
+/// 7. `first` — first exploration.
 pub fn classify_fs_read_motive(
     residency: FsRereadClass,
     prior: Option<&ResourceFact>,
@@ -34,6 +35,8 @@ pub fn classify_fs_read_motive(
         FsRereadClass::Stored => return FsReadMotive::Stored,
         FsRereadClass::FirstRead
         | FsRereadClass::PreviouslySelected
+        | FsRereadClass::SelectedDescriptor
+        | FsRereadClass::ExternalDescriptor
         | FsRereadClass::ResidentUnselected => {}
     }
     if let Some(fact) = prior {
@@ -41,17 +44,24 @@ pub fn classify_fs_read_motive(
             return FsReadMotive::NeedsRevalidation;
         }
         if fact.freshness == ResourceFreshness::Fresh {
-            if residency == FsRereadClass::PreviouslySelected {
-                return FsReadMotive::SelectedCurrent;
-            }
-            return FsReadMotive::CheckedFresh;
+            return match residency {
+                FsRereadClass::PreviouslySelected => FsReadMotive::BodyVisibleCurrent,
+                FsRereadClass::SelectedDescriptor | FsRereadClass::ExternalDescriptor => {
+                    FsReadMotive::DescriptorOnly
+                }
+                FsRereadClass::FirstRead
+                | FsRereadClass::ResidentUnselected
+                | FsRereadClass::Warm
+                | FsRereadClass::Stored => FsReadMotive::CheckedFresh,
+            };
         }
     }
     match residency {
-        FsRereadClass::PreviouslySelected | FsRereadClass::ResidentUnselected => {
-            FsReadMotive::SelectedCurrent
+        FsRereadClass::PreviouslySelected => FsReadMotive::BodyVisibleCurrent,
+        FsRereadClass::SelectedDescriptor | FsRereadClass::ExternalDescriptor => {
+            FsReadMotive::DescriptorOnly
         }
-        FsRereadClass::FirstRead => FsReadMotive::First,
+        FsRereadClass::ResidentUnselected | FsRereadClass::FirstRead => FsReadMotive::First,
         FsRereadClass::Warm => FsReadMotive::Warm,
         FsRereadClass::Stored => FsReadMotive::Stored,
     }
@@ -96,13 +106,29 @@ mod tests {
     }
 
     #[test]
-    fn body_in_last_prompt_is_selected_current() {
+    fn body_in_last_prompt_is_body_visible_current() {
         let motive = classify_fs_read_motive(
             FsRereadClass::PreviouslySelected,
             Some(&fact("revB", ResourceFreshness::Fresh)),
             Some("revB"),
         );
-        assert_eq!(motive, FsReadMotive::SelectedCurrent);
+        assert_eq!(motive, FsReadMotive::BodyVisibleCurrent);
+    }
+
+    #[test]
+    fn selected_descriptor_is_not_body_visible() {
+        let motive = classify_fs_read_motive(
+            FsRereadClass::SelectedDescriptor,
+            Some(&fact("revB", ResourceFreshness::Fresh)),
+            Some("revB"),
+        );
+        assert_eq!(motive, FsReadMotive::DescriptorOnly);
+    }
+
+    #[test]
+    fn external_descriptor_is_descriptor_only() {
+        let motive = classify_fs_read_motive(FsRereadClass::ExternalDescriptor, None, Some("revB"));
+        assert_eq!(motive, FsReadMotive::DescriptorOnly);
     }
 
     #[test]
@@ -139,5 +165,17 @@ mod tests {
     fn no_fact_first_read_is_first() {
         let motive = classify_fs_read_motive(FsRereadClass::FirstRead, None, Some("revA"));
         assert_eq!(motive, FsReadMotive::First);
+    }
+
+    #[test]
+    fn old_selected_current_wire_name_still_parses() {
+        assert_eq!(
+            FsReadMotive::parse("selected-current"),
+            Some(FsReadMotive::BodyVisibleCurrent)
+        );
+        assert_eq!(
+            FsReadMotive::parse("body-visible-current"),
+            Some(FsReadMotive::BodyVisibleCurrent)
+        );
     }
 }

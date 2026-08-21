@@ -1,12 +1,16 @@
-//! End-to-end tests for the Linux landlock write confinement (the M13
-//! residual slice: OS-level write filtering for process children).
+//! End-to-end tests for the Linux landlock confinement (M13: OS-level
+//! write filtering, TCP deny on ABI v4+, device-ioctl deny on ABI v5,
+//! signal scope on ABI v6).
 //!
 //! The `sandbox_probe` bin is spawned under a confinement whose only write
 //! root is one tempdir; it must be able to write there, must be refused at
 //! the OS layer when writing to a sibling tempdir, and must still read
-//! system files. A second test proves the `ProcessHost` handshake still
-//! works when the sandbox carries landlock roots, so wiring the field does
-//! not break legitimate children.
+//! system files. On ABI v4+ it must also be refused a TCP connect with
+//! `PermissionDenied`. On ABI v5+ it must be refused a device ioctl with
+//! `PermissionDenied`. On ABI v6 it must be refused `kill(parent, 0)` with
+//! `EPERM`. A second test proves the `ProcessHost` handshake still works
+//! when the sandbox carries landlock roots, so wiring the field does not
+//! break legitimate children.
 
 #![cfg(target_os = "linux")]
 
@@ -23,6 +27,30 @@ fn locate_probe() -> std::path::PathBuf {
     })
 }
 
+fn spawn_probe(allowed: &std::path::Path, denied: &std::path::Path) -> std::process::Output {
+    let rules = landlock::ChildRules::open(&[allowed.to_path_buf()]).unwrap();
+    let mut command = std::process::Command::new(locate_probe());
+    command.args([allowed.to_str().unwrap(), denied.to_str().unwrap()]);
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(move || landlock::apply_in_child(&rules));
+    }
+    command.output().expect("probe runs")
+}
+
+fn assert_probe_pass(output: &std::process::Output, needles: &[&str]) {
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "probe must pass, got status {:?}\nstdout: {stdout}\nstderr: {stderr}",
+        output.status.code()
+    );
+    for needle in needles {
+        assert!(stdout.contains(needle), "{stdout}");
+    }
+}
+
 #[test]
 fn child_cannot_write_outside_its_landlock_root() {
     if !landlock::available() {
@@ -31,35 +59,62 @@ fn child_cannot_write_outside_its_landlock_root() {
     }
     let allowed = tempfile::tempdir().unwrap();
     let denied = tempfile::tempdir().unwrap();
-
-    let rules = landlock::ChildRules::open(&[allowed.path().to_path_buf()]).unwrap();
-    let output = {
-        let mut command = std::process::Command::new(locate_probe());
-        command.args([
-            allowed.path().to_str().unwrap(),
-            denied.path().to_str().unwrap(),
-        ]);
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            command.pre_exec(move || landlock::apply_in_child(&rules));
-        }
-        command.output().expect("probe runs")
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(
-        output.status.success(),
-        "probe must pass, got status {:?}\nstdout: {stdout}\nstderr: {stderr}",
-        output.status.code()
-    );
-    assert!(stdout.contains("write-inside:ok"), "{stdout}");
+    let output = spawn_probe(allowed.path(), denied.path());
     // The outside write must have been refused by the kernel at the OS
     // layer (EACCES/EROFS) — the probe prints `write-outside:ok` only when
     // the write failed.
-    assert!(stdout.contains("write-outside:ok"), "{stdout}");
-    assert!(stdout.contains("read-passwd:ok"), "{stdout}");
-    assert!(stdout.contains("RESULT:PASS"), "{stdout}");
+    assert_probe_pass(
+        &output,
+        &[
+            "write-inside:ok",
+            "write-outside:ok",
+            "read-passwd:ok",
+            "RESULT:PASS",
+        ],
+    );
+}
+
+#[test]
+fn child_cannot_connect_tcp_under_landlock() {
+    if !landlock::tcp_deny_available() {
+        eprintln!("landlock TCP deny unavailable on this kernel; skipping");
+        return;
+    }
+    let allowed = tempfile::tempdir().unwrap();
+    let denied = tempfile::tempdir().unwrap();
+    let output = spawn_probe(allowed.path(), denied.path());
+    assert_probe_pass(&output, &["tcp-connect:ok", "RESULT:PASS"]);
+}
+
+#[test]
+fn child_cannot_ioctl_devices_under_landlock() {
+    if !landlock::ioctl_dev_deny_available() {
+        eprintln!("landlock device-ioctl deny unavailable on this kernel; skipping");
+        return;
+    }
+    let allowed = tempfile::tempdir().unwrap();
+    let denied = tempfile::tempdir().unwrap();
+    let output = spawn_probe(allowed.path(), denied.path());
+    assert_probe_pass(&output, &["ioctl-dev:ok", "RESULT:PASS"]);
+}
+
+#[test]
+fn child_cannot_signal_outside_its_landlock_domain() {
+    if !landlock::signal_scope_available() {
+        eprintln!("landlock signal scope unavailable on this kernel; skipping");
+        return;
+    }
+    let allowed = tempfile::tempdir().unwrap();
+    let parent = std::process::id();
+    let rules = landlock::ChildRules::open(&[allowed.path().to_path_buf()]).unwrap();
+    let mut command = std::process::Command::new(locate_probe());
+    command.args(["signal", &parent.to_string()]);
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(move || landlock::apply_in_child(&rules));
+    }
+    let output = command.output().expect("probe runs");
+    assert_probe_pass(&output, &["signal-self:ok", "signal-out:ok", "RESULT:PASS"]);
 }
 
 #[tokio::test]

@@ -18,11 +18,10 @@ use agent_contracts::{
     validate_capability_id,
 };
 use agent_platform_protocol::{JsonDecodeBudget, decode_value};
-use agent_process::kill_process_tree;
+use agent_process::{DEFAULT_CANCEL_ACK_TIMEOUT, ProcessSupervisor, RestartCircuit};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
-use tokio::process::Child;
 
 /// MCP protocol version this client speaks.
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -40,6 +39,8 @@ pub const MAX_MCP_TOOL_TEXT_CHARS: usize = 16_000;
 /// response.
 pub const DEFAULT_MAX_SKIPPED_FRAMES_PER_REQUEST: usize = 64;
 pub const DEFAULT_MAX_SKIPPED_BYTES_PER_REQUEST: u64 = 1024 * 1024;
+/// MCP peer cancel notification. Not Core `OperationCancelAck`.
+pub const MCP_CANCEL_NOTIFICATION: &str = "notifications/cancelled";
 
 /// A declared MCP server: identity plus how to spawn it. The id follows the
 /// capability id grammar (it is embedded in catalog routes).
@@ -84,10 +85,10 @@ pub struct McpCallResult {
 /// unit-testable against in-memory duplex streams without a real process.
 ///
 /// Frames are bounded in both directions (the shared `agent-process` frame
-/// codec), and a stdio client owns its server child: a poisoned, timed-out
-/// or cancelled exchange kills and reaps the whole process tree, so late
-/// output can never be admitted and a dropped connection never orphans the
-/// server.
+/// codec), and a stdio client owns its server child through
+/// [`ProcessSupervisor`]: a poisoned, timed-out or cancelled exchange kills
+/// and reaps the whole process tree, so late output can never be admitted
+/// and a dropped connection never orphans the server.
 pub struct McpClient<R, W> {
     reader: BufReader<R>,
     writer: BufWriter<W>,
@@ -101,10 +102,9 @@ pub struct McpClient<R, W> {
     /// limit alone would still permit hundreds of individually large frames;
     /// use one frame budget for the whole skipped prefix as well.
     max_skipped_bytes: u64,
-    /// The spawned server child (stdio transports only), owned by the
-    /// client for the whole connection lifetime.
-    child: Option<Child>,
-    pid: Option<u32>,
+    /// Stdio transports own the server through the shared supervisor.
+    /// In-memory duplex tests leave this `None`.
+    supervisor: Option<ProcessSupervisor>,
     /// `Some(reason)` once the connection is unusable. Poisoned clients
     /// reject every further call; the adapter replaces them on the next
     /// invoke.
@@ -137,15 +137,16 @@ where
             max_frame_bytes,
             max_skipped_frames: DEFAULT_MAX_SKIPPED_FRAMES_PER_REQUEST,
             max_skipped_bytes: max_frame_bytes.min(DEFAULT_MAX_SKIPPED_BYTES_PER_REQUEST),
-            child: None,
-            pid: None,
+            supervisor: None,
             poisoned: None,
             _private_cwd: None,
         }
     }
 
-    /// True once the connection is unusable. The adapter replaces a
-    /// poisoned client on the next invoke instead of reusing it.
+    /// True once the connection is unusable. The adapter may replace a
+    /// poisoned client on the next invoke within the restart budget;
+    /// exhaustion keeps this client so a later invoke cannot look like a
+    /// first connect.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.is_some()
     }
@@ -157,26 +158,21 @@ where
     /// await follow up with [`Self::reap`].
     fn poison(&mut self, reason: String) -> AgentError {
         self.poisoned = Some(reason.clone());
-        if let Some(pid) = self.pid {
-            kill_process_tree(pid);
-        }
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.start_kill();
+        if let Some(supervisor) = &self.supervisor {
+            supervisor.kill_tree();
         }
         AgentError::Tool(format!("MCP connection poisoned: {reason}"))
     }
 
     /// Reap the owned child after a kill (avoids a zombie on Unix). Safe to
-    /// call on a stream variant (no child): a no-op.
+    /// call on a stream variant (no child): a no-op. Dropping the supervisor
+    /// after reap cannot kill a reused pid: [`ProcessSupervisor::reap`]
+    /// clears it first.
     async fn reap(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.wait().await;
+        if let Some(supervisor) = &self.supervisor {
+            supervisor.reap().await;
         }
-        // A reaped pid may be reused by the OS. Clear it before Drop so the
-        // backstop cannot terminate an unrelated process that later receives
-        // the same numeric pid.
-        self.child = None;
-        self.pid = None;
+        self.supervisor = None;
     }
 
     /// The MCP `initialize` handshake: send the initialize request, check
@@ -296,6 +292,10 @@ where
                 self.poisoned.as_deref().unwrap_or("unknown")
             )));
         }
+        if cancel.is_cancelled() {
+            // Nothing was written; keep a healthy resident server.
+            return Err(AgentError::Cancelled);
+        }
         // A fresh v4 UUID for every exchange prevents a peer from predicting
         // the next id and pre-sending a response that a later request could
         // accidentally accept. `OperationId` is the contracts-owned UUID
@@ -303,45 +303,44 @@ where
         let id = OperationId::new().to_string();
         let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
 
-        enum Exchange {
-            Cancelled,
-            TimedOut,
-            Completed(AgentResult<Value>),
-        }
+        self.send_frame(&request).await?;
 
         let request_timeout = self.request_timeout;
-        let exchange = async {
-            self.send_frame(&request).await?;
-            self.read_matching(&id).await
-        };
-        let outcome = tokio::select! {
-            // An already-cancelled request must not write anything to the
-            // child even when the pipe is immediately writable.
+        tokio::select! {
             biased;
-            _ = cancel.cancelled() => Exchange::Cancelled,
-            result = tokio::time::timeout(request_timeout, exchange) => match result {
-                Ok(result) => Exchange::Completed(result),
-                Err(_) => Exchange::TimedOut,
-            }
-        };
-        match outcome {
-            Exchange::Cancelled => {
-                // A late answer must never be admitted as a later call's
-                // response, so cancellation destroys this session.
+            _ = cancel.cancelled() => {
+                let _ = self
+                    .send_frame(&json!({
+                        "jsonrpc": "2.0",
+                        "method": MCP_CANCEL_NOTIFICATION,
+                        "params": { "requestId": id },
+                    }))
+                    .await;
+                // Implicit ACK: a matching response, discarded. Silent peers
+                // cannot stall past DEFAULT_CANCEL_ACK_TIMEOUT.
+                let _ = tokio::time::timeout(
+                    DEFAULT_CANCEL_ACK_TIMEOUT,
+                    self.read_matching(&id),
+                )
+                .await;
                 self.poison(format!("request '{method}' cancelled by the runtime"));
                 self.reap().await;
                 Err(AgentError::Cancelled)
             }
-            Exchange::TimedOut => {
-                let error = self.poison(format!("request '{method}' timed out"));
-                self.reap().await;
-                Err(error)
-            }
-            Exchange::Completed(result) => {
-                if result.is_err() && self.is_poisoned() {
-                    self.reap().await;
+            result = tokio::time::timeout(request_timeout, self.read_matching(&id)) => {
+                match result {
+                    Ok(inner) => {
+                        if inner.is_err() && self.is_poisoned() {
+                            self.reap().await;
+                        }
+                        inner
+                    }
+                    Err(_) => {
+                        let error = self.poison(format!("request '{method}' timed out"));
+                        self.reap().await;
+                        Err(error)
+                    }
                 }
-                result
             }
         }
     }
@@ -474,12 +473,12 @@ where
 impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
     /// Spawn the declared server over stdio with a scrubbed environment and
     /// a private cwd, then run the MCP `initialize` handshake. The child is
-    /// owned by the client for the whole connection: teardown, timeout,
-    /// cancellation and framing failures kill and reap the whole process
-    /// tree, so a dead or abandoned server never keeps running and late
-    /// output can never be admitted. The child's stderr is discarded (the
-    /// runtime's process host owns stderr accounting for its own protocol;
-    /// MCP servers log to stderr freely).
+    /// owned through [`ProcessSupervisor`]: teardown, timeout, cancellation
+    /// and framing failures kill and reap the whole process tree, so a dead
+    /// or abandoned server never keeps running and late output can never be
+    /// admitted. The child's stderr is discarded (the runtime's process host
+    /// owns stderr accounting for its own protocol; MCP servers log to
+    /// stderr freely).
     pub async fn connect_stdio(
         decl: &McpServerDecl,
         request_timeout: Duration,
@@ -504,54 +503,109 @@ impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
                 command.env(key, value);
             }
         }
-        // OS-level write confinement (Linux): the MCP server may create,
-        // modify or destroy filesystem state only inside its private cwd.
-        // Reads stay unhandled (the loader must be readable; the model sees
-        // only what the adapter returns). A kernel without landlock
-        // degrades to a warning; a server that cannot be confined does not
-        // start.
-        #[cfg(target_os = "linux")]
+        #[cfg(windows)]
         {
             let mut roots = vec![private.path().to_path_buf()];
             roots.extend(decl.extra_write_roots.iter().cloned());
-            if !agent_process::landlock::available() {
-                eprintln!(
-                    "landlock sandbox skipped: kernel support unavailable \
-                     (OS-level write confinement off for MCP server '{}')",
-                    decl.program
-                );
-            } else {
-                let rules = agent_process::landlock::ChildRules::open(&roots).map_err(|e| {
-                    AgentError::Tool(format!("landlock sandbox setup for MCP server: {e}"))
+            agent_process::integrity::label_write_roots(&roots).map_err(|e| {
+                AgentError::Tool(format!("integrity sandbox setup for MCP server: {e}"))
+            })?;
+            let (program, args) = agent_process::integrity::wrap_command(&decl.program, &decl.args)
+                .map_err(|e| {
+                    AgentError::Tool(format!("spawn MCP server '{}': {e}", decl.program))
                 })?;
-                unsafe {
-                    command.pre_exec(move || agent_process::landlock::apply_in_child(&rules));
+            command = tokio::process::Command::new(&program);
+            command
+                .args(&args)
+                .current_dir(private.path())
+                .env_clear()
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            for key in MCP_ENV_KEYS {
+                if let Ok(value) = std::env::var(key) {
+                    command.env(key, value);
                 }
             }
         }
+        // Unix rlimits and Linux landlock share one pre_exec so a
+        // toolchain that keeps only the last hook cannot drop the memory,
+        // file-size or open-file ceiling when write roots are configured.
+        // RLIMIT_AS is 2 GiB VAS, RLIMIT_FSIZE is 256 MiB and
+        // RLIMIT_NOFILE is 1024 (same defaults as process capabilities).
+        // apply_unix_rlimits also zeros RLIMIT_CORE (`MOD-15`) and on
+        // Linux clamps NICE/RTPRIO and sets no_new_privs (`MOD-16`).
+        // CPU/nproc stay unset here: RLIMIT_NPROC is per-user on Linux
+        // and a small cap can starve MCP handshake threads on a busy CI
+        // host. Inherited fds other than stdio are closed after landlock.
         #[cfg(unix)]
-        command.process_group(0);
+        {
+            const MCP_MAX_MEMORY_BYTES: u64 = 2u64 * 1024 * 1024 * 1024;
+            const MCP_MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+            const MCP_MAX_OPEN_FILES: u64 = 1024;
+            #[cfg(target_os = "linux")]
+            let landlock_rules = {
+                let mut roots = vec![private.path().to_path_buf()];
+                roots.extend(decl.extra_write_roots.iter().cloned());
+                if !agent_process::landlock::available() {
+                    eprintln!(
+                        "landlock sandbox skipped: kernel support unavailable \
+                         (OS-level write/TCP confinement off for MCP server '{}')",
+                        decl.program
+                    );
+                    None
+                } else {
+                    Some(
+                        agent_process::landlock::ChildRules::open(&roots).map_err(|e| {
+                            AgentError::Tool(format!("landlock sandbox setup for MCP server: {e}"))
+                        })?,
+                    )
+                }
+            };
+            unsafe {
+                command.pre_exec(move || {
+                    agent_process::apply_unix_rlimits(
+                        0,
+                        0,
+                        MCP_MAX_MEMORY_BYTES,
+                        MCP_MAX_FILE_BYTES,
+                        MCP_MAX_OPEN_FILES,
+                    )?;
+                    #[cfg(target_os = "linux")]
+                    if let Some(rules) = landlock_rules.as_ref() {
+                        agent_process::landlock::apply_in_child(rules)?;
+                    }
+                    agent_process::close_inherited_fds();
+                    Ok(())
+                });
+            }
+            command.process_group(0);
+        }
         let mut child = command
             .spawn()
             .map_err(|e| AgentError::Tool(format!("spawn MCP server '{}': {e}", decl.program)))?;
-        let pid = child.id();
+        let Some(pid) = child.id() else {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(AgentError::Tool("MCP server pid not available".into()));
+        };
         let stdin = match child.stdin.take() {
             Some(stdin) => stdin,
             None => {
-                terminate_child(&mut child, pid).await;
+                ProcessSupervisor::from_child(child, pid).terminate().await;
                 return Err(AgentError::Tool("MCP server stdin not available".into()));
             }
         };
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                terminate_child(&mut child, pid).await;
+                ProcessSupervisor::from_child(child, pid).terminate().await;
                 return Err(AgentError::Tool("MCP server stdout not available".into()));
             }
         };
         let mut client = Self::new(stdout, stdin, request_timeout, max_frame_bytes);
-        client.child = Some(child);
-        client.pid = pid;
+        client.supervisor = Some(ProcessSupervisor::from_child(child, pid));
         if let Err(error) = client.initialize().await {
             // The handshake failed: the spawned server must not be left
             // running. Kill and reap it before surfacing the error.
@@ -564,34 +618,6 @@ impl McpClient<tokio::process::ChildStdout, tokio::process::ChildStdin> {
         client._private_cwd = Some(private);
         Ok(client)
     }
-}
-
-impl<R, W> Drop for McpClient<R, W> {
-    fn drop(&mut self) {
-        // The child is owned by the client for its whole lifetime; dropping
-        // the connection must never orphan the server process. Explicit
-        // teardown paths (stop, cancel, timeout, poison) kill and reap
-        // first; this backstop kills the tree when the client is dropped
-        // any other way. (`kill_on_drop` on the spawn command covers the
-        // direct child; the tree kill covers descendants.)
-        if let Some(pid) = self.pid.take() {
-            kill_process_tree(pid);
-        }
-        if let Some(child) = self.child.as_mut() {
-            // Drop cannot await, but `kill_on_drop` plus this explicit start
-            // guarantees the direct child is terminated. Awaiting reaping is
-            // reserved for stop/cancel/timeout paths, which all call `reap`.
-            let _ = child.start_kill();
-        }
-    }
-}
-
-async fn terminate_child(child: &mut Child, pid: Option<u32>) {
-    if let Some(pid) = pid {
-        kill_process_tree(pid);
-    }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
 }
 
 fn bounded_tool_text(content: Option<&Vec<Value>>) -> String {
@@ -641,6 +667,9 @@ pub struct McpCapabilityAdapter {
     request_timeout: Duration,
     max_frame_bytes: u64,
     client: tokio::sync::Mutex<Option<McpStdioClient>>,
+    /// Replacements of a poisoned resident server. Discovery connect/reap
+    /// does not count. Connection state is not task or Core authority.
+    restart: RestartCircuit,
 }
 
 impl McpCapabilityAdapter {
@@ -700,7 +729,13 @@ impl McpCapabilityAdapter {
             request_timeout,
             max_frame_bytes,
             client: tokio::sync::Mutex::new(None),
+            restart: RestartCircuit::new(agent_process::DEFAULT_MAX_CONNECTION_RESTARTS),
         })
+    }
+
+    #[cfg(test)]
+    fn with_restart_circuit(self, restart: RestartCircuit) -> Self {
+        Self { restart, ..self }
     }
 }
 
@@ -734,9 +769,14 @@ impl Capability for McpCapabilityAdapter {
         }
         if guard.as_ref().is_none_or(|client| client.is_poisoned()) {
             // A poisoned client (timeout, cancel, framing failure) is
-            // replaced with a fresh connection; the old server tree was
-            // already killed and reaped, so its late output can never be
-            // admitted.
+            // replaced with a fresh connection up to the restart budget;
+            // the old server tree was already killed and reaped, so its
+            // late output can never be admitted. Exhaustion keeps the
+            // poisoned client so the next invoke cannot pretend this is a
+            // first connect.
+            if guard.as_ref().is_some_and(|client| client.is_poisoned()) {
+                self.restart.try_acquire()?;
+            }
             if let Some(mut stale) = guard.take() {
                 stale.reap().await;
             }
@@ -883,6 +923,86 @@ mod tests {
         );
         client.initialize().await.expect("handshake succeeds");
         client
+    }
+
+    #[tokio::test]
+    async fn cancel_sends_notifications_cancelled_then_poisons() {
+        let (client_read, mut server_write) = duplex(64 * 1024);
+        let (mut server_read, client_write) = duplex(64 * 1024);
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            loop {
+                let mut line = Vec::new();
+                let Ok(count) = read_line(&mut server_read, &mut line).await else {
+                    return;
+                };
+                if count == 0 {
+                    return;
+                }
+                let Ok(request) = serde_json::from_slice::<Value>(&line) else {
+                    return;
+                };
+                let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+                if method == MCP_CANCEL_NOTIFICATION {
+                    let _ = seen_tx.send(method.to_string());
+                    std::future::pending::<()>().await;
+                    return;
+                }
+                let id = request.get("id");
+                if id.is_none() {
+                    continue;
+                }
+                if method == "tools/call" {
+                    continue;
+                }
+                let response = match method {
+                    "initialize" => json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {
+                            "protocolVersion": MCP_PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "serverInfo": {"name": "mock", "version": "0.1.0"}
+                        }
+                    }),
+                    _ => json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32601, "message": "method not found"}
+                    }),
+                };
+                let mut frame = serde_json::to_string(&response).unwrap();
+                frame.push('\n');
+                if server_write.write_all(frame.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let mut client = McpClient::new(
+            client_read,
+            client_write,
+            Duration::from_secs(5),
+            1024 * 1024,
+        );
+        client.initialize().await.expect("handshake succeeds");
+        let cancel = CancellationToken::new();
+        let fire = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            fire.cancel();
+        });
+        let error = client
+            .call_tool_with_cancel("mock.echo", json!({"text": "hang"}), &cancel)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AgentError::Cancelled),
+            "MCP cancel must surface as Cancelled: {error}"
+        );
+        assert!(client.is_poisoned());
+        let method = tokio::time::timeout(Duration::from_secs(2), seen_rx)
+            .await
+            .expect("cancel notification observed")
+            .expect("oneshot");
+        assert_eq!(method, MCP_CANCEL_NOTIFICATION);
     }
 
     #[tokio::test]
@@ -1222,6 +1342,7 @@ mod tests {
                     granted_permissions: Vec::new(),
                     workspace: None,
                     artifacts: None,
+                    approved_intent: None,
                     cancel: agent_contracts::CancellationToken::new(),
                 },
             )
@@ -1251,6 +1372,7 @@ mod tests {
                     granted_permissions: Vec::new(),
                     workspace: None,
                     artifacts: None,
+                    approved_intent: None,
                     cancel: agent_contracts::CancellationToken::new(),
                 },
             )
@@ -1262,6 +1384,61 @@ mod tests {
         assert!(
             !output.ok,
             "a server isError must reach the model as ok:false"
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_exhausted_restart_budget_keeps_the_poisoned_client() {
+        let adapter = McpCapabilityAdapter::connect(
+            mock_decl(),
+            ToolRisk::ReadOnly,
+            Duration::from_secs(10),
+            1024 * 1024,
+        )
+        .await
+        .expect("connect + discover succeeds")
+        .with_restart_circuit(RestartCircuit::new(0));
+        let invoke_ctx = || CapabilityInvocationContext {
+            granted_permissions: Vec::new(),
+            workspace: None,
+            artifacts: None,
+            approved_intent: None,
+            cancel: agent_contracts::CancellationToken::new(),
+        };
+        let first = ToolCall {
+            id: "c1".into(),
+            name: "mock.echo".into(),
+            arguments: json!({"text": "once"}),
+        };
+        adapter
+            .invoke(first, invoke_ctx())
+            .await
+            .expect("first connect is not a restart");
+        {
+            let mut guard = adapter.client.lock().await;
+            guard
+                .as_mut()
+                .expect("resident client")
+                .poison("test fence".into());
+        }
+        let second = ToolCall {
+            id: "c2".into(),
+            name: "mock.echo".into(),
+            arguments: json!({"text": "again"}),
+        };
+        let error = adapter.invoke(second, invoke_ctx()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("restart budget exhausted"),
+            "a zero restart budget must not spawn a replacement: {error}"
+        );
+        assert!(
+            adapter
+                .client
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|client| client.is_poisoned()),
+            "exhausted restart must keep the poisoned client"
         );
     }
 
@@ -1308,6 +1485,7 @@ mod tests {
                     granted_permissions: Vec::new(),
                     workspace: None,
                     artifacts: None,
+                    approved_intent: None,
                     cancel: agent_contracts::CancellationToken::new(),
                 },
             )

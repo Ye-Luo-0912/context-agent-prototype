@@ -12,8 +12,9 @@ mod common;
 
 use std::time::Duration;
 
+use agent_contracts::CancellationToken;
 use agent_platform_protocol::{ActiveFeatures, FEATURE_LEGACY_INVOKE_OUTPUT};
-use agent_process::{ProcessHost, ProcessHostConfig, ProcessSandbox};
+use agent_process::{ConnectionHealth, ProcessHost, ProcessHostConfig, ProcessSandbox};
 use serde_json::json;
 
 /// Spawn the `mock_host` bin with `--serve` and the env marker.
@@ -46,6 +47,10 @@ async fn spawn_mock(tune: impl FnOnce(&mut ProcessHostConfig)) -> ProcessHost {
 #[tokio::test]
 async fn normal_exchange_and_graceful_shutdown() {
     let host = spawn_mock(|_| {}).await;
+    let status = host.status();
+    assert_eq!(status.health, ConnectionHealth::Ready);
+    assert_eq!(status.epoch.host, 1);
+    assert_eq!(status.epoch.peer, 1, "mock ping advertises epoch 1");
     let value = host.call(json!({ "op": "ping" })).await.unwrap();
     assert_eq!(value, json!("pong"));
     host.shutdown().await;
@@ -83,6 +88,93 @@ async fn silent_request_times_out_and_poisons_the_connection() {
         second.to_string().contains("poisoned"),
         "expected a poisoned-connection error, got: {second}"
     );
+    assert_eq!(host.status().health, ConnectionHealth::Quarantined);
+    assert_eq!(host.status().epoch.host, 1);
+}
+
+#[tokio::test]
+async fn peer_cancel_ack_quarantines_and_does_not_admit_a_value() {
+    let host = spawn_mock(|_| {}).await;
+    let cancel = CancellationToken::new();
+    let fire = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        fire.cancel();
+    });
+    let error = host
+        .call_with_cancel(json!({ "op": "ack_cancel" }), &cancel)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, agent_contracts::AgentError::Cancelled),
+        "cancel-ACK must surface as Cancelled, got {error}"
+    );
+    assert_eq!(host.status().health, ConnectionHealth::Quarantined);
+    let second = host.call(json!({ "op": "ping" })).await.unwrap_err();
+    assert!(
+        second.to_string().contains("poisoned"),
+        "cancel-ACK still kill-then-reaps: {second}"
+    );
+}
+
+#[tokio::test]
+async fn cancel_without_peer_ack_still_kills_after_the_bound() {
+    let host = spawn_mock(|config| config.request_timeout = Duration::from_secs(5)).await;
+    let cancel = CancellationToken::new();
+    let fire = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        fire.cancel();
+    });
+    let started = std::time::Instant::now();
+    let error = host
+        .call_with_cancel(json!({ "op": "silent" }), &cancel)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, agent_contracts::AgentError::Cancelled));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a silent peer must not stall cancel past the ACK bound"
+    );
+    assert_eq!(host.status().health, ConnectionHealth::Quarantined);
+}
+
+#[tokio::test]
+async fn cancel_before_write_leaves_the_connection_usable() {
+    let host = spawn_mock(|_| {}).await;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let error = host
+        .call_with_cancel(json!({ "op": "ping" }), &cancel)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, agent_contracts::AgentError::Cancelled));
+    assert_eq!(host.status().health, ConnectionHealth::Ready);
+    let value = host.call(json!({ "op": "ping" })).await.unwrap();
+    assert_eq!(value, json!("pong"));
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn progress_frames_are_coalesced_and_the_final_value_is_admitted() {
+    let host = spawn_mock(|_| {}).await;
+    let value = host.call(json!({ "op": "progress" })).await.unwrap();
+    assert_eq!(value, json!("done"));
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn progress_flood_poisons_the_connection() {
+    let host = spawn_mock(|_| {}).await;
+    let error = host
+        .call(json!({ "op": "progress_flood" }))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("too many progress frames"),
+        "progress flood must trip the per-call cap: {error}"
+    );
+    assert_eq!(host.status().health, ConnectionHealth::Quarantined);
 }
 
 #[tokio::test]

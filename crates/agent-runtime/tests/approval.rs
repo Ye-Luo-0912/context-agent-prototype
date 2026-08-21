@@ -43,6 +43,7 @@ impl ContextEngine for TestContextEngine {
             external: agent_contracts::ContextMapView::default(),
             selected: Vec::new(),
             approx_tokens: 0,
+            foreground: Vec::new(),
             diagnostics: ContextDiagnostics::default(),
         })
     }

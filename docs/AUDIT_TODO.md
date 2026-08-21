@@ -574,8 +574,8 @@ Confirmed chain:
 - inherited stderr is unbounded.
 
 External process capabilities must remain disabled until this closes; M13
-is not yet a completed trust boundary. The old wire staging path is now
-fail-closed pending PLAT actual-intent proof.
+is not yet a completed trust boundary. Process wire effects stage only
+after host-proven actual intent; unproven lists stay fail-closed.
 
 Required order:
 
@@ -614,9 +614,8 @@ Implemented:
    not mark any tool `ReadOnly` (ReadOnly auto-allows at the approval
    gate); a `WorkspaceWrite` tool needs `workspace:write`, a
    `ProcessExecution` tool needs `process:run`; a process-transport
-   capability may declare `workspace:write`, but a non-empty process wire
-   effect is currently refused before staging until PLAT actual-intent proof
-   exists (item 8 below).
+   capability may declare `workspace:write`. A process wire effect stages
+   only after host-proven actual intent (item 8 below).
 3. **No direct capability mutation** — the runtime hands a
    `workspace:write` capability a `StagedOnlyWorkspace` handle whose
    `write` is refused ("must be staged") and whose `prepare_write` returns
@@ -648,18 +647,44 @@ Implemented:
    `private_capability_dirs_are_unpredictable_and_path_safe`, and
    `stderr_is_drained_into_a_bounded_tail` (a 4 MiB stderr flood leaves an
    8 KiB tail ending in the newest bytes).
-8. **Wire-level effect contract (temporarily fail-closed)** — `WireEffect`
-   still describes the candidate `workspace_write` shape, but the process
-   adapter rejects every non-empty effect list before base64 decode, staging
-   or workspace mutation. Broad `workspace:write` plus an untrusted path is
-   not proof that actual intent is inside the lease. Empty-effect and legacy
-   plain `ToolOutput` responses remain usable. Re-enabling this path requires
-   PLAT-03/04 to bind `operation_id + effect_id + argument_digest` and typed
-   actual intent to Core authority. Tests assert `prepare_write` remains zero
-   and files remain unchanged with or without a grant/handle. Composite
-   effects remain relevant to trusted in-process builtins: they commit
-   sequentially and now truthfully report Applied+DurabilityFailed when an
-   earlier member landed before a later failure.
+8. **Wire-level effect contract (actual-intent proof, 2026-08-20)** —
+   `WireEffect` still describes the candidate `workspace_write` shape. The
+   process adapter stages exactly one confined write only when
+   `CapabilityInvocationContext.approved_intent` covers the host-canonical
+   actual path and content size (`EffectIntent::covers`) and the invocation
+   holds `workspace:write`. Runtime fills that bound from
+   `derive_effect_intent` (tool-call `path` / `content`). Missing bound,
+   a different path, an unconfined path, missing grant/handle, invalid
+   payload, or more than one effect stay fail-closed before
+   `prepare_write`. Tests:
+   `proven_wire_effect_stages_when_actual_intent_matches_approved_path`,
+   `wire_effect_for_a_different_path_fails_closed_before_prepare_write`,
+   `nonempty_wire_effects_fail_closed_before_workspace_mutation`.
+   Generic `shell.exec` / `process.run` / `process.session` are the typed
+   non-transactional M12 residual: Core identity is required before spawn,
+   spawn/exit is journaled, they return `ToolOutcome::Value`, and cancel
+   kills the tree without rolling back child mutations. The approved
+   `ProcessRun` bound is the command the tool will actually spawn
+   (`command` for `shell.exec`, `argv` for `process.run` /
+   `process.session`); an unused sibling field cannot widen it, and spawn
+   fails closed unless `EffectIntent::covers` holds. Tests:
+   `shell_without_effect_identity_does_not_spawn`,
+   `persist_without_identity_kills_the_child`,
+   `cancelled_shell_does_not_roll_back_a_file_the_child_already_wrote`,
+   `process_run_intent_comes_from_argv_not_an_unused_command_field`,
+   `process_run_grant_matches_argv_not_an_unused_command_field`,
+   `process_session_poll_and_stop_are_not_a_new_process_run`,
+   `process_session_poll_does_not_consume_a_process_grant`,
+   `session_stop_settles_start_as_completed_value_not_unapplied`,
+   `cancelled_process_run_does_not_roll_back_a_file_the_child_already_wrote`,
+   `process_tool_requests_require_core_effect_identity` (covers session
+   poll/stop),
+   `session_start_rejects_a_mismatched_identity_before_spawn`,
+   `session_start_rejects_escaping_cwd`,
+   `session_start_ignores_an_unused_command_field`,
+   `process_run_rejects_a_mismatched_identity_before_spawn`,
+   `dispatcher_refuses_process_session_without_effect_identity`,
+   `dispatcher_refuses_effect_identity_on_readonly_git`.
 9. **Mid-invoke system broker** — a child can issue `{"system": <op>, ...}`
    frames during an invoke; `ProcessHost` (`agent-process`,
    `call_with_cancel_and_broker`) routes them to a `SystemBroker` the
@@ -695,14 +720,36 @@ Implemented:
     feature negotiation remain `PLAT-00/04` work.
 
 Residual (M13; CORE-01 remains open): OS-level filesystem/network isolation
-for the child process — a hostile child can still open arbitrary absolute
-paths or sockets directly at the OS layer (seccomp-bpf / AppContainer-style
-filtering is out of v0 scope) — and Windows Job-Object quota enforcement.
-The mid-invoke system broker is implemented for bounded filesystem reads and
-deny-by-default network requests. Process mutations remain disabled at the
-wire boundary until PLAT actual-intent/operation proof exists; trusted
-in-process staged effects still commit behind the Core-owned
-authority-epoch/lease fence.
+for the child process. Linux landlock now fences writes (`MOD-06`) and, on
+ABI v4+, TCP bind/connect (`MOD-07`, deny-all because no port rules are
+added). ABI v5 denies device ioctl (`MOD-12`). ABI v6 also scopes outbound signals (`MOD-11`). Windows Low-IL write confinement is landed (`MOD-08`): a confined
+child cannot write up to Medium objects outside labeled roots. Unix
+`RLIMIT_AS` is landed (`MOD-09`; capability default 2 GiB VAS). Unix
+`RLIMIT_FSIZE` is landed (`MOD-10`; capability default 256 MiB). Unix
+`RLIMIT_NOFILE` and inherited-fd close are landed (`MOD-13`; capability
+default 1024 fds). The Windows integrity wrap Job-Object caps the real
+child's commit at 512 MiB (`MOD-14`). Unix `RLIMIT_CORE` is forced to zero
+when sandbox `pre_exec` runs (`MOD-15`). Linux `RLIMIT_NICE`/`RLIMIT_RTPRIO`
+are clamped to zero and `no_new_privs` is set in that same hook (`MOD-16`).
+Windows Job-Objects pin `PRIORITY_CLASS=NORMAL` and leave breakaway
+default-deny (`MOD-17`). A hostile
+child can still *read* arbitrary absolute paths and can still open UDP, raw,
+netlink or pathname-Unix sockets; Windows has no OS-level network fence.
+I/O bandwidth quotas remain. Inherited TTY detach (`setsid` / reopen stdio)
+is skipped: ProcessHost already makes the child a process-group leader
+(`process_group(0)`); `setsid` would fail or change the kill-tree pgid.
+Windows `HANDLE_LIST` is skipped (not clean with tokio/std Command). Job UI
+restrictions are skipped (tests flaky). seccomp-bpf / AppContainer-style filtering is
+out of v0 scope. After MOD-17 there is no further allowed v0 sandbox
+slice; do not invent `MOD-18` from that residual. The mid-invoke
+system broker is implemented for bounded
+filesystem reads and deny-by-default network requests. Process `workspace_write`
+wire effects
+stage only after host-proven actual intent; generic shell/process execution
+is the typed non-transactional M12 residual (identity before spawn, argv vs
+command bound, session poll/stop are not a new spawn, session recovery is
+keyed by the start identity, no rollback of child mutations). Trusted in-process staged
+effects still commit behind the Core-owned authority-epoch/lease fence.
 
 ### CORE-10 — Current wire containment landed; common protocol proof remains open
 
@@ -794,9 +841,13 @@ are landed (`PLAT-04`). Adapter envelope migration onto Platform DTOs remains
 later work. Current adapters still lack the
 operation/attempt/scope/deadline fields defined by the landed `PLAT-02`
 envelope. Error paths kill
-owned children synchronously, but
-uniform "kill then await reap before return" belongs to the supervisor/session
-contract in `PLAT-05/06` (MCP already does it explicitly).
+owned children synchronously, then `ProcessHost` and MCP stdio await reap
+via `ProcessSupervisor` (`PLAT-05`). `DuplexTransport` is the byte-duplex
+seam (`FramedProtocolSession`; stdio first backend). Uniform health/epochs
+slice 1 is landed (`ConnectionHealth`, `ConnectionEpoch`, bounded
+`RestartCircuit`; first connect is not a restart). Peer cancel-ACK and
+coalescible progress are landed (`PLAT-06` slice 2; kill-then-reap
+remains settlement). Remaining `PLAT-06`: multiplexing. Named Pipe/UDS remain `PLAT-08`.
 
 `PLAT-02` has now added the pure common envelope/identity/error semantics in
 `agent-platform-protocol`, with strict IDs, exact profiles, explicit response
@@ -1276,13 +1327,50 @@ no SPEC rewrite).
 
 **Follow-up 2026-08-19 (execution module).** `ResumePoint` is now
 `ExecutionState` in `agent-runtime/src/execution/` (checkpoint field
-still `resume`). Freshness, needs, and a phase-2 read-memo stub live
+still `resume`). Freshness, needs, and an unwired ObservationMemo stub live
 there; `policy.rs` only maps `ExecutionNeeds` → tool surface. Prompt
 authority framing is `TASK ORIGIN` / `PERSISTENT TASK STATE` /
 `CURRENT DIRECTIVE`. Each `fs.read` ToolFinished is stamped with an E2E
-motive (`checked-fresh` vs `warm`/`stored` vs `selected-current`) so GC
-extra rounds can be counted separately from identity-known duplicates.
+motive (`checked-fresh` vs `warm`/`stored` vs `body-visible-current`
+vs `descriptor-only`) so GC extra rounds can be counted separately from
+identity-known duplicates and from "the prompt only showed `path@rev`".
+Checked projection is Fresh-only. Verification obligation persists
+across user turns; `verification_due_now` decides whether to Prefer
+Verify this round. Natural-language verify is a frozen four-needle
+soft hint, not a growing dictionary, and is ignored unless an
+obligation already exists. Tool-role name fallback is known legacy
+builtins only (`fs.delete` / unknown plugins have no role). No
+builtin declares `Verify`; do not add `verify.run(command)`.
+Foreground Evidence Projection copies at most two current-directive
+exact-mention file bodies into the prompt without changing residency.
+A structurally empty 0/0 model completion is a
+transport anomaly, not `TurnCompleted`.
 Do not enable ObservationMemo dispatch and do not memoize writes.
+First wired version, when coherence is done, is `fs.read` only.
+
+**Freeze candidate 2026-08-19.** Context operational core is a freeze
+candidate. Auto-reactivation left the extra-round problem on latest C
+(`reactivation_events=1`, selected/consumed 0). Do not retune GC
+thresholds or the reactivation scorer. Do not add Typed EpisodeOutcome,
+a smarter scorer, vectors, embeddings, RAG, a learned router, or a new
+GC generation algorithm. Execution Coherence V1 is four phases (world
+facts → freshness → obligation ledger → round projection) with three
+invariants (Unknown ≠ False; obligation ≠ due now; identity ≠ body in
+prompt). Next mechanism live is `--context-mech`, not another
+`recall_after_fix` pass. Live coding compare now reuses production
+`ToolLifecycleConfig::default()`. Scripted `--compare-arm` and
+context-bench/mech ops still pin write/edit and `context.manage`.
+`--compare-live-reasonable` runs only `add_test`. After this write-up, main engineering is M12/M13
+(with PLAT-06 beside the residual).
+
+**Closeout 2026-08-21 (items 21–29).** The operator freeze list now
+lives in `docs/STATUS.md` § Execution Coherence closeout. GC knobs are
+freeze-pinned; live coding uses the production tool surface; live
+`recall_after_fix` is refused; ObservationMemo stays unwired; the
+four-phase algorithm and three invariants stand. Item 24
+(`context.manage` catalog-only except NeedEvidence / EXTERNAL CONTEXT)
+is closed. This does not close M12, M13, or PLAT-06. After MOD-17 there is no
+further allowed v0 sandbox slice.
 
 **Live 2026-08-19.** `recall_after_fix` n=1 compare is in
 `crates/agent-eval/evidence/roles-verify-recall/REPORT.md`. C extra
@@ -1817,7 +1905,7 @@ Required direction:
   a tool or changes its lifecycle;
 - [x] derive typed tool roots from execution need → `ToolSpec.roles`
   (`Verify` → capability search → `EscapeHatch` for NeedVerify; InspectDiff
-  is not a verifier) at the existing BeforeModel safe point;
+  is not a verifier; unstamped plugins are not EscapeHatch) at the existing BeforeModel safe point;
 - [x] `MustSurface` tools are selected or produce explicit unsatisfiable
   reports; `PreferSurface` omissions are observable but do not mutate
   lifecycle; `KeepReady` stays cheap to reactivate without entering prompts;
@@ -2105,9 +2193,12 @@ Landed 2026-08-16:
   Do not collect 300×3 cells. Wave-1 live is 27 cells (repeats=1) under
   `crates/agent-eval/evidence/context-bench-wave1/`; it includes fixture-turn
   timeouts and A/C discordance, so second repeat is only for discordant,
-  anomalous cost, or unexplained tasks — not automatic. Before another live
-  wave, close `TOOL-ENV-01` → `TOOL-EDIT-01` → `TOOL-VIEW-01` →
-  `TOOL-ERROR-01` and rerun the same frozen cells.
+  anomalous cost, or unexplained tasks — not automatic. Tool-quality
+  preflight (`TOOL-ENV-01` → `TOOL-EDIT-01` → `TOOL-VIEW-01` →
+  `TOOL-ERROR-01`) closed in code 2026-08-17. A later-milestone rerun of
+  the same frozen cells is still required before causal C claims; that
+  rerun is live eval, not v0 engineering. Do not retune scoring. Frozen
+  SPEC/pack digest are untouched.
 
 **Benchmark ambiguity from the earlier draft is closed for this frozen pack.**
 Task identity hashes JSON + seed + golden + checker; hidden command sources are
@@ -2122,8 +2213,9 @@ call, not a `rate_limit` substring. `FROZEN_SPEC_SHA256` and
 `FROZEN_PACK_DIGEST` move with that amendment. `context.manage` no longer
 surfaces `gc_hint`; `item_id` accepts `context://run/<uuid>`.
 
-The remaining evaluator residual is typed tool-failure attribution and a clean
-rerun after the tool-quality preflight, not weaker verification.
+The remaining evaluator residual is a later-milestone frozen-cell rerun
+after the closed tool-quality preflight, not weaker verification and not
+reopening `TOOL-ENV-01`…`TOOL-ERROR-01`.
 
 Until closure, M15, V2, learned/vector policy and PLAT-08 evidence gates stay
 closed. M12/M13 remain independent trusted-execution blockers.

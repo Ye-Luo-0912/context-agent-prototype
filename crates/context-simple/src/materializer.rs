@@ -1,19 +1,26 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
+use std::path::Path;
+
 use agent_contracts::{
     AttentionState, CONTEXT_MAP_VIEW_CAP, ContextItem, ContextItemId, ContextMapView, ContextQuery,
-    ContextRetention, ContextSelection, MaterializedContext, MaterializedItem, ScopeId, ScopeKind,
-    ScopeState, ScoreBreakdown, checked_files_cover_path, normalize_resource_path,
+    ContextRetention, ContextSelection, MAX_FOREGROUND_RESOURCES, MAX_FOREGROUND_TOKENS,
+    MaterializedContext, MaterializedItem, ScopeId, ScopeKind, ScopeState, ScoreBreakdown,
+    checked_files_cover_path, normalize_resource_path,
 };
 
 use crate::diagnostics;
 use crate::engine::{SimpleContextConfig, State};
 use crate::gc::reachability::is_excluded;
 use crate::index::dependency::MAX_DEPENDENCY_EDGES;
-use crate::index::entity::{entities_match_exact, observation_file_path};
+use crate::index::entity::{
+    entities_match_exact, is_file_body_entry, is_file_body_observation, observation_file_path,
+    observation_file_path_entry,
+};
 use crate::item::{approx_tokens, short_id};
 use crate::policy::score_item_with_breakdown;
+use crate::store;
 
 /// Per-snapshot cap on items pulled in by dependency expansion.
 const MAX_EXPANSION_ITEMS: usize = 8;
@@ -447,12 +454,22 @@ pub(crate) fn materialize(
     }
 
     selected_indices.sort_by_key(|index| state.items[*index].created_tick);
+    state.selected_body_paths.clear();
+    state.selected_descriptor_paths.clear();
+    state.external_descriptor_paths.clear();
     for &index in &selected_indices {
-        if let Some(path) = crate::index::entity::observation_file_path(&state.items[index]) {
-            let path = normalize_resource_path(path);
-            if !path.is_empty() {
-                state.selected_file_paths.insert(path);
-            }
+        let item = &state.items[index];
+        let Some(path) = crate::index::entity::observation_file_path(item) else {
+            continue;
+        };
+        let path = normalize_resource_path(path);
+        if path.is_empty() {
+            continue;
+        }
+        if prices_as_file_body_descriptor(item, &query.hints.checked_files) {
+            state.selected_descriptor_paths.insert(path);
+        } else {
+            state.selected_body_paths.insert(path);
         }
     }
     let items: Vec<MaterializedItem> = selected_indices
@@ -483,6 +500,20 @@ pub(crate) fn materialize(
     // the runtime assembler's share and is charged after this snapshot.
     let checked_files = merged_checked_files(state, query);
     let external = external_view(state, &state.hot_entities, &checked_files);
+    for entry in external.iter() {
+        if let Some(path) = entry.file_path.as_deref() {
+            let path = normalize_resource_path(path);
+            if path.is_empty() {
+                continue;
+            }
+            if state.selected_body_paths.contains(&path)
+                || state.selected_descriptor_paths.contains(&path)
+            {
+                continue;
+            }
+            state.external_descriptor_paths.insert(path);
+        }
+    }
     let approx_tokens_total = items
         .iter()
         .map(|item| approx_tokens(&item.content))
@@ -510,6 +541,7 @@ pub(crate) fn materialize(
         selected: selections,
         approx_tokens: approx_tokens_total,
         diagnostics: diagnostics::compute(state),
+        foreground: Vec::new(),
     }
 }
 
@@ -806,4 +838,181 @@ fn packed_item_tokens(item: &ContextItem, checked_files: &[String]) -> usize {
     } else {
         approx_tokens(&item.content)
     }
+}
+
+/// One current-directive file body to project. Memory sources are cloned
+/// under the state lock; store ids are read after the lock is dropped.
+pub(crate) enum ForegroundPlanItem {
+    Ready(Box<ContextItem>),
+    Store(ContextItemId),
+}
+
+pub(crate) fn plan_foreground(
+    state: &State,
+    query: &ContextQuery,
+    selected: &[MaterializedItem],
+) -> Vec<ForegroundPlanItem> {
+    let mut plan = Vec::new();
+    for key in &query.hints.foreground_resources {
+        if plan.len() >= MAX_FOREGROUND_RESOURCES {
+            break;
+        }
+        let path = normalize_resource_path(&key.path);
+        if path.is_empty() {
+            continue;
+        }
+        if selected_includes_file_body(selected, &path) {
+            continue;
+        }
+        let revision = key.revision.as_deref();
+        if let Some(item) = best_live_file_body(state.items.iter(), &path, revision) {
+            plan.push(ForegroundPlanItem::Ready(Box::new(item.clone())));
+            continue;
+        }
+        if let Some(item) = best_live_file_body(state.eviction_buffer.iter(), &path, revision) {
+            plan.push(ForegroundPlanItem::Ready(Box::new(item.clone())));
+            continue;
+        }
+        if let Some(id) = best_stored_file_body(state, &path, revision) {
+            plan.push(ForegroundPlanItem::Store(id));
+        }
+    }
+    plan
+}
+
+pub(crate) async fn realize_foreground(
+    plan: Vec<ForegroundPlanItem>,
+    dir: &Path,
+) -> Vec<MaterializedItem> {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for source in plan {
+        if out.len() >= MAX_FOREGROUND_RESOURCES || used >= MAX_FOREGROUND_TOKENS {
+            break;
+        }
+        let Some(item) = (match source {
+            ForegroundPlanItem::Ready(item) => Some(*item),
+            ForegroundPlanItem::Store(id) => store::read_item_async(dir, id).await,
+        }) else {
+            continue;
+        };
+        if !item.semantic.is_live() || !is_file_body_observation(&item) {
+            continue;
+        }
+        let remaining = MAX_FOREGROUND_TOKENS.saturating_sub(used);
+        let content = clip_to_token_budget(&item.content, remaining);
+        if content.is_empty() {
+            continue;
+        }
+        used = used.saturating_add(approx_tokens(&content));
+        out.push(MaterializedItem {
+            item_id: item.id,
+            kind: item.kind,
+            scope: item.scope,
+            attention: item.attention,
+            semantic: item.semantic,
+            retention: item.retention,
+            content,
+            source: item.source.clone(),
+            file_path: item.file_path.clone(),
+            file_revision: item.file_revision.clone(),
+        });
+    }
+    out
+}
+
+fn selected_includes_file_body(selected: &[MaterializedItem], path: &str) -> bool {
+    selected.iter().any(|item| {
+        let Some(item_path) = item
+            .file_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        if normalize_resource_path(item_path) != path {
+            return false;
+        }
+        let descriptor = match item
+            .file_revision
+            .as_deref()
+            .map(str::trim)
+            .filter(|revision| !revision.is_empty())
+        {
+            Some(revision) => format!("{path}@{revision}"),
+            None => path.to_string(),
+        };
+        item.content != descriptor
+    })
+}
+
+fn revision_ok(item_revision: Option<&str>, wanted: Option<&str>) -> bool {
+    let wanted = wanted.map(str::trim).filter(|value| !value.is_empty());
+    let item_revision = item_revision
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (wanted, item_revision) {
+        (None, _) | (Some(_), None) => true,
+        (Some(wanted), Some(have)) => wanted == have,
+    }
+}
+
+fn best_live_file_body<'a>(
+    items: impl Iterator<Item = &'a ContextItem>,
+    path: &str,
+    revision: Option<&str>,
+) -> Option<&'a ContextItem> {
+    items
+        .filter(|item| item.semantic.is_live() && is_file_body_observation(item))
+        .filter(|item| {
+            observation_file_path(item)
+                .map(normalize_resource_path)
+                .as_deref()
+                == Some(path)
+        })
+        .filter(|item| revision_ok(item.file_revision.as_deref(), revision))
+        .max_by_key(|item| (item.created_tick, item.last_access_tick))
+}
+
+fn best_stored_file_body(
+    state: &State,
+    path: &str,
+    revision: Option<&str>,
+) -> Option<ContextItemId> {
+    state
+        .external
+        .iter()
+        .filter(|entry| store::externally_retrievable(entry) && is_file_body_entry(entry))
+        .filter(|entry| {
+            observation_file_path_entry(entry)
+                .map(normalize_resource_path)
+                .as_deref()
+                == Some(path)
+        })
+        .filter(|entry| revision_ok(entry.file_revision.as_deref(), revision))
+        .max_by_key(|entry| (entry.created_tick, entry.last_access_tick))
+        .map(|entry| entry.item_id)
+}
+
+fn clip_to_token_budget(text: &str, max_tokens: usize) -> String {
+    if max_tokens == 0 {
+        return String::new();
+    }
+    if approx_tokens(text) <= max_tokens {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let prefix: String = chars[..mid].iter().collect();
+        if approx_tokens(&prefix) <= max_tokens {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    chars[..lo].iter().collect()
 }

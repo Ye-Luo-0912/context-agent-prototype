@@ -170,6 +170,21 @@ impl TurnFrame {
             .any(|step| matches!(step, TurnFrameStep::AssistantToolCalls { .. }))
     }
 
+    /// Persistable tool results already on this turn. A structurally empty
+    /// model stop after these is a real "I'm done"; the same empty 0/0
+    /// before any such delta is a transport/parser hole.
+    pub fn has_persistable_tool_delta(&self) -> bool {
+        self.steps.iter().any(|step| {
+            matches!(
+                step,
+                TurnFrameStep::ToolResult {
+                    disposition: ToolResultDisposition::PersistObservation,
+                    ..
+                }
+            )
+        })
+    }
+
     /// Render the stack as protocol messages: the user message first, then
     /// assistant(tool_calls) / tool(tool_call_id) pairs in execution order.
     pub fn messages(&self) -> Vec<ModelMessage> {
@@ -341,6 +356,15 @@ pub struct ModelUsage {
     pub retries: u32,
 }
 
+/// Whether a model round is a usable completion or a transport/parser hole.
+/// An empty assistant with no tool calls is only an anomaly when usage is
+/// also missing (`0/0`); a billed empty stop is a real "I'm done".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCompletionValidity {
+    Meaningful,
+    StructurallyEmpty,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelOutput {
     pub content: String,
@@ -348,6 +372,27 @@ pub struct ModelOutput {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default)]
     pub usage: ModelUsage,
+}
+
+impl ModelOutput {
+    pub fn completion_validity(&self) -> ModelCompletionValidity {
+        completion_validity(&self.content, &self.tool_calls, &self.usage)
+    }
+}
+
+/// `content` empty, no tool calls, and both usage counters absent or zero.
+pub fn completion_validity(
+    content: &str,
+    tool_calls: &[ToolCall],
+    usage: &ModelUsage,
+) -> ModelCompletionValidity {
+    let input = usage.input_tokens.unwrap_or(0);
+    let output = usage.output_tokens.unwrap_or(0);
+    if content.trim().is_empty() && tool_calls.is_empty() && input == 0 && output == 0 {
+        ModelCompletionValidity::StructurallyEmpty
+    } else {
+        ModelCompletionValidity::Meaningful
+    }
 }
 
 #[async_trait]
@@ -486,5 +531,32 @@ mod tests {
         assert_eq!(parsed.role, ModelRole::User);
         assert!(parsed.tool_calls.is_empty());
         assert!(parsed.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn empty_zero_usage_is_structurally_empty() {
+        let usage = ModelUsage::default();
+        assert_eq!(
+            completion_validity("", &[], &usage),
+            ModelCompletionValidity::StructurallyEmpty
+        );
+        let billed = ModelUsage {
+            input_tokens: Some(12),
+            output_tokens: Some(0),
+            attempts: 1,
+            retries: 0,
+        };
+        assert_eq!(
+            completion_validity("", &[], &billed),
+            ModelCompletionValidity::Meaningful
+        );
+        assert_eq!(
+            completion_validity("ok", &[], &usage),
+            ModelCompletionValidity::Meaningful
+        );
+        assert_eq!(
+            completion_validity("", &[tool_call("c1")], &usage),
+            ModelCompletionValidity::Meaningful
+        );
     }
 }

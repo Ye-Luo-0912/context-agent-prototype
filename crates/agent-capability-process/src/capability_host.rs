@@ -13,12 +13,13 @@ use std::time::Duration;
 
 use agent_contracts::{
     AgentError, AgentResult, Capability, CapabilityInvocationContext, CapabilityManifest,
-    CapabilityOutcome, CapabilityTransport, ProcessInvokeResponse, ToolCall, ToolRisk,
-    WORKSPACE_READ, WORKSPACE_WRITE, WorkspaceHandle, validate_capability_id,
+    CapabilityOutcome, CapabilityTransport, EffectIntent, ProcessInvokeResponse, ToolCall,
+    ToolRisk, WORKSPACE_READ, WORKSPACE_WRITE, WireEffect, WorkspaceHandle, validate_capability_id,
 };
 use agent_platform_protocol::FEATURE_LEGACY_INVOKE_OUTPUT;
 use agent_process::{
-    MAX_SYSTEM_REQUESTS_PER_CALL, ProcessHost, ProcessHostConfig, ProcessSandbox, SystemBroker,
+    MAX_SYSTEM_REQUESTS_PER_CALL, ProcessHost, ProcessHostConfig, ProcessSandbox, RestartCircuit,
+    SystemBroker,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -32,8 +33,10 @@ pub struct ProcessCapabilityAdapter {
     manifest: CapabilityManifest,
     config: ProcessHostConfig,
     /// `None` until `start()` connects the child; the capability is not
-    /// usable before then.
+    /// usable before then. Quarantined hosts stay in the slot until a
+    /// restart is acquired.
     host: Mutex<Option<ProcessHost>>,
+    restart: RestartCircuit,
 }
 
 /// How many raw bytes one brokered `fs.read` answer may carry. The control
@@ -118,15 +121,34 @@ impl ProcessCapabilityAdapter {
                 stderr_capture_bytes: 64 * 1024,
                 // A per-process memory ceiling enforced by the Job-Object,
                 // so a runaway capability child cannot exhaust the machine.
-                // Unix relies on rlimits only.
                 #[cfg(windows)]
                 job_max_memory_bytes: 512 * 1024 * 1024,
-                // OS-level write confinement (Linux): the child may create,
-                // modify or destroy filesystem state only inside its own
-                // private dir. Reads are gated by the app-level broker; this
-                // is the kernel fence no application logic can bypass.
+                // Virtual address-space ceiling on Unix (`RLIMIT_AS`). This
+                // is coarser than the Windows commit charge; 2 GiB still
+                // bounds a runaway allocator without failing ordinary exec.
+                #[cfg(unix)]
+                max_memory_bytes: 2u64 * 1024 * 1024 * 1024,
+                // Per-file size ceiling (`RLIMIT_FSIZE`). Bounds a child
+                // filling its private write root; not I/O bandwidth.
+                #[cfg(unix)]
+                max_file_bytes: 256 * 1024 * 1024,
+                // Open-file ceiling (`RLIMIT_NOFILE`). Bounds fd
+                // exhaustion; inherited fds other than stdio are closed
+                // in the same pre_exec (`MOD-13`). That hook also zeros
+                // RLIMIT_CORE so a crash cannot dump secrets (`MOD-15`).
+                // On Linux it also clamps NICE/RTPRIO and sets
+                // no_new_privs (`MOD-16`).
+                #[cfg(unix)]
+                max_open_files: 1024,
+                // OS-level write confinement (Linux landlock / Windows Low IL):
+                // the child may create, modify or destroy filesystem state
+                // only inside its own private dir. Reads are gated by the
+                // app-level broker; this is the kernel fence no application
+                // logic can bypass.
                 #[cfg(target_os = "linux")]
                 landlock_write_roots: vec![private_dir.clone()],
+                #[cfg(windows)]
+                integrity_write_roots: vec![private_dir.clone()],
             },
         };
         Ok(Self::with_config(manifest, config))
@@ -139,6 +161,7 @@ impl ProcessCapabilityAdapter {
             manifest,
             config,
             host: Mutex::new(None),
+            restart: RestartCircuit::new(agent_process::DEFAULT_MAX_CONNECTION_RESTARTS),
         }
     }
 }
@@ -154,8 +177,17 @@ impl Capability for ProcessCapabilityAdapter {
 
     async fn start(&self) -> AgentResult<()> {
         let mut slot = self.host.lock().await;
-        if slot.is_some() {
-            return Ok(()); // already connected
+        if let Some(host) = slot.as_ref() {
+            if host.status().health.allows_call() {
+                return Ok(());
+            }
+            // Quarantined: replace only within the restart budget. Keep the
+            // dead host if the budget is exhausted so the next start cannot
+            // look like a first connect.
+            self.restart.try_acquire()?;
+            if let Some(old) = slot.take() {
+                old.shutdown().await;
+            }
         }
         *slot = Some(ProcessHost::connect(self.config.clone()).await?);
         Ok(())
@@ -180,18 +212,10 @@ impl Capability for ProcessCapabilityAdapter {
                 self.manifest.id
             ))
         })?;
-        // The process receives the call plus the granted permissions so it
-        // knows what it may do. The current `{output, effects}` envelope is
-        // always accepted. Plain `ToolOutput` requires a ping-negotiated
-        // `legacy.invoke-output.v1` feature. A non-empty wire-effect
-        // list is quarantined below: the current wire shape carries only a
-        // broad permission word, not a host-derived/canonical actual intent
-        // that Core can prove is inside the invocation lease. Staging such
-        // an effect would let a child widen a narrow path authorization.
-        // Mid-invoke, the child may also send *system requests* (a brokered
-        // filesystem read): the broker answers them from the confined
-        // workspace handle, so the child's filesystem access is brokered
-        // and permission-gated, never a direct absolute-path read.
+        // Mid-invoke system requests stay brokered. A non-empty wire-effect
+        // list stages only after the host proves the canonical actual intent
+        // is covered by the approved bound; otherwise the path stays
+        // fail-closed so a child cannot widen a narrow path authorization.
         let broker = InvokeFsBroker {
             id: &self.manifest.id,
             grant: &ctx.granted_permissions,
@@ -223,11 +247,7 @@ impl Capability for ProcessCapabilityAdapter {
         if response.effects.is_empty() {
             return Ok(CapabilityOutcome::Value(response.output));
         }
-        Err(AgentError::InvalidRequest(format!(
-            "capability '{}' returned {} wire effect(s), but process wire effects are disabled until the host can prove canonical actual intent is within the invocation lease; no workspace mutation was staged",
-            self.manifest.id,
-            response.effects.len()
-        )))
+        stage_proven_wire_effects(&self.manifest.id, &ctx, response).await
     }
 }
 
@@ -259,6 +279,93 @@ fn decode_process_invoke_response(
     response.output.call_id = request_call_id;
     response.output.tool_name = request_tool_name;
     Ok(response)
+}
+
+fn unproven_wire_effects(id: &str, count: usize) -> AgentError {
+    AgentError::InvalidRequest(format!(
+        "capability '{id}' returned {count} wire effect(s), but process wire effects are disabled until the host can prove canonical actual intent is within the invocation lease; no workspace mutation was staged"
+    ))
+}
+
+/// Stage process wire effects only when each actual write is covered by the
+/// approved invocation intent. Identity without a covering bound, a
+/// widened path, missing `workspace:write`, or an unconfined path stays
+/// fail-closed and never calls `prepare_write`.
+async fn stage_proven_wire_effects(
+    id: &str,
+    ctx: &CapabilityInvocationContext,
+    response: ProcessInvokeResponse,
+) -> AgentResult<CapabilityOutcome> {
+    let count = response.effects.len();
+    let [WireEffect::WorkspaceWrite { path, content_b64 }] = response.effects.as_slice() else {
+        return Err(unproven_wire_effects(id, count));
+    };
+    if !ctx
+        .granted_permissions
+        .iter()
+        .any(|permission| permission == WORKSPACE_WRITE)
+    {
+        return Err(unproven_wire_effects(id, count));
+    }
+    let Some(approved) = ctx.approved_intent.as_ref() else {
+        return Err(unproven_wire_effects(id, count));
+    };
+    let confined = confined_relative_path(id, path)?;
+    let content = decode_wire_content(id, content_b64)?;
+    let actual = EffectIntent::WorkspaceWrite {
+        path: confined.to_string(),
+        content_bytes: content.len() as u64,
+    };
+    if !approved.covers(&actual) {
+        return Err(unproven_wire_effects(id, count));
+    }
+    let workspace = ctx.workspace.as_ref().ok_or_else(|| {
+        AgentError::InvalidRequest(format!(
+            "capability '{id}' returned {count} wire effect(s), but process wire effects are disabled until the host can prove canonical actual intent is within the invocation lease; no workspace mutation was staged"
+        ))
+    })?;
+    let effect = workspace.prepare_write(confined, &content).await?;
+    Ok(CapabilityOutcome::EffectRequest {
+        output: response.output,
+        effect,
+    })
+}
+
+fn decode_wire_content(id: &str, content_b64: &str) -> AgentResult<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(content_b64)
+        .map_err(|_| {
+            AgentError::InvalidRequest(format!(
+                "capability '{id}' returned 1 wire effect(s), but process wire effects are disabled until the host can prove canonical actual intent is within the invocation lease; no workspace mutation was staged"
+            ))
+        })
+}
+
+fn confined_relative_path<'a>(id: &str, path: &'a str) -> AgentResult<&'a str> {
+    let relative = std::path::Path::new(path);
+    if path.is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(AgentError::InvalidRequest(format!(
+            "capability '{id}' requested an absolute or empty path '{path}'"
+        )));
+    }
+    if relative
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(AgentError::InvalidRequest(format!(
+            "capability '{id}' requested an escaping path '{path}'"
+        )));
+    }
+    Ok(path)
 }
 
 /// A broker for the child's mid-invoke system requests. Slice 1 brokers
@@ -327,36 +434,7 @@ impl InvokeFsBroker<'_> {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| AgentError::InvalidRequest("fs.read requires a string 'path'".into()))?;
-        // Confined by construction: the broker never hands an absolute,
-        // rooted or `..`-escaping path to the workspace handle — the
-        // handle confines too, but the broker must not depend on the
-        // handle's implementation for the security boundary. A rooted path
-        // like `/etc/passwd` (or `\foo`) is refused even where the OS
-        // does not consider it "absolute" (Windows).
-        let relative = std::path::Path::new(path);
-        if path.is_empty()
-            || relative.is_absolute()
-            || relative.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::RootDir | std::path::Component::Prefix(_)
-                )
-            })
-        {
-            return Err(AgentError::InvalidRequest(format!(
-                "capability '{}' requested an absolute or empty path '{path}'",
-                self.id
-            )));
-        }
-        if relative
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            return Err(AgentError::InvalidRequest(format!(
-                "capability '{}' requested an escaping path '{path}'",
-                self.id
-            )));
-        }
+        let relative = confined_relative_path(self.id, path)?;
         let workspace = self.workspace.ok_or_else(|| {
             AgentError::InvalidRequest(format!(
                 "capability '{}' has no workspace handle: '{WORKSPACE_READ}' was not granted",
@@ -364,7 +442,7 @@ impl InvokeFsBroker<'_> {
             ))
         })?;
         let content = workspace
-            .read_bounded(path, BROKER_FS_READ_MAX_BYTES)
+            .read_bounded(relative, BROKER_FS_READ_MAX_BYTES)
             .await?;
         // The control plane is not a file transport: a large file is
         // served as a bounded prefix with a truncation marker, never copied

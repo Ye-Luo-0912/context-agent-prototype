@@ -65,13 +65,19 @@ pub struct RunMetrics {
     pub repeated_fs_reads: u64,
     /// Engine-classified `fs.read` attribution (last diagnostics snapshot).
     pub reread_previously_selected: u64,
+    pub reread_selected_descriptor: u64,
+    pub reread_external_descriptor: u64,
     pub reread_resident_unselected: u64,
     pub reread_warm: u64,
     pub reread_stored: u64,
     pub reread_first_read: u64,
     /// E2E `fs.read` motive from Runtime-stamped ToolFinished metadata.
+    /// Use these to answer "did GC add rounds?" (`warm`/`stored`) vs
+    /// identity-known duplicates (`checked-fresh`) vs "prompt only had
+    /// `path@rev`" (`descriptor-only`) vs trajectory (`body-visible-current`).
     pub reread_motive_first: u64,
-    pub reread_motive_selected_current: u64,
+    pub reread_motive_body_visible_current: u64,
+    pub reread_motive_descriptor_only: u64,
     pub reread_motive_checked_fresh: u64,
     pub reread_motive_needs_revalidation: u64,
     pub reread_motive_warm: u64,
@@ -241,9 +247,10 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 {
                     match motive {
                         FsReadMotive::First => metrics.reread_motive_first += 1,
-                        FsReadMotive::SelectedCurrent => {
-                            metrics.reread_motive_selected_current += 1
+                        FsReadMotive::BodyVisibleCurrent => {
+                            metrics.reread_motive_body_visible_current += 1
                         }
+                        FsReadMotive::DescriptorOnly => metrics.reread_motive_descriptor_only += 1,
                         FsReadMotive::CheckedFresh => metrics.reread_motive_checked_fresh += 1,
                         FsReadMotive::NeedsRevalidation => {
                             metrics.reread_motive_needs_revalidation += 1
@@ -574,6 +581,8 @@ fn snapshot_access(metrics: &mut RunMetrics, diagnostics: &agent_contracts::Cont
     metrics.reactivation_file_observation_consumed =
         diagnostics.reactivation_file_observation_consumed;
     metrics.reread_previously_selected = diagnostics.reread_previously_selected;
+    metrics.reread_selected_descriptor = diagnostics.reread_selected_descriptor;
+    metrics.reread_external_descriptor = diagnostics.reread_external_descriptor;
     metrics.reread_resident_unselected = diagnostics.reread_resident_unselected;
     metrics.reread_warm = diagnostics.reread_warm;
     metrics.reread_stored = diagnostics.reread_stored;
@@ -621,8 +630,8 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          prompt_layers: system={} facts={} anchor={} progress={} focus={} history={} turn={} tools={}\n\
          compaction: in={} out={}\n\
          behavior: tool_calls={} failed_outputs={} spills={} output_chars={} repeated_fs_reads={}\n\
-         reread: previously_selected={} resident_unselected={} warm={} stored={} first_read={}\n\
-         reread_motive: first={} selected_current={} checked_fresh={} needs_revalidation={} warm={} stored={} changed={}\n\
+         reread: previously_selected={} selected_descriptor={} external_descriptor={} resident_unselected={} warm={} stored={} first_read={}\n\
+         reread_motive: first={} body_visible_current={} descriptor_only={} checked_fresh={} needs_revalidation={} warm={} stored={} changed={}\n\
          selected_attr: kind={:?} reason={:?} source={:?} reactivated={} resident={}\n\
          tool_failures: {:?}\n",
         metrics.model_input_tokens,
@@ -702,12 +711,15 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.output_chars_total,
         metrics.repeated_fs_reads,
         metrics.reread_previously_selected,
+        metrics.reread_selected_descriptor,
+        metrics.reread_external_descriptor,
         metrics.reread_resident_unselected,
         metrics.reread_warm,
         metrics.reread_stored,
         metrics.reread_first_read,
         metrics.reread_motive_first,
-        metrics.reread_motive_selected_current,
+        metrics.reread_motive_body_visible_current,
+        metrics.reread_motive_descriptor_only,
         metrics.reread_motive_checked_fresh,
         metrics.reread_motive_needs_revalidation,
         metrics.reread_motive_warm,
@@ -1355,5 +1367,31 @@ mod tests {
         assert_eq!(metrics.reread_motive_checked_fresh, 1);
         assert_eq!(metrics.reread_motive_first, 0);
         assert!(render_metrics(&metrics).contains("checked_fresh=1"));
+    }
+
+    #[test]
+    fn legacy_selected_current_motive_counts_as_body_visible() {
+        let run = RunId::new();
+        let events = vec![envelope(
+            run,
+            1,
+            RuntimeEvent::ToolFinished {
+                output: ToolOutput {
+                    call_id: "r1".into(),
+                    tool_name: "fs.read".into(),
+                    ok: true,
+                    summary: "read".into(),
+                    model_content: "body".into(),
+                    artifact_ref: None,
+                    metadata: json!({
+                        "path": "src/util.py",
+                        FS_READ_MOTIVE_KEY: "selected-current",
+                    }),
+                },
+            },
+        )];
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.reread_motive_body_visible_current, 1);
+        assert_eq!(metrics.reread_motive_descriptor_only, 0);
     }
 }

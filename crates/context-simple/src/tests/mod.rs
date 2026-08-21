@@ -2,6 +2,7 @@ mod admit;
 mod directive;
 mod distill;
 mod entity;
+mod foreground;
 mod harness;
 mod lifecycle;
 mod residency;

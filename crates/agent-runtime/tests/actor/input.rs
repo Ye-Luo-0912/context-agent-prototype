@@ -440,3 +440,62 @@ async fn applied_user_input_is_consumed_then_archived_when_the_turn_commits() {
     );
     handle.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn structurally_empty_model_completion_does_not_complete_the_turn() {
+    use std::sync::atomic::Ordering;
+
+    let model = Arc::new(StructurallyEmptyModel::default());
+    let (handle, _task) = start(model.clone()).await;
+    let mut events = handle.subscribe();
+    handle
+        .user_message("Append to src/scratch.md: printer is in room 4B.".into())
+        .await
+        .unwrap();
+
+    let (saw_error, saw_completed, saw_consumed) =
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut saw_error = false;
+            let mut saw_completed = false;
+            let mut saw_consumed = false;
+            loop {
+                match events.recv().await {
+                    Ok(envelope) => match envelope.event {
+                        RuntimeEvent::Error { message } => {
+                            assert!(
+                                message.contains("structurally empty"),
+                                "unexpected error: {message}"
+                            );
+                            saw_error = true;
+                            break;
+                        }
+                        RuntimeEvent::TurnCompleted => saw_completed = true,
+                        RuntimeEvent::UserMessageAccepted { input }
+                            if input.lifecycle == agent_contracts::InputLifecycle::Consumed =>
+                        {
+                            saw_consumed = true;
+                        }
+                        _ => {}
+                    },
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            (saw_error, saw_completed, saw_consumed)
+        })
+        .await
+        .expect("structurally empty completion was not fenced");
+
+    assert!(saw_error);
+    assert!(!saw_completed, "empty 0/0 must not TurnCompleted");
+    assert!(
+        !saw_consumed,
+        "empty retries must not publish input Consumed"
+    );
+    assert_eq!(
+        model.calls.load(Ordering::SeqCst),
+        3,
+        "one attempt plus two bounded retries"
+    );
+    handle.stop().await.unwrap();
+}

@@ -54,6 +54,8 @@ pub(crate) fn compute(state: &State) -> ContextDiagnostics {
         compaction_input_tokens: state.compaction_input_tokens,
         compaction_output_tokens: state.compaction_output_tokens,
         reread_previously_selected: state.reread_previously_selected,
+        reread_selected_descriptor: state.reread_selected_descriptor,
+        reread_external_descriptor: state.reread_external_descriptor,
         reread_resident_unselected: state.reread_resident_unselected,
         reread_warm: state.reread_warm,
         reread_stored: state.reread_stored,

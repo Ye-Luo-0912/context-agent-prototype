@@ -206,9 +206,12 @@ impl ApprovalAuthority {
 /// `Applied`+`DurabilityFailed` means the effect landed but its record did
 /// not, `Unknown` means the applied state can never be learned back).
 /// Every effect that has actually been staged by a trusted in-process path
-/// commits through this one seam. Process-capability `WireEffect`s currently
-/// fail closed before staging; PLAT-03/04 must bind their actual intent to a
-/// recoverable operation/effect identity before that path can use this seam.
+/// commits through this one seam. Process-capability `WireEffect`s stage
+/// only after the host proves the actual intent is covered by the approved
+/// invocation bound; unproven lists stay fail-closed before `prepare_write`.
+/// Generic `shell.exec` / `process.run` / `process.session` never commit
+/// here: they are the typed non-transactional exception (Core identity
+/// before spawn, spawn/exit journal, `ToolOutcome::Value`, no rollback).
 pub struct EffectAuthority;
 
 impl EffectAuthority {

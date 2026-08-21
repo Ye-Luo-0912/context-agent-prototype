@@ -14,21 +14,22 @@ use std::{
 use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
     AgentError, AgentResult, AnchorPatchKind, ArgumentDigest, ArtifactLocator, AuthorityLease,
-    AuthorityRecoveryStatus, CAPABILITY_MANAGE, CONTEXT_CONSUMPTION_ACK_ITEM_CAP,
+    AuthorityRecoveryStatus, CAPABILITY_MANAGE, CONTEXT_CONSUMPTION_ACK_ITEM_CAP, CONTEXT_MANAGE,
     CancellationToken, CompletionProposal, ContextConsumptionAck, ContextHints, ContextIngress,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention,
     DISCOVERY_IDENTICAL_QUERY_BUDGET, DISCOVERY_MAX_QUERIES_PER_TURN, DiscoveryBudgetExhausted,
     DiscoveryTurnBudget, Effect, EffectDurability, EffectId, EffectReceipt, FocusState,
     FsRereadClass, InputAuthority, InputKind, InputLifecycle, InputSource,
-    MAX_COMPLETION_ARTIFACTS, MaterializedContext, ModelInput, ModelRequest, OperationId,
-    OperationOutcome, OperationQueryResult, OperationResult, OperationState, OperationTerminal,
-    ResourceVersionOracle, RestoreRevision, RunId, RuntimeDirective, RuntimeEvent,
-    RuntimeInputEnvelope, RuntimeInputId, ScopeId, ScopeKind, StatePatchProposal, TaskAnchorView,
-    TaskId, TaskProgressView, ToolCall, ToolOperationIdentity, ToolOutcome, ToolOutput,
-    ToolResultDisposition, ToolSpec, ToolSurfaceBlock, ToolSurfaceBlockReason, ToolSurfaceDemand,
-    ToolSurfaceSnapshot, TurnCancelAck, TurnCancellationReason, TurnFrame, TurnFrameStep, TurnId,
-    USER_INPUT_ARTIFACT_OWNER, USER_INPUT_PREVIEW_CHARS, USER_INPUT_QUEUE_CAP, bounded_preview,
-    context_maintenance_events, discovery_search_from_call,
+    MAX_COMPLETION_ARTIFACTS, MAX_FOREGROUND_TOKENS, MaterializedContext, ModelCompletionValidity,
+    ModelInput, ModelRequest, OperationId, OperationOutcome, OperationQueryResult, OperationResult,
+    OperationState, OperationTerminal, ResourceKey, ResourceVersionOracle, RestoreRevision, RunId,
+    RuntimeDirective, RuntimeEvent, RuntimeInputEnvelope, RuntimeInputId, ScopeId, ScopeKind,
+    StatePatchProposal, TaskAnchorView, TaskId, TaskProgressView, ToolCall, ToolOperationIdentity,
+    ToolOutcome, ToolOutput, ToolResultDisposition, ToolSpec, ToolSurfaceBlock,
+    ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceSnapshot, TurnCancelAck,
+    TurnCancellationReason, TurnFrame, TurnFrameStep, TurnId, USER_INPUT_ARTIFACT_OWNER,
+    USER_INPUT_PREVIEW_CHARS, USER_INPUT_QUEUE_CAP, bounded_preview, context_maintenance_events,
+    discovery_search_from_call,
 };
 use agent_core::{
     ApprovalVerdict, CorePort, EffectCommitDisposition, EffectCommitRejection, EffectCommitRequest,
@@ -177,6 +178,11 @@ struct InFlightOp {
     cancel: CancellationToken,
 }
 
+/// Bounded retries of a structurally empty provider completion (empty
+/// content, no tool calls, 0/0 usage) when this turn has no persistable
+/// tool delta yet. The first empty response plus this many retries.
+const MAX_STRUCTURALLY_EMPTY_RETRIES: u8 = 2;
+
 /// The runtime's view of the active turn: the execution stack (TurnFrame),
 /// how many model rounds ran, tool calls still waiting to run, and the
 /// One turn's mutable state: the model round counter, the tool calls the
@@ -203,6 +209,8 @@ struct ActiveTurn {
     applied_input: Option<RuntimeInputEnvelope>,
     /// 已经为这条 applied input 发过 Consumed。
     input_consumed: bool,
+    /// Provider 0/0 empty completions retried this turn. Not checkpointed.
+    structurally_empty_retries: u8,
 }
 
 /// Raw assistant evidence is ephemeral runtime state, not task authority.

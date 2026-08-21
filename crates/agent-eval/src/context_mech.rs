@@ -1,6 +1,9 @@
 //! Mechanism V2: three one-mechanism scenarios. Independent of frozen
 //! `agent-eval.context-bench.v1`. Structural CI is pack self-check plus
-//! unit tests; live `--context-mech-run` is optional (2–3 repeats).
+//! unit tests; live `--context-mech-run` is the next mechanism instrument
+//! (`late_semantic_constraint` is the non-Anchor GC-recall test). Do not
+//! keep live-running `recall_after_fix`; that fixture's diagnostic
+//! mission is complete. Keep its scripted `--compare-arm` tests.
 
 use std::fs;
 use std::path::PathBuf;
@@ -27,6 +30,8 @@ engines=dynamic only
 repeats=2
 frozen_context_bench_v1=untouched
 semantic_recall_v1=long-protocol trajectory only; do not keep live-running it
+recall_after_fix=diagnostic complete; keep scripted tests; do not keep live-running it
+next_live=context-mech.v2; late_semantic_constraint is the non-Anchor recall test
 ";
 
 pub fn mech_root() -> PathBuf {

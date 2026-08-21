@@ -14,14 +14,16 @@
 
 use std::collections::HashSet;
 
-use agent_contracts::{ToolSemanticRole, ToolSpec, ToolSurfaceDemand, ToolSurfaceRequirement};
+use agent_contracts::{
+    CONTEXT_MANAGE, ToolSemanticRole, ToolSpec, ToolSurfaceDemand, ToolSurfaceRequirement,
+};
 
 use crate::task::TaskAnchor;
 
 /// Revision of this typed root-derivation policy. Bumped only when the
 /// derivation rules change; recorded as the execution-policy source while
 /// an active call pins its tool.
-pub const TASK_ROOT_POLICY_REVISION: u64 = 5;
+pub const TASK_ROOT_POLICY_REVISION: u64 = 8;
 
 /// Hard cap on derived roots per round, so a pathological anchor can never
 /// grow the requirement set past the explicit-set bound. The explicit
@@ -43,13 +45,18 @@ pub struct TaskRootInput<'a> {
     pub active_tool: Option<&'a str>,
     /// Candidate catalog specs for this round (roles, not just names).
     pub catalog: &'a [ToolSpec],
-    /// True when a verification obligation is currently due (stale or
-    /// failed identity, user asked to verify). Not "acceptance is nonempty".
+    /// True when a verification obligation is due *this round* (failed
+    /// verification, unmet obligation plus complete/coverage/soft-NL
+    /// verify, never NL-alone). Not "acceptance is nonempty".
     pub verification_due: bool,
-    /// Current user-turn directive. Drives NeedMutate; not TaskSpec.
+    /// Current user-turn directive. Used for explore-without-anchor; not
+    /// a planner for mutation.
     pub turn_intent: Option<&'a str>,
     /// Open failed-command rows. Drives NeedRepair.
     pub has_failures: bool,
+    /// Warm/Cold/Stored catalog or upcoming EXTERNAL CONTEXT refs.
+    /// Drives NeedEvidence → `context.manage`.
+    pub has_external_context: bool,
 }
 
 /// Deterministic execution needs for one BeforeModel round. No planner.
@@ -64,16 +71,6 @@ pub fn derive_execution_policy_revision(active_tool: Option<&str>) -> Option<u64
     active_tool.map(|_| TASK_ROOT_POLICY_REVISION)
 }
 
-/// Conservative user-turn signal that this instruction is asking to verify.
-/// Not a planner and not command-needle classification of tool output.
-pub fn turn_requests_verify(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("run the tests")
-        || lower.contains("run tests")
-        || lower.contains("verify that")
-        || lower.contains("check that tests")
-}
-
 /// Derive typed tool roots from the safe-point state.
 ///
 /// Rules (explicit, deterministic, in priority order; each root names the
@@ -84,6 +81,7 @@ pub fn turn_requests_verify(message: &str) -> bool {
 /// 2. `derive_needs` → semantic roles → catalog specs.
 ///    NeedVerify: `Verify` → capability search → `EscapeHatch`.
 ///    InspectDiff is never pulled in as a verifier.
+///    NeedEvidence: PreferSurface `context.manage` (catalog retrieval).
 /// 3. Focus goal without an anchor still explores when there is a query.
 ///
 /// Roots are de-duplicated by tool name, only name tools that exist in the
@@ -124,6 +122,7 @@ pub fn derive_task_roots(input: TaskRootInput<'_>) -> Vec<ToolSurfaceRequirement
         input.anchor,
         input.verification_due,
         input.has_failures,
+        input.has_external_context,
     );
 
     if needs.verify {
@@ -149,6 +148,13 @@ pub fn derive_task_roots(input: TaskRootInput<'_>) -> Vec<ToolSurfaceRequirement
                 "current instruction needs mutation tools"
             );
         }
+    }
+    if needs.evidence {
+        push_root!(
+            ToolSurfaceDemand::PreferSurface,
+            CONTEXT_MANAGE,
+            "EXTERNAL CONTEXT / NeedEvidence needs catalog retrieval"
+        );
     }
 
     roots
@@ -290,6 +296,7 @@ mod tests {
             verification_due: false,
             turn_intent: None,
             has_failures: false,
+            has_external_context: false,
         });
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].tool_name, "search.grep");
@@ -323,16 +330,11 @@ mod tests {
             verification_due: false,
             turn_intent: None,
             has_failures: false,
+            has_external_context: false,
         });
-        // Acceptance nonempty does not prefer verify tools. Exploration +
-        // mutation only; shell.exec is never a verify member.
-        let mut expected: Vec<&str> = vec![
-            "fs.list",
-            "fs.read",
-            "search.grep",
-            "fs.write",
-            "edit.replace",
-        ];
+        // Acceptance nonempty does not prefer verify tools. Exploration
+        // only: mutation is not inferred from plan_progress or intent.
+        let mut expected: Vec<&str> = vec!["fs.list", "fs.read", "search.grep"];
         expected.sort_unstable();
         let mut actual = names(&roots);
         actual.sort_unstable();
@@ -359,6 +361,7 @@ mod tests {
             verification_due: true,
             turn_intent: None,
             has_failures: false,
+            has_external_context: false,
         });
         // The active call still pins the one real tool.
         assert_eq!(names(&roots), vec!["demo.one"]);
@@ -376,6 +379,7 @@ mod tests {
             verification_due: false,
             turn_intent: None,
             has_failures: false,
+            has_external_context: false,
         });
         let mut actual = names(&roots);
         actual.sort_unstable();
@@ -402,6 +406,7 @@ mod tests {
             verification_due: true,
             turn_intent: None,
             has_failures: false,
+            has_external_context: false,
         });
         assert_eq!(names(&roots), vec!["tests.run"]);
         assert_eq!(roots[0].reason, "verification capability is available");
@@ -424,6 +429,7 @@ mod tests {
             verification_due: true,
             turn_intent: None,
             has_failures: false,
+            has_external_context: false,
         });
         assert_eq!(names(&roots), vec![agent_contracts::CAPABILITY_MANAGE]);
         assert_eq!(
@@ -434,6 +440,26 @@ mod tests {
             !names(&roots).iter().any(|name| {
                 *name == "git.diff" || *name == "git.status" || *name == "shell.exec"
             })
+        );
+    }
+
+    #[test]
+    fn unknown_plugin_is_not_an_escape_hatch_for_need_verify() {
+        let catalog = catalog(&["git.status", "git.diff", "plugin.generated", "fs.delete"]);
+        let anchor = anchor_with(true, false, false, false);
+        let roots = derive_task_roots(TaskRootInput {
+            anchor: Some(&anchor),
+            focus_goal: Some("goal"),
+            active_tool: None,
+            catalog: &catalog,
+            verification_due: true,
+            turn_intent: None,
+            has_failures: false,
+            has_external_context: false,
+        });
+        assert!(
+            roots.is_empty(),
+            "unstamped plugins and fs.delete must not become verifiers: {roots:?}"
         );
     }
 
@@ -449,6 +475,7 @@ mod tests {
             verification_due: true,
             turn_intent: None,
             has_failures: false,
+            has_external_context: false,
         });
         assert_eq!(names(&roots), vec!["shell.exec"]);
         assert_eq!(
@@ -469,6 +496,7 @@ mod tests {
             verification_due: false,
             turn_intent: None,
             has_failures: false,
+            has_external_context: false,
         });
         assert!(roots.is_empty());
     }
@@ -494,6 +522,7 @@ mod tests {
             verification_due: true,
             turn_intent: None,
             has_failures: false,
+            has_external_context: false,
         });
         let b = derive_task_roots(TaskRootInput {
             anchor: Some(&anchor),
@@ -503,6 +532,7 @@ mod tests {
             verification_due: true,
             turn_intent: None,
             has_failures: false,
+            has_external_context: false,
         });
         assert_eq!(a, b);
         assert!(a.len() <= MAX_DERIVED_TOOL_ROOTS);
@@ -519,12 +549,13 @@ mod tests {
             verification_due: false,
             turn_intent: None,
             has_failures: false,
+            has_external_context: false,
         });
         assert!(roots.is_empty());
     }
 
     #[test]
-    fn note_turn_intent_prefers_mutate_not_verify() {
+    fn note_turn_intent_does_not_prefer_mutate() {
         let catalog = catalog(&[
             "fs.write",
             "edit.replace",
@@ -542,14 +573,91 @@ mod tests {
             verification_due: false,
             turn_intent: Some("Append to src/scratch.md: HDMI is in drawer 3"),
             has_failures: false,
+            has_external_context: false,
         });
-        let mut actual = names(&roots);
-        actual.sort_unstable();
-        assert_eq!(actual, vec!["edit.replace", "fs.write"]);
         assert!(
-            !actual
-                .iter()
-                .any(|name| *name == "git.diff" || *name == "shell.exec")
+            roots.is_empty(),
+            "a note turn must not surface mutation apps: {roots:?}"
+        );
+    }
+
+    #[test]
+    fn question_intent_does_not_prefer_mutate() {
+        let catalog = catalog(&["fs.write", "edit.replace", "fs.read"]);
+        let anchor = anchor_with(true, false, false, false);
+        let roots = derive_task_roots(TaskRootInput {
+            anchor: Some(&anchor),
+            focus_goal: Some("goal"),
+            active_tool: None,
+            catalog: &catalog,
+            verification_due: false,
+            turn_intent: Some("what is the current status of this file?"),
+            has_failures: false,
+            has_external_context: false,
+        });
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn need_evidence_prefers_context_manage() {
+        let catalog = catalog(&[CONTEXT_MANAGE, "fs.read", "search.grep"]);
+        let roots = derive_task_roots(TaskRootInput {
+            anchor: None,
+            focus_goal: None,
+            active_tool: None,
+            catalog: &catalog,
+            verification_due: false,
+            turn_intent: None,
+            has_failures: false,
+            has_external_context: true,
+        });
+        assert_eq!(names(&roots), vec![CONTEXT_MANAGE]);
+        assert_eq!(roots[0].demand, ToolSurfaceDemand::PreferSurface);
+        assert_eq!(
+            roots[0].reason,
+            "EXTERNAL CONTEXT / NeedEvidence needs catalog retrieval"
+        );
+    }
+
+    #[test]
+    fn evidence_refs_prefer_context_manage_without_external_catalog() {
+        let catalog = catalog(&[CONTEXT_MANAGE, "fs.read"]);
+        let mut anchor = anchor_with(false, false, false, false);
+        anchor.evidence_refs = vec![crate::task::ContextRootClaim {
+            item_ref: "context://run/evidence".into(),
+            role: RootClaimRole::Verification,
+            strength: crate::task::RootClaimStrength::StorageRequired,
+            source_field_id: "evidence_refs".into(),
+        }];
+        let roots = derive_task_roots(TaskRootInput {
+            anchor: Some(&anchor),
+            focus_goal: Some("goal"),
+            active_tool: None,
+            catalog: &catalog,
+            verification_due: false,
+            turn_intent: None,
+            has_failures: false,
+            has_external_context: false,
+        });
+        assert_eq!(names(&roots), vec![CONTEXT_MANAGE]);
+    }
+
+    #[test]
+    fn no_need_evidence_does_not_prefer_context_manage() {
+        let catalog = catalog(&[CONTEXT_MANAGE, "fs.read"]);
+        let roots = derive_task_roots(TaskRootInput {
+            anchor: None,
+            focus_goal: None,
+            active_tool: None,
+            catalog: &catalog,
+            verification_due: false,
+            turn_intent: None,
+            has_failures: false,
+            has_external_context: false,
+        });
+        assert!(
+            roots.is_empty(),
+            "catalog-only context.manage must stay off without NeedEvidence: {roots:?}"
         );
     }
 }

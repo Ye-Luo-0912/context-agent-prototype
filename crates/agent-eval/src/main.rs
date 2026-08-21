@@ -75,11 +75,18 @@ fn usage() -> ! {
          Same three engines and hidden verification as --compare-arm, but\n\
          each cell uses a real model (OPENAI_*) on a fresh workspace.\n\
          Each fixture sends its live_turns (one prompt for the original\n\
-         four; five for recall_after_fix). Tool-loop capped. Put --repeats\n\
-         first (1..=8). --compare-live-reasonable runs add_test plus\n\
-         recall_after_fix. Live cells always write a versioned evidence\n\
-         bundle (default target/eval-evidence/<unix-secs>). This is the\n\
-         live paired smoke, not the 300×3 gate.\n\
+         four). Tool-loop capped. Put --repeats first (1..=8).\n\
+         --compare-live-reasonable runs only add_test.\n\
+         --compare-live-all excludes recall_after_fix.\n\
+         --compare-live / --fixture-live recall_after_fix is refused:\n\
+         that diagnostic is complete (scripted --compare-arm remains).\n\
+         Next mechanism live is --context-mech-run. Live coding\n\
+         cells use production ToolLifecycleConfig::default() (write/edit/\n\
+         context.manage stay catalog-only except NeedEvidence). Scripted\n\
+         --compare-arm, fixtures, and context-bench/mech ops still pin\n\
+         write/edit and context.manage. Live cells always write a versioned\n\
+         evidence bundle (default target/eval-evidence/<unix-secs>). This\n\
+         is the live paired smoke, not the 300×3 gate.\n\
          \n\
          usage: agent-eval --show-evidence <cell-dir|pair-dir>\n\
          \n\
@@ -166,10 +173,13 @@ fn usage() -> ! {
          usage: agent-eval --context-mech\n\
          usage: agent-eval [--repeats N] [--evidence-dir <dir>] --context-mech-run [id]\n\
          \n\
-         Mechanism V2: three one-mechanism scenarios (late constraint,\n\
-         resume freshness, no-semantic episode). Dynamic engine only.\n\
-         Default repeats=2. Does not rewrite frozen context-bench.v1.\n\
-         This does not close M15 and does not open the 300×3 ITT gate.\n"
+         Mechanism V2: three one-mechanism scenarios. late_semantic_constraint\n\
+         is the non-Anchor GC-recall test; resume_operational_state covers\n\
+         verify→mutate→switch→resume freshness; no_semantic_episode is the\n\
+         distill-skip case. Dynamic engine only. Default repeats=2.\n\
+         Does not rewrite frozen context-bench.v1. Do not keep live-running\n\
+         recall_after_fix. This does not close M15 and does not open the\n\
+         300×3 ITT gate.\n"
     );
     std::process::exit(2);
 }
@@ -255,6 +265,9 @@ async fn main() -> anyhow::Result<()> {
                 let Some(id) = args.next() else {
                     usage();
                 };
+                if let Some(reason) = workload::live_coding_refused(&id) {
+                    anyhow::bail!("{reason}");
+                }
                 let fixture = workload::FIXTURES
                     .iter()
                     .find(|fixture| fixture.id == id)
@@ -347,6 +360,9 @@ async fn main() -> anyhow::Result<()> {
                 let Some(id) = args.next() else {
                     usage();
                 };
+                if let Some(reason) = workload::live_coding_refused(&id) {
+                    anyhow::bail!("{reason}");
+                }
                 let fixture = workload::FIXTURES
                     .iter()
                     .find(|fixture| fixture.id == id)
@@ -355,14 +371,15 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             "--compare-live-all" => {
-                let fixtures: Vec<&workload::CodingFixture> = workload::FIXTURES.iter().collect();
+                let fixtures: Vec<&workload::CodingFixture> =
+                    workload::live_coding_compare_fixtures().collect();
                 run_live_compare(&fixtures, repeats, evidence_dir).await?;
                 return Ok(());
             }
             "--compare-live-reasonable" => {
                 let fixtures: Vec<&workload::CodingFixture> = workload::FIXTURES
                     .iter()
-                    .filter(|fixture| fixture.id == "add_test" || fixture.id == "recall_after_fix")
+                    .filter(|fixture| fixture.id == "add_test")
                     .collect();
                 run_live_compare(&fixtures, repeats, evidence_dir).await?;
                 return Ok(());

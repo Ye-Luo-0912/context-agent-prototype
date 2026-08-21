@@ -100,12 +100,107 @@ pub fn normalize_resource_path(path: &str) -> String {
     stripped.chars().take(MAX_RESOURCE_PATH_CHARS).collect()
 }
 
+/// Exact path or basename mention in a current directive. The needle must
+/// sit on a path-token boundary, so `util.py` does not match `utils.py`
+/// and `a.rs` does not match `ba.rs`. Not semantic similarity.
+pub fn path_exactly_in_directive(directive: &str, path: &str) -> bool {
+    let path = normalize_resource_path(path);
+    if path.is_empty() {
+        return false;
+    }
+    let directive = directive.replace('\\', "/");
+    if contains_as_path_token(&directive, &path) {
+        return true;
+    }
+    std::path::Path::new(&path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != path)
+        .is_some_and(|name| contains_as_path_token(&directive, name))
+}
+
+fn contains_as_path_token(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(rel) = haystack[start..].find(needle) {
+        let abs = start + rel;
+        let before_ok = abs == 0 || is_path_token_boundary(haystack.as_bytes()[abs - 1]);
+        let after = abs + needle.len();
+        let after_ok =
+            after == haystack.len() || is_path_token_boundary(haystack.as_bytes()[after]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs.saturating_add(1);
+        if start >= haystack.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn is_path_token_boundary(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'/' | b'\\'
+            | b' '
+            | b'\t'
+            | b'\n'
+            | b'\r'
+            | b'"'
+            | b'\''
+            | b'`'
+            | b':'
+            | b','
+            | b';'
+            | b'('
+            | b')'
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+            | b'<'
+            | b'>'
+    )
+}
+
+/// How this path appeared in the last model prompt, independent of
+/// engine residency. Selecting a context item is not the same as packing
+/// its file body: a Checked identity may be selected as `path@rev`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FileExposure {
+    SelectedBody,
+    SelectedDescriptor,
+    ExternalDescriptor,
+    NotSelected,
+}
+
+impl FileExposure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SelectedBody => "selected-body",
+            Self::SelectedDescriptor => "selected-descriptor",
+            Self::ExternalDescriptor => "external-descriptor",
+            Self::NotSelected => "not-selected",
+        }
+    }
+}
+
 /// Why this `fs.read` happened, given the engine's current catalog.
-/// Mutually exclusive; classified against current residency, not history.
+/// Mutually exclusive; classified against current residency *and* last
+/// prompt exposure, not "item was selected".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FsRereadClass {
+    /// File body was packed into the last prompt.
     PreviouslySelected,
+    /// Item was selected but packed as `path@rev`, not the body.
+    SelectedDescriptor,
+    /// Path appeared only as an EXTERNAL CONTEXT `path@rev` ref.
+    ExternalDescriptor,
     ResidentUnselected,
     Warm,
     Stored,
@@ -116,10 +211,23 @@ impl FsRereadClass {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::PreviouslySelected => "previously-selected",
+            Self::SelectedDescriptor => "selected-descriptor",
+            Self::ExternalDescriptor => "external-descriptor",
             Self::ResidentUnselected => "resident-unselected",
             Self::Warm => "warm",
             Self::Stored => "stored",
             Self::FirstRead => "first-read",
+        }
+    }
+
+    pub fn exposure(self) -> FileExposure {
+        match self {
+            Self::PreviouslySelected => FileExposure::SelectedBody,
+            Self::SelectedDescriptor => FileExposure::SelectedDescriptor,
+            Self::ExternalDescriptor => FileExposure::ExternalDescriptor,
+            Self::ResidentUnselected | Self::Warm | Self::Stored | Self::FirstRead => {
+                FileExposure::NotSelected
+            }
         }
     }
 }
@@ -128,13 +236,25 @@ impl FsRereadClass {
 /// Runtime resource-fact freshness. Mutually exclusive. Engine-only
 /// [`FsRereadClass`] remains the GC/residency axis; this is the E2E
 /// "why did the model need to re-read?" axis.
+///
+/// | Motive | Meaning |
+/// | `first` | Normal first exploration |
+/// | `body-visible-current` | Body was in the last prompt; model trajectory |
+/// | `descriptor-only` | Last prompt had identity only; model needed the body |
+/// | `checked-fresh` | Identity known and the body had no clear need |
+/// | `needs-revalidation` | Runtime should hash; the model should not `fs.read` |
+/// | `warm` | GC moved the body to the eviction buffer |
+/// | `stored` | Deeper GC rehydration from the store |
+/// | `changed` | Digest actually moved; a reread is justified |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FsReadMotive {
     /// First exploration of this path.
     First,
-    /// Body was in the last prompt; the model still re-read (trajectory).
-    SelectedCurrent,
+    /// File body was actually in the last prompt; the model still re-read.
+    BodyVisibleCurrent,
+    /// Last prompt only had `path@rev` (selected or external descriptor).
+    DescriptorOnly,
     /// Runtime already knew `path@revision` was Fresh.
     CheckedFresh,
     /// Runtime was uncertain; VersionOracle should have settled this.
@@ -151,7 +271,8 @@ impl FsReadMotive {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::First => "first",
-            Self::SelectedCurrent => "selected-current",
+            Self::BodyVisibleCurrent => "body-visible-current",
+            Self::DescriptorOnly => "descriptor-only",
             Self::CheckedFresh => "checked-fresh",
             Self::NeedsRevalidation => "needs-revalidation",
             Self::Warm => "warm",
@@ -163,7 +284,8 @@ impl FsReadMotive {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "first" => Some(Self::First),
-            "selected-current" => Some(Self::SelectedCurrent),
+            "body-visible-current" | "selected-current" => Some(Self::BodyVisibleCurrent),
+            "descriptor-only" => Some(Self::DescriptorOnly),
             "checked-fresh" => Some(Self::CheckedFresh),
             "needs-revalidation" => Some(Self::NeedsRevalidation),
             "warm" => Some(Self::Warm),
@@ -815,6 +937,19 @@ pub struct ContextHints {
     /// onto `MaterializedContext` for prompt rendering.
     #[serde(default)]
     pub checked_files: Vec<String>,
+    /// Current-directive exact-mention ∩ ExecutionState known paths.
+    /// Engines may transiently project those file bodies for this request
+    /// without changing residency (no Warm→Resident, no Stored Admit).
+    #[serde(default)]
+    pub foreground_resources: Vec<ResourceKey>,
+}
+
+/// Workspace path identity used by prompt hints. Not a GC residency key.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ResourceKey {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
 }
 
 /// Hard cap on the anchor-root projection the runtime pushes into one
@@ -826,6 +961,12 @@ pub const MAX_ANCHOR_ROOT_CLAIMS: usize = 64;
 /// GC pass. Matches the ResumePoint file cache; extra rows are dropped
 /// from the front (oldest) so the engine never sees an unbounded set.
 pub const MAX_CHECKED_FILE_HINTS: usize = 32;
+
+/// Max file bodies in one CURRENT FOREGROUND EVIDENCE projection.
+pub const MAX_FOREGROUND_RESOURCES: usize = 2;
+
+/// Token cap for the combined foreground bodies of one model request.
+pub const MAX_FOREGROUND_TOKENS: usize = 2048;
 
 /// Bounded prompt projection of a `TaskAnchor`. Raw refs and bodies stay
 /// out: the assembler renders this contract in the focus frame, while
@@ -1272,9 +1413,13 @@ pub struct ContextDiagnostics {
     pub compaction_output_tokens: u64,
     /// Cumulative `fs.read` classifications this engine segment.
     /// `warm` + `stored` approximate GC-caused rereads; `previously-selected`
-    /// approximates prompt-ignored rereads.
+    /// is body-in-last-prompt only (not descriptorized `path@rev`).
     #[serde(default)]
     pub reread_previously_selected: u64,
+    #[serde(default)]
+    pub reread_selected_descriptor: u64,
+    #[serde(default)]
+    pub reread_external_descriptor: u64,
     #[serde(default)]
     pub reread_resident_unselected: u64,
     #[serde(default)]
@@ -1347,6 +1492,11 @@ pub struct MaterializedContext {
     pub selected: Vec<ContextSelection>,
     pub approx_tokens: usize,
     pub diagnostics: ContextDiagnostics,
+    /// Transient CURRENT FOREGROUND EVIDENCE bodies. Not a residency
+    /// change: Warm stays Warm, Stored is not Admitted, and consumption
+    /// ack must not stamp these ids.
+    #[serde(default)]
+    pub foreground: Vec<MaterializedItem>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2253,5 +2403,34 @@ mod tests {
             (3..=4).contains(&sentences),
             "keep the contract short, got {sentences} sentences: {prompt}"
         );
+    }
+
+    #[test]
+    fn path_exactly_in_directive_is_a_path_token_not_a_substring() {
+        assert!(path_exactly_in_directive(
+            "Append to src/scratch.md: HDMI is in drawer 3",
+            "src/scratch.md"
+        ));
+        assert!(path_exactly_in_directive(
+            "Append to `src/scratch.md`",
+            "src/scratch.md"
+        ));
+        assert!(path_exactly_in_directive(
+            "edit scratch.md please",
+            "src/scratch.md"
+        ));
+        assert!(!path_exactly_in_directive(
+            "look at src/utils.py",
+            "src/util.py"
+        ));
+        assert!(!path_exactly_in_directive(
+            "look at src/util.py",
+            "src/utils.py"
+        ));
+        assert!(!path_exactly_in_directive("open ba.rs", "a.rs"));
+        assert!(!path_exactly_in_directive(
+            "file.rs.bak is stale",
+            "file.rs"
+        ));
     }
 }

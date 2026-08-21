@@ -1,7 +1,7 @@
 //! PLAT-04 共享适配器故障矩阵。
 //!
 //! 列是当前线协议，不是 Platform 信封（信封迁移在 PLAT-07）：
-//! - process：`FramedProtocolSession` + 解析期 `JsonDecodeBudget`
+//! - process：`DuplexTransport`（双工直连 + `ProcessHost` 管道）+ 解析期 `JsonDecodeBudget`
 //! - context：`serve_session` + 进程内 `AppendOnlyEngine`
 //! - MCP：内存双工 `McpClient`
 //!
@@ -23,7 +23,9 @@ use agent_contracts::{
     ToolRisk, ToolSpec,
 };
 use agent_platform_protocol::{JsonDecodeBudget, decode_value};
-use agent_process::{FrameErrorKind, FramedProtocolSession, ProcessHost, ProcessHostConfig};
+use agent_process::{
+    DuplexTransport, FrameErrorKind, FramedProtocolSession, ProcessHost, ProcessHostConfig,
+};
 use context_baselines::AppendOnlyEngine;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
@@ -77,6 +79,10 @@ fn context_error(output: &[u8]) -> String {
     value["error"].as_str().expect("error string").to_string()
 }
 
+fn process_direct(stream: DuplexStream, max_frame_bytes: usize) -> impl DuplexTransport {
+    FramedProtocolSession::from_stream(stream, max_frame_bytes).unwrap()
+}
+
 fn mcp_client(
     max_frame_bytes: u64,
 ) -> (
@@ -101,7 +107,7 @@ fn mcp_client(
 #[tokio::test]
 async fn malformed_json_fails_closed() {
     let (mut peer, stream) = tokio::io::duplex(1024);
-    let mut session = FramedProtocolSession::from_stream(stream, 1024).unwrap();
+    let mut session = process_direct(stream, 1024);
     peer.write_all(b"this is not json\n").await.unwrap();
     peer.flush().await.unwrap();
     let frame = session.recv().await.unwrap();
@@ -133,7 +139,7 @@ async fn malformed_json_fails_closed() {
 #[tokio::test]
 async fn truncated_and_partial_eof_fail_closed() {
     let (mut peer, stream) = tokio::io::duplex(1024);
-    let mut session = FramedProtocolSession::from_stream(stream, 1024).unwrap();
+    let mut session = process_direct(stream, 1024);
     peer.write_all(b"{\"ok\":true").await.unwrap();
     peer.flush().await.unwrap();
     drop(peer);
@@ -164,7 +170,7 @@ async fn truncated_and_partial_eof_fail_closed() {
 #[tokio::test]
 async fn oversize_frames_fail_closed() {
     let (mut peer, stream) = tokio::io::duplex(8192);
-    let mut session = FramedProtocolSession::from_stream(stream, 32).unwrap();
+    let mut session = process_direct(stream, 32);
     peer.write_all(format!("{}\n", "x".repeat(64)).as_bytes())
         .await
         .unwrap();
@@ -201,7 +207,7 @@ async fn oversize_frames_fail_closed() {
 async fn json_node_bomb_fails_closed_before_the_tree_inflates() {
     let bomb = json_object_array(70_000);
     let (mut peer, stream) = tokio::io::duplex(512 * 1024);
-    let mut session = FramedProtocolSession::from_stream(stream, 512 * 1024).unwrap();
+    let mut session = process_direct(stream, 512 * 1024);
     peer.write_all(bomb.as_bytes()).await.unwrap();
     peer.write_all(b"\n").await.unwrap();
     peer.flush().await.unwrap();
@@ -287,7 +293,7 @@ async fn version_and_schema_mismatch_fail_closed() {
 #[tokio::test]
 async fn duplicate_or_stale_id_frames_fail_closed() {
     let (mut peer, stream) = tokio::io::duplex(4096);
-    let mut session = FramedProtocolSession::from_stream(stream, 1024).unwrap();
+    let mut session = process_direct(stream, 1024);
     let coalesced = "{\"seq\":1}\n{\"seq\":2}\n";
     peer.write_all(coalesced.as_bytes()).await.unwrap();
     peer.flush().await.unwrap();
@@ -409,7 +415,7 @@ async fn cancel_late_poisons_so_a_late_frame_cannot_reconnect() {
 #[tokio::test]
 async fn crash_or_poison_rejects_reuse_instead_of_silent_reconnect() {
     let (mut peer, stream) = tokio::io::duplex(1024);
-    let mut session = FramedProtocolSession::from_stream(stream, 32).unwrap();
+    let mut session = process_direct(stream, 32);
     peer.write_all(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n")
         .await
         .unwrap();
@@ -482,6 +488,7 @@ async fn effect_disconnect_quarantines_process_wire_effects() {
                 granted_permissions: vec!["workspace:write".into()],
                 workspace: None,
                 artifacts: None,
+                approved_intent: None,
                 cancel: CancellationToken::new(),
             },
         )

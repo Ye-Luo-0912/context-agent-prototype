@@ -92,6 +92,9 @@ spawn/exit in a sibling authority journal: never-spawned work is
 window without exit stays `Ambiguous`. Leftover children are killed only
 when the OS create-time token still matches; PID reuse is never killed.
 Process recovery cannot roll back mutations the child already performed.
+`process.session` recovery is keyed by the **start** identity: stop or a
+poll that records exit settles that spawn as `CompletedValue`. Poll/stop
+never spawn, so their own identities stay `NotApplied`.
 Out-of-process capability/MCP invokes now record reserved/dispatch/ack in
 `.focus-agent/authority/remote-effects.jsonl`: never-sent work is
 `NotApplied`, a durable Completed/Failed ack settles as `CompletedValue`,
@@ -168,7 +171,9 @@ distinct registration path and a distinct default posture.
    operation registry and journal-first persistent transitions used for stale
    and duplicate dispatch/commit validation, plus exact startup reconciliation
    for builtin workspace mutations. Generic shell/process spawn/exit
-   evidence is now reconciled the same way; out-of-process capability/MCP
+   evidence is now reconciled the same way, and those tools now fail closed
+   without Core-issued effect identity before spawn (they still cannot
+   roll back mutations the child already performed). Out-of-process capability/MCP
    invokes now use the same reserved/dispatch/ack journal. A future HTTP
    broker must reuse that barrier; peer mutations are never rolled back.
 2. **Platform / runtime orchestrator (`agent-runtime`)** — evolvable
@@ -353,10 +358,16 @@ Important consequences:
 - `context-contextcore` implements `ContextEngine` over a process without
   changing the Platform contract; the framed transport it uses is the shared
   `agent-process` host, so the context service and native process capabilities
-  share one host implementation. This is not yet unified Platform process
-  supervision: each adapter owns lifecycle independently, and MCP has its own
-  stdio client. `PLAT-00` contains the current wire faults; `PLAT-05..07`
-  must still unify supervision, protocol sessions and SDK-facing adapters.
+  share one host implementation. `ProcessHost` composes
+  `ProcessSupervisor` and `DuplexTransport` (`PLAT-05`; stdio first
+  backend) and reaps after kill on poison/timeout/cancel. MCP stdio owns
+  the same `ProcessSupervisor` (JSON-RPC stays MCP's; it does not speak
+  the native ping/invoke host protocol). `PLAT-00` contains the current
+  wire faults; `PLAT-06` slice 1 health/epochs/restart is landed
+  (`ConnectionHealth`, `ConnectionEpoch`, `RestartCircuit`). Peer cancel-ACK
+  and coalescible progress are landed. Remaining
+  `PLAT-06` (multiplexing) and
+  `PLAT-07` SDK-facing adapters remain. Named Pipe/UDS remain `PLAT-08`.
 
 ## 4. Stable contracts
 
@@ -1418,8 +1429,15 @@ explicit `ProcessSandbox` (shared `ProcessHost`, since the crate split in
   limits accidental/relative-path access; it is not `chroot` or a mount
   namespace and cannot block absolute paths.
 - **Process/job limits and CPU quota** — Unix `pre_exec` rlimits
-  (`RLIMIT_CPU`, `RLIMIT_NPROC`) applied right after fork; the adapter
-  sets 60 s CPU and 16 processes.
+  (`RLIMIT_CPU`, `RLIMIT_NPROC`, `RLIMIT_AS`, `RLIMIT_FSIZE`,
+  `RLIMIT_NOFILE`) applied
+  right after fork, in the same closure as landlock (`MOD-09`/`MOD-10`/
+  `MOD-13`); that hook also forces `RLIMIT_CORE=0` (`MOD-15`; not a
+  `0` = unlimited field) and on Linux clamps `RLIMIT_NICE`/`RLIMIT_RTPRIO`
+  plus `no_new_privs` (`MOD-16`). Inherited fds other than stdio are closed after landlock.
+  The adapter sets 60 s CPU, 16 processes, 2 GiB virtual address space,
+  256 MiB per file, and 1024 open files. Windows Job-Object
+  `JOB_OBJECT_LIMIT_PROCESS_MEMORY` remains the commit-charge counterpart.
 - **OS-level write fence (Linux)** — `landlock_write_roots:
   Vec<PathBuf>` (V1-M13/MOD-06): when non-empty, the child applies a
   landlock confinement in `pre_exec` — no_new_privs via `prctl`, a
@@ -1432,6 +1450,51 @@ explicit `ProcessSandbox` (shared `ProcessHost`, since the crate split in
   adapter confines children to their private dir; stdio MCP servers are
   confined to their private temp cwd. Reads stay unhandled (loader must
   remain readable) and are gated by the app-level broker.
+- **OS-level TCP fence (Linux)** — the same ruleset handles TCP
+  bind/connect on Landlock ABI v4+ (`MOD-07`, kernel 6.7+). No port rules
+  are added, so every TCP port is denied. ABI v6 also scopes abstract Unix
+  sockets and outbound signals (`MOD-11`, `LANDLOCK_SCOPE_SIGNAL`) when
+  the kernel accepts that attr. ABI v5 handles device ioctl without
+  granting it (`MOD-12`), so newly opened character/block devices cannot
+  ioctl. UDP, raw sockets and pathname
+  Unix stay unhandled. Windows has no Landlock.
+- **OS-level write fence (Windows)** — `integrity_write_roots:
+  Vec<PathBuf>` (`MOD-08`): when non-empty, the parent labels each root
+  Low and re-spawns through this executable as a wrap that drops to Low IL
+  before CreateProcess of the real program. Low IL cannot write up to
+  Medium objects outside those roots. Reads and TCP stay unhandled. The
+  wrap's Job-Object also caps the real child's commit at 512 MiB (`MOD-14`)
+  and dies on unhandled exceptions, and pins `PRIORITY_CLASS=NORMAL`
+  (`MOD-17`).
+- **Unix address-space ceiling** — `max_memory_bytes` (`MOD-09`): when
+  non-zero, the child `setrlimit(RLIMIT_AS)` in the same `pre_exec` as
+  landlock. Capability children default to 2 GiB VAS; stdio MCP servers
+  get the same memory cap. This counts mappings, not Windows-style commit.
+- **Unix file-size ceiling** — `max_file_bytes` (`MOD-10`): when non-zero,
+  the child `setrlimit(RLIMIT_FSIZE)` in that same `pre_exec`. Capability
+  and stdio MCP children default to 256 MiB per file. Not I/O bandwidth;
+  Windows has no Job-Object equivalent.
+- **Unix open-file ceiling** — `max_open_files` (`MOD-13`): when non-zero,
+  the child `setrlimit(RLIMIT_NOFILE)` in that same `pre_exec`, then
+  closes inherited fds other than stdin/stdout/stderr (bounded scan).
+  Capability and stdio MCP children default to 1024 fds. Not I/O
+  bandwidth.
+- **Unix core-dump disable** — `RLIMIT_CORE=0` (`MOD-15`): whenever
+  `apply_unix_rlimits` runs, both soft and hard core-file limits are
+  forced to zero so a crash cannot dump sandbox secrets. Other rlimit
+  fields keep `0` = unlimited; there is no `max_core_bytes` field.
+  Probe via `getrlimit`, not by crashing.
+- **Linux priority freeze (`MOD-16`)** — whenever `apply_unix_rlimits`
+  runs on Linux, `RLIMIT_NICE` and `RLIMIT_RTPRIO` are forced to zero and
+  `PR_SET_NO_NEW_PRIVS` is set (via `syscall(SYS_prctl)`) so a parent with
+  a raised nice/rtprio ceiling cannot leak into the child and a setuid
+  exec cannot escalate even when landlock is skipped. Not fields; same
+  always-zero meaning as CORE. Probe via `getrlimit` / `PR_GET_NO_NEW_PRIVS`.
+- **Windows Job priority pin (`MOD-17`)** — ProcessHost sandbox jobs and
+  the integrity wrap job set `JOB_OBJECT_LIMIT_PRIORITY_CLASS` to
+  `NORMAL_PRIORITY_CLASS` so the child cannot raise HIGH/REALTIME.
+  `BREAKAWAY_OK` / `SILENT_BREAKAWAY_OK` stay unset. Not a rate limit and
+  not UI. Probe via `QueryInformationJobObject`.
 - **Kill tree on cancel** — `call_with_cancel(op, cancel)` selects the
   framed request against the invocation's `CancellationToken`: on cancel
   (user `/cancel`, superseded operation) it poisons the connection and
@@ -1463,8 +1526,20 @@ explicit `ProcessSandbox` (shared `ProcessHost`, since the crate split in
   The adapter's system
   broker gates brokered filesystem reads through an allocation-bounded
   primitive (at most a 256 KiB prefix with truncation metadata) and denies
-  network by default, but
-  raw process syscalls remain the child's own. See §2c: the current stdio is
+  network by default. Linux landlock additionally fences writes and, on ABI
+  v4+, TCP bind/connect, on ABI v5+ device ioctl, and on ABI v6 outbound
+  signals; Windows Low IL
+  fences writes outside labeled roots.
+  Unix `RLIMIT_AS` caps virtual maps, `RLIMIT_FSIZE` caps per-file size,
+  and `RLIMIT_NOFILE` caps open fds (inherited fds other than stdio are
+  closed after landlock). Sandbox `pre_exec` also forces `RLIMIT_CORE=0`
+  (`MOD-15`) and on Linux clamps NICE/RTPRIO plus `no_new_privs`
+  (`MOD-16`). The Windows integrity wrap Job-Object caps the
+  real child's commit at 512 MiB (`MOD-14`) and pins NORMAL priority
+  (`MOD-17`).
+  UDP/raw/pathname-Unix, Windows OS
+  sockets, and I/O bandwidth quotas remain
+  the child's. See §2c: the current stdio is
   an inherited anonymous-pipe backend, not the permanent protocol identity.
 
 `ProcessCapabilityAdapter::from_manifest` applies this hardened profile to
@@ -1489,9 +1564,20 @@ a hostile pre-created directory cannot be predicted. The broker confines
 the *brokered* surface; since MOD-06 the OS-level *write* half of the
 direct-OS gap is closed on Linux (landlock fence above — a hostile child
 is refused by the kernel when it creates, modifies or destroys state
-outside its roots), while OS-level *network* filtering (sockets) and
-cross-platform memory/I/O/disk quotas remain open M13
-acceptance requirements; until then **V2 autonomous
+outside its roots), since MOD-07 TCP bind/connect is denied on Linux
+ABI v4+ (no port rules), ABI v5 denies device ioctl (`MOD-12`), ABI v6 scopes outbound signals (`MOD-11`), and since MOD-08 Windows Low-IL write
+confinement refuses writes outside labeled roots. Unix `RLIMIT_AS`
+(`MOD-09`) caps virtual address space and Unix `RLIMIT_FSIZE` (`MOD-10`)
+caps per-file size. Unix `RLIMIT_NOFILE` (`MOD-13`) caps open fds and
+closes inherited descriptors other than stdio. Unix `RLIMIT_CORE`
+(`MOD-15`) is forced to zero when that `pre_exec` runs; Linux also
+clamps `RLIMIT_NICE`/`RLIMIT_RTPRIO` and sets `no_new_privs` (`MOD-16`).
+The Windows integrity wrap Job-Object caps the real child's commit at
+512 MiB (`MOD-14`) and pins `PRIORITY_CLASS=NORMAL` (`MOD-17`). UDP, raw, pathname Unix,
+arbitrary absolute reads, Windows OS-level network fences, and I/O
+bandwidth quotas remain open M13
+acceptance requirements; after MOD-17 do not invent `MOD-18` from that
+residual. Until then **V2 autonomous
 capability generation stays gated** — a generated capability only runs
 after explicit `enable`, and only inside the sandbox above.
 
@@ -1511,9 +1597,18 @@ mutation can no longer land during `invoke` (the CORE-01 bypass). Risk is
 derived, never self-declared: a capability declaring workspace-write or
 process-run authority may not mark any tool `ReadOnly` (ReadOnly
 auto-allows at the approval gate), a tool's risk may not exceed its grant,
-and a process-transport capability may declare `workspace:write`, but every
-non-empty wire effect is refused before staging until PLAT actual-intent proof
-exists. Both enforcement points are
+and a process-transport capability may declare `workspace:write`. A
+non-empty process wire effect stages only when the host-canonical actual
+intent is covered by the approved invocation bound; otherwise it is
+refused before staging. Generic `shell.exec` / `process.run` /
+`process.session` require Core-issued effect identity before spawn and
+return a plain value; they never stage a prepared effect. The approved
+`ProcessRun` bound is the command they will actually spawn (`command` vs
+`argv`). `process.session` poll/stop do not spawn and cannot spend a
+command-prefix grant. Session recovery is keyed by the start identity.
+A mismatched process-tool identity and a parent-escaping session cwd fail
+closed before spawn. The grant
+enforcement points are
 under test: `undeclared_permissions_receive_no_handle` and
 `capability_authority_is_derived_and_validated_at_registration`
 (agent-runtime) prove the grant-by-construction behavior end to end, and
@@ -1539,11 +1634,14 @@ single-purpose meta-tools:
   `unload`, provided identically by the builtin dispatcher and the
   capability-aware dispatcher (which filters out the builtin copy).
 
-The default model surface is now five schemas — `fs.list`, `fs.read`,
-`search.grep`, `context.manage`, `capability.manage` — down from fourteen.
-The merge is evidence-backed, not assumed: `merged_control_surface_costs_
-fewer_schema_tokens` measures the always-visible schema cost of the merged
-surface against the old separate tools and asserts a decisive win.
+The default always-loaded model surface is `fs.list`, `fs.read`,
+`search.grep`, `artifact.read`, `task.complete`, `capability.manage`.
+`context.manage` is catalog-only until NeedEvidence / EXTERNAL CONTEXT
+(Warm/Cold/Stored catalog or TaskAnchor `evidence_refs`); the model can
+also load it through `capability.manage`. The merge is evidence-backed,
+not assumed: `merged_control_surface_costs_
+fewer_schema_tokens` measures the merged schemas against the old
+separate tools and asserts a decisive win.
 
 The catalog is bounded, so a growing capability universe cannot itself
 become context pollution:

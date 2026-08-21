@@ -342,6 +342,7 @@ impl ContextEngine for RollingSummaryEngine {
             external: agent_contracts::ContextMapView::default(),
             selected,
             approx_tokens: approx_tokens_total,
+            foreground: Vec::new(),
             diagnostics: state.diagnostics(),
         })
     }

@@ -387,9 +387,9 @@ The first live smoke showed two fixture problems, not an engine split:
    this id uses one tool per turn; the original four keep the packed
    first-turn tool-loop so the ≥300 token CI floor does not move.
 
-`--compare-live-reasonable` runs `add_test` then `recall_after_fix`.
+`--compare-live-reasonable` historically ran `add_test` then `recall_after_fix`.
 These cells are diagnostics, not a rewrite of the n=4 bound above.
-Do not claim M15 closed from them.
+Do not claim M15 closed from them. The command now runs only `add_test`.
 
 ### Reasonable live re-run (2026-08-14)
 
@@ -817,6 +817,39 @@ missed `visit_all` then `4B`). Total `model_in` is not a same-trace A/B
 (append unpinned spent three extra rounds). No builtin `Verify` role
 yet; `capability.manage` is already MustSurface. Not a gate. Do not
 retune scoring.
+
+### Execution Coherence freeze (2026-08-19)
+
+Latest C on that `recall_after_fix` unpinned cell:
+`reactivation_events=1`, `unique=1`, `reactivation_selected=0`,
+`reactivation_consumed=0`, `reactivated_tokens=48`. Auto-reactivation is
+no longer the extra-round driver. Do not retune GC thresholds or the
+reactivation scorer. `recall_after_fix` diagnostic mission is complete;
+keep scripted `--compare-arm` tests. Next mechanism live is
+`--context-mech` (`late_semantic_constraint`,
+`resume_operational_state`, `no_semantic_episode`).
+`--compare-live-reasonable` now runs only `add_test`.
+Live `--compare-live` / `--fixture-live` / `--compare-live-all` refuse
+`recall_after_fix` (2026-08-21 item 28). Item 24 (`context.manage`
+catalog-only except NeedEvidence / EXTERNAL CONTEXT) is closed.
+M12/M13/PLAT-06 remain
+open.
+
+Live coding compare (`--compare-live`, `--compare-live-reasonable`,
+`--pilot-run`, `--fixture-live`) reuses production
+`ToolLifecycleConfig::default()`. Scripted `--compare-arm` and
+context-bench/mech ops still pin `fs.write` / `edit.replace` and
+`context.manage`. Those historical unpinned cells still pinned
+write/edit. Production default does not. `context.manage` is catalog-only
+on that default; Runtime PreferSurfaces it when Warm/Cold/Stored catalog
+entries or TaskAnchor `evidence_refs` exist so Late Semantic Recall still
+has a retrieval safety net.
+
+The 2026-08-21 production-surface `add_test` compare (n=1, hidden 3/3)
+is under `crates/agent-eval/evidence/compare-live-reasonable-2026-08-21/`.
+Round inflation versus the 2026-08-14 pinned-write smoke is catalog
+search/load, not a C working-set split. Per-round C input (~6.2k) does
+not beat A on that cell.
 
 Until those artifacts and the predeclared interval exist, the live tables are
 diagnostic observations rather than independently reproducible acceptance

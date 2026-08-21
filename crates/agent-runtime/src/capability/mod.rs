@@ -22,7 +22,7 @@ use agent_contracts::{
     CapabilityTransport, Effect, RUNTIME_CONTEXT_CONTROL, ResourceDescriptor, ToolCatalogEntry,
     ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolSemanticRole,
     ToolSpec, ToolSurfaceSnapshot, WORKSPACE_READ, WORKSPACE_WRITE, WorkspaceHandle,
-    search_tool_catalog,
+    derive_effect_intent, search_tool_catalog,
 };
 use agent_core::{CapabilityAdmission, CapabilityState, CapabilityStateAuthority};
 use agent_workspace::{ArtifactStoreHandle, ConfinedWorkspaceHandle, RemoteEffectAck, Workspace};
@@ -1178,9 +1178,10 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
     fn may_omit_from_round(&self, name: &str) -> bool {
         // A capability tool is optional at this pre-TaskAnchor stage. Base
         // tools delegate to their own catalog because only the concrete
-        // provider knows which entries are configured as core. Runtime
-        // controls remain fail-closed in either path.
-        if matches!(name, CAPABILITY_MANAGE | agent_contracts::CONTEXT_MANAGE) {
+        // provider knows which entries are configured as core.
+        // `capability.manage` stays fail-closed. `context.manage` follows
+        // the builtin catalog (production default is catalog-only).
+        if name == CAPABILITY_MANAGE {
             false
         } else if self.capabilities.owner_of(name).is_some() {
             true
@@ -1469,11 +1470,15 @@ impl CapabilityAwareDispatcher {
         } else {
             None
         };
+        let approved_intent = self
+            .inspect_tool(&request.call.name)
+            .map(|spec| derive_effect_intent(&request.call, &spec));
         CapabilityInvocationContext {
             granted_permissions: grant.to_vec(),
             workspace,
             artifacts,
             cancel: request.cancel.clone(),
+            approved_intent,
         }
     }
 }

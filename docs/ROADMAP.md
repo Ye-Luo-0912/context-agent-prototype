@@ -998,7 +998,9 @@ acceptance:
   (the process-capability adapter's profile is PATH/SystemRoot/
   SystemDrive/TEMP/TMP only — no inherited secrets, `OPENAI_API_KEY` and
   `HOME` never cross), a dedicated per-capability cwd, Unix rlimits
-  (RLIMIT_CPU / RLIMIT_NPROC; 60 s / 16 processes), and
+  (RLIMIT_CPU / RLIMIT_NPROC / RLIMIT_AS / RLIMIT_FSIZE / RLIMIT_NOFILE, plus RLIMIT_CORE=0 on that same `pre_exec`; 60 s / 16 processes /
+  2 GiB VAS / 256 MiB files / 1024 fds),
+  and
   `call_with_cancel` — a cancel (user `/cancel`, superseded operation)
   poisons the connection and kills the whole process tree immediately
   instead of waiting for the request deadline. Absolute filesystem/network
@@ -1136,10 +1138,10 @@ operation; see `docs/ARCHITECTURE.md` §9h and
 | --- | --- | --- |
 | M10 Runtime Consistency | ✅ | Checkpoint capture and two-stage live restore are recovery-fenced (`CORE-03`): capability activation is fail-closed and applied before `RuntimeRestored` releases the actor; mandatory turn-commit failure persists the same fence. GC/storage operations (`CTX-06`), TaskAnchor/CompletionRecord root transfer (`CTX-10`) and recovery replay (`CORE-02`) have fault coverage. |
 | M11 Context Recall | ✅ narrow retrieval baseline | Search/inspect/fetch, transient results, bounded external view and service parity work. Canonical catalog ownership and complete cross-residency semantics remain context-runtime work rather than reasons to call recall itself absent. TaskAnchor/Completion roots are now implemented (`CTX-10`). |
-| M12 Effect Runtime | 🟡 staged-effect baseline | Trusted prepared effects commit behind the Core-owned authority-epoch/lease fence (`CORE-01`); stale dispatch and commit are rejected, and cancellation advances the fence before awaiting cleanup. Non-empty process-capability wire effects currently fail closed before staging pending PLAT actual-intent/recovery proof, and cancellation kills owned process trees (`CORE-06`). Generic `shell.exec` / `process.run` execute before completion and may already mutate the world, so they remain bounded, separately authorized non-transactional exceptions—not proof that every side effect uses one commit path. |
-| M13 Extension Sandbox | 🟡 partial | Env scrub, private cwd, bounded stderr, process-tree cancellation, Windows Job-Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE), Unix rlimits (CPU/process) and directory-handle-relative workspace opens with reparse substitution rejected at open time (`CORE-07`) are enforced. Mid-invoke filesystem access is now brokered: a child's `fs.read` system request is answered only under the invocation's `workspace:read` grant, only through a confined workspace handle, and only for relative non-escaping paths (absolute/rooted and `..` paths refused before the handle is consulted); network is explicitly deny-by-default (no network permission word exists; recognized network ops get a named refusal). OS-level *write* filtering is now kernel-enforced on Linux (landlock, `MOD-06`): a confined child may create/modify/destroy filesystem state only under its configured write roots, irrevocably and inherited by every descendant, verified on a real kernel. OS-level *network* filtering (sockets) remains the residual gap (`CORE-01` open). |
+| M12 Effect Runtime | 🟡 staged-effect baseline | Trusted prepared effects commit behind the Core-owned authority-epoch/lease fence (`CORE-01`); stale dispatch and commit are rejected, and cancellation advances the fence before awaiting cleanup. Process-capability `workspace_write` wire effects stage only when the host proves the actual path/size is covered by the approved `EffectIntent`; unproven lists stay fail-closed. Cancellation kills owned process trees (`CORE-06`). Generic `shell.exec` / `process.run` / `process.session` require Core identity before spawn, journal spawn/exit, and return a plain value. Their approved `ProcessRun` bound is the lexical command they will spawn (`command` vs `argv`); spawn fails closed unless that bound covers the actual command. `process.session` poll/stop are not a new spawn and cannot consume a command-prefix grant via leftover `argv`. Session recovery is keyed by the start identity (`CompletedValue` after stop or a poll-seen exit); poll/stop themselves never spawned. They still execute before completion and may already mutate the world, so they remain bounded non-transactional exceptions, not proof that every side effect uses one commit path. |
+| M13 Extension Sandbox | 🟡 partial | Env scrub, private cwd, bounded stderr, process-tree cancellation, Windows Job-Object quotas (active-process + per-process memory ceilings, KILL_ON_JOB_CLOSE, wrap 512 MiB `MOD-14`), Unix rlimits (CPU/process/AS/FSIZE/NOFILE plus CORE=0 and Linux NICE/RTPRIO/NNP, `MOD-09`/`MOD-10`/`MOD-13`/`MOD-15`/`MOD-16`), Windows Job NORMAL priority (`MOD-17`) and directory-handle-relative workspace opens with reparse substitution rejected at open time (`CORE-07`) are enforced. Mid-invoke filesystem access is now brokered: a child's `fs.read` system request is answered only under the invocation's `workspace:read` grant, only through a confined workspace handle, and only for relative non-escaping paths (absolute/rooted and `..` paths refused before the handle is consulted); network is explicitly deny-by-default (no network permission word exists; recognized network ops get a named refusal). OS-level *write* filtering is now kernel-enforced on Linux (landlock, `MOD-06`): a confined child may create/modify/destroy filesystem state only under its configured write roots, irrevocably and inherited by every descendant, verified on a real kernel. OS-level *TCP* filtering is kernel-enforced on Linux when Landlock ABI v4 is present (`MOD-07`): bind/connect are handled with no port rules, so every TCP port is denied. Windows Low-IL write confinement is landed (`MOD-08`): a confined child cannot write up to Medium objects outside labeled roots. UDP, raw sockets, pathname Unix, arbitrary absolute *reads*, and Windows OS-level network fences remain (`CORE-01` open). |
 | M14 Resource Policy | ✅ | Schema/context quotas, risk/permission validation and final output guards exist; the narrow standing `TaskExecutionPolicy` is landed (`CORE-08`: effect + target + constraint + expiry grants, revocable, zero-responder deny/skip); the kernel-level trusted output broker is landed (`CORE-04`: capped fields, one-time artifact spill, execution-enforced query limits); a declared per-tool output budget on `ToolSpec` is enforced by the broker (clamped to the global hard cap); approval is now effect-derived: `EffectIntent` (contract type) is derived from the validated arguments and standing grants match the concrete intent (path, content bytes, command prefix) instead of re-parsing raw arguments; commit-time resource enforcement is landed (`AuthorityLease`: every side-effecting call mints a short-lived lease at approval, and Core refuses stale-epoch or expired-lease commits — rollback, never commit); and every meta-tool surface is bounded by logical history size, not by it: diagnostics answers in O(1) (Cold/External counts), `inspect` and `search` keep only their limit of rows while streaming (memory O(limit)), and the ledger is capped. The acceptance — the LLM cannot exhaust runtime resources through meta-tools — is met. |
-| M15 Real Evaluation | 🧪 Context Bench is the current decision instrument; 300×3 parked | The question is where dynamic context helps or hurts a coding agent, not whether the agent can fix random bugs. `agent-eval --context-bench` is 12 tasks × A/C (rolling only on three mechanism tasks); pack/SPEC are hash-frozen; wave-1 live is under `evidence/context-bench-wave1/`. Before another live wave, finish `TOOL-ENV-01`→`TOOL-ERROR-01`. Replay remains a policy proxy. The frozen analysis.v2 300×3 ITT gate is unchanged and parked until this bench says C is worth continuing. Do not mix P0/P1 ITT tables. Do not close M15 from the 30-task pilot. |
+| M15 Real Evaluation | 🧪 Context Bench is the current decision instrument; 300×3 parked | The question is where dynamic context helps or hurts a coding agent, not whether the agent can fix random bugs. `agent-eval --context-bench` is 12 tasks × A/C (rolling only on three mechanism tasks); pack/SPEC are hash-frozen; wave-1 live is under `evidence/context-bench-wave1/`. Tool-quality preflight (`TOOL-ENV-01`→`TOOL-ERROR-01`) closed 2026-08-17. Another live wave is a later-milestone frozen-cell rerun, not v0 engineering. Replay remains a policy proxy. The frozen analysis.v2 300×3 ITT gate is unchanged and parked until this bench says C is worth continuing. Do not mix P0/P1 ITT tables. Do not close M15 from the 30-task pilot. |
 | V2 Self-Iteration | 🔒 blocked | Registry maturity and sandboxed self-checks are foundations only. Autonomous generation/promotion stays disabled until M12/M13/M15 close and the `PLAT-00..04` containment/protocol/recovery boundary is proven. |
 
 The milestone dependency remains M10 → M11 → M12 → M13 → M14 → M15 → V2;
@@ -1207,9 +1209,11 @@ root transfer with fault injection coverage, and completed-task records are
    identify the bounded summary; when artifact storage is wired, the full
    assistant response is written before ContextItem truncation and attached
    separately. `CTX-11` ResumePoint/TaskProgress core is frozen (2026-08-18);
-   do not add further Context features (including sourced `EpisodeOutcome`).
-   Main engineering returns to M12/M13. Formal large-scale M15 waits for a
-   V1 candidate. Contract: `docs/STATUS.md`, `docs/AUDIT_TODO.md` (`CTX-11`).
+   Execution Coherence V1 (2026-08-19) is a freeze candidate. Do not add
+   further Context features (including sourced `EpisodeOutcome`) and do
+   not retune GC thresholds. Main engineering returns to M12/M13. Formal
+   large-scale M15 waits for a V1 candidate. Contract: `docs/STATUS.md`,
+   `docs/AUDIT_TODO.md` (`CTX-11`).
 
 The detailed milestone notes below retain implementation landing order, not
 the required gate order; the numbered list and table above are authoritative.
@@ -1245,8 +1249,18 @@ the required gate order; the numbered list and table above are authoritative.
    explicitly deny-by-default (no network permission word; recognized
    network ops refused by name; undeclared ops refused). OS-level *write*
    filtering is now kernel-enforced on Linux (landlock, `MOD-06`); OS-level
-   *network* filtering (seccomp/AppContainer-style) remains the residual
-   gap.
+   *TCP* filtering is kernel-enforced on Linux ABI v4+ (landlock, `MOD-07`,
+   deny-all bind/connect). ABI v5 device-ioctl deny is landed (`MOD-12`). ABI v6 signal scope is landed (`MOD-11`). Windows Low-IL write confinement is landed
+   (`MOD-08`). Unix `RLIMIT_AS` is landed (`MOD-09`). Unix `RLIMIT_FSIZE`
+   is landed (`MOD-10`). Unix `RLIMIT_NOFILE` and inherited-fd close are
+   landed (`MOD-13`). The Windows integrity wrap Job-Object caps the real
+   child's commit at 512 MiB (`MOD-14`). Unix `RLIMIT_CORE` is forced to zero
+   when sandbox `pre_exec` runs (`MOD-15`). Linux `RLIMIT_NICE`/`RLIMIT_RTPRIO`
+   and `no_new_privs` are clamped in that hook (`MOD-16`). Windows Job-Objects
+   pin `PRIORITY_CLASS=NORMAL` (`MOD-17`). UDP, raw sockets, pathname Unix and Windows network
+   AppContainer-style filtering remain the residual gap. After MOD-17
+   there is no further allowed v0 sandbox slice; do not invent `MOD-18`
+   from that residual. Do not claim M13 closed.
 5. **V1-M14 Resource Policy** — tool schema budget (the per-round surface
    bound landed in Performance P1), context hint quota,
    RiskClass, PermissionSet. Acceptance: the LLM cannot exhaust runtime
@@ -1268,9 +1282,10 @@ the required gate order; the numbered list and table above are authoritative.
    `agent-eval --context-bench` is 12 tasks × A/C (rolling only on
    `horizon_long` / `semantic_recall` / `task_switch`; 27 cells at
    repeats=1). Pack/SPEC are hash-frozen; wave-1 live evidence is under
-   `crates/agent-eval/evidence/context-bench-wave1/`. Before another live
-   wave, finish the tool-quality preflight (`TOOL-ENV-01`…
-   `TOOL-ERROR-01`). Replay remains a policy proxy. The fixture harness
+   `crates/agent-eval/evidence/context-bench-wave1/`. Tool-quality
+   preflight (`TOOL-ENV-01`…`TOOL-ERROR-01`) closed 2026-08-17. Another
+   live wave is a later-milestone frozen-cell rerun, not v0 engineering.
+   Replay remains a policy proxy. The fixture harness
    (`--fixture` / `--compare-arm` / `--compare-live`) is landed smoke.
    The frozen analysis.v2 300×3 ITT gate is unchanged and parked until
    this bench says C is worth continuing. Do not mix P0/P1 ITT tables.
@@ -1291,15 +1306,16 @@ starts at item 3 (`PLAT-00`) and must stay ahead of external/managed workers;
 the context-objective lane in item 2 may proceed in parallel, but it cannot
 be used to declare the Platform or sandbox gates complete.
 
-**2026-08-17 tool-quality preflight (blocks causal Context claims).** Wave-1
-live (`crates/agent-eval/evidence/context-bench-wave1/`, 27 cells,
-repeats=1) showed many fixture-turn timeouts, A/C discordance on
-`supersession_leak` / `task_switch_long_b`, and no C provider-token win on
-passed A/C pairs. Coarse `Likely optimization target` was `none` on every
-cell — attribution only, never a modification order. Before another live
-wave, or any claim that C's extra rounds/cost come from context lifecycle,
-close preventable tool defects in this order (owning specs:
-`docs/TOOL_ECOSYSTEM_TODO.md` / `docs/AUDIT_TODO.md`):
+**2026-08-17 tool-quality preflight (closed in code; blocks causal Context
+claims until a later frozen-cell rerun).** Wave-1 live
+(`crates/agent-eval/evidence/context-bench-wave1/`, 27 cells, repeats=1)
+showed many fixture-turn timeouts, A/C discordance on `supersession_leak`
+/ `task_switch_long_b`, and no C provider-token win on passed A/C pairs.
+Coarse `Likely optimization target` was `none` on every cell —
+attribution only, never a modification order. The preventable-tool
+preflight is closed in code (2026-08-17; owning specs
+`docs/TOOL_ECOSYSTEM_TODO.md` / `docs/AUDIT_TODO.md`; baseline table
+corrected 2026-08-21). Landed:
 
 - `TOOL-ENV-01` — bounded Runtime Facts (platform product/release, arch,
   workspace-relative contract, ≤16 confined project markers) and one
@@ -1315,13 +1331,14 @@ close preventable tool defects in this order (owning specs:
   preventable product failures from task/provider/infra without blind
   retry or dropping cells from end-to-end cost.
 
-Then rerun the **same frozen** Context Bench cells with scoring unchanged.
-Focused regressions precede that rerun. `CTX-11` stays a valid
+A later-milestone rerun of the **same frozen** Context Bench cells
+(scoring unchanged) is still required before causal C claims; that rerun
+is live eval, not this v0 lane. Do not retune scoring. Do not amend
+`FROZEN_SPEC_SHA256` / `FROZEN_PACK_DIGEST`. `CTX-11` stays a valid
 task-continuity design, but its incremental value is measured only on the
-residual after this cleaner tool baseline. This preflight may proceed in
-parallel with M12/M13 confinement work; it does **not** close those gates
-or make arbitrary shell mutation transactional. Tool failures remain in
-end-to-end success, rounds, latency and cost.
+residual after this cleaner tool baseline. This preflight does **not**
+close M12/M13 or make arbitrary shell mutation transactional. Tool
+failures remain in end-to-end success, rounds, latency and cost.
 
 1. **State authority (M10, complete).** Serialize or revision-fence context GC,
    storage GC, checkpoint and restore; capture actor + capability state as one
@@ -1353,24 +1370,27 @@ end-to-end success, rounds, latency and cost.
    (   `generation >= 4` is not a trigger); transport retries are accounted as
    a token lower bound. Mechanism V2 (`--context-mech`) is the isolated
    structural gate. Frozen `context-bench.v1` SPEC / pack digest stay
-   untouched. A follow-up C-hygiene slice is in progress: structured
-   `ResourceTouch` working-set signals, user/tool hot split with tool-hot
-   TTL, exact auto-reactivation, reread/selected-token attribution,
-   ResumePoint `path@revision` from `metadata.files[]`, prompt projection
-   of open-turn persistable tools into TaskProgress, omission of
-   progress-covered historical `fs.read` bodies and stamped-path identity
-   logs from SELECTED WORKING CONTEXT (packing prices them as descriptors
-   via `ContextHints.checked_files`), stamped-path shell/process logs not
-   hot-recalling, checked TaskProgress paths not hot-recalling their
-   `fs.read` bodies (`ContextAction::CheckedFiles` before GC; Warm/Stored
-   identity still reachable as EXTERNAL CONTEXT `path@rev` refs, Stored
-   via the entity index past the recency tail; search/inspect of raw
-   file/tool evidence are identity cards, not body prefixes), and
-   ablation switches for descriptor-only ToolObservation recall and
-   recent-file-body caps (`agent-eval --context-hygiene`, engine-only). Do not retune scoring thresholds. Main
-   engineering still returns to item 4 (M12/M13) after this slice. Keep
-   `semantic_recall.v1` as a long-protocol trajectory only.
-   Contract: `docs/STATUS.md`, `docs/AUDIT_TODO.md` (`CTX-11`).
+   untouched. The C-hygiene follow-up **landed** and is a freeze
+   candidate: structured `ResourceTouch` working-set signals, user/tool
+   hot split with tool-hot TTL, exact auto-reactivation, reread/selected-
+   token attribution, ResumePoint `path@revision` from `metadata.files[]`,
+   prompt projection of open-turn persistable tools into TaskProgress,
+   omission of progress-covered historical `fs.read` bodies and
+   stamped-path identity logs from SELECTED WORKING CONTEXT (packing
+   prices them as descriptors via `ContextHints.checked_files`),
+   stamped-path shell/process logs not hot-recalling, checked TaskProgress
+   paths not hot-recalling their `fs.read` bodies
+   (`ContextAction::CheckedFiles` before GC; Warm/Stored identity still
+   reachable as EXTERNAL CONTEXT `path@rev` refs, Stored via the entity
+   index past the recency tail; search/inspect of raw file/tool evidence
+   are identity cards, not body prefixes), Foreground Evidence Projection,
+   verification obligation vs `due_now`, and ablation switches for
+   descriptor-only ToolObservation recall and recent-file-body caps
+   (`agent-eval --context-hygiene`, engine-only). Do not retune scoring
+   thresholds. Do not keep live-running `recall_after_fix`; next
+   mechanism live is `--context-mech`. Main engineering returns to item 4
+   (M12/M13). Keep `semantic_recall.v1` as a long-protocol trajectory
+   only. Contract: `docs/STATUS.md`, `docs/AUDIT_TODO.md` (`CTX-11`).
 3. **Contain current protocol boundaries (`PLAT-00`, P0a).** Before designing
    a new envelope, fix current codecs, bidirectional frame/exchange caps,
    known decoded-large-field caps, and MCP child ownership/cancellation.
@@ -1392,15 +1412,40 @@ end-to-end success, rounds, latency and cost.
    Therefore PLAT-00 containment is not evidence that the Platform Protocol
    itself is complete.
 4. **Close the remaining trusted-execution boundary (M12/M13).** Trusted
-   in-process staged effects are implemented; non-empty process wire effects
-   deliberately fail closed pending PLAT actual-intent proof. Finish that
-   authority/recovery contract plus OS-level network isolation,
-   cross-platform confinement and the generic shell/process non-transactional
-   effect contract with adversarial escape/recovery tests.
+   in-process staged effects are implemented. Process-capability
+   `workspace_write` wire effects stage only when the host proves the
+   actual path/size is covered by the approved `EffectIntent`; unproven
+   lists stay fail-closed. Generic `shell.exec` / `process.run` /
+   `process.session` are the typed non-transactional exception: they
+   require Core-issued effect identity before spawn, journal spawn/exit,
+   return `ToolOutcome::Value` (never a prepared effect), and cancel by
+   killing the tree without rolling back mutations the child already
+   performed. The approved `ProcessRun` bound is the command they will
+   spawn (`command` vs `argv`); an unused sibling field cannot widen it.
+   `process.session` poll/stop are not a new spawn: leftover `argv` cannot
+   consume a command-prefix grant. Session recovery is keyed by the
+   **start** identity: stop (or a poll that sees exit) settles start as
+   `CompletedValue`, not `NotApplied`; poll/stop identities never spawned
+   so they stay `NotApplied`. Poll/stop still require Core identity at
+   dispatch, including through the builtin dispatcher. A mismatched
+   process-tool identity and a parent-escaping session cwd fail closed
+   before spawn. Remaining: Linux UDP/raw/pathname-Unix, Linux absolute
+   reads, Windows OS-level network confinement (seccomp/AppContainer
+   stay out of v0), and I/O bandwidth quotas. Linux TCP bind/connect is landlock-denied on ABI v4+
+   when write roots are configured. Windows Low-IL write confinement is
+   landed (`MOD-08`). Unix `RLIMIT_AS` is landed (`MOD-09`). Unix
+   `RLIMIT_FSIZE` is landed (`MOD-10`). Unix `RLIMIT_NOFILE` and inherited-fd
+   close are landed (`MOD-13`). The Windows integrity wrap Job-Object caps
+   the real child's commit at 512 MiB (`MOD-14`). Unix `RLIMIT_CORE` is forced
+   to zero when sandbox `pre_exec` runs (`MOD-15`). Linux `RLIMIT_NICE`/
+   `RLIMIT_RTPRIO` and `no_new_privs` are clamped in that hook (`MOD-16`).
+   Windows Job-Objects pin `PRIORITY_CLASS=NORMAL` (`MOD-17`). ABI v6 signal scope is landed
+   (`MOD-11`). ABI v5 device-ioctl deny is landed (`MOD-12`). Do not claim M12
+   closed. Do not make raw shell transactional.
    The `TOOL-ENV-01` → `TOOL-EDIT-01` → `TOOL-VIEW-01` → `TOOL-ERROR-01`
-   preflight above may run in parallel as product quality work; it does not
-   satisfy M12/M13 acceptance and must not be read as a substitute for
-   confinement or transactional shell recovery.
+   preflight is closed in code (2026-08-17). It does not satisfy M12/M13
+   acceptance and must not be read as a substitute for confinement or
+   transactional shell recovery.
 5. **Finish remaining PLAT-03 recovery (`PLAT-03` partial; `PLAT-04` landed) on the
    landed PLAT-01/02 + PLAT-03a1-a4 boundary.** PLAT-01 formalized Platform=`RuntimeActor`, made the
    concrete actor/Core internals private behind a narrow `CorePort`, and added
@@ -1431,6 +1476,35 @@ end-to-end success, rounds, latency and cost.
    `FramedProtocolSession` while retaining
    anonymous-pipe stdio as the first backend; add health, epochs, bounded
    restart, cancellation acknowledgement and backpressure.
+   **Slice 1 landed 2026-08-20:** `ProcessHost` composes `ProcessSupervisor`
+   and `StdioDuplexTransport`; poison/timeout/cancel/handshake paths kill
+   the tree then await reap before return.
+   **Slice 2 landed 2026-08-20:** MCP stdio owns `ProcessSupervisor` instead
+   of a raw `Child`; Drop of the supervisor is the tree-kill backstop and
+   reap clears the pid so a reused OS pid cannot be killed. Native process
+   capabilities already went through `ProcessHost`.
+   **Slice 3 landed 2026-08-20:** `DuplexTransport` is the byte-duplex seam;
+   `FramedProtocolSession` implements it; `ProcessHost` helpers take
+   `impl DuplexTransport`. Stdio remains the first backend. Named Pipe/UDS
+   remain PLAT-08.
+   **PLAT-06 slice 1 landed 2026-08-20:** `ConnectionHealth`
+   (Ready/Degraded/NotServing/Quarantined), `ConnectionEpoch` (`host` is 1
+   per `ProcessHost` instance; `peer` from ping), and `RestartCircuit`
+   (first connect is not a restart; default max 3 replacements). MCP
+   invoke and process-capability `start()` replace a quarantined child
+   only within the budget; exhaustion keeps the dead connection so the
+   next attempt cannot look like a first connect. Connection state is
+   never task or Core authority.
+   **PLAT-06 slice 2 landed 2026-08-20:** peer cancel-ACK and coalescible
+   progress. After a written request is cancelled, `ProcessHost` writes
+   `op=cancel` and waits `DEFAULT_CANCEL_ACK_TIMEOUT` (250 ms) for
+   `{cancelled: true}`; MCP sends `notifications/cancelled` and waits the
+   same bound for a discarded matching response. A late value is never
+   admitted. Cancel before any write leaves the connection usable.
+   Settlement is still kill-then-reap. Mid-call `progress` frames are
+   coalesced (latest wins) and capped (`MAX_PROGRESS_FRAMES_PER_CALL`);
+   they are not task or Core state. Remaining PLAT-06: multiplexing
+   (stay single-inflight).
 7. **Publish the transport-neutral Platform SDK (`PLAT-07`).** Extract stable
    wire DTOs and extension-facing clients only after protocol conformance;
    migrate process/context/MCP adapters before discovery and managed-Agent
@@ -1501,8 +1575,9 @@ end-to-end success, rounds, latency and cost.
    planted/restated hidden constraints. Wave-1 evidence is under
    `crates/agent-eval/evidence/context-bench-wave1/`. Coarse
    `Likely optimization target` was `none` on every wave-1 cell and is not a
-   modification order until `TOOL-ERROR-01` attribution exists; use raw
-   trace/cost deltas and the tool-quality preflight order above.
+   modification order. `TOOL-ERROR-01` attribution is landed; use raw
+   trace/cost deltas. A later frozen-cell rerun is live eval, not this
+   v0 lane. Do not retune scoring.
 
 ### Next design package: Platform Protocol, events, discovery, and managed Agents
 
@@ -1605,13 +1680,24 @@ A process capability runs with a hardened process-host profile
   relative-path access; it is not `chroot`/a mount namespace and does not
   block absolute filesystem paths. Covered by
   `sandbox_cwd_is_created_and_isolates_the_child`.
-- **Resource limits (Unix).** Hard `RLIMIT_CPU` / `RLIMIT_NPROC` ceilings
-  applied by the kernel right after fork. Note the `RLIMIT_NPROC` caveat:
+- **Resource limits (Unix).** Hard `RLIMIT_CPU` / `RLIMIT_NPROC` /
+  `RLIMIT_AS` / `RLIMIT_FSIZE` / `RLIMIT_NOFILE` ceilings applied by the
+  kernel right after fork, in the same `pre_exec` as landlock so a second
+  hook cannot drop the caps. That hook also forces `RLIMIT_CORE=0`
+  (`MOD-15`; not a `0` = unlimited field). On Linux that hook also clamps
+  `RLIMIT_NICE`/`RLIMIT_RTPRIO` and sets `no_new_privs` (`MOD-16`). Inherited fds other than stdio are closed
+  after landlock (`MOD-13`). The capability default is 60 s CPU, 16
+  processes, 2 GiB virtual address space (`MOD-09`), 256 MiB per file
+  (`MOD-10`), and 1024 open files (`MOD-13`). Note
+  the `RLIMIT_NPROC` caveat:
   on Linux it is a *per-user* ceiling, so a small value (the default 16)
   can starve the child on a host where the same user already runs many
-  threads (observed on the CI runner). The limits are implemented but not
-  asserted in the sandbox acceptance tests, which focus on the env and cwd
-  dimensions.
+  threads (observed on the CI runner). `RLIMIT_AS` is coarser than the
+  Windows commit charge (it counts mappings); 512 MiB often fails
+  ordinary exec of debug binaries, which is why the default is 2 GiB.
+  `RLIMIT_FSIZE` is a per-file size cap (`EFBIG` / `SIGXFSZ`), not I/O
+  bandwidth and not a Windows Job-Object feature. Covered by
+  `tests/rlimits.rs`.
 - **Cancellation kills the tree.** A cancelled invoke aborts immediately
   and terminates the child's whole process tree (process group on Unix,
   `taskkill /T /F` on Windows), never a background process still
@@ -1660,18 +1746,118 @@ A process capability runs with a hardened process-host profile
   broker; the fence is verified on a real kernel by `tests/landlock.rs`
   and is inherited by every descendant. Wired for process capabilities and
   stdio MCP servers.
+- **OS-level TCP fence (Linux, `MOD-07`).** The same landlock ruleset now
+  handles TCP bind/connect when the kernel speaks ABI v4 (Linux 6.7+),
+  with no `LANDLOCK_RULE_NET_PORT` rules, so every TCP port is denied.
+  ABI v6 also scopes abstract Unix sockets and outbound signals
+  (`LANDLOCK_SCOPE_SIGNAL`, `MOD-11`) when accepted. Older landlock
+  kernels keep the write fence and leave TCP unhandled (same degrade as
+  unknown FS bits). UDP, raw sockets, netlink and pathname Unix sockets
+  stay unhandled; Windows has no Landlock. Verified by
+  `child_cannot_connect_tcp_under_landlock` (skipped when ABI < 4).
+- **OS-level device-ioctl deny (Linux, `MOD-12`).** ABI v5
+  `LANDLOCK_ACCESS_FS_IOCTL_DEV` is handled but never granted, so a
+  confined child cannot ioctl newly opened character/block devices
+  (`EACCES`). Inherited stdin/stdout/stderr stay usable. Always-allowed
+  ioctls (`FIOCLEX`, `FIONBIO`, …) are unchanged. Verified by
+  `child_cannot_ioctl_devices_under_landlock` (skipped when ABI < 5).
+- **OS-level signal scope (Linux, `MOD-11`).** The same ABI v6 `scoped`
+  field now includes `LANDLOCK_SCOPE_SIGNAL`: a confined child cannot
+  `kill` processes outside its landlock domain (the parent, siblings, the
+  rest of the host). Signalling itself still works. Parent→child tree
+  kill on cancel is unaffected. Verified by
+  `child_cannot_signal_outside_its_landlock_domain` (skipped when ABI < 6).
+- **OS-level write fence (Windows, `MOD-08`).** A Medium IL parent labels
+  configured write roots Low and re-spawns through the same executable
+  with a wrap sentinel: a CRT constructor hijacks that child, drops to
+  Low IL, then CreateProcess-es the real program with inherited stdio.
+  Low IL cannot write up to Medium objects (sibling tempdirs, the parent
+  tree). Reads stay allowed. TCP/UDP are not fenced. The wrap holds a
+  `KILL_ON_JOB_CLOSE` job with a 512 MiB per-process commit ceiling
+  (`MOD-14`) and `DIE_ON_UNHANDLED_EXCEPTION` so TerminateProcess of the
+  wrap still kills the real child and a Low-IL allocator cannot exhaust
+  the machine, plus `PRIORITY_CLASS=NORMAL` (`MOD-17`). Missing target programs fail as spawn errors before wrap.
+  Verified by `tests/integrity.rs` (`child_cannot_write_outside_its_
+  integrity_root`, handshake under the same fence,
+  `wrapped_child_sees_the_wrap_job_process_memory_ceiling`,
+  `wrapped_child_cannot_commit_past_job_process_memory`,
+  `wrapped_child_sees_the_wrap_job_normal_priority_class`). Wired for process
+  capabilities and stdio MCP servers.
+- **Unix address-space ceiling (`MOD-09`).** `ProcessSandbox.max_memory_bytes`
+  maps to `RLIMIT_AS` and is applied in the same `pre_exec` as landlock.
+  The capability adapter defaults to 2 GiB VAS; stdio MCP servers get the
+  same memory cap (CPU/nproc stay unset on MCP because `RLIMIT_NPROC` is
+  per-user). Verified by `tests/rlimits.rs`.
+- **Unix file-size ceiling (`MOD-10`).** `ProcessSandbox.max_file_bytes`
+  maps to `RLIMIT_FSIZE` in that same `pre_exec`. The capability adapter
+  and stdio MCP servers default to 256 MiB per file. This bounds a child
+  filling its private write root; it is not I/O bandwidth and Windows has
+  no Job-Object equivalent. Verified by `child_cannot_write_past_rlimit_
+  fsize` and a handshake under a production-sized ceiling.
+- **Unix open-file ceiling (`MOD-13`).** `ProcessSandbox.max_open_files`
+  maps to `RLIMIT_NOFILE` in that same `pre_exec`. After landlock, the
+  child closes inherited fds other than stdin/stdout/stderr (bounded
+  scan, async-signal-safe `close` only) so a parent descriptor without
+  `O_CLOEXEC` cannot leak across exec. The capability adapter and stdio
+  MCP servers default to 1024 fds. Not I/O bandwidth. Verified by
+  `child_cannot_open_past_rlimit_nofile`,
+  `child_cannot_keep_inherited_fds_without_cloexec`, and a handshake
+  under a production-sized ceiling.
+- **Unix core-dump disable (`MOD-15`).** `apply_unix_rlimits` always sets
+  `RLIMIT_CORE` to zero when sandbox `pre_exec` already runs (capability
+  and stdio MCP). Other rlimit arguments keep `0` = unlimited; there is
+  no `max_core_bytes` field. Verified by `sandbox_probe core` /
+  `child_sees_rlimit_core_zero_when_sandbox_pre_exec_runs` (getrlimit,
+  not a crash).
+- **Linux priority freeze (`MOD-16`).** `apply_unix_rlimits` always sets
+  `RLIMIT_NICE=0`, `RLIMIT_RTPRIO=0`, and `PR_SET_NO_NEW_PRIVS` on Linux
+  (capability and stdio MCP). Not fields; same always-zero meaning as
+  CORE. `no_new_privs` still applies when landlock is skipped. Verified by
+  `sandbox_probe pri` /
+  `child_sees_priority_rlimits_and_no_new_privs_when_sandbox_pre_exec_runs`
+  (getrlimit / prctl, skipped on this Windows host).
+- **Windows Job priority pin (`MOD-17`).** ProcessHost sandbox jobs and the
+  integrity wrap job set `JOB_OBJECT_LIMIT_PRIORITY_CLASS` to NORMAL.
+  `BREAKAWAY_OK` stays unset. Not a rate limit and not UI. Verified by
+  `created_job_pins_normal_priority_and_denies_breakaway` and
+  `wrapped_child_sees_the_wrap_job_normal_priority_class` (`sandbox_probe
+  jobprio`; skipped when an outer job prevents assign).
+- **Windows wrap commit ceiling (`MOD-14`).** The integrity wrap's
+  Job-Object now sets `JOB_OBJECT_LIMIT_PROCESS_MEMORY` to 512 MiB
+  (capability Windows default) plus `DIE_ON_UNHANDLED_EXCEPTION`.
+  ProcessHost's job covers the wrap process; this job covers the Low-IL
+  program the wrap CreateProcess-es, including stdio MCP children on
+  Windows. Unix MCP already had `RLIMIT_AS`. Not I/O bandwidth.
+  Verified by `wrapped_child_sees_the_wrap_job_process_memory_ceiling`
+  and `wrapped_child_cannot_commit_past_job_process_memory` (skipped
+  when an outer job prevents assign).
 - **Residual.** The brokered surface is confined; the child's *direct* OS
   access is not fully. On Linux, writes/destroys are kernel-fenced
-  (landlock) but a hostile child can still *read* arbitrary absolute paths
-  or open sockets itself at the OS layer; on Windows there is no OS-level
-  file fence at all — seccomp-bpf / AppContainer-style filtering is out of
-  v0 scope and stays gated with V2. Cross-platform memory/I/O/disk quotas
-  also remain (Windows Job-Object memory ceilings and Unix rlimits cover
-  part of it). These keep M13 from closing.
+  (landlock) and TCP bind/connect is kernel-fenced on ABI v4+, but a
+  hostile child can still *read* arbitrary absolute paths or open UDP/raw/
+  pathname-Unix sockets itself at the OS layer; on Windows, writes outside
+  labeled roots are Low-IL refused but there is no OS-level network fence
+  — seccomp-bpf / AppContainer-style filtering is out of
+  v0 scope and stays gated with V2. Cross-platform
+  I/O bandwidth quotas remain (Windows Job-Object memory ceilings, Unix
+  `RLIMIT_AS`, Unix `RLIMIT_FSIZE`, Unix `RLIMIT_NOFILE`, Unix
+  `RLIMIT_CORE=0`, Linux NICE/RTPRIO/`no_new_privs`, and Windows Job
+  NORMAL priority cover memory, per-file size, fd count, core dumps, and
+  priority escalation). Inherited TTY detach is skipped (`process_group(0)`
+  already makes the child a group leader; `setsid` would fail or change
+  the kill-tree pgid). Windows `HANDLE_LIST` is skipped (not clean with
+  tokio/std Command). Job UI restrictions are skipped (tests flaky).
+  These keep M13 from closing.
 
 Therefore `ProcessSandbox` covers host hardening plus a brokered
-filesystem/network surface and, on Linux, an OS-level write fence; it is
-not a full OS-level sandbox. External process
+filesystem/network surface, on Linux an OS-level write fence plus TCP deny
+when ABI v4 is present, on Windows a Low-IL write fence plus wrap-job
+512 MiB commit (`MOD-14`), and on Unix
+`RLIMIT_AS` plus `RLIMIT_FSIZE` plus `RLIMIT_NOFILE` plus `RLIMIT_CORE=0`
+plus Linux NICE/RTPRIO/`no_new_privs` (`MOD-16`) and Windows Job NORMAL
+priority (`MOD-17`); it is
+not a full OS-level sandbox. After MOD-17 there is no further allowed
+v0 sandbox slice; do not invent `MOD-18` from the residual. External process
 capabilities remain disabled by default until the isolation boundary is
 complete.
 
@@ -2005,13 +2191,15 @@ in the authoritative table above:
   deletes the staging file, durability-failure semantics) is covered by
   `agent-workspace`'s own tests.
 
-Process capabilities may declare structured wire effects, but non-empty
-effects are currently rejected before staging until actual intent can be
-bound to PLAT operation/effect identity and proved within the lease.
-Direct process/shell paths are bounded and cancel their owned process trees,
+Process capabilities may declare structured wire effects. A single confined
+`workspace_write` stages when the host-canonical actual intent is covered by
+the approved invocation bound; unproven lists stay fail-closed before
+`prepare_write`. Direct process/shell paths require Core-issued effect identity before spawn,
+journal spawn/exit, return a plain value, prove the actual spawn command is
+covered by the `command`/`argv` bound, and cancel their owned process trees,
 but side effects made before cancellation are neither staged nor rollbackable.
-M12 therefore remains partial until that exception has an explicit authority,
-recovery and isolation contract (or is brokered). Platform Protocol must also
+M12 therefore remains partial until that exception has isolation (or is
+brokered) and remaining adversarial escape tests close. Platform Protocol must also
 thread the landed PLAT-02 operation/effect identity into existing receipts and
 mutation journals (`PLAT-03/04`) without promising general transport
 exactly-once.

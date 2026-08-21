@@ -17,7 +17,7 @@ use std::sync::{Arc, RwLock};
 use agent_contracts::{
     AgentError, AgentResult, ResourceDescriptor, ToolCatalogEntry, ToolDispatcher,
     ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec,
-    ToolSurfaceSnapshot, search_tool_catalog,
+    ToolSurfaceSnapshot, reject_staged_effect_for_process_tool, search_tool_catalog,
 };
 use agent_workspace::Workspace;
 use serde::Deserialize;
@@ -31,7 +31,7 @@ use crate::tools::{
 };
 
 /// Control tools are now defined by the unified catalog contract.
-pub use agent_contracts::{CAPABILITY_MANAGE, CONTEXT_MANAGE, ToolLifecycle};
+pub use agent_contracts::{CAPABILITY_MANAGE, ToolLifecycle};
 
 /// Tuning knobs for the catalog lifecycle.
 #[derive(Debug, Clone)]
@@ -46,6 +46,13 @@ pub struct ToolLifecycleConfig {
 
 impl Default for ToolLifecycleConfig {
     fn default() -> Self {
+        // Production always-loaded surface. Git / shell / write / edit /
+        // `context.manage` stay in the catalog and load through
+        // `capability.manage` (or runtime NeedEvidence). Scripted eval
+        // fixtures, `--compare-arm`, and context-bench/mech ops pin
+        // write/edit and `context.manage`; live coding compare
+        // (`--compare-live`, `--pilot-run`, `--fixture-live`) reuses
+        // this default so the cell is the product surface.
         Self {
             always_loaded: vec![
                 "fs.list".into(),
@@ -59,13 +66,9 @@ impl Default for ToolLifecycleConfig {
                 // Completion is a task-level control: the model can always
                 // propose a structured outcome.
                 "task.complete".into(),
-                // The merged control surface: one `context.manage` (tags,
-                // leases, admit/derive, and the on-demand retrieval
-                // loop over the catalog) and one `capability.manage`
-                // (catalog search/inspect/load/unload). A dozen
-                // single-purpose meta-tools would cost more model input than
-                // the runtime control they provide.
-                CONTEXT_MANAGE.into(),
+                // Catalog control plane: search/inspect/load/unload. The
+                // merged retrieval tool (`context.manage`) is catalog-only
+                // until EXTERNAL CONTEXT / NeedEvidence (item 24).
                 CAPABILITY_MANAGE.into(),
             ],
             idle_to_warm_ticks: 8,
@@ -346,10 +349,11 @@ impl ToolDispatcher for BuiltinToolDispatcher {
 
     fn may_omit_from_round(&self, name: &str) -> bool {
         // The catalog configuration is the authority for builtin core
-        // membership. Runtime controls are fail-closed even when a custom
-        // configuration accidentally leaves one out of `always_loaded`;
-        // unknown names are also fail-closed rather than guessed optional.
-        if matches!(name, CAPABILITY_MANAGE | CONTEXT_MANAGE) {
+        // membership. `capability.manage` is fail-closed even when a custom
+        // configuration accidentally leaves it out of `always_loaded`.
+        // `context.manage` follows `always_loaded` (catalog-only on the
+        // production default; item 24). Unknown names stay fail-closed.
+        if name == CAPABILITY_MANAGE {
             return false;
         }
         self.catalog
@@ -412,6 +416,10 @@ impl ToolDispatcher for BuiltinToolDispatcher {
                         request.cancel,
                     )
                     .await;
+                let output = match output {
+                    Ok(outcome) => reject_staged_effect_for_process_tool(&name, outcome),
+                    Err(error) => Err(error),
+                };
                 let mut catalog = self.catalog.write().expect("tool catalog poisoned");
                 if let Some(entry) = catalog.get_mut(&name)
                     && entry.state == ToolLifecycle::Active
@@ -605,6 +613,7 @@ impl BuiltinToolDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_contracts::CONTEXT_MANAGE;
     use agent_contracts::{CancellationToken, ContextAction, ToolCall, ToolExecutionRequest};
     use serde_json::Value;
 
@@ -675,7 +684,10 @@ mod tests {
         let dispatcher = dispatcher().await;
         let names = surface(&dispatcher);
         assert!(names.contains(&"fs.read".to_string()));
-        assert!(names.contains(&"context.manage".to_string()));
+        assert!(
+            !names.contains(&"context.manage".to_string()),
+            "item 24: context.manage is catalog-only on the production surface: {names:?}"
+        );
         assert!(names.contains(&"capability.manage".to_string()));
         assert!(
             !names.contains(&"context.gc_hint".to_string()),
@@ -696,13 +708,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_manage_is_catalog_only_on_the_production_surface() {
+        let dispatcher = dispatcher().await;
+        assert!(
+            !surface(&dispatcher).contains(&CONTEXT_MANAGE.to_string()),
+            "item 24: production default must not always-load context.manage"
+        );
+        assert!(
+            dispatcher
+                .catalog()
+                .iter()
+                .any(|entry| entry.name == CONTEXT_MANAGE),
+            "context.manage must remain catalog-loadable"
+        );
+        assert!(dispatcher.may_omit_from_round(CONTEXT_MANAGE));
+        dispatcher.load(CONTEXT_MANAGE).unwrap();
+        assert!(surface(&dispatcher).contains(&CONTEXT_MANAGE.to_string()));
+        dispatcher.unload(CONTEXT_MANAGE).unwrap();
+        assert!(!surface(&dispatcher).contains(&CONTEXT_MANAGE.to_string()));
+    }
+
+    #[tokio::test]
     async fn context_manage_search_names_the_whole_catalog() {
         let dispatcher = dispatcher().await;
         let spec = dispatcher
-            .specs()
-            .into_iter()
-            .find(|spec| spec.name == "context.manage")
-            .expect("context.manage is on the default surface");
+            .inspect_tool(CONTEXT_MANAGE)
+            .expect("context.manage stays in the catalog");
         assert!(
             spec.description.contains("whole catalog")
                 && spec.description.contains("Resident/Warm/Stored"),
@@ -744,8 +775,8 @@ mod tests {
         let dispatcher = dispatcher().await;
         let names = surface(&dispatcher);
         assert!(
-            names.contains(&"context.manage".to_string()),
-            "context.manage must be on the default surface: {names:?}"
+            !names.contains(&"context.manage".to_string()),
+            "item 24: context.manage starts catalog-only: {names:?}"
         );
 
         let item_id = "00000000-0000-0000-0000-000000000000";
@@ -930,7 +961,10 @@ mod tests {
     async fn round_omission_classification_preserves_core_and_controls() {
         let dispatcher = dispatcher().await;
         assert!(!dispatcher.may_omit_from_round("fs.read"));
-        assert!(!dispatcher.may_omit_from_round(CONTEXT_MANAGE));
+        assert!(
+            dispatcher.may_omit_from_round(CONTEXT_MANAGE),
+            "item 24: context.manage follows catalog lifecycle, not fail-closed omission"
+        );
         assert!(!dispatcher.may_omit_from_round(CAPABILITY_MANAGE));
         assert!(!dispatcher.may_omit_from_round("unknown.tool"));
         assert!(dispatcher.may_omit_from_round("git.status"));
@@ -1375,6 +1409,46 @@ mod tests {
         assert!(
             merged_tokens * 2 < old_tokens,
             "the merge must be a decisive win (merged {merged_tokens}, separate {old_tokens})"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_refuses_process_session_without_effect_identity() {
+        let dispatcher = dispatcher().await;
+        for arguments in [
+            json!({"action": "start", "argv": ["echo", "hi"]}),
+            json!({"action": "poll", "session_id": "s1"}),
+            json!({"action": "stop", "session_id": "s1"}),
+        ] {
+            let error = dispatcher
+                .execute(request("process.session", arguments.clone()))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(
+                    "non-transactional process tools require a Core-issued effect context"
+                ),
+                "dispatch must refuse {arguments} without identity: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatcher_refuses_effect_identity_on_readonly_git() {
+        let dispatcher = dispatcher().await;
+        let mut request = request("git.status", json!({}));
+        request.effect_context = Some(crate::tools::test_process_effect_context(
+            request.run_id,
+            &request.call.id,
+            "git.status",
+            &request.call.arguments,
+        ));
+        let error = dispatcher.execute(request).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must not receive a Core-issued effect context"),
+            "a ReadOnly git spawn must not be laundered through a process identity: {error}"
         );
     }
 }

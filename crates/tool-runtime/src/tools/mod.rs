@@ -33,7 +33,7 @@ pub(crate) use view::{
 
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, OperationEffectContext, RunId, ToolOutcome,
-    ToolSpec,
+    ToolSpec, is_non_transactional_process_tool, process_spawn_command_is_covered,
 };
 use agent_process::kill_process_tree;
 use agent_workspace::Workspace;
@@ -351,19 +351,68 @@ pub(crate) async fn read_snapshot_lines(
         .collect())
 }
 
-/// spawn 成功后立刻记下 PID；失败时由调用方杀树，避免留下无证据孩子。
+/// spawn 成功后立刻记下 PID；没有 Core 身份时杀树并失败，避免留下无证据孩子。
 pub(crate) fn persist_spawned_process(
     workspace: &Workspace,
     effect_context: &Option<OperationEffectContext>,
     child: &tokio::process::Child,
+    expected_tool_name: &str,
 ) -> AgentResult<u32> {
     let pid = child
         .id()
         .ok_or_else(|| AgentError::Tool("spawned process has no pid".into()))?;
-    if let Some(context) = effect_context {
-        workspace.record_process_spawn(context, pid)?;
+    match require_process_effect_context(effect_context, expected_tool_name) {
+        Ok(context) => {
+            workspace.record_process_spawn(context, pid)?;
+            Ok(pid)
+        }
+        Err(error) => {
+            kill_process_tree(pid);
+            Err(error)
+        }
     }
-    Ok(pid)
+}
+
+/// Non-transactional process tools may not spawn without Core-issued identity.
+/// The identity's tool name must be this builtin; a fs.write lease cannot
+/// authorize a shell child.
+pub(crate) fn require_process_effect_context<'a>(
+    effect_context: &'a Option<OperationEffectContext>,
+    expected_tool_name: &str,
+) -> AgentResult<&'a OperationEffectContext> {
+    let Some(context) = effect_context.as_ref() else {
+        return Err(AgentError::InvalidRequest(
+            "non-transactional process tools cannot spawn without Core-issued effect identity"
+                .into(),
+        ));
+    };
+    context.validate().map_err(AgentError::InvalidRequest)?;
+    if !is_non_transactional_process_tool(expected_tool_name) {
+        return Err(AgentError::InvalidRequest(format!(
+            "'{expected_tool_name}' is not a non-transactional process tool"
+        )));
+    }
+    if context.identity.tool_name != expected_tool_name {
+        return Err(AgentError::InvalidRequest(format!(
+            "process spawn identity is for '{}' but this tool is '{expected_tool_name}'",
+            context.identity.tool_name
+        )));
+    }
+    Ok(context)
+}
+
+pub(crate) fn require_covered_process_command(
+    tool_name: &str,
+    arguments: &Value,
+    actual_command: &str,
+) -> AgentResult<()> {
+    if process_spawn_command_is_covered(tool_name, arguments, actual_command) {
+        Ok(())
+    } else {
+        Err(AgentError::InvalidRequest(
+            "actual process command is not covered by the approved effect intent; the child was not started".into(),
+        ))
+    }
 }
 
 pub(crate) fn persist_process_exit(
@@ -376,6 +425,30 @@ pub(crate) fn persist_process_exit(
 
 pub(crate) fn abandon_spawned_process(child: &mut tokio::process::Child) {
     kill_process_tree(child.id().unwrap_or(0));
+}
+
+#[cfg(test)]
+pub(crate) fn test_process_effect_context(
+    run_id: RunId,
+    call_id: &str,
+    tool_name: &str,
+    arguments: &Value,
+) -> OperationEffectContext {
+    use agent_contracts::{ArgumentDigest, EffectId, OperationId, ToolOperationIdentity, TurnId};
+    OperationEffectContext {
+        identity: ToolOperationIdentity {
+            run_id,
+            task_id: None,
+            turn_id: TurnId::new(),
+            scope_id: None,
+            operation_id: OperationId::new(),
+            generation: 1,
+            call_id: call_id.into(),
+            tool_name: tool_name.into(),
+            argument_digest: ArgumentDigest::from_json(arguments),
+        },
+        effect_id: EffectId::new(),
+    }
 }
 
 #[async_trait]
@@ -468,6 +541,78 @@ mod classify_tests {
                 &[],
             ),
             Some(ToolFailureClass::CommandUnavailable)
+        );
+    }
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    fn sleeper() -> tokio::process::Command {
+        #[cfg(windows)]
+        {
+            let mut command = tokio::process::Command::new("ping");
+            command.args(["-n", "20", "127.0.0.1"]);
+            command.stdout(Stdio::null());
+            command.stderr(Stdio::null());
+            command
+        }
+        #[cfg(not(windows))]
+        {
+            let mut command = tokio::process::Command::new("sleep");
+            command.arg("20");
+            command.stdout(Stdio::null());
+            command.stderr(Stdio::null());
+            command
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_without_identity_kills_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let mut child = sleeper().spawn().unwrap();
+        let error = persist_spawned_process(&workspace, &None, &child, "shell.exec").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot spawn without Core-issued effect identity"),
+            "{error}"
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "an unmanaged child must not be left running"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_rejects_a_mismatched_tool_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let mut child = sleeper().spawn().unwrap();
+        let arguments = serde_json::json!({"argv": ["sleep", "1"]});
+        let context = Some(test_process_effect_context(
+            RunId::new(),
+            "c",
+            "process.run",
+            &arguments,
+        ));
+        let error =
+            persist_spawned_process(&workspace, &context, &child, "shell.exec").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("process spawn identity is for 'process.run'"),
+            "{error}"
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "a mismatched-identity child must not be left running"
         );
     }
 }

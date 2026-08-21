@@ -1,31 +1,37 @@
-//! Linux landlock filesystem confinement for child processes (the M13
-//! residual slice: OS-level write filtering).
+//! Linux landlock confinement for child processes (M13: OS-level write
+//! fence, plus TCP deny when the kernel speaks ABI v4).
 //!
 //! Landlock (kernel 5.13+) lets an unprivileged process restrict *its own*
-//! filesystem access irrevocably, and every descendant inherits the
-//! restriction. This module applies the restriction in the child right
-//! before `exec` (via `pre_exec`), so the spawned program runs with a
-//! kernel-enforced fence: it can create, modify or destroy filesystem
-//! state only under the configured write roots.
+//! access irrevocably, and every descendant inherits the restriction. This
+//! module applies the restriction in the child right before `exec` (via
+//! `pre_exec`), so the spawned program runs with a kernel-enforced fence:
+//! it can create, modify or destroy filesystem state only under the
+//! configured write roots, and on ABI v4+ (kernel 6.7+) it cannot
+//! `bind`/`connect` TCP — no port rules are added, so every TCP port is
+//! denied. ABI v5 (kernel 6.10+) handles `LANDLOCK_ACCESS_FS_IOCTL_DEV`
+//! without granting it, so newly opened character/block devices cannot
+//! ioctl (inherited stdin/stdout/stderr stay usable). ABI v6 (kernel
+//! 6.12+) also scopes abstract Unix sockets and
+//! outbound signals (`LANDLOCK_SCOPE_SIGNAL`) when the kernel accepts
+//! that handled-access set: the child cannot signal processes outside
+//! its landlock domain (parent, siblings, the rest of the machine).
 //!
-//! Deliberate scope: *reads* are not handled. The child must be able to
-//! load its executable and shared libraries, so a read fence would have to
-//! enumerate loader paths (fragile across distros); instead reads stay
-//! gated by the application-level broker (`fs.read` answered by the host
-//! under the invocation's grant). What landlock adds here is the OS-level
-//! write/destroy/exfil-by-write fence that no application logic can
-//! bypass: a hostile child cannot `rm -rf` the parent's tree, overwrite
-//! `/etc/passwd`, or write to any path outside its roots — the syscall is
-//! refused by the kernel before userland policy ever runs.
+//! Deliberate scope: filesystem *reads* are not handled. The child must
+//! be able to load its executable and shared libraries, so a read fence
+//! would have to enumerate loader paths (fragile across distros); instead
+//! reads stay gated by the application-level broker (`fs.read` answered
+//! by the host under the invocation's grant). UDP, raw sockets, netlink
+//! and pathname Unix sockets stay unhandled (Landlock has no UDP bit;
+//! seccomp/AppContainer stay out of v0). Windows has no Landlock.
 //!
-//! ABI adaptation: the handled-access set is tried newest-first (v3, v2,
-//! v1); older kernels refuse unknown bits with `EINVAL`, so the first
-//! candidate that creates a ruleset wins. Sizes are passed as the smallest
-//! legal structs (8 / 12 bytes), which every landlock kernel accepts.
-//! `landlock_restrict_self` demands the no_new_privs bit (or
-//! CAP_SYS_ADMIN), so the child sets it via `prctl` first — a side effect
-//! that also stops a setuid/setgid binary in the confined tree from
-//! escalating at exec.
+//! ABI adaptation: the handled-access set is tried newest-first (v6 net+
+//! scope, v4 net, then v5/v3/v2/v1 filesystem-only). Older kernels refuse
+//! unknown bits with `EINVAL`, or `E2BIG` when the attr is larger than
+//! the kernel's struct and the extra bytes are non-zero, so those errors
+//! continue to the next candidate. `landlock_restrict_self` demands the
+//! no_new_privs bit (or CAP_SYS_ADMIN), so the child sets it via `prctl`
+//! first — a side effect that also stops a setuid/setgid binary in the
+//! confined tree from escalating at exec.
 
 use std::ffi::CString;
 use std::io;
@@ -56,6 +62,18 @@ const FS_MAKE_BLOCK: u64 = 1 << 11;
 const FS_MAKE_SYM: u64 = 1 << 12;
 const FS_REFER: u64 = 1 << 13; // ABI v2 (kernel 5.19+)
 const FS_TRUNCATE: u64 = 1 << 14; // ABI v3 (kernel 6.2+)
+const FS_IOCTL_DEV: u64 = 1 << 15; // ABI v5 (kernel 6.10+)
+
+/// `LANDLOCK_ACCESS_NET_BIND_TCP` / `CONNECT_TCP` (ABI v4, kernel 6.7+).
+const NET_BIND_TCP: u64 = 1 << 0;
+const NET_CONNECT_TCP: u64 = 1 << 1;
+const NET_TCP: u64 = NET_BIND_TCP | NET_CONNECT_TCP;
+
+/// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` / `LANDLOCK_SCOPE_SIGNAL`
+/// (ABI v6, kernel 6.12+).
+const SCOPE_ABSTRACT_UNIX: u64 = 1 << 0;
+const SCOPE_SIGNAL: u64 = 1 << 1;
+const SCOPE_IPC: u64 = SCOPE_ABSTRACT_UNIX | SCOPE_SIGNAL;
 
 /// Every right that can create, modify or destroy filesystem state. Reads
 /// are intentionally absent (see the module docs).
@@ -72,20 +90,36 @@ const WRITE_ACCESS: u64 = FS_WRITE_FILE
 
 /// Handled-access candidates, newest ABI first: the first that creates a
 /// ruleset wins on the running kernel. `FS_REFER` (cross-hierarchy
-/// renames) and `FS_TRUNCATE` (open-with-truncate) are included only where
-/// the kernel knows them; without them the write fence still holds for
-/// same-tree mutations and truncation stays confined to the write roots.
-const HANDLED_CANDIDATES: [u64; 3] = [
-    WRITE_ACCESS | FS_TRUNCATE | FS_REFER, // ABI v3 (kernel 6.2+)
-    WRITE_ACCESS | FS_REFER,               // ABI v2 (kernel 5.19+)
-    WRITE_ACCESS,                          // ABI v1 (kernel 5.13+)
+/// renames), `FS_TRUNCATE` (open-with-truncate) and `FS_IOCTL_DEV`
+/// (ioctl on newly opened devices) are included only where the kernel
+/// knows them. `FS_IOCTL_DEV` is handled but never granted, so device
+/// ioctls are deny-all when the kernel knows the bit.
+const HANDLED_CANDIDATES: [u64; 4] = [
+    WRITE_ACCESS | FS_TRUNCATE | FS_REFER | FS_IOCTL_DEV, // ABI v5 (kernel 6.10+)
+    WRITE_ACCESS | FS_TRUNCATE | FS_REFER,                // ABI v3 (kernel 6.2+)
+    WRITE_ACCESS | FS_REFER,                              // ABI v2 (kernel 5.19+)
+    WRITE_ACCESS,                                         // ABI v1 (kernel 5.13+)
 ];
 
-/// Smallest legal `landlock_ruleset_attr` (handled_access_fs only; the
-/// kernel zero-fills the rest).
+/// Smallest legal `landlock_ruleset_attr` (handled_access_fs only).
 #[repr(C)]
-struct RulesetAttr {
+struct RulesetAttrFs {
     handled_access_fs: u64,
+}
+
+/// ABI v4 attr (`handled_access_net`).
+#[repr(C)]
+struct RulesetAttrFsNet {
+    handled_access_fs: u64,
+    handled_access_net: u64,
+}
+
+/// ABI v6 attr (`scoped`).
+#[repr(C)]
+struct RulesetAttrFsNetScope {
+    handled_access_fs: u64,
+    handled_access_net: u64,
+    scoped: u64,
 }
 
 /// Smallest legal `landlock_path_beneath_attr` (allowed_access +
@@ -101,17 +135,67 @@ struct PathBeneathAttr {
 /// child, so an unsupported kernel degrades to a warning instead of
 /// failing every sandboxed spawn.
 pub fn available() -> bool {
-    let attr = RulesetAttr {
+    let attr = RulesetAttrFs {
         handled_access_fs: WRITE_ACCESS,
     };
-    let ret = unsafe {
-        libc::syscall(
-            SYS_LANDLOCK_CREATE_RULESET,
-            &attr as *const RulesetAttr as usize,
-            std::mem::size_of::<RulesetAttr>(),
-            0usize,
+    close_if_ruleset(unsafe {
+        create_ruleset(
+            std::ptr::from_ref(&attr).cast(),
+            std::mem::size_of::<RulesetAttrFs>(),
         )
+    })
+}
+
+/// Whether the running kernel will handle TCP bind/connect in a landlock
+/// ruleset (ABI v4 / Linux 6.7+). Older landlock kernels still get the
+/// write fence; this probe is for tests that require the TCP half.
+pub fn tcp_deny_available() -> bool {
+    let attr = RulesetAttrFsNet {
+        handled_access_fs: WRITE_ACCESS,
+        handled_access_net: NET_TCP,
     };
+    close_if_ruleset(unsafe {
+        create_ruleset(
+            std::ptr::from_ref(&attr).cast(),
+            std::mem::size_of::<RulesetAttrFsNet>(),
+        )
+    })
+}
+
+/// Whether the running kernel will handle device ioctl in a landlock
+/// ruleset (ABI v5 / Linux 6.10+). Older landlock kernels still get the
+/// write fence; this probe is for tests that require the ioctl half.
+pub fn ioctl_dev_deny_available() -> bool {
+    let attr = RulesetAttrFs {
+        handled_access_fs: WRITE_ACCESS | FS_TRUNCATE | FS_REFER | FS_IOCTL_DEV,
+    };
+    close_if_ruleset(unsafe {
+        create_ruleset(
+            std::ptr::from_ref(&attr).cast(),
+            std::mem::size_of::<RulesetAttrFs>(),
+        )
+    })
+}
+
+/// Whether the running kernel will scope abstract Unix sockets and
+/// outbound signals in a landlock ruleset (ABI v6 / Linux 6.12+). Older
+/// landlock kernels still get the write fence (and TCP deny on ABI v4);
+/// this probe is for tests that require the signal half.
+pub fn signal_scope_available() -> bool {
+    let attr = RulesetAttrFsNetScope {
+        handled_access_fs: WRITE_ACCESS,
+        handled_access_net: NET_TCP,
+        scoped: SCOPE_IPC,
+    };
+    close_if_ruleset(unsafe {
+        create_ruleset(
+            std::ptr::from_ref(&attr).cast(),
+            std::mem::size_of::<RulesetAttrFsNetScope>(),
+        )
+    })
+}
+
+fn close_if_ruleset(ret: i64) -> bool {
     if ret >= 0 {
         unsafe {
             libc::close(ret as RawFd);
@@ -120,6 +204,81 @@ pub fn available() -> bool {
     } else {
         false
     }
+}
+
+unsafe fn create_ruleset(attr: *const u8, size: usize) -> i64 {
+    // SAFETY: `attr` is a landlock_ruleset_attr of `size` bytes; the
+    // kernel copies min(size, its struct) and rejects extra non-zero
+    // bytes with E2BIG. Called from the parent probe or from pre_exec.
+    unsafe { libc::syscall(SYS_LANDLOCK_CREATE_RULESET, attr as usize, size, 0usize) }
+}
+
+fn last_os_is_retryable() -> bool {
+    matches!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::EINVAL) | Some(libc::E2BIG)
+    )
+}
+
+/// Newest ABI first. `EINVAL` / `E2BIG` mean this kernel does not know
+/// the attr; any other error is fatal (landlock unusable in this
+/// namespace). Returns `(ruleset_fd, handled_access_fs)`.
+fn create_handled_ruleset() -> io::Result<(RawFd, u64)> {
+    for fs in HANDLED_CANDIDATES {
+        let attr = RulesetAttrFsNetScope {
+            handled_access_fs: fs,
+            handled_access_net: NET_TCP,
+            scoped: SCOPE_IPC,
+        };
+        let ret = unsafe {
+            create_ruleset(
+                std::ptr::from_ref(&attr).cast(),
+                std::mem::size_of::<RulesetAttrFsNetScope>(),
+            )
+        };
+        if ret >= 0 {
+            return Ok((ret as RawFd, fs));
+        }
+        if !last_os_is_retryable() {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    for fs in HANDLED_CANDIDATES {
+        let attr = RulesetAttrFsNet {
+            handled_access_fs: fs,
+            handled_access_net: NET_TCP,
+        };
+        let ret = unsafe {
+            create_ruleset(
+                std::ptr::from_ref(&attr).cast(),
+                std::mem::size_of::<RulesetAttrFsNet>(),
+            )
+        };
+        if ret >= 0 {
+            return Ok((ret as RawFd, fs));
+        }
+        if !last_os_is_retryable() {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    for fs in HANDLED_CANDIDATES {
+        let attr = RulesetAttrFs {
+            handled_access_fs: fs,
+        };
+        let ret = unsafe {
+            create_ruleset(
+                std::ptr::from_ref(&attr).cast(),
+                std::mem::size_of::<RulesetAttrFs>(),
+            )
+        };
+        if ret >= 0 {
+            return Ok((ret as RawFd, fs));
+        }
+        if !last_os_is_retryable() {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Err(io::Error::from_raw_os_error(libc::EINVAL))
 }
 
 /// The confinement a child will inherit: `O_PATH` file descriptors for the
@@ -175,40 +334,17 @@ impl Drop for ChildRules {
 /// async-signal-safe. On error the spawn fails (fail closed: a child that
 /// cannot be confined does not run).
 pub fn apply_in_child(rules: &ChildRules) -> io::Result<()> {
-    // Pick the newest handled-access set the kernel accepts.
-    let mut handled = 0u64;
-    let mut ruleset_fd = -1;
-    for candidate in HANDLED_CANDIDATES {
-        let attr = RulesetAttr {
-            handled_access_fs: candidate,
-        };
-        let ret = unsafe {
-            libc::syscall(
-                SYS_LANDLOCK_CREATE_RULESET,
-                &attr as *const RulesetAttr as usize,
-                std::mem::size_of::<RulesetAttr>(),
-                0usize,
-            )
-        };
-        if ret >= 0 {
-            handled = candidate;
-            ruleset_fd = ret as RawFd;
-            break;
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EINVAL) {
-            // ENOSYS / EOPNOTSUPP / EPERM: landlock is absent or unusable
-            // in this kernel/namespace.
-            return Err(error);
-        }
-    }
-    if ruleset_fd < 0 {
-        return Err(io::Error::from_raw_os_error(libc::EINVAL));
-    }
+    // Newest ABI first: TCP deny (no net-port rules → every TCP port
+    // denied) and abstract-Unix plus signal scope when the kernel knows
+    // them; older kernels still get the write fence alone.
+    let (ruleset_fd, handled) = create_handled_ruleset()?;
 
     // One rule per write root, granting the write set (plus truncate when
-    // the kernel handles it). `FS_REFER` stays ungranted, so cross-tree
-    // renames are denied even between two write roots.
+    // the kernel handles it). `FS_REFER` and `FS_IOCTL_DEV` stay
+    // ungranted: cross-tree renames are denied even between two write
+    // roots, and newly opened character/block devices cannot ioctl.
+    // No `LANDLOCK_RULE_NET_PORT` rules are added: handled TCP
+    // bind/connect with an empty port set is deny-all.
     let granted = WRITE_ACCESS | (handled & FS_TRUNCATE);
     for fd in &rules.write_root_fds {
         let attr = PathBeneathAttr {
@@ -235,11 +371,17 @@ pub fn apply_in_child(rules: &ChildRules) -> io::Result<()> {
 
     // `landlock_restrict_self` requires the no_new_privs bit (or
     // CAP_SYS_ADMIN), so set it first. This also hardens the exec that
-    // follows: a setuid/setgid binary can no longer escalate. prctl and
-    // the syscalls below are async-signal-safe, so this stays valid
-    // inside pre_exec.
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
-        return Err(io::Error::last_os_error());
+    // follows: a setuid/setgid binary can no longer escalate. `apply_
+    // unix_rlimits` sets the same bit on Linux even when landlock is
+    // skipped (`MOD-16`). `syscall(SYS_prctl)` stays async-signal-safe
+    // inside pre_exec; libc 0.2 does not export `prctl`/`PR_*` on gnu.
+    const PR_SET_NO_NEW_PRIVS: libc::c_long = 38;
+    if unsafe { libc::syscall(libc::SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(ruleset_fd);
+        }
+        return Err(error);
     }
 
     let ret = unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd as usize, 0usize) };
@@ -293,5 +435,20 @@ mod tests {
         let ret = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         assert_eq!(ret, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn tcp_deny_probe_does_not_panic() {
+        let _ = tcp_deny_available();
+    }
+
+    #[test]
+    fn signal_scope_probe_does_not_panic() {
+        let _ = signal_scope_available();
+    }
+
+    #[test]
+    fn ioctl_dev_probe_does_not_panic() {
+        let _ = ioctl_dev_deny_available();
     }
 }
