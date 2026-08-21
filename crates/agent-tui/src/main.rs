@@ -298,12 +298,13 @@ async fn run_ui(
                             }
                             for grant in grants {
                                 println!(
-                                    "grant {} risk={:?} workspace={:?} command={:?} \
+                                    "grant {} risk={:?} workspace={:?} argv={:?} shell={:?} \
                                      max_runs={:?} max_bytes={:?} expires_at_ms={}",
                                     grant.id,
                                     grant.risk,
                                     grant.target.workspace_path_prefix,
-                                    grant.target.process_command_prefix,
+                                    grant.target.exec_argv_prefix,
+                                    grant.target.shell_command_digest,
                                     grant.constraint.max_runs,
                                     grant.constraint.max_content_bytes,
                                     grant.expires_at_ms,

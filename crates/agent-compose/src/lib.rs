@@ -81,7 +81,8 @@ impl ContextPolicy {
 /// folders around the tree.
 ///
 /// `model` 非空时，rolling / dynamic 注入同一有界压缩器：B 折叠和 C 的
-/// `TaskCompleted` 蒸馏共用，比较的是生命周期而不是摘要质量。`append` 和
+/// episode-rotation semantic distill 共用（`TaskCompleted` 直接写入
+/// `CompletionRecord.summary`，不再二次 LLM）。`append` 和
 /// 进程外 `service` 不注入（子进程引擎没有这条 in-process 注入缝）。
 pub async fn build_context_engine(
     policy: ContextPolicy,

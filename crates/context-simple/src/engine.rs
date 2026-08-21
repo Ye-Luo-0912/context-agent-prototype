@@ -17,7 +17,6 @@ use crate::checkpoint;
 use crate::diagnostics;
 use crate::distill::{
     DistillJob, insert_derived_summary, insert_task_summary, plan_episode_distill,
-    plan_task_distill,
 };
 use crate::gc::{full, minor, reachability};
 use crate::heap::external_summary;
@@ -776,10 +775,12 @@ impl ContextEngine for SimpleContextEngine {
                     // set. The transitions are applied here and surfaced by the
                     // next maintenance report.
                     if needs_episode_rotation(&state, &self.config, &content) {
-                        // Distill the closing episode with the same operator
-                        // as TaskCompleted: plan under the lock, compact
-                        // after it drops. Without a compactor the rotation
-                        // is still just promote-and-evict.
+                        // Distill the closing episode: plan under the lock,
+                        // compact after it drops. TaskCompleted no longer
+                        // uses this operator — it already has an
+                        // authoritative CompletionRecord summary. Without a
+                        // compactor the rotation is still just
+                        // promote-and-evict.
                         if self.compactor.is_some() {
                             distill = plan_episode_distill(&state, &self.config);
                         }
@@ -1081,23 +1082,17 @@ impl ContextEngine for SimpleContextEngine {
                         state.external.replace_all(external);
                         scope::queue_task_scope_close(&mut state, completed_task);
                     }
-                    if self.compactor.is_some() {
-                        distill = Some(plan_task_distill(
-                            &state,
-                            completed_task,
-                            summary_scope_id,
-                            summary,
-                        ));
-                    } else {
-                        insert_task_summary(
-                            &mut state,
-                            &self.config,
-                            completed_task,
-                            summary_scope_id,
-                            summary,
-                            &[],
-                        );
-                    }
+                    // CompletionRecord.summary is already the validated
+                    // bounded outcome. Do not spend a second LLM round
+                    // re-summarizing it plus leftover task items.
+                    insert_task_summary(
+                        &mut state,
+                        &self.config,
+                        completed_task,
+                        summary_scope_id,
+                        summary,
+                        &[],
+                    );
                 }
                 ContextIngress::ContextDirective { action } => {
                     // Admit of an externalized item reads its content back from
@@ -1271,9 +1266,52 @@ impl ContextEngine for SimpleContextEngine {
                     AgentError::Internal("context materialization id is exhausted".into())
                 })?;
         let materialization_id = state.materialization_revision;
-        let mut materialized = materializer::materialize(&mut state, &self.config, &query);
+        let foreground_plan = materializer::plan_foreground(&state, &query, &[]);
+        drop(state);
+        let foreground = if foreground_plan.is_empty() {
+            Vec::new()
+        } else {
+            let dir = crate::store::store_dir(&self.config);
+            materializer::realize_foreground(foreground_plan, &dir).await
+        };
+        let used: usize = foreground
+            .iter()
+            .map(|item| item::approx_tokens(&item.content))
+            .sum();
+        let mut packed_query = query;
+        packed_query.budget_tokens = packed_query.budget_tokens.saturating_sub(used);
+        for item in &foreground {
+            let Some(path) = item
+                .file_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+            else {
+                continue;
+            };
+            let path = normalize_resource_path(path);
+            let key = match item
+                .file_revision
+                .as_deref()
+                .map(str::trim)
+                .filter(|revision| !revision.is_empty())
+            {
+                Some(revision) => format!("{path}@{revision}"),
+                None => path,
+            };
+            if !packed_query
+                .hints
+                .checked_files
+                .iter()
+                .any(|row| row == &key)
+            {
+                packed_query.hints.checked_files.push(key);
+            }
+        }
+        let mut state = self.state.lock().await;
+        let mut materialized = materializer::materialize(&mut state, &self.config, &packed_query);
         materialized.materialization_id = materialization_id;
-        let foreground_plan = materializer::plan_foreground(&state, &query, &materialized.items);
+        materialized.foreground = foreground;
         state.pending_materialization = Some(PendingMaterialization {
             id: materialization_id,
             item_ids: materialized.items.iter().map(|item| item.item_id).collect(),
@@ -1284,10 +1322,6 @@ impl ContextEngine for SimpleContextEngine {
                 .collect(),
         });
         drop(state);
-        if !foreground_plan.is_empty() {
-            let dir = crate::store::store_dir(&self.config);
-            materialized.foreground = materializer::realize_foreground(foreground_plan, &dir).await;
-        }
         Ok(materialized)
     }
 

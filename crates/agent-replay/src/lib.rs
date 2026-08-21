@@ -647,7 +647,7 @@ mod tests {
         ContextMaintenanceReport::default()
     }
 
-    fn tool_output(ok: bool, model_content: &str) -> ToolOutput {
+    fn tool_output_at(ok: bool, model_content: &str, path: Option<&str>) -> ToolOutput {
         ToolOutput {
             call_id: "call-1".into(),
             tool_name: "shell.exec".into(),
@@ -655,7 +655,9 @@ mod tests {
             summary: if ok { "ok" } else { "failed" }.into(),
             model_content: model_content.into(),
             artifact_ref: Some("artifact://run/test.log".into()),
-            metadata: json!({}),
+            metadata: path
+                .map(|path| json!({"path": path}))
+                .unwrap_or_else(|| json!({})),
         }
     }
 
@@ -1137,7 +1139,11 @@ mod tests {
                 run,
                 5,
                 RuntimeEvent::ToolFinished {
-                    output: tool_output(false, "tests failed: AuthService.rs:42"),
+                    output: tool_output_at(
+                        false,
+                        "tests failed: AuthService.rs:42",
+                        Some("AuthService.rs"),
+                    ),
                 },
             ),
             envelope(
@@ -1197,7 +1203,11 @@ mod tests {
                 run,
                 14,
                 RuntimeEvent::ToolFinished {
-                    output: tool_output(true, "tests passed in AuthService.rs"),
+                    output: tool_output_at(
+                        true,
+                        "tests passed in AuthService.rs",
+                        Some("AuthService.rs"),
+                    ),
                 },
             ),
             envelope(
@@ -1276,8 +1286,8 @@ mod tests {
             AttentionState::Archived,
             "successful observation leaves attention after consumption"
         );
-        // Dependency graph: the successful observation shares the
-        // AuthService.rs entity with the earlier error, so it must depend on it.
+        // Dependency graph: successful identity is the stamped path, which
+        // shares AuthService.rs with the earlier error.
         assert!(
             ok_item.dependencies.contains(&tool_item.id),
             "successful observation must depend on the error it verifies, got {:?}",

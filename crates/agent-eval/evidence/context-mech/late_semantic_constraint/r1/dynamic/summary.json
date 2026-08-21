@@ -1,0 +1,155 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 244601,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 1548,
+  "model_started": 33,
+  "model_used": 33,
+  "usage_incomplete": false,
+  "provider_tokens_lower_bound": false,
+  "workspace_sha256": "3bec86241dee695c67c151a368d5fea6af8fb86e5acb8af8e3cc5965172612bf",
+  "workspace_files": 30,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 4,
+      "failed": 0
+    },
+    {
+      "name": "edit.patch",
+      "calls": 1,
+      "failed": 1
+    },
+    {
+      "name": "edit.replace",
+      "calls": 11,
+      "failed": 6
+    },
+    {
+      "name": "fs.list",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 9,
+      "failed": 0
+    },
+    {
+      "name": "fs.write",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "process.run",
+      "calls": 2,
+      "failed": 2
+    },
+    {
+      "name": "search.grep",
+      "calls": 2,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 132,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 9,
+    "fetch_calls": 0,
+    "final_resident_bytes": 1392,
+    "forgotten_items": 38,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 67,
+    "materialize_rounds": 33,
+    "model_attempts": 33,
+    "model_input_tokens": 268452,
+    "model_output_tokens": 7057,
+    "model_retries": 0,
+    "peak_resident_bytes": 2123,
+    "prompt_current_focus_tokens": 1403,
+    "prompt_historical_context_tokens": 10830,
+    "prompt_runtime_facts_tokens": 891,
+    "prompt_system_tokens": 2343,
+    "prompt_task_anchor_tokens": 858,
+    "prompt_task_progress_tokens": 2136,
+    "prompt_tool_catalog_index_tokens": 7518,
+    "prompt_tool_schema_tokens": 25423,
+    "prompt_turn_frame_tokens": 55701,
+    "provider_tokens_lower_bound": false,
+    "provider_tokens_total": 275509,
+    "reactivated_tokens": 115,
+    "reactivation_consumed": 0,
+    "reactivation_consumed_tokens": 0,
+    "reactivation_events": 2,
+    "reactivation_file_observation_consumed": 0,
+    "reactivation_file_observation_selected": 0,
+    "reactivation_selected": 0,
+    "reactivation_selected_tokens": 0,
+    "reactivation_tool_observation_consumed": 0,
+    "reactivation_tool_observation_selected": 0,
+    "recovered_items": 2,
+    "recovery_auto_reactivation": 2,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 36,
+    "recovery_workspace_reread": 8,
+    "repeated_fs_reads": 8,
+    "reread_external_descriptor": 0,
+    "reread_first_read": 1,
+    "reread_motive_body_visible_current": 0,
+    "reread_motive_changed": 0,
+    "reread_motive_checked_fresh": 0,
+    "reread_motive_descriptor_only": 7,
+    "reread_motive_first": 1,
+    "reread_motive_needs_revalidation": 1,
+    "reread_motive_stored": 0,
+    "reread_motive_warm": 0,
+    "reread_previously_selected": 8,
+    "reread_resident_unselected": 0,
+    "reread_selected_descriptor": 0,
+    "reread_stored": 0,
+    "reread_warm": 0,
+    "rounds": 33,
+    "schema_tokens_total": 25423,
+    "search_calls": 1,
+    "search_empty": 0,
+    "search_hits": 4,
+    "search_ms_p50": 3,
+    "search_ms_p95": 3,
+    "selected_tokens_by_kind": {
+      "assistant_message": 2920,
+      "tool_observation": 2609,
+      "user_message": 352
+    },
+    "selected_tokens_by_reason": {
+      "latest_file_body": 2609,
+      "scored": 3272
+    },
+    "selected_tokens_by_source": {
+      "assistant": 2920,
+      "tool:fs.read": 2609,
+      "user": 352
+    },
+    "selected_tokens_reactivated": 0,
+    "selected_tokens_resident": 5881,
+    "tool_calls": 33,
+    "tool_failure_classes": {
+      "missing_project_marker": 2,
+      "no_exact_match": 3,
+      "no_search_match": 1,
+      "stale_revision": 4
+    },
+    "turns": 5,
+    "unique_reactivated": 2
+  }
+}

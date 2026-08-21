@@ -284,15 +284,30 @@ impl TaskApprovalGate {
                 }
             }
             ToolRisk::ProcessExecution => {
-                let Some(prefix) = &grant.target.process_command_prefix else {
-                    return Err(AgentError::InvalidRequest(
-                        "a process grant needs a process_command_prefix target".into(),
-                    ));
-                };
-                if prefix.split_whitespace().next().is_none() {
-                    return Err(AgentError::InvalidRequest(
-                        "process command prefix must not be empty".into(),
-                    ));
+                let exec = grant
+                    .target
+                    .exec_argv_prefix
+                    .as_ref()
+                    .filter(|tokens| tokens.iter().any(|token| !token.trim().is_empty()));
+                let shell = grant
+                    .target
+                    .shell_command_digest
+                    .as_ref()
+                    .map(|digest| digest.trim())
+                    .filter(|digest| !digest.is_empty());
+                match (exec, shell) {
+                    (Some(_), None) | (None, Some(_)) => {}
+                    (Some(_), Some(_)) => {
+                        return Err(AgentError::InvalidRequest(
+                            "a process grant cannot mix exec_argv_prefix and shell_command_digest"
+                                .into(),
+                        ));
+                    }
+                    (None, None) => {
+                        return Err(AgentError::InvalidRequest(
+                            "a process grant needs exec_argv_prefix or shell_command_digest".into(),
+                        ));
+                    }
                 }
             }
         }
@@ -332,8 +347,8 @@ impl TaskApprovalGate {
 
     /// Whether the derived intent of `call` falls inside the grant's
     /// declared target scope. Matching is effect-derived: the grant is
-    /// compared against the concrete intent (path, content size, command
-    /// prefix), never against the tool name alone.
+    /// compared against the concrete intent (path, content size, argv prefix
+    /// or exact shell digest), never against the tool name alone.
     fn grant_matches(grant: &StandingGrant, intent: &EffectIntent) -> bool {
         if grant.risk != intent.risk() {
             return false;
@@ -359,11 +374,20 @@ impl TaskApprovalGate {
                 }
                 true
             }
-            EffectIntent::ProcessRun { command } => {
-                let Some(prefix) = &grant.target.process_command_prefix else {
+            EffectIntent::ExecArgv { program, argv } => {
+                let Some(prefix) = grant.target.exec_argv_prefix.as_ref() else {
                     return false;
                 };
-                command_with_prefix(command, prefix)
+                agent_contracts::exec_argv_intent(prefix).covers(&EffectIntent::ExecArgv {
+                    program: program.clone(),
+                    argv: argv.clone(),
+                })
+            }
+            EffectIntent::ShellExec { command_digest, .. } => {
+                let Some(approved) = grant.target.shell_command_digest.as_ref() else {
+                    return false;
+                };
+                !approved.is_empty() && approved == command_digest
             }
         }
     }
@@ -398,7 +422,13 @@ fn intent_label(intent: &EffectIntent) -> String {
         EffectIntent::WorkspaceWrite { path, .. } => {
             format!("workspace write to '{path}'")
         }
-        EffectIntent::ProcessRun { command } => format!("process run '{command}'"),
+        EffectIntent::ExecArgv { program, argv } => {
+            format!("exec {program} {argv:?}")
+        }
+        EffectIntent::ShellExec {
+            dialect,
+            command_digest,
+        } => format!("shell exec dialect='{dialect}' digest={command_digest}"),
     }
 }
 
@@ -482,8 +512,9 @@ impl ApprovalGate for TaskApprovalGate {
         // validated arguments and match grants against it.
         let intent = Self::derive_effect_intent(call, spec);
         // `process.session` poll/stop keep ProcessExecution dispatch
-        // identity but do not spawn. They must not consume a command-prefix
-        // grant and must not fall through as an empty `ProcessRun`.
+        // identity but do not spawn. They must not consume an argv-prefix
+        // or shell-digest grant and must not fall through as an empty
+        // ExecArgv.
         if matches!(intent, EffectIntent::ReadOnly) {
             drop(book);
             self.record(&call.name, spec.risk, None).await;
@@ -501,7 +532,10 @@ impl ApprovalGate for TaskApprovalGate {
                 continue;
             }
             matched_id = Some(id.clone());
-            if matches!(intent, EffectIntent::ProcessRun { .. }) {
+            if matches!(
+                intent,
+                EffectIntent::ExecArgv { .. } | EffectIntent::ShellExec { .. }
+            ) {
                 entry.runs_used += 1;
             }
             break;
@@ -550,17 +584,6 @@ fn path_within_prefix(path: &str, prefix: &str) -> bool {
         return false;
     }
     path_parts[..prefix_parts.len()] == prefix_parts[..]
-}
-
-/// Lexical command-prefix match on whitespace-separated tokens: `cargo
-/// test` covers `cargo test -- --nocapture` but not `cargo testx`.
-fn command_with_prefix(command: &str, prefix: &str) -> bool {
-    let command_tokens: Vec<&str> = command.split_whitespace().collect();
-    let prefix_tokens: Vec<&str> = prefix.split_whitespace().collect();
-    if command_tokens.len() < prefix_tokens.len() {
-        return false;
-    }
-    command_tokens[..prefix_tokens.len()] == prefix_tokens[..]
 }
 
 fn now_ms() -> u64 {
@@ -811,13 +834,45 @@ mod tests {
         }
     }
 
+    fn exec_grant(id: &str, argv: &[&str], max_runs: Option<u32>) -> StandingGrant {
+        StandingGrant {
+            id: id.into(),
+            risk: ToolRisk::ProcessExecution,
+            target: GrantTarget {
+                exec_argv_prefix: Some(argv.iter().map(|token| (*token).to_string()).collect()),
+                ..Default::default()
+            },
+            constraint: agent_contracts::GrantConstraint {
+                max_runs,
+                ..Default::default()
+            },
+            expires_at_ms: u64::MAX,
+        }
+    }
+
+    fn shell_grant(id: &str, command: &str, max_runs: Option<u32>) -> StandingGrant {
+        StandingGrant {
+            id: id.into(),
+            risk: ToolRisk::ProcessExecution,
+            target: GrantTarget {
+                shell_command_digest: Some(agent_contracts::shell_command_digest(command)),
+                ..Default::default()
+            },
+            constraint: agent_contracts::GrantConstraint {
+                max_runs,
+                ..Default::default()
+            },
+            expires_at_ms: u64::MAX,
+        }
+    }
+
     fn write_grant(id: &str, prefix: &str, expires_at_ms: u64) -> StandingGrant {
         StandingGrant {
             id: id.into(),
             risk: ToolRisk::WorkspaceWrite,
             target: GrantTarget {
                 workspace_path_prefix: Some(prefix.into()),
-                process_command_prefix: None,
+                ..Default::default()
             },
             constraint: Default::default(),
             expires_at_ms,
@@ -1023,31 +1078,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_grant_limits_runs_and_prefix_is_lexical() {
+    async fn process_run_grant_is_structured_argv_prefix() {
         let inner = RecordingGate::denying();
         let gate = TaskApprovalGate::new(inner.clone());
-        gate.grant(StandingGrant {
-            id: "g-test".into(),
-            risk: ToolRisk::ProcessExecution,
-            target: GrantTarget {
-                workspace_path_prefix: None,
-                process_command_prefix: Some("cargo test".into()),
-            },
-            constraint: agent_contracts::GrantConstraint {
-                max_content_bytes: None,
-                max_runs: Some(2),
-            },
-            expires_at_ms: u64::MAX,
-        })
-        .await
-        .unwrap();
+        gate.grant(exec_grant("g-test", &["cargo", "test"], Some(2)))
+            .await
+            .unwrap();
 
-        // Two runs inside the envelope.
-        for command in ["cargo test", "cargo test -- --nocapture"] {
+        for argv in [
+            &["cargo", "test"][..],
+            &["cargo", "test", "--", "--nocapture"][..],
+        ] {
             let decision = gate
                 .authorize(
-                    &process_call(command),
-                    &process_spec(),
+                    &process_run_call(argv),
+                    &process_run_spec(),
                     &CancellationToken::new(),
                 )
                 .await
@@ -1055,25 +1100,23 @@ mod tests {
             assert_eq!(
                 decision,
                 ApprovalDecision::Allow,
-                "a bounded local test inside the grant must run without prompting: {command}"
+                "argv prefix must cover extra args: {argv:?}"
             );
         }
-        // The third run exceeds the cap and falls through.
         let decision = gate
             .authorize(
-                &process_call("cargo test"),
-                &process_spec(),
+                &process_run_call(&["cargo", "test"]),
+                &process_run_spec(),
                 &CancellationToken::new(),
             )
             .await
             .unwrap();
         assert_eq!(decision, ApprovalDecision::Deny, "the run cap must bite");
 
-        // A lexical neighbour is not covered even with runs left.
         let decision = gate
             .authorize(
-                &process_call("cargo testx -- --ignored"),
-                &process_spec(),
+                &process_run_call(&["cargo", "testx"]),
+                &process_run_spec(),
                 &CancellationToken::new(),
             )
             .await
@@ -1081,9 +1124,50 @@ mod tests {
         assert_eq!(
             decision,
             ApprovalDecision::Deny,
-            "command matching must be token-aware, not substring-aware"
+            "argv matching must keep argument boundaries"
         );
         assert_eq!(inner.calls.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn shell_grant_is_exact_digest_and_rejects_conjunction() {
+        let inner = RecordingGate::denying();
+        let gate = TaskApprovalGate::new(inner);
+        gate.grant(shell_grant("g-shell", "git status", Some(2)))
+            .await
+            .unwrap();
+        assert_eq!(
+            gate.authorize(
+                &process_call("git status"),
+                &process_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+            ApprovalDecision::Allow
+        );
+        assert_eq!(
+            gate.authorize(
+                &process_call("git status && something-dangerous"),
+                &process_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+            ApprovalDecision::Deny,
+            "shell && must not inherit an exact-command grant"
+        );
+        assert_eq!(
+            gate.authorize(
+                &process_call("git status --porcelain"),
+                &process_spec(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+            ApprovalDecision::Deny,
+            "shell grants are not command prefixes"
+        );
     }
 
     #[tokio::test]
@@ -1095,7 +1179,7 @@ mod tests {
             risk: ToolRisk::WorkspaceWrite,
             target: GrantTarget {
                 workspace_path_prefix: Some("src/".into()),
-                process_command_prefix: None,
+                ..Default::default()
             },
             constraint: agent_contracts::GrantConstraint {
                 max_content_bytes: Some(10),
@@ -1159,7 +1243,7 @@ mod tests {
             risk: ToolRisk::ReadOnly,
             target: GrantTarget {
                 workspace_path_prefix: Some("src/".into()),
-                process_command_prefix: None,
+                ..Default::default()
             },
             constraint: Default::default(),
             expires_at_ms: u64::MAX,
@@ -1286,9 +1370,7 @@ mod tests {
         };
         assert_eq!(
             TaskApprovalGate::derive_effect_intent(&process, &process_spec),
-            EffectIntent::ProcessRun {
-                command: "cargo test -- --nocapture".into()
-            }
+            agent_contracts::shell_exec_intent("", "cargo test -- --nocapture")
         );
 
         let read = ToolCall {
@@ -1314,18 +1396,9 @@ mod tests {
     async fn process_run_grant_matches_argv_not_an_unused_command_field() {
         let inner = RecordingGate::denying();
         let gate = TaskApprovalGate::new(inner);
-        gate.grant(StandingGrant {
-            id: "g-cargo".into(),
-            risk: ToolRisk::ProcessExecution,
-            target: GrantTarget {
-                workspace_path_prefix: None,
-                process_command_prefix: Some("cargo".into()),
-            },
-            constraint: Default::default(),
-            expires_at_ms: u64::MAX,
-        })
-        .await
-        .unwrap();
+        gate.grant(exec_grant("g-cargo", &["cargo"], None))
+            .await
+            .unwrap();
 
         let decision = gate
             .authorize(
@@ -1361,21 +1434,9 @@ mod tests {
     async fn process_session_poll_does_not_consume_a_process_grant() {
         let inner = RecordingGate::denying();
         let gate = TaskApprovalGate::new(inner);
-        gate.grant(StandingGrant {
-            id: "g-cargo".into(),
-            risk: ToolRisk::ProcessExecution,
-            target: GrantTarget {
-                workspace_path_prefix: None,
-                process_command_prefix: Some("cargo".into()),
-            },
-            constraint: agent_contracts::GrantConstraint {
-                max_runs: Some(1),
-                ..Default::default()
-            },
-            expires_at_ms: u64::MAX,
-        })
-        .await
-        .unwrap();
+        gate.grant(exec_grant("g-cargo", &["cargo"], Some(1)))
+            .await
+            .unwrap();
 
         let start = process_session_call(json!({
             "action": "start",
@@ -1468,7 +1529,7 @@ mod tests {
             risk: ToolRisk::WorkspaceWrite,
             target: GrantTarget {
                 workspace_path_prefix: Some("src".into()),
-                process_command_prefix: None,
+                ..Default::default()
             },
             constraint: Default::default(),
             expires_at_ms: u64::MAX,
@@ -1560,19 +1621,7 @@ mod tests {
         // than the legacy gate.
         let process = TaskApprovalGate::new(RecordingGate::denying());
         process
-            .grant(StandingGrant {
-                id: "g-run".into(),
-                risk: ToolRisk::ProcessExecution,
-                target: GrantTarget {
-                    workspace_path_prefix: None,
-                    process_command_prefix: Some("cargo test".into()),
-                },
-                constraint: agent_contracts::GrantConstraint {
-                    max_runs: Some(2),
-                    ..Default::default()
-                },
-                expires_at_ms: u64::MAX,
-            })
+            .grant(shell_grant("g-run", "cargo test", Some(2)))
             .await
             .unwrap();
         for _ in 0..2 {
@@ -1605,18 +1654,12 @@ mod tests {
         gate.grant(write_grant("g-src", "src/", u64::MAX))
             .await
             .unwrap();
-        gate.grant(StandingGrant {
-            id: "g-run".into(),
-            risk: ToolRisk::ProcessExecution,
-            target: GrantTarget {
-                workspace_path_prefix: None,
-                process_command_prefix: Some("cargo".into()),
-            },
-            constraint: Default::default(),
-            expires_at_ms: u64::MAX,
-        })
-        .await
-        .unwrap();
+        gate.grant(exec_grant("g-run", &["cargo"], None))
+            .await
+            .unwrap();
+        gate.grant(shell_grant("g-shell", "cargo test", None))
+            .await
+            .unwrap();
 
         let cancel = CancellationToken::new();
         let cases: Vec<(ToolCall, ToolSpec)> = vec![

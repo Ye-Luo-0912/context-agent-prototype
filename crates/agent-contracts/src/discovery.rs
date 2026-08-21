@@ -371,96 +371,91 @@ pub fn federate(
     page
 }
 
-/// Provider-owned tool catalog index (`TOOLS-10`). Candidate generation
-/// uses token/owner/state/risk buckets; a needle that hits no key
-/// residual-scans name+description so coverage stays at least as wide as
-/// the old case-sensitive name-contains scan, but case-insensitive and
-/// over descriptor fields.
+/// Provider-owned tool catalog search (`TOOLS-10`).
+///
+/// Ranking is token-OR plus a phrase bonus: a multi-word needle such as
+/// `"patch edit file"` must still hit `edit.patch`. Requiring every token
+/// *and* the whole phrase as a substring dropped those queries to zero
+/// hits. Empty query returns the catalog prefix (stable name order).
 pub fn search_tool_catalog(
     entries: &[ToolCatalogEntry],
     query: Option<&str>,
     limit: usize,
 ) -> Vec<ToolCatalogEntry> {
+    search_tool_catalog_filtered(entries, query, None, limit)
+}
+
+/// Catalog search with an optional [`crate::ToolSemanticRole`] filter.
+///
+/// `role=Mutate` is the execution-gap path: the model asks for a mutation
+/// primitive instead of guessing `"patch edit file"`. Role filtering
+/// happens before text ranking. Empty query + role returns the matching
+/// catalog prefix (stable name order).
+pub fn search_tool_catalog_filtered(
+    entries: &[ToolCatalogEntry],
+    query: Option<&str>,
+    role: Option<crate::ToolSemanticRole>,
+    limit: usize,
+) -> Vec<ToolCatalogEntry> {
     let limit = if limit == 0 { entries.len() } else { limit };
+    let filtered: Vec<&ToolCatalogEntry> = match role {
+        Some(role) => entries
+            .iter()
+            .filter(|entry| entry.has_role(role))
+            .collect(),
+        None => entries.iter().collect(),
+    };
     let Some(raw) = query.map(str::trim).filter(|q| !q.is_empty()) else {
-        return entries.iter().take(limit).cloned().collect();
+        return filtered.into_iter().take(limit).cloned().collect();
     };
     let needle = raw.to_lowercase();
-    let index = ToolCatalogIndex::build(entries);
-    let ids = index.candidate_ids(&needle);
-    let mut hits = Vec::new();
-    match ids {
-        Some(ids) => {
-            for idx in ids {
-                if let Some(entry) = entries.get(idx)
-                    && descriptor_matches(entry, &needle)
-                {
-                    hits.push(entry.clone());
-                    if hits.len() >= limit {
-                        break;
-                    }
-                }
-            }
-        }
-        None => {
-            for entry in entries {
-                if descriptor_matches(entry, &needle) {
-                    hits.push(entry.clone());
-                    if hits.len() >= limit {
-                        break;
-                    }
-                }
-            }
+    let tokens: Vec<String> = tokenize(&needle).into_iter().collect();
+    let mut scored: Vec<(u32, usize)> = Vec::new();
+    for (idx, entry) in filtered.iter().enumerate() {
+        let score = catalog_search_score(entry, &needle, &tokens);
+        if score > 0 {
+            scored.push((score, idx));
         }
     }
-    hits
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| filtered[a.1].name.cmp(&filtered[b.1].name))
+    });
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, idx)| filtered[idx].clone())
+        .collect()
 }
 
-struct ToolCatalogIndex {
-    by_token: HashMap<String, Vec<usize>>,
+fn catalog_search_score(entry: &ToolCatalogEntry, needle: &str, tokens: &[String]) -> u32 {
+    let mut score = 0u32;
+    if descriptor_matches(entry, needle) {
+        score += 1000;
+    }
+    let name = entry.name.to_lowercase();
+    if name == needle || name.contains(needle) {
+        score += 200;
+    }
+    let haystack = tool_tokens(entry);
+    for token in tokens {
+        if token_hits_entry(token, &haystack, entry) {
+            score += 10;
+        }
+    }
+    score
 }
 
-impl ToolCatalogIndex {
-    fn build(entries: &[ToolCatalogEntry]) -> Self {
-        let mut by_token: HashMap<String, Vec<usize>> = HashMap::new();
-        for (idx, entry) in entries.iter().enumerate() {
-            for token in tool_tokens(entry) {
-                let bucket = by_token.entry(token).or_default();
-                if bucket.last().copied() != Some(idx) {
-                    bucket.push(idx);
-                }
-            }
-        }
-        Self { by_token }
+fn token_hits_entry(token: &str, haystack: &HashSet<String>, entry: &ToolCatalogEntry) -> bool {
+    // Haystack-contains-query covers stems (`files` vs `file`). Never the
+    // reverse: a 1-char haystack token would match every query.
+    if haystack
+        .iter()
+        .any(|h| h == token || (token.len() >= 2 && h.contains(token)))
+    {
+        return true;
     }
-
-    fn candidate_ids(&self, needle: &str) -> Option<Vec<usize>> {
-        let mut ids: Option<HashSet<usize>> = None;
-        let mut any_token = false;
-        for token in tokenize(needle) {
-            any_token = true;
-            let mut bucket: HashSet<usize> = HashSet::new();
-            for (key, rows) in &self.by_token {
-                if key.contains(&token) {
-                    bucket.extend(rows.iter().copied());
-                }
-            }
-            ids = Some(match ids.take() {
-                None => bucket,
-                Some(set) => set.intersection(&bucket).copied().collect(),
-            });
-        }
-        if !any_token {
-            return None;
-        }
-        let set = ids?;
-        if set.is_empty() {
-            return None;
-        }
-        let mut ids: Vec<usize> = set.into_iter().collect();
-        ids.sort_unstable();
-        Some(ids)
-    }
+    descriptor_matches(entry, token)
 }
 
 fn descriptor_matches(entry: &ToolCatalogEntry, needle: &str) -> bool {
@@ -494,6 +489,41 @@ fn tokenize(text: &str) -> HashSet<String> {
         tokens.insert(current);
     }
     tokens
+}
+
+/// Bounded model-facing catalog index: tools *not* on this round's schema
+/// surface. Names only — full JSON schemas stay behind `capability.manage`
+/// load. Surfaced tools are omitted so the index does not duplicate the
+/// tools array. Empty when every catalog entry is already on the surface.
+pub fn render_tool_catalog_index(
+    entries: &[ToolCatalogEntry],
+    surfaced: &HashSet<&str>,
+) -> Option<String> {
+    let mut rows: Vec<&ToolCatalogEntry> = entries
+        .iter()
+        .filter(|entry| {
+            entry.name != crate::CAPABILITY_MANAGE && !surfaced.contains(entry.name.as_str())
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows.truncate(crate::MAX_TOOL_CATALOG_INDEX_ROWS);
+    if rows.is_empty() {
+        return None;
+    }
+    let mut out = String::from("tool_catalog/v1\nload via capability.manage op=load name=<id>\n");
+    for entry in rows {
+        let summary = truncate_chars(
+            entry.description.trim(),
+            crate::MAX_TOOL_CATALOG_INDEX_SUMMARY_CHARS,
+        );
+        let line = format!("{}\t{}\t{summary}", entry.state.as_str(), entry.name);
+        if out.len() + line.len() + 1 > crate::MAX_TOOL_CATALOG_INDEX_CHARS {
+            break;
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    Some(out)
 }
 
 struct Fnv64(u64);
@@ -563,6 +593,7 @@ mod tests {
         ContextKind, ContextRef, ContextResidency, ContextRetention, ContextScope, SemanticState,
         ToolLifecycle, ToolRisk,
     };
+    use std::collections::HashSet;
 
     fn tool(name: &str, description: &str, owner: &str) -> ToolCatalogEntry {
         ToolCatalogEntry {
@@ -571,6 +602,7 @@ mod tests {
             owner: owner.into(),
             description: description.into(),
             risk: ToolRisk::ReadOnly,
+            roles: Vec::new(),
         }
     }
 
@@ -605,6 +637,72 @@ mod tests {
         let hits = search_tool_catalog(&entries, None, 1);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "a");
+    }
+
+    #[test]
+    fn tool_search_ranks_multi_word_needles_without_requiring_the_whole_phrase() {
+        let entries = vec![
+            tool("fs.read", "Read a workspace file", "builtin"),
+            tool(
+                "edit.patch",
+                "Apply exact-match text hunks to one or more workspace files",
+                "builtin",
+            ),
+            tool("fs.write", "Write/replace a UTF-8 text file", "builtin"),
+        ];
+        let hits = search_tool_catalog(&entries, Some("patch edit file"), 8);
+        assert_eq!(hits[0].name, "edit.patch");
+        assert!(hits.iter().any(|hit| hit.name == "fs.read"));
+    }
+
+    #[test]
+    fn tool_search_by_mutate_role_returns_edit_patch_without_a_text_query() {
+        use crate::ToolSemanticRole;
+        let entries = vec![
+            tool("fs.read", "Read a workspace file", "builtin"),
+            tool(
+                "edit.patch",
+                "Apply exact-match text hunks to one or more workspace files",
+                "builtin",
+            ),
+            tool("git.status", "Show the working tree status", "builtin"),
+            tool("shell.exec", "Run a shell command", "builtin"),
+        ];
+        let hits = search_tool_catalog_filtered(&entries, None, Some(ToolSemanticRole::Mutate), 8);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "edit.patch");
+        let hits = search_tool_catalog_filtered(
+            &entries,
+            Some("patch"),
+            Some(ToolSemanticRole::Mutate),
+            8,
+        );
+        assert_eq!(hits[0].name, "edit.patch");
+        let empty = search_tool_catalog_filtered(
+            &entries,
+            Some("status"),
+            Some(ToolSemanticRole::Mutate),
+            8,
+        );
+        assert!(
+            empty.is_empty(),
+            "role filter must not leak InspectDiff tools: {:?}",
+            empty.iter().map(|h| h.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tool_catalog_index_omits_surfaced_names_and_stays_bounded() {
+        let entries = vec![
+            tool("fs.read", "Read a workspace file", "builtin"),
+            tool("edit.patch", "Apply exact-match text hunks", "builtin"),
+        ];
+        let surfaced = HashSet::from(["fs.read"]);
+        let rendered = render_tool_catalog_index(&entries, &surfaced).expect("index");
+        assert!(rendered.starts_with("tool_catalog/v1"));
+        assert!(rendered.contains("edit.patch"));
+        assert!(!rendered.contains("fs.read"));
+        assert!(rendered.len() <= crate::MAX_TOOL_CATALOG_INDEX_CHARS);
     }
 
     #[test]

@@ -23,16 +23,12 @@ use crate::task::TaskAnchor;
 /// Revision of this typed root-derivation policy. Bumped only when the
 /// derivation rules change; recorded as the execution-policy source while
 /// an active call pins its tool.
-pub const TASK_ROOT_POLICY_REVISION: u64 = 8;
+pub const TASK_ROOT_POLICY_REVISION: u64 = 9;
 
 /// Hard cap on derived roots per round, so a pathological anchor can never
 /// grow the requirement set past the explicit-set bound. The explicit
 /// `TaskToolRequirementSet` stays the authority; derivation only adds.
 pub const MAX_DERIVED_TOOL_ROOTS: usize = 16;
-
-const EXPLORE_ROLES: &[ToolSemanticRole] =
-    &[ToolSemanticRole::ReadResource, ToolSemanticRole::Search];
-const MUTATE_ROLES: &[ToolSemanticRole] = &[ToolSemanticRole::Mutate];
 
 /// Everything the derivation needs from the safe point. All inputs are
 /// immutable references; the function is a pure projection of them.
@@ -49,13 +45,12 @@ pub struct TaskRootInput<'a> {
     /// verification, unmet obligation plus complete/coverage/soft-NL
     /// verify, never NL-alone). Not "acceptance is nonempty".
     pub verification_due: bool,
-    /// Current user-turn directive. Used for explore-without-anchor; not
-    /// a planner for mutation.
+    /// Current user-turn directive. Not a planner for mutation, read, or search.
     pub turn_intent: Option<&'a str>,
-    /// Open failed-command rows. Drives NeedRepair.
+    /// Open failed-command rows. A fact-gap, not a PreferSurface Mutate plan.
     pub has_failures: bool,
     /// Warm/Cold/Stored catalog or upcoming EXTERNAL CONTEXT refs.
-    /// Drives NeedEvidence → `context.manage`.
+    /// Drives evidence retrieval via `context.manage`.
     pub has_external_context: bool,
 }
 
@@ -78,11 +73,12 @@ pub fn derive_execution_policy_revision(active_tool: Option<&str>) -> Option<u64
 ///
 /// 1. Active-call policy: the executing tool becomes `MustSurface` so the
 ///    round that consumes its result still offers it.
-/// 2. `derive_needs` → semantic roles → catalog specs.
-///    NeedVerify: `Verify` → capability search → `EscapeHatch`.
+/// 2. `derive_needs` → fact-gaps, never an action plan.
+///    VerificationDue: `Verify` → capability search → `EscapeHatch`.
 ///    InspectDiff is never pulled in as a verifier.
-///    NeedEvidence: PreferSurface `context.manage` (catalog retrieval).
-/// 3. Focus goal without an anchor still explores when there is a query.
+///    EvidenceNeeded / OpenLoopNeedsEvidence: PreferSurface `context.manage`.
+///    UnresolvedFailure is a fact for the prompt, not PreferSurface Mutate.
+/// 3. A focus goal or user instruction never PreferSurfaces Read/Search/Mutate.
 ///
 /// Roots are de-duplicated by tool name, only name tools that exist in the
 /// catalog, and never exceed `MAX_DERIVED_TOOL_ROOTS`.
@@ -125,31 +121,13 @@ pub fn derive_task_roots(input: TaskRootInput<'_>) -> Vec<ToolSurfaceRequirement
         input.has_external_context,
     );
 
-    if needs.verify {
+    if needs.verification_due {
         let (specs, reason) = verification_surface(input.catalog);
         for spec in specs {
             push_root!(ToolSurfaceDemand::PreferSurface, spec.name.as_str(), reason);
         }
     }
-    if needs.explore {
-        for spec in catalog_specs_for_roles(input.catalog, EXPLORE_ROLES) {
-            push_root!(
-                ToolSurfaceDemand::PreferSurface,
-                spec.name.as_str(),
-                "turn intent or open loops need exploration tools"
-            );
-        }
-    }
-    if needs.mutate || needs.repair {
-        for spec in catalog_specs_for_roles(input.catalog, MUTATE_ROLES) {
-            push_root!(
-                ToolSurfaceDemand::PreferSurface,
-                spec.name.as_str(),
-                "current instruction needs mutation tools"
-            );
-        }
-    }
-    if needs.evidence {
+    if needs.evidence_needed || needs.open_loop_needs_evidence {
         push_root!(
             ToolSurfaceDemand::PreferSurface,
             CONTEXT_MANAGE,
@@ -162,24 +140,6 @@ pub fn derive_task_roots(input: TaskRootInput<'_>) -> Vec<ToolSurfaceRequirement
 
 fn catalog_has(catalog: &[ToolSpec], name: &str) -> bool {
     catalog.iter().any(|spec| spec.name == name)
-}
-
-fn catalog_specs_for_roles<'a>(
-    catalog: &'a [ToolSpec],
-    roles: &[ToolSemanticRole],
-) -> Vec<&'a ToolSpec> {
-    let mut specs: Vec<&ToolSpec> = catalog
-        .iter()
-        .filter(|spec| {
-            !spec.is_capability_search()
-                && spec
-                    .effective_roles()
-                    .iter()
-                    .any(|role| roles.contains(role))
-        })
-        .collect();
-    specs.sort_by(|a, b| a.name.cmp(&b.name));
-    specs
 }
 
 /// NeedVerify: declared verifiers, else catalog discovery, else escape hatch.
@@ -332,19 +292,10 @@ mod tests {
             has_failures: false,
             has_external_context: false,
         });
-        // Acceptance nonempty does not prefer verify tools. Exploration
-        // only: mutation is not inferred from plan_progress or intent.
-        let mut expected: Vec<&str> = vec!["fs.list", "fs.read", "search.grep"];
-        expected.sort_unstable();
-        let mut actual = names(&roots);
-        actual.sort_unstable();
-        assert_eq!(actual, expected);
         assert!(
-            roots
-                .iter()
-                .all(|r| r.demand == ToolSurfaceDemand::PreferSurface)
+            roots.is_empty(),
+            "open loops without context.manage must not PreferSurface Read/Search/Mutate: {roots:?}"
         );
-        assert!(roots.iter().all(|r| !r.reason.is_empty()));
     }
 
     #[test]
@@ -369,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_without_anchor_derives_exploration() {
+    fn focus_without_anchor_derives_no_action_plan() {
         let catalog = catalog(&["fs.read", "search.grep", "git.status"]);
         let roots = derive_task_roots(TaskRootInput {
             anchor: None,
@@ -381,9 +332,10 @@ mod tests {
             has_failures: false,
             has_external_context: false,
         });
-        let mut actual = names(&roots);
-        actual.sort_unstable();
-        assert_eq!(actual, vec!["fs.read", "search.grep"]);
+        assert!(
+            roots.is_empty(),
+            "a focus goal is not NeedExplore: {roots:?}"
+        );
     }
 
     #[test]
@@ -552,6 +504,42 @@ mod tests {
             has_external_context: false,
         });
         assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn unresolved_failure_does_not_prefer_mutate() {
+        let catalog = catalog(&["fs.write", "edit.patch", "fs.read"]);
+        let roots = derive_task_roots(TaskRootInput {
+            anchor: None,
+            focus_goal: Some("goal"),
+            active_tool: None,
+            catalog: &catalog,
+            verification_due: false,
+            turn_intent: None,
+            has_failures: true,
+            has_external_context: false,
+        });
+        assert!(
+            roots.is_empty(),
+            "unresolved failure is a fact-gap, not PreferSurface Mutate: {roots:?}"
+        );
+    }
+
+    #[test]
+    fn open_loops_prefer_context_manage() {
+        let catalog = catalog(&[CONTEXT_MANAGE, "fs.read", "search.grep"]);
+        let anchor = anchor_with(false, true, false, false);
+        let roots = derive_task_roots(TaskRootInput {
+            anchor: Some(&anchor),
+            focus_goal: Some("goal"),
+            active_tool: None,
+            catalog: &catalog,
+            verification_due: false,
+            turn_intent: None,
+            has_failures: false,
+            has_external_context: false,
+        });
+        assert_eq!(names(&roots), vec![CONTEXT_MANAGE]);
     }
 
     #[test]

@@ -18,8 +18,8 @@ use agent_contracts::{
 };
 use agent_platform_protocol::FEATURE_LEGACY_INVOKE_OUTPUT;
 use agent_process::{
-    MAX_SYSTEM_REQUESTS_PER_CALL, ProcessHost, ProcessHostConfig, ProcessSandbox, RestartCircuit,
-    SystemBroker,
+    HostLifecycle, MAX_SYSTEM_REQUESTS_PER_CALL, ProcessHost, ProcessHostConfig, ProcessSandbox,
+    RestartCircuit, SystemBroker,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -32,10 +32,9 @@ use tokio::sync::Mutex;
 pub struct ProcessCapabilityAdapter {
     manifest: CapabilityManifest,
     config: ProcessHostConfig,
-    /// `None` until `start()` connects the child; the capability is not
-    /// usable before then. Quarantined hosts stay in the slot until a
-    /// restart is acquired.
-    host: Mutex<Option<ProcessHost>>,
+    /// Explicit lifecycle so a failed replacement connect cannot look like
+    /// a first start and skip [`RestartCircuit`].
+    host: Mutex<HostLifecycle<ProcessHost>>,
     restart: RestartCircuit,
 }
 
@@ -160,7 +159,7 @@ impl ProcessCapabilityAdapter {
         Self {
             manifest,
             config,
-            host: Mutex::new(None),
+            host: Mutex::new(HostLifecycle::NeverStarted),
             restart: RestartCircuit::new(agent_process::DEFAULT_MAX_CONNECTION_RESTARTS),
         }
     }
@@ -177,24 +176,49 @@ impl Capability for ProcessCapabilityAdapter {
 
     async fn start(&self) -> AgentResult<()> {
         let mut slot = self.host.lock().await;
-        if let Some(host) = slot.as_ref() {
-            if host.status().health.allows_call() {
-                return Ok(());
-            }
-            // Quarantined: replace only within the restart budget. Keep the
-            // dead host if the budget is exhausted so the next start cannot
-            // look like a first connect.
+        if let HostLifecycle::Serving(host) = &*slot
+            && host.status().health.allows_call()
+        {
+            return Ok(());
+        }
+        if slot.connect_kind() == agent_process::ConnectKind::Restart {
             self.restart.try_acquire()?;
-            if let Some(old) = slot.take() {
+            if let HostLifecycle::Serving(old) = std::mem::replace(
+                &mut *slot,
+                HostLifecycle::Quarantined {
+                    reason: "restarting".into(),
+                },
+            ) {
                 old.shutdown().await;
             }
         }
-        *slot = Some(ProcessHost::connect(self.config.clone()).await?);
-        Ok(())
+        match ProcessHost::connect(self.config.clone()).await {
+            Ok(host) => {
+                let actual = host.sandbox_attestation();
+                let profile = self.manifest.sandbox_profile;
+                if !profile.allows_start(actual) {
+                    host.shutdown().await;
+                    let error = AgentError::Context(format!(
+                        "capability '{}' sandbox profile {:?} is not covered by enforced {:?}",
+                        self.manifest.id, profile, actual
+                    ));
+                    slot.record_connect_failure(error.to_string());
+                    return Err(error);
+                }
+                *slot = HostLifecycle::Serving(host);
+                Ok(())
+            }
+            Err(error) => {
+                slot.record_connect_failure(error.to_string());
+                Err(error)
+            }
+        }
     }
 
     async fn stop(&self) -> AgentResult<()> {
-        if let Some(host) = self.host.lock().await.take() {
+        if let HostLifecycle::Serving(host) =
+            std::mem::replace(&mut *self.host.lock().await, HostLifecycle::Stopped)
+        {
             host.shutdown().await;
         }
         Ok(())
@@ -206,7 +230,7 @@ impl Capability for ProcessCapabilityAdapter {
         ctx: CapabilityInvocationContext,
     ) -> AgentResult<CapabilityOutcome> {
         let slot = self.host.lock().await;
-        let host = slot.as_ref().ok_or_else(|| {
+        let host = slot.serving().ok_or_else(|| {
             AgentError::Context(format!(
                 "capability '{}' process is not started",
                 self.manifest.id

@@ -65,6 +65,63 @@ pub struct ConnectionStatus {
     pub reason: Option<String>,
 }
 
+/// Explicit host slot. `Option<Host>` conflated "never started" with
+/// "replacement connect failed", which skipped [`RestartCircuit`] on the
+/// next start.
+#[derive(Debug)]
+pub enum HostLifecycle<T> {
+    NeverStarted,
+    Serving(T),
+    Quarantined { reason: String },
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectKind {
+    /// First connect after NeverStarted/Stopped. Must not consume the
+    /// restart budget.
+    First,
+    /// Replacement of a serving or quarantined child. Must consume
+    /// [`RestartCircuit`].
+    Restart,
+}
+
+impl<T> HostLifecycle<T> {
+    pub fn connect_kind(&self) -> ConnectKind {
+        match self {
+            Self::NeverStarted | Self::Stopped => ConnectKind::First,
+            Self::Serving(_) | Self::Quarantined { .. } => ConnectKind::Restart,
+        }
+    }
+
+    pub fn serving(&self) -> Option<&T> {
+        match self {
+            Self::Serving(host) => Some(host),
+            _ => None,
+        }
+    }
+
+    pub fn serving_mut(&mut self) -> Option<&mut T> {
+        match self {
+            Self::Serving(host) => Some(host),
+            _ => None,
+        }
+    }
+
+    pub fn record_connect_failure(&mut self, reason: String) {
+        match self.connect_kind() {
+            ConnectKind::First => {
+                if matches!(self, Self::Stopped) {
+                    *self = Self::Stopped;
+                } else {
+                    *self = Self::NeverStarted;
+                }
+            }
+            ConnectKind::Restart => *self = Self::Quarantined { reason },
+        }
+    }
+}
+
 /// Bounds how many times an adapter may spawn a replacement child.
 pub struct RestartCircuit {
     max_restarts: u32,
@@ -136,5 +193,24 @@ mod tests {
         assert!(ConnectionHealth::Degraded.allows_call());
         assert!(!ConnectionHealth::NotServing.allows_call());
         assert!(!ConnectionHealth::Quarantined.allows_call());
+    }
+
+    #[test]
+    fn failed_replacement_is_not_a_first_connect() {
+        let mut slot = HostLifecycle::<()>::NeverStarted;
+        assert_eq!(slot.connect_kind(), ConnectKind::First);
+        slot.record_connect_failure("first connect failed".into());
+        assert!(matches!(slot, HostLifecycle::NeverStarted));
+        assert_eq!(slot.connect_kind(), ConnectKind::First);
+
+        let mut slot = HostLifecycle::Serving(());
+        assert_eq!(slot.connect_kind(), ConnectKind::Restart);
+        slot.record_connect_failure("replacement connect failed".into());
+        assert!(matches!(slot, HostLifecycle::Quarantined { .. }));
+        assert_eq!(
+            slot.connect_kind(),
+            ConnectKind::Restart,
+            "a failed replacement must keep consuming RestartCircuit"
+        );
     }
 }

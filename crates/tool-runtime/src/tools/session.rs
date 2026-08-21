@@ -257,7 +257,11 @@ impl ProcessSessionTool {
         command.process_group(0);
 
         super::require_process_effect_context(&effect_context, "process.session")?;
-        super::require_covered_process_command("process.session", arguments, &args.argv.join(" "))?;
+        super::require_covered_process_spawn(
+            "process.session",
+            arguments,
+            &agent_contracts::exec_argv_intent(&args.argv),
+        )?;
 
         let mut child = command
             .spawn()

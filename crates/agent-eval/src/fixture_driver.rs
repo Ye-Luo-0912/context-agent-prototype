@@ -1079,7 +1079,8 @@ pub async fn compare_bench_live(
     Ok(runs)
 }
 
-/// Live Mechanism V2: dynamic engine only, one mechanism per task.
+/// Live Mechanism V2: A/C only (no rolling). Default 3 tasks × 2
+/// engines × 2 repeats = 12 cells.
 pub async fn compare_mech_live(
     pack: &BenchPack,
     task: &BenchTask,
@@ -1088,34 +1089,46 @@ pub async fn compare_mech_live(
     pair: Option<&bundle::PairSink>,
 ) -> anyhow::Result<Vec<EngineRun>> {
     let limits = LIVE_LIMITS;
-    let name = "dynamic";
-    let engine = named_engine(name, Some(model.clone()))?;
-    let root = workspace_root.join(name);
-    std::fs::create_dir_all(&root)?;
-    context_bench::seed_task(pack, task, &root)?;
-    suite::ensure_workspace_git(&root)?;
-    let eval = run_bench_with_engine(
-        pack,
-        task,
-        &root,
-        model.clone(),
-        engine.clone(),
-        limits,
-        name,
-        pair,
-        true,
-    )
-    .await?;
-    let manager_tokens = manager_token_cost(engine.as_ref()).await?;
-    let runs = vec![EngineRun {
-        engine: name,
-        eval,
-        manager_tokens,
-    }];
+    let repeat = pair.map(|p| p.repeat).unwrap_or(1);
+    let order = bench_arm_order(task, repeat);
+    anyhow::ensure!(
+        order.len() == crate::context_mech::MECH_ENGINES
+            && order.contains(&"append")
+            && order.contains(&"dynamic")
+            && !order.contains(&"rolling"),
+        "{} mech live must be A/C, got {order:?}",
+        task.id()
+    );
+    let mut runs = Vec::new();
+    for &name in &order {
+        let engine = named_engine(name, Some(model.clone()))?;
+        let root = workspace_root.join(name);
+        std::fs::create_dir_all(&root)?;
+        context_bench::seed_task(pack, task, &root)?;
+        suite::ensure_workspace_git(&root)?;
+        let eval = run_bench_with_engine(
+            pack,
+            task,
+            &root,
+            model.clone(),
+            engine.clone(),
+            limits,
+            name,
+            pair,
+            true,
+        )
+        .await?;
+        let manager_tokens = manager_token_cost(engine.as_ref()).await?;
+        runs.push(EngineRun {
+            engine: name,
+            eval,
+            manager_tokens,
+        });
+    }
     if let Some(pair) = pair {
         bundle::write_pair_doc(
             pair,
-            &[name],
+            &order,
             crate::context_mech::SCHEMA,
             &serde_json::json!({
                 "mechanism": task.file.scenario,
@@ -1281,6 +1294,22 @@ mod tests {
     }
 
     #[test]
+    fn context_mech_live_is_twelve_ac_cells() {
+        let pack = crate::context_mech::load_pack().expect("mech pack");
+        assert_eq!(crate::context_mech::LIVE_CELLS, 12);
+        assert_eq!(pack.tasks.len(), crate::context_mech::MECH_TASKS);
+        for task in &pack.tasks {
+            assert!(!task.include_rolling(), "{}", task.id());
+            for repeat in [1u32, 2] {
+                let order = bench_arm_order(task, repeat);
+                assert_eq!(order.len(), 2, "{} r{repeat}: {order:?}", task.id());
+                assert!(order.contains(&"append") && order.contains(&"dynamic"));
+                assert!(!order.contains(&"rolling"));
+            }
+        }
+    }
+
+    #[test]
     fn live_coding_compare_uses_production_tool_surface() {
         let production = EvalToolSurface::Production.lifecycle_config();
         let product = tool_runtime::ToolLifecycleConfig::default();
@@ -1292,10 +1321,11 @@ mod tests {
                 "fs.read".to_string(),
                 "search.grep".to_string(),
                 "artifact.read".to_string(),
+                "edit.patch".to_string(),
                 "task.complete".to_string(),
                 agent_contracts::CAPABILITY_MANAGE.to_string(),
             ],
-            "item 24: live coding compare matches production; context.manage is catalog-only"
+            "live coding compare matches production; edit.patch is the canonical mutation primitive; context.manage is catalog-only"
         );
         assert!(
             !production

@@ -20,8 +20,8 @@ use agent_contracts::{
     DISCOVERY_IDENTICAL_QUERY_BUDGET, DISCOVERY_MAX_QUERIES_PER_TURN, DiscoveryBudgetExhausted,
     DiscoveryTurnBudget, Effect, EffectDurability, EffectId, EffectReceipt, FocusState,
     FsRereadClass, InputAuthority, InputKind, InputLifecycle, InputSource,
-    MAX_COMPLETION_ARTIFACTS, MAX_FOREGROUND_TOKENS, MaterializedContext, ModelCompletionValidity,
-    ModelInput, ModelRequest, OperationId, OperationOutcome, OperationQueryResult, OperationResult,
+    MAX_COMPLETION_ARTIFACTS, MaterializedContext, ModelCompletionValidity, ModelInput,
+    ModelRequest, OperationId, OperationOutcome, OperationQueryResult, OperationResult,
     OperationState, OperationTerminal, ResourceKey, ResourceVersionOracle, RestoreRevision, RunId,
     RuntimeDirective, RuntimeEvent, RuntimeInputEnvelope, RuntimeInputId, ScopeId, ScopeKind,
     StatePatchProposal, TaskAnchorView, TaskId, TaskProgressView, ToolCall, ToolOperationIdentity,
@@ -46,14 +46,15 @@ use crate::checkpoint::{
     RUNTIME_CHECKPOINT_VERSION, RunMetadata, RuntimeCheckpoint, TaskManagerSnapshot,
 };
 use crate::command::{Reply, RuntimeCommand, RuntimeHandle};
+use crate::execution::{ExecutionState, RoundExecutionSnapshot};
 use crate::output::bound_tool_output;
 use crate::prompt::PromptAssembler;
 use crate::services::RuntimeServices;
 use crate::sink::LiveSink;
 use crate::surface::{RoundSurfacePlan, SurfaceReportContext};
 use crate::task::{
-    AnchorPatch, TaskManager, changed_fields_kind, normalize_tool_requirements,
-    validate_completion_proposal,
+    AnchorPatch, TaskManager, changed_fields_kind, completion_from_execution,
+    normalize_tool_requirements, validate_completion_proposal,
 };
 
 mod commands;
@@ -200,6 +201,14 @@ struct ActiveTurn {
     /// Where the turn is in its commit lifecycle (see `TurnState`).
     turn_state: TurnState,
     op: Option<InFlightOp>,
+    /// Ephemeral execution projection for this turn. Seeded from
+    /// `TaskRecord.resume` at turn start; observed on persistable tool
+    /// results; installed back onto the task only after TurnCompleted.
+    /// Cancel / fail / stale drops this value.
+    execution: ExecutionState,
+    /// Captured once per BeforeModel after revalidate. Prompt, ContextHints,
+    /// and tool-surface policy all read this — not per-consumer clones.
+    round_snapshot: Option<RoundExecutionSnapshot>,
     /// A structured completion proposal the model attached to a tool call
     /// (`task.complete`). Committed at the turn's safe point — after the
     /// turn commits — through the CTX-10 transaction, so completion never

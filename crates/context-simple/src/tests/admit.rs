@@ -1678,25 +1678,10 @@ async fn unnamed_task_summary_keeps_the_focused_tasks_identity() {
     );
 }
 
-/// 注入压缩器后，任务完成蒸馏成带 `DerivedFrom` 的派生摘要；原文条目保留。
-struct TaskDistillCompactor;
-
-#[async_trait::async_trait]
-impl BoundedCompactor for TaskDistillCompactor {
-    async fn compact(
-        &self,
-        request: CompactionRequest,
-    ) -> agent_contracts::AgentResult<CompactionOutput> {
-        Ok(CompactionOutput {
-            text: format!("[distilled] {}", request.source),
-            input_tokens: 5,
-            output_tokens: 3,
-        })
-    }
-}
-
+/// A compactor on TaskCompleted must not spend a second LLM round: the
+/// runtime summary is already the authoritative CompletionRecord text.
 #[tokio::test]
-async fn task_completion_distills_with_derived_from_and_keeps_sources() {
+async fn task_completion_stores_the_completion_record_summary_without_llm() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default())
         .with_compactor(Arc::new(TaskDistillCompactor));
     let task = open_focus(&engine, "finish task A").await;
@@ -1715,46 +1700,46 @@ async fn task_completion_distills_with_derived_from_and_keeps_sources() {
         .unwrap();
 
     let state = engine.state.lock().await;
-    let source = state
-        .items
-        .iter()
-        .find(|item| item.kind == ContextKind::UserMessage)
-        .expect("source user message must remain retrievable");
-    let source_id = source.id;
-    assert!(
-        source.content.contains("AuthService.rs"),
-        "raw bodies stay after distillation"
-    );
     let summary = state
         .items
         .iter()
         .find(|item| item.kind == ContextKind::Summary)
-        .expect("distilled summary must exist");
+        .expect("completion summary must exist");
     assert_eq!(summary.task_id, Some(task));
-    assert_eq!(summary.source.as_deref(), Some("derived"));
-    assert!(
-        summary.content.contains("[distilled]"),
-        "compactor output must become the summary, got: {}",
-        summary.content
+    assert_eq!(summary.source.as_deref(), Some("task-summary"));
+    assert_eq!(
+        summary.content, "A is done",
+        "CompletionRecord.summary is stored verbatim even when a compactor is wired"
     );
     assert!(
-        summary.content.contains("AuthService.rs"),
-        "distill source must include the task body, got: {}",
-        summary.content
-    );
-    assert!(
-        summary
-            .dependencies
-            .iter()
-            .any(|edge| edge.kind == DependencyKind::DerivedFrom && edge.target == source_id),
-        "distilled summary must carry DerivedFrom, got: {:?}",
-        summary.dependencies
+        summary.dependencies.is_empty(),
+        "task completion is not an LLM-derived card"
     );
     drop(state);
 
     let diagnostics = engine.diagnostics().await.unwrap();
-    assert_eq!(diagnostics.compaction_input_tokens, 5);
-    assert_eq!(diagnostics.compaction_output_tokens, 3);
+    assert_eq!(
+        diagnostics.compaction_input_tokens, 0,
+        "TaskCompleted must not call the compactor"
+    );
+    assert_eq!(diagnostics.compaction_output_tokens, 0);
+}
+
+/// Episode rotation still uses the LLM compactor; TaskCompleted does not.
+struct TaskDistillCompactor;
+
+#[async_trait::async_trait]
+impl BoundedCompactor for TaskDistillCompactor {
+    async fn compact(
+        &self,
+        request: CompactionRequest,
+    ) -> agent_contracts::AgentResult<CompactionOutput> {
+        Ok(CompactionOutput {
+            text: format!("[distilled] {}", request.source),
+            input_tokens: 5,
+            output_tokens: 3,
+        })
+    }
 }
 
 fn episode_budget_config() -> SimpleContextConfig {

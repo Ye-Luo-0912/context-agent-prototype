@@ -471,6 +471,7 @@ async fn effect_disconnect_quarantines_process_wire_effects() {
             transport: CapabilityTransport::Process {
                 program: program.clone(),
             },
+            sandbox_profile: Default::default(),
         },
         process_host_config(&program, Default::default()),
     );

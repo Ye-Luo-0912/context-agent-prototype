@@ -18,7 +18,7 @@ use agent_contracts::{
     validate_capability_id,
 };
 use agent_platform_protocol::{JsonDecodeBudget, decode_value};
-use agent_process::{DEFAULT_CANCEL_ACK_TIMEOUT, ProcessSupervisor, RestartCircuit};
+use agent_process::{DEFAULT_CANCEL_ACK_TIMEOUT, HostLifecycle, ProcessSupervisor, RestartCircuit};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
@@ -666,7 +666,7 @@ pub struct McpCapabilityAdapter {
     decl: McpServerDecl,
     request_timeout: Duration,
     max_frame_bytes: u64,
-    client: tokio::sync::Mutex<Option<McpStdioClient>>,
+    client: tokio::sync::Mutex<HostLifecycle<McpStdioClient>>,
     /// Replacements of a poisoned resident server. Discovery connect/reap
     /// does not count. Connection state is not task or Core authority.
     restart: RestartCircuit,
@@ -722,13 +722,14 @@ impl McpCapabilityAdapter {
             transport: CapabilityTransport::Process {
                 program: decl.program.clone(),
             },
+            sandbox_profile: Default::default(),
         };
         Ok(Self {
             manifest,
             decl,
             request_timeout,
             max_frame_bytes,
-            client: tokio::sync::Mutex::new(None),
+            client: tokio::sync::Mutex::new(HostLifecycle::NeverStarted),
             restart: RestartCircuit::new(agent_process::DEFAULT_MAX_CONNECTION_RESTARTS),
         })
     }
@@ -767,25 +768,35 @@ impl Capability for McpCapabilityAdapter {
         if ctx.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        if guard.as_ref().is_none_or(|client| client.is_poisoned()) {
-            // A poisoned client (timeout, cancel, framing failure) is
-            // replaced with a fresh connection up to the restart budget;
-            // the old server tree was already killed and reaped, so its
-            // late output can never be admitted. Exhaustion keeps the
-            // poisoned client so the next invoke cannot pretend this is a
-            // first connect.
-            if guard.as_ref().is_some_and(|client| client.is_poisoned()) {
+        let needs_connect = match &*guard {
+            HostLifecycle::Serving(client) => client.is_poisoned(),
+            HostLifecycle::NeverStarted
+            | HostLifecycle::Stopped
+            | HostLifecycle::Quarantined { .. } => true,
+        };
+        if needs_connect {
+            if guard.connect_kind() == agent_process::ConnectKind::Restart {
                 self.restart.try_acquire()?;
+                if let HostLifecycle::Serving(mut stale) = std::mem::replace(
+                    &mut *guard,
+                    HostLifecycle::Quarantined {
+                        reason: "restarting".into(),
+                    },
+                ) {
+                    stale.reap().await;
+                }
             }
-            if let Some(mut stale) = guard.take() {
-                stale.reap().await;
+            match McpClient::connect_stdio(&self.decl, self.request_timeout, self.max_frame_bytes)
+                .await
+            {
+                Ok(client) => *guard = HostLifecycle::Serving(client),
+                Err(error) => {
+                    guard.record_connect_failure(error.to_string());
+                    return Err(error);
+                }
             }
-            *guard = Some(
-                McpClient::connect_stdio(&self.decl, self.request_timeout, self.max_frame_bytes)
-                    .await?,
-            );
         }
-        let client = guard.as_mut().expect("client present after ensure");
+        let client = guard.serving_mut().expect("client present after ensure");
         let result = client
             .call_tool_with_cancel(&call.name, call.arguments, &ctx.cancel)
             .await?;
@@ -809,7 +820,9 @@ impl Capability for McpCapabilityAdapter {
     /// never leaves the server process behind.
     async fn stop(&self) -> AgentResult<()> {
         let mut guard = self.client.lock().await;
-        if let Some(mut client) = guard.take() {
+        if let HostLifecycle::Serving(mut client) =
+            std::mem::replace(&mut *guard, HostLifecycle::Stopped)
+        {
             client.poison("capability stopped by the runtime".into());
             client.reap().await;
         }
@@ -1325,7 +1338,7 @@ mod tests {
         assert!(manifest.tools.iter().any(|t| t.name == "mock.add"));
         assert!(manifest.tools.iter().any(|t| t.name == "mock.fail"));
         assert!(
-            adapter.client.lock().await.is_none(),
+            matches!(&*adapter.client.lock().await, HostLifecycle::NeverStarted),
             "lazy discovery must reap its temporary server"
         );
 
@@ -1349,7 +1362,7 @@ mod tests {
             .await
             .expect("invoke succeeds");
         assert!(
-            adapter.client.lock().await.is_some(),
+            adapter.client.lock().await.serving().is_some(),
             "first invoke must establish the lazy execution session"
         );
         let CapabilityOutcome::Value(output) = outcome else {
@@ -1417,7 +1430,7 @@ mod tests {
         {
             let mut guard = adapter.client.lock().await;
             guard
-                .as_mut()
+                .serving_mut()
                 .expect("resident client")
                 .poison("test fence".into());
         }
@@ -1436,7 +1449,7 @@ mod tests {
                 .client
                 .lock()
                 .await
-                .as_ref()
+                .serving()
                 .is_some_and(|client| client.is_poisoned()),
             "exhausted restart must keep the poisoned client"
         );

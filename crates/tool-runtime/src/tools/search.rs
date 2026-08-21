@@ -103,7 +103,7 @@ impl Tool for SearchGrepTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "search.grep".into(),
-            description: "Regex search across workspace files (rg-style). Returns file:line hits, bounded; ignored dirs are skipped.".into(),
+            description: "Regex search workspace files (rg-style, bounded).".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["pattern"],

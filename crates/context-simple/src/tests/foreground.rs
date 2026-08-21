@@ -271,3 +271,74 @@ async fn stored_body_is_projected_without_admit() {
             .all(|item| item.file_path.as_deref() != Some("src/scratch.md"))
     );
 }
+
+#[tokio::test]
+async fn foreground_deducts_actual_tokens_from_the_historical_budget() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    open_focus(&engine, "append notes").await;
+    engine
+        .ingest(ContextIngress::ToolObservation {
+            output: fs_read("1", "src/scratch.md"),
+            scope_id: None,
+        })
+        .await
+        .unwrap();
+    {
+        let mut state = engine.state.lock().await;
+        let mut note = crate::item::make_item(
+            &state,
+            &engine.config,
+            "historical ".repeat(20),
+            ContextKind::Note,
+            ContextScope::Session,
+            ContextRetention::Working,
+            0.9,
+            Some("note:history".into()),
+        );
+        note.scope_id = None;
+        state.items.push(note);
+    }
+    let fg_tokens = tokens::approx_tokens("     1 | fn body() {}");
+    let historical_tokens = tokens::approx_tokens("historical ".repeat(20).as_str());
+    assert!(
+        historical_tokens > 10,
+        "the historical note must be large enough to miss a leftover after foreground"
+    );
+    let budget = fg_tokens + 8;
+    assert!(
+        historical_tokens > budget.saturating_sub(fg_tokens),
+        "historical must not fit after actual foreground is charged"
+    );
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "Append to src/scratch.md".into(),
+            budget_tokens: budget,
+            hints: ContextHints {
+                foreground_resources: vec![ResourceKey {
+                    path: "src/scratch.md".into(),
+                    revision: None,
+                }],
+                ..ContextHints::default()
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(materialized.foreground.len(), 1);
+    assert!(
+        materialized.foreground[0].content.contains("fn body"),
+        "foreground packs first: {}",
+        materialized.foreground[0].content
+    );
+    assert!(
+        materialized
+            .items
+            .iter()
+            .all(|item| !item.content.contains("historical historical")),
+        "historical working set must see leftover after actual foreground, not a 2K reserve; selected={:?}",
+        materialized
+            .items
+            .iter()
+            .map(|item| item.content.chars().take(40).collect::<String>())
+            .collect::<Vec<_>>()
+    );
+}

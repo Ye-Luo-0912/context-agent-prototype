@@ -39,7 +39,7 @@ impl Tool for TaskCompleteTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "task.complete".into(),
-            description: "Propose completing the active task with a structured outcome: a bounded summary and optional artifact:// refs. The runtime validates the proposal and commits the typed completion record after this turn finalizes.".into(),
+            description: "Propose task completion (summary + optional artifact:// refs).".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["summary"],

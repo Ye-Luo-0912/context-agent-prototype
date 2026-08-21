@@ -7,6 +7,7 @@ pub mod context;
 pub mod discovery;
 pub mod error;
 pub mod event;
+pub mod host_policy;
 pub mod ids;
 pub mod input;
 pub mod jcs;
@@ -28,6 +29,9 @@ pub use context::*;
 pub use discovery::*;
 pub use error::*;
 pub use event::*;
+pub use host_policy::{
+    HostEffectBinding, HostToolPolicy, builtin_host_tool_policy, derive_effect_intent,
+};
 pub use ids::*;
 pub use input::*;
 pub use jcs::{JcsError, serialize as jcs_serialize};

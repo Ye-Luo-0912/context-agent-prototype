@@ -4,9 +4,10 @@ use std::path::Path;
 
 use agent_contracts::{
     MAX_FOREGROUND_RESOURCES, MAX_TASK_ANCHOR_ITEM_CHARS, ResourceFreshness, ResourceKey,
-    TaskProgressView, ToolOutput, ToolResultDisposition, TurnFrame, TurnFrameStep,
-    path_exactly_in_directive,
+    TaskProgressView, ToolOutput, path_exactly_in_directive,
 };
+#[cfg(test)]
+use agent_contracts::{ToolResultDisposition, TurnFrame, TurnFrameStep};
 
 pub(crate) const MAX_RESUME_FILES: usize = 32;
 pub(super) const MAX_RESUME_FAILURES: usize = 8;
@@ -66,6 +67,11 @@ pub struct VerificationObligation {
     /// Survives user turns ("still fixing").
     #[serde(default)]
     pub failed_open: bool,
+    /// When true, completion is refused unless [`ExecutionState::validity`]
+    /// is [`VerificationState::Current`]. Default false: do not force a
+    /// test run on every task.
+    #[serde(default)]
+    pub required_for_completion: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -110,6 +116,9 @@ pub struct VerificationFact {
     pub anchor_revision: u64,
     #[serde(default)]
     pub workspace_revision: u64,
+    /// Artifact locator of the verification output, when the tool retained one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -134,21 +143,69 @@ impl ExecutionState {
     pub fn on_user_turn(&mut self) {}
 
     /// Persistent obligation: something still needs a verification, even if
-    /// this round should not Prefer-verify.
+    /// this round should not Prefer-verify. Derived from
+    /// [`Self::validity`], not from independently toggled bools.
     pub fn has_unmet_obligation(&self) -> bool {
-        self.verification.failed_open
-            || self.verification.source_changed
-            || matches!(
-                self.verification.state,
-                VerificationState::Pending | VerificationState::Stale | VerificationState::Failed
-            )
-            || matches!(
-                self.verification.cause,
-                VerificationCause::SourceChanged
-                    | VerificationCause::SpecChanged
-                    | VerificationCause::FailureRepair
-            )
-            || self.current_verifications().any(|row| !row.ok)
+        matches!(
+            self.validity(),
+            VerificationState::Pending | VerificationState::Stale | VerificationState::Failed
+        ) || self.last_evidence().is_some_and(|row| !row.ok)
+    }
+
+    /// Latest verification evidence, including epoch-stale rows.
+    /// `workspace_revision` omits old PASS from the prompt view; validity
+    /// still needs the last result.
+    pub(crate) fn last_evidence(&self) -> Option<&VerificationFact> {
+        self.verifications.last()
+    }
+
+    /// Derived validity. Stored `verification.state` is refreshed after
+    /// mutations so checkpoints stay consistent with this function.
+    pub fn validity(&self) -> VerificationState {
+        if self.verification.failed_open || self.last_evidence().is_some_and(|ev| !ev.ok) {
+            return VerificationState::Failed;
+        }
+        let Some(_last) = self.last_evidence() else {
+            return if self.verification.cause != VerificationCause::None
+                || self.verification.required_for_completion
+            {
+                VerificationState::Pending
+            } else {
+                VerificationState::NotRun
+            };
+        };
+        if self.verification.source_changed
+            || self.unknown_blocks_current()
+            || self.verification.cause == VerificationCause::SpecChanged
+        {
+            return VerificationState::Stale;
+        }
+        VerificationState::Current
+    }
+
+    fn unknown_blocks_current(&self) -> bool {
+        if !self.verification.unknown_pending {
+            return false;
+        }
+        match &self.verification.coverage {
+            VerificationCoverage::Resources(paths) if !paths.is_empty() => {
+                !self.covered_resources_identity_confirmed(paths)
+            }
+            _ => true,
+        }
+    }
+
+    pub(super) fn covered_resources_identity_confirmed(&self, paths: &[String]) -> bool {
+        !self.verification.source_changed
+            && paths.iter().all(|path| {
+                self.checked_files
+                    .iter()
+                    .any(|fact| fact.path == *path && fact.freshness == ResourceFreshness::Fresh)
+            })
+    }
+
+    pub(super) fn refresh_validity(&mut self) {
+        self.verification.state = self.validity();
     }
 
     /// Conservative user-turn signal that this instruction is asking to
@@ -178,7 +235,7 @@ impl ExecutionState {
     /// Natural-language verify is a soft hint: it never creates an
     /// obligation and is ignored unless one already exists.
     pub fn verification_due_now(&self, turn_intent: &str) -> bool {
-        if self.verification.failed_open || self.current_verifications().any(|row| !row.ok) {
+        if self.verification.failed_open || self.last_evidence().is_some_and(|row| !row.ok) {
             return true;
         }
         if !self.has_unmet_obligation() {
@@ -198,36 +255,31 @@ impl ExecutionState {
             VerificationCoverage::Resources(paths) => paths
                 .iter()
                 .any(|path| path_mentioned_in_query(turn_intent, path)),
-            VerificationCoverage::Workspace | VerificationCoverage::Unspecified => false,
+            VerificationCoverage::Workspace | VerificationCoverage::Unspecified => {
+                self.verification.source_changed
+                    && self
+                        .checked_files
+                        .iter()
+                        .any(|fact| path_mentioned_in_query(turn_intent, &fact.path))
+            }
         }
     }
 
     pub fn mark_spec_changed(&mut self) {
         if self.verification.state != VerificationState::Failed {
             self.verification.cause = VerificationCause::SpecChanged;
-            if self.verification.state == VerificationState::Current {
-                self.verification.state = VerificationState::Stale;
-            } else if self.verification.state == VerificationState::NotRun {
-                self.verification.state = VerificationState::Pending;
-            }
         }
         self.verification.coverage = VerificationCoverage::Workspace;
+        self.refresh_validity();
     }
 
     pub(super) fn mark_source_changed(&mut self, path: &str) {
         self.verification.source_changed = true;
         if !matches!(self.verification.state, VerificationState::Failed) {
             self.verification.cause = VerificationCause::SourceChanged;
-            self.verification.state = if matches!(
-                self.verification.state,
-                VerificationState::Current | VerificationState::Stale
-            ) {
-                VerificationState::Stale
-            } else {
-                VerificationState::Pending
-            };
         }
         self.add_coverage_path(path);
+        self.refresh_validity();
     }
 
     fn add_coverage_path(&mut self, path: &str) {
@@ -279,9 +331,10 @@ impl ExecutionState {
             .collect()
     }
 
-    /// Prompt-only view of this cache plus the open turn's persistable
-    /// tool results. The stored state is unchanged; durable `observe_tool`
-    /// still runs after the turn commit barrier.
+    /// Unit-test helper: clone plus replay persistable `TurnFrame` results.
+    /// Production uses `ActiveTurn.execution` (observed live, installed
+    /// onto `TaskRecord.resume` after the TurnCompleted barrier).
+    #[cfg(test)]
     pub(crate) fn project_from_turn(
         &self,
         turn: &TurnFrame,
@@ -292,6 +345,7 @@ impl ExecutionState {
             .view()
     }
 
+    #[cfg(test)]
     pub(crate) fn apply_open_turn(
         &self,
         turn: &TurnFrame,
@@ -391,13 +445,20 @@ impl ExecutionState {
         });
     }
 
-    pub(super) fn push_verification(&mut self, summary: String, ok: bool, turn: u64) {
+    pub(super) fn push_verification(
+        &mut self,
+        summary: String,
+        ok: bool,
+        turn: u64,
+        evidence_ref: Option<String>,
+    ) {
         self.verifications.push(VerificationFact {
             summary: bound_item(&summary),
             ok,
             turn,
             anchor_revision: self.anchor_revision,
             workspace_revision: self.workspace_revision,
+            evidence_ref: evidence_ref.map(|value| bound_item(&value)),
         });
     }
 

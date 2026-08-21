@@ -266,6 +266,35 @@ pub fn close_inherited_fds() {
     }
 }
 
+fn attest_sandbox(
+    sandbox: &ProcessSandbox,
+    landlock_applied: bool,
+    windows_job: bool,
+) -> agent_contracts::SandboxCapabilities {
+    let mut actual = agent_contracts::SandboxCapabilities::default();
+    #[cfg(target_os = "linux")]
+    if landlock_applied {
+        actual.fs_write_confined = true;
+        actual.tcp_connect_denied = crate::landlock::tcp_deny_available();
+        actual.signal_scoped = crate::landlock::signal_scope_available();
+    }
+    #[cfg(unix)]
+    {
+        actual.cpu_quota = sandbox.cpu_time_limit_secs > 0;
+        actual.memory_quota = sandbox.max_memory_bytes > 0;
+        actual.fd_quota = sandbox.max_open_files > 0;
+        actual.process_spawn_controlled = sandbox.process_limit > 0;
+    }
+    #[cfg(windows)]
+    {
+        actual.fs_write_confined = !sandbox.integrity_write_roots.is_empty();
+        actual.process_spawn_controlled = windows_job;
+        actual.memory_quota = windows_job && sandbox.job_max_memory_bytes > 0;
+    }
+    let _ = (sandbox, landlock_applied, windows_job);
+    actual
+}
+
 /// A live child process speaking JSON-lines on stdio. Strict ping-pong:
 /// one request in flight at a time (the `Mutex`), because the callers are
 /// `&self` traits. Supervision ([`ProcessSupervisor`]) and framed bytes
@@ -284,6 +313,8 @@ pub struct ProcessHost {
     stderr_saturated: Arc<AtomicBool>,
     /// ping 握手交叉后的特性。缺省为空：历史纯 ToolOutput 默认关闭。
     negotiated_features: ActiveFeatures,
+    /// Capabilities actually applied at spawn, not the configured policy.
+    attestation: agent_contracts::SandboxCapabilities,
 }
 
 impl ProcessHost {
@@ -367,6 +398,10 @@ impl ProcessHost {
                     .map_err(|e| AgentError::Context(format!("landlock sandbox setup: {e}")))?,
             )
         };
+        #[cfg(target_os = "linux")]
+        let landlock_applied = landlock_rules.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let landlock_applied = false;
         #[cfg(unix)]
         {
             let cpu = config.sandbox.cpu_time_limit_secs;
@@ -427,6 +462,15 @@ impl ProcessHost {
             },
             None => None,
         };
+
+        let attestation = attest_sandbox(
+            &config.sandbox,
+            landlock_applied,
+            #[cfg(windows)]
+            job.is_some(),
+            #[cfg(not(windows))]
+            false,
+        );
         let stdin = child
             .stdin
             .take()
@@ -489,6 +533,7 @@ impl ProcessHost {
             peer_epoch: AtomicU64::new(0),
             stderr_saturated,
             negotiated_features: ActiveFeatures::default(),
+            attestation,
         };
         let mut ping = json!({ "op": "ping", "host_epoch": 1u64 });
         if !host.config.offered_features.is_empty() {
@@ -531,6 +576,11 @@ impl ProcessHost {
             host.peer_epoch.store(peer, Ordering::Relaxed);
         }
         Ok(host)
+    }
+
+    /// Capabilities the OS actually applied to this child.
+    pub fn sandbox_attestation(&self) -> agent_contracts::SandboxCapabilities {
+        self.attestation
     }
 
     /// Connection health and epochs. Never task or Core authority.

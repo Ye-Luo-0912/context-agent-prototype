@@ -63,18 +63,22 @@ refused lease rolls the staged effect back and surfaces a failed tool
 result, so an operation that overran its authorization window cannot
 mutate the world. `derive_effect_intent` moved to `agent-contracts` so
 grant matching and lease minting share one normalization; the bounded
-`RuntimeEvent::LeaseIssued` audit row records lease/grant/expiry. Still
-open from this draft: the `ModelToolSpec`/`HostToolPolicy` split and typed
-`PermissionSet`/`GrantSpec` — both remain specification until a later
+`RuntimeEvent::LeaseIssued` audit row records lease/grant/expiry. Builtin
+`HostToolPolicy` is landed (args → structured `EffectIntent`; unknown
+plugins fail closed). Full `ModelToolSpec` / typed
+`PermissionSet`/`GrantSpec` remain specification until a later
 migration item.
 
 **2026-08-11 (M14 slice):** the `EffectIntent` type is implemented in
 `agent-contracts` (`ReadOnly | WorkspaceWrite { path, content_bytes } |
-ProcessRun { command }`, with `risk()` bridging to the legacy `ToolRisk`),
-and `TaskApprovalGate` now derives the concrete intent from the validated
-arguments and matches standing grants against that intent — approval is
-effect-derived, never tool-name-derived. The `AuthorityGate` shadow-mode
-migration (`MOD-04`) can now reuse the derived intent directly.
+ExecArgv { program, argv } | ShellExec { dialect, command_digest }`,
+with `risk()` bridging to the legacy `ToolRisk`). Trusted
+`HostToolPolicy` binds builtin arguments; unknown plugins fail closed
+and do not bind `command`/`argv`/`destination`/`payload`.
+`TaskApprovalGate` matches standing grants against that structured
+intent — approval is effect-derived, never tool-name-derived. The
+`AuthorityGate` shadow-mode migration (`MOD-04`) can now reuse the
+derived intent directly.
 
 ## 2. ModelToolSpec / HostToolPolicy split
 
@@ -380,7 +384,8 @@ pub struct GrantSpec {
 
 pub struct GrantTargetV2 {
     pub workspace_path_prefix: Option<String>,
-    pub process_command_prefix: Option<String>,
+    pub exec_argv_prefix: Option<Vec<String>>,
+    pub shell_command_digest: Option<String>,
     pub network_host_allowlist: Option<Vec<String>>,
 }
 

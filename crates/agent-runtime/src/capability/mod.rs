@@ -22,7 +22,7 @@ use agent_contracts::{
     CapabilityTransport, Effect, RUNTIME_CONTEXT_CONTROL, ResourceDescriptor, ToolCatalogEntry,
     ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolSemanticRole,
     ToolSpec, ToolSurfaceSnapshot, WORKSPACE_READ, WORKSPACE_WRITE, WorkspaceHandle,
-    derive_effect_intent, search_tool_catalog,
+    derive_effect_intent, search_tool_catalog_filtered,
 };
 use agent_core::{CapabilityAdmission, CapabilityState, CapabilityStateAuthority};
 use agent_workspace::{ArtifactStoreHandle, ConfinedWorkspaceHandle, RemoteEffectAck, Workspace};
@@ -623,6 +623,7 @@ impl CapabilityRegistry {
                         owner: owner.clone(),
                         description: spec.description.clone(),
                         risk: spec.risk,
+                        roles: spec.effective_roles(),
                     });
                 }
             }
@@ -1094,16 +1095,21 @@ impl CapabilityAwareDispatcher {
         vec![
             ToolSpec {
                 name: CAPABILITY_MANAGE.into(),
-                description: "Manage the tool catalog in one call (builtin tools and dynamic capabilities). ops: search (list known tools with lifecycle state and owner), inspect (one tool's schema, risk, owner and state), load (put one tool on the model surface; its capability's sibling tools stay off until loaded individually), unload (take it off; core builtin tools cannot be unloaded).".into(),
+                description: "Catalog ops: search, inspect, load, unload. Search by query and/or role=mutate|verify|read_resource|search|inspect_diff|escape_hatch. Load by exact name from the TOOL CATALOG index.".into(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["op"],
                     "properties": {
                         "op": {"type": "string", "enum": ["search", "inspect", "load", "unload"]},
-                        "name": {"type": "string", "description": "Tool name for inspect/load/unload"},
-                        "query": {"type": "string", "description": "search: optional case-insensitive filter over name, description, owner, state, and risk"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "search: max rows in the model-facing page (default 20)"},
-                        "cursor": {"type": "string", "description": "search: last tool name of the previous page"}
+                        "name": {"type": "string", "description": "Exact tool name for inspect/load/unload"},
+                        "query": {"type": "string", "description": "search: token match over name/description/owner/state/risk"},
+                        "role": {
+                            "type": "string",
+                            "enum": ["read_resource", "search", "inspect_diff", "verify", "mutate", "escape_hatch"],
+                            "description": "search: filter by semantic role instead of guessing keywords"
+                        },
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                        "cursor": {"type": "string"}
                     }
                 }),
                 risk: agent_contracts::ToolRisk::ReadOnly,
@@ -1491,6 +1497,8 @@ struct ManageArgs {
     #[serde(default)]
     query: Option<String>,
     #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
     cursor: Option<String>,
@@ -1500,6 +1508,8 @@ struct ManageArgs {
 struct SearchArgs {
     #[serde(default)]
     query: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
     /// Max rows in the model-facing page (default 20, capped at 50).
     #[serde(default)]
     limit: Option<usize>,
@@ -1518,9 +1528,16 @@ impl CapabilityAwareDispatcher {
             .limit
             .unwrap_or(CAPABILITY_SEARCH_DEFAULT_LIMIT)
             .clamp(1, CAPABILITY_SEARCH_MAX_LIMIT);
-        // 描述符索引检索：name/description/owner/state/risk，大小写不敏感。
-        let mut entries =
-            search_tool_catalog(&self.unified_catalog(), args.query.as_deref(), usize::MAX);
+        let role = ToolSemanticRole::parse_search_arg(args.role.as_deref())
+            .map_err(AgentError::InvalidRequest)?;
+        // 描述符索引检索：name/description/owner/state/risk，可按
+        // ToolSemanticRole 过滤，避免模型猜关键词。
+        let mut entries = search_tool_catalog_filtered(
+            &self.unified_catalog(),
+            args.query.as_deref(),
+            role,
+            usize::MAX,
+        );
         let active = entries
             .iter()
             .filter(|entry| entry.state.in_surface())
@@ -1710,6 +1727,7 @@ impl CapabilityAwareDispatcher {
             "search" => {
                 let search = SearchArgs {
                     query: args.query,
+                    role: args.role,
                     limit: args.limit,
                     cursor: args.cursor,
                 };

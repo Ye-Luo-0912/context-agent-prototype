@@ -244,6 +244,103 @@ pub struct CapabilityManifest {
     pub tools: Vec<ToolSpec>,
     pub lifecycle: CapabilityLifecycle,
     pub transport: CapabilityTransport,
+    /// Isolation floor the host must actually enforce before this
+    /// capability may start. Manifests cannot self-attest: Runtime compares
+    /// this to post-spawn [`SandboxCapabilities`]. `Trusted` requires
+    /// nothing extra (operator-installed). `UntrustedGenerated` fails
+    /// closed when the native process plane cannot prove the floor.
+    #[serde(default)]
+    pub sandbox_profile: SandboxProfile,
+}
+
+/// Isolation floor a capability declares. The host compares this to
+/// *actually enforced* sandbox capabilities after spawn, not to configured
+/// policy. Do not invent another `MOD-xx` slice to paper over residual
+/// syscalls; fail closed for untrusted generated code instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxProfile {
+    /// Operator-trusted / semi-trusted integration. Missing OS fences may
+    /// degrade with a warning.
+    #[default]
+    Trusted,
+    /// Extra write/memory/spawn floors. Still native-process.
+    Restricted,
+    /// LLM-generated untrusted code. Activation requires
+    /// `required ⊆ actually_enforced`. Native process currently cannot
+    /// satisfy UDP/pathname-Unix/OS-read confinement; that is fail-closed
+    /// on purpose (WASI is the V2 candidate for this profile).
+    UntrustedGenerated,
+}
+
+/// Capabilities the host actually enforced on a child, not the configured
+/// wish-list. `false` means "not proven".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SandboxCapabilities {
+    pub fs_read_confined: bool,
+    pub fs_write_confined: bool,
+    pub tcp_connect_denied: bool,
+    pub udp_denied: bool,
+    pub unix_socket_denied: bool,
+    pub process_spawn_controlled: bool,
+    pub signal_scoped: bool,
+    pub cpu_quota: bool,
+    pub memory_quota: bool,
+    pub fd_quota: bool,
+}
+
+impl SandboxCapabilities {
+    /// Every `true` flag on `self` is also `true` on `actual`.
+    pub fn subset_of(self, actual: Self) -> bool {
+        flag_subset(self.fs_read_confined, actual.fs_read_confined)
+            && flag_subset(self.fs_write_confined, actual.fs_write_confined)
+            && flag_subset(self.tcp_connect_denied, actual.tcp_connect_denied)
+            && flag_subset(self.udp_denied, actual.udp_denied)
+            && flag_subset(self.unix_socket_denied, actual.unix_socket_denied)
+            && flag_subset(
+                self.process_spawn_controlled,
+                actual.process_spawn_controlled,
+            )
+            && flag_subset(self.signal_scoped, actual.signal_scoped)
+            && flag_subset(self.cpu_quota, actual.cpu_quota)
+            && flag_subset(self.memory_quota, actual.memory_quota)
+            && flag_subset(self.fd_quota, actual.fd_quota)
+    }
+}
+
+fn flag_subset(required: bool, actual: bool) -> bool {
+    !required || actual
+}
+
+impl SandboxProfile {
+    pub fn required(self) -> SandboxCapabilities {
+        match self {
+            Self::Trusted => SandboxCapabilities::default(),
+            Self::Restricted => SandboxCapabilities {
+                fs_write_confined: true,
+                memory_quota: true,
+                process_spawn_controlled: true,
+                ..SandboxCapabilities::default()
+            },
+            Self::UntrustedGenerated => SandboxCapabilities {
+                fs_write_confined: true,
+                tcp_connect_denied: true,
+                udp_denied: true,
+                unix_socket_denied: true,
+                process_spawn_controlled: true,
+                signal_scoped: true,
+                memory_quota: true,
+                fd_quota: true,
+                ..SandboxCapabilities::default()
+            },
+        }
+    }
+
+    /// Trusted may start under a weaker actual sandbox. Restricted and
+    /// UntrustedGenerated fail closed when the floor is missing.
+    pub fn allows_start(self, actual: SandboxCapabilities) -> bool {
+        self.required().subset_of(actual)
+    }
 }
 
 /// A confined view of the agent's workspace handed to a capability for one
@@ -509,5 +606,33 @@ mod tests {
                 assert_eq!(decoded, binary, "every byte must survive the round trip");
             }
         }
+    }
+
+    #[test]
+    fn untrusted_generated_fails_closed_without_full_native_attestation() {
+        let trusted_actual = SandboxCapabilities {
+            fs_write_confined: true,
+            memory_quota: true,
+            process_spawn_controlled: true,
+            ..SandboxCapabilities::default()
+        };
+        assert!(SandboxProfile::Trusted.allows_start(SandboxCapabilities::default()));
+        assert!(SandboxProfile::Restricted.allows_start(trusted_actual));
+        assert!(
+            !SandboxProfile::UntrustedGenerated.allows_start(trusted_actual),
+            "native process without UDP/Unix/TCP proof must not start untrusted generated code"
+        );
+        let full = SandboxCapabilities {
+            fs_write_confined: true,
+            tcp_connect_denied: true,
+            udp_denied: true,
+            unix_socket_denied: true,
+            process_spawn_controlled: true,
+            signal_scoped: true,
+            memory_quota: true,
+            fd_quota: true,
+            ..SandboxCapabilities::default()
+        };
+        assert!(SandboxProfile::UntrustedGenerated.allows_start(full));
     }
 }

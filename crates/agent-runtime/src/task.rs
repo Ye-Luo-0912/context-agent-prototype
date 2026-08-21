@@ -289,6 +289,16 @@ fn root_reason_for_role(role: RootClaimRole) -> agent_contracts::RootReason {
     }
 }
 
+/// How the completion relates to the verification obligation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionVerificationStatus {
+    #[default]
+    Unverified,
+    Current,
+    Failed,
+}
+
 /// One immutable, typed task completion outcome.
 ///
 /// A completed task owns exactly one committed `CompletionRecord`: it is the
@@ -314,6 +324,44 @@ pub struct CompletionRecord {
     pub final_output_digest: Option<String>,
     /// Bounded artifact/effect refs the completion produced.
     pub artifacts: Vec<String>,
+    /// Derived from ExecutionState at commit. Default Unverified for
+    /// records written before this field existed.
+    #[serde(default)]
+    pub verification_status: CompletionVerificationStatus,
+    /// Evidence locators from the last verification, when status is
+    /// Current or Failed. Capped like `artifacts`.
+    #[serde(default)]
+    pub verification_refs: Vec<String>,
+}
+
+/// Stamp completion verification from the live or durable execution state.
+/// Required + not-Current refuses. Optional stale/pending is Unverified;
+/// optional Failed is recorded as Failed; Current attaches evidence refs.
+pub(crate) fn completion_from_execution(
+    state: &crate::execution::ExecutionState,
+) -> AgentResult<(CompletionVerificationStatus, Vec<String>)> {
+    use crate::execution::VerificationState;
+    let validity = state.validity();
+    if state.verification.required_for_completion && validity != VerificationState::Current {
+        return Err(AgentError::InvalidRequest(
+            "verification is required for completion but is not current".into(),
+        ));
+    }
+    let status = match validity {
+        VerificationState::Current => CompletionVerificationStatus::Current,
+        VerificationState::Failed => CompletionVerificationStatus::Failed,
+        _ => CompletionVerificationStatus::Unverified,
+    };
+    let refs = match status {
+        CompletionVerificationStatus::Unverified => Vec::new(),
+        CompletionVerificationStatus::Current | CompletionVerificationStatus::Failed => state
+            .last_evidence()
+            .and_then(|ev| ev.evidence_ref.clone())
+            .into_iter()
+            .take(MAX_COMPLETION_ARTIFACTS)
+            .collect(),
+    };
+    Ok((status, refs))
 }
 
 /// Validate a structured completion proposal from `task.complete` before
@@ -478,6 +526,18 @@ impl TaskManager {
         task.resume.observe_tool(output, task.anchor.revision, turn);
     }
 
+    /// Install a committed turn's execution projection onto the durable
+    /// task resume. Cancel / fail / stale paths must not call this.
+    pub fn install_resume(&mut self, task_id: TaskId, resume: crate::execution::ExecutionState) {
+        let Some(task) = self.get_mut(task_id) else {
+            return;
+        };
+        if task.status == TaskStatus::Completed {
+            return;
+        }
+        task.resume = resume;
+    }
+
     /// Plan to make `goal` the active task. A non-completed task with the
     /// same goal is resumed instead — the `/focus A -> /focus B ->
     /// /focus A` sequence must come back to task A, not spawn task C. A
@@ -552,6 +612,8 @@ impl TaskManager {
         final_output_ref: Option<String>,
         final_output_digest: Option<String>,
         artifacts: Vec<String>,
+        verification_status: CompletionVerificationStatus,
+        verification_refs: Vec<String>,
     ) -> Option<(TaskTxn, CompletionRecord)> {
         let active = self.active?;
         let anchor_revision = self
@@ -568,6 +630,8 @@ impl TaskManager {
             final_output_ref,
             final_output_digest,
             artifacts,
+            verification_status,
+            verification_refs,
         };
         Some((
             TaskTxn {
@@ -1148,7 +1212,14 @@ mod tests {
         assert_eq!(tasks.get(b).map(|t| t.status), Some(TaskStatus::Suspended));
 
         let (txn, _record) = tasks
-            .prepare_complete("done".into(), None, None, Vec::new())
+            .prepare_complete(
+                "done".into(),
+                None,
+                None,
+                Vec::new(),
+                CompletionVerificationStatus::Unverified,
+                Vec::new(),
+            )
             .expect("a is active");
         tasks.commit(txn);
         assert_eq!(tasks.get(a).map(|t| t.status), Some(TaskStatus::Completed));
@@ -1176,7 +1247,14 @@ mod tests {
         assert!(tasks.prepare_activate(TaskId::new()).is_none());
         assert!(
             tasks
-                .prepare_complete("done".into(), None, None, Vec::new())
+                .prepare_complete(
+                    "done".into(),
+                    None,
+                    None,
+                    Vec::new(),
+                    CompletionVerificationStatus::Unverified,
+                    Vec::new(),
+                )
                 .is_none()
         );
     }
@@ -1334,7 +1412,14 @@ mod tests {
         );
 
         let (txn, _record) = tasks
-            .prepare_complete("done".into(), None, None, Vec::new())
+            .prepare_complete(
+                "done".into(),
+                None,
+                None,
+                Vec::new(),
+                CompletionVerificationStatus::Unverified,
+                Vec::new(),
+            )
             .expect("active task completes");
         tasks.commit(txn);
         let closed = tasks.prepare_patch_anchor(
@@ -1460,7 +1545,14 @@ mod tests {
         let mut tasks = TaskManager::new();
         let task_id = create(&mut tasks, "task A");
         let (txn, _record) = tasks
-            .prepare_complete("done".into(), None, None, Vec::new())
+            .prepare_complete(
+                "done".into(),
+                None,
+                None,
+                Vec::new(),
+                CompletionVerificationStatus::Unverified,
+                Vec::new(),
+            )
             .expect("task is active");
         tasks.commit(txn);
 
@@ -1614,7 +1706,14 @@ mod tests {
         let mut tasks = TaskManager::new();
         let task_id = create(&mut tasks, "task A");
         let (txn, _record) = tasks
-            .prepare_complete("done".into(), None, None, Vec::new())
+            .prepare_complete(
+                "done".into(),
+                None,
+                None,
+                Vec::new(),
+                CompletionVerificationStatus::Unverified,
+                Vec::new(),
+            )
             .expect("task is active");
         tasks.commit(txn);
 
@@ -1654,7 +1753,14 @@ mod tests {
         tasks.commit(replace);
 
         let (txn, record) = tasks
-            .prepare_complete("auth refactor shipped".into(), None, None, Vec::new())
+            .prepare_complete(
+                "auth refactor shipped".into(),
+                None,
+                None,
+                Vec::new(),
+                CompletionVerificationStatus::Unverified,
+                Vec::new(),
+            )
             .unwrap();
         assert_eq!(record.task_id, task_id);
         assert_eq!(
@@ -1761,6 +1867,47 @@ mod tests {
             claims.len(),
             agent_contracts::MAX_ANCHOR_ROOT_CLAIMS,
             "投影必须截断到有界上限"
+        );
+    }
+
+    #[test]
+    fn optional_stale_completion_is_unverified_and_current_attaches_refs() {
+        let mut state = crate::execution::ExecutionState::default();
+        let mut read = agent_contracts::ToolOutput {
+            call_id: "c".into(),
+            tool_name: "fs.read".into(),
+            ok: true,
+            summary: "read".into(),
+            model_content: "read".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({"path": "src/auth.rs", "revision": "abc"}),
+        };
+        state.observe_tool(&read, 1, 1);
+        let mut test = read.clone();
+        test.tool_name = "shell.exec".into();
+        test.summary = "ok".into();
+        test.artifact_ref = Some("artifact://v1/run/owner/digest".into());
+        test.metadata = serde_json::json!({"command": "cargo test", "verification": true});
+        state.observe_tool(&test, 1, 2);
+        let (status, refs) = completion_from_execution(&state).unwrap();
+        assert_eq!(status, CompletionVerificationStatus::Current);
+        assert_eq!(refs, vec!["artifact://v1/run/owner/digest"]);
+
+        read.metadata = serde_json::json!({"path": "src/auth.rs", "revision": "zzz"});
+        read.tool_name = "fs.write".into();
+        state.observe_tool(&read, 1, 3);
+        let (status, refs) = completion_from_execution(&state).unwrap();
+        assert_eq!(status, CompletionVerificationStatus::Unverified);
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn required_completion_refuses_when_not_current() {
+        let mut state = crate::execution::ExecutionState::default();
+        state.verification.required_for_completion = true;
+        assert!(
+            completion_from_execution(&state).is_err(),
+            "required + no evidence must refuse"
         );
     }
 }

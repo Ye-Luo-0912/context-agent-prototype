@@ -1,0 +1,25 @@
+{
+  "analysis_schema": "agent-eval.context-mech.v2",
+  "arm_order": [
+    "dynamic",
+    "append"
+  ],
+  "cells": [
+    {
+      "dir": "dynamic",
+      "engine": "dynamic"
+    },
+    {
+      "dir": "append",
+      "engine": "append"
+    }
+  ],
+  "fixture_id": "resume_operational_state",
+  "live": true,
+  "mechanism": "resume_freshness",
+  "repeat": 1,
+  "repeats": 2,
+  "schema": "agent-eval.pair.v1",
+  "spec_sha256": "d3ee79ce7ec8c51bea6976a8a6e0df77e30b116930f1032f809a67f42c93e198",
+  "task_id": "resume_operational_state"
+}

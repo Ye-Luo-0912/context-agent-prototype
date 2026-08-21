@@ -10,7 +10,11 @@ Benchmark (`agent-eval --context-bench`, pack
 `crates/agent-eval/context-bench/`): 12 live coding tasks that ask where
 dynamic context helps or hurts. Replay still proves policy on scripted
 events (`long_refactor`, `superseded_decisions`, `task_switch_and_return`,
-`high_volume_irrelevant_output`). The frozen 300×3 ITT gate stays parked.
+`high_volume_irrelevant_output`). The frozen 300×3 ITT gate stays parked. Context live `context-mech.v2`
+(A/C × 3 tasks × 2 repeats = 12 cells) is in
+`crates/agent-eval/evidence/context-mech/REPORT.md`; see
+[`STATUS.md`](STATUS.md) and [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md).
+`add_test` is Tool Surface, not Context.
 
 - **A — append-only**: every message and tool result is resent every model
   turn until the *send* window forces a trim. Live P1 does not starve A
@@ -18,8 +22,9 @@ events (`long_refactor`, `superseded_decisions`, `task_switch_and_return`,
 - **B — rolling marker baseline** (`RollingSummaryEngine`): append like A,
   but when retained history crosses a threshold, drop the oldest part outside
   a verbatim recency window and insert a bounded summary. Live P1 injects the
-  shared `ModelBackedCompactor` (same operator as C's `TaskCompleted`
-  distill); CI keeps a scripted digest. Compactor provider tokens are
+  shared `ModelBackedCompactor` (same operator as C episode-rotation
+  distill; `TaskCompleted` stores `CompletionRecord.summary` without a
+  second LLM call); CI keeps a scripted digest. Compactor provider tokens are
   counted separately from the visible working set. B packs against the
   same kernel working-set cap as C.
 - **C — dynamic working set**: `SimpleContextEngine` (this design). Live P1
@@ -49,7 +54,9 @@ cargo run -p agent-replay -- --compare long_refactor
 cargo run -p agent-replay -- --facts
 
 # Context Bench pack + seed/golden/hidden-command self-check (no model).
-# --context-bench-run is live A/C (27 cells). Python must be present.
+# Frozen context-bench.v1 live was 27 cells. Context live is
+# --context-mech (context-mech.v2, 12 cells, evidence already on disk).
+# Do not expand to 27 or 300×3.
 cargo run -p agent-eval -- --context-bench
 ```
 
@@ -829,7 +836,11 @@ keep scripted `--compare-arm` tests. Next mechanism live is
 `--context-mech` (`late_semantic_constraint`,
 `resume_operational_state`, `no_semantic_episode`).
 `--compare-live-reasonable` now runs only `add_test`.
-Live `--compare-live` / `--fixture-live` / `--compare-live-all` refuse
+`add_test` is Tool Surface (`historical_context=0`), not a Context
+working-set eval. `context-mech.v2` 12-cell A/C live (2026-08-21) is
+under `crates/agent-eval/evidence/context-mech/REPORT.md`. Do not expand
+to 27 cells or 300×3. Do not retune GC from it.
+Do not retune GC from an `add_test` cell. Live `--compare-live` / `--fixture-live` / `--compare-live-all` refuse
 `recall_after_fix` (2026-08-21 item 28). Item 24 (`context.manage`
 catalog-only except NeedEvidence / EXTERNAL CONTEXT) is closed.
 M12/M13/PLAT-06 remain

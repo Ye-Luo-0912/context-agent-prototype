@@ -52,7 +52,7 @@ impl Tool for FsListTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "fs.list".into(),
-            description: "List files/directories inside the current workspace. Runtime state (.focus-agent) and raw .git internals are omitted; use artifact.read or git.* for those.".into(),
+            description: "List workspace files (hides .focus-agent and .git).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -277,7 +277,7 @@ impl Tool for FsReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "fs.read".into(),
-            description: "Read a bounded line range from a UTF-8 text file in the workspace. Runtime state (.focus-agent) and raw .git internals are not readable here; use artifact.read or git.*.".into(),
+            description: "Read UTF-8 workspace file lines (not .focus-agent or .git).".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path"],

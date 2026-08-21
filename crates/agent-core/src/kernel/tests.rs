@@ -1533,8 +1533,6 @@ async fn lease_is_minted_even_when_the_shadow_gate_denies() {
     );
     assert_eq!(
         lease.intent,
-        agent_contracts::EffectIntent::ProcessRun {
-            command: "cargo test".into()
-        }
+        agent_contracts::shell_exec_intent("", "cargo test")
     );
 }

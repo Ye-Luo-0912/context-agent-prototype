@@ -77,6 +77,8 @@ impl RuntimeActor {
         };
 
         self.revalidate_stored_resource_facts(&current_input).await;
+        self.capture_round_snapshot(&current_input, has_external_context);
+        let snapshot = self.round_snapshot().cloned();
 
         // Tool lifecycle safe point. The active task's tool-demand set is
         // the GC root set: a tool the task requires is never aged out by
@@ -97,20 +99,24 @@ impl RuntimeActor {
                     .collect()
             })
             .unwrap_or_default();
-        let need_evidence = has_external_context
-            || active_task
-                .map(|task| !task.anchor.evidence_refs.is_empty())
-                .unwrap_or(false);
+        let need_evidence = snapshot
+            .as_ref()
+            .map(|snap| snap.needs.evidence_needed || snap.needs.open_loop_needs_evidence)
+            .unwrap_or(has_external_context);
         if need_evidence {
             task_roots.push(CONTEXT_MANAGE.to_string());
         }
         self.services.tool_gc(&task_roots);
-        let verification_due = self.verification_due_for_round(&turn_frame, &current_input);
+        let verification_due = self
+            .round_verification()
+            .map(|projection| projection.due)
+            .unwrap_or(false);
         let turn_intent = active_task
             .map(|task| task.turn_intent.as_str())
             .filter(|intent| !intent.is_empty());
-        let has_failures = active_task
-            .map(|task| task.resume.has_failures())
+        let has_failures = snapshot
+            .as_ref()
+            .map(|snap| snap.needs.unresolved_failure)
             .unwrap_or(false);
         let (task_requirement_revision, mut requirements) = active_task
             .map(|task| {
@@ -363,13 +369,7 @@ impl RuntimeActor {
             .map(|task| crate::task::anchor_root_claims(&task.anchor))
             .unwrap_or_default();
         let foreground_resources = self.foreground_resource_hints(&turn_frame, &current_input);
-        let context_budget = if foreground_resources.is_empty() {
-            model_budget.context_frame_budget
-        } else {
-            model_budget
-                .context_frame_budget
-                .saturating_sub(MAX_FOREGROUND_TOKENS)
-        };
+        let context_budget = model_budget.context_frame_budget;
         let materialized = match self
             .services
             .context_materialize(ContextQuery {
@@ -644,7 +644,7 @@ impl RuntimeActor {
                 generation,
                 surface_revision,
                 model_round,
-                prompt_layers: crate::prompt::prompt_layer_costs(
+                prompt_layers: crate::prompt::prompt_layer_costs_with_catalog(
                     &self.assembler,
                     runtime_focus.as_ref(),
                     task_view.as_ref(),
@@ -652,6 +652,7 @@ impl RuntimeActor {
                     &materialized,
                     &turn_frame,
                     &input.tool_schemas,
+                    &self.services.tool_catalog(),
                 ),
             })
             .await
@@ -744,66 +745,81 @@ impl RuntimeActor {
         turn_frame: &TurnFrame,
         tools: Vec<ToolSpec>,
     ) -> ModelInput {
-        self.assembler
-            .assemble(focus, task, progress, history, turn_frame, tools)
+        self.assembler.assemble_with_catalog(
+            focus,
+            task,
+            progress,
+            history,
+            turn_frame,
+            tools,
+            &self.services.tool_catalog(),
+        )
     }
 
     async fn revalidate_stored_resource_facts(&mut self, current_query: &str) {
         let Some(oracle) = self.services.artifact_workspace() else {
             return;
         };
-        let Some(task_id) = self.state.task_id else {
+        let Some(turn) = self.state.turn.as_mut() else {
             return;
         };
-        let Some(task) = self.state.tasks.get_mut(task_id) else {
-            return;
-        };
-        if task.status == crate::task::TaskStatus::Completed {
-            return;
-        }
-        task.resume
+        turn.execution
             .revalidate(oracle as &dyn ResourceVersionOracle, current_query)
             .await;
     }
 
-    fn verification_due_for_round(&self, turn_frame: &TurnFrame, current_input: &str) -> bool {
-        let Some(task_id) = self.state.task_id else {
-            return false;
-        };
-        let Some(task) = self.state.tasks.get(task_id) else {
-            return false;
-        };
-        let turn_number = self
+    fn capture_round_snapshot(&mut self, current_input: &str, has_external_context: bool) {
+        let (focus_goal, anchor) = match self
             .state
+            .task_id
+            .and_then(|task_id| self.state.tasks.get(task_id))
+        {
+            Some(task) if task.status != crate::task::TaskStatus::Completed => {
+                (Some(task.goal.clone()), Some(task.anchor.clone()))
+            }
+            _ => (None, None),
+        };
+        let Some(turn) = self.state.turn.as_mut() else {
+            return;
+        };
+        turn.round_snapshot = Some(crate::execution::RoundExecutionSnapshot::capture(
+            &turn.execution,
+            current_input,
+            focus_goal.as_deref(),
+            anchor.as_ref(),
+            has_external_context,
+        ));
+    }
+
+    fn round_snapshot(&self) -> Option<&crate::execution::RoundExecutionSnapshot> {
+        self.state
             .turn
             .as_ref()
-            .map(|turn| turn.model_round as u64)
-            .unwrap_or(0);
-        task.resume
-            .apply_open_turn(turn_frame, task.anchor.revision, turn_number)
-            .verification_due_now(current_input)
+            .and_then(|turn| turn.round_snapshot.as_ref())
+    }
+
+    fn round_verification(&self) -> Option<&crate::execution::VerificationProjection> {
+        self.round_snapshot().map(|snapshot| &snapshot.verification)
     }
 
     fn foreground_resource_hints(
         &self,
-        turn_frame: &TurnFrame,
+        _turn_frame: &TurnFrame,
         current_input: &str,
     ) -> Vec<ResourceKey> {
-        let Some(task_id) = self.state.task_id else {
-            return Vec::new();
+        if let Some(snapshot) = self.round_snapshot() {
+            return snapshot.foreground_resources.clone();
+        }
+        let Some(turn) = self.state.turn.as_ref() else {
+            let Some(task_id) = self.state.task_id else {
+                return Vec::new();
+            };
+            let Some(task) = self.state.tasks.get(task_id) else {
+                return Vec::new();
+            };
+            return task.resume.foreground_resources(current_input);
         };
-        let Some(task) = self.state.tasks.get(task_id) else {
-            return Vec::new();
-        };
-        let turn_number = self
-            .state
-            .turn
-            .as_ref()
-            .map(|turn| turn.model_round as u64)
-            .unwrap_or(0);
-        task.resume
-            .apply_open_turn(turn_frame, task.anchor.revision, turn_number)
-            .foreground_resources(current_input)
+        turn.execution.foreground_resources(current_input)
     }
 
     async fn runtime_prompt_focus(
@@ -824,25 +840,14 @@ impl RuntimeActor {
         if !turn_frame.user_message.is_empty() {
             focus.current_query = turn_frame.user_message.clone();
         }
-        let turn_number = self
-            .state
-            .turn
-            .as_ref()
-            .map(|turn| turn.model_round as u64)
-            .unwrap_or(0);
         let progress = if self.services.project_task_progress() {
-            let mut projected =
-                task.resume
-                    .apply_open_turn(turn_frame, task.anchor.revision, turn_number);
-            if let Some(oracle) = self.services.artifact_workspace() {
-                projected
-                    .revalidate(
-                        oracle as &dyn ResourceVersionOracle,
-                        &turn_frame.user_message,
-                    )
-                    .await;
+            if let Some(snapshot) = self.round_snapshot() {
+                Some(snapshot.progress.clone())
+            } else if let Some(turn) = self.state.turn.as_ref() {
+                Some(turn.execution.view())
+            } else {
+                Some(task.resume.view())
             }
-            Some(projected.view())
         } else {
             None
         };

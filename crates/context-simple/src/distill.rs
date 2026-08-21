@@ -1,5 +1,6 @@
-//! Task-completion and episode-rotation distillation helpers.
-//! Behavior is unchanged; these used to live in `engine.rs`.
+//! Task-completion summary insert and episode-rotation distillation.
+//! `TaskCompleted` stores the validated CompletionRecord summary verbatim;
+//! only episode rotation may call the LLM compactor.
 
 use agent_contracts::{
     CompactionReason, ContextItemId, ContextKind, ContextRetention, ContextScope, CoreLabel,
@@ -23,37 +24,7 @@ pub(crate) struct DistillJob {
 
 const MAX_DISTILL_SOURCES: usize = 8;
 const TASK_SUMMARY_SOURCE: &str = "task-summary";
-const TASK_DERIVED_SOURCE: &str = "derived";
 const EPISODE_DERIVED_SOURCE: &str = "episode-derived";
-
-pub(crate) fn plan_task_distill(
-    state: &State,
-    completed_task: Option<TaskId>,
-    summary_scope_id: Option<ScopeId>,
-    summary: String,
-) -> DistillJob {
-    let mut source = String::new();
-    let mut source_ids = Vec::new();
-    if let Some(task) = completed_task {
-        for item in &state.items {
-            if item.task_id == Some(task) && source_ids.len() < MAX_DISTILL_SOURCES {
-                source_ids.push(item.id);
-                source.push_str(&item.content);
-                source.push('\n');
-            }
-        }
-    }
-    source.push_str(&summary);
-    DistillJob {
-        task_id: completed_task,
-        summary_scope_id,
-        fallback: summary,
-        source: bound_compaction_source(&source),
-        source_ids,
-        source_label: TASK_DERIVED_SOURCE,
-        reason: CompactionReason::TaskCompleted,
-    }
-}
 
 /// Plan a sourced distill of the *closing* focus episode. Called before
 /// `close_focus_episode` so membership still uses the open focus scope's
@@ -211,11 +182,6 @@ pub(crate) fn insert_task_summary(
     content: String,
     source_ids: &[ContextItemId],
 ) {
-    let source_label = if source_ids.is_empty() {
-        TASK_SUMMARY_SOURCE
-    } else {
-        TASK_DERIVED_SOURCE
-    };
     insert_derived_summary(
         state,
         config,
@@ -223,7 +189,7 @@ pub(crate) fn insert_task_summary(
         summary_scope_id,
         content,
         source_ids,
-        source_label,
+        TASK_SUMMARY_SOURCE,
     );
 }
 

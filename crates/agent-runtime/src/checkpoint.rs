@@ -283,10 +283,17 @@ pub(crate) fn validate_completion_record(record: &CompletionRecord) -> AgentResu
             record.artifacts.len()
         )));
     }
+    if record.verification_refs.len() > MAX_COMPLETION_ARTIFACTS {
+        return Err(AgentError::InvalidRequest(format!(
+            "completion record carries {} verification refs, above the {MAX_COMPLETION_ARTIFACTS} cap",
+            record.verification_refs.len()
+        )));
+    }
     for reference in record
         .final_output_ref
         .iter()
         .chain(record.final_output_digest.iter())
+        .chain(record.verification_refs.iter())
     {
         if reference.chars().count() > MAX_COMPLETION_REF_CHARS {
             return Err(AgentError::InvalidRequest(format!(

@@ -5,9 +5,12 @@
 //! current Focus/TaskAnchor, the turn stack and the tool schemas; this
 //! module turns those layers into the `ModelInput` sent to the provider.
 
+use std::collections::HashSet;
+
 use agent_contracts::{
     ContextKind, FocusState, MaterializedContext, MaterializedItem, ModelInput, ModelMessage,
-    RuntimeFactsView, TaskAnchorView, TaskProgressView, ToolSpec, TurnFrame,
+    RuntimeFactsView, TaskAnchorView, TaskProgressView, ToolCatalogEntry, ToolSpec, TurnFrame,
+    render_tool_catalog_index,
 };
 use agent_workspace::capture_host_runtime_facts;
 
@@ -16,10 +19,11 @@ use agent_workspace::capture_host_runtime_facts;
 /// ```text
 /// System Policy        - standing instructions, owned by the runtime
 /// Runtime Facts        - bounded host/workspace profile (system-owned)
+/// Tool Catalog Index   - names of tools not on this round's schema surface
 /// Focus Frame          - runtime TaskAnchor + Focus (never engine materialize)
 /// Context Frame        - historical working set from MaterializedContext
 /// Turn Frame           - the current turn's execution stack
-/// Active Tool Schemas  - tool definitions carried by the model request
+/// Active Tool Schemas  - compacted tool definitions for this request
 /// ```
 pub struct PromptAssembler {
     system_prompt: String,
@@ -76,6 +80,35 @@ impl PromptAssembler {
         turn: &TurnFrame,
         tools: Vec<ToolSpec>,
     ) -> ModelInput {
+        self.assemble_with_catalog(
+            runtime_focus,
+            task_anchor,
+            task_progress,
+            history,
+            turn,
+            tools,
+            &[],
+        )
+    }
+
+    /// Assemble including the bounded catalog index for tools not on this
+    /// round's schema surface. `assemble` is the empty-index form used by
+    /// unit tests.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble_with_catalog(
+        &self,
+        runtime_focus: Option<&FocusState>,
+        task_anchor: Option<&TaskAnchorView>,
+        task_progress: Option<&TaskProgressView>,
+        history: &MaterializedContext,
+        turn: &TurnFrame,
+        tools: Vec<ToolSpec>,
+        catalog: &[ToolCatalogEntry],
+    ) -> ModelInput {
+        let tools: Vec<ToolSpec> = tools
+            .into_iter()
+            .map(ToolSpec::compact_for_model_surface)
+            .collect();
         // Observations (retrieved history, external refs) are rendered as
         // low-authority `user` messages, never as `system`: policy and
         // instructions stay in the system layer, so content retrieved from
@@ -141,11 +174,17 @@ impl PromptAssembler {
             context_frame.push(ModelMessage::user(external));
         }
 
+        let mut system_policy = vec![
+            ModelMessage::system(self.system_prompt.clone()),
+            ModelMessage::system(self.runtime_facts.render()),
+        ];
+        let surfaced: HashSet<&str> = tools.iter().map(|spec| spec.name.as_str()).collect();
+        if let Some(index) = render_tool_catalog_index(catalog, &surfaced) {
+            system_policy.push(ModelMessage::system(index));
+        }
+
         ModelInput {
-            system_policy: vec![
-                ModelMessage::system(self.system_prompt.clone()),
-                ModelMessage::system(self.runtime_facts.render()),
-            ],
+            system_policy,
             focus_frame: render_focus_frame(runtime_focus, task_anchor, task_progress),
             context_frame,
             turn_frame: turn.clone(),
@@ -166,7 +205,8 @@ pub fn focus_frame_tokens(
         .unwrap_or(0)
 }
 
-pub fn prompt_layer_costs(
+#[allow(clippy::too_many_arguments)]
+pub fn prompt_layer_costs_with_catalog(
     assembler: &PromptAssembler,
     focus: Option<&FocusState>,
     task: Option<&TaskAnchorView>,
@@ -174,8 +214,17 @@ pub fn prompt_layer_costs(
     history: &MaterializedContext,
     turn: &TurnFrame,
     tools: &[ToolSpec],
+    catalog: &[ToolCatalogEntry],
 ) -> agent_contracts::PromptLayerCosts {
-    let assembled = assembler.assemble(focus, task, progress, history, turn, tools.to_vec());
+    let assembled = assembler.assemble_with_catalog(
+        focus,
+        task,
+        progress,
+        history,
+        turn,
+        tools.to_vec(),
+        catalog,
+    );
     let historical = assembled
         .context_frame
         .iter()
@@ -201,6 +250,12 @@ pub fn prompt_layer_costs(
         turn_frame_tokens: crate::budget::approx_layer_tokens(&assembled.turn_frame.messages())
             as u64,
         tool_schema_tokens: crate::budget::approx_layer_tokens(&assembled.tool_schemas) as u64,
+        tool_catalog_index_tokens: assembled
+            .system_policy
+            .iter()
+            .filter(|message| message.content.starts_with("tool_catalog/v1"))
+            .map(|message| agent_contracts::tokens::approx_tokens(&message.content) as u64)
+            .sum(),
     }
 }
 
@@ -861,7 +916,8 @@ mod tests {
         );
         assert!(messages.iter().all(|m| m.role != ModelRole::System
             || m.content == "policy"
-            || m.content.starts_with("runtime_facts/v1")));
+            || m.content.starts_with("runtime_facts/v1")
+            || m.content.starts_with("tool_catalog/v1")));
     }
 
     #[test]
@@ -958,13 +1014,14 @@ mod tests {
         assert!(!focus.contains("Objective:"));
         assert!(!focus.contains("Blockers:"));
         assert!(!focus.contains("Next actions:"));
-        let layers = prompt_layer_costs(
+        let layers = prompt_layer_costs_with_catalog(
             &assembler,
             Some(&runtime_focus),
             Some(&task),
             Some(&progress),
             &history,
             &TurnFrame::new("continue"),
+            &[],
             &[],
         );
         assert!(layers.task_progress_tokens > 0);
@@ -981,13 +1038,14 @@ mod tests {
         let focus = without.focus_frame.expect("anchor + focus still render");
         assert!(!focus.contains("TASK PROGRESS"));
         assert!(!focus.contains("src/auth.rs"));
-        let layers_off = prompt_layer_costs(
+        let layers_off = prompt_layer_costs_with_catalog(
             &assembler,
             Some(&runtime_focus),
             Some(&task),
             None,
             &history,
             &TurnFrame::new("continue"),
+            &[],
             &[],
         );
         assert_eq!(layers_off.task_progress_tokens, 0);
@@ -1051,6 +1109,65 @@ mod tests {
         refreshed.refresh_markers(vec![".git".into(), "package.json".into()]);
         assert!(refreshed.runtime_facts().render().contains("package.json"));
         assert!(!refreshed.runtime_facts().render().contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn catalog_index_lists_unsurfaced_names_as_a_system_layer() {
+        use agent_contracts::{ToolCatalogEntry, ToolLifecycle, ToolRisk};
+        let assembler = PromptAssembler::new("policy");
+        let catalog = vec![
+            ToolCatalogEntry {
+                name: "fs.read".into(),
+                state: ToolLifecycle::Loaded,
+                owner: "builtin".into(),
+                description: "Read UTF-8 workspace file lines.".into(),
+                risk: ToolRisk::ReadOnly,
+                roles: Vec::new(),
+            },
+            ToolCatalogEntry {
+                name: "edit.patch".into(),
+                state: ToolLifecycle::Available,
+                owner: "builtin".into(),
+                description: "Apply exact-match text hunks.".into(),
+                risk: ToolRisk::WorkspaceWrite,
+                roles: Vec::new(),
+            },
+        ];
+        let tools = vec![ToolSpec {
+            name: "fs.read".into(),
+            description: "Read UTF-8 workspace file lines.".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        }];
+        let input = assembler.assemble_with_catalog(
+            None,
+            None,
+            None,
+            &materialized_with(Vec::new(), ContextMapView::default()),
+            &TurnFrame::new("continue"),
+            tools,
+            &catalog,
+        );
+        let index = input
+            .system_policy
+            .iter()
+            .find(|message| message.content.starts_with("tool_catalog/v1"))
+            .expect("catalog index");
+        assert!(index.content.contains("edit.patch"));
+        assert!(!index.content.contains("fs.read"));
+        let layers = prompt_layer_costs_with_catalog(
+            &assembler,
+            None,
+            None,
+            None,
+            &materialized_with(Vec::new(), ContextMapView::default()),
+            &TurnFrame::new("continue"),
+            &input.tool_schemas,
+            &catalog,
+        );
+        assert!(layers.tool_catalog_index_tokens > 0);
     }
 
     #[test]

@@ -55,7 +55,7 @@ impl Tool for ArtifactReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "artifact.read".into(),
-            description: "Read a bounded line range from an artifact:// reference returned by another tool (spilled listings, grep hit sets, process logs).".into(),
+            description: "Read lines from an artifact:// ref (spilled listings/logs).".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["reference"],

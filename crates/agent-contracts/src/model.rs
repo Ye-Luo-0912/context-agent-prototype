@@ -259,6 +259,9 @@ pub struct PromptLayerCosts {
     pub historical_context_tokens: u64,
     pub turn_frame_tokens: u64,
     pub tool_schema_tokens: u64,
+    /// Bounded TOOL CATALOG index (names not on this round's schema surface).
+    #[serde(default)]
+    pub tool_catalog_index_tokens: u64,
 }
 
 impl PromptLayerCosts {
@@ -286,6 +289,9 @@ impl PromptLayerCosts {
             tool_schema_tokens: self
                 .tool_schema_tokens
                 .saturating_add(other.tool_schema_tokens),
+            tool_catalog_index_tokens: self
+                .tool_catalog_index_tokens
+                .saturating_add(other.tool_catalog_index_tokens),
         }
     }
 }

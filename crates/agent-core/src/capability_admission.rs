@@ -282,6 +282,7 @@ mod tests {
             tools: Vec::new(),
             lifecycle: CapabilityLifecycle::Lazy,
             transport: CapabilityTransport::Builtin,
+            sandbox_profile: Default::default(),
         }
     }
 

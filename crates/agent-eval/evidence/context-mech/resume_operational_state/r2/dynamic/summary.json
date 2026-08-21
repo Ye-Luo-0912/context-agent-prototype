@@ -1,0 +1,173 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 178691,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 1304,
+  "model_started": 32,
+  "model_used": 32,
+  "usage_incomplete": false,
+  "provider_tokens_lower_bound": false,
+  "workspace_sha256": "fcb7d2be4fc0eddce7a601b619b080e968aad53521e81e0d17d3f259128cd9d7",
+  "workspace_files": 32,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 12,
+      "failed": 0
+    },
+    {
+      "name": "edit.patch",
+      "calls": 1,
+      "failed": 1
+    },
+    {
+      "name": "edit.replace",
+      "calls": 3,
+      "failed": 1
+    },
+    {
+      "name": "fs.list",
+      "calls": 4,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 8,
+      "failed": 0
+    },
+    {
+      "name": "fs.write",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "process.run",
+      "calls": 3,
+      "failed": 2
+    },
+    {
+      "name": "search.grep",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "task.complete",
+      "calls": 1,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 131,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 4,
+    "fetch_calls": 0,
+    "final_resident_bytes": 1096,
+    "forgotten_items": 46,
+    "inspect_calls": 2,
+    "lifecycle_transitions": 93,
+    "materialize_rounds": 32,
+    "model_attempts": 32,
+    "model_input_tokens": 221823,
+    "model_output_tokens": 3965,
+    "model_retries": 0,
+    "peak_resident_bytes": 1096,
+    "prompt_current_focus_tokens": 1657,
+    "prompt_historical_context_tokens": 8592,
+    "prompt_runtime_facts_tokens": 864,
+    "prompt_system_tokens": 2272,
+    "prompt_task_anchor_tokens": 778,
+    "prompt_task_progress_tokens": 1728,
+    "prompt_tool_catalog_index_tokens": 6504,
+    "prompt_tool_schema_tokens": 26964,
+    "prompt_turn_frame_tokens": 26385,
+    "provider_tokens_lower_bound": false,
+    "provider_tokens_total": 225788,
+    "reactivated_tokens": 0,
+    "reactivation_consumed": 0,
+    "reactivation_consumed_tokens": 0,
+    "reactivation_events": 0,
+    "reactivation_file_observation_consumed": 0,
+    "reactivation_file_observation_selected": 0,
+    "reactivation_selected": 0,
+    "reactivation_selected_tokens": 0,
+    "reactivation_tool_observation_consumed": 0,
+    "reactivation_tool_observation_selected": 0,
+    "recovered_items": 0,
+    "recovery_auto_reactivation": 0,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 46,
+    "recovery_workspace_reread": 6,
+    "repeated_fs_reads": 6,
+    "reread_external_descriptor": 2,
+    "reread_first_read": 2,
+    "reread_motive_body_visible_current": 0,
+    "reread_motive_changed": 0,
+    "reread_motive_checked_fresh": 2,
+    "reread_motive_descriptor_only": 3,
+    "reread_motive_first": 2,
+    "reread_motive_needs_revalidation": 0,
+    "reread_motive_stored": 0,
+    "reread_motive_warm": 1,
+    "reread_previously_selected": 2,
+    "reread_resident_unselected": 2,
+    "reread_selected_descriptor": 0,
+    "reread_stored": 0,
+    "reread_warm": 0,
+    "rounds": 32,
+    "schema_tokens_total": 26964,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "search_ms_p50": 0,
+    "search_ms_p95": 0,
+    "selected_tokens_by_kind": {
+      "assistant_message": 1252,
+      "tool_observation": 496,
+      "user_message": 1024
+    },
+    "selected_tokens_by_reason": {
+      "latest_file_body": 496,
+      "scored": 2276
+    },
+    "selected_tokens_by_source": {
+      "assistant": 1252,
+      "tool:fs.read": 496,
+      "user": 1024
+    },
+    "selected_tokens_reactivated": 0,
+    "selected_tokens_resident": 2772,
+    "tool_calls": 42,
+    "tool_failure_classes": {
+      "missing_project_marker": 2,
+      "no_exact_match": 2
+    },
+    "turns": 4,
+    "unique_reactivated": 0
+  }
+}

@@ -124,6 +124,12 @@ impl RuntimeActor {
         // them still consumes their results.
         self.state.active_tool = None;
         self.state.discovery_budget.reset();
+        let execution = self
+            .state
+            .task_id
+            .and_then(|task_id| self.state.tasks.get(task_id))
+            .map(|task| task.resume.clone())
+            .unwrap_or_default();
         self.state.turn = Some(ActiveTurn {
             turn_id,
             turn_frame: TurnFrame::new(content),
@@ -132,6 +138,8 @@ impl RuntimeActor {
             tool_surface: None,
             turn_state: TurnState::Running,
             op: None,
+            execution,
+            round_snapshot: None,
             pending_completion: None,
             applied_input: Some(applied),
             input_consumed: false,
@@ -283,6 +291,12 @@ impl RuntimeActor {
             self.services.artifact_workspace(),
             self.core.run_id(),
         )?;
+        let Some(turn) = self.state.turn.as_ref() else {
+            return Err(AgentError::InvalidRequest(
+                "no active turn to complete".into(),
+            ));
+        };
+        completion_from_execution(&turn.execution)?;
         let Some(turn) = self.state.turn.as_mut() else {
             return Err(AgentError::InvalidRequest(
                 "no active turn to complete".into(),
@@ -394,11 +408,27 @@ impl RuntimeActor {
             .tasks
             .active()
             .map(|task_id| format!("task:{task_id}:completion"));
+        let (verification_status, verification_refs) = {
+            let state = if let Some(turn) = self.state.turn.as_ref() {
+                Some(&turn.execution)
+            } else {
+                self.state.tasks.get(active_task).map(|task| &task.resume)
+            };
+            match state {
+                Some(state) => crate::task::completion_from_execution(state)?,
+                None => (
+                    crate::task::CompletionVerificationStatus::Unverified,
+                    Vec::new(),
+                ),
+            }
+        };
         let Some((txn, record)) = self.state.tasks.prepare_complete(
             summary.clone(),
             final_output_ref,
             final_output_digest,
             merged_artifacts,
+            verification_status,
+            verification_refs,
         ) else {
             return Err(AgentError::InvalidRequest(
                 "no active task to complete".into(),
@@ -458,13 +488,6 @@ impl RuntimeActor {
             turn.turn_state = TurnState::ModelFinished;
         }
         let mut ingested = false;
-        let resume_turn = self
-            .state
-            .turn
-            .as_ref()
-            .map(|turn| turn.model_round as u64)
-            .unwrap_or(0);
-        let mut pending_resume = Vec::new();
         if let Some(turn) = self.state.turn.as_mut() {
             for step in &turn.turn_frame.steps {
                 let TurnFrameStep::ToolResult {
@@ -482,7 +505,6 @@ impl RuntimeActor {
                 if *disposition != ToolResultDisposition::PersistObservation {
                     continue;
                 }
-                pending_resume.push(output.clone());
                 if let Err(error) = self
                     .services
                     .context_ingest(ContextIngress::ToolObservation {
@@ -655,8 +677,12 @@ impl RuntimeActor {
         if let Some(turn) = self.state.turn.as_mut() {
             turn.turn_state = TurnState::Committed;
         }
-        for output in pending_resume {
-            self.state.tasks.observe_tool(&output, resume_turn);
+        if let Some(turn) = self.state.turn.as_ref()
+            && let Some(task_id) = self.state.task_id
+        {
+            self.state
+                .tasks
+                .install_resume(task_id, turn.execution.clone());
         }
         // Publish the evidence locator only after the same durable barrier as
         // the turn. A failed commit must not leave a later `/done` pointing

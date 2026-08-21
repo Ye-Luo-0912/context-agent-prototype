@@ -101,6 +101,8 @@ impl RoundSurfacePlan {
             };
             origins.insert(spec.name.clone(), origin);
 
+            let spec = spec.compact_for_model_surface();
+
             if demand == ToolSurfaceDemand::KeepReady {
                 let approx_tokens = approx_layer_tokens(&spec);
                 push_omission(
@@ -441,11 +443,18 @@ mod tests {
 
     use super::*;
 
-    fn spec(name: &str, description_chars: usize) -> ToolSpec {
+    fn spec(name: &str, payload_chars: usize) -> ToolSpec {
+        // Pad the schema payload, not the description: round-surface compact
+        // truncates descriptions and strips nested `description` keys.
         ToolSpec {
             name: name.into(),
-            description: "x".repeat(description_chars),
-            input_schema: json!({"type": "object"}),
+            description: "tool".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pad": {"type": "string", "enum": ["x".repeat(payload_chars)]}
+                }
+            }),
             risk: ToolRisk::ReadOnly,
             output_budget: None,
             roles: Vec::new(),

@@ -26,10 +26,17 @@
 //!    selected items, Checked omit, and Foreground Evidence exist because
 //!    of this gap.
 //!
-//! Prompt assembly reads `TaskAnchor` + `TurnIntent` + [`ExecutionState`].
-//! Tool-surface policy maps [`ExecutionNeeds`] onto catalog `ToolSpec.roles`.
-//! NeedEvidence PreferSurfaces `context.manage` when Warm/Cold/Stored catalog
-//! entries or TaskAnchor `evidence_refs` exist.
+//! 4. One model round = one [`RoundExecutionSnapshot`]. Prompt, hints,
+//!    and tool-surface policy all read that snapshot. Do not clone
+//!    `ExecutionState` and replay `TurnFrame` per consumer.
+//!
+//! Prompt assembly reads `TaskAnchor` + `TurnIntent` + one
+//! [`RoundExecutionSnapshot`] captured from the active turn's ephemeral
+//! [`ExecutionState`]. Tool-surface policy maps [`RoundNeeds`] onto catalog
+//! `ToolSpec.roles`. Evidence gaps PreferSurface `context.manage` when
+//! Warm/Cold/Stored catalog entries, TaskAnchor `evidence_refs`, or open
+//! loops exist. Runtime does not PreferSurface Read/Search/Mutate as an
+//! action plan.
 //!
 //! Phase 2 ([`memo`]) stays unwired. [`memo::lookup`] is always a miss.
 //! When it is wired, the first version caches only `fs.read` keyed by
@@ -42,11 +49,19 @@ mod classify;
 mod freshness;
 pub mod memo;
 mod needs;
+mod snapshot;
 mod state;
 
 pub use classify::{classify_fs_read_motive, stamp_fs_read_motive};
-pub use needs::{ExecutionNeeds, catalog_has_external_context, derive_execution_needs};
-pub use state::{ExecutionState, ResourceFact};
+pub use needs::{
+    ExecutionNeeds, RoundNeeds, catalog_has_external_context, derive_execution_needs,
+    derive_round_needs,
+};
+pub use snapshot::RoundExecutionSnapshot;
+pub use snapshot::VerificationProjection;
+pub use state::{
+    ExecutionState, ResourceFact, VerificationCause, VerificationCoverage, VerificationState,
+};
 
 /// Checkpoint/wire name for [`ExecutionState`]. The `TaskRecord` field is
 /// still `resume` so existing checkpoints load. Prefer `ExecutionState` in

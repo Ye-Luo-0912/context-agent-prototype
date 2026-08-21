@@ -18,10 +18,15 @@ pub struct GrantTarget {
     /// whose path is at or under this prefix is covered. `None` = no path
     /// scope.
     pub workspace_path_prefix: Option<String>,
-    /// Lexical command prefix (whitespace-separated tokens): a process call
-    /// whose command starts with these tokens is covered. `None` = no
-    /// command scope.
-    pub process_command_prefix: Option<String>,
+    /// Structured argv prefix for `process.run` / session start: first
+    /// element is the program, the rest are leading arguments. Argument
+    /// boundaries are preserved. `None` = no exec grant.
+    #[serde(default)]
+    pub exec_argv_prefix: Option<Vec<String>>,
+    /// Exact `shell.exec` command digest (`shell_command_digest`). Shell is
+    /// a language; there is no command-prefix standing grant.
+    #[serde(default)]
+    pub shell_command_digest: Option<String>,
 }
 
 /// Bounded resource envelope of a standing grant. A `None` limit means the

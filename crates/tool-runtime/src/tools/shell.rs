@@ -273,7 +273,11 @@ impl Tool for ShellExecTool {
         let timeout_ms = args.timeout_ms.clamp(100, MAX_TIMEOUT_MS);
 
         super::require_process_effect_context(&effect_context, "shell.exec")?;
-        super::require_covered_process_command("shell.exec", &arguments, &args.command)?;
+        super::require_covered_process_spawn(
+            "shell.exec",
+            &arguments,
+            &agent_contracts::shell_exec_intent(self.dialect.kind.program(), &args.command),
+        )?;
 
         let mut command = self.dialect.spawn_command(&args.command);
 

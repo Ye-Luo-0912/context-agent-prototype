@@ -1,0 +1,162 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "error",
+  "error": "op 5 failed: runtime error: tool round budget exhausted after 48 rounds",
+  "passed": false,
+  "wall_ms": 461388,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 1461,
+  "model_started": 60,
+  "model_used": 60,
+  "usage_incomplete": false,
+  "provider_tokens_lower_bound": true,
+  "workspace_sha256": "b13746b34742b71aeab1ff2ab5953b37126a52e9eba481bef6629a953ffa443e",
+  "workspace_files": 30,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 11,
+      "failed": 0
+    },
+    {
+      "name": "edit.replace",
+      "calls": 18,
+      "failed": 11
+    },
+    {
+      "name": "fs.list",
+      "calls": 5,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 12,
+      "failed": 0
+    },
+    {
+      "name": "fs.write",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "process.run",
+      "calls": 17,
+      "failed": 9
+    },
+    {
+      "name": "search.grep",
+      "calls": 3,
+      "failed": 1
+    },
+    {
+      "name": "task.complete",
+      "calls": 1,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 257,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 21,
+    "fetch_calls": 0,
+    "final_resident_bytes": 1529,
+    "forgotten_items": 17,
+    "inspect_calls": 2,
+    "lifecycle_transitions": 38,
+    "materialize_rounds": 60,
+    "model_attempts": 61,
+    "model_input_tokens": 852129,
+    "model_output_tokens": 12599,
+    "model_retries": 1,
+    "peak_resident_bytes": 2287,
+    "prompt_current_focus_tokens": 2933,
+    "prompt_historical_context_tokens": 25654,
+    "prompt_runtime_facts_tokens": 1620,
+    "prompt_system_tokens": 4260,
+    "prompt_task_anchor_tokens": 1560,
+    "prompt_task_progress_tokens": 4895,
+    "prompt_tool_catalog_index_tokens": 12951,
+    "prompt_tool_schema_tokens": 48143,
+    "prompt_turn_frame_tokens": 435423,
+    "provider_tokens_lower_bound": true,
+    "provider_tokens_total": 864728,
+    "reactivated_tokens": 0,
+    "reactivation_consumed": 0,
+    "reactivation_consumed_tokens": 0,
+    "reactivation_events": 0,
+    "reactivation_file_observation_consumed": 0,
+    "reactivation_file_observation_selected": 0,
+    "reactivation_selected": 0,
+    "reactivation_selected_tokens": 0,
+    "reactivation_tool_observation_consumed": 0,
+    "reactivation_tool_observation_selected": 0,
+    "recovered_items": 0,
+    "recovery_auto_reactivation": 0,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 17,
+    "recovery_workspace_reread": 11,
+    "repeated_fs_reads": 11,
+    "reread_external_descriptor": 0,
+    "reread_first_read": 1,
+    "reread_motive_body_visible_current": 0,
+    "reread_motive_changed": 0,
+    "reread_motive_checked_fresh": 0,
+    "reread_motive_descriptor_only": 6,
+    "reread_motive_first": 1,
+    "reread_motive_needs_revalidation": 5,
+    "reread_motive_stored": 0,
+    "reread_motive_warm": 0,
+    "reread_previously_selected": 3,
+    "reread_resident_unselected": 0,
+    "reread_selected_descriptor": 0,
+    "reread_stored": 0,
+    "reread_warm": 0,
+    "rounds": 60,
+    "schema_tokens_total": 48143,
+    "search_calls": 2,
+    "search_empty": 0,
+    "search_hits": 6,
+    "search_ms_p50": 4,
+    "search_ms_p95": 4,
+    "selected_tokens_by_kind": {
+      "assistant_message": 6209,
+      "tool_observation": 7040,
+      "user_message": 198
+    },
+    "selected_tokens_by_reason": {
+      "latest_file_body": 7040,
+      "scored": 6407
+    },
+    "selected_tokens_by_source": {
+      "assistant": 6209,
+      "tool:fs.read": 7040,
+      "user": 198
+    },
+    "selected_tokens_reactivated": 0,
+    "selected_tokens_resident": 13447,
+    "tool_calls": 70,
+    "tool_failure_classes": {
+      "invalid_request": 1,
+      "missing_project_marker": 2,
+      "no_exact_match": 4,
+      "path_not_found": 1,
+      "process_exit": 7,
+      "stale_revision": 6
+    },
+    "turns": 5,
+    "unique_reactivated": 0
+  }
+}

@@ -814,7 +814,7 @@ impl ModelTransport for VariableWindowModel {
 pub(crate) struct RoundLocalToolDispatcher {
     optional_loaded: AtomicBool,
     evict_on_gc: AtomicBool,
-    optional_description_chars: usize,
+    optional_schema_chars: usize,
     generation: AtomicU64,
     load_calls: AtomicUsize,
     unload_calls: AtomicUsize,
@@ -828,7 +828,7 @@ impl RoundLocalToolDispatcher {
         Self {
             optional_loaded: AtomicBool::new(true),
             evict_on_gc: AtomicBool::new(false),
-            optional_description_chars: 10_000,
+            optional_schema_chars: 10_000,
             generation: AtomicU64::new(17),
             load_calls: AtomicUsize::new(0),
             unload_calls: AtomicUsize::new(0),
@@ -848,7 +848,7 @@ impl RoundLocalToolDispatcher {
 
     pub(crate) fn schema_overflow() -> Self {
         Self {
-            optional_description_chars: 20_000,
+            optional_schema_chars: 20_000,
             ..Self::new()
         }
     }
@@ -884,10 +884,19 @@ impl ToolDispatcher for RoundLocalToolDispatcher {
         if self.optional_loaded() {
             specs.push(ToolSpec {
                 name: "optional.large".into(),
-                // ~2,500 tokens: too large for the first round's input
-                // budget but comfortably inside the restored window.
-                description: "x".repeat(self.optional_description_chars),
-                input_schema: serde_json::json!({"type": "object"}),
+                // Compact round-surface descriptions are truncated, so the
+                // overflow mass lives in input_schema (enum payload), which
+                // compact_for_model_surface does not strip.
+                description: "large optional schema".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "payload": {
+                            "type": "string",
+                            "enum": ["x".repeat(self.optional_schema_chars)]
+                        }
+                    }
+                }),
                 risk: ToolRisk::ReadOnly,
                 output_budget: None,
                 roles: Vec::new(),
@@ -925,6 +934,7 @@ impl ToolDispatcher for RoundLocalToolDispatcher {
                 owner: "test".into(),
                 description: "mandatory core reader".into(),
                 risk: agent_contracts::ToolRisk::ReadOnly,
+                roles: Vec::new(),
             },
             ToolCatalogEntry {
                 name: "optional.large".into(),
@@ -936,6 +946,7 @@ impl ToolDispatcher for RoundLocalToolDispatcher {
                 owner: "test".into(),
                 description: "large optional schema".into(),
                 risk: agent_contracts::ToolRisk::ReadOnly,
+                roles: Vec::new(),
             },
         ]
     }

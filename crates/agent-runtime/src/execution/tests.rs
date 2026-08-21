@@ -390,12 +390,16 @@ fn known_write_of_an_existing_digest_stales_verification() {
 }
 
 #[tokio::test]
-async fn unknown_after_current_pass_stales_fact_but_same_hash_is_not_due() {
+async fn unknown_after_current_pass_stales_workspace_coverage_even_when_tracked_hashes_match() {
     let mut resume = ExecutionState::default();
     let mut test = output("shell.exec", true, "exit 0");
     test.metadata = json!({"command": "cargo test", "verification": true});
     resume.observe_tool(&test, 1, 1);
     resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
+    assert_eq!(
+        resume.verification.coverage,
+        VerificationCoverage::Workspace
+    );
     let mut py = output("shell.exec", true, "exit 0");
     py.metadata = json!({"command": "python -c import visit_all"});
     resume.observe_tool(&py, 1, 2);
@@ -409,7 +413,45 @@ async fn unknown_after_current_pass_stales_fact_but_same_hash_is_not_due() {
     map.insert("src/auth.rs".into(), Some("abc123".into()));
     resume.revalidate(&MapOracle(map), "").await;
     assert_eq!(resume.checked_files[0].freshness, ResourceFreshness::Fresh);
+    assert!(
+        resume.verification.unknown_pending,
+        "Workspace coverage cannot recover from tracked-file identity"
+    );
+    assert_eq!(resume.validity(), VerificationState::Stale);
+    assert!(resume.has_unmet_obligation());
+    assert!(
+        !resume.verification_due_now(""),
+        "obligation is not automatically due"
+    );
+    assert!(resume.verification_due_now("run the tests"));
+    assert!(resume.verification_due_now("complete the task"));
+}
+
+#[tokio::test]
+async fn unknown_after_resources_coverage_recovers_when_covered_hashes_match() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
+    let mut write = output("fs.write", true, "wrote");
+    write.metadata = json!({"path": "src/auth.rs", "revision": "zzz"});
+    resume.observe_tool(&write, 1, 2);
+    let mut test = output("shell.exec", true, "exit 0");
+    test.metadata = json!({"command": "cargo test", "verification": true});
+    resume.observe_tool(&test, 1, 3);
+    assert_eq!(
+        resume.verification.coverage,
+        VerificationCoverage::Resources(vec!["src/auth.rs".into()])
+    );
+    assert_eq!(resume.validity(), VerificationState::Current);
+    let mut py = output("shell.exec", true, "exit 0");
+    py.metadata = json!({"command": "python -c import visit_all"});
+    resume.observe_tool(&py, 1, 4);
+    assert_eq!(resume.validity(), VerificationState::Stale);
+    let mut map = std::collections::HashMap::new();
+    map.insert("src/auth.rs".into(), Some("zzz".into()));
+    resume.revalidate(&MapOracle(map), "").await;
     assert!(!resume.verification.unknown_pending);
+    assert_eq!(resume.validity(), VerificationState::Current);
+    assert!(!resume.has_unmet_obligation());
     assert!(!resume.verification_due_now(""));
 }
 

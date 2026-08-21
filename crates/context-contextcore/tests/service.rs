@@ -583,6 +583,11 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
         } else {
             format!("historical File{item}.rs AuthService observation")
         };
+        let metadata = if item == 0 {
+            json!({"path": "RecallSentinel.rs"})
+        } else {
+            json!({})
+        };
         engine
             .ingest(ContextIngress::ToolObservation {
                 output: ToolOutput {
@@ -592,7 +597,7 @@ async fn contract_snapshot(engine: &dyn ContextEngine) -> serde_json::Value {
                     summary: "historical result".into(),
                     model_content,
                     artifact_ref: None,
-                    metadata: json!({}),
+                    metadata,
                 },
                 scope_id: None,
             })

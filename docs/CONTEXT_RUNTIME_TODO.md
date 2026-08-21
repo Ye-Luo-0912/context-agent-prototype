@@ -1,5 +1,8 @@
 # Continuous Context Runtime TODO
 
+Not live contract. Current freeze / P0: `docs/STATUS.md`. Execution:
+`docs/EXECUTION_COHERENCE.md`. An unchecked item here is a proposal.
+
 Status: code-grounded discussion draft, reorganized 2026-08-10
 
 This document records the target design and implementation order for the
@@ -1864,10 +1867,9 @@ current slice above.)
   GC thresholds or the reactivation scorer. Active/Suspended
   root downgrade and sourced `EpisodeOutcome` stay deferred (**do not
   start**). Main engineering returns to M12/M13.
-  **Closeout 2026-08-21 (items 21–29):** durable list is
-  `docs/STATUS.md` § Execution Coherence closeout. Item 24
-  (`context.manage` catalog-only except NeedEvidence / EXTERNAL CONTEXT)
-  is closed.
+  **Closeout:** durable now/freeze is `docs/STATUS.md`. Contract:
+  `docs/EXECUTION_COHERENCE.md`. Item 24 (`context.manage` catalog-only
+  except NeedEvidence / EXTERNAL CONTEXT) is closed.
   Live `recall_after_fix` is refused. M12/M13/PLAT-06 remain open.
 - [ ] After Anchor/root-claim properties pass, replace “entire active Focus
   subtree is a root” with Anchor claims + unresolved obligations + a bounded

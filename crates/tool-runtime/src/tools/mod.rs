@@ -33,7 +33,7 @@ pub(crate) use view::{
 
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, OperationEffectContext, RunId, ToolOutcome,
-    ToolSpec, is_non_transactional_process_tool, process_spawn_command_is_covered,
+    ToolSpec, is_non_transactional_process_tool, process_spawn_is_covered,
 };
 use agent_process::kill_process_tree;
 use agent_workspace::Workspace;
@@ -401,12 +401,12 @@ pub(crate) fn require_process_effect_context<'a>(
     Ok(context)
 }
 
-pub(crate) fn require_covered_process_command(
+pub(crate) fn require_covered_process_spawn(
     tool_name: &str,
     arguments: &Value,
-    actual_command: &str,
+    actual: &agent_contracts::EffectIntent,
 ) -> AgentResult<()> {
-    if process_spawn_command_is_covered(tool_name, arguments, actual_command) {
+    if process_spawn_is_covered(tool_name, arguments, actual) {
         Ok(())
     } else {
         Err(AgentError::InvalidRequest(

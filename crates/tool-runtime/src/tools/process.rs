@@ -142,7 +142,11 @@ impl Tool for ProcessRunTool {
         };
 
         super::require_process_effect_context(&effect_context, "process.run")?;
-        super::require_covered_process_command("process.run", &arguments, &args.argv.join(" "))?;
+        super::require_covered_process_spawn(
+            "process.run",
+            &arguments,
+            &agent_contracts::exec_argv_intent(&args.argv),
+        )?;
 
         let mut command = Command::new(&args.argv[0]);
         command

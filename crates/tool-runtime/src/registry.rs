@@ -17,7 +17,7 @@ use std::sync::{Arc, RwLock};
 use agent_contracts::{
     AgentError, AgentResult, ResourceDescriptor, ToolCatalogEntry, ToolDispatcher,
     ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec,
-    ToolSurfaceSnapshot, reject_staged_effect_for_process_tool, search_tool_catalog,
+    ToolSurfaceSnapshot, reject_staged_effect_for_process_tool, search_tool_catalog_filtered,
 };
 use agent_workspace::Workspace;
 use serde::Deserialize;
@@ -46,13 +46,14 @@ pub struct ToolLifecycleConfig {
 
 impl Default for ToolLifecycleConfig {
     fn default() -> Self {
-        // Production always-loaded surface. Git / shell / write / edit /
-        // `context.manage` stay in the catalog and load through
-        // `capability.manage` (or runtime NeedEvidence). Scripted eval
-        // fixtures, `--compare-arm`, and context-bench/mech ops pin
-        // write/edit and `context.manage`; live coding compare
-        // (`--compare-live`, `--pilot-run`, `--fixture-live`) reuses
-        // this default so the cell is the product surface.
+        // Production always-loaded surface. Git / shell / `fs.write` /
+        // `edit.replace` / `context.manage` stay in the catalog and load
+        // through `capability.manage` (or runtime NeedEvidence).
+        // `edit.patch` is the single canonical mutation primitive: one
+        // extra discovery round costs more than keeping its compact schema
+        // on the core coding surface. Scripted eval fixtures,
+        // `--compare-arm`, and context-bench/mech ops still pin write/edit
+        // and `context.manage`; live coding compare reuses this default.
         Self {
             always_loaded: vec![
                 "fs.list".into(),
@@ -63,6 +64,9 @@ impl Default for ToolLifecycleConfig {
                 // read side of that contract, so it must always be on the
                 // surface.
                 "artifact.read".into(),
+                // Canonical revision-aware mutation. Not fs.write /
+                // edit.replace / git / shell / process.
+                "edit.patch".into(),
                 // Completion is a task-level control: the model can always
                 // propose a structured outcome.
                 "task.complete".into(),
@@ -213,12 +217,17 @@ impl BuiltinToolDispatcher {
         let catalog = self.catalog.read().expect("tool catalog poisoned");
         let mut entries: Vec<_> = catalog
             .iter()
-            .map(|(name, entry)| ToolCatalogEntry {
-                name: name.clone(),
-                state: entry.state,
-                owner: "builtin".to_string(),
-                description: entry.tool.spec().description.clone(),
-                risk: entry.tool.spec().risk,
+            .map(|(name, entry)| {
+                let spec = entry.tool.spec();
+                let roles = spec.effective_roles();
+                ToolCatalogEntry {
+                    name: name.clone(),
+                    state: entry.state,
+                    owner: "builtin".to_string(),
+                    description: spec.description,
+                    risk: spec.risk,
+                    roles,
+                }
             })
             .collect();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -270,16 +279,21 @@ impl BuiltinToolDispatcher {
         vec![
             ToolSpec {
                 name: CAPABILITY_MANAGE.into(),
-                description: "Manage the tool catalog in one call. ops: search (list known tools with lifecycle state and owner), inspect (one tool's schema and state), load (put a tool on the model surface, e.g. git.status), unload (take a tool off the surface; core tools cannot be unloaded).".into(),
+                description: "Catalog ops: search, inspect, load, unload. Search by query and/or role=mutate|verify|read_resource|search|inspect_diff|escape_hatch. Load by exact name from the TOOL CATALOG index.".into(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["op"],
                     "properties": {
                         "op": {"type": "string", "enum": ["search", "inspect", "load", "unload"]},
-                        "name": {"type": "string", "description": "Tool name for inspect/load/unload"},
-                        "query": {"type": "string", "description": "search: optional case-insensitive filter over name, description, owner, state, and risk"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "search: max rows in the model-facing page (default 20)"},
-                        "cursor": {"type": "string", "description": "search: last tool name of the previous page"}
+                        "name": {"type": "string", "description": "Exact tool name for inspect/load/unload"},
+                        "query": {"type": "string", "description": "search: token match over name/description/owner/state/risk"},
+                        "role": {
+                            "type": "string",
+                            "enum": ["read_resource", "search", "inspect_diff", "verify", "mutate", "escape_hatch"],
+                            "description": "search: filter by semantic role instead of guessing keywords"
+                        },
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                        "cursor": {"type": "string"}
                     }
                 }),
                 risk: ToolRisk::ReadOnly,
@@ -309,6 +323,8 @@ struct ManageArgs {
     #[serde(default)]
     query: Option<String>,
     #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
     cursor: Option<String>,
@@ -318,6 +334,8 @@ struct ManageArgs {
 struct SearchArgs {
     #[serde(default)]
     query: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
     /// Max rows in the model-facing page (default 20, capped at 50).
     #[serde(default)]
     limit: Option<usize>,
@@ -442,9 +460,13 @@ impl BuiltinToolDispatcher {
             .limit
             .unwrap_or(agent_contracts::CAPABILITY_SEARCH_DEFAULT_LIMIT)
             .clamp(1, agent_contracts::CAPABILITY_SEARCH_MAX_LIMIT);
-        // 描述符索引检索：name/description/owner/state/risk，大小写不敏感。
-        // 先取全部命中再按 cursor 分页，避免索引 limit 把后续页裁掉。
-        let mut entries = search_tool_catalog(&self.catalog(), args.query.as_deref(), usize::MAX);
+        let role = ToolSemanticRole::parse_search_arg(args.role.as_deref())
+            .map_err(AgentError::InvalidRequest)?;
+        // Token-OR catalog search over name/description/owner/state/risk,
+        // optionally filtered by ToolSemanticRole so the model can ask
+        // for mutate/verify instead of guessing keywords.
+        let mut entries =
+            search_tool_catalog_filtered(&self.catalog(), args.query.as_deref(), role, usize::MAX);
         let active = entries
             .iter()
             .filter(|entry| entry.state.in_surface())
@@ -580,6 +602,7 @@ impl BuiltinToolDispatcher {
             "search" => {
                 let search = SearchArgs {
                     query: args.query,
+                    role: args.role,
                     limit: args.limit,
                     cursor: args.cursor,
                 };
@@ -1153,6 +1176,55 @@ mod tests {
             .unwrap();
         let by_name = value(by_name);
         assert!(by_name.model_content.contains("git.status"));
+
+        let natural = dispatcher
+            .execute(request(
+                CAPABILITY_MANAGE,
+                json!({"op": "search", "query": "patch edit file"}),
+            ))
+            .await
+            .unwrap();
+        let natural = value(natural);
+        assert!(
+            natural.model_content.contains("edit.patch"),
+            "token-OR search must hit edit.patch: {}",
+            natural.model_content
+        );
+
+        let by_role = dispatcher
+            .execute(request(
+                CAPABILITY_MANAGE,
+                json!({"op": "search", "role": "mutate"}),
+            ))
+            .await
+            .unwrap();
+        let by_role = value(by_role);
+        assert!(
+            by_role.model_content.contains("edit.patch"),
+            "role=mutate must hit edit.patch: {}",
+            by_role.model_content
+        );
+        assert!(
+            !by_role.model_content.contains("git.status"),
+            "role=mutate must not leak InspectDiff: {}",
+            by_role.model_content
+        );
+        assert!(
+            !by_role.model_content.contains("shell.exec"),
+            "role=mutate must not leak EscapeHatch: {}",
+            by_role.model_content
+        );
+
+        let bad_role = dispatcher
+            .execute(request(
+                CAPABILITY_MANAGE,
+                json!({"op": "search", "role": "planner"}),
+            ))
+            .await;
+        assert!(
+            matches!(bad_role, Err(AgentError::InvalidRequest(_))),
+            "unknown role must refuse: {bad_role:?}"
+        );
 
         let unknown = dispatcher
             .execute(request(

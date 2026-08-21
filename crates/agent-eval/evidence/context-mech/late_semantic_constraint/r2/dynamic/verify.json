@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "late_semantic_constraint",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 3,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "9e69b6e34714991fb19335877ca892fc7d7e47296ce022269144b5e6a2385641",
+      "bytes": 2597,
+      "truncated": false,
+      "body": "pub enum Msg {\n    Ping,\n    Hello(String),\n}\n\npub fn decode(bytes: &str) -> Result<Msg, String> {\n    if bytes.contains(\"ping\") {\n        return Ok(Msg::Ping);\n    }\n\n    const PREFIX: &str = \"{\\\"v\\\":2,\\\"hello\\\":\\\"\";\n    if let Some(value) = bytes.strip_prefix(PREFIX).and_then(|value| value.strip_suffix(\"\\\"}\")) {\n        return decode_json_string(value).map(Msg::Hello);\n    }\n\n    Err(\"unknown\".into())\n}\n\npub fn encode(msg: &Msg) -> String {\n    match msg {\n        Msg::Ping => \"ping\".into(),\n        Msg::Hello(value) => format!(r#\"{{\"v\":2,\"hello\":\"{}\"}}\"#, encode_json_string(value)),\n    }\n}\n\nfn encode_json_string(value: &str) -> String {\n    let mut encoded = String::with_capacity(value.len());\n    for character in value.chars() {\n        match character {\n            '\"' => encoded.push_str(\"\\\\\\\"\"),\n            '\\\\' => encoded.push_str(\"\\\\\\\\\"),\n            '\\n' => encoded.push_str(r#\"\\n\"#),\n            '\\r' => encoded.push_str(r#\"\\r\"#),\n            '\\t' => encoded.push_str(r#\"\\t\"#),\n            character if character.is_control() => {\n                encoded.push_str(&format!(r#\"\\u{:04x}\"#, character as u32));\n            }\n            character => encoded.push(character),\n        }\n    }\n    encoded\n}\n\nfn decode_json_string(value: &str) -> Result<String, String> {\n    let mut decoded = String::with_capacity(value.len());\n    let mut characters = value.chars();\n    while let Some(character) = characters.next() {\n        if character != '\\\\' {\n            decoded.push(character);\n            continue;\n        }\n\n        match characters.next() {\n            Some('\"') => decoded.push('\"'),\n            Some('\\\\') => decoded.push('\\\\'),\n            Some('/') => decoded.push('/'),\n            Some('b') => decoded.push('\\u{0008}'),\n            Some('f') => decoded.push('\\u{000c}'),\n            Some('n') => decoded.push('\\n'),\n            Some('r') => decoded.push('\\r'),\n            Some('t') => decoded.push('\\t'),\n            _ => return Err(\"invalid hello envelope\".into()),\n        }\n    }\n    Ok(decoded)\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{decode, encode, Msg};\n\n    fn roundtrip(msg: &Msg) -> Msg {\n        decode(&encode(msg)).unwrap()\n    }\n\n    #[test]\n    fn ping_encode_roundtrip() {\n        assert!(matches!(roundtrip(&Msg::Ping), Msg::Ping));\n    }\n\n    #[test]\n    fn hello_uses_v2_envelope_and_roundtrips() {\n        let message = Msg::Hello(\"hello\".into());\n        assert_eq!(encode(&message), r#\"{\"v\":2,\"hello\":\"hello\"}\"#);\n        assert!(matches!(decode(r#\"{\"v\":2,\"hello\":\"hello\"}\"#), Ok(Msg::Hello(value)) if value == \"hello\"));\n    }\n}\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-mech\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpjoiX2H\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

@@ -1,5 +1,10 @@
 # Context Lifecycle v0.1
 
+Context / GC / evidence / retrieval. Execution algorithm:
+[`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md). Sandbox:
+[`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md). Now/freeze:
+[`STATUS.md`](STATUS.md).
+
 ## 1. Core rule
 
 **Forgetting is a normal runtime operation, not an emergency response to token pressure.**
@@ -881,83 +886,10 @@ The same materialize request also carries a bounded `TaskAnchorView` on
 `CURRENT DIRECTIVE`) and TaskProgress from the runtime `TaskManager`; production
 engines leave `MaterializedContext.focus` / `.task` empty.
 
-**Execution Coherence V1 (freeze candidate).** Ownership is:
+Execution Coherence V1 (freeze candidate) is specified in
+[`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md). This file keeps the
+Context packing rules that follow from **IdentityKnown ≠ BodyVisible**.
 
-```text
-Task authority          → Runtime / TaskAnchor
-Operational state       → ExecutionState
-Historical selected     → ContextEngine
-Exact old evidence      → Catalog / Search / Fetch
-Body residency          → GC
-Prompt                  → Runtime assembler
-```
-
-The algorithm is four phases. There is no planner. The LLM still decides
-actions. Runtime only maintains provable world state:
-
-```text
-World Facts (path@rev / errors)
-  → Freshness Engine (Fresh / NeedsRevalidation / Missing)
-  → Obligation Ledger (verify / failure / unresolved evidence)
-  → Round Projection (due_now / foreground refs / missing evidence)
-       → Prompt and Tool roles → LLM
-```
-
-Invariants: (1) Unknown ≠ False, and NeedsRevalidation ≠ Fresh — do not
-delete facts to hide uncertainty; (2) Obligation exists ≠ Due now — do
-not wipe a real obligation just to avoid surfacing Verify; (3) Resource
-identity known ≠ body available in prompt. Do not add Typed
-EpisodeOutcome, a smarter reactivation scorer, vectors, embeddings, RAG,
-a learned router, or a new GC generation algorithm. Do not retune
-`active_threshold` / `archive_threshold` / `gc_max_generation`. Latest C
-live (`reactivation_events=1`, selected/consumed 0, 48 reactivated
-tokens) shows auto-reactivation has left the extra-round problem. After
-this contract, main engineering is M12/M13.
-**Closeout 2026-08-21 (items 21–29)** is in `docs/STATUS.md`. Item 24
-(`context.manage` catalog-only except NeedEvidence / EXTERNAL CONTEXT)
-is closed. This does not
-close M12/M13/PLAT-06.
-
-`CTX-11` is a bounded operational cache (`ExecutionState`, checkpointed as
-`resume` on `TaskRecord`) bound to `task_id + anchor_revision +
-workspace_revision`. Prompt framing is `TASK ORIGIN` (historical
-`original_goal`), `PERSISTENT TASK STATE` (constraints / acceptance /
-plan / open loops), and `CURRENT DIRECTIVE` (this user turn). Temporal
-wording on the origin is not a perpetual instruction. The state algorithm
-lives in `agent-runtime/src/execution/` (`state`, `freshness`, `needs`);
-`policy.rs` maps `ExecutionNeeds` onto catalog `ToolSpec.roles`.
-NeedVerify resolves `Verify` → capability search → `EscapeHatch`;
-`InspectDiff` is not a verifier and Runtime does not know that cargo
-uses `shell.exec`. Unstamped specs fall back to *known legacy builtin
-names only*; unknown plugins have no role and are not an EscapeHatch.
-No builtin currently declares `Verify`. Do not add `verify.run(command)`.
-Verification obligation (Pending/Stale/Failed plus
-cause/coverage) is not the same as `verification_due_now`. A later note
-turn does not wipe an unmet source/spec change; it simply is not due
-until a complete/coverage signal or the frozen NL verify hint *and* an
-obligation already exists. Natural-language verify is not a dictionary.
-`NeedMutate`
-is not inferred from a non-empty user instruction. ObservationMemo stays
-unwired (`lookup()` is always a miss). When it is wired, the first
-version caches only `fs.read` keyed by path + line range + content
-revision. Do not memo `search.grep` / `git.diff` / `git.status` until a
-workspace snapshot identity exists. Memo never intercepts write, patch,
-or shell side-effects, and it cannot replace Foreground Evidence.
-`TaskProgressView` projects checked resources, revision-bound
-verification state, and unresolved operation failures under a total prompt
-hard cap. It
-does not own objective / blockers / next-actions. The durable cache still
-updates after the turn commit barrier. The prompt projection additionally
-folds persistable open-turn `TurnFrame` tool results so the current coding
-loop sees `path@revision` before that barrier. Transient retrieval results
-stay out of both. Checked files come from stamped `ResourceTouch`
-paths (`metadata.path` and `metadata.files[]`); a may-mutate observation
-without a touch is an `Unknown` footprint: `workspace_revision` still
-advances (old PASS is omitted) but known `path@revision` facts are kept
-and marked `NeedsRevalidation` for a hash-only BeforeModel revalidate.
-TaskProgress `Checked` and that body-omission / GC suppression consume
-only `Fresh` identities; pending revalidation and Missing stay off the
-projection (cap 8 hashes per BeforeModel round).
 Selected historical `fs.read` bodies
 and stamped-path identity logs whose path is already Checked are omitted
 from SELECTED WORKING CONTEXT (the item header keeps `path@revision`);
@@ -976,10 +908,13 @@ latest matching file body into `MaterializedContext.foreground` for this
 request only: Warm stays Warm, Stored is not Admitted, consumption ack
 does not stamp those ids. Assembler renders `CURRENT FOREGROUND EVIDENCE`
 before SELECTED WORKING CONTEXT; Checked omit does not apply there.
-Total body budget is ~2048 tokens. This is Meaning/state resident; body
-on demand — not a long-term `recent_file_bodies = 8` safety net. P3/P4
-stay ablation-only until this projection is measured against extra
-rereads.
+The engine packs foreground first, then subtracts **actual** body tokens
+from `budget_tokens` before historical packing. Runtime must not
+worst-case-reserve `MAX_FOREGROUND_TOKENS` (~2048); that constant is the
+foreground cap inside `realize_foreground`, not a frame reservation.
+GC-induced reread is `Warm` + `Stored` only (`FsReadMotive` /
+`FsRereadClass.gc_induced()`). Do not retune `active_threshold` /
+`archive_threshold` / `gc_max_generation`. P3/P4 stay ablation-only.
 
 Verification is typed metadata, orthogonal to
 mutation: a may-mutate observation bumps `workspace_revision` and old PASS
@@ -991,8 +926,8 @@ counters are segment-local (zeroed on restore); run-global unique/event
 counts come from `ContextGc` events. Context V1 still does not enable
 P3/P4 by default. Do not add further Context heuristics. Production
 `ToolLifecycleConfig::default()` always-loads `fs.list` / `fs.read` /
-`search.grep` / `artifact.read` / `task.complete` /
-`capability.manage`; git / shell / write / edit / `context.manage` are catalog-only. Eval
+`search.grep` / `artifact.read` / `edit.patch` / `task.complete` /
+`capability.manage`; git / shell / write / `edit.replace` / `context.manage` are catalog-only. Eval
 fixtures and scripted `--compare-arm` that pin `fs.write` / `edit.replace`
 and `context.manage` are not a product-surface isomorph. Live coding
 compare now reuses production

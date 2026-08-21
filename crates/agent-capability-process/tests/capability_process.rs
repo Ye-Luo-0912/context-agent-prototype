@@ -45,6 +45,7 @@ fn manifest_with_program(program: &str) -> CapabilityManifest {
         transport: CapabilityTransport::Process {
             program: program.into(),
         },
+        sandbox_profile: Default::default(),
     }
 }
 

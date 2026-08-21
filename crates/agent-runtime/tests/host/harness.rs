@@ -96,6 +96,7 @@ impl ToolDispatcher for StubTools {
             owner: "builtin".into(),
             description: "stub builtin tool".into(),
             risk: agent_contracts::ToolRisk::ReadOnly,
+            roles: Vec::new(),
         }]
     }
     async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -191,6 +192,7 @@ impl DemoCapability {
                 tools: Vec::new(),
                 lifecycle,
                 transport: CapabilityTransport::Builtin,
+                sandbox_profile: Default::default(),
             },
             tool_names: vec![format!("{id}.demo")],
             started,
@@ -301,6 +303,7 @@ impl ContextCapturingCapability {
                 tools: Vec::new(),
                 lifecycle: CapabilityLifecycle::Lazy,
                 transport: CapabilityTransport::Builtin,
+                sandbox_profile: Default::default(),
             },
             captured: Arc::new(Mutex::new(None)),
         }
@@ -501,6 +504,7 @@ impl Capability for RecordingCapability {
             tools: Vec::new(),
             lifecycle: CapabilityLifecycle::Eager,
             transport: CapabilityTransport::Builtin,
+            sandbox_profile: Default::default(),
         })
     }
     async fn start(&self) -> AgentResult<()> {
@@ -589,5 +593,6 @@ pub(crate) fn instrumented_manifest(id: &str) -> CapabilityManifest {
         tools: Vec::new(),
         lifecycle: CapabilityLifecycle::Lazy,
         transport: CapabilityTransport::Builtin,
+        sandbox_profile: Default::default(),
     }
 }

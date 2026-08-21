@@ -1,5 +1,13 @@
 # Agent OS Architecture
 
+Stable architecture: authority, runtime, tools, context. Sibling contracts:
+
+- [`STATUS.md`](STATUS.md) — now / freeze / P0
+- [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md) — operational state
+- [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md) — EffectIntent / sandbox
+- [`CONTEXT_LIFECYCLE.md`](CONTEXT_LIFECYCLE.md) — GC and retrieval
+- [`ROADMAP.md`](ROADMAP.md) — milestone gates
+
 ## 1. Purpose
 
 This prototype is not intended to become a second ContextCore. It is a small, real agent runtime used to validate the runtime behavior that ContextCore will eventually power.
@@ -398,7 +406,7 @@ without changing the Platform's `ContextEngine` contract.
 
 Since V1-P0-2 the engine never renders prompt text. It answers a
 `ContextQuery { current_input, budget_tokens, hints }` with a
-`MaterializedContext { focus, items, external, selected, approx_tokens,
+`MaterializedContext { focus, items, external, selected, foreground, approx_tokens,
 diagnostics }`; `items` are structured `MaterializedItem`s, `external` is
 a bounded refs-only view (store hot/recency plus Warm items that are hot
 or already Checked; max 32 entries, never the full map), and the runtime-owned `PromptAssembler` is the only place that turns
@@ -803,8 +811,9 @@ maintain(BeforeModel)
 ContextEngine.materialize(ContextQuery)   ── the Context Frame (long-term working set)
    │
    v
-PromptAssembler.assemble(runtime_focus, task_anchor, history, turn, tools)
-   = System Policy + Focus Frame + Context Frame + Turn Frame + Tool Schemas
+PromptAssembler.assemble_with_catalog(runtime_focus, task_anchor, history, turn, tools, catalog)
+   = System Policy + Runtime Facts + Tool Catalog Index + Focus Frame
+     + Context Frame + Turn Frame + compacted Tool Schemas
    │
    v
 ModelTransport.complete_stream()
@@ -851,6 +860,11 @@ Pack window = min(kernel context_budget_tokens, send window)
         - Active Tool Schemas   (wire-form estimate of the tool specs)
         = Context Frame Budget  (the only number the engine receives)
 ```
+
+The engine packs `MaterializedContext.foreground` first, charges actual
+body tokens, and uses the remainder for the historical working set.
+Runtime must not worst-case-reserve `MAX_FOREGROUND_TOKENS` from this
+budget; that constant is the foreground cap, not a frame reservation.
 
 The engine never sees the send window, the output reserve or the tool schemas —
 it just knows it has N tokens for the working set. A large declared provider
@@ -910,10 +924,12 @@ replaying an append-only transcript. The input is assembled in five layers:
 
 ```text
 System Policy    - standing instructions (runtime-owned)
+Runtime Facts    - bounded host/workspace profile (runtime-owned)
+Tool Catalog Index - names of tools not on this round's schema surface
 Focus Frame      - current TaskAnchor + Focus from TaskManager (runtime-owned)
 Context Frame    - historical working set from MaterializedItem's
 Turn Frame       - the current turn's execution stack (runtime-owned)
-Active Tool Schemas - tool definitions for this request
+Active Tool Schemas - compacted tool definitions for this request
 ```
 
 Role authority follows the same split. Only the system policy and the
@@ -940,6 +956,20 @@ markers after a committed durable mutation and after a successful `shell.exec`
 or `process.run`. Caps: 1 KiB UTF-8, 16 sorted markers, 64 bytes per marker.
 Facts never enter `ContextEngine`, transcript storage or lifecycle scoring, and
 they do not repeat the tool catalog. Stale trusted facts are worse than none.
+
+#### Tool Catalog Index
+
+`PromptAssembler` places a bounded `tool_catalog/v1` system block after
+Runtime Facts. It lists catalog tools that are **not** in this round's
+tools array (name + one-line summary + lifecycle). Caps: 24 rows, 64
+chars per summary, 1536 chars total. The model loads by exact name
+(`capability.manage` `op=load`). Full JSON schemas stay off the surface
+until loaded. Round-surface schemas are compacted: descriptions truncate
+to 96 chars and nested JSON-schema `description` keys are stripped.
+`capability.manage inspect` still returns the producer spec. Search ranks
+by token overlap plus a whole-phrase bonus so `"patch edit file"` hits
+`edit.patch`; it no longer requires every token *and* the concatenated
+phrase as a substring.
 
 `shell.exec` binds one dialect for the whole run and names it in the schema.
 Windows prefers detected/pinned PowerShell 7, then Windows PowerShell 5.1,
@@ -1411,6 +1441,10 @@ Do not move Agent Kernel, tools, approvals, TUI, or provider code into ContextCo
 
 ## 9b. Process capability boundary: sandbox + cancellation (V1-M9)
 
+M12/M13 first cuts, HostToolPolicy, HostLifecycle, and the per-OS
+attestation matrix live in [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md).
+Do not claim those milestones closed from this section.
+
 A process capability is not sandboxed by *telling* the child what it may
 do — the manifest's `permissions` array is informational, not
 enforcement. Since V1-M9 every out-of-process child runs inside an
@@ -1603,9 +1637,22 @@ intent is covered by the approved invocation bound; otherwise it is
 refused before staging. Generic `shell.exec` / `process.run` /
 `process.session` require Core-issued effect identity before spawn and
 return a plain value; they never stage a prepared effect. The approved
-`ProcessRun` bound is the command they will actually spawn (`command` vs
-`argv`). `process.session` poll/stop do not spawn and cannot spend a
-command-prefix grant. Session recovery is keyed by the start identity.
+bound is structured: `ExecArgv { program, argv }` for argv tools
+(prefix cover with intact argument boundaries) and `ShellExec { dialect,
+command_digest }` for `shell.exec` (exact RFC 8785 JCS digest of
+`{"command"}`, never a shell-string prefix). Trusted `HostToolPolicy`
+binds builtin arguments to those intents; `ToolSpec` is not authority
+and a plugin cannot self-authorize via `ToolRisk` plus parameter names
+(`command` / `argv` / `destination` / `payload`). `process.session`
+poll/stop do not spawn and cannot spend an argv-prefix grant. Session
+recovery is keyed by the start identity.
+Process-connection state is `HostLifecycle` (`NeverStarted` / `Serving`
+/ `Quarantined` / `Stopped`): first connect is not a restart, and a
+failed replacement stays quarantined. Capability start compares
+`SandboxProfile` to post-spawn `SandboxCapabilities` (actual enforced,
+not configured). `UntrustedGenerated` fails closed on the native process
+plane; WASI is a V2 candidate for that profile, not a v0 slice. Do not
+invent `MOD-18`.
 A mismatched process-tool identity and a parent-escaping session cwd fail
 closed before spawn. The grant
 enforcement points are
@@ -1635,10 +1682,14 @@ single-purpose meta-tools:
   capability-aware dispatcher (which filters out the builtin copy).
 
 The default always-loaded model surface is `fs.list`, `fs.read`,
-`search.grep`, `artifact.read`, `task.complete`, `capability.manage`.
-`context.manage` is catalog-only until NeedEvidence / EXTERNAL CONTEXT
-(Warm/Cold/Stored catalog or TaskAnchor `evidence_refs`); the model can
-also load it through `capability.manage`. The merge is evidence-backed,
+`search.grep`, `artifact.read`, `edit.patch`, `task.complete`,
+`capability.manage`. `edit.patch` is the single canonical mutation
+primitive; `fs.write`, `edit.replace`, git, shell, and process stay
+catalog-only. `context.manage` is catalog-only until an evidence fact-gap
+(Warm/Cold/Stored catalog, TaskAnchor `evidence_refs`, or open loops);
+the model can also load it through `capability.manage`. Catalog search
+accepts `role=mutate|verify|read_resource|search|inspect_diff|escape_hatch`
+so the model does not have to guess keywords. The merge is evidence-backed,
 not assumed: `merged_control_surface_costs_
 fewer_schema_tokens` measures the merged schemas against the old
 separate tools and asserts a decisive win.
@@ -1649,7 +1700,9 @@ become context pollution:
 - `capability.manage op=search` pages (default 20, capped at 50, with a
   name-sorted `cursor`) and spills the full listing to an artifact when the
   page is not the whole catalog — the model only ever sees the bounded
-  page.
+  page. Search ranks token-OR plus a phrase bonus, and may filter by
+  `ToolSemanticRole` (`role=mutate` returns `edit.patch` without a text
+  query).
 - Registration validates and caps a capability's declared schemas:
   `MAX_TOOLS_PER_CAPABILITY` (32), `MAX_TOOL_NAME_CHARS` (64, names
   restricted to `[A-Za-z0-9._:-]`), `MAX_TOOL_DESCRIPTION_CHARS` (200),

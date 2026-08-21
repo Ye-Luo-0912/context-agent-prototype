@@ -1,9 +1,10 @@
 //! Mechanism V2: three one-mechanism scenarios. Independent of frozen
 //! `agent-eval.context-bench.v1`. Structural CI is pack self-check plus
 //! unit tests; live `--context-mech-run` is the next mechanism instrument
-//! (`late_semantic_constraint` is the non-Anchor GC-recall test). Do not
-//! keep live-running `recall_after_fix`; that fixture's diagnostic
-//! mission is complete. Keep its scripted `--compare-arm` tests.
+//! (`late_semantic_constraint` is the non-Anchor GC-recall test): A/C ×
+//! 3 tasks × 2 repeats = 12 cells. Do not keep live-running
+//! `recall_after_fix`; that fixture's diagnostic mission is complete.
+//! Keep its scripted `--compare-arm` tests.
 
 use std::fs;
 use std::path::PathBuf;
@@ -15,6 +16,9 @@ use crate::context_bench::{self, BenchPack, BenchTask, BenchTaskFile};
 
 pub const SCHEMA: &str = "agent-eval.context-mech.v2";
 pub const MECH_TASKS: usize = 3;
+pub const MECH_ENGINES: usize = 2;
+pub const DEFAULT_REPEATS: u32 = 2;
+pub const LIVE_CELLS: usize = MECH_TASKS * MECH_ENGINES * DEFAULT_REPEATS as usize;
 pub const TASK_IDS: [&str; 3] = [
     "late_semantic_constraint",
     "resume_operational_state",
@@ -24,10 +28,11 @@ pub const TASK_IDS: [&str; 3] = [
 pub const SPEC: &str = "\
 schema=agent-eval.context-mech.v2
 question=does each Context V1 mechanism hold in isolation
-primary=per-mechanism structural test; live 2-3 repeats for development judgment
+primary=per-mechanism structural test; live A/C two repeats for development judgment
 tasks=late_semantic_constraint, resume_operational_state, no_semantic_episode
-engines=dynamic only
+engines=append vs dynamic
 repeats=2
+cells=12
 frozen_context_bench_v1=untouched
 semantic_recall_v1=long-protocol trajectory only; do not keep live-running it
 recall_after_fix=diagnostic complete; keep scripted tests; do not keep live-running it
@@ -89,8 +94,9 @@ pub fn render_pack(pack: &BenchPack) -> String {
     out.push_str(&format!("schema={SCHEMA}\n"));
     out.push_str(&format!("spec_sha256={}\n", spec_sha256()));
     out.push_str("decision_instrument=context-mech.v2 (not frozen context-bench.v1)\n");
-    out.push_str("engines=dynamic\n");
-    out.push_str("repeats=2\n");
+    out.push_str("engines=append vs dynamic\n");
+    out.push_str(&format!("repeats={DEFAULT_REPEATS}\n"));
+    out.push_str(&format!("cells={LIVE_CELLS}\n"));
     out.push_str("spec:\n");
     for line in SPEC.lines() {
         out.push_str(&format!("  {line}\n"));
@@ -171,6 +177,13 @@ mod tests {
         assert!(report.contains("ok resume_operational_state"));
         assert!(report.contains("ok no_semantic_episode"));
         assert_eq!(report.lines().count(), MECH_TASKS);
+        assert_eq!(LIVE_CELLS, 12);
+        let rendered = render_pack(&pack);
+        assert!(rendered.contains("engines=append vs dynamic"));
+        assert!(rendered.contains("cells=12"));
+        for task in &pack.tasks {
+            assert!(!task.include_rolling(), "{} is A/C, not rolling", task.id());
+        }
     }
 
     #[test]

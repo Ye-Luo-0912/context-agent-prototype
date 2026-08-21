@@ -71,11 +71,9 @@ impl ToolRisk {
 }
 
 /// The normalized side effect one tool call intends to perform, derived from
-/// the validated arguments — never from the tool's self-declared risk
-/// alone. Approval/policy matches this concrete intent, and the executor
-/// proves the actual effect fits it before commit. It is a conservative
-/// upper bound by design: a workspace write carries its target path and a
-/// byte estimate of the content, a process run its lexical command prefix.
+/// a trusted [`crate::HostToolPolicy`] — never from the tool's self-declared
+/// risk or argument names alone. Approval matches this concrete intent, and
+/// the executor proves the actual effect fits it before commit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EffectIntent {
     /// A read-only call; nothing to authorize.
@@ -83,8 +81,15 @@ pub enum EffectIntent {
     /// A workspace write: the workspace-relative target path and a
     /// conservative byte estimate of the content being written.
     WorkspaceWrite { path: String, content_bytes: u64 },
-    /// A process run: the lexical command (whitespace-separated tokens).
-    ProcessRun { command: String },
+    /// Direct spawn with intact argument boundaries. Standing grants may
+    /// match an argv prefix (`program` plus leading `argv` entries).
+    ExecArgv { program: String, argv: Vec<String> },
+    /// Shell is a language (`&&`, `|`, `$()`, PowerShell). Standing grants
+    /// are an exact canonical-command digest, never a whitespace prefix.
+    ShellExec {
+        dialect: String,
+        command_digest: String,
+    },
 }
 
 impl EffectIntent {
@@ -94,16 +99,17 @@ impl EffectIntent {
         match self {
             Self::ReadOnly => ToolRisk::ReadOnly,
             Self::WorkspaceWrite { .. } => ToolRisk::WorkspaceWrite,
-            Self::ProcessRun { .. } => ToolRisk::ProcessExecution,
+            Self::ExecArgv { .. } | Self::ShellExec { .. } => ToolRisk::ProcessExecution,
         }
     }
 
     /// Whether `actual` is the same class and inside this approved upper
-    /// bound. Empty path/command never covers anything. Workspace writes
-    /// require an exact canonical relative path (`src/a.rs` ≠ `src/ab.rs`)
-    /// and `actual.content_bytes <= approved`. A process-run bound cannot
-    /// cover a workspace write: that is the path-widening hole the process
-    /// wire-effect quarantine exists to close.
+    /// bound. Empty path / empty program / empty digest never covers.
+    /// Workspace writes require an exact canonical relative path
+    /// (`src/a.rs` ≠ `src/ab.rs`) and `actual.content_bytes <= approved`.
+    /// ExecArgv matches program equality plus argv prefix with intact
+    /// argument boundaries. ShellExec matches digest equality; an empty
+    /// approved dialect matches any actual dialect of the same command.
     pub fn covers(&self, actual: &EffectIntent) -> bool {
         match (self, actual) {
             (Self::ReadOnly, Self::ReadOnly) => true,
@@ -125,12 +131,31 @@ impl EffectIntent {
                 };
                 approved == path && *content_bytes <= *max_bytes
             }
-            (Self::ProcessRun { command: approved }, Self::ProcessRun { command }) => {
-                let approved_tokens: Vec<&str> = approved.split_whitespace().collect();
-                let command_tokens: Vec<&str> = command.split_whitespace().collect();
-                !approved_tokens.is_empty()
-                    && command_tokens.len() >= approved_tokens.len()
-                    && command_tokens[..approved_tokens.len()] == approved_tokens[..]
+            (
+                Self::ExecArgv {
+                    program: approved_program,
+                    argv: approved_argv,
+                },
+                Self::ExecArgv { program, argv },
+            ) => {
+                !approved_program.is_empty()
+                    && approved_program == program
+                    && argv.len() >= approved_argv.len()
+                    && argv[..approved_argv.len()] == approved_argv[..]
+            }
+            (
+                Self::ShellExec {
+                    dialect: approved_dialect,
+                    command_digest: approved_digest,
+                },
+                Self::ShellExec {
+                    dialect,
+                    command_digest,
+                },
+            ) => {
+                !approved_digest.is_empty()
+                    && approved_digest == command_digest
+                    && (approved_dialect.is_empty() || approved_dialect == dialect)
             }
             _ => false,
         }
@@ -159,139 +184,58 @@ fn canonical_relative_path(path: &str) -> Option<String> {
     }
 }
 
-/// Derive the conservative `EffectIntent` upper bound from validated tool
-/// arguments. This is the shared normalization both the legacy
-/// standing-grant gate and the v2 lease/`AuthorityGate` path use:
-/// approval matches the concrete intent, never the tool name. Fail-closed:
-/// a missing argument yields the empty/zero bound, which can never match a
-/// grant (an empty path has no prefix, an empty command has no tokens).
-/// Process tools: `argv` for `process.run` / `process.session` start,
-/// `command` for `shell.exec`, and `ReadOnly` for `process.session`
-/// poll/stop (no new child).
-pub fn derive_effect_intent(call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
-    match spec.risk {
-        ToolRisk::ReadOnly => EffectIntent::ReadOnly,
-        ToolRisk::WorkspaceWrite => {
-            let path = call
-                .arguments
-                .get("path")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let content_bytes = call
-                .arguments
-                .get("content")
-                .or_else(|| call.arguments.get("new"))
-                .and_then(|value| value.as_str())
-                .map(|content| content.len() as u64)
-                .unwrap_or(0);
-            EffectIntent::WorkspaceWrite {
-                path,
-                content_bytes,
-            }
-        }
-        ToolRisk::ProcessExecution => process_effect_intent(&call.name, &call.arguments),
+/// Structured argv intent. `argv[0]` is the program; the rest is argv.
+/// An empty program never covers a spawn.
+pub fn exec_argv_intent(argv: &[String]) -> EffectIntent {
+    match argv.split_first() {
+        Some((program, rest)) if !program.is_empty() => EffectIntent::ExecArgv {
+            program: program.clone(),
+            argv: rest.to_vec(),
+        },
+        _ => EffectIntent::ExecArgv {
+            program: String::new(),
+            argv: Vec::new(),
+        },
     }
 }
 
-/// Process-tool intent: a new child is a `ProcessRun` bound; session
-/// poll/stop do not spawn and must not consume a command-prefix grant.
-/// Unknown `process.session` actions are an empty `ProcessRun` (fail-closed).
-fn process_effect_intent(tool_name: &str, arguments: &Value) -> EffectIntent {
-    if tool_name == "process.session" {
-        return match session_action(arguments) {
-            Some("poll" | "stop") => EffectIntent::ReadOnly,
-            Some("start") => EffectIntent::ProcessRun {
-                command: argv_command(arguments),
-            },
-            _ => EffectIntent::ProcessRun {
-                command: String::new(),
-            },
-        };
-    }
-    EffectIntent::ProcessRun {
-        command: lexical_process_command(tool_name, arguments),
-    }
-}
-
-fn session_action(arguments: &Value) -> Option<&str> {
-    arguments
-        .get("action")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|action| !action.is_empty())
-}
-
-/// Lexical process command used as the `EffectIntent::ProcessRun` bound.
-///
-/// The bound must name the arguments the tool will actually spawn:
-/// `shell.exec` reads `command`; `process.run` and `process.session`
-/// **start** read `argv`. Poll/stop are not spawn paths — see
-/// [`derive_effect_intent`]. An unused sibling field must not become the
-/// bound (that is the process-run analogue of path widening). Unknown
-/// process tools: one present shape is used; both present and unequal is
-/// empty (fail-closed).
-pub fn lexical_process_command(tool_name: &str, arguments: &Value) -> String {
-    match tool_name {
-        "shell.exec" => command_argument(arguments),
-        "process.run" | "process.session" => argv_command(arguments),
-        _ => {
-            let command = command_argument(arguments);
-            let argv = argv_command(arguments);
-            match (command.is_empty(), argv.is_empty()) {
-                (false, true) => command,
-                (true, false) => argv,
-                (false, false) if command == argv => command,
-                _ => String::new(),
-            }
-        }
-    }
-}
-
-fn command_argument(arguments: &Value) -> String {
-    arguments
-        .get("command")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|command| !command.is_empty())
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn argv_command(arguments: &Value) -> String {
-    let Some(argv) = arguments.get("argv").and_then(|value| value.as_array()) else {
+/// Exact shell-command intent. The digest is RFC 8785 JCS + sha256 of
+/// `{"command": <trimmed command>}` — not a whitespace token prefix.
+pub fn shell_command_digest(command: &str) -> String {
+    let command = command.trim();
+    if command.is_empty() {
         return String::new();
+    }
+    crate::ArgumentDigest::from_json(&serde_json::json!({ "command": command })).to_string()
+}
+
+pub fn shell_exec_intent(dialect: &str, command: &str) -> EffectIntent {
+    EffectIntent::ShellExec {
+        dialect: dialect.trim().to_string(),
+        command_digest: shell_command_digest(command),
+    }
+}
+
+/// Whether the actual spawn sits inside the host-derived approved bound
+/// for this call. Empty approved bounds never cover a spawn.
+pub fn process_spawn_is_covered(tool_name: &str, arguments: &Value, actual: &EffectIntent) -> bool {
+    let spec = ToolSpec {
+        name: tool_name.into(),
+        description: String::new(),
+        input_schema: serde_json::json!({"type": "object"}),
+        risk: ToolRisk::ProcessExecution,
+        output_budget: None,
+        roles: Vec::new(),
     };
-    if argv.is_empty() {
-        return String::new();
-    }
-    let mut tokens = Vec::with_capacity(argv.len());
-    for item in argv {
-        let Some(token) = item.as_str() else {
-            return String::new();
-        };
-        if token.is_empty() {
-            return String::new();
-        }
-        tokens.push(token);
-    }
-    tokens.join(" ")
-}
-
-/// Whether the command about to be spawned sits inside the approved
-/// `ProcessRun` bound derived from the same tool call. Empty approved
-/// bounds never cover a spawn.
-pub fn process_spawn_command_is_covered(
-    tool_name: &str,
-    arguments: &Value,
-    actual_command: &str,
-) -> bool {
-    EffectIntent::ProcessRun {
-        command: lexical_process_command(tool_name, arguments),
-    }
-    .covers(&EffectIntent::ProcessRun {
-        command: actual_command.to_string(),
-    })
+    crate::derive_effect_intent(
+        &ToolCall {
+            id: String::new(),
+            name: tool_name.into(),
+            arguments: arguments.clone(),
+        },
+        &spec,
+    )
+    .covers(actual)
 }
 
 /// Semantic capability a catalog tool offers. Tool-surface policy maps an
@@ -309,6 +253,47 @@ pub enum ToolSemanticRole {
 }
 
 impl ToolSemanticRole {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::ReadResource => "read_resource",
+            Self::Search => "search",
+            Self::InspectDiff => "inspect_diff",
+            Self::Verify => "verify",
+            Self::Mutate => "mutate",
+            Self::EscapeHatch => "escape_hatch",
+        }
+    }
+
+    /// Parse a `capability.manage` search `role=` argument. Accepts the
+    /// snake_case wire name; a few short aliases (`read`, `inspect`,
+    /// `escape`) are allowed so the model does not have to guess the
+    /// exact identifier.
+    pub fn parse_arg(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "read_resource" | "read" => Some(Self::ReadResource),
+            "search" => Some(Self::Search),
+            "inspect_diff" | "inspect" => Some(Self::InspectDiff),
+            "verify" => Some(Self::Verify),
+            "mutate" => Some(Self::Mutate),
+            "escape_hatch" | "escape" => Some(Self::EscapeHatch),
+            _ => None,
+        }
+    }
+
+    /// Parse an optional `capability.manage search` `role` argument.
+    /// Empty/absent is `Ok(None)`. An unknown token is an error so the
+    /// model sees a typed refusal instead of a silent unfiltered catalog.
+    pub fn parse_search_arg(raw: Option<&str>) -> Result<Option<Self>, String> {
+        let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        Self::parse_arg(raw).map(Some).ok_or_else(|| {
+            format!(
+                "unknown tool role '{raw}' (expected read_resource|search|inspect_diff|verify|mutate|escape_hatch)"
+            )
+        })
+    }
+
     /// Name fallback for unstamped *legacy builtin* specs. Unknown
     /// external/plugin names have no role — the producer must declare.
     /// Do not default to [`Self::EscapeHatch`] and do not treat `fs.*` /
@@ -372,6 +357,33 @@ impl ToolSpec {
     /// workspace grep.
     pub fn is_capability_search(&self) -> bool {
         matches!(self.name.as_str(), CAPABILITY_MANAGE | CAPABILITY_SEARCH)
+    }
+
+    /// Round-surface form: truncate the tool description and drop nested
+    /// JSON-schema `description` keys. Inspect / catalog search still see
+    /// the producer spec; only the model-facing tools array is compacted.
+    pub fn compact_for_model_surface(mut self) -> Self {
+        self.description =
+            crate::discovery::truncate_chars(&self.description, MAX_TOOL_SURFACE_DESCRIPTION_CHARS);
+        strip_json_schema_descriptions(&mut self.input_schema);
+        self
+    }
+}
+
+fn strip_json_schema_descriptions(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("description");
+            for nested in map.values_mut() {
+                strip_json_schema_descriptions(nested);
+            }
+        }
+        Value::Array(items) => {
+            for nested in items {
+                strip_json_schema_descriptions(nested);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1691,6 +1703,29 @@ pub struct ToolCatalogEntry {
     /// Declared risk class; searchable via the provider-owned catalog index.
     #[serde(default)]
     pub risk: ToolRisk,
+    /// Semantic roles for role-aware catalog search. Empty falls back to
+    /// [`ToolSemanticRole::from_tool_name`] for known builtins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<ToolSemanticRole>,
+}
+
+impl ToolCatalogEntry {
+    pub fn effective_roles(&self) -> Vec<ToolSemanticRole> {
+        if self.roles.is_empty() {
+            ToolSemanticRole::from_tool_name(&self.name)
+                .into_iter()
+                .collect()
+        } else {
+            let mut roles = self.roles.clone();
+            roles.sort();
+            roles.dedup();
+            roles
+        }
+    }
+
+    pub fn has_role(&self, role: ToolSemanticRole) -> bool {
+        self.effective_roles().contains(&role)
+    }
 }
 
 /// Always-visible control tools of the unified catalog: the model can
@@ -1713,6 +1748,14 @@ pub const CONTEXT_MANAGE: &str = "context.manage";
 /// page is capped, and the full listing spills to an artifact.
 pub const CAPABILITY_SEARCH_DEFAULT_LIMIT: usize = 20;
 pub const CAPABILITY_SEARCH_MAX_LIMIT: usize = 50;
+
+/// Model-facing catalog index (names of tools not on this round's
+/// schema surface). Full schemas still require `capability.manage` load.
+pub const MAX_TOOL_CATALOG_INDEX_ROWS: usize = 24;
+pub const MAX_TOOL_CATALOG_INDEX_SUMMARY_CHARS: usize = 64;
+pub const MAX_TOOL_CATALOG_INDEX_CHARS: usize = 1536;
+/// Truncate each tool description on the round surface (not inspect).
+pub const MAX_TOOL_SURFACE_DESCRIPTION_CHARS: usize = 96;
 
 #[async_trait]
 pub trait ToolDispatcher: Send + Sync {
@@ -1790,6 +1833,7 @@ pub trait ToolDispatcher: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::derive_effect_intent;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1801,8 +1845,13 @@ mod tests {
                 path: "src/main.rs".into(),
                 content_bytes: 42,
             },
-            EffectIntent::ProcessRun {
-                command: "cargo test".into(),
+            EffectIntent::ExecArgv {
+                program: "cargo".into(),
+                argv: vec!["test".into()],
+            },
+            EffectIntent::ShellExec {
+                dialect: "sh".into(),
+                command_digest: shell_command_digest("cargo test"),
             },
         ] {
             let value = serde_json::to_value(&intent).unwrap();
@@ -1819,12 +1868,48 @@ mod tests {
             ToolRisk::WorkspaceWrite
         );
         assert_eq!(
-            EffectIntent::ProcessRun {
-                command: "x".into()
+            EffectIntent::ExecArgv {
+                program: "x".into(),
+                argv: Vec::new(),
             }
             .risk(),
             ToolRisk::ProcessExecution
         );
+        assert_eq!(
+            EffectIntent::ShellExec {
+                dialect: String::new(),
+                command_digest: shell_command_digest("x"),
+            }
+            .risk(),
+            ToolRisk::ProcessExecution
+        );
+    }
+
+    #[test]
+    fn compact_for_model_surface_strips_nested_schema_descriptions() {
+        let spec = ToolSpec {
+            name: "edit.patch".into(),
+            description: "x".repeat(200),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "description": "root",
+                "properties": {
+                    "path": {"type": "string", "description": "target"}
+                }
+            }),
+            risk: ToolRisk::WorkspaceWrite,
+            output_budget: None,
+            roles: Vec::new(),
+        }
+        .compact_for_model_surface();
+        assert!(spec.description.chars().count() <= MAX_TOOL_SURFACE_DESCRIPTION_CHARS);
+        assert!(spec.input_schema.get("description").is_none());
+        assert!(
+            spec.input_schema["properties"]["path"]
+                .get("description")
+                .is_none()
+        );
+        assert_eq!(spec.input_schema["properties"]["path"]["type"], "string");
     }
 
     #[test]
@@ -1849,9 +1934,7 @@ mod tests {
             path: "src/util.py".into(),
             content_bytes: 33,
         }));
-        assert!(!approved.covers(&EffectIntent::ProcessRun {
-            command: "echo hi".into(),
-        }));
+        assert!(!approved.covers(&exec_argv_intent(&["echo".into(), "hi".into()])));
         assert!(
             !EffectIntent::WorkspaceWrite {
                 path: String::new(),
@@ -1862,15 +1945,12 @@ mod tests {
                 content_bytes: 1,
             })
         );
-        assert!(
-            !EffectIntent::ProcessRun {
-                command: "cargo test".into(),
-            }
-            .covers(&EffectIntent::WorkspaceWrite {
+        assert!(!exec_argv_intent(&["cargo".into(), "test".into()]).covers(
+            &EffectIntent::WorkspaceWrite {
                 path: "src/lib.rs".into(),
                 content_bytes: 1,
-            })
-        );
+            }
+        ));
     }
 
     fn process_spec(name: &str) -> ToolSpec {
@@ -1896,24 +1976,40 @@ mod tests {
         };
         assert_eq!(
             derive_effect_intent(&call, &process_spec("process.run")),
-            EffectIntent::ProcessRun {
-                command: "echo hi".into()
-            }
+            exec_argv_intent(&["echo".into(), "hi".into()])
         );
-        assert!(process_spawn_command_is_covered(
+        assert!(process_spawn_is_covered(
             "process.run",
             &call.arguments,
-            "echo hi"
+            &exec_argv_intent(&["echo".into(), "hi".into()])
         ));
-        assert!(!process_spawn_command_is_covered(
+        assert!(!process_spawn_is_covered(
             "process.run",
             &call.arguments,
-            "cargo test"
+            &exec_argv_intent(&["cargo".into(), "test".into()])
         ));
+        // Joining argv and splitting on whitespace used to make
+        // `["git", "status && evil"]` look like `git status && evil`.
+        let joined_trap = ToolCall {
+            id: "c".into(),
+            name: "process.run".into(),
+            arguments: serde_json::json!({"argv": ["git", "status && something-dangerous"]}),
+        };
+        let grant = exec_argv_intent(&["git".into(), "status".into()]);
+        let actual = derive_effect_intent(&joined_trap, &process_spec("process.run"));
+        assert!(
+            !grant.covers(&actual),
+            "argument boundaries must survive: {actual:?}"
+        );
+        assert!(grant.covers(&exec_argv_intent(&[
+            "git".into(),
+            "status".into(),
+            "--porcelain".into()
+        ])));
     }
 
     #[test]
-    fn shell_exec_intent_comes_from_command_not_argv() {
+    fn shell_exec_intent_is_exact_digest_not_a_command_prefix() {
         let call = ToolCall {
             id: "c".into(),
             name: "shell.exec".into(),
@@ -1924,20 +2020,31 @@ mod tests {
         };
         assert_eq!(
             derive_effect_intent(&call, &process_spec("shell.exec")),
-            EffectIntent::ProcessRun {
-                command: "cargo test".into()
-            }
+            shell_exec_intent("", "cargo test")
         );
-        assert!(process_spawn_command_is_covered(
+        assert!(process_spawn_is_covered(
             "shell.exec",
             &call.arguments,
-            "cargo test --all"
+            &shell_exec_intent("sh", "cargo test")
         ));
-        assert!(!process_spawn_command_is_covered(
+        assert!(
+            !process_spawn_is_covered(
+                "shell.exec",
+                &call.arguments,
+                &shell_exec_intent("sh", "cargo test --all")
+            ),
+            "shell standing/spawn coverage is exact command, not a prefix"
+        );
+        assert!(!process_spawn_is_covered(
             "shell.exec",
             &call.arguments,
-            "rm -rf ."
+            &shell_exec_intent("sh", "rm -rf .")
         ));
+        assert!(
+            !shell_exec_intent("", "git status")
+                .covers(&shell_exec_intent("", "git status && something-dangerous")),
+            "shell && must not inherit a prefix grant"
+        );
     }
 
     #[test]
@@ -1953,19 +2060,23 @@ mod tests {
         };
         assert_eq!(
             derive_effect_intent(&call, &process_spec("process.session")),
-            EffectIntent::ProcessRun {
-                command: "python -m http.server".into()
-            }
+            exec_argv_intent(&["python".into(), "-m".into(), "http.server".into()])
         );
-        assert!(process_spawn_command_is_covered(
+        assert!(process_spawn_is_covered(
             "process.session",
             &call.arguments,
-            "python -m http.server --bind 127.0.0.1"
+            &exec_argv_intent(&[
+                "python".into(),
+                "-m".into(),
+                "http.server".into(),
+                "--bind".into(),
+                "127.0.0.1".into()
+            ])
         ));
-        assert!(!process_spawn_command_is_covered(
+        assert!(!process_spawn_is_covered(
             "process.session",
             &call.arguments,
-            "rm -rf ."
+            &exec_argv_intent(&["rm".into(), "-rf".into(), ".".into()])
         ));
     }
 
@@ -1995,23 +2106,20 @@ mod tests {
         };
         assert_eq!(
             derive_effect_intent(&unknown, &process_spec("process.session")),
-            EffectIntent::ProcessRun {
-                command: String::new()
-            }
+            exec_argv_intent(&[])
         );
     }
 
     #[test]
-    fn unknown_process_tool_refuses_disagreeing_command_and_argv() {
+    fn unknown_process_tool_does_not_bind_command_or_argv() {
         let arguments = serde_json::json!({
             "command": "echo safe",
             "argv": ["rm", "-rf", "."]
         });
-        assert!(lexical_process_command("plugin.process", &arguments).is_empty());
-        assert!(!process_spawn_command_is_covered(
+        assert!(!process_spawn_is_covered(
             "plugin.process",
             &arguments,
-            "rm -rf ."
+            &exec_argv_intent(&["rm".into(), "-rf".into(), ".".into()])
         ));
     }
 
@@ -2058,6 +2166,15 @@ mod tests {
         );
         assert_eq!(ToolSemanticRole::from_tool_name("fs.delete"), None);
         assert_eq!(ToolSemanticRole::from_tool_name("plugin.generated"), None);
+        assert_eq!(
+            ToolSemanticRole::parse_arg("mutate"),
+            Some(ToolSemanticRole::Mutate)
+        );
+        assert_eq!(
+            ToolSemanticRole::parse_arg("read"),
+            Some(ToolSemanticRole::ReadResource)
+        );
+        assert_eq!(ToolSemanticRole::parse_arg("planner"), None);
         let stamped = ToolSpec {
             name: "tests.run".into(),
             roles: vec![ToolSemanticRole::Verify],

@@ -211,11 +211,7 @@ impl RuntimeActor {
             return Vec::new();
         };
         let view = match self.state.turn.as_ref() {
-            Some(turn) => task.resume.project_from_turn(
-                &turn.turn_frame,
-                task.anchor.revision,
-                turn.model_round as u64,
-            ),
+            Some(turn) => turn.execution.view(),
             None => task.resume.view(),
         };
         view.checked_files

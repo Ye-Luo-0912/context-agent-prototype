@@ -41,8 +41,9 @@ impl RuntimeActor {
                     })
                     .await;
                 if let Some(turn) = self.state.turn.as_mut() {
-                    turn.turn_frame.push_tool_result(output, None);
+                    turn.turn_frame.push_tool_result(output.clone(), None);
                 }
+                self.observe_persistable_tool(&output, ToolResultDisposition::PersistObservation);
             }
             self.spawn_next_model_or_end(op_tx).await;
             return;
@@ -729,6 +730,7 @@ impl RuntimeActor {
                         completion.disposition,
                     );
                 }
+                self.observe_persistable_tool(&output, completion.disposition);
                 let _ = self
                     .core
                     .emit_event(RuntimeEvent::ToolFinished { output })
@@ -809,19 +811,38 @@ impl RuntimeActor {
     }
 
     fn projected_resource_fact(&self, path: &str) -> Option<crate::execution::ResourceFact> {
+        if let Some(turn) = self.state.turn.as_ref() {
+            return turn.execution.fact_for(path).cloned();
+        }
         let task_id = self.state.task_id?;
         let task = self.state.tasks.get(task_id)?;
-        let Some(turn) = self.state.turn.as_ref() else {
-            return task.resume.fact_for(path).cloned();
+        task.resume.fact_for(path).cloned()
+    }
+
+    fn observe_persistable_tool(
+        &mut self,
+        output: &ToolOutput,
+        disposition: ToolResultDisposition,
+    ) {
+        if disposition != ToolResultDisposition::PersistObservation {
+            return;
+        }
+        let Some(task_id) = self.state.task_id else {
+            return;
         };
-        task.resume
-            .apply_open_turn(
-                &turn.turn_frame,
-                task.anchor.revision,
-                turn.model_round as u64,
-            )
-            .fact_for(path)
-            .cloned()
+        let Some(task) = self.state.tasks.get(task_id) else {
+            return;
+        };
+        if task.status == crate::task::TaskStatus::Completed {
+            return;
+        }
+        let anchor_revision = task.anchor.revision;
+        let Some(turn) = self.state.turn.as_mut() else {
+            return;
+        };
+        let turn_number = turn.model_round as u64;
+        turn.execution
+            .observe_tool(output, anchor_revision, turn_number);
     }
 
     /// Poison the normal-mutation lane after an effect result proves that

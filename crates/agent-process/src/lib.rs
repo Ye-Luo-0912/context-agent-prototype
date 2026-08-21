@@ -29,8 +29,8 @@ pub mod landlock;
 
 pub use frame::{FrameError, FrameErrorKind, encode_frame, encode_frame_bytes, read_frame};
 pub use health::{
-    ConnectionEpoch, ConnectionHealth, ConnectionStatus, DEFAULT_MAX_CONNECTION_RESTARTS,
-    RestartCircuit,
+    ConnectKind, ConnectionEpoch, ConnectionHealth, ConnectionStatus,
+    DEFAULT_MAX_CONNECTION_RESTARTS, HostLifecycle, RestartCircuit,
 };
 pub use host::{
     DEFAULT_CANCEL_ACK_TIMEOUT, MAX_PROGRESS_FRAMES_PER_CALL, MAX_PROGRESS_NOTE_CHARS,

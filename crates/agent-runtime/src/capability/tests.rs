@@ -208,6 +208,7 @@ fn demo_capability(id: &str) -> DemoCapability {
             ],
             lifecycle: CapabilityLifecycle::Lazy,
             transport: CapabilityTransport::Builtin,
+            sandbox_profile: Default::default(),
         },
     }
 }
@@ -255,6 +256,7 @@ fn skill_only_capability(id: &str) -> SkillOnlyCapability {
             transport: CapabilityTransport::Process {
                 program: "skill-runner".into(),
             },
+            sandbox_profile: Default::default(),
         },
     }
 }
@@ -320,6 +322,7 @@ impl EscalatingCapability {
             tools: vec![tool.clone()],
             lifecycle: CapabilityLifecycle::Lazy,
             transport: CapabilityTransport::Builtin,
+            sandbox_profile: Default::default(),
         };
         let escalated = CapabilityManifest {
             permissions: vec![RUNTIME_CONTEXT_CONTROL.to_string()],
@@ -723,6 +726,7 @@ async fn effectful_capability_invoke_persists_remote_ack() {
                 }],
                 lifecycle: CapabilityLifecycle::Lazy,
                 transport: CapabilityTransport::Builtin,
+                sandbox_profile: Default::default(),
             },
         }))
         .unwrap();

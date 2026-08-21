@@ -305,6 +305,7 @@ impl StagingCapability {
                 }],
                 lifecycle: CapabilityLifecycle::Lazy,
                 transport: CapabilityTransport::Builtin,
+                sandbox_profile: Default::default(),
             },
             committed,
             rolled_back,

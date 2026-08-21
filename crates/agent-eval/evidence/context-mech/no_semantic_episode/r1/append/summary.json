@@ -1,0 +1,138 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 61360,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 412,
+  "model_started": 12,
+  "model_used": 12,
+  "usage_incomplete": false,
+  "provider_tokens_lower_bound": false,
+  "workspace_sha256": "c7f531613722cbcb6c207070e7355b404cd7f420182f9803f6aa4ab8fa1eb562",
+  "workspace_files": 32,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "edit.replace",
+      "calls": 1,
+      "failed": 1
+    },
+    {
+      "name": "fs.list",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 4,
+      "failed": 1
+    },
+    {
+      "name": "fs.write",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "search.grep",
+      "calls": 1,
+      "failed": 0
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 0,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 2,
+    "fetch_calls": 0,
+    "final_resident_bytes": 3130,
+    "forgotten_items": 0,
+    "inspect_calls": 0,
+    "lifecycle_transitions": 0,
+    "materialize_rounds": 12,
+    "model_attempts": 12,
+    "model_input_tokens": 79620,
+    "model_output_tokens": 1270,
+    "model_retries": 0,
+    "peak_resident_bytes": 3130,
+    "prompt_current_focus_tokens": 438,
+    "prompt_historical_context_tokens": 5585,
+    "prompt_runtime_facts_tokens": 324,
+    "prompt_system_tokens": 852,
+    "prompt_task_anchor_tokens": 288,
+    "prompt_task_progress_tokens": 620,
+    "prompt_tool_catalog_index_tokens": 2727,
+    "prompt_tool_schema_tokens": 8976,
+    "prompt_turn_frame_tokens": 3072,
+    "provider_tokens_lower_bound": false,
+    "provider_tokens_total": 80890,
+    "reactivated_tokens": 0,
+    "reactivation_consumed": 0,
+    "reactivation_consumed_tokens": 0,
+    "reactivation_events": 0,
+    "reactivation_file_observation_consumed": 0,
+    "reactivation_file_observation_selected": 0,
+    "reactivation_selected": 0,
+    "reactivation_selected_tokens": 0,
+    "reactivation_tool_observation_consumed": 0,
+    "reactivation_tool_observation_selected": 0,
+    "recovered_items": 0,
+    "recovery_auto_reactivation": 0,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 0,
+    "recovery_workspace_reread": 1,
+    "repeated_fs_reads": 1,
+    "reread_external_descriptor": 0,
+    "reread_first_read": 0,
+    "reread_motive_body_visible_current": 0,
+    "reread_motive_changed": 0,
+    "reread_motive_checked_fresh": 1,
+    "reread_motive_descriptor_only": 0,
+    "reread_motive_first": 3,
+    "reread_motive_needs_revalidation": 0,
+    "reread_motive_stored": 0,
+    "reread_motive_warm": 0,
+    "reread_previously_selected": 0,
+    "reread_resident_unselected": 0,
+    "reread_selected_descriptor": 0,
+    "reread_stored": 0,
+    "reread_warm": 0,
+    "rounds": 12,
+    "schema_tokens_total": 8976,
+    "search_calls": 0,
+    "search_empty": 0,
+    "search_hits": 0,
+    "search_ms_p50": 0,
+    "search_ms_p95": 0,
+    "selected_tokens_by_kind": {
+      "unknown": 3458
+    },
+    "selected_tokens_by_reason": {
+      "scored": 3458
+    },
+    "selected_tokens_by_source": {
+      "unknown": 3458
+    },
+    "selected_tokens_reactivated": 0,
+    "selected_tokens_resident": 3458,
+    "tool_calls": 9,
+    "tool_failure_classes": {
+      "no_exact_match": 1,
+      "path_not_found": 1
+    },
+    "turns": 5,
+    "unique_reactivated": 0
+  }
+}

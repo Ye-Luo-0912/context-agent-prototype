@@ -172,6 +172,8 @@ pub struct RunMetrics {
     pub prompt_historical_context_tokens: u64,
     pub prompt_turn_frame_tokens: u64,
     pub prompt_tool_schema_tokens: u64,
+    /// Sum of `PromptLayerCosts.tool_catalog_index_tokens` across rounds.
+    pub prompt_tool_catalog_index_tokens: u64,
     /// Repeated `fs.read` of the same path (workspace reread, not an id partition).
     pub recovery_workspace_reread: u64,
     /// Forgotten ids that were never recovered.
@@ -414,6 +416,9 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 metrics.prompt_tool_schema_tokens = metrics
                     .prompt_tool_schema_tokens
                     .saturating_add(prompt_layers.tool_schema_tokens);
+                metrics.prompt_tool_catalog_index_tokens = metrics
+                    .prompt_tool_catalog_index_tokens
+                    .saturating_add(prompt_layers.tool_catalog_index_tokens);
             }
             RuntimeEvent::ModelUsed {
                 input_tokens,
@@ -627,7 +632,7 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          access: search_hits={} inspects={} fetches={} admits={} acks={}\n\
          reactivation_utility: events={} unique={} selected={} consumed={} tokens(reactivated/selected/consumed)={}/{}/{}\n\
          reactivation_kind: tool_obs selected/consumed={}/{} file_obs selected/consumed={}/{}\n\
-         prompt_layers: system={} facts={} anchor={} progress={} focus={} history={} turn={} tools={}\n\
+         prompt_layers: system={} facts={} anchor={} progress={} focus={} history={} turn={} tools={} catalog={}\n\
          compaction: in={} out={}\n\
          behavior: tool_calls={} failed_outputs={} spills={} output_chars={} repeated_fs_reads={}\n\
          reread: previously_selected={} selected_descriptor={} external_descriptor={} resident_unselected={} warm={} stored={} first_read={}\n\
@@ -703,6 +708,7 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.prompt_historical_context_tokens,
         metrics.prompt_turn_frame_tokens,
         metrics.prompt_tool_schema_tokens,
+        metrics.prompt_tool_catalog_index_tokens,
         metrics.compaction_input_tokens,
         metrics.compaction_output_tokens,
         metrics.tool_calls,
@@ -938,6 +944,7 @@ mod tests {
                     historical_context_tokens: 800,
                     turn_frame_tokens: 50,
                     tool_schema_tokens: 512,
+                    tool_catalog_index_tokens: 40,
                 },
             },
         ));
@@ -1054,6 +1061,7 @@ mod tests {
         assert!(!metrics.provider_tokens_lower_bound);
         assert_eq!(metrics.prompt_task_progress_tokens, 40);
         assert_eq!(metrics.prompt_historical_context_tokens, 800);
+        assert_eq!(metrics.prompt_tool_catalog_index_tokens, 40);
         assert_eq!(metrics.reactivation_events, 0);
         assert_eq!(metrics.unique_reactivated, 0);
         assert_eq!(metrics.reactivation_selected, 10);

@@ -176,10 +176,10 @@ fn usage() -> ! {
          Mechanism V2: three one-mechanism scenarios. late_semantic_constraint\n\
          is the non-Anchor GC-recall test; resume_operational_state covers\n\
          verify→mutate→switch→resume freshness; no_semantic_episode is the\n\
-         distill-skip case. Dynamic engine only. Default repeats=2.\n\
-         Does not rewrite frozen context-bench.v1. Do not keep live-running\n\
-         recall_after_fix. This does not close M15 and does not open the\n\
-         300×3 ITT gate.\n"
+         distill-skip case. Live is A/C (no rolling): 3 tasks × 2 engines\n\
+         × 2 repeats = 12 cells. Default repeats=2. Does not rewrite frozen\n\
+         context-bench.v1. Do not keep live-running recall_after_fix. This\n\
+         does not close M15 and does not open the 300×3 ITT gate.\n"
     );
     std::process::exit(2);
 }
@@ -759,7 +759,7 @@ async fn run_context_mech_live(
     for round in 1..=repeats {
         for task in &tasks {
             eprintln!(
-                "== context-mech {} dynamic repeat {round}/{repeats} ==",
+                "== context-mech {} A/C repeat {round}/{repeats} ==",
                 task.id()
             );
             let dir = tempfile::tempdir()?;
