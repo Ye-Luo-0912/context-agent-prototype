@@ -16,7 +16,8 @@ use std::hash::Hash;
 
 use agent_contracts::{
     AttentionState, ContextItem, ContextItemId, ContextKind, ContextResidency, ContextScope,
-    ContextSearchQuery, ExternalizedContext, TaskId, TextIndex,
+    ContextSearchQuery, ExternalizedContext, SearchCandidates, SearchIncompleteReason, TaskId,
+    TextIndex, tokenize,
 };
 
 /// Where the item's body currently lives. Exactly one location per id.
@@ -155,6 +156,11 @@ pub(crate) struct ContextCatalog {
     /// never collide within a generation).
     text_ids: HashMap<ContextItemId, u32>,
     text_docs: Vec<ContextItemId>,
+    /// Set once any indexed doc's body hit the prefix bound: keywords
+    /// beyond it are invisible to the index, so needle searches must
+    /// report incomplete recall (SCHED-02). Monotonic on purpose — the
+    /// extra residual verification it triggers is bounded and safe.
+    any_body_truncated: bool,
     fingerprint: CatalogFingerprint,
     #[cfg(test)]
     last_sync_rebuilt: bool,
@@ -282,6 +288,19 @@ impl ContextCatalog {
     /// the free-text needle did not hit an entity/label key and no filter
     /// was set, so the caller must residual-scan summaries/uris.
     pub(crate) fn search_ids(&self, query: &ContextSearchQuery) -> Option<Vec<ContextItemId>> {
+        self.search_candidates(query)
+            .map(|candidates| candidates.ids)
+    }
+
+    /// Candidates plus an explicit completeness statement (SCHED-02):
+    /// when the index could not have seen everything (saturated postings,
+    /// truncated bodies), `incomplete` tells the caller to run a bounded
+    /// residual verification over non-candidates. Search is the GC safety
+    /// net — recall completeness must be explicit, not implied.
+    pub(crate) fn search_candidates(&self, query: &ContextSearchQuery) -> Option<SearchCandidates> {
+        let done = |ids: Vec<ContextItemId>, incomplete: Option<SearchIncompleteReason>| {
+            Some(SearchCandidates { ids, incomplete })
+        };
         let mut candidates: Option<HashSet<ContextItemId>> = None;
         let mut intersect = |bucket: &[ContextItemId]| {
             let incoming: HashSet<ContextItemId> = bucket.iter().copied().collect();
@@ -335,11 +354,13 @@ impl ContextCatalog {
             // 候选集平方级的线性 contains。
             let mut seen: HashSet<ContextItemId> = HashSet::new();
             let mut saw_candidate = false;
+            let mut text_live_hits = false;
             for matched in self.text.search(needle) {
                 saw_candidate = true;
                 let id = self.text_docs[matched.doc as usize];
                 if self.live.contains(&id) && seen.insert(id) {
                     ids.push(id);
+                    text_live_hits = true;
                 }
             }
             for id in self.text_key_ids(needle) {
@@ -352,29 +373,33 @@ impl ContextCatalog {
                 if let Some(set) = candidates.as_ref() {
                     ids.retain(|id| set.contains(id));
                 }
-                return Some(ids);
+                let incomplete = text_live_hits
+                    .then(|| self.index_incomplete_reason(needle))
+                    .flatten();
+                return done(ids, incomplete);
             }
             if saw_candidate {
                 // 文本层有候选但全部语义死亡：索引已经界定了集合，
                 // 如实返回空集（终态永不复活，也绝不走残差扫描放大）。
-                return match candidates.as_ref() {
-                    Some(set) => Some(
-                        set.iter()
-                            .copied()
-                            .filter(|id| self.live.contains(id))
-                            .collect(),
-                    ),
-                    None => Some(Vec::new()),
+                let ids = match candidates.as_ref() {
+                    Some(set) => set
+                        .iter()
+                        .copied()
+                        .filter(|id| self.live.contains(id))
+                        .collect(),
+                    None => Vec::new(),
                 };
+                return done(ids, self.index_incomplete_reason(needle));
             }
             // 真正无文本候选：有过滤时过滤桶本身就是候选集（旧行为）；
             // 无过滤时交给调用方残差扫描。
             let set = candidates.as_ref()?;
-            return Some(
+            return done(
                 set.iter()
                     .copied()
                     .filter(|id| self.live.contains(id))
                     .collect(),
+                None,
             );
         }
 
@@ -400,7 +425,20 @@ impl ContextCatalog {
                 ids
             }
         };
-        Some(ids)
+        done(ids, None)
+    }
+
+    /// Why the text index may have missed matches for this needle. Only
+    /// meaningful once the text layer was consulted.
+    fn index_incomplete_reason(&self, needle: &str) -> Option<SearchIncompleteReason> {
+        let tokens = tokenize(needle);
+        if self.text.has_saturated_token(&tokens) {
+            return Some(SearchIncompleteReason::SaturatedPosting);
+        }
+        if self.any_body_truncated {
+            return Some(SearchIncompleteReason::TruncatedIndexedText);
+        }
+        None
     }
 
     /// Stored (Cold/External) candidate ids for store-only ranking tests.
@@ -519,6 +557,7 @@ impl ContextCatalog {
         self.text.clear();
         self.text_ids.clear();
         self.text_docs.clear();
+        self.any_body_truncated = false;
     }
 
     fn insert_item(&mut self, item: &ContextItem, location: CatalogLocation) {
@@ -574,6 +613,12 @@ impl ContextCatalog {
     /// hit may legitimately match — entities, labels, path identity, and a
     /// bounded body prefix / stored summary.
     fn index_text(&mut self, id: ContextItemId, keys: &CatalogKeys) {
+        if keys.body_text.chars().count() >= INDEX_BODY_PREFIX_CHARS {
+            // This doc's body was cut at the index bound: deep-body
+            // keywords cannot match. One flag is enough — the residual
+            // verification it triggers is bounded and recall-safe.
+            self.any_body_truncated = true;
+        }
         let doc = self.text_docs.len() as u32;
         let mut fields: Vec<&str> = Vec::with_capacity(4 + keys.entities.len() + keys.labels.len());
         for entity in &keys.entities {
@@ -807,6 +852,36 @@ mod tests {
                 .is_none(),
             "a needle matching nothing anywhere must residual-scan"
         );
+    }
+
+    #[test]
+    fn truncated_bodies_report_incomplete_candidates() {
+        // The keyword lives ONLY in the body beyond the index bound:
+        // entities are indexed untruncated, so they must not carry it.
+        let mut long = item(ContextItemId::new(), "", None);
+        long.content = format!("{} zebra tail beyond the bound", "x".repeat(600));
+        long.entities.clear();
+        let short = item(ContextItemId::new(), "zebra marker", None);
+        let mut catalog = ContextCatalog::default();
+        catalog.rebuild(&[long, short.clone()], &[], &[]);
+
+        let candidates = catalog
+            .search_candidates(&ContextSearchQuery::new("zebra", 8))
+            .expect("the short doc is an indexed candidate");
+        assert_eq!(candidates.ids, vec![short.id]);
+        assert_eq!(
+            candidates.incomplete,
+            Some(agent_contracts::SearchIncompleteReason::TruncatedIndexedText),
+            "a 600-char body hides its tail keyword from the index"
+        );
+
+        let mut plain = ContextCatalog::default();
+        let only_short = item(ContextItemId::new(), "zebra marker", None);
+        plain.rebuild(&[only_short], &[], &[]);
+        let complete = plain
+            .search_candidates(&ContextSearchQuery::new("zebra", 8))
+            .expect("candidate");
+        assert_eq!(complete.incomplete, None, "no truncation: complete");
     }
 
     #[test]

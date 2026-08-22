@@ -233,6 +233,12 @@ pub(crate) struct State {
     /// events and measures event-distance, not age.
     #[serde(default, alias = "tick")]
     pub(crate) event_seq: u64,
+    /// Sequence value as of the last completed maintenance pass
+    /// (SCHED-01): when it equals `event_seq`, no state has changed and a
+    /// skippable maintenance trigger becomes a true no-op — no scan, no
+    /// sequence consumption.
+    #[serde(default)]
+    pub(crate) last_maintained_seq: u64,
     /// User-turn clock: advances once per user message. Rules measuring
     /// age in user turns (ephemeral TTL, staleness) read this.
     pub(crate) turn: u64,
@@ -1172,8 +1178,19 @@ impl ContextEngine for SimpleContextEngine {
         trigger: ContextMaintenanceTrigger,
     ) -> AgentResult<ContextMaintenanceReport> {
         let mut state = self.state.lock().await;
+        // Maintenance-debt gate (SCHED-01): a pass consumes sequence space
+        // and rescans Resident+Warm. Lifecycle-closure triggers always run
+        // — they carry semantics beyond dirty work. A clean `BeforeModel`
+        // (no state change since the last completed pass) is a true no-op:
+        // no scan, no `event_seq` consumption.
+        if matches!(trigger, ContextMaintenanceTrigger::BeforeModel)
+            && state.last_maintained_seq == state.event_seq
+        {
+            return Ok(ContextMaintenanceReport::default());
+        }
         state.event_seq += 1;
         let now_tick = state.event_seq;
+        state.last_maintained_seq = now_tick;
         let turn = state.turn;
         Ok(minor::run_minor(
             &mut state,

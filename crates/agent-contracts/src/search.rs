@@ -13,6 +13,29 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::ids::ContextItemId;
+
+/// Why a candidate set may be incomplete against the full corpus
+/// (SCHED-02). Each reason names the bound that hid potential matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchIncompleteReason {
+    /// A queried token's posting list was capped at
+    /// [`MAX_POSTINGS_PER_TOKEN`]; later documents were rejected.
+    SaturatedPosting,
+    /// Some indexed docs truncated their text at the index prefix bound,
+    /// so keywords beyond it cannot match inside the index.
+    TruncatedIndexedText,
+}
+
+/// Candidate ids plus an explicit completeness statement. Search is the
+/// GC safety net: when `incomplete` is set, callers must run a bounded
+/// residual verification over non-candidates instead of trusting the set.
+#[derive(Debug, Clone, Default)]
+pub struct SearchCandidates {
+    pub ids: Vec<ContextItemId>,
+    pub incomplete: Option<SearchIncompleteReason>,
+}
+
 /// Tokens shorter than this are stop-characters noise (`rs`, `a`), not
 /// needles. Kept small so version-ish fragments still match.
 pub const MIN_TOKEN_CHARS: usize = 2;
@@ -192,6 +215,13 @@ impl TextIndex {
     /// Tokens that stopped accepting postings at the cap.
     pub fn saturated_tokens(&self) -> usize {
         self.saturated.len()
+    }
+
+    /// Whether any of `tokens` hit the posting cap at insert time. A yes
+    /// means this search's candidate set may be missing documents whose
+    /// postings were rejected — callers must treat recall as partial.
+    pub fn has_saturated_token(&self, tokens: &[String]) -> bool {
+        tokens.iter().any(|token| self.saturated.contains(token))
     }
 
     /// Score every document matching the query tokens and return the

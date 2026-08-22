@@ -42,6 +42,8 @@ pub use operation::*;
 pub use plugin::*;
 pub use runtime::*;
 pub use runtime_facts::*;
-pub use search::{ScoredMatch, TextIndex, TokenRarity, tokenize};
+pub use search::{
+    SearchCandidates, SearchIncompleteReason, ScoredMatch, TextIndex, TokenRarity, tokenize,
+};
 pub use tokens::*;
 pub use tool::*;

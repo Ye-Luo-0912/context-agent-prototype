@@ -491,14 +491,16 @@ falls back to the residual scan over summaries/uris/bodies. Verification
 mirrors that split: a whole-needle substring hit ranks first, and a
 multi-word needle verifies when *every* token (shared `tokenize` rule)
 appears in the entry's matchable text — candidate recall is not discarded
-at the verification gate. Two bounded-recall follow-ups are queued
-(AUDIT_TODO SCHED-02): an explicit candidate-completeness contract
-(`Partial(reason)` triggers bounded residual verification), because index
-caps (64 tokens/doc, 512-char body prefix) mean deep-body keywords are
-not yet guaranteed to surface; and a reread-motive attribution note —
-measured long-flow rereads were descriptor-only / needs-revalidation with
-Warm=Stored=0, so loosening residency to chase them is **rejected** on
-current evidence. See `docs/AUDIT_TODO.md` CTX-02.
+at the verification gate. Candidate completeness is now explicit
+(AUDIT_TODO SCHED-02, landed 2026-08-23): the catalog reports
+`SearchCandidates { ids, incomplete }`, and an incomplete reason
+(saturated posting, truncated indexed text) triggers a bounded residual
+verification over non-candidates against full stored bodies — deep-body
+keywords surface even though the index only saw their 512-char prefix.
+The reread-motive note stands: measured long-flow rereads were
+descriptor-only / needs-revalidation with Warm=Stored=0, so loosening
+residency to chase them is **rejected** on current evidence. See
+`docs/AUDIT_TODO.md` CTX-02.
 
 ### Retrieval results are transient; admit and derive move items deliberately (CTX-03)
 

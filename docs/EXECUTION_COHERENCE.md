@@ -252,14 +252,17 @@ result settles; round boundaries drain it; cancellation drains it plus
 the in-flight op's scope. The engine bumps `event_seq` only when a close
 actually produced transitions.
 
+**Maintenance debt gate (landed).** `BeforeModel` used to run the full
+minor scan every round (77x/cell measured) even with zero pending state
+changes. The engine now stamps `last_maintained_seq` when a pass
+completes; a `BeforeModel` trigger at an unchanged sequence returns a
+default report — no scan, no `event_seq` bump, so idle rounds stop
+consuming sequence space. Lifecycle-closure triggers always run: they
+carry semantics beyond dirty work. Bounded dirty batches instead of full
+heap scans stay a later step.
+
 Queued (design agreed, not yet landed):
 
-- **Maintenance debt gate**: `BeforeModel` currently runs the full minor
-  scan every round (77x/cell measured) even with zero pending state
-  changes. First step: skip `run_minor` when nothing changed since the
-  last completed pass; later, bounded dirty batches instead of full
-  heap scans. CPU/lock/event-volume work first — not a proven source of
-  extra rounds, unlike the tool clock.
 - **Convergence failure clusters**: after ≥2 consecutive same-class
   failures over an unchanged world revision (e.g. invented-program
   PathNotFound streaks), surface an `EXECUTION STALL` line built from

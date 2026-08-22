@@ -212,27 +212,32 @@ fixtures before broader filesystem claims. M12 and M13 mainline does not move.
 
 Design + invariants: [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md)
 ("Lifecycle clocks and maintenance scheduling"). The tool-lifecycle clock
-defect (load/execute advancing the shared tick) and the O(R²) repeated
-tool-scope closes are **fixed**; their write-up lives in that section.
+defect (load/execute advancing the shared tick), the O(R²) repeated
+tool-scope closes, and the every-round `BeforeModel` minor scan are
+**fixed**; their write-ups live in that section.
 
-### SCHED-01 — BeforeModel runs a full minor scan every round (open)
+### SCHED-01 — BeforeModel runs a full minor scan every round (fixed 2026-08-23)
 
 Measured: 77 `BeforeModel` maintenances per 15-turn cell, most with no
 pending state change (`gc_work_batch` 4096 ≫ heap size, so each pass
-rescans Resident+Warm). First step: skip `run_minor` when nothing changed
-since the last completed pass; then bounded dirty batches
-(`MaintenanceDebt`) before ever touching scan width. CPU/lock/event work —
-no extra-round causality claimed.
+rescans Resident+Warm). Landed: the engine stamps `last_maintained_seq`
+at each completed pass, so `BeforeModel` at an unchanged sequence is a
+true no-op — default report, no scan, no sequence consumption;
+lifecycle-closure triggers always run. Bounded dirty batches
+(`MaintenanceDebt`) remain the later step before touching scan width.
+CPU/lock/event work — no extra-round causality claimed.
 
-### SCHED-02 — search candidate completeness contract (open)
+### SCHED-02 — search candidate completeness contract (fixed 2026-08-23)
 
 The shared index bounds tokens/doc (64), postings/token (4096) and body
 text to its first 512 chars, while candidate hits suppress the residual
-scan — so deep-body keyword recall is not guaranteed end-to-end. Plan:
-`SearchCandidates { ids, completeness }` with `Partial(reason)`
-(saturated posting / truncated indexed text / prefix-only) triggering a
-bounded residual verification over non-candidates. Search is GC's safety
-net; recall completeness must be explicit, not implied.
+scan — deep-body keyword recall was not guaranteed end-to-end. Landed:
+catalog search returns `SearchCandidates { ids, incomplete }` with
+`SearchIncompleteReason::{SaturatedPosting, TruncatedIndexedText}`;
+an incomplete set triggers one bounded residual verification of the
+non-candidates against full stored bodies (lazy projection keeps memory
+at O(limit)). Search is GC's safety net; recall completeness is now
+explicit, not implied.
 
 ### SCHED-03 — convergence failure-cluster escalation (open)
 

@@ -154,12 +154,29 @@ pub(crate) fn search_catalog(
     state: &State,
     query: &agent_contracts::ContextSearchQuery,
 ) -> Vec<ExternalizedContext> {
-    match state.catalog.search_ids(query) {
-        Some(ids) => search_entries(
-            ids.into_iter()
-                .filter_map(|id| project_search_hit(state, id)),
-            query,
-        ),
+    match state.catalog.search_candidates(query) {
+        Some(candidates) => {
+            let seen: std::collections::HashSet<ContextItemId> =
+                candidates.ids.iter().copied().collect();
+            let primary = candidates
+                .ids
+                .into_iter()
+                .filter_map(|id| project_search_hit(state, id));
+            if candidates.incomplete.is_some() {
+                // Completeness guarantee (SCHED-02): the index could not
+                // have seen everything, so non-candidates go through the
+                // same bounded heap — lazy projection keeps memory at
+                // O(limit), and the body closure lets deep-body keywords
+                // verify against actual content, not just the bounded
+                // projected summary.
+                let residual = residual_live_candidates(state)
+                    .filter(move |entry| !seen.contains(&entry.item_id));
+                let body_of = |id: ContextItemId| catalog_body(state, id).map(|item| item.content);
+                search_entries_with(primary.chain(residual), query, Some(&body_of))
+            } else {
+                search_entries(primary, query)
+            }
+        }
         None => search_entries(residual_live_candidates(state), query),
     }
 }
@@ -307,6 +324,18 @@ pub(crate) fn search_entries(
     entries: impl IntoIterator<Item = ExternalizedContext>,
     query: &agent_contracts::ContextSearchQuery,
 ) -> Vec<ExternalizedContext> {
+    search_entries_with(entries, query, None)
+}
+
+/// Same ranking/verification as [`search_entries`], with an optional
+/// full-body lookup used only by the incomplete-recall residual pass
+/// (SCHED-02): projected summaries are bounded, so a deep-body keyword
+/// can only be verified against the item's actual content.
+pub(crate) fn search_entries_with(
+    entries: impl IntoIterator<Item = ExternalizedContext>,
+    query: &agent_contracts::ContextSearchQuery,
+    body_of: Option<&dyn Fn(ContextItemId) -> Option<String>>,
+) -> Vec<ExternalizedContext> {
     let needle = query.query.to_lowercase();
     let limit = if query.limit == 0 { 16 } else { query.limit };
     if limit == 0 {
@@ -373,8 +402,9 @@ pub(crate) fn search_entries(
             // 整段未命中时的确定性兜底：候选层已按 token 召回多词查询，
             // 校验若仍要求整段子串会把它们全部拒掉。改为要求 needle 的
             // 每个 token（共享 tokenize 规则，≥2 字符）都出现在本条目的
-            // 可匹配文本里——AND 语义，不放宽为任意单词命中。
-            if !token_verify {
+            // 可匹配文本里——AND 语义，不放宽为任意单词命中。残差通道
+            // （带正文闭包）对单 token 也生效：深正文关键词只有正文里有。
+            if !token_verify && body_of.is_none() {
                 continue;
             }
             haystack.clear();
@@ -389,6 +419,12 @@ pub(crate) fn search_entries(
             haystack.push_str(&entry.context_ref.summary);
             haystack.push(' ');
             haystack.push_str(&entry.context_ref.uri);
+            if let Some(body_of) = body_of
+                && let Some(body) = body_of(entry.item_id)
+            {
+                haystack.push(' ');
+                haystack.push_str(&body);
+            }
             let lowered = haystack.to_lowercase();
             if !needle_tokens.iter().all(|t| lowered.contains(t.as_str())) {
                 continue;
@@ -1317,6 +1353,57 @@ mod tests {
             split.is_empty(),
             "tokens spread across different entries must NOT merge-match"
         );
+    }
+
+    #[test]
+    fn deep_body_keywords_are_rescued_when_candidates_are_incomplete() {
+        // The index sees only the first 512 chars: the long doc's "zebra"
+        // sits beyond it, so candidates name just the short doc — but
+        // incompleteness must trigger the residual verification that
+        // rescues the deep-body target (SCHED-02).
+        let mut state = State::default();
+        let mut resident = Vec::new();
+        let mut item_ids = Vec::new();
+        for content in [
+            "Decision: zebra marker on the short note".to_string(),
+            format!(
+                "Decision: {} then zebra appears far into the body",
+                "filler ".repeat(100)
+            ),
+        ] {
+            let mut item = make_item(
+                &state,
+                &SimpleContextConfig::default(),
+                content,
+                ContextKind::Decision,
+                ContextScope::Task,
+                agent_contracts::ContextRetention::Working,
+                0.6,
+                Some("ab".into()),
+            );
+            item.id = ContextItemId::new();
+            state.items.push(item.clone());
+            resident.push(item);
+            item_ids.push(state.items.last().unwrap().id);
+        }
+        let (short_id, deep_id) = (item_ids[0], item_ids[1]);
+        state.catalog.rebuild(&resident[..], &[], &[]);
+
+        let hits = search_catalog(
+            &state,
+            &agent_contracts::ContextSearchQuery::new("zebra", 8),
+        );
+        // Identity, not summary text: the projection is bounded by design,
+        // so the deep doc's summary never shows the phrase — the rescue is
+        // visible only in which items surface.
+        assert!(
+            hits.iter().any(|h| h.item_id == deep_id),
+            "the deep-body target must be rescued by the residual pass: {:?}",
+            hits.iter()
+                .map(|h| &h.context_ref.summary)
+                .collect::<Vec<_>>()
+        );
+        assert!(hits.iter().any(|h| h.item_id == short_id));
     }
 
     #[test]
