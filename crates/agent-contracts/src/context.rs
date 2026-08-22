@@ -241,6 +241,7 @@ impl FsRereadClass {
 /// | `first` | Normal first exploration |
 /// | `body-visible-current` | Body was in the last prompt; model trajectory |
 /// | `descriptor-only` | Last prompt had identity only; model needed the body |
+/// | `protocol-checkpoint-body-missing` | Read earlier, digest unchanged, frame lost the body |
 /// | `checked-fresh` | Identity known and the body had no clear need |
 /// | `needs-revalidation` | Runtime should hash; the model should not `fs.read` |
 /// | `warm` | GC moved the body to the eviction buffer |
@@ -255,6 +256,11 @@ pub enum FsReadMotive {
     BodyVisibleCurrent,
     /// Last prompt only had `path@rev` (selected or external descriptor).
     DescriptorOnly,
+    /// The model consumed this exact body before (read-provenance fact,
+    /// unchanged digest), but the current frame carries identity only —
+    /// the turn/checkpoint boundary dropped it. This is the population a
+    /// protocol evidence body cache could serve (SCHED-04).
+    ProtocolCheckpointBodyMissing,
     /// Runtime already knew `path@revision` was Fresh.
     CheckedFresh,
     /// Runtime was uncertain; VersionOracle should have settled this.
@@ -273,6 +279,7 @@ impl FsReadMotive {
             Self::First => "first",
             Self::BodyVisibleCurrent => "body-visible-current",
             Self::DescriptorOnly => "descriptor-only",
+            Self::ProtocolCheckpointBodyMissing => "protocol-checkpoint-body-missing",
             Self::CheckedFresh => "checked-fresh",
             Self::NeedsRevalidation => "needs-revalidation",
             Self::Warm => "warm",
@@ -286,6 +293,7 @@ impl FsReadMotive {
             "first" => Some(Self::First),
             "body-visible-current" | "selected-current" => Some(Self::BodyVisibleCurrent),
             "descriptor-only" => Some(Self::DescriptorOnly),
+            "protocol-checkpoint-body-missing" => Some(Self::ProtocolCheckpointBodyMissing),
             "checked-fresh" => Some(Self::CheckedFresh),
             "needs-revalidation" => Some(Self::NeedsRevalidation),
             "warm" => Some(Self::Warm),

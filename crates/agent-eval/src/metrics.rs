@@ -78,6 +78,9 @@ pub struct RunMetrics {
     pub reread_motive_first: u64,
     pub reread_motive_body_visible_current: u64,
     pub reread_motive_descriptor_only: u64,
+    /// Body consumed earlier, digest unchanged, frame identity-only —
+    /// the population a protocol evidence body cache could serve.
+    pub reread_motive_protocol_checkpoint_body_missing: u64,
     pub reread_motive_checked_fresh: u64,
     pub reread_motive_needs_revalidation: u64,
     pub reread_motive_warm: u64,
@@ -334,6 +337,9 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                             metrics.reread_motive_body_visible_current += 1
                         }
                         FsReadMotive::DescriptorOnly => metrics.reread_motive_descriptor_only += 1,
+                        FsReadMotive::ProtocolCheckpointBodyMissing => {
+                            metrics.reread_motive_protocol_checkpoint_body_missing += 1
+                        }
                         FsReadMotive::CheckedFresh => metrics.reread_motive_checked_fresh += 1,
                         FsReadMotive::NeedsRevalidation => {
                             metrics.reread_motive_needs_revalidation += 1
@@ -893,7 +899,7 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          edits: attempts={} started={} raw_ok={} committed_change={} failed={} first_raw_ok={}/{} first_committed_change={}/{} unfinished={} latency_p50={}ms latency_p95={}ms to_trace_end={}ms\n\
          edit_io: fs_read_bytes={} success_bytes_before={} success_bytes_after={} confirm_reads={} fallback(shell_proxy/fs_write)={}/{} settlement(not_applied/recovery/unknown)={}/{}/{}\n\
          reread: previously_selected={} selected_descriptor={} external_descriptor={} resident_unselected={} warm={} stored={} first_read={}\n\
-         reread_motive: first={} body_visible_current={} descriptor_only={} checked_fresh={} needs_revalidation={} warm={} stored={} changed={}\n\
+         reread_motive: first={} body_visible_current={} descriptor_only={} protocol_checkpoint_body_missing={} checked_fresh={} needs_revalidation={} warm={} stored={} changed={}\n\
          selected_attr: kind={:?} reason={:?} source={:?} reactivated={} resident={}\n\
          tool_failures: {:?}\n",
         metrics.model_input_tokens,
@@ -1005,6 +1011,7 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.reread_motive_first,
         metrics.reread_motive_body_visible_current,
         metrics.reread_motive_descriptor_only,
+        metrics.reread_motive_protocol_checkpoint_body_missing,
         metrics.reread_motive_checked_fresh,
         metrics.reread_motive_needs_revalidation,
         metrics.reread_motive_warm,
@@ -1871,5 +1878,34 @@ mod tests {
         let metrics = aggregate_metrics(&events);
         assert_eq!(metrics.reread_motive_body_visible_current, 1);
         assert_eq!(metrics.reread_motive_descriptor_only, 0);
+    }
+
+    #[test]
+    fn protocol_checkpoint_body_missing_motive_is_counted() {
+        let run = RunId::new();
+        let events = vec![envelope(
+            run,
+            1,
+            RuntimeEvent::ToolFinished {
+                output: ToolOutput {
+                    call_id: "r1".into(),
+                    tool_name: "fs.read".into(),
+                    ok: true,
+                    summary: "read".into(),
+                    model_content: "body".into(),
+                    artifact_ref: None,
+                    metadata: json!({
+                        "path": "src/util.py",
+                        FS_READ_MOTIVE_KEY: "protocol-checkpoint-body-missing",
+                    }),
+                },
+            },
+        )];
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(
+            metrics.reread_motive_protocol_checkpoint_body_missing,
+            1
+        );
+        assert!(render_metrics(&metrics).contains("protocol_checkpoint_body_missing=1"));
     }
 }

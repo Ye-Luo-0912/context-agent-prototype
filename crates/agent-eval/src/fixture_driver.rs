@@ -673,7 +673,7 @@ fn render_comparison_header(runs: &[EngineRun], header: &str) -> String {
                {:8}   resident_bytes final={} peak={}\n\
                {:8}   materialize(p50/p95)={}ms/{}ms store(w/r/recalled)={}/{}/{}\n\
                {:8}   retrieval search={}/{} empty={} recovered={}/{} access(search/inspect/fetch/ack)={}/{}/{}/{}\n\
-               {:8}   reread prev/desc/ext/resident/warm/stored/first={}/{}/{}/{}/{}/{}/{} motive(first/body/desc/checked/reval/warm/stored/changed)={}/{}/{}/{}/{}/{}/{}/{} repeated_fs={} recovery_reread={}\n",
+               {:8}   reread prev/desc/ext/resident/warm/stored/first={}/{}/{}/{}/{}/{}/{} motive(first/body/desc/proto/checked/reval/warm/stored/changed)={}/{}/{}/{}/{}/{}/{}/{}/{} repeated_fs={} recovery_reread={}\n",
             run.engine,
             run.eval.passed,
             run.eval.wall_ms,
@@ -723,6 +723,7 @@ fn render_comparison_header(runs: &[EngineRun], header: &str) -> String {
             metrics.reread_motive_first,
             metrics.reread_motive_body_visible_current,
             metrics.reread_motive_descriptor_only,
+            metrics.reread_motive_protocol_checkpoint_body_missing,
             metrics.reread_motive_checked_fresh,
             metrics.reread_motive_needs_revalidation,
             metrics.reread_motive_warm,

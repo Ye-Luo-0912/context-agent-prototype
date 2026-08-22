@@ -283,10 +283,9 @@ impl ContextCatalog {
     }
 
     /// Catalog candidate ids for `context.search` (Resident, Warm, Stored).
-    ///
-    /// `Some(ids)` means the catalog indexes bounded the set. `None` means
-    /// the free-text needle did not hit an entity/label key and no filter
-    /// was set, so the caller must residual-scan summaries/uris.
+    /// Test-only convenience over [`Self::search_candidates`]; production
+    /// callers need the completeness statement too.
+    #[cfg(test)]
     pub(crate) fn search_ids(&self, query: &ContextSearchQuery) -> Option<Vec<ContextItemId>> {
         self.search_candidates(query)
             .map(|candidates| candidates.ids)

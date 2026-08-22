@@ -239,20 +239,29 @@ non-candidates against full stored bodies (lazy projection keeps memory
 at O(limit)). Search is GC's safety net; recall completeness is now
 explicit, not implied.
 
-### SCHED-03 — convergence failure-cluster escalation (open)
+### SCHED-03 — convergence failure-cluster escalation (fixed 2026-08-23)
 
 Invented-program PathNotFound streaks survived per-call cwd listings (8
-attempts across 4 spellings). Aggregate consecutive same-class failures
-over an unchanged world revision and surface an EXECUTION STALL line;
-never hard-code fixtures, never plan for the model.
+attempts across 4 spellings) because every spelling is its own
+signature. Landed: alongside the MOD-PROG-01 identical-signature
+counter, `ExecutionState` aggregates consecutive same-class failures
+across different targets over an unchanged world; at ≥2 distinct targets
+the TASK PROGRESS view carries an EXECUTION STALL line naming tool and
+class (advisory only — the model still chooses). A class change, any
+world progress, or an Evidence-class observation restarts the cluster;
+the per-signature threshold stays at 3.
 
-### SCHED-04 — reread motive attribution instrument (open)
+### SCHED-04 — reread motive attribution instrument (instrument landed 2026-08-23)
 
 Latest long-flow: fs.read 21 / repeats 18 with Warm=Stored=0 — rereads
 are descriptor-only (12) and needs-revalidation (7) motives, NOT Context
-GC reclaims. Add a `protocol_checkpoint_body_missing` motive class before
-considering any protocol body cache; residency loosening is rejected on
-current evidence.
+GC reclaims. Landed: the `protocol-checkpoint-body-missing` motive class
+identifies identity-only reads of a body the model already consumed
+(read-provenance fact, unchanged digest, descriptor residency), split
+out of descriptor-only/needs-revalidation so a protocol body cache would
+be sized against real demand. Residency loosening stays rejected on
+current evidence; the tiny current-turn LRU gets built only if this
+motive shows up in live runs.
 
 ## Freeze (not a defect)
 

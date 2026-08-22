@@ -16,6 +16,10 @@ pub(super) const MAX_COVERAGE_PATHS: usize = 8;
 /// Consecutive identical no-progress rounds before the runtime tells the
 /// model its repeated behavior is not moving the world (MOD-PROG-01).
 pub(super) const STALL_THRESHOLD: u32 = 3;
+/// Distinct targets hit by consecutive same-class failures before the
+/// cluster line surfaces (SCHED-03): a spelling-variation streak never
+/// reaches [`STALL_THRESHOLD`] on any one signature.
+pub(super) const STALL_CLUSTER_DISTINCT_TARGETS: u32 = 2;
 
 /// Deterministic progress classification of one tool result. Not a
 /// planner: it only states what the world can prove changed.
@@ -48,6 +52,22 @@ pub struct StallState {
     pub failure: Option<ToolFailureClass>,
 }
 
+/// SCHED-03: consecutive same-class failures across different targets
+/// over an unchanged world. The per-signature counter cannot see
+/// invented-path streaks that vary the spelling on every attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct FailureCluster {
+    #[serde(default)]
+    pub tool: String,
+    #[serde(default)]
+    pub failure: Option<ToolFailureClass>,
+    #[serde(default)]
+    pub distinct_targets: u32,
+    #[serde(default)]
+    pub last_target: String,
+}
+
 /// Bounded operational cache bound to `task_id + anchor_revision +
 /// workspace_revision`. Serialized as `resume` on `TaskRecord`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -65,6 +85,8 @@ pub struct ExecutionState {
     pub verification: VerificationObligation,
     #[serde(default)]
     pub stall: StallState,
+    #[serde(default)]
+    pub failure_cluster: FailureCluster,
 }
 
 /// How one [`ResourceFact`] was last observed. Observability only: it
@@ -457,33 +479,46 @@ impl ExecutionState {
         }
     }
 
-    /// Bounded deterministic stall message when the same operation
-    /// signature produced no world progress for
-    /// [`STALL_THRESHOLD`] consecutive rounds. Advisory only: the model
-    /// still chooses the next action.
+    /// Bounded deterministic stall message. Two detectors feed it: the
+    /// MOD-PROG-01 identical-signature repeat and the SCHED-03
+    /// same-class-across-targets cluster; whichever fires first wins.
+    /// Advisory only: the model still chooses the next action.
     pub(super) fn stall_warning(&self) -> Option<String> {
-        if self.stall.consecutive_no_progress < STALL_THRESHOLD {
-            return None;
+        if self.stall.consecutive_no_progress >= STALL_THRESHOLD {
+            let target = if self.stall.target.is_empty() {
+                "unknown target"
+            } else {
+                &self.stall.target
+            };
+            let failure = self
+                .stall
+                .failure
+                .map(|class| class.as_str().to_string())
+                .unwrap_or_else(|| "no failure class".into());
+            return Some(format!(
+                "EXECUTION STALL: {} on {} repeated {} time(s) without world progress (last failure: {}). Choose another strategy or finish with the current state.",
+                self.stall.tool, target, self.stall.consecutive_no_progress, failure
+            ));
         }
-        let target = if self.stall.target.is_empty() {
-            "unknown target"
-        } else {
-            &self.stall.target
-        };
-        let failure = self
-            .stall
-            .failure
-            .map(|class| class.as_str().to_string())
-            .unwrap_or_else(|| "no failure class".into());
-        Some(format!(
-            "EXECUTION STALL: {} on {} repeated {} time(s) without world progress (last failure: {}). Choose another strategy or finish with the current state.",
-            self.stall.tool, target, self.stall.consecutive_no_progress, failure
-        ))
+        if self.stall.consecutive_no_progress > 0
+            && let Some(failure) = self.failure_cluster.failure
+            && self.failure_cluster.distinct_targets >= STALL_CLUSTER_DISTINCT_TARGETS
+        {
+            return Some(format!(
+                "EXECUTION STALL: {} hit {} across {} different targets in a row without world progress. Choose another strategy or finish with the current state.",
+                self.failure_cluster.tool,
+                failure.as_str(),
+                self.failure_cluster.distinct_targets
+            ));
+        }
+        None
     }
 
     /// MOD-PROG-01 stall accounting: any progress resets the counter; a
     /// no-progress round increments it when the operation signature
-    /// (tool + target + failure class) repeats.
+    /// (tool + target + failure class) repeats. SCHED-03 additionally
+    /// aggregates same-class failures across changing targets so a
+    /// spelling-variation streak cannot dodge the per-signature counter.
     pub(super) fn update_stall(
         &mut self,
         identity: &OperationIdentity,
@@ -492,6 +527,7 @@ impl ExecutionState {
     ) {
         if progress != RoundProgress::None {
             self.stall = StallState::default();
+            self.failure_cluster = FailureCluster::default();
             return;
         }
         if self.stall.tool != identity.tool_name
@@ -503,6 +539,24 @@ impl ExecutionState {
                 tool: identity.tool_name.clone(),
                 target: identity.target.clone(),
                 failure,
+            };
+        }
+        if self.failure_cluster.tool == identity.tool_name
+            && self.failure_cluster.failure == failure
+            && failure.is_some()
+        {
+            if self.failure_cluster.last_target != identity.target {
+                self.failure_cluster.distinct_targets += 1;
+                self.failure_cluster.last_target = identity.target.clone();
+            }
+        } else {
+            // A no-progress round without a failure class carries no
+            // cluster evidence; start over rather than mix classes.
+            self.failure_cluster = FailureCluster {
+                tool: identity.tool_name.clone(),
+                failure,
+                distinct_targets: 1,
+                last_target: identity.target.clone(),
             };
         }
         self.stall.consecutive_no_progress = self.stall.consecutive_no_progress.saturating_add(1);

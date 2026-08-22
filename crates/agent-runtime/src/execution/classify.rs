@@ -4,18 +4,20 @@ use agent_contracts::{
     FS_READ_MOTIVE_KEY, FsReadMotive, FsRereadClass, ResourceFreshness, ToolOutput,
 };
 
-use super::state::ResourceFact;
+use super::state::{ResourceFact, ResourceProvenance};
 
 /// Combine last-prompt exposure with the prior resource fact.
 ///
 /// Priority answers "why this read":
 /// 1. `changed` — digest actually moved (legitimate).
 /// 2. `warm` / `stored` — GC dropped the body.
-/// 3. `needs-revalidation` — Runtime should have hashed instead.
-/// 4. `body-visible-current` — file body was in the last prompt.
-/// 5. `descriptor-only` — last prompt only had `path@rev`.
-/// 6. `checked-fresh` — Runtime already knew `path@rev`.
-/// 7. `first` — first exploration.
+/// 3. `protocol-checkpoint-body-missing` — body consumed earlier, digest
+///    unchanged, frame now identity-only (SCHED-04 instrument).
+/// 4. `needs-revalidation` — Runtime should have hashed instead.
+/// 5. `body-visible-current` — file body was in the last prompt.
+/// 6. `descriptor-only` — last prompt only had `path@rev`.
+/// 7. `checked-fresh` — Runtime already knew `path@rev`.
+/// 8. `first` — first exploration.
 pub fn classify_fs_read_motive(
     residency: FsRereadClass,
     prior: Option<&ResourceFact>,
@@ -38,6 +40,26 @@ pub fn classify_fs_read_motive(
         | FsRereadClass::SelectedDescriptor
         | FsRereadClass::ExternalDescriptor
         | FsRereadClass::ResidentUnselected => {}
+    }
+    // SCHED-04 instrument: identity-only exposure of a body the model
+    // already consumed (read-provenance fact, unchanged digest). Only
+    // descriptor residency qualifies — ResidentUnselected means the
+    // engine still holds the body (a packing choice, not a loss), and
+    // FirstRead means nothing was ever materialized for a cache to serve.
+    if let Some(fact) = prior {
+        let unchanged = (!fact.digest.is_empty())
+            .then_some(fact.digest.as_str())
+            .zip(new_digest)
+            .is_some_and(|(old, new)| old == new);
+        if unchanged
+            && fact.provenance == ResourceProvenance::Read
+            && matches!(
+                residency,
+                FsRereadClass::SelectedDescriptor | FsRereadClass::ExternalDescriptor
+            )
+        {
+            return FsReadMotive::ProtocolCheckpointBodyMissing;
+        }
     }
     if let Some(fact) = prior {
         if fact.freshness == ResourceFreshness::NeedsRevalidation {
@@ -118,13 +140,47 @@ mod tests {
     }
 
     #[test]
-    fn selected_descriptor_is_not_body_visible() {
+    fn selected_descriptor_without_a_body_read_stays_descriptor_only() {
+        // Mutation-stamp provenance: the runtime knows path@rev but no
+        // body was ever consumed, so a body cache has nothing to serve.
+        let mut never_read = fact("revB", ResourceFreshness::Fresh);
+        never_read.provenance = ResourceProvenance::MutationResult;
         let motive = classify_fs_read_motive(
             FsRereadClass::SelectedDescriptor,
-            Some(&fact("revB", ResourceFreshness::Fresh)),
+            Some(&never_read),
             Some("revB"),
         );
         assert_eq!(motive, FsReadMotive::DescriptorOnly);
+    }
+
+    #[test]
+    fn descriptor_exposure_of_a_consumed_body_is_protocol_checkpoint_missing() {
+        // The model read this exact body earlier; the frame now carries
+        // identity only (SCHED-04). Both descriptor classes qualify.
+        for residency in [
+            FsRereadClass::SelectedDescriptor,
+            FsRereadClass::ExternalDescriptor,
+        ] {
+            let motive = classify_fs_read_motive(
+                residency,
+                Some(&fact("revB", ResourceFreshness::Fresh)),
+                Some("revB"),
+            );
+            assert_eq!(motive, FsReadMotive::ProtocolCheckpointBodyMissing);
+        }
+    }
+
+    #[test]
+    fn pending_revalidation_descriptor_of_a_consumed_body_is_protocol_checkpoint_missing() {
+        // An unknown-footprint boundary flips facts to needs-revalidation,
+        // but with an unchanged digest and read provenance the frame still
+        // lost a body the cache could have served.
+        let motive = classify_fs_read_motive(
+            FsRereadClass::SelectedDescriptor,
+            Some(&fact("revB", ResourceFreshness::NeedsRevalidation)),
+            Some("revB"),
+        );
+        assert_eq!(motive, FsReadMotive::ProtocolCheckpointBodyMissing);
     }
 
     #[test]

@@ -748,6 +748,8 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
                 "reread_motive_first": metrics.reread_motive_first,
                 "reread_motive_body_visible_current": metrics.reread_motive_body_visible_current,
                 "reread_motive_descriptor_only": metrics.reread_motive_descriptor_only,
+                "reread_motive_protocol_checkpoint_body_missing":
+                    metrics.reread_motive_protocol_checkpoint_body_missing,
                 "reread_motive_checked_fresh": metrics.reread_motive_checked_fresh,
                 "reread_motive_needs_revalidation": metrics.reread_motive_needs_revalidation,
                 "reread_motive_warm": metrics.reread_motive_warm,

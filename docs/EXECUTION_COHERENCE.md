@@ -261,16 +261,24 @@ consuming sequence space. Lifecycle-closure triggers always run: they
 carry semantics beyond dirty work. Bounded dirty batches instead of full
 heap scans stay a later step.
 
-Queued (design agreed, not yet landed):
+**Reread motive attribution (landed).** The E2E motive axis gained
+`protocol-checkpoint-body-missing`: an identity-only frame for a body the
+model consumed earlier (read-provenance fact, unchanged digest,
+descriptor residency). It splits that population out of
+`descriptor-only`/`needs-revalidation` so any protocol evidence body
+cache would be sized against measured demand. The tiny current-turn LRU
+is implemented only if the motive shows up in live runs.
 
-- **Convergence failure clusters**: after ≥2 consecutive same-class
-  failures over an unchanged world revision (e.g. invented-program
-  PathNotFound streaks), surface an `EXECUTION STALL` line built from
-  the recorded cluster instead of letting the model guess another
-  spelling.
-- **Protocol evidence instrument**: add a reread motive class
-  (`protocol_checkpoint_body_missing`) before building any body cache;
-  implement the tiny current-turn LRU only if that motive shows up.
+**Convergence failure clusters (landed).** The per-signature stall
+counter cannot see invented-path streaks that vary the spelling every
+attempt. `ExecutionState` therefore also aggregates consecutive
+same-class failures across different targets over an unchanged world:
+at ≥2 distinct targets, `TaskProgressView.stall_warning` carries an
+EXECUTION STALL line naming tool and class, built from the recorded
+cluster. Mixed failure classes and any progress restart it; the
+identical-signature threshold stays 3. Advisory only. Replacing the
+full Resident+Warm heap scan in `run_minor` with bounded dirty batches
+(`MaintenanceDebt`) remains queued behind idle-round evidence.
 
 ## What not to add
 

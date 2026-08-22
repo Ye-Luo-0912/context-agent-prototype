@@ -208,7 +208,9 @@ fn progress_resets_the_stall_counter() {
 
 #[test]
 fn stall_signature_change_resets_the_counter() {
-    // Alternating targets never accumulate: each signature counts alone.
+    // Alternating targets keep the per-signature counter alone, and a
+    // refusal that observes a NEW file is Evidence progress, which
+    // clears the cluster too.
     let mut resume = ExecutionState::default();
     resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
     resume.observe_tool(&refused_edit("src/a.rs", "rev-a", "stale_revision"), 1, 2);
@@ -217,6 +219,60 @@ fn stall_signature_change_resets_the_counter() {
     assert!(resume.view().stall_warning.is_none());
     assert_eq!(resume.stall.consecutive_no_progress, 1);
     assert_eq!(resume.stall.target, "src/a.rs");
+}
+
+fn failed_read(path: &str, class: &str) -> ToolOutput {
+    let mut failure = output("fs.read", false, "read refused");
+    failure.metadata = json!({
+        "path": path,
+        "failure_class": class,
+    });
+    failure
+}
+
+#[test]
+fn invented_path_streak_across_spellings_surfaces_the_cluster_stall() {
+    // SCHED-03: an invented-program streak varies the spelling every
+    // attempt, so no single signature accumulates. The class cluster
+    // sees two distinct targets fail alike over an unchanged world.
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&output("fs.read", true, "read protocol"), 1, 1);
+    resume.observe_tool(&failed_read("src/lib.rs", "path_not_found"), 1, 2);
+    assert!(
+        resume.view().stall_warning.is_none(),
+        "one failure is not yet a cluster"
+    );
+    resume.observe_tool(&failed_read("src/main.rs", "path_not_found"), 1, 3);
+    let warning = resume
+        .view()
+        .stall_warning
+        .expect("two distinct targets failed with the same class");
+    assert!(warning.contains("EXECUTION STALL"));
+    assert!(warning.contains("fs.read"));
+    assert!(warning.contains("path_not_found"));
+}
+
+#[test]
+fn failure_cluster_needs_the_same_failure_class() {
+    // Different classes are different evidence: mixing them must not
+    // manufacture a streak.
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
+    resume.observe_tool(&failed_read("src/a.rs", "path_not_found"), 1, 2);
+    resume.observe_tool(&failed_read("src/b.rs", "ambiguous_match"), 1, 3);
+    assert!(resume.view().stall_warning.is_none());
+}
+
+#[test]
+fn world_progress_clears_the_failure_cluster() {
+    // A real observation between failures means the model is exploring,
+    // not looping: the cluster restarts.
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
+    resume.observe_tool(&failed_read("src/lib.rs", "path_not_found"), 1, 2);
+    resume.observe_tool(&output("fs.write", true, "wrote"), 1, 3);
+    resume.observe_tool(&failed_read("src/main.rs", "path_not_found"), 1, 4);
+    assert!(resume.view().stall_warning.is_none());
 }
 
 #[test]
