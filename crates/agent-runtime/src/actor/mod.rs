@@ -226,6 +226,12 @@ struct ActiveTurn {
     input_consumed: bool,
     /// Provider 0/0 empty completions retried this turn. Not checkpointed.
     structurally_empty_retries: u8,
+    /// Tool scopes whose results have landed and still need their context
+    /// close. Enqueued exactly once when a result settles; drained at the
+    /// next round boundary or on cancellation. Replaces rescanning the
+    /// whole turn frame every round (O(R²) with repeated no-op closes
+    /// inflating `event_seq`).
+    pending_scope_closes: VecDeque<agent_contracts::ScopeId>,
 }
 
 /// Raw assistant evidence is ephemeral runtime state, not task authority.
@@ -357,6 +363,7 @@ mod edit_attempt_tests {
             applied_input: None,
             input_consumed: false,
             structurally_empty_retries: 0,
+            pending_scope_closes: VecDeque::new(),
         };
         turn.execution
             .checked_files

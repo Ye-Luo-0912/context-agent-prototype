@@ -1425,8 +1425,13 @@ impl ContextEngine for SimpleContextEngine {
 
     async fn close_scope(&self, scope_id: ScopeId) -> AgentResult<Vec<ContextStateTransition>> {
         let mut state = self.state.lock().await;
-        state.event_seq += 1;
-        Ok(scope::close_scope(&mut state, scope_id))
+        // Only a real close consumes sequence space: a repeated close is a
+        // true no-op — `event_seq` counts state changes, not attempts.
+        let transitions = scope::close_scope(&mut state, scope_id);
+        if !transitions.is_empty() {
+            state.event_seq += 1;
+        }
+        Ok(transitions)
     }
 
     async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {

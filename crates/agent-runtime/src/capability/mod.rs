@@ -168,9 +168,9 @@ pub struct CapabilityRegistry {
     /// point, so per-tool idle aging measures rounds, like the builtin
     /// catalog.
     tick: AtomicU64,
-    /// Idle ticks before a loaded capability tool cools to Warm.
+    /// Idle model rounds before a loaded capability tool cools to Warm.
     idle_to_warm_ticks: u64,
-    /// Idle ticks before a warm capability tool is unloaded from the model
+    /// Idle model rounds before a warm capability tool is unloaded from the model
     /// surface.
     warm_to_unload_ticks: u64,
 }
@@ -210,8 +210,13 @@ impl CapabilityRegistry {
         }
     }
 
-    fn tick_now(&self) -> u64 {
-        self.tick.fetch_add(1, Ordering::Relaxed) + 1
+    /// Current lifecycle-clock value. Loads and active-use stamps carry
+    /// it; ONLY `gc` — the merged dispatcher's once-per-model-round safe
+    /// point — advances the clock, so idle thresholds mean "model rounds
+    /// without use". A load or a tool call must never make time pass
+    /// faster (that feedback loop cooled in-use tools mid-task).
+    fn stamp_now(&self) -> u64 {
+        self.tick.load(Ordering::Relaxed)
     }
 
     /// The registry's surface generation: any capability surface change
@@ -497,7 +502,7 @@ impl CapabilityRegistry {
                 activation.as_str()
             )));
         }
-        let tick = self.tick_now();
+        let tick = self.stamp_now();
         entry.tool_states.insert(
             tool_name.to_string(),
             CapabilityToolState {
@@ -642,7 +647,7 @@ impl CapabilityRegistry {
     /// Executing a tool also refreshes its idle clock: a tool in active use
     /// never ages out mid-work.
     pub fn mark_active(&self, tool_name: &str) {
-        let tick = self.tick_now();
+        let tick = self.stamp_now();
         let owner = self.owner_of(tool_name);
         if let Some(owner) = owner
             && let Some(entry) = self
@@ -684,7 +689,9 @@ impl CapabilityRegistry {
     /// from idle aging, so TaskAnchor-driven roots cover the whole unified
     /// surface, not just the builtin half.
     pub fn gc(&self, roots: &[String]) {
-        let tick = self.tick_now();
+        // The single place this clock advances: once per model round, at
+        // the same safe point that ages the builtin catalog.
+        let tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
         let mut changed = false;
         {
             let mut inner = self.inner.write().expect("capability registry poisoned");

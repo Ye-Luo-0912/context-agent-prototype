@@ -906,6 +906,12 @@ impl RuntimeActor {
                         op_scope_id,
                         completion.disposition,
                     );
+                    // Exactly-once close scheduling: this result's frame is
+                    // consumed by the next model request, so its context
+                    // scope closes at that boundary — never scanned again.
+                    if let Some(scope_id) = op_scope_id {
+                        turn.pending_scope_closes.push_back(scope_id);
+                    }
                 }
                 self.observe_persistable_tool(&output, completion.disposition);
                 // MOD-PROG-01: remember deterministic edit refusals so an

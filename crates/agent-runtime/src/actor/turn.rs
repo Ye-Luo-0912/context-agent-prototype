@@ -145,6 +145,7 @@ impl RuntimeActor {
             applied_input: Some(applied),
             input_consumed: false,
             structurally_empty_retries: 0,
+            pending_scope_closes: VecDeque::new(),
         });
         self.advance_turn(op_tx).await;
         Ok(())
@@ -773,22 +774,24 @@ impl RuntimeActor {
         self.settle_aborted_turn().await;
     }
 
-    /// Close every tool frame the turn opened (from committed results and
-    /// the in-flight op). Called before each model round — the request
-    /// consumes the previous results — and on cancellation, so no tool
-    /// scope outlives its execution frame. Already-closed scopes are no-ops.
+    /// Close the tool scopes this turn still owes a close for. Called
+    /// before each model round (drains the exactly-once queue) and on
+    /// cancellation, which additionally closes the in-flight operation's
+    /// scope — its result will never land to enqueue itself.
     pub(super) async fn close_tool_frames(&mut self) -> AgentResult<()> {
+        self.close_tool_scopes(false).await
+    }
+
+    /// Shared body: drain `pending_scope_closes`, optionally adding the
+    /// in-flight op's scope. Already-closed ids are engine-side no-ops.
+    pub(super) async fn close_tool_scopes(&mut self, include_in_flight: bool) -> AgentResult<()> {
         let mut scope_ids: Vec<ScopeId> = Vec::new();
-        if let Some(turn) = self.state.turn.as_ref() {
-            for step in &turn.turn_frame.steps {
-                if let TurnFrameStep::ToolResult {
-                    scope_id: Some(id), ..
-                } = step
-                {
-                    scope_ids.push(*id);
-                }
+        if let Some(turn) = self.state.turn.as_mut() {
+            while let Some(scope_id) = turn.pending_scope_closes.pop_front() {
+                scope_ids.push(scope_id);
             }
-            if let Some(op) = turn.op.as_ref()
+            if include_in_flight
+                && let Some(op) = turn.op.as_ref()
                 && let Some(id) = op.scope_id
             {
                 scope_ids.push(id);
@@ -884,7 +887,7 @@ impl RuntimeActor {
         if cleanup_kind == Some(OpKind::Tool) {
             self.state.pending_tool_cleanup = operation_id;
         }
-        if let Err(error) = self.close_tool_frames().await {
+        if let Err(error) = self.close_tool_scopes(true).await {
             self.state.recovery_required = true;
             let _ = self
                 .core
@@ -964,7 +967,7 @@ impl RuntimeActor {
         if cleanup_kind == Some(OpKind::Tool) {
             self.state.pending_tool_cleanup = operation_id;
         }
-        if let Err(error) = self.close_tool_frames().await {
+        if let Err(error) = self.close_tool_scopes(true).await {
             self.state.recovery_required = true;
             let _ = self
                 .core

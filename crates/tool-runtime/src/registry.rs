@@ -38,9 +38,10 @@ pub use agent_contracts::{CAPABILITY_MANAGE, ToolLifecycle};
 pub struct ToolLifecycleConfig {
     /// Tools that stay loaded for the whole run (the model always sees them).
     pub always_loaded: Vec<String>,
-    /// Idle ticks before a loaded tool cools to Warm.
+    /// Idle model rounds before a loaded tool cools to Warm.
     pub idle_to_warm_ticks: usize,
-    /// Idle ticks before a warm tool is unloaded from the model surface.
+    /// Idle model rounds before a warm tool is unloaded from the model
+    /// surface.
     pub warm_to_unload_ticks: usize,
 }
 
@@ -162,7 +163,7 @@ impl BuiltinToolDispatcher {
     /// Load a catalog tool into the active set (or re-load a warm/unloaded
     /// one) so its schema appears on the next model request.
     pub fn load(&self, name: &str) -> AgentResult<()> {
-        let tick = self.tick_now();
+        let tick = self.stamp_now();
         let mut catalog = self.catalog.write().expect("tool catalog poisoned");
         let entry = catalog.get_mut(name).ok_or_else(|| {
             AgentError::Tool(format!("unknown tool: {name} (see capability.search)"))
@@ -234,8 +235,12 @@ impl BuiltinToolDispatcher {
         entries
     }
 
-    fn tick_now(&self) -> u64 {
-        self.tick.fetch_add(1, Ordering::Relaxed) + 1
+    /// Current lifecycle-clock value. Loads and executes STAMP entries
+    /// with it; ONLY `gc` — the runtime's once-per-model-round safe point
+    /// — advances the clock, so `idle_to_warm_ticks` really means "model
+    /// rounds without use". A tool call must never make time pass faster.
+    fn stamp_now(&self) -> u64 {
+        self.tick.load(Ordering::Relaxed)
     }
 
     /// Age transitions at an explicit runtime safe point: idle tools cool
@@ -248,7 +253,9 @@ impl BuiltinToolDispatcher {
     /// so budget, prompt and tool-call validation all observe one stable
     /// surface per round.
     pub fn gc(&self, roots: &[String]) {
-        let tick = self.tick_now();
+        // The single place the lifecycle clock advances: once per model
+        // round, at the runtime safe point.
+        let tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
         let mut catalog = self.catalog.write().expect("tool catalog poisoned");
         let mut changed = false;
         for (name, entry) in catalog.iter_mut() {
@@ -404,7 +411,7 @@ impl ToolDispatcher for BuiltinToolDispatcher {
         match name.as_str() {
             CAPABILITY_MANAGE => self.run_manage(request).await.map(ToolOutcome::Value),
             _ => {
-                let tick = self.tick_now();
+                let tick = self.stamp_now();
                 let tool = {
                     let mut catalog = self.catalog.write().expect("tool catalog poisoned");
                     let entry = catalog.get_mut(&name).ok_or_else(|| {

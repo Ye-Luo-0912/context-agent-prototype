@@ -210,6 +210,23 @@ comparing rounds/tools/tokens/pass-rate before/after.
 
 ## Known boundaries
 
+**Revision (2026-08-23): the "batch closed-scope evictions / read-on-lease"
+direction below is REJECTED as a default change.** The long-flow motive
+breakdown attributes all 18 fs.read repeats to descriptor-only (12) and
+needs-revalidation (7) motives with Warm=Stored=0 — none were caused by
+Context GC reclaiming bodies. Loosening residency on this evidence would
+re-inflate per-round frames without addressing the actual causes
+(PromptAssembler eliding historical bodies behind path@rev identities,
+and post-mutation revalidation). See AUDIT_TODO SCHED-04 for the
+instrument-first plan.
+
+Additional root cause found post-commit: capability reload churn was NOT
+model blindness but real idle-cooling — the lifecycle tick advanced on
+load/execute as well as gc, so thresholds elapsed in 2–3 real rounds.
+Fixed: the clock now advances only at the once-per-model-round gc safe
+point (EXECUTION_COHERENCE "Lifecycle clocks"). The already-loaded no-op
+and session-loaded trailer remain correct for genuinely-loaded tools.
+
 - Body text is indexed to its first 512 chars; deeper body keywords still
   rely on the residual-scan layer (no regression vs before).
 - Engine-only: live-model paired cells (`--compare-live`) are out of scope

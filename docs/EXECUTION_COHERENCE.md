@@ -215,6 +215,60 @@ is `fs.read` keyed by path + line range + content revision. Never memoize
 writes, patches, or shell. Memo cannot replace this algorithm (the model
 round has already happened).
 
+## Lifecycle clocks and maintenance scheduling
+
+The runtime keeps exactly four logical clocks, and nothing else may
+advance time:
+
+| Clock | Advances on | Used for |
+| --- | --- | --- |
+| `event_seq` | any real state change | audit / ordering / stamps |
+| user turn | a committed user input | Context TTL / semantic aging |
+| model round | each inference request | Tool Surface lifecycle |
+| `gc_epoch` | each full Context GC pass | residency generations |
+
+Invariants: loading a tool does not make time pass; executing a tool does
+not age the user turn; materializing never advances a lifecycle clock;
+and a no-op never consumes `event_seq`.
+
+**Tool surface clock (landed).** `BuiltinToolDispatcher` and
+`CapabilityRegistry` previously advanced their private tick on load,
+execute, *and* every gc() safe point, so `idle_to_warm_ticks = 8`
+could elapse within 2–3 real rounds of a tool-heavy trajectory and cool
+in-use tools off the surface (measured live: 20 forced
+`capability.manage op=load` calls in one 15-turn cell, zero of them
+redundant). Now loads/executes only stamp `last_used_tick` with the
+current value; the clock advances **only** inside `gc()`, which the
+runtime calls once per model round. Idle thresholds are therefore model
+rounds, and both halves stay in lockstep because their gc() runs from
+the same safe point.
+
+**Exactly-once tool-scope closes (landed).** Round prep used to rescan
+every historical `TurnFrameStep::ToolResult` each round — O(R²), with a
+lock/acall per id even when already closed, and
+`ContextEngine::close_scope` bumped `event_seq` for those no-ops.
+`ActiveTurn.pending_scope_closes` now enqueues each scope once when its
+result settles; round boundaries drain it; cancellation drains it plus
+the in-flight op's scope. The engine bumps `event_seq` only when a close
+actually produced transitions.
+
+Queued (design agreed, not yet landed):
+
+- **Maintenance debt gate**: `BeforeModel` currently runs the full minor
+  scan every round (77x/cell measured) even with zero pending state
+  changes. First step: skip `run_minor` when nothing changed since the
+  last completed pass; later, bounded dirty batches instead of full
+  heap scans. CPU/lock/event-volume work first — not a proven source of
+  extra rounds, unlike the tool clock.
+- **Convergence failure clusters**: after ≥2 consecutive same-class
+  failures over an unchanged world revision (e.g. invented-program
+  PathNotFound streaks), surface an `EXECUTION STALL` line built from
+  the recorded cluster instead of letting the model guess another
+  spelling.
+- **Protocol evidence instrument**: add a reread motive class
+  (`protocol_checkpoint_body_missing`) before building any body cache;
+  implement the tiny current-turn LRU only if that motive shows up.
+
 ## What not to add
 
 Typed EpisodeOutcome, a smarter reactivation scorer, embeddings, RAG, a

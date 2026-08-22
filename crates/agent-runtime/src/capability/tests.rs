@@ -814,3 +814,26 @@ async fn a_repeat_load_is_a_cheap_no_op_that_names_the_loaded_set() {
         second.model_content
     );
 }
+
+#[test]
+fn unrelated_loads_never_cool_sibling_tools() {
+    // The lifecycle clock advances only at the gc safe point. Under the
+    // old semantics five loads pushed the shared tick forward and cooled
+    // an idle sibling past warm_to_unload without a single model round
+    // having passed (observed live: forced capability reloads mid-task).
+    let registry = CapabilityRegistry::with_idle_thresholds(2, 4);
+    registry
+        .register(Arc::new(demo_capability("demo")))
+        .expect("registration succeeds");
+    registry.load_tool("demo.one").expect("load one");
+    registry.load_tool("demo.two").expect("load two");
+    for _ in 0..4 {
+        registry.load_tool("demo.one").expect("reload churn");
+    }
+    registry.gc(&[]); // exactly one model round has elapsed
+    assert_eq!(
+        registry.tool_state("demo.two"),
+        Some(agent_contracts::ToolLifecycle::Loaded),
+        "unrelated load churn must not cool an idle sibling"
+    );
+}

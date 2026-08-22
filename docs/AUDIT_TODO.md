@@ -208,6 +208,47 @@ conflicts and partial recovery. Safety refusals may be a separate class, but
 remain in end-to-end task success/time/cost. Add deterministic fault/race
 fixtures before broader filesystem claims. M12 and M13 mainline does not move.
 
+## Open P1 — runtime scheduling correctness
+
+Design + invariants: [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md)
+("Lifecycle clocks and maintenance scheduling"). The tool-lifecycle clock
+defect (load/execute advancing the shared tick) and the O(R²) repeated
+tool-scope closes are **fixed**; their write-up lives in that section.
+
+### SCHED-01 — BeforeModel runs a full minor scan every round (open)
+
+Measured: 77 `BeforeModel` maintenances per 15-turn cell, most with no
+pending state change (`gc_work_batch` 4096 ≫ heap size, so each pass
+rescans Resident+Warm). First step: skip `run_minor` when nothing changed
+since the last completed pass; then bounded dirty batches
+(`MaintenanceDebt`) before ever touching scan width. CPU/lock/event work —
+no extra-round causality claimed.
+
+### SCHED-02 — search candidate completeness contract (open)
+
+The shared index bounds tokens/doc (64), postings/token (4096) and body
+text to its first 512 chars, while candidate hits suppress the residual
+scan — so deep-body keyword recall is not guaranteed end-to-end. Plan:
+`SearchCandidates { ids, completeness }` with `Partial(reason)`
+(saturated posting / truncated indexed text / prefix-only) triggering a
+bounded residual verification over non-candidates. Search is GC's safety
+net; recall completeness must be explicit, not implied.
+
+### SCHED-03 — convergence failure-cluster escalation (open)
+
+Invented-program PathNotFound streaks survived per-call cwd listings (8
+attempts across 4 spellings). Aggregate consecutive same-class failures
+over an unchanged world revision and surface an EXECUTION STALL line;
+never hard-code fixtures, never plan for the model.
+
+### SCHED-04 — reread motive attribution instrument (open)
+
+Latest long-flow: fs.read 21 / repeats 18 with Warm=Stored=0 — rereads
+are descriptor-only (12) and needs-revalidation (7) motives, NOT Context
+GC reclaims. Add a `protocol_checkpoint_body_missing` motive class before
+considering any protocol body cache; residency loosening is rejected on
+current evidence.
+
 ## Freeze (not a defect)
 
 ### CTX-11 — Execution Coherence V1
