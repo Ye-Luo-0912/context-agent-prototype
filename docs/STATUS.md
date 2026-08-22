@@ -29,6 +29,12 @@ and sandbox contracts live elsewhere. Experiment facts live in
 - M13 first cut: `SandboxProfile` vs post-spawn `SandboxCapabilities`.
 - PLAT-06 slices 1–2 (lifecycle / cancel-ACK) landed. Multiplexing is
   not in v0.
+- Scheduling/reliability fixes landed 2026-08-23 (AUDIT_TODO
+  SCHED-01–04): idle-round `BeforeModel` maintenance gate; explicit
+  search candidate completeness with bounded residual verification;
+  same-class-across-targets `EXECUTION STALL` cluster escalation; and
+  the `protocol-checkpoint-body-missing` reread motive instrument
+  (body-cache LRU stays conditional on live evidence).
 - Production always-load: `fs.list`, `fs.read`, `search.grep`,
   `artifact.read`, `edit.patch`, `task.complete`, `capability.manage`.
   Git / shell / write / `edit.replace` / `context.manage` are catalog-only
