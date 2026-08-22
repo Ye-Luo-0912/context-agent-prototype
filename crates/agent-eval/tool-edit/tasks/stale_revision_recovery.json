@@ -1,0 +1,53 @@
+{
+  "id": "stale_revision_recovery",
+  "name": "Recover safely after an external revision change",
+  "description": "Read src/retry.cfg and report its current settings without editing it in this turn. A later turn will request the change.",
+  "expected_edit": "preserve concurrent content and eventually apply a revision-checked limit change",
+  "target_rounds_lo": 4,
+  "target_rounds_hi": 10,
+  "seed_files": [
+    {
+      "path": "src/retry.cfg",
+      "content": "limit=3\nowner=user\n",
+      "sha256": "0de0bf052bb6c4fd8751f82697ac3dda7724fc52df6c49743ded6158c9157ec0"
+    }
+  ],
+  "golden_files": [
+    {
+      "path": "src/retry.cfg",
+      "content": "limit=5\nowner=user\nconcurrent=preserve\n",
+      "sha256": "47c2e2fe08863b41eca344c4d6f65d476d97f23f3695ba8be2655abe8520393f"
+    }
+  ],
+  "ops": [
+    {
+      "op": "user",
+      "text": "Read src/retry.cfg and report its current settings. Do not edit it in this turn."
+    },
+    {
+      "op": "fixture_replace",
+      "path": "src/retry.cfg",
+      "expected_sha256": "0de0bf052bb6c4fd8751f82697ac3dda7724fc52df6c49743ded6158c9157ec0",
+      "content": "limit=3\nowner=user\nconcurrent=preserve\n"
+    },
+    {
+      "op": "user",
+      "text": "Now set limit=5 using edit.patch with a base_revision obtained from fs.read. Preserve all other current content and do not rewrite the whole file."
+    }
+  ],
+  "trace": {
+    "target_files": ["src/retry.cfg"],
+    "required_successful_patch_calls": 1,
+    "max_patch_calls": 2,
+    "expected_files_per_success": 1,
+    "min_hunks_per_success": 1,
+    "exact_hunks": [
+      {"path": "src/retry.cfg", "old": "limit=3", "new": "limit=5"}
+    ],
+    "require_base_revision": true,
+    "first_patch_must_succeed": false,
+    "conflict": "stale_or_revalidated",
+    "forbidden_tools": ["shell.exec", "process.run", "process.session", "fs.write", "edit.replace"],
+    "max_confirm_reads_after_success": 0
+  }
+}

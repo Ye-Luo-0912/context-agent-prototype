@@ -480,9 +480,18 @@ The catalog directory is a single `item_id -> location` record per id
 kind / entity / label / residency / attention). Authority metadata stays
 on the body; GC moves location. `context.search` generates candidates from
 those indexes across Resident/Warm/Stored; a live working-set file is a
-catalog hit (heap projection), not an empty miss. A free-text needle that
-hits no entity/label key still residual-scans summaries/uris/bodies. See
-`docs/AUDIT_TODO.md` CTX-02.
+catalog hit (heap projection), not an empty miss. Since the shared search
+kernel (`agent-contracts::search`) landed, candidates also come from an
+incrementally maintained inverted index over entities/labels/path identity
+and a bounded body prefix (stored entries: summary) — multi-word needles
+match by token coverage, rare tokens outrank common ones, and unique-prefix
+extensions count as weaker hits; the whole-needle key-substring scan is
+kept as the second union layer, and only a needle matching nothing anywhere
+falls back to the residual scan over summaries/uris/bodies. Verification
+mirrors that split: a whole-needle substring hit ranks first, and a
+multi-word needle verifies when *every* token (shared `tokenize` rule)
+appears in the entry's matchable text — candidate recall is not discarded
+at the verification gate. See `docs/AUDIT_TODO.md` CTX-02.
 
 ### Retrieval results are transient; admit and derive move items deliberately (CTX-03)
 

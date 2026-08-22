@@ -74,6 +74,140 @@ than it delivers — `process_count_quota` was renamed from
 `process_spawn_controlled` for exactly that (serde alias keeps the
 wire compatible).
 
+## Open P1 — Tool Surface reliability
+
+### TOOL-EDIT-02 — canonical edit first-attempt success (open)
+
+Do not reopen `TOOL-EDIT-01`: revision-aware exact refusals and bounded
+candidates remain landed. The open gate is product reliability of the one
+canonical mutation path, `edit.patch`.
+
+Confirmed evidence: the 2026-08-22 replay of
+`context-mech-convergence` found `edit.patch` 5/5 failed and
+`edit.replace` 8/21 failed; all 11 multi-line `no_exact_match` refusals
+were caused by `fs.read` showing LF text from a raw CRLF seed while the
+edit tools matched raw bytes. Details and the non-retroactive reading are
+in the evidence `REPORT.md`.
+
+Landed implementation (not formal acceptance): uniform LF/CRLF-aware exact
+matching with target-style preservation; constant-memory occurrence scans;
+pre-allocation and workspace-boundary 4 MiB caps; bounded preflight reads;
+duplicate resolved-target rejection; bounded missing-path/candidate output;
+and one global multi-file echo cap. `fs.read` exposes a JSON-quoted path,
+raw-byte revision and EOL facts (plus a bounded mixed-EOL token map). The model
+sees only canonical revision-required `files[]`; the legacy single-file shape
+is parser-only compatibility and cannot ambiguously bind one revision to many
+files. A successful patch reports every new revision in submitted-file order
+outside the optional echo cap.
+
+Canonical batch path keys are acquired in sorted order before any edit
+snapshot; one pinned bounded read feeds transformation, SHA-256, recovery hash
+and bounded backup capture; the shared lease is retained through composite
+settlement. Prepared content uses a short exclusive sibling temp, is checked
+by open-handle/name identity, length and SHA before replacement, and the
+installed target is checked before and after durable journal acknowledgement.
+Unix mode bits or the Windows readonly bit are retained. Cleanup or rollback
+journal uncertainty becomes `Unknown`; an already-landed replacement is never
+reported as `NotApplied`. Mixed-EOL anchors use strict logical newline tokens
+(`LF == CRLF` only), map an authorized match back to its raw UTF-8 span,
+preserve physical EOLs by ordinal, and keep lone CR/non-EOL bytes literal.
+Matching remains non-fuzzy and multi-file commit remains sequential with
+honest partial recovery. `Effect::rollback` now returns `AgentResult<()>` as a
+settlement claim: Workspace propagates cleanup/review/authority-terminal
+failure; staged and composite rollback attempts every child in reverse order
+and aggregates bounded diagnostics; Core installs its recovery fence and
+Runtime emits `not_applied_cleanup_recovery_required` for commit-rejection
+cleanup uncertainty and `execution_cleanup_recovery_required` for
+preparation/execution cleanup uncertainty rather than treating either as an
+ordinary rejection. Both projections discard proposed revisions/files and
+retain only bounded attempted paths and diagnostics.
+
+For Core-managed writes, authority journal v2 now lands its synced `Prepared`
+intent before the deterministic `.fa-{tx_id}.tmp` is created. It records
+before/after byte lengths and SHA-256 revisions. Reopen reconciliation limits
+aggregate target/stage reads, refuses any file over the 4 MiB mutation bound,
+and removes a staged entry only through a confined open handle after proving
+regular-file type, full expected content, and name identity both before and
+after hashing. Crash seams after intent persistence, stage sync, and review
+record all have deterministic recovery tests; create collisions and partial or
+substituted stages have fail-closed tests. Existing v1 records remain readable
+with their legacy FNV-1a-64 evidence, under the same new byte bounds.
+File mutations also refuse a missing parent before opening a transaction: they
+may create the final file in an existing directory but never leave implicit
+directory topology outside the approved/recoverable effect. Directory creation
+will need its own effect contract if added later.
+
+Post-fix evidence now exists. The source-bound, dirty-tree 2026-08-22 r4 run
+used `agent-eval.tool-edit.v2` with the v3 gate over 4 fixtures × 3 repeats and
+binds the implementation after rollback/recovery and filesystem P1 hardening:
+12/12 raw-byte verification and 12/12 flow gate; 9/9 non-conflict first patch;
+3/3 proactive stale routes; zero patch failures, forbidden fallback,
+post-success confirmation reads, provenance/target/exact-hunk violations,
+recovery-required or unknown settlements; 42 rounds. Total wall time was
+164,417 ms and reported provider tokens were 258,325. It preserved all r3
+correctness/call-quality results; wall p50/p95 were lower while token measures
+were effectively unchanged. The gate independently binds calls to the frozen
+task/pack/schema/source/model identities, the latest successful same-path
+read, exact local-hunk fingerprints, raw final hashes, complete runtime
+barriers, and the model-invisible stale-mutation boundary. See
+`crates/agent-eval/evidence/tool-surface-edit-v2-diagnostic-2026-08-22-r4/REPORT.md`.
+
+Confirmed residuals:
+
+- the path lease is an in-process guarantee shared by clones of one
+  `Workspace`, while a second official `Workspace::open` on the same root is
+  refused by the authority-journal lock. Direct or authority-bypassing
+  filesystem writers remain outside it, and hash→rename is not an atomic
+  filesystem CAS against them;
+- Unix still has narrow name/inode-check→rename and final-check→return windows;
+  Windows preservation covers the readonly bit, not ACLs, alternate streams,
+  hidden/system attributes or timestamps, and its parent-directory sync is a
+  no-op rather than a proved power-loss barrier;
+- `.focus-agent/changes.jsonl` is a serialized, flushed review log, distinct
+  from the checksummed, synced authority
+  `.focus-agent/authority/workspace-effects.jsonl`. Core-managed writes are
+  mapped before temp creation, but a crash after authority `Committed` and
+  before the review terminal can still leave review history at `Prepared`;
+- the context-free `MutationTransaction::prepare` entry is retained for
+  trusted tests/maintenance and is explicitly not crash-recoverable. A
+  partially written, substituted, or colliding deterministic stage is not
+  deleted automatically: reconciliation returns `Ambiguous` for manual
+  recovery. Legacy v1 records still use FNV-1a-64, though their reads are now
+  bounded; new v2 records use byte lengths plus SHA-256;
+- mixed-EOL matching materializes one bounded canonical view per hunk; keep
+  the simpler implementation until profiling shows it is a hot path, then a
+  streaming token matcher may replace it without changing semantics;
+- `fs.write` remains a catalog-only blind whole-file upsert for scripted-arm
+  compatibility; a future compatible schema needs explicit create vs
+  revision-checked replace rather than making it a second primary editor;
+- the r4 live diagnostic did not exercise external-process races, process
+  crash, disk-full/journal failures, or partial multi-file recovery, and does
+  not yet aggregate staged bytes. Deterministic unit tests now cover three
+  Core-managed prepare crash seams and conservative stage cleanup, but broader
+  process/fault fixtures remain open. A successful edit currently performs the snapshot
+  plus repeated bounded full-file integrity hashes; treat that as a candidate
+  measurement, not an established performance hotspot.
+
+Before removing an integrity pass, add a test/benchmark-only counter with zero
+production-path branching. For 4 KiB, 256 KiB and 4 MiB single/two/16-file
+cases, report file-read bytes, SHA/FNV bytes, staged-write bytes, review and
+authority journal bytes, file/directory sync counts, and replacement/changed-
+span/journal amplification. The current nominal changed-file path has about
+`2N + 3M` full-file handle reads for input `N` and result `M`; caching may make
+physical I/O different. Fuse a pass only after measurement and only if stale,
+staged-integrity, post-replace and final-ack truth remain independently
+provable.
+
+The direct formal-acceptance blocker is a run of the same frozen pack on a
+clean source tree; r4 deliberately used `--allow-dirty`, so all manifests say
+`git_dirty=true` and `acceptance_eligible=false`. Acceptance measures
+non-conflict first-patch success, correct proactive/reactive stale recovery,
+edit-to-passing verification, failure class, fallback-to-shell/`fs.write`,
+confirm reads, rounds, tokens, p50/p95 latency, bytes read/staged, commit
+conflicts and partial recovery. Safety refusals may be a separate class, but
+remain in end-to-end task success/time/cost. Add deterministic fault/race
+fixtures before broader filesystem claims. M12 and M13 mainline does not move.
+
 ## Freeze (not a defect)
 
 ### CTX-11 — Execution Coherence V1

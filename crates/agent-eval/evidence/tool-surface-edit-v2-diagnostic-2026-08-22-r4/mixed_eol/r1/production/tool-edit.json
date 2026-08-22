@@ -1,0 +1,110 @@
+{
+  "context_engine": "dynamic",
+  "fixture_id": "mixed_eol",
+  "fixture_mutations": [],
+  "gate": {
+    "analysis_truncated": false,
+    "changed_bytes_after": 43,
+    "changed_bytes_before": 43,
+    "commit_not_applied": 0,
+    "commit_recovery_required": 0,
+    "commit_unknown": 0,
+    "confirm_reads_after_success": 0,
+    "conflict_route": null,
+    "duplicate_call_ids": 0,
+    "edit_latency_ms_p50": 25,
+    "edit_latency_ms_p95": 25,
+    "edit_to_green_ms": 25,
+    "first_patch_changed_success": true,
+    "first_patch_exact_hunks": true,
+    "first_patch_has_required_revisions": true,
+    "first_patch_raw_success": true,
+    "first_patch_revisions_from_latest_reads": true,
+    "first_patch_shape_valid": true,
+    "fixture_id": "mixed_eol",
+    "fixture_mutation_evidence_valid": true,
+    "forbidden_calls": 0,
+    "forbidden_tool_counts": {},
+    "fs_read_bytes": 43,
+    "model_rounds": 3,
+    "non_stale_failures": 0,
+    "orphan_tool_finishes": 0,
+    "passed": true,
+    "patch_attempts": 1,
+    "patch_changed_successes": 1,
+    "patch_failures": 0,
+    "patch_finished": 1,
+    "patch_hunk_contract_failures": 0,
+    "patch_noops": 0,
+    "patch_raw_successes": 1,
+    "patch_revision_provenance_failures": 0,
+    "patch_started": 1,
+    "patch_target_mismatches": 0,
+    "read_identity_failures": 0,
+    "schema": "agent-eval.tool-surface-edit.v3",
+    "seq_contiguous": true,
+    "session_ok": true,
+    "stale_refusals": 0,
+    "strict_passed": true,
+    "target_files_covered": [
+      "src/mixed.cfg"
+    ],
+    "target_read_successes": 1,
+    "trace_complete": true,
+    "unfinished_patch_calls": 0,
+    "valid_call_first_attempt_success": true,
+    "violations": []
+  },
+  "gate_implementation_sha256": "2a25cfbf29190c0171dc06f09a03b4376ec2a8586a994e6721ac627e4cf4d030",
+  "gate_schema": "agent-eval.tool-surface-edit.v3",
+  "schema": "agent-eval.tool-edit.v2",
+  "strict": {
+    "files": [
+      {
+        "actual_sha256": "850b543f8e6f0c1dcdf5309ff4d21bb354ea2b0f3e4d26edd6f852f106c014b2",
+        "bytes": 43,
+        "expected_sha256": "850b543f8e6f0c1dcdf5309ff4d21bb354ea2b0f3e4d26edd6f852f106c014b2",
+        "passed": true,
+        "path": "src/mixed.cfg"
+      }
+    ],
+    "fixture_id": "mixed_eol",
+    "passed": true,
+    "schema": "agent-eval.tool-edit.v2",
+    "unexpected_files": [],
+    "unexpected_files_truncated": false
+  },
+  "surface": "production-default",
+  "trace_contract": {
+    "conflict": "none",
+    "exact_hunks": [
+      {
+        "new": "alpha=new\nbeta=keep",
+        "old": "alpha=old\nbeta=keep",
+        "path": "src/mixed.cfg"
+      },
+      {
+        "new": "gamma=new\ndelta=keep",
+        "old": "gamma=old\ndelta=keep",
+        "path": "src/mixed.cfg"
+      }
+    ],
+    "expected_files_per_success": 1,
+    "first_patch_must_succeed": true,
+    "forbidden_tools": [
+      "shell.exec",
+      "process.run",
+      "process.session",
+      "fs.write",
+      "edit.replace"
+    ],
+    "max_confirm_reads_after_success": 0,
+    "max_patch_calls": 1,
+    "min_hunks_per_success": 2,
+    "require_base_revision": true,
+    "required_successful_patch_calls": 1,
+    "target_files": [
+      "src/mixed.cfg"
+    ]
+  }
+}

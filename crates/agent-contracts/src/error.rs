@@ -32,11 +32,18 @@ pub enum AgentError {
     #[error("internal error: {0}")]
     Internal(String),
 
-    /// A mutation may have partially landed and automatic rollback also
-    /// failed. Callers must stop ordinary mutation and recover from a
-    /// known-good checkpoint instead of treating this as a retryable error.
+    /// A mutation may have partially landed, or cleanup/durable settlement
+    /// of a prepared mutation could not be confirmed. Callers must stop
+    /// ordinary mutation and reconcile from known authority state instead
+    /// of treating this as a retryable error or claiming rollback succeeded.
     #[error("recovery required: {0}")]
     RecoveryRequired(String),
+
+    /// An operation referenced a Core authority epoch that has already
+    /// advanced. Distinct from [`AgentError::InvalidRequest`] so callers
+    /// can classify staleness structurally instead of parsing error text.
+    #[error("operation epoch {expected} is stale; current Core epoch is {current}")]
+    StaleEpoch { expected: u64, current: u64 },
 }
 
 pub type AgentResult<T> = Result<T, AgentError>;

@@ -479,6 +479,32 @@ fn render_cell(dir: &Path) -> anyhow::Result<String> {
             }
         }
     }
+    if let Ok(text) = fs::read_to_string(parent.join("gate.json"))
+        && let Ok(gate) = serde_json::from_str::<crate::tool_edit_gate::ToolEditGateReport>(&text)
+    {
+        out.push_str(&format!(
+            "           tool-edit schema={} gate={} first_valid_green={} revision_from_read={} exact_hunks={} mutation_evidence={} conflict_route={:?} patch={}/{} failed={} stale={} rounds={} edit_to_green_ms={:?} confirm={} fallback={} recovery={}\n",
+            gate.schema,
+            gate.passed,
+            gate.valid_call_first_attempt_success,
+            gate.first_patch_revisions_from_latest_reads,
+            gate.first_patch_exact_hunks,
+            gate.fixture_mutation_evidence_valid,
+            gate.conflict_route,
+            gate.patch_changed_successes,
+            gate.patch_attempts,
+            gate.patch_failures,
+            gate.stale_refusals,
+            gate.model_rounds,
+            gate.edit_to_green_ms,
+            gate.confirm_reads_after_success,
+            gate.forbidden_calls,
+            gate.commit_recovery_required + gate.commit_unknown,
+        ));
+        for violation in &gate.violations {
+            out.push_str(&format!("           tool-edit FAIL {violation}\n"));
+        }
+    }
     for tool in &summary.tools {
         out.push_str(&format!(
             "           tool {} calls={} failed={}\n",
@@ -663,6 +689,34 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
         "materialize_rounds": metrics.materialize_rounds,
     });
     if let Some(map) = value.as_object_mut() {
+        map.extend(
+            json!({
+                "edit_attempts": metrics.edit_attempts,
+                "edit_started_calls": metrics.edit_started_calls,
+                "edit_successes": metrics.edit_successes,
+                "edit_committed_changes": metrics.edit_committed_changes,
+                "edit_failures": metrics.edit_failures,
+                "edit_first_attempts": metrics.edit_first_attempts,
+                "edit_first_attempt_successes": metrics.edit_first_attempt_successes,
+                "edit_first_attempt_committed_changes": metrics.edit_first_attempt_committed_changes,
+                "edit_unfinished_calls": metrics.edit_unfinished_calls,
+                "edit_ms_p50": metrics.edit_ms_p50,
+                "edit_ms_p95": metrics.edit_ms_p95,
+                "edit_to_trace_end_ms": metrics.edit_to_trace_end_ms,
+                "fs_read_bytes_total": metrics.fs_read_bytes_total,
+                "edit_success_bytes_before": metrics.edit_success_bytes_before,
+                "edit_success_bytes_after": metrics.edit_success_bytes_after,
+                "post_edit_confirm_reads": metrics.post_edit_confirm_reads,
+                "edit_failure_shell_fallback_proxy": metrics.edit_failure_shell_fallback_proxy,
+                "edit_failure_fs_write_fallback": metrics.edit_failure_fs_write_fallback,
+                "edit_commit_not_applied": metrics.edit_commit_not_applied,
+                "edit_commit_recovery_required": metrics.edit_commit_recovery_required,
+                "edit_commit_unknown": metrics.edit_commit_unknown,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
         map.extend(
             json!({
                 "model_attempts": metrics.model_attempts,

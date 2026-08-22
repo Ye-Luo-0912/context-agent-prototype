@@ -8,8 +8,8 @@
 use std::time::Instant;
 
 use agent_contracts::{
-    ContextEngine, ContextIngress, ContextMaintenanceTrigger, ContextSearchQuery, FocusState,
-    TaskId, ToolOutput,
+    ContextEngine, ContextIngress, ContextKind, ContextMaintenanceTrigger, ContextSearchQuery,
+    FocusState, TaskId, ToolOutput,
 };
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 
@@ -164,6 +164,253 @@ fn percentile(sorted: &[u64], pct: u64) -> u64 {
     }
     let index = ((sorted.len() - 1) as f64 * pct as f64 / 100.0).round() as usize;
     sorted[index.min(sorted.len() - 1)]
+}
+
+/// 复杂检索场景（真实引擎调用链）：ingest → GC 外置 → search_external。
+/// 多词 needle 的 token 全部在场但从不连续出现，用于区分"整段子串
+/// 校验"与"token 覆盖校验"两代实现；单词与 identity 控制组在两代
+/// 实现上都必须命中，作为回归守卫。逐行打印 `RC,` 前缀结果。
+pub async fn run_retrieval_complex_baseline() -> anyhow::Result<String> {
+    let dir = tempfile::tempdir()?;
+    // 小缓冲 + 关闭热实体召回：让语义条目真正被挤出外置，走存储侧
+    // 检索路径；Pin 条目保持驻留，语料同时覆盖两种 residency。
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        gc_buffer_capacity: 2,
+        gc_reactivate_per_pass: 0,
+        entity_affinity: false,
+        context_store_dir: Some(dir.path().to_path_buf()),
+        ..SimpleContextConfig::default()
+    });
+    let task_id = TaskId::new();
+    engine
+        .ingest(ContextIngress::FocusChanged {
+            focus: FocusState::for_task(task_id, "complex retrieval session"),
+        })
+        .await?;
+
+    // 多词语义埋入（UserMessage 摘要保留正文）。
+    let planted: &[&str] = &[
+        "auth service token refresh raised after the load test timeout review",
+        "db pool sized for burst traffic; connection breaker added",
+        "retry jitter added for flaky network calls under packet loss",
+        "cache eviction switched to an lru approximation under pressure",
+        "secret rotation enforced nightly; lease bound to prod keys",
+    ];
+    for content in planted {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: (*content).into(),
+            })
+            .await?;
+    }
+    // 干扰语料：与任何 needle token 无重叠。
+    const TOPICS: [&str; 12] = [
+        "logging",
+        "metrics",
+        "tracing",
+        "config",
+        "schema",
+        "migration",
+        "queue",
+        "worker",
+        "cron",
+        "tls",
+        "dns",
+        "proxy",
+    ];
+    const VERBS: [&str; 6] = [
+        "enabled",
+        "disabled",
+        "tuned",
+        "documented",
+        "reviewed",
+        "deferred",
+    ];
+    for i in 0..15 {
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: format!(
+                    "{} setup {} for component{}",
+                    TOPICS[i % TOPICS.len()],
+                    VERBS[(i / TOPICS.len()) % VERBS.len()],
+                    i
+                ),
+            })
+            .await?;
+    }
+    // identity 控制：ToolObservation 检索面是 stamped path@rev。
+    let identity_paths = [
+        "unique-fact-alpha-complex",
+        "unique-fact-bravo-complex",
+        "unique-fact-charlie-complex",
+    ];
+    for (index, path) in identity_paths.iter().enumerate() {
+        engine
+            .ingest(ContextIngress::ToolObservation {
+                output: ToolOutput {
+                    call_id: format!("cobs-{index}"),
+                    tool_name: "shell.exec".into(),
+                    ok: true,
+                    summary: "ok".into(),
+                    model_content: format!("step {index}: {path}"),
+                    artifact_ref: None,
+                    metadata: serde_json::json!({
+                        "path": path,
+                        "revision": format!("crev-{index}"),
+                    }),
+                },
+                scope_id: None,
+            })
+            .await?;
+    }
+    // kind 过滤用例的载体：驻留 Constraint。
+    engine
+        .ingest(ContextIngress::Pin {
+            content: "deploy rollback shortened to a one-hour window by policy".into(),
+            kind: ContextKind::Constraint,
+        })
+        .await?;
+
+    engine
+        .maintain(ContextMaintenanceTrigger::AfterModel)
+        .await?;
+    let gc = engine.gc().await?;
+    anyhow::ensure!(
+        !gc.externalized_ids.is_empty(),
+        "complex retrieval expected buffer overflow: {gc:?}"
+    );
+    let forgotten = gc.externalized_ids.len();
+
+    // (name, needle, 相关文档内容 marker, kind 过滤)。marker 取自埋入
+    // 文案，用于在返回投影中认定相关命中。
+    let cases: &[(&str, &str, &str, Option<ContextKind>)] = &[
+        ("auth_timeout", "auth timeout", "load test timeout", None),
+        (
+            "connection_pool",
+            "connection pool",
+            "connection breaker",
+            None,
+        ),
+        (
+            "retry_flaky_network",
+            "retry flaky network",
+            "flaky network calls",
+            None,
+        ),
+        (
+            "cache_eviction_lru",
+            "cache eviction lru",
+            "lru approximation",
+            None,
+        ),
+        (
+            "secret_rotation_lease",
+            "secret rotation lease",
+            "lease bound to prod keys",
+            None,
+        ),
+        (
+            "rollback_window_constraint",
+            "rollback window",
+            "one-hour window",
+            Some(ContextKind::Constraint),
+        ),
+        ("single_token_jitter", "jitter", "retry jitter added", None),
+        ("single_token_nightly", "nightly", "enforced nightly", None),
+        (
+            "identity_alpha",
+            "unique-fact-alpha-complex",
+            "unique-fact-alpha-complex",
+            None,
+        ),
+        (
+            "identity_bravo",
+            "unique-fact-bravo-complex",
+            "unique-fact-bravo-complex",
+            None,
+        ),
+        ("absent_terms", "zzqq noth1ng", "", None),
+    ];
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "RC,meta,forgotten={forgotten},cases={}\n",
+        cases.len()
+    ));
+    out.push_str(
+        "RC,row,name,category,hits,total_relevant,first_rank,recovered_from_gc,us_per_query\n",
+    );
+    let mut cat_stats: Vec<(&str, usize, usize)> = Vec::new();
+    for (name, needle, marker, kind) in cases {
+        let query = ContextSearchQuery {
+            kind: *kind,
+            ..ContextSearchQuery::new(*needle, 8)
+        };
+        let started = Instant::now();
+        let hits = engine.search_external(query.clone()).await?;
+        let us = started.elapsed().as_micros() as u64;
+        let again = engine.search_external(query).await?;
+        let ids: Vec<_> = hits.iter().map(|h| h.item_id).collect();
+        let again_ids: Vec<_> = again.iter().map(|h| h.item_id).collect();
+        anyhow::ensure!(
+            ids == again_ids,
+            "complex retrieval case {name} must be deterministic"
+        );
+
+        let relevant =
+            |h: &agent_contracts::ExternalizedContext| h.context_ref.summary.contains(marker);
+        let total_relevant = hits.iter().filter(|h| relevant(h)).count();
+        let first_rank = hits.iter().position(|h| relevant(h)).map(|p| p + 1);
+        let recovered = hits
+            .iter()
+            .filter(|h| relevant(h) && gc.externalized_ids.contains(&h.item_id))
+            .count();
+        let category = if kind.is_some() {
+            "kind_filtered"
+        } else if name.starts_with("identity") {
+            "identity_control"
+        } else if name.starts_with("single_token") {
+            "single_word_control"
+        } else if *name == "absent_terms" {
+            "control"
+        } else {
+            "multi_word"
+        };
+        // 回归守卫：两代实现都必须成立的控制组断言。
+        if category == "control" {
+            anyhow::ensure!(
+                total_relevant == 0 && hits.is_empty(),
+                "absent terms must stay empty"
+            );
+        }
+        if category == "single_word_control" || category == "identity_control" {
+            anyhow::ensure!(
+                total_relevant >= 1,
+                "control case {name} must keep hitting on both implementations"
+            );
+        }
+        let rank = first_rank.map_or("-".into(), |r| r.to_string());
+        out.push_str(&format!(
+            "RC,row,{name},{category},{},{total_relevant},{rank},{recovered},{us}\n",
+            hits.len()
+        ));
+        let hit_case = usize::from(!hits.is_empty());
+        match cat_stats.iter_mut().find(|(c, _, _)| *c == category) {
+            Some(row) => {
+                row.1 += 1;
+                row.2 += hit_case;
+            }
+            None => cat_stats.push((category, 1, hit_case)),
+        }
+    }
+
+    // 分类汇总（多词类不设断言——它正是两代实现的差异所在）。
+    for (category, n, hit_cases) in cat_stats {
+        out.push_str(&format!(
+            "RC,summary,{category},cases={n},hit_cases={hit_cases}/{n}\n"
+        ));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

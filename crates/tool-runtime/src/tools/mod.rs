@@ -134,6 +134,13 @@ pub(crate) fn display_relative(workspace: &Workspace, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// Quote untrusted workspace text before placing it in a line-oriented model
+/// protocol. Workspace paths can contain spaces and, on Unix, newlines; JSON
+/// string syntax keeps them from forging adjacent `revision=` fields.
+pub(crate) fn model_json_string(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing a Rust string cannot fail")
+}
+
 /// The file-revision identity shared by the read and patch tools: the
 /// SHA-256 of the file's bytes as a lowercase hex string. `fs.read`
 /// reports it (`revision`), and `edit.patch` requires it as
@@ -148,8 +155,8 @@ pub(crate) fn content_digest(bytes: &[u8]) -> String {
 }
 
 /// The line-ending shape of the current on-disk text. Exact edits preserve
-/// a uniform target style, but deliberately leave mixed/legacy files
-/// byte-exact instead of guessing how they should be rewritten.
+/// a uniform target style; mixed files use logical newline-token matching
+/// and reconstruct only the matched region's physical EOL sequence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LineEnding {
     None,
@@ -201,10 +208,10 @@ impl LineEnding {
 }
 
 /// Normalize only the representation of line breaks in model-provided edit
-/// text. This is not fuzzy matching: every non-line-ending byte must still
-/// match exactly, and mixed target files stay fully byte-exact. A uniform
-/// target keeps its existing style so an LF-formatted tool argument can edit
-/// a CRLF Windows file without producing a mixed-ending result.
+/// text for a uniform target. This is not fuzzy matching: every non-EOL byte
+/// still matches exactly. Mixed targets are handled later against a concrete
+/// raw match so each physical newline can be preserved by ordinal rather than
+/// guessing one global style.
 pub(crate) fn normalize_edit_line_endings(text: &str, target: LineEnding) -> Cow<'_, str> {
     match target {
         LineEnding::CrLf => {
@@ -265,6 +272,335 @@ pub(crate) fn exact_match(
     }
 }
 
+/// Locate an edit anchor with the same strict content contract as
+/// `exact_match`, except that LF and CRLF are two physical encodings of one
+/// logical newline token. Lone CR remains an ordinary byte. This closes the
+/// `fs.read` projection gap for mixed-EOL files without admitting whitespace,
+/// indentation, case, Unicode, or positional fuzziness.
+pub(crate) fn exact_edit_match(
+    text: &str,
+    needle: &str,
+    target: LineEnding,
+    occurrence: Option<usize>,
+) -> Result<ExactMatch, ExactMatchError> {
+    let needs_logical_eol_match =
+        target == LineEnding::Mixed || (target == LineEnding::CrLf && contains_lone_cr(needle));
+    if !needs_logical_eol_match {
+        return exact_match(text, needle, occurrence);
+    }
+    let canonical_text = canonical_eol(text);
+    let canonical_needle = canonical_eol(needle);
+    let found = exact_match(&canonical_text, &canonical_needle, occurrence)?;
+    let mut mapper = CanonicalOffsetMapper::new(text);
+    let start = mapper.advance_to(found.start);
+    let end = mapper.advance_to(found.end);
+    debug_assert!(text.is_char_boundary(start));
+    debug_assert!(text.is_char_boundary(end));
+    Ok(ExactMatch {
+        start,
+        end,
+        count: found.count,
+    })
+}
+
+/// Whether `text` contains a CR byte that is not the first half of CRLF.
+/// Byte scanning is intentional: CR/LF are ASCII and cannot occur inside a
+/// multi-byte UTF-8 code point.
+pub(crate) fn contains_lone_cr(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes
+        .iter()
+        .enumerate()
+        .any(|(index, byte)| *byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'))
+}
+
+fn canonical_eol(text: &str) -> Cow<'_, str> {
+    if text.contains("\r\n") {
+        Cow::Owned(text.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EolStyle {
+    Lf,
+    CrLf,
+}
+
+impl EolStyle {
+    const fn len(self) -> usize {
+        match self {
+            Self::Lf => 1,
+            Self::CrLf => 2,
+        }
+    }
+
+    fn push_to(self, output: &mut String) {
+        match self {
+            Self::Lf => output.push('\n'),
+            Self::CrLf => output.push_str("\r\n"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EolToken {
+    start: usize,
+    end: usize,
+    style: EolStyle,
+}
+
+struct EolTokens<'a> {
+    bytes: &'a [u8],
+    index: usize,
+}
+
+impl<'a> EolTokens<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            bytes: text.as_bytes(),
+            index: 0,
+        }
+    }
+}
+
+impl Iterator for EolTokens<'_> {
+    type Item = EolToken;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < self.bytes.len() {
+            let start = self.index;
+            if self.bytes[start] == b'\r' && self.bytes.get(start + 1) == Some(&b'\n') {
+                self.index += 2;
+                return Some(EolToken {
+                    start,
+                    end: self.index,
+                    style: EolStyle::CrLf,
+                });
+            }
+            self.index += 1;
+            if self.bytes[start] == b'\n' {
+                return Some(EolToken {
+                    start,
+                    end: self.index,
+                    style: EolStyle::Lf,
+                });
+            }
+        }
+        None
+    }
+}
+
+/// Monotonic canonical-LF offset to raw-byte mapper. Advancing through a
+/// CRLF consumes one canonical byte and two raw bytes; every other byte is
+/// one-to-one. `last_eol` gives replace-all a local deterministic style
+/// without rescanning the file for every occurrence.
+struct CanonicalOffsetMapper<'a> {
+    bytes: &'a [u8],
+    raw: usize,
+    canonical: usize,
+    last_eol: Option<EolStyle>,
+}
+
+impl<'a> CanonicalOffsetMapper<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            bytes: text.as_bytes(),
+            raw: 0,
+            canonical: 0,
+            last_eol: None,
+        }
+    }
+
+    fn advance_to(&mut self, target: usize) -> usize {
+        while self.canonical < target && self.raw < self.bytes.len() {
+            if self.bytes[self.raw] == b'\r' && self.bytes.get(self.raw + 1) == Some(&b'\n') {
+                self.raw += 2;
+                self.canonical += 1;
+                self.last_eol = Some(EolStyle::CrLf);
+            } else {
+                if self.bytes[self.raw] == b'\n' {
+                    self.last_eol = Some(EolStyle::Lf);
+                }
+                self.raw += 1;
+                self.canonical += 1;
+            }
+        }
+        debug_assert_eq!(self.canonical, target);
+        self.raw
+    }
+}
+
+fn replacement_metrics(
+    replacement: &str,
+    matched: &str,
+    fallback: Option<EolStyle>,
+) -> (usize, bool) {
+    let mut matched_eols = EolTokens::new(matched);
+    let mut last_matched = None;
+    let mut length = replacement.len();
+    let mut changed = false;
+    for token in EolTokens::new(replacement) {
+        let selected = matched_eols
+            .next()
+            .map(|token| token.style)
+            .or(last_matched);
+        let selected = selected.or(fallback).unwrap_or(token.style);
+        if selected != token.style {
+            changed = true;
+        }
+        length = length - token.style.len() + selected.len();
+        last_matched = Some(selected);
+    }
+    (length, changed)
+}
+
+fn push_reconstructed_replacement(
+    output: &mut String,
+    replacement: &str,
+    matched: &str,
+    fallback: Option<EolStyle>,
+) -> bool {
+    let mut matched_eols = EolTokens::new(matched);
+    let mut last_matched = None;
+    let mut cursor = 0usize;
+    let mut changed = false;
+    for token in EolTokens::new(replacement) {
+        output.push_str(&replacement[cursor..token.start]);
+        let selected = matched_eols
+            .next()
+            .map(|token| token.style)
+            .or(last_matched);
+        let selected = selected.or(fallback).unwrap_or(token.style);
+        selected.push_to(output);
+        changed |= selected != token.style;
+        last_matched = Some(selected);
+        cursor = token.end;
+    }
+    output.push_str(&replacement[cursor..]);
+    changed
+}
+
+fn preceding_eol(text: &str, raw_offset: usize) -> Option<EolStyle> {
+    EolTokens::new(&text[..raw_offset])
+        .last()
+        .map(|token| token.style)
+}
+
+fn following_eol(text: &str, raw_offset: usize) -> Option<EolStyle> {
+    EolTokens::new(&text[raw_offset..])
+        .next()
+        .map(|token| token.style)
+}
+
+/// Rebuild model-provided newlines for one mixed-EOL raw match. Newline j
+/// inherits physical style j from the matched span; extras inherit the last
+/// matched style, then a deterministic local neighbor, then their explicit
+/// argument style. Only newline encoding can change.
+pub(crate) fn adapt_edit_replacement<'a>(
+    text: &str,
+    found: ExactMatch,
+    replacement: &'a str,
+    target: LineEnding,
+) -> Cow<'a, str> {
+    if target != LineEnding::Mixed || !replacement.contains('\n') {
+        return Cow::Borrowed(replacement);
+    }
+    let matched = &text[found.start..found.end];
+    let fallback = preceding_eol(text, found.start).or_else(|| following_eol(text, found.end));
+    let mut rebuilt = String::with_capacity(replacement.len());
+    let changed = push_reconstructed_replacement(&mut rebuilt, replacement, matched, fallback);
+    if changed {
+        Cow::Owned(rebuilt)
+    } else {
+        Cow::Borrowed(replacement)
+    }
+}
+
+pub(crate) struct LogicalEolReplaceAll {
+    pub(crate) count: usize,
+    pub(crate) updated: Option<String>,
+    pub(crate) line_endings_adapted: bool,
+}
+
+/// Replace every logical-newline-exact occurrence when raw matching is not
+/// token-safe: mixed EOL text, or an anchor containing a literal lone CR
+/// against a CRLF target.
+/// Two monotonic passes keep match state constant: the first computes the
+/// exact physical output size before allocation; the second emits directly
+/// without collecting occurrence offsets.
+pub(crate) fn replace_all_logical_eol(
+    text: &str,
+    old: &str,
+    new: &str,
+    max_output_bytes: usize,
+) -> Result<LogicalEolReplaceAll, ()> {
+    debug_assert!(!old.is_empty());
+    let canonical_text = canonical_eol(text);
+    let canonical_old = canonical_eol(old);
+    let first_eol = EolTokens::new(text).next().map(|token| token.style);
+    let mut mapper = CanonicalOffsetMapper::new(text);
+    let mut count = 0usize;
+    let mut removed = 0usize;
+    let mut added = 0usize;
+    let mut adapted = false;
+    for (canonical_start, matched) in canonical_text.match_indices(canonical_old.as_ref()) {
+        count += 1;
+        let start = mapper.advance_to(canonical_start);
+        let preceding = mapper.last_eol;
+        let end = mapper.advance_to(canonical_start + matched.len());
+        let raw_match = &text[start..end];
+        let fallback = preceding.or(first_eol);
+        let (replacement_len, replacement_adapted) = replacement_metrics(new, raw_match, fallback);
+        removed = removed.checked_add(end - start).ok_or(())?;
+        added = added.checked_add(replacement_len).ok_or(())?;
+        if added > max_output_bytes {
+            return Err(());
+        }
+        adapted |= raw_match != old || replacement_adapted;
+    }
+    if count == 0 {
+        return Ok(LogicalEolReplaceAll {
+            count,
+            updated: None,
+            line_endings_adapted: false,
+        });
+    }
+
+    let projected = text
+        .len()
+        .checked_sub(removed)
+        .and_then(|length| length.checked_add(added))
+        .ok_or(())?;
+    if projected > max_output_bytes {
+        return Err(());
+    }
+    let mut output = String::with_capacity(projected);
+    let mut mapper = CanonicalOffsetMapper::new(text);
+    let mut raw_cursor = 0usize;
+    for (canonical_start, matched) in canonical_text.match_indices(canonical_old.as_ref()) {
+        let start = mapper.advance_to(canonical_start);
+        let preceding = mapper.last_eol;
+        let end = mapper.advance_to(canonical_start + matched.len());
+        output.push_str(&text[raw_cursor..start]);
+        push_reconstructed_replacement(
+            &mut output,
+            new,
+            &text[start..end],
+            preceding.or(first_eol),
+        );
+        raw_cursor = end;
+    }
+    output.push_str(&text[raw_cursor..]);
+    debug_assert_eq!(output.len(), projected);
+    Ok(LogicalEolReplaceAll {
+        count,
+        updated: Some(output),
+        line_endings_adapted: adapted,
+    })
+}
+
 /// Project a replacement before allocating the result. All text mutators
 /// use the same file-size ceiling for both input and output, preventing a
 /// small replace-all request from expanding into an unbounded allocation.
@@ -307,10 +643,9 @@ pub(crate) fn candidate_regions(text: &str, needle: &str) -> Vec<String> {
     if probe.trim().is_empty() {
         return Vec::new();
     }
-    let lines: Vec<&str> = text.lines().collect();
-    for (index, line) in lines.iter().enumerate() {
+    for (index, line) in text.lines().enumerate() {
         if line.contains(&probe) {
-            out.push(window_at(&lines, index));
+            out.push(window_at(text, index));
             if out.len() >= MAX_EDIT_CANDIDATES {
                 break;
             }
@@ -321,15 +656,16 @@ pub(crate) fn candidate_regions(text: &str, needle: &str) -> Vec<String> {
 
 fn region_at(text: &str, byte_index: usize) -> String {
     let before = text[..byte_index].lines().count().saturating_sub(1);
-    let lines: Vec<&str> = text.lines().collect();
-    window_at(&lines, before)
+    window_at(text, before)
 }
 
-fn window_at(lines: &[&str], center: usize) -> String {
+fn window_at(text: &str, center: usize) -> String {
     let start = center.saturating_sub(CANDIDATE_CONTEXT_LINES);
-    let end = (center + CANDIDATE_CONTEXT_LINES + 1).min(lines.len());
+    let take = center
+        .saturating_add(CANDIDATE_CONTEXT_LINES + 1)
+        .saturating_sub(start);
     let mut block = String::new();
-    for (offset, line) in lines[start..end].iter().enumerate() {
+    for (offset, line) in text.lines().skip(start).take(take).enumerate() {
         let number = start + offset + 1;
         let clipped: String = line.chars().take(120).collect();
         block.push_str(&format!("{number:>6} | {clipped}\n"));
@@ -850,6 +1186,56 @@ mod echo_tests {
     use super::*;
 
     #[test]
+    fn model_protocol_strings_escape_header_breaks() {
+        assert_eq!(
+            model_json_string("dir/line\nrevision=fake\tfile.txt"),
+            "\"dir/line\\nrevision=fake\\tfile.txt\""
+        );
+    }
+
+    #[test]
+    fn candidate_regions_keep_first_three_windows_in_newline_dense_text() {
+        let gap = 64 * 1024;
+        let labels = ["one", "two", "three", "four"];
+        let mut text = String::with_capacity(labels.len() * (gap + 16));
+        for label in labels {
+            for _ in 0..gap {
+                text.push('\n');
+            }
+            text.push_str("hit ");
+            text.push_str(label);
+            text.push('\n');
+        }
+
+        // Exercise both allocation sites from the old implementation: an
+        // exact needle goes through `region_at`, while a missing multi-line
+        // needle falls back to per-line probes in `candidate_regions`.
+        let exact = candidate_regions(&text, "hit");
+        let fallback = candidate_regions(&text, "hit\nnot-present");
+        for candidates in [&exact, &fallback] {
+            assert_eq!(candidates.len(), MAX_EDIT_CANDIDATES);
+            for (index, label) in ["one", "two", "three"].iter().enumerate() {
+                let line_number = (index + 1) * (gap + 1);
+                assert!(
+                    candidates[index].contains(&format!("{line_number:>6} | hit {label}")),
+                    "candidate {index} lost its line-numbered hit: {}",
+                    candidates[index]
+                );
+                assert!(
+                    candidates[index].chars().count() <= CANDIDATE_MAX_CHARS,
+                    "candidate windows must retain the existing hard cap"
+                );
+            }
+            assert!(
+                candidates
+                    .iter()
+                    .all(|candidate| !candidate.contains("hit four")),
+                "only the first three candidates may be returned"
+            );
+        }
+    }
+
+    #[test]
     fn echo_covers_the_changed_region_with_context_and_numbers() {
         let original = "l1\nl2\nl3\nl4\nfn b() {}\nl6\nl7\nl8\nl9\nl10\n";
         let updated = original.replace("fn b() {}", "fn b() -> u8 { 1 }");
@@ -934,7 +1320,8 @@ mod echo_tests {
             normalize_edit_line_endings("a\r\nb\r\n", LineEnding::Lf),
             "a\nb\n"
         );
-        // Mixed targets are never guessed at or silently rewritten.
+        // Mixed targets have no global style; per-match reconstruction owns
+        // their explicit newline-token adaptation.
         assert!(matches!(
             normalize_edit_line_endings("a\nb", LineEnding::Mixed),
             Cow::Borrowed(_)
@@ -959,6 +1346,85 @@ mod echo_tests {
             exact_match("abc", "z", None),
             Err(ExactMatchError::NoMatch { count: 0 })
         );
+    }
+
+    #[test]
+    fn mixed_eol_token_match_maps_raw_utf8_offsets_and_keeps_lone_cr_literal() {
+        let text = "你\r\n好\n世界\r\n";
+        let found = exact_edit_match(text, "你\n好\n世界", LineEnding::Mixed, None).unwrap();
+        assert_eq!(&text[found.start..found.end], "你\r\n好\n世界");
+        assert!(text.is_char_boundary(found.start));
+        assert!(text.is_char_boundary(found.end));
+
+        assert_eq!(
+            exact_edit_match("a\rb\n", "a\nb", LineEnding::Mixed, None),
+            Err(ExactMatchError::NoMatch { count: 0 }),
+            "a lone CR is literal content, not a logical newline"
+        );
+        assert_eq!(
+            exact_edit_match("a\r\nb\n", "\r", LineEnding::Mixed, None),
+            Err(ExactMatchError::NoMatch { count: 0 }),
+            "the CR half of a CRLF token is not a standalone literal CR"
+        );
+        assert_eq!(
+            exact_edit_match("a\r\nb\r\n", "\r", LineEnding::CrLf, None),
+            Err(ExactMatchError::NoMatch { count: 0 }),
+            "uniform CRLF text has the same token boundary"
+        );
+        let legacy = "\r\r\n";
+        let found = exact_edit_match(legacy, "\r\n", LineEnding::Mixed, None).unwrap();
+        assert_eq!((found.start, found.end), (1, 3));
+        let literal = exact_edit_match(legacy, "\r", LineEnding::Mixed, None).unwrap();
+        assert_eq!((literal.start, literal.end), (0, 1));
+    }
+
+    #[test]
+    fn mixed_eol_logical_ambiguity_and_occurrence_stay_explicit() {
+        let text = "x\r\ny\n--\nx\ny\r\n";
+        assert_eq!(
+            exact_edit_match(text, "x\ny", LineEnding::Mixed, None),
+            Err(ExactMatchError::Ambiguous { count: 2 })
+        );
+        let second = exact_edit_match(text, "x\r\ny", LineEnding::Mixed, Some(2)).unwrap();
+        assert_eq!(&text[second.start..second.end], "x\ny");
+        assert_eq!(second.count, 2);
+    }
+
+    #[test]
+    fn mixed_eol_replacement_preserves_matched_styles_by_ordinal() {
+        let text = "head\r\nA\r\nB\nC\r\ntail\n";
+        let found = exact_edit_match(text, "A\nB\nC", LineEnding::Mixed, None).unwrap();
+        let replacement = adapt_edit_replacement(text, found, "A1\nB1\nC1\nD", LineEnding::Mixed);
+        assert_eq!(replacement, "A1\r\nB1\nC1\nD");
+
+        let single = exact_edit_match(text, "tail", LineEnding::Mixed, None).unwrap();
+        let replacement = adapt_edit_replacement(text, single, "u\nv", LineEnding::Mixed);
+        assert_eq!(
+            replacement, "u\r\nv",
+            "a new newline inherits the nearest preceding local style"
+        );
+    }
+
+    #[test]
+    fn mixed_eol_replace_all_preserves_each_occurrences_local_style() {
+        let text = "x\r\ny\n--\nx\ny\r\n";
+        let result = replace_all_logical_eol(text, "x\ny", "u\nv\nw", 1024).unwrap();
+        assert_eq!(result.count, 2);
+        assert!(result.line_endings_adapted);
+        assert_eq!(result.updated.unwrap(), "u\r\nv\r\nw\n--\nu\nv\nw\r\n");
+
+        assert!(replace_all_logical_eol(text, "x\ny", &"z".repeat(1024), 1024).is_err());
+        let missing = replace_all_logical_eol(text, "missing", "value", 1024).unwrap();
+        assert_eq!(missing.count, 0);
+        assert!(missing.updated.is_none());
+
+        let literal_cr = replace_all_logical_eol("\r\r\nx\n", "\r", "R", 1024).unwrap();
+        assert_eq!(literal_cr.count, 1);
+        assert_eq!(literal_cr.updated.unwrap(), "R\r\nx\n");
+
+        let crlf_half = replace_all_logical_eol("a\r\nb\r\n", "\r", "R", 1024).unwrap();
+        assert_eq!(crlf_half.count, 0, "lone CR cannot split a CRLF token");
+        assert!(crlf_half.updated.is_none());
     }
 
     #[test]

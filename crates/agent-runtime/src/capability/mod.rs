@@ -1534,6 +1534,25 @@ fn catalog_row_line(entry: &ToolCatalogEntry) -> String {
 }
 
 impl CapabilityAwareDispatcher {
+    /// One bounded line naming the tools already on the model surface.
+    /// Tool observations leave the frame when their scope closes, so the
+    /// loaded set is otherwise invisible after eviction and the model
+    /// re-loads tools it already has (observed live: repeated
+    /// `capability.manage op=load` within one cell).
+    fn loaded_surface_trailer(&self) -> String {
+        let catalog = self.unified_catalog();
+        let mut names: Vec<&str> = catalog
+            .iter()
+            .filter(|entry| entry.state.in_surface())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names.truncate(16);
+        (!names.is_empty())
+            .then(|| format!("\nsession-loaded: {}", names.join(" ")))
+            .unwrap_or_default()
+    }
+
     async fn run_search(
         &self,
         request: ToolExecutionRequest,
@@ -1592,16 +1611,18 @@ impl CapabilityAwareDispatcher {
         let page: Vec<_> = entries.into_iter().take(page_size).collect();
         let has_more = remaining > page.len();
         let lines: Vec<String> = page.iter().map(catalog_row_line).collect();
+        let mut model_content = if lines.is_empty() {
+            "no tools match".to_string()
+        } else {
+            lines.join("\n")
+        };
+        model_content.push_str(&self.loaded_surface_trailer());
         Ok(ToolOutput {
             call_id: request.call.id,
             tool_name: CAPABILITY_MANAGE.into(),
             ok: true,
             summary: format!("{} tools matched ({} on the model surface)", total, active),
-            model_content: if lines.is_empty() {
-                "no tools match".to_string()
-            } else {
-                lines.join("\n")
-            },
+            model_content,
             artifact_ref,
             metadata: json!({
                 "op": "search",
@@ -1688,15 +1709,37 @@ impl CapabilityAwareDispatcher {
         request: ToolExecutionRequest,
         name: String,
     ) -> AgentResult<ToolOutput> {
-        self.load_tool(&name)?;
+        // A repeat load for a tool already on the surface is a cheap
+        // no-op: the model cannot see the loaded set after its earlier
+        // observations were evicted, so treat the redundancy as expected.
+        let already = self
+            .unified_catalog()
+            .iter()
+            .find(|entry| entry.name == name)
+            .is_some_and(|entry| entry.state.in_surface());
+        if !already {
+            self.load_tool(&name)?;
+        }
+        let trailer = self.loaded_surface_trailer();
+        let (summary, model_content) = if already {
+            (
+                format!("already loaded: {name}"),
+                format!("already loaded: {name} — no change{trailer}"),
+            )
+        } else {
+            (
+                format!("tool loaded: {name}"),
+                format!("tool loaded: {name} — its schema is now offered to the model{trailer}"),
+            )
+        };
         Ok(ToolOutput {
             call_id: request.call.id,
             tool_name: CAPABILITY_MANAGE.into(),
             ok: true,
-            summary: format!("tool loaded: {name}"),
-            model_content: format!("tool loaded: {name} — its schema is now offered to the model"),
+            summary,
+            model_content,
             artifact_ref: None,
-            metadata: json!({"tool": name}),
+            metadata: json!({"tool": name, "already_loaded": already}),
         })
     }
 

@@ -1,0 +1,9 @@
+{
+  "schema": "agent-eval.tool-edit.v2",
+  "tasks": [
+    "tasks/crlf_multi_hunk.json",
+    "tasks/mixed_eol.json",
+    "tasks/stale_revision_recovery.json",
+    "tasks/batch_two_file.json"
+  ]
+}

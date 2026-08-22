@@ -90,6 +90,23 @@ digest honestly (a real drift marks the source changed). A failed
 *read* saw nothing and stays out of the fact table. Attention is
 unchanged: failed outputs never heat the working set.
 
+**Commit-time content conflict.** Existing edit targets are leased by
+canonical path key before one bounded transaction snapshot is taken; batch
+keys are sorted, and every prepared child retains the shared lease group
+through final composite settlement. Same-`Workspace` writers therefore
+queue and re-snapshot the settled winner while unrelated paths remain
+parallel. A prepared mutation re-checks the target immediately before
+replace. Drift from an external writer already visible when that check begins
+settles as definite `NotApplied` with `stale_revision`; it is not a durability
+failure and does not require the recovery fence. Hash then rename is still
+not an atomic CAS against another process or independently opened workspace
+authority. Runtime drops the prepared output's proposed
+`revision` / `files[]` metadata from every result other than fully durable
+`Applied`, retains only bounded `attempted_paths`, and attaches the trusted
+failure class where non-application is definite. Because a receipt does not
+carry an intervening writer's body/revision or the exact subset of a partial
+composite, Runtime does not manufacture Fresh resource facts from it.
+
 ### Freshness
 
 `may_mutate_workspace` is the authority fence. Knowledge uses

@@ -92,6 +92,53 @@ pub struct RunMetrics {
     /// Counts of trusted `metadata.failure_class` values (`TOOL-ERROR-01`).
     /// Includes classified no-match searches that still have `ok: true`.
     pub tool_failure_classes: BTreeMap<String, u64>,
+    /// Structured edit attempts observed at `ToolFinished`. This includes
+    /// runtime refusals that deliberately never reached `ToolStarted`.
+    pub edit_attempts: u64,
+    /// Structured edit calls that reached execution (`ToolStarted`).
+    pub edit_started_calls: u64,
+    pub edit_successes: u64,
+    /// Successful outputs that actually proposed and durably committed a
+    /// changed body (`metadata.changed=true`), excluding successful no-ops.
+    pub edit_committed_changes: u64,
+    pub edit_failures: u64,
+    /// A per-cell denominator/numerator for the first structured edit
+    /// attempt. This is intentionally not called "valid": only a
+    /// fixture-level oracle can prove that the model supplied valid args.
+    pub edit_first_attempts: u64,
+    pub edit_first_attempt_successes: u64,
+    pub edit_first_attempt_committed_changes: u64,
+    /// Started edits with no matching terminal output in the captured
+    /// trace (usually cancellation or an incomplete trace).
+    pub edit_unfinished_calls: u64,
+    /// Paired ToolStarted -> ToolFinished latency for structured edits.
+    pub edit_ms_p50: u64,
+    pub edit_ms_p95: u64,
+    /// Time from the first structured edit attempt to the final captured
+    /// event. A passing hidden verifier may use this as an explicitly
+    /// labelled edit-to-final-verification proxy; it is not an intermediate
+    /// green measurement.
+    pub edit_to_trace_end_ms: u64,
+    /// Successful `fs.read` bytes reported by the tool.
+    pub fs_read_bytes_total: u64,
+    /// Bytes before/after successful structured edits. Failed or unsettled
+    /// effects intentionally do not expose proposed bodies, so these remain
+    /// successful-edit totals rather than estimates.
+    pub edit_success_bytes_before: u64,
+    pub edit_success_bytes_after: u64,
+    /// `fs.read` calls on a path after a successful structured edit to that
+    /// path. The edit result already carries a revision and bounded echo,
+    /// so this exposes avoidable confirmation reads.
+    pub post_edit_confirm_reads: u64,
+    /// First shell/full-write fallback after an edit-failure episode. Shell
+    /// is only a sequence proxy: events do not claim that the command edited
+    /// a file.
+    pub edit_failure_shell_fallback_proxy: u64,
+    pub edit_failure_fs_write_fallback: u64,
+    /// Runtime settlement outcomes for structured edits.
+    pub edit_commit_not_applied: u64,
+    pub edit_commit_recovery_required: u64,
+    pub edit_commit_unknown: u64,
 
     // Materialization (the Phase 0 measurement baseline: how big the model
     // input actually was and where the working set lived).
@@ -197,6 +244,11 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     let mut materialize_ms_samples: Vec<u64> = Vec::new();
     let mut search_ms_samples: Vec<u64> = Vec::new();
     let mut open_calls: HashMap<String, OpenManageCall> = HashMap::new();
+    let mut open_edits: HashMap<String, OpenEditCall> = HashMap::new();
+    let mut edit_ms_samples: Vec<u64> = Vec::new();
+    let mut successfully_edited_paths: HashSet<String> = HashSet::new();
+    let mut awaiting_edit_fallback = false;
+    let mut first_edit_timestamp_ms: Option<u64> = None;
     let mut forgotten: HashSet<ContextItemId> = HashSet::new();
     let mut recovered: HashSet<ContextItemId> = HashSet::new();
     let mut recovered_path: HashMap<ContextItemId, RecoverPath> = HashMap::new();
@@ -208,11 +260,40 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             RuntimeEvent::UserMessageAccepted { input } if input.is_applied() => metrics.turns += 1,
             RuntimeEvent::ToolStarted { call } => {
                 metrics.tool_calls += 1;
+                if is_edit_tool(&call.name) {
+                    metrics.edit_started_calls += 1;
+                    first_edit_timestamp_ms.get_or_insert(envelope.timestamp_ms);
+                    open_edits.insert(
+                        call.id.clone(),
+                        OpenEditCall {
+                            started_ms: envelope.timestamp_ms,
+                            paths: argument_paths(&call.arguments),
+                        },
+                    );
+                }
                 if call.name == "fs.read"
                     && let Some(path) = call.arguments.get("path").and_then(|value| value.as_str())
-                    && !read_paths.insert(path.to_string())
                 {
-                    metrics.repeated_fs_reads += 1;
+                    let path = normalized_path(path);
+                    if !read_paths.insert(path.clone()) {
+                        metrics.repeated_fs_reads += 1;
+                    }
+                    if successfully_edited_paths.contains(&path) {
+                        metrics.post_edit_confirm_reads += 1;
+                    }
+                }
+                if awaiting_edit_fallback {
+                    match call.name.as_str() {
+                        "shell.exec" => {
+                            metrics.edit_failure_shell_fallback_proxy += 1;
+                            awaiting_edit_fallback = false;
+                        }
+                        "fs.write" => {
+                            metrics.edit_failure_fs_write_fallback += 1;
+                            awaiting_edit_fallback = false;
+                        }
+                        _ => {}
+                    }
                 }
                 if let Some(op) = manage_op(&call.name, &call.arguments) {
                     match op.as_str() {
@@ -260,6 +341,81 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                         FsReadMotive::Warm => metrics.reread_motive_warm += 1,
                         FsReadMotive::Stored => metrics.reread_motive_stored += 1,
                         FsReadMotive::Changed => metrics.reread_motive_changed += 1,
+                    }
+                }
+                if output.tool_name == "fs.read" && output.ok {
+                    metrics.fs_read_bytes_total = metrics
+                        .fs_read_bytes_total
+                        .saturating_add(metadata_u64(&output.metadata, "bytes"));
+                }
+                if is_edit_tool(&output.tool_name) {
+                    metrics.edit_attempts += 1;
+                    first_edit_timestamp_ms.get_or_insert(envelope.timestamp_ms);
+                    if metrics.edit_first_attempts == 0 {
+                        metrics.edit_first_attempts = 1;
+                        if output.ok {
+                            metrics.edit_first_attempt_successes = 1;
+                            if output
+                                .metadata
+                                .get("changed")
+                                .and_then(|value| value.as_bool())
+                                == Some(true)
+                            {
+                                metrics.edit_first_attempt_committed_changes = 1;
+                            }
+                        }
+                    }
+                    let open = open_edits.remove(&output.call_id);
+                    if let Some(open) = &open {
+                        edit_ms_samples.push(envelope.timestamp_ms.saturating_sub(open.started_ms));
+                    }
+                    if output.ok {
+                        metrics.edit_successes += 1;
+                        if output
+                            .metadata
+                            .get("changed")
+                            .and_then(|value| value.as_bool())
+                            == Some(true)
+                        {
+                            metrics.edit_committed_changes += 1;
+                        }
+                        awaiting_edit_fallback = false;
+                        let mut paths = output_paths(&output.metadata);
+                        let output_named_paths = output.metadata.get("path").is_some()
+                            || output.metadata.get("files").is_some();
+                        if paths.is_empty()
+                            && !output_named_paths
+                            && let Some(open) = open
+                        {
+                            paths = open.paths;
+                        }
+                        successfully_edited_paths.extend(paths);
+                        let (before, after) = successful_edit_bytes(&output.metadata);
+                        metrics.edit_success_bytes_before =
+                            metrics.edit_success_bytes_before.saturating_add(before);
+                        metrics.edit_success_bytes_after =
+                            metrics.edit_success_bytes_after.saturating_add(after);
+                    } else {
+                        metrics.edit_failures += 1;
+                        awaiting_edit_fallback = true;
+                    }
+                    match output
+                        .metadata
+                        .get("commit_state")
+                        .and_then(|value| value.as_str())
+                    {
+                        Some("not_applied" | "rejected") => metrics.edit_commit_not_applied += 1,
+                        Some("not_applied_authority_recovery_required") => {
+                            metrics.edit_commit_not_applied += 1;
+                            metrics.edit_commit_recovery_required += 1;
+                        }
+                        Some(
+                            "applied_recovery_required" | "applied_authority_recovery_required",
+                        ) => metrics.edit_commit_recovery_required += 1,
+                        Some(state) if state.starts_with("unknown") || state == "unsettled" => {
+                            metrics.edit_commit_unknown += 1
+                        }
+                        _ => {}
                     }
                 }
                 if let Some(class) = output.failure_class() {
@@ -494,6 +650,15 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
         metrics.search_ms_p50 = percentile(&search_ms_samples, 50);
         metrics.search_ms_p95 = percentile(&search_ms_samples, 95);
     }
+    if !edit_ms_samples.is_empty() {
+        edit_ms_samples.sort_unstable();
+        metrics.edit_ms_p50 = percentile(&edit_ms_samples, 50);
+        metrics.edit_ms_p95 = percentile(&edit_ms_samples, 95);
+    }
+    metrics.edit_unfinished_calls = open_edits.len() as u64;
+    if let (Some(first), Some(last)) = (first_edit_timestamp_ms, events.last()) {
+        metrics.edit_to_trace_end_ms = last.timestamp_ms.saturating_sub(first);
+    }
     metrics.forgotten_items = forgotten.len() as u64;
     metrics.recovered_items = recovered.len() as u64;
     metrics.recovery_explicit_search = recovered_path
@@ -527,6 +692,96 @@ struct OpenManageCall {
     started_ms: u64,
     op: String,
     item_id: Option<ContextItemId>,
+}
+
+struct OpenEditCall {
+    started_ms: u64,
+    paths: Vec<String>,
+}
+
+fn is_edit_tool(name: &str) -> bool {
+    matches!(name, "edit.replace" | "edit.patch")
+}
+
+fn normalized_path(path: &str) -> String {
+    path.trim().replace('\\', "/")
+}
+
+fn argument_paths(arguments: &serde_json::Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(path) = arguments.get("path").and_then(|value| value.as_str()) {
+        paths.push(normalized_path(path));
+    }
+    if let Some(files) = arguments.get("files").and_then(|value| value.as_array()) {
+        for file in files {
+            if let Some(path) = file.get("path").and_then(|value| value.as_str()) {
+                let path = normalized_path(path);
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn output_paths(metadata: &serde_json::Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    if metadata
+        .get("changed")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true)
+        && let Some(path) = metadata.get("path").and_then(|value| value.as_str())
+    {
+        paths.push(normalized_path(path));
+    }
+    if let Some(files) = metadata.get("files").and_then(|value| value.as_array()) {
+        for file in files {
+            if !file
+                .get("changed")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            if let Some(path) = file.get("path").and_then(|value| value.as_str()) {
+                let path = normalized_path(path);
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn metadata_u64(metadata: &serde_json::Value, key: &str) -> u64 {
+    metadata
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
+}
+
+fn successful_edit_bytes(metadata: &serde_json::Value) -> (u64, u64) {
+    if let Some(files) = metadata.get("files").and_then(|value| value.as_array()) {
+        return files
+            .iter()
+            .filter(|file| {
+                file.get("changed")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true)
+            })
+            .fold((0_u64, 0_u64), |(before, after), file| {
+                (
+                    before.saturating_add(metadata_u64(file, "bytes_before")),
+                    after.saturating_add(metadata_u64(file, "bytes_after")),
+                )
+            });
+    }
+    (
+        metadata_u64(metadata, "bytes_before"),
+        metadata_u64(metadata, "bytes_after"),
+    )
 }
 
 fn is_manage_tool(name: &str) -> bool {
@@ -594,9 +849,9 @@ fn snapshot_access(metrics: &mut RunMetrics, diagnostics: &agent_contracts::Cont
     metrics.reread_first_read = diagnostics.reread_first_read;
 }
 
-/// The nearest-rank percentile of a sorted sample: index
+/// The nearest-index percentile of a sorted sample: index
 /// `round((len - 1) * pct / 100)`.
-fn percentile(sorted: &[u64], pct: u64) -> u64 {
+pub(crate) fn percentile(sorted: &[u64], pct: u64) -> u64 {
     debug_assert!(!sorted.is_empty());
     let index = ((sorted.len() - 1) as f64 * pct as f64 / 100.0).round() as usize;
     sorted[index.min(sorted.len() - 1)]
@@ -635,6 +890,8 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          prompt_layers: system={} facts={} anchor={} progress={} focus={} history={} turn={} tools={} catalog={}\n\
          compaction: in={} out={}\n\
          behavior: tool_calls={} failed_outputs={} spills={} output_chars={} repeated_fs_reads={}\n\
+         edits: attempts={} started={} raw_ok={} committed_change={} failed={} first_raw_ok={}/{} first_committed_change={}/{} unfinished={} latency_p50={}ms latency_p95={}ms to_trace_end={}ms\n\
+         edit_io: fs_read_bytes={} success_bytes_before={} success_bytes_after={} confirm_reads={} fallback(shell_proxy/fs_write)={}/{} settlement(not_applied/recovery/unknown)={}/{}/{}\n\
          reread: previously_selected={} selected_descriptor={} external_descriptor={} resident_unselected={} warm={} stored={} first_read={}\n\
          reread_motive: first={} body_visible_current={} descriptor_only={} checked_fresh={} needs_revalidation={} warm={} stored={} changed={}\n\
          selected_attr: kind={:?} reason={:?} source={:?} reactivated={} resident={}\n\
@@ -716,6 +973,28 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.artifact_spills,
         metrics.output_chars_total,
         metrics.repeated_fs_reads,
+        metrics.edit_attempts,
+        metrics.edit_started_calls,
+        metrics.edit_successes,
+        metrics.edit_committed_changes,
+        metrics.edit_failures,
+        metrics.edit_first_attempt_successes,
+        metrics.edit_first_attempts,
+        metrics.edit_first_attempt_committed_changes,
+        metrics.edit_first_attempts,
+        metrics.edit_unfinished_calls,
+        metrics.edit_ms_p50,
+        metrics.edit_ms_p95,
+        metrics.edit_to_trace_end_ms,
+        metrics.fs_read_bytes_total,
+        metrics.edit_success_bytes_before,
+        metrics.edit_success_bytes_after,
+        metrics.post_edit_confirm_reads,
+        metrics.edit_failure_shell_fallback_proxy,
+        metrics.edit_failure_fs_write_fallback,
+        metrics.edit_commit_not_applied,
+        metrics.edit_commit_recovery_required,
+        metrics.edit_commit_unknown,
         metrics.reread_previously_selected,
         metrics.reread_selected_descriptor,
         metrics.reread_external_descriptor,
@@ -1186,6 +1465,197 @@ mod tests {
         let rendered = render_metrics(&metrics);
         assert!(rendered.contains("retrieval: search_calls=1 hits=1"));
         assert!(rendered.contains("recovery: forgotten=1 recovered=1"));
+    }
+
+    #[test]
+    fn edit_metrics_pair_calls_and_expose_recovery_overhead() {
+        let run = RunId::new();
+        let event = |seq, timestamp_ms, event| RuntimeEventEnvelope {
+            run_id: run,
+            seq,
+            timestamp_ms,
+            event,
+        };
+        let events = vec![
+            event(
+                1,
+                10,
+                RuntimeEvent::ToolStarted {
+                    call: agent_contracts::ToolCall {
+                        id: "edit-1".into(),
+                        name: "edit.replace".into(),
+                        arguments: json!({"path": "src\\lib.rs", "old": "a", "new": "b"}),
+                    },
+                },
+            ),
+            event(
+                2,
+                20,
+                RuntimeEvent::ToolFinished {
+                    output: ToolOutput {
+                        call_id: "edit-1".into(),
+                        tool_name: "edit.replace".into(),
+                        ok: false,
+                        summary: "commit failed".into(),
+                        model_content: String::new(),
+                        artifact_ref: None,
+                        metadata: json!({
+                            "commit_state": "not_applied",
+                            "attempted_paths": ["src/lib.rs"]
+                        }),
+                    },
+                },
+            ),
+            event(
+                3,
+                21,
+                RuntimeEvent::ToolStarted {
+                    call: agent_contracts::ToolCall {
+                        id: "fallback".into(),
+                        name: "shell.exec".into(),
+                        arguments: json!({"command": "git diff"}),
+                    },
+                },
+            ),
+            event(
+                4,
+                30,
+                RuntimeEvent::ToolStarted {
+                    call: agent_contracts::ToolCall {
+                        id: "edit-2".into(),
+                        name: "edit.patch".into(),
+                        arguments: json!({
+                            "files": [{"path": "src/lib.rs", "hunks": []}]
+                        }),
+                    },
+                },
+            ),
+            event(
+                5,
+                50,
+                RuntimeEvent::ToolFinished {
+                    output: ToolOutput {
+                        call_id: "edit-2".into(),
+                        tool_name: "edit.patch".into(),
+                        ok: true,
+                        summary: "patched".into(),
+                        model_content: "done".into(),
+                        artifact_ref: None,
+                        metadata: json!({
+                            "changed": true,
+                            "files": [{
+                                "path": "src/lib.rs",
+                                "changed": true,
+                                "bytes_before": 100,
+                                "bytes_after": 120
+                            }]
+                        }),
+                    },
+                },
+            ),
+            event(
+                6,
+                60,
+                RuntimeEvent::ToolStarted {
+                    call: agent_contracts::ToolCall {
+                        id: "read-1".into(),
+                        name: "fs.read".into(),
+                        arguments: json!({"path": "src/lib.rs"}),
+                    },
+                },
+            ),
+            event(
+                7,
+                70,
+                RuntimeEvent::ToolFinished {
+                    output: ToolOutput {
+                        call_id: "read-1".into(),
+                        tool_name: "fs.read".into(),
+                        ok: true,
+                        summary: "read".into(),
+                        model_content: "body".into(),
+                        artifact_ref: None,
+                        metadata: json!({"path": "src/lib.rs", "bytes": 120}),
+                    },
+                },
+            ),
+            event(
+                8,
+                80,
+                RuntimeEvent::ToolStarted {
+                    call: agent_contracts::ToolCall {
+                        id: "edit-cancelled".into(),
+                        name: "edit.replace".into(),
+                        arguments: json!({"path": "src/lib.rs", "old": "b", "new": "c"}),
+                    },
+                },
+            ),
+            event(9, 90, RuntimeEvent::TurnCompleted),
+        ];
+
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.edit_attempts, 2);
+        assert_eq!(metrics.edit_started_calls, 3);
+        assert_eq!(metrics.edit_successes, 1);
+        assert_eq!(metrics.edit_committed_changes, 1);
+        assert_eq!(metrics.edit_failures, 1);
+        assert_eq!(metrics.edit_first_attempts, 1);
+        assert_eq!(metrics.edit_first_attempt_successes, 0);
+        assert_eq!(metrics.edit_first_attempt_committed_changes, 0);
+        assert_eq!(metrics.edit_unfinished_calls, 1);
+        assert_eq!(metrics.edit_ms_p50, 20);
+        assert_eq!(metrics.edit_ms_p95, 20);
+        assert_eq!(metrics.edit_to_trace_end_ms, 80);
+        assert_eq!(metrics.fs_read_bytes_total, 120);
+        assert_eq!(metrics.edit_success_bytes_before, 100);
+        assert_eq!(metrics.edit_success_bytes_after, 120);
+        assert_eq!(metrics.post_edit_confirm_reads, 1);
+        assert_eq!(metrics.edit_failure_shell_fallback_proxy, 1);
+        assert_eq!(metrics.edit_failure_fs_write_fallback, 0);
+        assert_eq!(metrics.edit_commit_not_applied, 1);
+        assert_eq!(metrics.edit_commit_recovery_required, 0);
+        assert_eq!(metrics.edit_commit_unknown, 0);
+        assert!(render_metrics(&metrics).contains("first_raw_ok=0/1"));
+    }
+
+    #[test]
+    fn edit_commit_metrics_cover_every_runtime_settlement_label() {
+        let run = RunId::new();
+        let states = [
+            "not_applied",
+            "applied_recovery_required",
+            "unknown_recovery_required",
+            "not_applied_authority_recovery_required",
+            "applied_authority_recovery_required",
+            "unknown_authority_recovery_required",
+            "rejected",
+            "unsettled",
+        ];
+        let events: Vec<_> = states
+            .iter()
+            .enumerate()
+            .map(|(index, state)| RuntimeEventEnvelope {
+                run_id: run,
+                seq: index as u64 + 1,
+                timestamp_ms: index as u64,
+                event: RuntimeEvent::ToolFinished {
+                    output: ToolOutput {
+                        call_id: format!("edit-{index}"),
+                        tool_name: "edit.patch".into(),
+                        ok: false,
+                        summary: "settlement".into(),
+                        model_content: String::new(),
+                        artifact_ref: None,
+                        metadata: json!({"commit_state": state}),
+                    },
+                },
+            })
+            .collect();
+
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.edit_commit_not_applied, 3);
+        assert_eq!(metrics.edit_commit_recovery_required, 3);
+        assert_eq!(metrics.edit_commit_unknown, 3);
     }
 
     #[test]

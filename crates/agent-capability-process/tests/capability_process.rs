@@ -213,7 +213,9 @@ impl Effect for TestWriteEffect {
         }
     }
 
-    async fn rollback(self: Box<Self>, _reason: &str) {}
+    async fn rollback(self: Box<Self>, _reason: &str) -> AgentResult<()> {
+        Ok(())
+    }
 }
 
 #[tokio::test]

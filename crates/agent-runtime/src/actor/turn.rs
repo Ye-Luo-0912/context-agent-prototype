@@ -198,7 +198,9 @@ impl RuntimeActor {
                 })
                 .await;
             let _ = self.core.emit_event(RuntimeEvent::Error { message }).await;
-            self.state.turn = None;
+            // Deliberate refusal (round budget), not a fault: settle the
+            // applied input and drop the turn without fencing.
+            self.settle_aborted_turn().await;
             return;
         }
         self.spawn_model_operation(op_tx).await;
@@ -751,6 +753,24 @@ impl RuntimeActor {
             .await;
         let _ = self.core.emit_event(RuntimeEvent::RecoveryRequired).await;
         self.state.turn = None;
+    }
+
+    /// Abort a model-round preparation on an engine/journal fault: same
+    /// doctrine as `commit_failed`, one step earlier in the round. The
+    /// failed phase is journaled durably, mutation is fenced until a
+    /// known-good restore, the applied input is settled so it cannot dangle
+    /// at Applied, and the turn frame is dropped.
+    pub(super) async fn fail_round_preparation(&mut self, phase: &'static str, error: AgentError) {
+        self.state.recovery_required = true;
+        let _ = self
+            .core
+            .emit_event(RuntimeEvent::TurnCommitFailed {
+                phase: phase.into(),
+                message: error.to_string(),
+            })
+            .await;
+        let _ = self.core.emit_event(RuntimeEvent::RecoveryRequired).await;
+        self.settle_aborted_turn().await;
     }
 
     /// Close every tool frame the turn opened (from committed results and

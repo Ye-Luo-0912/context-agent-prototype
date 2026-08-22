@@ -15,9 +15,9 @@ use agent_contracts::{
     AgentError, AgentResult, ApprovalGate, ArgumentDigest, AuthorityCheckpointMarker,
     AuthorityLease, AuthorityRecoveryStatus, CancellationToken, ContextConsumptionAck,
     ContextEngine, Effect, EffectId, EffectReceipt, EffectReconciler, EngineQuery, EventJournal,
-    OperationId, OperationQueryResult, OperationSnapshot, RunId, RuntimeEvent,
-    RuntimeEventEnvelope, TaskId, ToolCall, ToolDispatcher, ToolOperationIdentity, ToolOutcome,
-    ToolOutput, ToolSpec, ToolSurfaceSnapshot, TurnId,
+    OperationId, OperationQueryResult, OperationSnapshot, OperationState, OperationTerminal, RunId,
+    RuntimeEvent, RuntimeEventEnvelope, TaskId, ToolCall, ToolDispatcher, ToolOperationIdentity,
+    ToolOutcome, ToolOutput, ToolSpec, ToolSurfaceSnapshot, TurnId,
 };
 use async_trait::async_trait;
 use tokio::sync::broadcast;
@@ -100,14 +100,74 @@ pub struct EffectRollbackRequest {
 pub enum EffectCommitDisposition {
     Receipt(EffectReceipt),
     Rejected(EffectCommitRejection),
-    /// The effect receipt is the best-known world-state truth, but Core
-    /// failed to record the matching terminal authority state. Runtime must
-    /// preserve the receipt and enter recovery rather than treating a
-    /// truthful `NotApplied` receipt as ordinary success.
+    /// The effect receipt is the best-known world-state truth, but rollback
+    /// cleanup or the matching terminal authority record could not be
+    /// confirmed. Runtime must preserve the receipt and enter recovery rather
+    /// than treating a truthful `NotApplied` receipt as a settled rollback.
     AuthorityRecordFailed {
         receipt: EffectReceipt,
         error: String,
     },
+}
+
+fn bounded_effect_error(message: &str) -> String {
+    let mut end = message
+        .len()
+        .min(agent_contracts::MAX_OPERATION_DIAGNOSTIC_BYTES);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message[..end].to_string()
+}
+
+fn operation_needs_rollback_terminal(
+    core: &CoreAuthority,
+    operation_id: OperationId,
+    effect_id: EffectId,
+    argument_digest: ArgumentDigest,
+) -> bool {
+    matches!(
+        core.query_operation(operation_id),
+        OperationQueryResult::Found { snapshot }
+            if snapshot.identity.argument_digest == argument_digest
+                && matches!(
+                    snapshot.state,
+                    OperationState::Prepared { effect_id: recorded }
+                        | OperationState::Terminal {
+                            effect_id: Some(recorded),
+                            terminal: OperationTerminal::CancelledBeforeCommit,
+                        } if recorded == effect_id
+                )
+    )
+}
+
+async fn settle_rejected_effect(
+    core: &CoreAuthority,
+    operation_id: OperationId,
+    effect_id: EffectId,
+    argument_digest: ArgumentDigest,
+    effect: Box<dyn Effect>,
+    reason: String,
+) -> Result<(), String> {
+    let terminal_required =
+        operation_needs_rollback_terminal(core, operation_id, effect_id, argument_digest);
+    if let Err(error) = core.effect().rollback(effect, &reason).await {
+        let message = bounded_effect_error(&format!(
+            "prepared-effect rollback could not be confirmed: {error}"
+        ));
+        core.require_operation_recovery(&message);
+        return Err(message);
+    }
+    if terminal_required
+        && let Err(error) = core.abort_prepared_operation(operation_id, effect_id, argument_digest)
+    {
+        let message = bounded_effect_error(&format!(
+            "rolled-back prepared operation could not be terminalized: {error}"
+        ));
+        core.require_operation_recovery(&message);
+        return Err(message);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +206,10 @@ pub struct CoreToolExecution {
     /// refusals are already terminal and prepared effects terminate through
     /// commit/rollback instead.
     pub value_completion_pending: bool,
+    /// A trusted bounded signal that execution could not settle preparation
+    /// cleanup. Runtime must publish recovery and must not record this as an
+    /// ordinary completed value.
+    pub recovery_required: Option<String>,
 }
 
 /// One-shot proof that Core durably admitted exactly one tool operation.
@@ -482,16 +546,20 @@ impl CorePort for CoreAuthority {
             effect,
         } = request;
         if let Err(error) = self.ensure_mutation_allowed() {
-            effect
-                .rollback(&format!(
+            let rollback_error = self
+                .effect()
+                .rollback(effect, &format!(
                     "effect commit blocked by Core recovery fence (turn {turn_id}, operation {operation_id}, generation {generation}): {error}"
                 ))
-                .await;
+                .await
+                .err()
+                .map(|rollback| format!("; prepared-effect rollback failed: {rollback}"))
+                .unwrap_or_default();
             return EffectCommitDisposition::AuthorityRecordFailed {
                 receipt: EffectReceipt::NotApplied {
                     error: "effect commit was blocked by the Core recovery fence".into(),
                 },
-                error: error.to_string(),
+                error: bounded_effect_error(&format!("{error}{rollback_error}")),
             };
         }
         let refusal = if run_id != self.run_id() {
@@ -511,19 +579,24 @@ impl CorePort for CoreAuthority {
         };
 
         if let Some(rejection) = refusal {
-            effect
-                .rollback(&format!(
+            if let Err(error) = settle_rejected_effect(
+                self,
+                operation_id,
+                effect_id,
+                argument_digest,
+                effect,
+                format!(
                     "effect commit rejected ({rejection:?}; turn {turn_id}, operation {operation_id}, generation {generation})"
-                ))
-                .await;
-            if let Err(error) =
-                self.abort_prepared_operation(operation_id, effect_id, argument_digest)
+                ),
+            )
+            .await
             {
-                tracing::debug!(
-                    %error,
-                    %operation_id,
-                    "rejected effect was not a matching prepared registry entry"
-                );
+                return EffectCommitDisposition::AuthorityRecordFailed {
+                    receipt: EffectReceipt::NotApplied {
+                        error: format!("effect commit was rejected before application: {rejection:?}"),
+                    },
+                    error,
+                };
             }
             EffectCommitDisposition::Rejected(rejection)
         } else {
@@ -546,20 +619,25 @@ impl CorePort for CoreAuthority {
                             .is_none_or(|path| !approved_paths.contains(&path))
                     })
                 {
-                    effect
-                        .rollback(&format!(
+                    if let Err(error) = settle_rejected_effect(
+                        self,
+                        operation_id,
+                        effect_id,
+                        argument_digest,
+                        effect,
+                        format!(
                             "actual workspace write '{}' is outside the approved intent",
                             stray.path
-                        ))
-                        .await;
-                    if let Err(error) =
-                        self.abort_prepared_operation(operation_id, effect_id, argument_digest)
+                        ),
+                    )
+                    .await
                     {
-                        tracing::debug!(
-                            %error,
-                            %operation_id,
-                            "actual-exceeds-approved effect was not a matching prepared registry entry"
-                        );
+                        return EffectCommitDisposition::AuthorityRecordFailed {
+                            receipt: EffectReceipt::NotApplied {
+                                error: "effect commit was rejected because its actual workspace write exceeded approved authority".into(),
+                            },
+                            error,
+                        };
                     }
                     return EffectCommitDisposition::Rejected(
                         EffectCommitRejection::ActualExceedsApproved,
@@ -572,27 +650,28 @@ impl CorePort for CoreAuthority {
                 effect_id,
                 argument_digest,
             ) {
-                effect
-                    .rollback(&format!("operation registry rejected commit: {error}"))
-                    .await;
-                let rejection = if error.to_string().contains("is stale; current Core epoch") {
+                let rejection = if matches!(error, AgentError::StaleEpoch { .. }) {
                     EffectCommitRejection::StaleEpoch
                 } else {
                     EffectCommitRejection::InvalidOperation
                 };
-                if rejection == EffectCommitRejection::StaleEpoch
-                    && let Err(cleanup_error) =
-                        self.abort_prepared_operation(operation_id, effect_id, argument_digest)
+                if let Err(rollback_error) = settle_rejected_effect(
+                    self,
+                    operation_id,
+                    effect_id,
+                    argument_digest,
+                    effect,
+                    format!("operation registry rejected commit: {error}"),
+                )
+                .await
                 {
                     return EffectCommitDisposition::AuthorityRecordFailed {
                         receipt: EffectReceipt::NotApplied {
                             error: format!(
-                                "effect commit rejected by stale authority epoch: {error}"
+                                "effect commit was rejected before application: {error}"
                             ),
                         },
-                        error: format!(
-                            "stale prepared operation could not be terminalized: {cleanup_error}"
-                        ),
+                        error: rollback_error,
                     };
                 }
                 return EffectCommitDisposition::Rejected(rejection);
@@ -631,16 +710,25 @@ impl CorePort for CoreAuthority {
             .as_ref()
             .map(|lease| lease.lease_id.as_str())
             .unwrap_or("none");
-        self.effect()
-            .rollback(
-                effect,
-                &format!(
-                    "{reason} (turn {turn_id}, operation {operation_id}, generation {generation}, lease {lease_id})"
-                ),
-            )
-            .await;
-        if let Some(effect_id) = effect_id {
-            self.abort_prepared_operation(operation_id, effect_id, argument_digest)?;
+        let rollback_reason = bounded_effect_error(&format!(
+            "{reason} (turn {turn_id}, operation {operation_id}, generation {generation}, lease {lease_id})"
+        ));
+        if let Err(error) = self.effect().rollback(effect, &rollback_reason).await {
+            let message = bounded_effect_error(&format!(
+                "operation {operation_id} prepared-effect rollback could not be confirmed: {error}"
+            ));
+            self.require_operation_recovery(&message);
+            return Err(AgentError::RecoveryRequired(message));
+        }
+        if let Some(effect_id) = effect_id
+            && let Err(error) =
+                self.abort_prepared_operation(operation_id, effect_id, argument_digest)
+        {
+            let message = bounded_effect_error(&format!(
+                "operation {operation_id} rollback cleanup succeeded, but its authority terminal could not be confirmed: {error}"
+            ));
+            self.require_operation_recovery(&message);
+            return Err(AgentError::RecoveryRequired(message));
         }
         match identity_error {
             Some(error) => Err(error),
@@ -898,6 +986,38 @@ mod tests {
         }
     }
 
+    struct FailingRollbackPreparedEffectTools;
+
+    #[async_trait]
+    impl ToolDispatcher for FailingRollbackPreparedEffectTools {
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "prepared.effect.failed-rollback".into(),
+                description: "stages an effect whose cleanup fails".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                risk: agent_contracts::ToolRisk::ReadOnly,
+                output_budget: None,
+                roles: Vec::new(),
+            }]
+        }
+
+        async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+            request.validate().map_err(AgentError::InvalidRequest)?;
+            Ok(ToolOutcome::PreparedEffect {
+                output: ToolOutput {
+                    call_id: request.call.id,
+                    tool_name: request.call.name,
+                    ok: true,
+                    summary: "staged".into(),
+                    model_content: "staged".into(),
+                    artifact_ref: None,
+                    metadata: serde_json::Value::Null,
+                },
+                effect: Box::new(FailingRollbackEffect),
+            })
+        }
+    }
+
     struct Allow;
 
     #[async_trait]
@@ -1030,8 +1150,28 @@ mod tests {
             }
         }
 
-        async fn rollback(self: Box<Self>, reason: &str) {
+        async fn rollback(self: Box<Self>, reason: &str) -> AgentResult<()> {
             *self.state.lock().unwrap() = format!("rolled back: {reason}");
+            Ok(())
+        }
+    }
+
+    struct FailingRollbackEffect;
+
+    #[async_trait]
+    impl Effect for FailingRollbackEffect {
+        fn describe(&self) -> String {
+            "failing rollback effect".into()
+        }
+
+        async fn commit(self: Box<Self>) -> EffectReceipt {
+            panic!("failing rollback fixture must not commit")
+        }
+
+        async fn rollback(self: Box<Self>, _reason: &str) -> AgentResult<()> {
+            Err(AgentError::RecoveryRequired(
+                "simulated prepared cleanup failure".into(),
+            ))
         }
     }
 
@@ -1440,6 +1580,36 @@ mod tests {
             EffectCommitDisposition::Rejected(EffectCommitRejection::MissingLease)
         ));
         assert!(state.lock().unwrap().starts_with("rolled back:"));
+    }
+
+    #[tokio::test]
+    async fn rejected_commit_with_failed_rollback_requires_core_recovery() {
+        let port = port();
+        let generation = port.current_authority_epoch();
+        let result = port
+            .commit_effect(EffectCommitRequest {
+                run_id: port.run_id(),
+                turn_id: TurnId::new(),
+                operation_id: OperationId::new(),
+                effect_id: EffectId::new(),
+                argument_digest: ArgumentDigest::sha256_bytes(b"args"),
+                generation,
+                lease: None,
+                effect: Box::new(FailingRollbackEffect),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            EffectCommitDisposition::AuthorityRecordFailed {
+                receipt: EffectReceipt::NotApplied { .. },
+                error,
+            } if error.contains("simulated prepared cleanup failure")
+        ));
+        assert!(matches!(
+            port.recovery_status(),
+            AuthorityRecoveryStatus::RecoveryRequired { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1991,6 +2161,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rollback_failure_is_propagated_and_fences_core() {
+        let port = port();
+        let result = port
+            .rollback_effect(EffectRollbackRequest {
+                run_id: port.run_id(),
+                turn_id: TurnId::new(),
+                operation_id: OperationId::new(),
+                effect_id: None,
+                argument_digest: ArgumentDigest::sha256_bytes(b"args"),
+                generation: port.current_authority_epoch(),
+                lease: None,
+                effect: Box::new(FailingRollbackEffect),
+                reason: "stale".into(),
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(AgentError::RecoveryRequired(message)) if message.contains("simulated prepared cleanup failure"))
+        );
+        assert!(matches!(
+            port.recovery_status(),
+            AuthorityRecoveryStatus::RecoveryRequired { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn read_only_tool_cannot_smuggle_a_prepared_effect_without_a_lease() {
         let state = Arc::new(Mutex::new(String::new()));
         let port = build_core_port(
@@ -2060,6 +2256,53 @@ mod tests {
                 terminal: OperationTerminal::CancelledBeforeCommit,
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn rejected_preparation_with_failed_rollback_reports_recovery() {
+        let tools = Arc::new(FailingRollbackPreparedEffectTools);
+        let port = build_core_port(
+            CoreAuthorityConfig::default(),
+            Arc::new(StubContext),
+            tools.clone(),
+            Arc::new(Allow),
+            None,
+        );
+        let call = ToolCall {
+            id: "failed-cleanup".into(),
+            name: "prepared.effect.failed-rollback".into(),
+            arguments: serde_json::json!({}),
+        };
+        let surface = ToolSurfaceSnapshot {
+            specs: tools.specs(),
+            ..ToolSurfaceSnapshot::default()
+        };
+        let generation = port.current_authority_epoch();
+        let operation_id = OperationId::new();
+        let execution = admit_and_execute(
+            port.as_ref(),
+            operation_identity(port.as_ref(), &call, operation_id, generation),
+            call,
+            CancellationToken::new(),
+            &surface,
+        )
+        .await;
+
+        assert!(matches!(execution.outcome, ToolOutcome::Value(ref output) if !output.ok));
+        assert!(
+            execution
+                .recovery_required
+                .as_deref()
+                .is_some_and(|message| message.contains("simulated prepared cleanup failure"))
+        );
+        assert!(matches!(
+            port.recovery_status(),
+            AuthorityRecoveryStatus::RecoveryRequired { .. }
+        ));
+        let OperationQueryResult::Found { snapshot } = port.query_operation(operation_id) else {
+            panic!("unsettled preparation must remain queryable")
+        };
+        assert!(matches!(snapshot.state, OperationState::Executing { .. }));
     }
 
     #[tokio::test]

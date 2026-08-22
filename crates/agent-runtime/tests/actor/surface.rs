@@ -390,6 +390,79 @@ async fn must_surface_overflow_is_unsatisfiable_before_model_start() {
     handle.stop().await.unwrap();
 }
 
+/// A deliberate Unsatisfiable refusal is not a commit failure: no
+/// `TurnCommitFailed` may be journaled for it, but the applied user input
+/// must still settle out of Applied instead of dangling there forever.
+#[tokio::test]
+async fn unsatisfiable_round_settles_the_input_without_a_failure_marker() {
+    use agent_contracts::{InputLifecycle, ToolSurfaceDemand, ToolSurfaceRequirement};
+
+    let model = Arc::new(VariableWindowModel::new(1_600));
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model.clone(),
+        Arc::new(RoundLocalToolDispatcher::new()),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut surface_events = handle.subscribe();
+    let mut all_events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .set_focus("must use the large tool".into())
+        .await
+        .unwrap();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    handle
+        .replace_task_tool_requirements(
+            task_id,
+            0,
+            vec![ToolSurfaceRequirement {
+                tool_name: "optional.large".into(),
+                demand: ToolSurfaceDemand::MustSurface,
+                reason: "the task cannot proceed without it".into(),
+            }],
+        )
+        .await
+        .unwrap();
+
+    handle
+        .user_message("settle me after the refusal".into())
+        .await
+        .unwrap();
+    let report = wait_for_surface_plan(&mut surface_events).await;
+    assert!(matches!(
+        report.status,
+        ToolSurfacePlanStatus::Unsatisfiable { .. }
+    ));
+
+    // The settlement event follows the refusal inside the same actor step.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut settled = false;
+    let mut saw_commit_failed = false;
+    while let Ok(envelope) = all_events.try_recv() {
+        match envelope.event {
+            RuntimeEvent::UserMessageAccepted { input } => {
+                settled |= input.lifecycle == InputLifecycle::InterruptCommitted;
+            }
+            RuntimeEvent::TurnCommitFailed { .. } => saw_commit_failed = true,
+            _ => {}
+        }
+    }
+    assert!(
+        settled,
+        "a refused round must commit the applied input's interruption"
+    );
+    assert!(
+        !saw_commit_failed,
+        "a deliberate refusal must not journal a turn-commit failure"
+    );
+    assert!(model.requests.lock().unwrap().is_empty());
+    handle.stop().await.unwrap();
+}
+
 #[tokio::test]
 async fn unavailable_must_surface_is_reported_before_model_start() {
     let model = Arc::new(VariableWindowModel::new(16_000));
@@ -504,30 +577,51 @@ async fn surface_event_failure_aborts_before_model_start_and_provider_call() {
         .await
         .unwrap();
 
-    let saw_model_started = tokio::time::timeout(Duration::from_secs(3), async {
-        let mut saw_model_started = false;
-        loop {
-            match events.recv().await {
-                Ok(RuntimeEventEnvelope {
-                    event: RuntimeEvent::Error { .. },
-                    ..
-                }) => break saw_model_started,
-                Ok(RuntimeEventEnvelope {
-                    event: RuntimeEvent::ModelStarted { .. },
-                    ..
-                }) => saw_model_started = true,
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    panic!("runtime closed before surfacing the journal failure")
+    let (phase, message, saw_recovery_required, saw_model_started) =
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut commit_failure = None;
+            let mut saw_recovery_required = false;
+            let mut saw_model_started = false;
+            loop {
+                match events.recv().await {
+                    Ok(RuntimeEventEnvelope {
+                        event: RuntimeEvent::TurnCommitFailed { phase, message },
+                        ..
+                    }) => commit_failure = Some((phase, message)),
+                    Ok(RuntimeEventEnvelope {
+                        event: RuntimeEvent::RecoveryRequired,
+                        ..
+                    }) => saw_recovery_required = true,
+                    Ok(RuntimeEventEnvelope {
+                        event: RuntimeEvent::ModelStarted { .. },
+                        ..
+                    }) => saw_model_started = true,
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("runtime closed before surfacing the journal failure")
+                    }
+                }
+                if saw_recovery_required && let Some((phase, message)) = commit_failure.take() {
+                    break (phase, message, saw_recovery_required, saw_model_started);
                 }
             }
-        }
-    })
-    .await
-    .expect("surface event failure was not surfaced");
+        })
+        .await
+        .expect("surface event failure was not surfaced");
 
+    assert_eq!(phase, "tool_surface_planned_event");
+    assert!(message.contains("simulated surface-plan journal failure"));
+    assert!(saw_recovery_required);
     assert!(!saw_model_started);
     assert!(model.requests.lock().unwrap().is_empty());
+    let next = handle
+        .user_message("must wait for recovery".into())
+        .await
+        .expect_err("a failed surface event must fence later turns");
+    assert!(matches!(
+        next,
+        agent_contracts::AgentError::RecoveryRequired(_)
+    ));
     handle.stop().await.unwrap();
 }
 
@@ -644,35 +738,51 @@ async fn unsatisfiable_surface_event_failure_is_reported_and_provider_fenced() {
         .unwrap();
     handle.user_message("start".into()).await.unwrap();
 
-    let (message, saw_model_started) = tokio::time::timeout(Duration::from_secs(3), async {
-        let mut saw_model_started = false;
-        loop {
-            match events.recv().await {
-                Ok(RuntimeEventEnvelope {
-                    event: RuntimeEvent::Error { message },
-                    ..
-                }) if message
-                    .contains("failed to persist the unavailable-tool surface decision") =>
-                {
-                    break (message, saw_model_started);
+    let (phase, message, saw_recovery_required, saw_model_started) =
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut commit_failure = None;
+            let mut saw_recovery_required = false;
+            let mut saw_model_started = false;
+            loop {
+                match events.recv().await {
+                    Ok(RuntimeEventEnvelope {
+                        event: RuntimeEvent::TurnCommitFailed { phase, message },
+                        ..
+                    }) => commit_failure = Some((phase, message)),
+                    Ok(RuntimeEventEnvelope {
+                        event: RuntimeEvent::RecoveryRequired,
+                        ..
+                    }) => saw_recovery_required = true,
+                    Ok(RuntimeEventEnvelope {
+                        event: RuntimeEvent::ModelStarted { .. },
+                        ..
+                    }) => saw_model_started = true,
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("runtime closed before surfacing the unsatisfiable journal failure")
+                    }
                 }
-                Ok(RuntimeEventEnvelope {
-                    event: RuntimeEvent::ModelStarted { .. },
-                    ..
-                }) => saw_model_started = true,
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    panic!("runtime closed before surfacing the unsatisfiable journal failure")
+                if saw_recovery_required && let Some((phase, message)) = commit_failure.take() {
+                    break (phase, message, saw_recovery_required, saw_model_started);
                 }
             }
-        }
-    })
-    .await
-    .expect("unsatisfiable surface event failure was not surfaced");
+        })
+        .await
+        .expect("unsatisfiable surface event failure was not surfaced");
 
+    assert_eq!(phase, "tool_surface_planned_event");
     assert!(message.contains("simulated surface-plan journal failure"));
+    assert!(saw_recovery_required);
     assert!(!saw_model_started);
     assert!(model.requests.lock().unwrap().is_empty());
+    let next = handle
+        .user_message("must wait for recovery".into())
+        .await
+        .expect_err("a failed unsatisfiable-surface event must fence later turns");
+    assert!(matches!(
+        next,
+        agent_contracts::AgentError::RecoveryRequired(_)
+    ));
     handle.stop().await.unwrap();
 }
 

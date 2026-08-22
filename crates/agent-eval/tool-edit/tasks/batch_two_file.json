@@ -1,0 +1,54 @@
+{
+  "id": "batch_two_file",
+  "name": "Apply one revision-checked two-file patch batch",
+  "description": "Read src/library.cfg and src/client.cfg. Then use one edit.patch files[] call, passing each fs.read revision, to change api=v1 to api=v2 in library.cfg and uses=v1 to uses=v2 in client.cfg. Preserve all other bytes and do not use separate mutation calls.",
+  "expected_edit": "one edit.patch files[] composite covering both revision-checked files",
+  "target_rounds_lo": 3,
+  "target_rounds_hi": 7,
+  "seed_files": [
+    {
+      "path": "src/library.cfg",
+      "content": "api=v1\nmode=stable\n",
+      "sha256": "70d88ea9e75ce05146165734d67a8b2e55f0dc00ec70a2a7af78221272a496b3"
+    },
+    {
+      "path": "src/client.cfg",
+      "content": "uses=v1\nflag=keep\n",
+      "sha256": "6a76c69f6df6ae8f115a1f2295fb7027fc15b3cb6a4d97bd3ea0f144fd319afc"
+    }
+  ],
+  "golden_files": [
+    {
+      "path": "src/library.cfg",
+      "content": "api=v2\nmode=stable\n",
+      "sha256": "8cba9a19a1c76c3b41252849472d900ce1a7b03cc6dadf2b0b945dec7ba8c5ff"
+    },
+    {
+      "path": "src/client.cfg",
+      "content": "uses=v2\nflag=keep\n",
+      "sha256": "990a5ef473ef9fbd2fd40288de375d0160f5246b219278566280b4175915c956"
+    }
+  ],
+  "ops": [
+    {
+      "op": "user",
+      "text": "Read src/library.cfg and src/client.cfg. Then use one edit.patch files[] call, passing each fs.read revision, to change api=v1 to api=v2 in library.cfg and uses=v1 to uses=v2 in client.cfg. Preserve all other bytes and do not use separate mutation calls."
+    }
+  ],
+  "trace": {
+    "target_files": ["src/library.cfg", "src/client.cfg"],
+    "required_successful_patch_calls": 1,
+    "max_patch_calls": 1,
+    "expected_files_per_success": 2,
+    "min_hunks_per_success": 2,
+    "exact_hunks": [
+      {"path": "src/library.cfg", "old": "api=v1", "new": "api=v2"},
+      {"path": "src/client.cfg", "old": "uses=v1", "new": "uses=v2"}
+    ],
+    "require_base_revision": true,
+    "first_patch_must_succeed": true,
+    "conflict": "none",
+    "forbidden_tools": ["shell.exec", "process.run", "process.session", "fs.write", "edit.replace"],
+    "max_confirm_reads_after_success": 0
+  }
+}

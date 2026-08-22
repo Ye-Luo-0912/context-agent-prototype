@@ -1898,7 +1898,10 @@ impl<'de> Deserialize<'de> for ContextMapView {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextSearchQuery {
     /// Free-text query matched (case-insensitively) against entity
-    /// signatures, the entry summary and the ref uri.
+    /// signatures, the entry summary and the ref uri. Multi-word queries
+    /// verify when every token (shared `tokenize` rule) appears in one
+    /// entry's matchable text; the whole-needle substring stays the
+    /// primary, ranking-privileged match.
     pub query: String,
     /// Optional kind filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]

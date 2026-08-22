@@ -1,0 +1,94 @@
+{
+  "context_engine": "dynamic",
+  "fixture_id": "stale_revision_recovery",
+  "fixture_mutations": [
+    {
+      "after_sha256": "a5609fed017fdf4543bdb7ad2383a89054a246fdd5ac12389c629e883128ec55",
+      "before_sha256": "0de0bf052bb6c4fd8751f82697ac3dda7724fc52df6c49743ded6158c9157ec0",
+      "bytes_after": 39,
+      "op_index": 2,
+      "path": "src/retry.cfg"
+    }
+  ],
+  "gate": {
+    "analysis_truncated": false,
+    "changed_bytes_after": 39,
+    "changed_bytes_before": 39,
+    "commit_not_applied": 0,
+    "commit_recovery_required": 0,
+    "commit_unknown": 0,
+    "confirm_reads_after_success": 0,
+    "edit_latency_ms_p50": 3,
+    "edit_latency_ms_p95": 3,
+    "edit_to_green_ms": 8332,
+    "first_patch_changed_success": false,
+    "first_patch_has_required_revisions": true,
+    "first_patch_raw_success": false,
+    "first_patch_shape_valid": true,
+    "fixture_id": "stale_revision_recovery",
+    "forbidden_calls": 0,
+    "forbidden_tool_counts": {},
+    "fs_read_bytes": 97,
+    "model_rounds": 7,
+    "non_stale_failures": 0,
+    "passed": true,
+    "patch_attempts": 2,
+    "patch_changed_successes": 1,
+    "patch_failures": 1,
+    "patch_finished": 2,
+    "patch_noops": 0,
+    "patch_raw_successes": 1,
+    "patch_started": 2,
+    "schema": "agent-eval.tool-surface-edit.v1",
+    "seq_contiguous": true,
+    "session_ok": true,
+    "stale_refusals": 1,
+    "strict_passed": true,
+    "target_files_covered": [
+      "src/retry.cfg"
+    ],
+    "target_read_successes": 3,
+    "trace_complete": true,
+    "unfinished_patch_calls": 0,
+    "valid_call_first_attempt_success": false,
+    "violations": []
+  },
+  "schema": "agent-eval.tool-edit.v1",
+  "strict": {
+    "files": [
+      {
+        "actual_sha256": "47c2e2fe08863b41eca344c4d6f65d476d97f23f3695ba8be2655abe8520393f",
+        "bytes": 39,
+        "expected_sha256": "47c2e2fe08863b41eca344c4d6f65d476d97f23f3695ba8be2655abe8520393f",
+        "passed": true,
+        "path": "src/retry.cfg"
+      }
+    ],
+    "fixture_id": "stale_revision_recovery",
+    "passed": true,
+    "schema": "agent-eval.tool-edit.v1",
+    "unexpected_files": [],
+    "unexpected_files_truncated": false
+  },
+  "surface": "production-default",
+  "trace_contract": {
+    "conflict": "stale_or_revalidated",
+    "expected_files_per_success": 1,
+    "first_patch_must_succeed": false,
+    "forbidden_tools": [
+      "shell.exec",
+      "process.run",
+      "process.session",
+      "fs.write",
+      "edit.replace"
+    ],
+    "max_confirm_reads_after_success": 0,
+    "max_patch_calls": 2,
+    "min_hunks_per_success": 1,
+    "require_base_revision": true,
+    "required_successful_patch_calls": 1,
+    "target_files": [
+      "src/retry.cfg"
+    ]
+  }
+}

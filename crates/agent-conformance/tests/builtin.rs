@@ -63,7 +63,7 @@ async fn bound_value(
     match outcome {
         ToolOutcome::Value(output) => broker.bound(run_id, None, output).await,
         ToolOutcome::PreparedEffect { output, effect } => {
-            effect.rollback("conformance run").await;
+            effect.rollback("conformance run").await.unwrap();
             broker.bound(run_id, None, output).await
         }
         ToolOutcome::RuntimeDirective { output, .. } => broker.bound(run_id, None, output).await,

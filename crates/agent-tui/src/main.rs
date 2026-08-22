@@ -171,6 +171,11 @@ async fn run_ui(
     }
     let mut approval_rx = interactive.as_ref().map(|handle| handle.broker.subscribe());
 
+    // Command output that resolves off the input thread (/tasks, /grants)
+    // comes back through this channel: printing to stdout directly would
+    // corrupt the alternate-screen frame.
+    let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
     loop {
         while let Ok(event) = runtime_events.try_recv() {
             app.apply_runtime_event(event);
@@ -179,6 +184,9 @@ async fn run_ui(
             while let Ok(request) = rx.try_recv() {
                 app.begin_approval(request);
             }
+        }
+        while let Ok(line) = notice_rx.try_recv() {
+            app.push_system(line);
         }
 
         terminal.draw(|frame| ui::render(frame, &app))?;
@@ -267,18 +275,19 @@ async fn run_ui(
                     }
                     if trimmed == "/tasks" {
                         let handle = handle.clone();
+                        let notice_tx = notice_tx.clone();
                         tokio::spawn(async move {
                             match handle.list_tasks().await {
                                 Ok(tasks) => {
                                     for task in tasks {
-                                        println!(
+                                        let _ = notice_tx.send(format!(
                                             "task {} [{:?}] tools=r{}/{} {}",
                                             task.id,
                                             task.status,
                                             task.tool_requirement_revision,
                                             task.tool_requirement_count,
                                             task.goal
-                                        );
+                                        ));
                                     }
                                 }
                                 Err(error) => tracing::error!(%error, "list tasks failed"),
@@ -291,13 +300,14 @@ async fn run_ui(
                             continue;
                         };
                         let task_grants = handle.task_grants.clone();
+                        let notice_tx = notice_tx.clone();
                         tokio::spawn(async move {
                             let grants = task_grants.active_grants().await;
                             if grants.is_empty() {
-                                println!("no active standing grants");
+                                let _ = notice_tx.send("no active standing grants".into());
                             }
                             for grant in grants {
-                                println!(
+                                let _ = notice_tx.send(format!(
                                     "grant {} risk={:?} workspace={:?} argv={:?} shell={:?} \
                                      max_runs={:?} max_bytes={:?} expires_at_ms={}",
                                     grant.id,
@@ -308,7 +318,7 @@ async fn run_ui(
                                     grant.constraint.max_runs,
                                     grant.constraint.max_content_bytes,
                                     grant.expires_at_ms,
-                                );
+                                ));
                             }
                         });
                         continue;

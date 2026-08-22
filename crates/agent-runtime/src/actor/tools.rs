@@ -1,5 +1,114 @@
 use super::*;
 
+const MAX_SETTLEMENT_DETAIL_CHARS: usize = 1_200;
+
+/// A prepared output describes proposed bytes, not observed world state.
+/// Unless commit settles as fully durable, strip every proposed revision and
+/// retain only a bounded set of attempted paths. Partial/unknown receipts do
+/// not yet carry the exact committed subset, so preserving `files[]` there
+/// would manufacture facts for files that might never have landed.
+fn unsettled_effect_output(
+    mut output: ToolOutput,
+    commit_state: &'static str,
+    summary_prefix: &str,
+    model_prefix: &str,
+    detail: &str,
+    diagnose: bool,
+) -> ToolOutput {
+    let mut attempted_paths = Vec::new();
+    if let Some(path) = output.metadata.get("path").and_then(|value| value.as_str()) {
+        push_attempted_path(&mut attempted_paths, path);
+    }
+    if let Some(files) = output
+        .metadata
+        .get("files")
+        .and_then(|value| value.as_array())
+    {
+        for file in files {
+            if let Some(path) = file.get("path").and_then(|value| value.as_str()) {
+                push_attempted_path(&mut attempted_paths, path);
+            }
+        }
+    }
+    let detail = bounded_preview(detail, MAX_SETTLEMENT_DETAIL_CHARS);
+    output.ok = false;
+    output.summary = bounded_preview(
+        &format!("{summary_prefix}: {detail}"),
+        agent_contracts::MAX_TOOL_SUMMARY_CHARS,
+    );
+    output.model_content = format!("{model_prefix}: {detail}");
+    output.artifact_ref = None;
+    output.metadata = serde_json::json!({
+        "commit_state": commit_state,
+        "attempted_paths": attempted_paths,
+    });
+    if diagnose {
+        apply_runtime_diagnosis(&mut output, None);
+    }
+    bound_settlement_metadata(&mut output.metadata);
+    output
+}
+
+fn push_attempted_path(paths: &mut Vec<String>, path: &str) {
+    if paths.len() >= agent_contracts::MAX_RESOURCE_TOUCHES {
+        return;
+    }
+    let path = bounded_preview(path, agent_contracts::MAX_RESOURCE_PATH_CHARS);
+    if !path.is_empty() && !paths.iter().any(|candidate| candidate == &path) {
+        paths.push(path);
+    }
+}
+
+fn bound_settlement_metadata(metadata: &mut serde_json::Value) {
+    // Path caps are expressed in Unicode characters while the envelope cap
+    // is serialized UTF-8 bytes. Drop the least-prioritized tail paths until
+    // the actual wire representation fits; four-byte paths must not bypass
+    // the broker merely because settlement happens after it.
+    while serde_json::to_vec(&*metadata)
+        .map(|bytes| bytes.len() > agent_contracts::MAX_TOOL_METADATA_BYTES)
+        .unwrap_or(true)
+    {
+        let removed = metadata
+            .get_mut("attempted_paths")
+            .and_then(|value| value.as_array_mut())
+            .and_then(Vec::pop)
+            .is_some();
+        if !removed {
+            *metadata = serde_json::json!({
+                "commit_state": "unsettled",
+                "attempted_paths": [],
+            });
+            break;
+        }
+    }
+}
+
+fn not_applied_effect_output(output: ToolOutput, error: &str) -> ToolOutput {
+    unsettled_effect_output(
+        output,
+        "not_applied",
+        "effect commit failed",
+        "the change was prepared but could not be committed",
+        error,
+        true,
+    )
+}
+
+/// The dispatcher or preparation path failed while cleaning staged state.
+/// Core has already installed its recovery fence and deliberately keeps the
+/// operation queryable, so this projection must not preserve proposed
+/// revisions or imply that any target landed.
+fn execution_cleanup_recovery_output(output: ToolOutput, error: &str) -> ToolOutput {
+    unsettled_effect_output(
+        output,
+        "execution_cleanup_recovery_required",
+        "tool execution cleanup requires recovery",
+        "the tool reported no committed result, but preparation cleanup could not be confirmed; recovery is required before another mutation",
+        error,
+        true,
+    )
+}
+
 impl RuntimeActor {
     /// Prepare + spawn one tool call. Core first appends the exact operation
     /// identity to its authority WAL; only then does Runtime publish
@@ -251,6 +360,7 @@ impl RuntimeActor {
                 effect_id,
                 argument_digest,
                 value_completion_pending,
+                recovery_required,
             } = execution;
             let (operation, effect, directive, disposition) = match outcome {
                 ToolOutcome::Value(output) => {
@@ -348,7 +458,9 @@ impl RuntimeActor {
                     effect_id,
                     argument_digest: Some(argument_digest),
                     tool_identity: Some(completion_identity),
-                    value_completion_pending,
+                    value_completion_pending: value_completion_pending
+                        && recovery_required.is_none(),
+                    recovery_required,
                     directive,
                     disposition,
                     context_ack: None,
@@ -438,6 +550,20 @@ impl RuntimeActor {
         completion: OperationCompletion,
         op_tx: &mpsc::Sender<OperationCompletion>,
     ) {
+        let execution_recovery = completion.recovery_required.clone();
+        if let Some(reason) = execution_recovery.clone() {
+            self.require_effect_recovery(format!(
+                "tool operation {} could not settle prepared-effect cleanup: {reason}",
+                completion.operation.operation_id
+            ))
+            .await;
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::Error {
+                    message: crate::output::bound_error_message(reason),
+                })
+                .await;
+        }
         if self.is_stale(&completion) {
             // The operation turned stale before its side effect was
             // committed: roll the staged effect back so a cancelled or
@@ -469,8 +595,17 @@ impl RuntimeActor {
                     })
                     .await
                 {
-                    tracing::warn!(%error, "Core rejected stale-effect rollback identity after cleanup");
+                    tracing::warn!(%error, "Core could not confirm stale-effect rollback settlement");
                     self.state.recovery_required = true;
+                    let _ = self
+                        .core
+                        .emit_event(RuntimeEvent::Error {
+                            message: crate::output::bound_error_message(format!(
+                                "stale tool operation {} prepared-effect cleanup could not be confirmed: {error}",
+                                completion.operation.operation_id
+                            )),
+                        })
+                        .await;
                     let _ = self.core.emit_event(RuntimeEvent::RecoveryRequired).await;
                 } else if self.state.pending_tool_cleanup == Some(completion.operation.operation_id)
                 {
@@ -567,7 +702,7 @@ impl RuntimeActor {
                             message: "provider returned a structurally empty completion (empty content, no tool calls, 0/0 usage); refusing to complete the turn".into(),
                         })
                         .await;
-                    self.state.turn = None;
+                    self.settle_aborted_turn().await;
                     self.drain_queued_user_input(op_tx).await;
                     return;
                 }
@@ -585,6 +720,15 @@ impl RuntimeActor {
                 }
             }
             OperationOutcome::ToolOutput(output) => {
+                // A dispatcher/preparation cleanup failure reaches Runtime as
+                // a value so the current turn can report the truth. Replace
+                // that generic error with the same conservative settlement
+                // envelope used by commit failures before it enters the turn
+                // frame or ToolFinished event.
+                let output = match execution_recovery.as_deref() {
+                    Some(reason) => execution_cleanup_recovery_output(output, reason),
+                    None => output,
+                };
                 // The actor's current-turn/generation fence passed. Core now
                 // validates the run identity and Core-issued lease itself
                 // before committing; Runtime cannot bypass that check by
@@ -616,14 +760,7 @@ impl RuntimeActor {
                             output
                         }
                         EffectCommitDisposition::Receipt(EffectReceipt::NotApplied { error }) => {
-                            ToolOutput {
-                                ok: false,
-                                summary: format!("effect commit failed: {error}"),
-                                model_content: format!(
-                                    "the change was prepared but could not be committed: {error}"
-                                ),
-                                ..output
-                            }
+                            not_applied_effect_output(output, &error)
                         }
                         EffectCommitDisposition::Receipt(EffectReceipt::Applied {
                             durability: EffectDurability::DurabilityFailed(error),
@@ -639,16 +776,14 @@ impl RuntimeActor {
                                 "effect applied but recovery is required: {error}"
                             ))
                             .await;
-                            ToolOutput {
-                                ok: false,
-                                summary: format!(
-                                    "effect applied but recovery is required: {error}"
-                                ),
-                                model_content: format!(
-                                    "at least one change WAS applied, but the effect operation did not complete durably: {error}. Recovery is required before another mutation."
-                                ),
-                                ..output
-                            }
+                            unsettled_effect_output(
+                                output,
+                                "applied_recovery_required",
+                                "effect applied but recovery is required",
+                                "at least one change WAS applied, but the effect operation did not complete durably; recovery is required before another mutation",
+                                &error,
+                                false,
+                            )
                         }
                         EffectCommitDisposition::Receipt(EffectReceipt::Unknown { error }) => {
                             // Retrying or accepting another mutation would
@@ -659,14 +794,14 @@ impl RuntimeActor {
                                 "effect applied state unknown; recovery is required: {error}"
                             ))
                             .await;
-                            ToolOutput {
-                                ok: false,
-                                summary: format!("effect applied state unknown: {error}"),
-                                model_content: format!(
-                                    "the change may or may not have been applied (the applied state is unknown): {error}. It is not retried blindly, and recovery is required before another mutation."
-                                ),
-                                ..output
-                            }
+                            unsettled_effect_output(
+                                output,
+                                "unknown_recovery_required",
+                                "effect applied state unknown",
+                                "the change may or may not have been applied; do not retry blindly, and recover before another mutation",
+                                &error,
+                                false,
+                            )
                         }
                         EffectCommitDisposition::AuthorityRecordFailed { receipt, error } => {
                             self.require_effect_recovery(format!(
@@ -676,35 +811,32 @@ impl RuntimeActor {
                             match receipt {
                                 EffectReceipt::NotApplied {
                                     error: effect_error,
-                                } => ToolOutput {
-                                    ok: false,
-                                    summary: format!(
-                                        "effect was not applied, but recovery is required: {effect_error}"
-                                    ),
-                                    model_content: format!(
-                                        "the change was NOT applied, but Core could not record the terminal operation state: {error}. Recovery is required before another mutation."
-                                    ),
-                                    ..output
-                                },
-                                EffectReceipt::Applied { .. } => ToolOutput {
-                                    ok: false,
-                                    summary: "effect applied but authority recovery is required"
-                                        .into(),
-                                    model_content: format!(
-                                        "the change WAS applied, but Core could not record the terminal operation state: {error}. Recovery is required before another mutation."
-                                    ),
-                                    ..output
-                                },
+                                } => unsettled_effect_output(
+                                    output,
+                                    "not_applied_cleanup_recovery_required",
+                                    "effect was not applied, but recovery is required",
+                                    "the change was not applied, but prepared-effect cleanup or its authority terminal could not be confirmed; recovery is required before another mutation",
+                                    &format!("{effect_error}; settlement error: {error}"),
+                                    true,
+                                ),
+                                EffectReceipt::Applied { .. } => unsettled_effect_output(
+                                    output,
+                                    "applied_authority_recovery_required",
+                                    "effect applied but authority recovery is required",
+                                    "the change WAS applied, but Core could not record the terminal operation state; recovery is required before another mutation",
+                                    &error,
+                                    false,
+                                ),
                                 EffectReceipt::Unknown {
                                     error: effect_error,
-                                } => ToolOutput {
-                                    ok: false,
-                                    summary: format!("effect state unknown: {effect_error}"),
-                                    model_content: format!(
-                                        "the change may or may not have been applied, and Core could not record the terminal operation state: {error}. Do not retry blindly; recovery is required."
-                                    ),
-                                    ..output
-                                },
+                                } => unsettled_effect_output(
+                                    output,
+                                    "unknown_authority_recovery_required",
+                                    "effect state unknown",
+                                    "the change may or may not have been applied, and Core could not record the terminal operation state; do not retry blindly, and recover before another mutation",
+                                    &format!("{effect_error}; authority record error: {error}"),
+                                    false,
+                                ),
                             }
                         }
                         EffectCommitDisposition::Rejected(rejection) => {
@@ -728,12 +860,14 @@ impl RuntimeActor {
                                     "the prepared effect reported a workspace write to a path the approved intent never named"
                                 }
                             };
-                            ToolOutput {
-                                ok: false,
-                                summary: "effect authorization rejected before commit".into(),
-                                model_content: format!("the change was not applied: {detail}."),
-                                ..output
-                            }
+                            unsettled_effect_output(
+                                output,
+                                "rejected",
+                                "effect authorization rejected before commit",
+                                "the change was not applied because Core rejected its commit authority",
+                                detail,
+                                true,
+                            )
                         }
                     },
                     None => output,
@@ -803,7 +937,9 @@ impl RuntimeActor {
             }
             OperationOutcome::Failed { message } => {
                 let _ = self.core.emit_event(RuntimeEvent::Error { message }).await;
-                self.state.turn = None;
+                // Provider failure, not runtime corruption: settle the
+                // applied input and drop the turn without fencing.
+                self.settle_aborted_turn().await;
                 self.drain_queued_user_input(op_tx).await;
             }
             OperationOutcome::Cancelled => {
@@ -902,6 +1038,7 @@ impl RuntimeActor {
     /// active turn is deliberately not aborted: it must carry the truthful
     /// receipt back to the model/user and durably record that outcome.
     pub(super) async fn require_effect_recovery(&mut self, warning: String) {
+        let warning = crate::output::bound_error_message(warning);
         let newly_required = !self.state.recovery_required;
         self.state.recovery_required = true;
         let _ = self.core.emit_warning(warning).await;
@@ -955,5 +1092,143 @@ fn duplicate_no_progress_output(
             "original_failure_class": original_failure.as_str(),
             "executed": false,
         }),
+    }
+}
+
+#[cfg(test)]
+mod settlement_output_tests {
+    use super::*;
+    use agent_contracts::ToolFailureClass;
+
+    #[test]
+    fn commit_conflict_drops_proposed_revisions_and_is_typed() {
+        let output = ToolOutput {
+            call_id: "c".into(),
+            tool_name: "edit.patch".into(),
+            ok: true,
+            summary: "prepared".into(),
+            model_content: "proposed revision deadbeef".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({
+                "changed": true,
+                "files": [{"path": "src/lib.rs", "revision": "deadbeef"}],
+            }),
+        };
+        let failed = not_applied_effect_output(
+            output,
+            "stale_revision: target changed after mutation preflight",
+        );
+        assert!(!failed.ok);
+        assert_eq!(
+            failed.failure_class(),
+            Some(ToolFailureClass::StaleRevision)
+        );
+        assert_eq!(failed.metadata["commit_state"], "not_applied");
+        assert_eq!(failed.metadata["attempted_paths"][0], "src/lib.rs");
+        assert!(failed.metadata.get("files").is_none());
+        assert!(failed.resource_touches().is_empty());
+        assert!(!failed.model_content.contains("deadbeef"));
+    }
+
+    #[test]
+    fn execution_cleanup_failure_is_typed_and_drops_proposed_revisions() {
+        let output = ToolOutput {
+            call_id: "c".into(),
+            tool_name: "edit.patch".into(),
+            ok: false,
+            summary: "generic recovery error with proposed revision deadbeef".into(),
+            model_content: "generic recovery error with proposed revision deadbeef".into(),
+            artifact_ref: Some("artifact://proposed".into()),
+            metadata: serde_json::json!({
+                "path": "src/lib.rs",
+                "revision": "deadbeef",
+                "files": [{"path": "src/other.rs", "revision": "cafebabe"}],
+            }),
+        };
+
+        let failed =
+            execution_cleanup_recovery_output(output, &format!("START{}END", "x".repeat(10_000)));
+
+        assert!(!failed.ok);
+        assert_eq!(
+            failed.metadata["commit_state"],
+            "execution_cleanup_recovery_required"
+        );
+        assert_eq!(
+            failed.metadata["attempted_paths"],
+            serde_json::json!(["src/lib.rs", "src/other.rs"])
+        );
+        assert!(failed.metadata.get("files").is_none());
+        assert!(failed.metadata.get("revision").is_none());
+        assert!(failed.resource_touches().is_empty());
+        assert!(failed.artifact_ref.is_none());
+        assert!(!failed.summary.contains("deadbeef"));
+        assert!(!failed.model_content.contains("deadbeef"));
+        assert!(failed.summary.chars().count() <= agent_contracts::MAX_TOOL_SUMMARY_CHARS);
+        assert!(
+            serde_json::to_vec(&failed.metadata).unwrap().len()
+                <= agent_contracts::MAX_TOOL_METADATA_BYTES
+        );
+    }
+
+    #[test]
+    fn every_unsettled_projection_is_bounded_and_drops_proposed_facts() {
+        let files: Vec<_> = (0..agent_contracts::MAX_RESOURCE_TOUCHES + 4)
+            .map(|index| {
+                serde_json::json!({
+                    "path": format!("src/{index}/{}.rs", "😀".repeat(400)),
+                    "revision": "deadbeef",
+                })
+            })
+            .collect();
+        let output = ToolOutput {
+            call_id: "c".into(),
+            tool_name: "edit.patch".into(),
+            ok: true,
+            summary: "prepared deadbeef".into(),
+            model_content: "proposed revision deadbeef".into(),
+            artifact_ref: Some("artifact://proposed".into()),
+            metadata: serde_json::json!({"files": files}),
+        };
+
+        for (state, diagnose) in [
+            ("applied_recovery_required", false),
+            ("unknown_recovery_required", false),
+            ("not_applied_cleanup_recovery_required", true),
+            ("applied_authority_recovery_required", false),
+            ("unknown_authority_recovery_required", false),
+            ("execution_cleanup_recovery_required", true),
+            ("rejected", true),
+        ] {
+            let failed = unsettled_effect_output(
+                output.clone(),
+                state,
+                "settlement",
+                "world state",
+                &format!("START{}END", "x".repeat(10_000)),
+                diagnose,
+            );
+            assert!(!failed.ok);
+            assert_eq!(failed.metadata["commit_state"], state);
+            assert!(failed.metadata.get("files").is_none());
+            assert!(failed.resource_touches().is_empty());
+            assert!(failed.artifact_ref.is_none());
+            assert!(!failed.summary.contains("deadbeef"));
+            assert!(!failed.model_content.contains("deadbeef"));
+            assert!(failed.summary.chars().count() <= agent_contracts::MAX_TOOL_SUMMARY_CHARS);
+            let attempted = failed.metadata["attempted_paths"].as_array().unwrap();
+            assert!(attempted.len() <= agent_contracts::MAX_RESOURCE_TOUCHES);
+            assert!(
+                attempted.len() < agent_contracts::MAX_RESOURCE_TOUCHES,
+                "four-byte paths must be dropped until serialized metadata fits"
+            );
+            assert!(attempted.iter().all(|path| {
+                path.as_str().unwrap().chars().count() <= agent_contracts::MAX_RESOURCE_PATH_CHARS
+            }));
+            assert!(
+                serde_json::to_vec(&failed.metadata).unwrap().len()
+                    <= agent_contracts::MAX_TOOL_METADATA_BYTES
+            );
+        }
     }
 }

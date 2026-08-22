@@ -16,7 +16,7 @@ use std::hash::Hash;
 
 use agent_contracts::{
     AttentionState, ContextItem, ContextItemId, ContextKind, ContextResidency, ContextScope,
-    ContextSearchQuery, ExternalizedContext, TaskId,
+    ContextSearchQuery, ExternalizedContext, TaskId, TextIndex,
 };
 
 /// Where the item's body currently lives. Exactly one location per id.
@@ -46,7 +46,16 @@ struct CatalogKeys {
     residency: ContextResidency,
     attention: AttentionState,
     live: bool,
+    /// Path identity, when the item carries one (`path@rev` sources).
+    file_path: Option<String>,
+    /// Bounded body text for the shared inverted index: a content prefix
+    /// for resident/warm items, the stored summary for externalized ones.
+    /// Never a full 16 KiB body — the kernel caps tokens per document.
+    body_text: String,
 }
+
+/// 正文进倒排的前缀上限：命中靠前导 token，全文召回走 fetch/admit。
+const INDEX_BODY_PREFIX_CHARS: usize = 512;
 
 impl CatalogKeys {
     fn from_item(item: &ContextItem) -> Self {
@@ -63,6 +72,8 @@ impl CatalogKeys {
             residency: item.residency,
             attention: item.attention,
             live: item.semantic.is_live(),
+            file_path: item.file_path.clone(),
+            body_text: item.content.chars().take(INDEX_BODY_PREFIX_CHARS).collect(),
         }
     }
 
@@ -80,6 +91,8 @@ impl CatalogKeys {
             residency: entry.residency,
             attention: entry.attention,
             live: entry.semantic.is_live(),
+            file_path: entry.file_path.clone(),
+            body_text: entry.context_ref.summary.clone(),
         }
     }
 }
@@ -132,6 +145,16 @@ pub(crate) struct ContextCatalog {
     by_residency: HashMap<ContextResidency, Vec<ContextItemId>>,
     by_attention: HashMap<AttentionState, Vec<ContextItemId>>,
     live: HashSet<ContextItemId>,
+    /// Shared-kernel inverted index (`agent_contracts::search`) over
+    /// entities/labels/path/body text. Mechanics only — ranking below is
+    /// this catalog's own policy.
+    text: TextIndex,
+    /// `ContextItemId -> doc handle` for index removal. Handles are arena
+    /// positions in `text_docs`; removal leaves holes until the next
+    /// wholesale rebuild resets the arena (ids are unique UUIDs, so slots
+    /// never collide within a generation).
+    text_ids: HashMap<ContextItemId, u32>,
+    text_docs: Vec<ContextItemId>,
     fingerprint: CatalogFingerprint,
     #[cfg(test)]
     last_sync_rebuilt: bool,
@@ -299,13 +322,60 @@ impl ContextCatalog {
 
         let needle = query.query.trim();
         if !needle.is_empty() {
-            let text_ids = self.text_key_ids(needle);
-            if text_ids.is_empty() {
-                // 无过滤、实体/标签键也未命中：摘要/uri/正文只能残差扫描。
-                candidates.as_ref()?;
-            } else {
-                intersect(&text_ids);
+            // 命中率优先的候选并集，两层各补对方的盲区：
+            // 1) 共享倒排核 —— 多词覆盖、稀有度分层、唯一前缀扩展；
+            //    摘要/正文前缀/路径都可命中（旧实现只有实体/标签键）。
+            // 2) 旧键包含扫描 —— 整段 needle 作为子串命中实体/标签键，
+            //    保留跨 token 边界的旧语义（如 "th ti" 这类碎片）。
+            // 候选只是预过滤：store.rs 的命中校验仍逐条独立执行，
+            // 因此并集只增召回、不降精度。顺序即排名：覆盖度/稀有度
+            // 在前，旧语义补充在后；最终排序由 search_entries 决定。
+            let mut ids: Vec<ContextItemId> = Vec::new();
+            // 饱和 token 的候选可达 4096 条：去重走 HashSet，避免
+            // 候选集平方级的线性 contains。
+            let mut seen: HashSet<ContextItemId> = HashSet::new();
+            let mut saw_candidate = false;
+            for matched in self.text.search(needle) {
+                saw_candidate = true;
+                let id = self.text_docs[matched.doc as usize];
+                if self.live.contains(&id) && seen.insert(id) {
+                    ids.push(id);
+                }
             }
+            for id in self.text_key_ids(needle) {
+                saw_candidate = true;
+                if self.live.contains(&id) && seen.insert(id) {
+                    ids.push(id);
+                }
+            }
+            if !ids.is_empty() {
+                if let Some(set) = candidates.as_ref() {
+                    ids.retain(|id| set.contains(id));
+                }
+                return Some(ids);
+            }
+            if saw_candidate {
+                // 文本层有候选但全部语义死亡：索引已经界定了集合，
+                // 如实返回空集（终态永不复活，也绝不走残差扫描放大）。
+                return match candidates.as_ref() {
+                    Some(set) => Some(
+                        set.iter()
+                            .copied()
+                            .filter(|id| self.live.contains(id))
+                            .collect(),
+                    ),
+                    None => Some(Vec::new()),
+                };
+            }
+            // 真正无文本候选：有过滤时过滤桶本身就是候选集（旧行为）；
+            // 无过滤时交给调用方残差扫描。
+            let set = candidates.as_ref()?;
+            return Some(
+                set.iter()
+                    .copied()
+                    .filter(|id| self.live.contains(id))
+                    .collect(),
+            );
         }
 
         let ids = match candidates {
@@ -446,6 +516,9 @@ impl ContextCatalog {
         self.by_residency.clear();
         self.by_attention.clear();
         self.live.clear();
+        self.text.clear();
+        self.text_ids.clear();
+        self.text_docs.clear();
     }
 
     fn insert_item(&mut self, item: &ContextItem, location: CatalogLocation) {
@@ -484,13 +557,39 @@ impl ContextCatalog {
         if let Some(keys) = self.records.remove(&id) {
             self.unindex(id, &keys);
         }
+        if let Some(doc) = self.text_ids.remove(&id) {
+            self.text.remove(doc);
+        }
         self.by_id.remove(&id);
     }
 
     fn install(&mut self, id: ContextItemId, location: CatalogLocation, keys: CatalogKeys) {
         self.by_id.insert(id, location);
         self.index_keys(id, &keys);
+        self.index_text(id, &keys);
         self.records.insert(id, keys);
+    }
+
+    /// Feed the shared inverted-index kernel. Fields mirror what a search
+    /// hit may legitimately match — entities, labels, path identity, and a
+    /// bounded body prefix / stored summary.
+    fn index_text(&mut self, id: ContextItemId, keys: &CatalogKeys) {
+        let doc = self.text_docs.len() as u32;
+        let mut fields: Vec<&str> = Vec::with_capacity(4 + keys.entities.len() + keys.labels.len());
+        for entity in &keys.entities {
+            fields.push(entity);
+        }
+        for label in &keys.labels {
+            fields.push(label);
+        }
+        if let Some(path) = keys.file_path.as_deref() {
+            fields.push(path);
+        }
+        fields.push(keys.body_text.as_str());
+        if self.text.insert(doc, &fields) {
+            self.text_ids.insert(id, doc);
+            self.text_docs.push(id);
+        }
     }
 
     fn index_keys(&mut self, id: ContextItemId, keys: &CatalogKeys) {
@@ -706,8 +805,81 @@ mod tests {
             catalog
                 .stored_search_ids(&ContextSearchQuery::new("not-an-entity", 8))
                 .is_none(),
-            "summary-only needles must residual-scan"
+            "a needle matching nothing anywhere must residual-scan"
         );
+    }
+
+    #[test]
+    fn multi_word_body_hits_rank_by_coverage() {
+        // 命中率核心：正文/摘要词现在可命中。两词都命中的条目排在单词
+        // 命中之前；旧实现里这类查询只能依赖残差扫描甚至空手而归。
+        let both = item(ContextItemId::new(), "auth-timeout", None);
+        let single = item(ContextItemId::new(), "timeout", None);
+        let mut catalog = ContextCatalog::default();
+        catalog.rebuild(&[both.clone(), single.clone()], &[], &[]);
+
+        let hits = catalog
+            .search_ids(&ContextSearchQuery::new("auth timeout", 8))
+            .expect("body tokens are indexed");
+        assert_eq!(hits, vec![both.id, single.id]);
+    }
+
+    #[test]
+    fn whole_needle_substring_over_keys_still_matches() {
+        // 旧语义保留：整段 needle 作为子串命中实体键（跨 token 边界的
+        // 碎片查询），由候选并集的第二层提供。
+        let decision = item(ContextItemId::new(), "AuthService.rs", None);
+        let mut catalog = ContextCatalog::default();
+        catalog.rebuild(&[decision.clone()], &[], &[]);
+
+        let hits = catalog
+            .search_ids(&ContextSearchQuery::new("hService", 8))
+            .expect("legacy key-substring candidates survive");
+        assert_eq!(hits, vec![decision.id]);
+    }
+
+    #[test]
+    fn text_candidates_exclude_semantically_dead_items() {
+        let live = item(ContextItemId::new(), "migration plan", None);
+        let mut dead = item(ContextItemId::new(), "migration plan draft", None);
+        dead.semantic = SemanticState::Tombstoned;
+        let mut catalog = ContextCatalog::default();
+        catalog.rebuild(&[live.clone(), dead], &[], &[]);
+
+        let hits = catalog
+            .search_ids(&ContextSearchQuery::new("migration plan", 8))
+            .expect("the live item matches");
+        assert_eq!(hits, vec![live.id], "terminal semantics never resurface");
+    }
+
+    #[test]
+    fn dead_only_candidates_return_an_empty_set_not_a_residual_scan() {
+        // 索引界定了候选（全部语义死亡）时必须返回 Some(空)：残差扫描
+        // 是"索引没 bounded"的信号，不得被死条目触发。
+        let mut dead = item(ContextItemId::new(), "superseded design", None);
+        dead.semantic = SemanticState::Tombstoned;
+        let mut catalog = ContextCatalog::default();
+        catalog.rebuild(&[dead], &[], &[]);
+
+        let hits = catalog
+            .search_ids(&ContextSearchQuery::new("design", 8))
+            .expect("the index bounded the set; empty means no live hit");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn wholesale_rebuild_resets_the_text_arena() {
+        // 稳定性：doc 句柄随重建代际重置，跨代际不得串号。
+        let mut catalog = ContextCatalog::default();
+        catalog.rebuild(&[item(ContextItemId::new(), "alpha", None)], &[], &[]);
+        catalog.rebuild(&[], &[], &[]);
+        let second = item(ContextItemId::new(), "alpha", None);
+        catalog.rebuild(&[second.clone()], &[], &[]);
+
+        let hits = catalog
+            .search_ids(&ContextSearchQuery::new("alpha", 4))
+            .expect("reindexed after rebuild");
+        assert_eq!(hits, vec![second.id]);
     }
 
     #[test]

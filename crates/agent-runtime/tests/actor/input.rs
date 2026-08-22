@@ -499,3 +499,117 @@ async fn structurally_empty_model_completion_does_not_complete_the_turn() {
     );
     handle.stop().await.unwrap();
 }
+
+/// A failed BeforeModel maintenance call must journal the failed phase
+/// durably (`TurnCommitFailed`), fence the runtime, and settle the applied
+/// user input out of Applied — a fenced turn can never reach Consumed or
+/// Archived, so the committed interruption is its only honest terminal.
+#[tokio::test]
+async fn before_model_maintain_failure_journals_the_phase_and_settles_the_input() {
+    use agent_contracts::{
+        ContextDiagnostics, ContextEngine, ContextIngress, ContextMaintenanceReport,
+        ContextMaintenanceTrigger, ContextQuery, ContextStateTransition, MaterializedContext,
+        ScopeId, ScopeKind,
+    };
+
+    struct FailBeforeModelMaintainEngine;
+    #[async_trait::async_trait]
+    impl ContextEngine for FailBeforeModelMaintainEngine {
+        async fn ingest(&self, _ingress: ContextIngress) -> AgentResult<()> {
+            Ok(())
+        }
+        async fn maintain(
+            &self,
+            trigger: ContextMaintenanceTrigger,
+        ) -> AgentResult<ContextMaintenanceReport> {
+            if trigger == ContextMaintenanceTrigger::BeforeModel {
+                return Err(agent_contracts::AgentError::Context(
+                    "simulated before-model maintain failure".into(),
+                ));
+            }
+            Ok(ContextMaintenanceReport::default())
+        }
+        async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+            Ok(MaterializedContext {
+                materialization_id: 0,
+                focus: None,
+                task: None,
+                items: Vec::new(),
+                external: agent_contracts::ContextMapView::default(),
+                selected: Vec::new(),
+                approx_tokens: 0,
+                foreground: Vec::new(),
+                diagnostics: ContextDiagnostics::default(),
+            })
+        }
+        async fn open_scope(
+            &self,
+            _kind: ScopeKind,
+            _parent: Option<ScopeId>,
+        ) -> AgentResult<ScopeId> {
+            Ok(ScopeId::new())
+        }
+        async fn close_scope(
+            &self,
+            _scope_id: ScopeId,
+        ) -> AgentResult<Vec<ContextStateTransition>> {
+            Ok(Vec::new())
+        }
+        async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+            Ok(ContextDiagnostics::default())
+        }
+        async fn inspect(
+            &self,
+            _limit: usize,
+        ) -> AgentResult<Vec<agent_contracts::ContextItemSummary>> {
+            Ok(Vec::new())
+        }
+        async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+        async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+            Ok(())
+        }
+    }
+
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(FailBeforeModelMaintainEngine),
+        Arc::new(SilentModel),
+        Arc::new(TestToolDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle.user_message("hello".into()).await.unwrap();
+
+    let mut seen: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(envelope) = events.try_recv() {
+            seen.push(format!("{:?}", envelope.event));
+        }
+        if seen.iter().any(|e| e.contains("RecoveryRequired")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        seen.iter()
+            .any(|e| e.contains("TurnCommitFailed") && e.contains("before_model_maintain")),
+        "the failed preparation phase must be journaled durably, saw: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|e| e.contains("UserMessageAccepted") && e.contains("InterruptCommitted")),
+        "the applied input must be settled out of Applied, saw: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|e| e.contains("TurnCompleted")),
+        "a fenced turn must never complete, saw: {seen:?}"
+    );
+    handle.stop().await.unwrap();
+}

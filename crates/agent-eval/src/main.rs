@@ -19,12 +19,15 @@ mod envfile;
 mod fixture_driver;
 mod harvest;
 mod hygiene;
+mod longflow;
 mod metrics;
 mod mock_model;
 mod pilot;
 mod retrieval;
 mod suite;
 mod task;
+mod tool_edit_gate;
+mod tool_edit_pack;
 mod workload;
 
 fn usage() -> ! {
@@ -151,6 +154,14 @@ fn usage() -> ! {
          measure search recall/latency and graded access stamps. Not the\n\
          paired real-model coding gate.\n\
          \n\
+         usage: agent-eval --retrieval-complex\n\
+         \n\
+         Engine-only COMPLEX retrieval scenario through the real call chain\n\
+         (ingest → GC externalize → search_external): multi-word semantic\n\
+         needles that are never contiguous in any summary, one kind-filtered\n\
+         case, single-word and identity controls as regression guards.\n\
+         Prints per-case RC rows. Not the paired real-model coding gate.\n\
+         \n\
          usage: agent-eval --context-hygiene\n\
          \n\
          Engine-only C-hygiene ablation: current / descriptor-only /\n\
@@ -182,7 +193,22 @@ fn usage() -> ! {
          distill-skip case. Live is A/C (no rolling): 3 tasks × 2 engines\n\
          × 2 repeats = 12 cells. Default repeats=2. Does not rewrite frozen\n\
          context-bench.v1. Do not keep live-running recall_after_fix. This\n\
-         does not close M15 and does not open the 300×3 ITT gate.\n"
+         does not close M15 and does not open the 300×3 ITT gate.\n\
+         \n\
+         usage: agent-eval --tool-edit\n\
+         usage: agent-eval [--repeats N] [--evidence-dir <dir>] --tool-edit-run [id]\n\
+         \n\
+         Tool Edit V2: four raw-byte fixtures on one fixed dynamic engine\n\
+         and the production-default tool surface. The live default is three\n\
+         repeats (12 cells). It measures edit.patch, not Context policy,\n\
+         and writes one versioned evidence bundle per cell.\n\
+         \n\
+         usage: agent-eval [--repeats N] [--evidence-dir <dir>] --longflow-run [id]\n\
+         \n\
+         Long-flow diagnostic: the 15-turn late-constraint trajectory on\n\
+         append vs dynamic, run CONCURRENTLY so wall time stays close to\n\
+         one cell. Development instrument only; evidence dir default is\n\
+         crates/agent-eval/evidence/longflow/.\n"
     );
     std::process::exit(2);
 }
@@ -428,9 +454,30 @@ async fn main() -> anyhow::Result<()> {
                 print!("{}", retrieval::render_retrieval(&report));
                 return Ok(());
             }
+            "--retrieval-complex" => {
+                let report = retrieval::run_retrieval_complex_baseline().await?;
+                print!("{report}");
+                return Ok(());
+            }
             "--context-hygiene" => {
                 let reports = hygiene::run_hygiene_ablation().await?;
                 print!("{}", hygiene::render_hygiene(&reports));
+                return Ok(());
+            }
+            "--tool-edit" => {
+                let pack = tool_edit_pack::load_pack()?;
+                print!("{}", tool_edit_pack::render_pack(&pack));
+                print!("{}", tool_edit_pack::check_pack(&pack)?);
+                return Ok(());
+            }
+            "--tool-edit-run" => {
+                let only = args.next().filter(|value| !value.starts_with('-'));
+                let repeats = if repeats_set {
+                    repeats
+                } else {
+                    tool_edit_pack::DEFAULT_REPEATS
+                };
+                run_tool_edit_live(only, repeats, evidence_dir, allow_dirty).await?;
                 return Ok(());
             }
             "--context-bench" => {
@@ -459,6 +506,12 @@ async fn main() -> anyhow::Result<()> {
                 let only = args.next().filter(|value| !value.starts_with('-'));
                 let repeats = if repeats_set { repeats } else { 2 };
                 run_context_mech_live(only, repeats, evidence_dir, allow_dirty).await?;
+                return Ok(());
+            }
+            "--longflow-run" => {
+                let only = args.next().filter(|value| !value.starts_with('-'));
+                let repeats = if repeats_set { repeats } else { 1 };
+                run_longflow_live(only, repeats, evidence_dir, allow_dirty).await?;
                 return Ok(());
             }
             "--all" => engines = vec!["append", "rolling", "dynamic"],
@@ -812,10 +865,853 @@ async fn run_context_mech_live(
     Ok(())
 }
 
+/// Long-flow diagnostic: same shape as the mech runner, but engines run
+/// concurrently and the pack/evidence identity is longflow-specific.
+async fn run_longflow_live(
+    only: Option<String>,
+    repeats: u32,
+    evidence_dir: Option<std::path::PathBuf>,
+    allow_dirty: bool,
+) -> anyhow::Result<()> {
+    bundle::require_clean_tree(allow_dirty)?;
+    let pack = longflow::load_pack()?;
+    let model = driver::build_live_coding_model()?;
+    let evidence_root = evidence_dir
+        .unwrap_or_else(|| std::path::PathBuf::from("crates/agent-eval/evidence/longflow"));
+    std::fs::create_dir_all(&evidence_root)?;
+    eprintln!("evidence dir: {}", evidence_root.display());
+    let tasks: Vec<&context_bench::BenchTask> = pack
+        .tasks
+        .iter()
+        .filter(|task| only.as_deref().is_none_or(|id| task.id() == id))
+        .collect();
+    anyhow::ensure!(!tasks.is_empty(), "no matching longflow task");
+    for round in 1..=repeats {
+        for task in &tasks {
+            eprintln!(
+                "== longflow {} A/C (concurrent) repeat {round}/{repeats} ==",
+                task.id()
+            );
+            let dir = tempfile::tempdir()?;
+            let pair = bundle::PairSink {
+                root: evidence_root.clone(),
+                fixture_id: task.id().to_string(),
+                repeat: round,
+                repeats,
+                live: true,
+            };
+            let runs = fixture_driver::compare_mech_live_parallel(
+                &pack,
+                task,
+                dir.path(),
+                model.clone(),
+                Some(&pair),
+                longflow::SCHEMA,
+                longflow::spec_sha256(),
+            )
+            .await?;
+            print!("{}", fixture_driver::render_live_comparison(&runs));
+            let pair_dir = pair.root.join(task.id()).join(format!("r{round}"));
+            print!("{}", bundle::render_evidence(&pair_dir)?);
+        }
+    }
+    Ok(())
+}
+
+async fn tool_edit_model_spec() -> anyhow::Result<agent_contracts::ToolSpec> {
+    use agent_contracts::ToolDispatcher as _;
+
+    let dir = tempfile::tempdir()?;
+    let workspace = agent_workspace::Workspace::open(dir.path()).await?;
+    let dispatcher = tool_runtime::BuiltinToolDispatcher::new(workspace);
+    dispatcher
+        .specs()
+        .into_iter()
+        .find(|spec| spec.name == "edit.patch")
+        .map(agent_contracts::ToolSpec::compact_for_model_surface)
+        .ok_or_else(|| anyhow::anyhow!("production surface omitted edit.patch"))
+}
+
+fn serialized_sha256(value: &impl serde::Serialize) -> anyhow::Result<String> {
+    use sha2::{Digest as _, Sha256};
+
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
+}
+
+fn checked_percentile(samples: &mut [u64], percentile: u64) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    Some(metrics::percentile(samples, percentile))
+}
+
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+
+fn model_identity(model: Option<&str>, base_url: Option<&str>) -> Option<String> {
+    let model = model.map(str::trim).filter(|value| !value.is_empty())?;
+    let base_url = match base_url {
+        Some(value) => value.trim(),
+        None => DEFAULT_OPENAI_BASE_URL,
+    };
+    if base_url.is_empty() {
+        return None;
+    }
+    Some(format!("{base_url}\n{model}"))
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+struct ToolEditCellIdentityChecks {
+    manifest_schema_matches: bool,
+    fixture_id_matches: bool,
+    engine_is_production: bool,
+    repeat_matches: bool,
+    repeats_match_plan: bool,
+    live: bool,
+    fixture_sha256_matches_plan: bool,
+    source_tree_digest_present: bool,
+    source_tree_digest_matches_plan: bool,
+    model_identity_nonempty: bool,
+    model_identity_matches_plan: bool,
+}
+
+impl ToolEditCellIdentityChecks {
+    fn passed(self) -> bool {
+        self.manifest_schema_matches
+            && self.fixture_id_matches
+            && self.engine_is_production
+            && self.repeat_matches
+            && self.repeats_match_plan
+            && self.live
+            && self.fixture_sha256_matches_plan
+            && self.source_tree_digest_present
+            && self.source_tree_digest_matches_plan
+            && self.model_identity_nonempty
+            && self.model_identity_matches_plan
+    }
+}
+
+fn tool_edit_cell_identity_checks(
+    manifest: &bundle::CellManifest,
+    fixture_id: &str,
+    repeat: u32,
+    repeats: u32,
+    fixture_sha256: &str,
+    source_tree_digest: &str,
+    planned_model_identity: &str,
+) -> ToolEditCellIdentityChecks {
+    let actual_model_identity = model_identity(
+        manifest.openai_model.as_deref(),
+        manifest.openai_base_url.as_deref(),
+    );
+    ToolEditCellIdentityChecks {
+        manifest_schema_matches: manifest.schema == bundle::CELL_SCHEMA,
+        fixture_id_matches: manifest.fixture_id == fixture_id,
+        engine_is_production: manifest.engine == "production",
+        repeat_matches: manifest.repeat == repeat,
+        repeats_match_plan: manifest.repeats == repeats,
+        live: manifest.live,
+        fixture_sha256_matches_plan: manifest.fixture_sha256 == fixture_sha256,
+        source_tree_digest_present: manifest.source_tree_digest.is_some(),
+        source_tree_digest_matches_plan: manifest.source_tree_digest.as_deref()
+            == Some(source_tree_digest),
+        model_identity_nonempty: actual_model_identity.is_some(),
+        model_identity_matches_plan: actual_model_identity.as_deref()
+            == Some(planned_model_identity),
+    }
+}
+
+#[derive(Debug)]
+struct ToolEditRecord {
+    cell: String,
+    conflict: tool_edit_pack::ConflictContract,
+    gate: tool_edit_gate::ToolEditGateReport,
+    summary: bundle::CellSummary,
+    manifest: bundle::CellManifest,
+    identity: ToolEditCellIdentityChecks,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProviderUsageCell {
+    tokens: Option<u64>,
+    usage_incomplete: bool,
+    tokens_lower_bound: bool,
+}
+
+impl ProviderUsageCell {
+    fn from_summary(summary: &bundle::CellSummary) -> Self {
+        Self {
+            tokens: summary
+                .metrics
+                .get("provider_tokens_total")
+                .and_then(serde_json::Value::as_u64),
+            usage_incomplete: summary.usage_incomplete,
+            tokens_lower_bound: summary.provider_tokens_lower_bound,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ProviderUsageRollup {
+    usage_complete_cells: usize,
+    usage_incomplete_cells: usize,
+    provider_tokens_lower_bound_cells: usize,
+    provider_tokens_lower_bound: bool,
+    provider_tokens_total: u64,
+    provider_token_percentile_samples: usize,
+    provider_tokens_p50: Option<u64>,
+    provider_tokens_p95: Option<u64>,
+}
+
+fn provider_usage_rollup(
+    cells: impl IntoIterator<Item = ProviderUsageCell>,
+) -> ProviderUsageRollup {
+    let mut usage_incomplete_cells = 0usize;
+    let mut provider_tokens_lower_bound_cells = 0usize;
+    let mut provider_tokens_total = 0u64;
+    let mut complete_samples = Vec::new();
+    for cell in cells {
+        let usage_incomplete = cell.usage_incomplete || cell.tokens.is_none();
+        let tokens_lower_bound = cell.tokens_lower_bound || usage_incomplete;
+        usage_incomplete_cells += usize::from(usage_incomplete);
+        provider_tokens_lower_bound_cells += usize::from(tokens_lower_bound);
+        if let Some(tokens) = cell.tokens {
+            provider_tokens_total = provider_tokens_total.saturating_add(tokens);
+            if !usage_incomplete && !tokens_lower_bound {
+                complete_samples.push(tokens);
+            }
+        }
+    }
+    let usage_complete_cells = complete_samples.len();
+    let provider_tokens_p50 = checked_percentile(&mut complete_samples.clone(), 50);
+    let provider_tokens_p95 = checked_percentile(&mut complete_samples, 95);
+    ProviderUsageRollup {
+        usage_complete_cells,
+        usage_incomplete_cells,
+        provider_tokens_lower_bound_cells,
+        provider_tokens_lower_bound: provider_tokens_lower_bound_cells > 0,
+        provider_tokens_total,
+        provider_token_percentile_samples: usage_complete_cells,
+        provider_tokens_p50,
+        provider_tokens_p95,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_tool_edit_cell(
+    pack: &tool_edit_pack::ToolEditPack,
+    task: &tool_edit_pack::ToolEditTask,
+    round: u32,
+    repeats: u32,
+    evidence_root: &std::path::Path,
+    model: std::sync::Arc<dyn agent_contracts::ModelTransport>,
+    task_sha256: &str,
+    source_tree_digest: &str,
+    planned_model_identity: &str,
+) -> anyhow::Result<ToolEditRecord> {
+    let dir = tempfile::tempdir()?;
+    let pair = bundle::PairSink {
+        root: evidence_root.to_path_buf(),
+        fixture_id: task.id().to_string(),
+        repeat: round,
+        repeats,
+        live: true,
+    };
+    let run =
+        fixture_driver::run_tool_edit_live(pack, task, dir.path(), model, Some(&pair)).await?;
+    print!(
+        "{}",
+        fixture_driver::render_live_comparison(std::slice::from_ref(&run))
+    );
+    let pair_dir = pair.root.join(task.id()).join(format!("r{round}"));
+    print!("{}", bundle::render_evidence(&pair_dir)?);
+    let cell_dir = pair.cell_dir("production");
+    for required in [
+        "events.jsonl",
+        "gate.json",
+        "manifest.json",
+        "summary.json",
+        "tool-edit.json",
+        "verify.json",
+        "workspace.json",
+    ] {
+        anyhow::ensure!(
+            cell_dir.join(required).is_file(),
+            "incomplete tool-edit cell {}: missing {required}",
+            cell_dir.display()
+        );
+    }
+    let gate: tool_edit_gate::ToolEditGateReport =
+        serde_json::from_str(&std::fs::read_to_string(cell_dir.join("gate.json"))?)?;
+    let summary: bundle::CellSummary =
+        serde_json::from_str(&std::fs::read_to_string(cell_dir.join("summary.json"))?)?;
+    let manifest: bundle::CellManifest =
+        serde_json::from_str(&std::fs::read_to_string(cell_dir.join("manifest.json"))?)?;
+    let identity = tool_edit_cell_identity_checks(
+        &manifest,
+        task.id(),
+        round,
+        repeats,
+        task_sha256,
+        source_tree_digest,
+        planned_model_identity,
+    );
+    Ok(ToolEditRecord {
+        cell: format!("{}/r{round}/production", task.id()),
+        conflict: task.file.trace.conflict,
+        gate,
+        summary,
+        manifest,
+        identity,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_incomplete_tool_edit_summary(
+    evidence_root: &std::path::Path,
+    expected_cells: &[String],
+    completed: &[ToolEditRecord],
+    failed_cell: &str,
+    error: &anyhow::Error,
+    source_tree_digest: &str,
+    gate_implementation_sha256: &str,
+    edit_patch_spec_sha256: &str,
+) -> anyhow::Result<()> {
+    let error: String = error.to_string().chars().take(1_000).collect();
+    let summary = serde_json::json!({
+        "schema": "agent-eval.tool-edit-run-summary.v2",
+        "verdict": "fail",
+        "acceptance_eligible": false,
+        "complete": false,
+        "expected_cells": expected_cells.len(),
+        "completed_cells": completed.len(),
+        "completed_cell_ids": completed.iter().map(|record| record.cell.as_str()).collect::<Vec<_>>(),
+        "failed_cell": failed_cell,
+        "error": error,
+        "source_tree_digest": source_tree_digest,
+        "gate_schema": tool_edit_gate::SCHEMA,
+        "gate_implementation_sha256": gate_implementation_sha256,
+        "edit_patch_model_spec_sha256": edit_patch_spec_sha256,
+    });
+    std::fs::write(
+        evidence_root.join("run-summary.json"),
+        serde_json::to_string_pretty(&summary)?,
+    )?;
+    Ok(())
+}
+
+async fn run_tool_edit_live(
+    only: Option<String>,
+    repeats: u32,
+    evidence_dir: Option<std::path::PathBuf>,
+    allow_dirty: bool,
+) -> anyhow::Result<()> {
+    bundle::require_clean_tree(allow_dirty)?;
+    let pack = tool_edit_pack::load_pack()?;
+    // Fail before the first provider call if fixture bytes or SHA identities
+    // drifted. Live cells never repair or reinterpret the pack.
+    tool_edit_pack::check_pack(&pack)?;
+    let full_pack = only.is_none();
+    let tasks: Vec<&tool_edit_pack::ToolEditTask> = match only {
+        Some(id) => vec![
+            pack.task(&id)
+                .ok_or_else(|| anyhow::anyhow!("unknown tool-edit task: {id} (see --tool-edit)"))?,
+        ],
+        None => pack.tasks.iter().collect(),
+    };
+    let evidence_root = evidence_dir.unwrap_or_else(default_evidence_dir);
+    if evidence_root.exists() {
+        anyhow::ensure!(
+            std::fs::read_dir(&evidence_root)?.next().is_none(),
+            "tool-edit evidence directory must be empty: {}",
+            evidence_root.display()
+        );
+    }
+    std::fs::create_dir_all(&evidence_root)?;
+    let edit_patch_spec = tool_edit_model_spec().await?;
+    let edit_patch_spec_sha256 = serialized_sha256(&edit_patch_spec)?;
+    let gate_implementation_sha256 = tool_edit_gate::implementation_sha256();
+    let expected_cells: Vec<String> = tasks
+        .iter()
+        .flat_map(|task| {
+            (1..=repeats).map(move |round| format!("{}/r{round}/production", task.id()))
+        })
+        .collect();
+    let mut task_sha256s = std::collections::BTreeMap::new();
+    for task in &tasks {
+        task_sha256s.insert(task.id().to_string(), tool_edit_pack::task_sha256(task)?);
+    }
+    let source_tree_digest = bundle::source_tree_digest().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Tool Edit live requires a source_tree_digest; git source identity is unavailable"
+        )
+    })?;
+    let planned_model = envfile::get("OPENAI_MODEL")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Tool Edit live requires an explicit non-empty OPENAI_MODEL for evidence identity"
+            )
+        })?;
+    let planned_base_url = envfile::get("OPENAI_BASE_URL");
+    let planned_model_identity =
+        model_identity(Some(planned_model.as_str()), planned_base_url.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("Tool Edit live model identity is empty"))?;
+    let plan = serde_json::json!({
+        "schema": "agent-eval.tool-edit-run-plan.v2",
+        "status": "planned",
+        "scope": if full_pack { "full_pack" } else { "single_task" },
+        "allow_dirty": allow_dirty,
+        "pack_schema": tool_edit_pack::SCHEMA,
+        "spec_sha256": tool_edit_pack::spec_sha256(),
+        "pack_digest": tool_edit_pack::pack_digest(&pack)?,
+        "gate_schema": tool_edit_gate::SCHEMA,
+        "gate_implementation_sha256": gate_implementation_sha256,
+        "edit_patch_model_spec_sha256": edit_patch_spec_sha256,
+        "edit_patch_model_spec": edit_patch_spec,
+        "source_tree_digest": source_tree_digest,
+        "task_sha256s": task_sha256s,
+        "model_identity": {
+            "model": planned_model,
+            "base_url": planned_base_url.as_deref().unwrap_or(DEFAULT_OPENAI_BASE_URL),
+        },
+        "task_ids": tasks.iter().map(|task| task.id()).collect::<Vec<_>>(),
+        "repeats": repeats,
+        "expected_cells": expected_cells,
+    });
+    std::fs::write(
+        evidence_root.join("run-plan.json"),
+        serde_json::to_string_pretty(&plan)?,
+    )?;
+    let model = driver::build_live_coding_model()?;
+    eprintln!(
+        "tool-edit pack={} gate={} tasks={} repeats={} cells={} surface=production-default engine=dynamic evidence={}",
+        tool_edit_pack::SCHEMA,
+        tool_edit_gate::SCHEMA,
+        tasks.len(),
+        repeats,
+        tasks.len() as u32 * repeats,
+        evidence_root.display()
+    );
+
+    let mut records = Vec::with_capacity(expected_cells.len());
+    for task in &tasks {
+        let task_sha256 = task_sha256s
+            .get(task.id())
+            .expect("every planned Tool Edit task has a SHA-256");
+        for round in 1..=repeats {
+            eprintln!("== tool-edit {} repeat {round}/{repeats} ==", task.id());
+            let failed_cell = format!("{}/r{round}/production", task.id());
+            match collect_tool_edit_cell(
+                &pack,
+                task,
+                round,
+                repeats,
+                &evidence_root,
+                model.clone(),
+                task_sha256,
+                &source_tree_digest,
+                &planned_model_identity,
+            )
+            .await
+            {
+                Ok(record) => records.push(record),
+                Err(error) => {
+                    write_incomplete_tool_edit_summary(
+                        &evidence_root,
+                        &expected_cells,
+                        &records,
+                        &failed_cell,
+                        &error,
+                        &source_tree_digest,
+                        &gate_implementation_sha256,
+                        &edit_patch_spec_sha256,
+                    )?;
+                    return Err(error.context(format!("Tool Edit cell {failed_cell} failed")));
+                }
+            }
+        }
+    }
+
+    let completed_cells: std::collections::BTreeSet<&str> =
+        records.iter().map(|record| record.cell.as_str()).collect();
+    let expected_cell_set: std::collections::BTreeSet<&str> =
+        expected_cells.iter().map(String::as_str).collect();
+    let exact_cell_set = completed_cells == expected_cell_set;
+    let identity_checks = ToolEditCellIdentityChecks {
+        manifest_schema_matches: records
+            .iter()
+            .all(|record| record.identity.manifest_schema_matches),
+        fixture_id_matches: records
+            .iter()
+            .all(|record| record.identity.fixture_id_matches),
+        engine_is_production: records
+            .iter()
+            .all(|record| record.identity.engine_is_production),
+        repeat_matches: records.iter().all(|record| record.identity.repeat_matches),
+        repeats_match_plan: records
+            .iter()
+            .all(|record| record.identity.repeats_match_plan),
+        live: records.iter().all(|record| record.identity.live),
+        fixture_sha256_matches_plan: records
+            .iter()
+            .all(|record| record.identity.fixture_sha256_matches_plan),
+        source_tree_digest_present: records
+            .iter()
+            .all(|record| record.identity.source_tree_digest_present),
+        source_tree_digest_matches_plan: records
+            .iter()
+            .all(|record| record.identity.source_tree_digest_matches_plan),
+        model_identity_nonempty: records
+            .iter()
+            .all(|record| record.identity.model_identity_nonempty),
+        model_identity_matches_plan: records
+            .iter()
+            .all(|record| record.identity.model_identity_matches_plan),
+    };
+    let model_identities: std::collections::BTreeSet<String> = records
+        .iter()
+        .filter_map(|record| {
+            model_identity(
+                record.manifest.openai_model.as_deref(),
+                record.manifest.openai_base_url.as_deref(),
+            )
+        })
+        .collect();
+    let model_identity_unique = model_identities.len() == 1;
+    let identity_passed = identity_checks.passed() && model_identity_unique;
+    let source_identity_consistent = identity_checks.source_tree_digest_present
+        && identity_checks.source_tree_digest_matches_plan;
+    let strict_passed = records
+        .iter()
+        .filter(|record| record.gate.strict_passed)
+        .count();
+    let gate_passed = records.iter().filter(|record| record.gate.passed).count();
+    let non_conflict_cells = records
+        .iter()
+        .filter(|record| record.conflict == tool_edit_pack::ConflictContract::None)
+        .count();
+    let non_conflict_first_attempt_passed = records
+        .iter()
+        .filter(|record| {
+            record.conflict == tool_edit_pack::ConflictContract::None
+                && record.gate.valid_call_first_attempt_success
+        })
+        .count();
+    let stale_proactive = records
+        .iter()
+        .filter(|record| {
+            record.conflict == tool_edit_pack::ConflictContract::StaleOrRevalidated
+                && record.gate.passed
+                && record.gate.conflict_route.as_deref() == Some("proactive")
+        })
+        .count();
+    let stale_reactive = records
+        .iter()
+        .filter(|record| {
+            record.conflict == tool_edit_pack::ConflictContract::StaleOrRevalidated
+                && record.gate.passed
+                && record.gate.conflict_route.as_deref() == Some("reactive")
+        })
+        .count();
+    let mut wall_samples: Vec<u64> = records
+        .iter()
+        .map(|record| record.summary.wall_ms)
+        .collect();
+    let wall_ms_total = wall_samples.iter().copied().fold(0u64, u64::saturating_add);
+    let wall_ms_p50 = checked_percentile(&mut wall_samples.clone(), 50);
+    let wall_ms_p95 = checked_percentile(&mut wall_samples, 95);
+    let provider_usage = provider_usage_rollup(
+        records
+            .iter()
+            .map(|record| ProviderUsageCell::from_summary(&record.summary)),
+    );
+    let sum_gate = |project: fn(&tool_edit_gate::ToolEditGateReport) -> u64| {
+        records.iter().fold(0_u64, |total, record| {
+            total.saturating_add(project(&record.gate))
+        })
+    };
+    let passed = exact_cell_set && identity_passed && gate_passed == expected_cells.len();
+    let usage_complete =
+        provider_usage.usage_incomplete_cells == 0 && !provider_usage.provider_tokens_lower_bound;
+    let acceptance_eligible = full_pack
+        && repeats == tool_edit_pack::DEFAULT_REPEATS
+        && !allow_dirty
+        && usage_complete
+        && passed;
+    let models: std::collections::BTreeSet<String> = records
+        .iter()
+        .filter_map(|record| record.manifest.openai_model.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    let base_urls: std::collections::BTreeSet<String> = records
+        .iter()
+        .filter_map(|record| record.manifest.openai_base_url.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    let cells: Vec<serde_json::Value> = records
+        .iter()
+        .map(|record| {
+            let provider_usage = ProviderUsageCell::from_summary(&record.summary);
+            serde_json::json!({
+                "cell": record.cell,
+                "conflict": record.conflict,
+                "strict_passed": record.gate.strict_passed,
+                "gate_passed": record.gate.passed,
+                "first_attempt_passed": record.gate.valid_call_first_attempt_success,
+                "first_patch_exact_hunks": record.gate.first_patch_exact_hunks,
+                "fixture_mutation_evidence_valid": record.gate.fixture_mutation_evidence_valid,
+                "conflict_route": record.gate.conflict_route,
+                "patch_attempts": record.gate.patch_attempts,
+                "patch_failures": record.gate.patch_failures,
+                "rounds": record.gate.model_rounds,
+                "wall_ms": record.summary.wall_ms,
+                "provider_tokens_total": provider_usage.tokens,
+                "usage_incomplete": provider_usage.usage_incomplete,
+                "provider_tokens_lower_bound": provider_usage.tokens_lower_bound,
+                "identity": record.identity,
+                "identity_passed": record.identity.passed(),
+                "violations": record.gate.violations,
+            })
+        })
+        .collect();
+    let identity_summary = serde_json::json!({
+        "passed": identity_passed,
+        "manifest_schema_matches": identity_checks.manifest_schema_matches,
+        "fixture_id_matches": identity_checks.fixture_id_matches,
+        "engine_is_production": identity_checks.engine_is_production,
+        "repeat_matches": identity_checks.repeat_matches,
+        "repeats_match_plan": identity_checks.repeats_match_plan,
+        "live": identity_checks.live,
+        "fixture_sha256_matches_plan": identity_checks.fixture_sha256_matches_plan,
+        "source_tree_digest_present": identity_checks.source_tree_digest_present,
+        "source_tree_digest_matches_plan": identity_checks.source_tree_digest_matches_plan,
+        "model_identity_nonempty": identity_checks.model_identity_nonempty,
+        "model_identity_matches_plan": identity_checks.model_identity_matches_plan,
+        "model_identity_unique": model_identity_unique,
+    });
+    let mut run_summary = serde_json::json!({
+        "schema": "agent-eval.tool-edit-run-summary.v2",
+        "verdict": if passed { if acceptance_eligible { "acceptance_pass" } else { "diagnostic_pass" } } else { "fail" },
+        "acceptance_eligible": acceptance_eligible,
+        "usage_complete": usage_complete,
+        "complete": exact_cell_set,
+        "identity_passed": identity_passed,
+        "identity": identity_summary,
+        "source_identity_consistent": source_identity_consistent,
+        "source_tree_digest": source_tree_digest,
+        "task_sha256s": task_sha256s,
+        "expected_cells": expected_cells.len(),
+        "completed_cells": records.len(),
+        "strict_passed": strict_passed,
+        "gate_passed": gate_passed,
+        "non_conflict_first_attempt_passed": non_conflict_first_attempt_passed,
+        "non_conflict_cells": non_conflict_cells,
+        "stale_proactive_passed": stale_proactive,
+        "stale_reactive_passed": stale_reactive,
+    });
+    let summary_metrics = serde_json::json!({
+        "patch_attempts": sum_gate(|gate| gate.patch_attempts),
+        "patch_failures": sum_gate(|gate| gate.patch_failures),
+        "stale_refusals": sum_gate(|gate| gate.stale_refusals),
+        "non_stale_failures": sum_gate(|gate| gate.non_stale_failures),
+        "patch_revision_provenance_failures": sum_gate(|gate| gate.patch_revision_provenance_failures),
+        "patch_target_mismatches": sum_gate(|gate| gate.patch_target_mismatches),
+        "patch_hunk_contract_failures": sum_gate(|gate| gate.patch_hunk_contract_failures),
+        "read_identity_failures": sum_gate(|gate| gate.read_identity_failures),
+        "forbidden_calls": sum_gate(|gate| gate.forbidden_calls),
+        "confirm_reads_after_success": sum_gate(|gate| gate.confirm_reads_after_success),
+        "commit_not_applied": sum_gate(|gate| gate.commit_not_applied),
+        "commit_recovery_required": sum_gate(|gate| gate.commit_recovery_required),
+        "commit_unknown": sum_gate(|gate| gate.commit_unknown),
+        "model_rounds": sum_gate(|gate| gate.model_rounds),
+        "fs_read_bytes": sum_gate(|gate| gate.fs_read_bytes),
+        "wall_ms_total": wall_ms_total,
+        "wall_ms_p50": wall_ms_p50,
+        "wall_ms_p95": wall_ms_p95,
+        "usage_complete_cells": provider_usage.usage_complete_cells,
+        "usage_incomplete_cells": provider_usage.usage_incomplete_cells,
+        "provider_tokens_lower_bound_cells": provider_usage.provider_tokens_lower_bound_cells,
+        "provider_tokens_lower_bound": provider_usage.provider_tokens_lower_bound,
+        "provider_tokens_total": provider_usage.provider_tokens_total,
+        "provider_token_percentile_samples": provider_usage.provider_token_percentile_samples,
+        "provider_tokens_p50": provider_usage.provider_tokens_p50,
+        "provider_tokens_p95": provider_usage.provider_tokens_p95,
+        "models": models,
+        "base_urls": base_urls,
+        "model_identities": model_identities,
+        "gate_schema": tool_edit_gate::SCHEMA,
+        "gate_implementation_sha256": gate_implementation_sha256,
+        "edit_patch_model_spec_sha256": edit_patch_spec_sha256,
+        "cells": cells,
+    });
+    run_summary
+        .as_object_mut()
+        .expect("Tool Edit run summary is an object")
+        .extend(
+            summary_metrics
+                .as_object()
+                .expect("Tool Edit metric summary is an object")
+                .clone(),
+        );
+    std::fs::write(
+        evidence_root.join("run-summary.json"),
+        serde_json::to_string_pretty(&run_summary)?,
+    )?;
+    println!(
+        "tool-edit run verdict={} identity={} strict={}/{} gate={}/{} non_conflict_first={}/{} stale proactive/reactive={}/{} rounds={} wall_ms={} tokens={} lower_bound={} usage_incomplete_cells={}",
+        run_summary["verdict"].as_str().unwrap_or("fail"),
+        identity_passed,
+        strict_passed,
+        expected_cells.len(),
+        gate_passed,
+        expected_cells.len(),
+        non_conflict_first_attempt_passed,
+        non_conflict_cells,
+        stale_proactive,
+        stale_reactive,
+        run_summary["model_rounds"],
+        wall_ms_total,
+        provider_usage.provider_tokens_total,
+        provider_usage.provider_tokens_lower_bound,
+        provider_usage.usage_incomplete_cells,
+    );
+    anyhow::ensure!(
+        passed,
+        "Tool Edit gate failed after writing complete evidence to {}",
+        evidence_root.display()
+    );
+    Ok(())
+}
+
 fn default_evidence_dir() -> std::path::PathBuf {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     std::path::PathBuf::from("target/eval-evidence").join(secs.to_string())
+}
+
+#[cfg(test)]
+mod tool_edit_main_tests {
+    use super::*;
+
+    fn manifest() -> bundle::CellManifest {
+        bundle::CellManifest {
+            schema: bundle::CELL_SCHEMA.into(),
+            fixture_id: "fixture".into(),
+            engine: "production".into(),
+            repeat: 1,
+            repeats: 3,
+            live: true,
+            fixture_sha256: "fixture-sha".into(),
+            git_head: None,
+            git_dirty: None,
+            git_dirty_sha256: None,
+            source_tree_digest: Some("source-sha".into()),
+            openai_model: Some("model".into()),
+            openai_base_url: None,
+        }
+    }
+
+    #[test]
+    fn tool_edit_identity_checks_every_manifest_binding() {
+        let valid = manifest();
+        let planned_model = model_identity(Some("model"), None).unwrap();
+        let checks = tool_edit_cell_identity_checks(
+            &valid,
+            "fixture",
+            1,
+            3,
+            "fixture-sha",
+            "source-sha",
+            &planned_model,
+        );
+        assert!(checks.passed());
+
+        let invalid = bundle::CellManifest {
+            schema: "wrong-schema".into(),
+            fixture_id: "wrong-fixture".into(),
+            engine: "dynamic".into(),
+            repeat: 2,
+            repeats: 4,
+            live: false,
+            fixture_sha256: "wrong-fixture-sha".into(),
+            source_tree_digest: None,
+            openai_model: Some(" ".into()),
+            ..valid
+        };
+        let checks = tool_edit_cell_identity_checks(
+            &invalid,
+            "fixture",
+            1,
+            3,
+            "fixture-sha",
+            "source-sha",
+            &planned_model,
+        );
+        assert!(!checks.manifest_schema_matches);
+        assert!(!checks.fixture_id_matches);
+        assert!(!checks.engine_is_production);
+        assert!(!checks.repeat_matches);
+        assert!(!checks.repeats_match_plan);
+        assert!(!checks.live);
+        assert!(!checks.fixture_sha256_matches_plan);
+        assert!(!checks.source_tree_digest_present);
+        assert!(!checks.source_tree_digest_matches_plan);
+        assert!(!checks.model_identity_nonempty);
+        assert!(!checks.model_identity_matches_plan);
+        assert!(!checks.passed());
+    }
+
+    #[test]
+    fn provider_usage_excludes_incomplete_and_lower_bound_cells_from_percentiles() {
+        let rollup = provider_usage_rollup([
+            ProviderUsageCell {
+                tokens: Some(100),
+                usage_incomplete: false,
+                tokens_lower_bound: false,
+            },
+            ProviderUsageCell {
+                tokens: Some(200),
+                usage_incomplete: true,
+                tokens_lower_bound: true,
+            },
+            ProviderUsageCell {
+                tokens: Some(300),
+                usage_incomplete: false,
+                tokens_lower_bound: true,
+            },
+            ProviderUsageCell {
+                tokens: None,
+                usage_incomplete: false,
+                tokens_lower_bound: false,
+            },
+        ]);
+        assert_eq!(rollup.provider_tokens_total, 600);
+        assert_eq!(rollup.usage_complete_cells, 1);
+        assert_eq!(rollup.usage_incomplete_cells, 2);
+        assert_eq!(rollup.provider_tokens_lower_bound_cells, 3);
+        assert!(rollup.provider_tokens_lower_bound);
+        assert_eq!(rollup.provider_token_percentile_samples, 1);
+        assert_eq!(rollup.provider_tokens_p50, Some(100));
+        assert_eq!(rollup.provider_tokens_p95, Some(100));
+    }
+
+    #[test]
+    fn provider_usage_without_complete_samples_reports_unavailable_percentiles() {
+        let rollup = provider_usage_rollup([ProviderUsageCell {
+            tokens: None,
+            usage_incomplete: true,
+            tokens_lower_bound: true,
+        }]);
+        assert_eq!(rollup.provider_tokens_p50, None);
+        assert_eq!(rollup.provider_tokens_p95, None);
+        assert_eq!(checked_percentile(&mut [], 50), None);
+    }
 }

@@ -1,0 +1,199 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 529704,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 3449,
+  "model_started": 77,
+  "model_used": 77,
+  "usage_incomplete": false,
+  "provider_tokens_lower_bound": false,
+  "workspace_sha256": "c587124fef8f04b910abb7e25383e8cc1e5ed37db1c253f0933a099a93cdcf3e",
+  "workspace_files": 33,
+  "tools": [
+    {
+      "name": "capability.manage",
+      "calls": 20,
+      "failed": 0
+    },
+    {
+      "name": "context.manage",
+      "calls": 2,
+      "failed": 1
+    },
+    {
+      "name": "edit.patch",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "edit.replace",
+      "calls": 9,
+      "failed": 2
+    },
+    {
+      "name": "fs.list",
+      "calls": 11,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 21,
+      "failed": 1
+    },
+    {
+      "name": "fs.write",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "git.diff",
+      "calls": 7,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "process.run",
+      "calls": 12,
+      "failed": 9
+    },
+    {
+      "name": "search.grep",
+      "calls": 6,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 9,
+      "failed": 1
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 0,
+    "access_fetches": 0,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 34319,
+    "compaction_output_tokens": 1019,
+    "edit_attempts": 10,
+    "edit_commit_not_applied": 0,
+    "edit_commit_recovery_required": 0,
+    "edit_commit_unknown": 0,
+    "edit_committed_changes": 8,
+    "edit_failure_fs_write_fallback": 0,
+    "edit_failure_shell_fallback_proxy": 0,
+    "edit_failures": 2,
+    "edit_first_attempt_committed_changes": 0,
+    "edit_first_attempt_successes": 0,
+    "edit_first_attempts": 1,
+    "edit_ms_p50": 20,
+    "edit_ms_p95": 24,
+    "edit_started_calls": 10,
+    "edit_success_bytes_after": 5184,
+    "edit_success_bytes_before": 4174,
+    "edit_successes": 8,
+    "edit_to_trace_end_ms": 504956,
+    "edit_unfinished_calls": 0,
+    "failed_tool_outputs": 14,
+    "fetch_calls": 0,
+    "final_resident_bytes": 4492,
+    "forgotten_items": 127,
+    "fs_read_bytes_total": 11531,
+    "inspect_calls": 3,
+    "lifecycle_transitions": 262,
+    "materialize_rounds": 77,
+    "model_attempts": 77,
+    "model_input_tokens": 631173,
+    "model_output_tokens": 14042,
+    "model_retries": 0,
+    "peak_resident_bytes": 5046,
+    "post_edit_confirm_reads": 14,
+    "prompt_current_focus_tokens": 3238,
+    "prompt_historical_context_tokens": 71766,
+    "prompt_runtime_facts_tokens": 2079,
+    "prompt_system_tokens": 5467,
+    "prompt_task_anchor_tokens": 2002,
+    "prompt_task_progress_tokens": 5154,
+    "prompt_tool_catalog_index_tokens": 16265,
+    "prompt_tool_schema_tokens": 64248,
+    "prompt_turn_frame_tokens": 80044,
+    "provider_tokens_lower_bound": false,
+    "provider_tokens_total": 680553,
+    "reactivated_tokens": 214,
+    "reactivation_consumed": 0,
+    "reactivation_consumed_tokens": 0,
+    "reactivation_events": 7,
+    "reactivation_file_observation_consumed": 0,
+    "reactivation_file_observation_selected": 0,
+    "reactivation_selected": 4,
+    "reactivation_selected_tokens": 199,
+    "reactivation_tool_observation_consumed": 0,
+    "reactivation_tool_observation_selected": 0,
+    "recovered_items": 5,
+    "recovery_auto_reactivation": 5,
+    "recovery_explicit_search": 0,
+    "recovery_failed": 122,
+    "recovery_workspace_reread": 18,
+    "repeated_fs_reads": 18,
+    "reread_external_descriptor": 2,
+    "reread_first_read": 2,
+    "reread_motive_body_visible_current": 0,
+    "reread_motive_changed": 0,
+    "reread_motive_checked_fresh": 0,
+    "reread_motive_descriptor_only": 12,
+    "reread_motive_first": 2,
+    "reread_motive_needs_revalidation": 7,
+    "reread_motive_stored": 0,
+    "reread_motive_warm": 0,
+    "reread_previously_selected": 12,
+    "reread_resident_unselected": 0,
+    "reread_selected_descriptor": 5,
+    "reread_stored": 0,
+    "reread_warm": 0,
+    "rounds": 77,
+    "schema_tokens_total": 64248,
+    "search_calls": 4,
+    "search_empty": 2,
+    "search_hits": 8,
+    "search_ms_p50": 3,
+    "search_ms_p95": 3,
+    "selected_tokens_by_kind": {
+      "assistant_message": 11650,
+      "error": 1001,
+      "summary": 4256,
+      "tool_observation": 16786,
+      "user_message": 4457
+    },
+    "selected_tokens_by_reason": {
+      "latest_file_body": 16786,
+      "scored": 21364
+    },
+    "selected_tokens_by_source": {
+      "assistant": 11650,
+      "episode-derived": 4256,
+      "tool:fs.read": 16786,
+      "tool:process.run": 1001,
+      "user": 4457
+    },
+    "selected_tokens_reactivated": 5433,
+    "selected_tokens_resident": 32717,
+    "tool_calls": 103,
+    "tool_failure_classes": {
+      "invalid_request": 4,
+      "path_not_found": 9,
+      "process_exit": 1
+    },
+    "turns": 15,
+    "unique_reactivated": 5
+  }
+}

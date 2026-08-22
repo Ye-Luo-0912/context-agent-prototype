@@ -1,0 +1,101 @@
+{
+  "id": "late_constraint_long",
+  "scenario": "late_constraint",
+  "variant": "longflow",
+  "name": "15-turn drift with an early wire constraint recalled across v2 and v3 features",
+  "seed": "protocol",
+  "include_rolling": false,
+  "target_rounds_lo": 20,
+  "target_rounds_hi": 45,
+  "expected_edit": "add v2 Hello and Heartbeat while keeping unversioned ping",
+  "ops": [
+    {
+      "op": "user",
+      "text": "Read src/protocol.rs and summarize the current message types. Do not change code yet."
+    },
+    {
+      "op": "user",
+      "text": "Add a comment-free encode/decode roundtrip helper for Ping."
+    },
+    {
+      "op": "user",
+      "text": "List three candidate v2 fields you might add someday. Do not add them yet."
+    },
+    {
+      "op": "user",
+      "text": "Create RELEASE.md with one paragraph about the planned v2 work."
+    },
+    {
+      "op": "user",
+      "text": "Important constraint that must never be written into any file as a comment: legacy clients send an unversioned ping body and must keep working on the wire."
+    },
+    {
+      "op": "user",
+      "text": "Append to NOTES.md two lines: staging deploy window is Tuesday 10:00, and rotate the staging DB password after it."
+    },
+    {
+      "op": "user",
+      "text": "Refactor decode to return a Result instead of panicking on bad input. Keep behavior otherwise identical."
+    },
+    {
+      "op": "user",
+      "text": "Append a small #[cfg(test)] test that decodes a ping frame successfully."
+    },
+    {
+      "op": "user",
+      "text": "Summarize what RELEASE.md currently says. Do not change it."
+    },
+    {
+      "op": "user",
+      "text": "Now add v2: Msg::Hello(String) with an explicit v:2 envelope. Leave every existing message path alone; do not restate earlier constraints in code or notes."
+    },
+    {
+      "op": "user",
+      "text": "Update RELEASE.md with a shipped line for v2 Hello."
+    },
+    {
+      "op": "user",
+      "text": "A partner asks, without modifying any file: which exact wire bytes do the oldest clients send that we must still accept? Answer in one sentence."
+    },
+    {
+      "op": "user",
+      "text": "Add Msg::Heartbeat(u32) carrying a sequence number, keeping every existing variant untouched."
+    },
+    {
+      "op": "user",
+      "text": "Extend the test module with one Heartbeat roundtrip case."
+    },
+    {
+      "op": "user",
+      "text": "Final check without changing files: list every message variant now supported and confirm the oldest client path still works."
+    }
+  ],
+  "hidden": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": ["Hello"]
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": ["Heartbeat"]
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": ["ping"]
+    },
+    {
+      "path": "RELEASE.md",
+      "pred": "contains",
+      "needles": ["v2"]
+    }
+  ],
+  "hidden_commands": [
+    {
+      "name": "wire_v1",
+      "script": "wire_v1.py"
+    }
+  ]
+}

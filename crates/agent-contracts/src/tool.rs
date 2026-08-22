@@ -508,8 +508,9 @@ pub struct ToolOutput {
 }
 
 impl ToolOutput {
-    /// 工具在 `metadata.path` 上盖的工作区相对路径。ingest 用它做结构化
-    /// 身份；`fs.read` 的 model_content 是带行号的片段，没有路径。
+    /// 工具在 `metadata.path` 上盖的工作区相对路径。ingest 只信任这个
+    /// 结构化身份；`fs.read` 的 model_content 也会显示 JSON 转义后的路径，
+    /// 但那只是给模型复制使用的有界展示，不是身份权威。
     pub fn file_path(&self) -> Option<&str> {
         self.metadata
             .get("path")
@@ -1223,7 +1224,13 @@ pub trait Effect: Send + Sync {
     /// can never be learned back.
     async fn commit(self: Box<Self>) -> EffectReceipt;
     /// Undo the preparation: the effect must not land.
-    async fn rollback(self: Box<Self>, reason: &str);
+    ///
+    /// `Ok(())` is a settlement claim: every preparation owned by this
+    /// effect has been cleaned up and every rollback record the effect
+    /// requires has been durably confirmed. A cleanup, journal, or bounded
+    /// execution failure must return [`AgentError::RecoveryRequired`]
+    /// instead of pretending the preparation was rolled back.
+    async fn rollback(self: Box<Self>, reason: &str) -> AgentResult<()>;
 }
 
 /// How durably an applied effect is recorded.
@@ -1258,8 +1265,10 @@ pub enum EffectReceipt {
         durability: EffectDurability,
         evidence: Option<String>,
     },
-    /// The applied state is unknowable (a remote operation whose result
-    /// never returned). Never blindly retried without an idempotency key.
+    /// The terminal settlement is unknowable. This covers a remote operation
+    /// whose applied result never returned and a local composite whose target
+    /// was not applied but whose remaining prepared cleanup could not be
+    /// confirmed. Never blindly retry without recovery/idempotency evidence.
     Unknown { error: String },
 }
 
@@ -1276,7 +1285,7 @@ impl EffectReceipt {
                 durability: EffectDurability::DurabilityFailed(error),
                 ..
             } => format!("effect applied but recovery is required: {error}"),
-            Self::Unknown { error } => format!("effect applied state unknown: {error}"),
+            Self::Unknown { error } => format!("effect terminal state unknown: {error}"),
         }
     }
 }
@@ -1345,46 +1354,74 @@ impl Effect for Vec<Box<dyn Effect>> {
                     evidence: own,
                 } => {
                     evidence.push_optional(own);
-                    rollback_remaining(
+                    let rollback = rollback_remaining(
                         effects,
                         "composite commit stopped after an applied sub-effect required recovery",
                     )
                     .await;
+                    let error = merge_rollback_failure(error, rollback.err());
                     return EffectReceipt::Applied {
                         durability: EffectDurability::DurabilityFailed(error),
                         evidence: Some(evidence.finish()),
                     };
                 }
                 EffectReceipt::NotApplied { error } => {
-                    rollback_remaining(
+                    let rollback = rollback_remaining(
                         effects,
                         "composite commit stopped after a sub-effect was not applied",
                     )
                     .await;
                     if applied_count == 0 {
-                        return EffectReceipt::NotApplied { error };
+                        if let Err(rollback_error) = rollback {
+                            return EffectReceipt::Unknown {
+                                error: bounded_rollback_message(&format!(
+                                    "composite effect was not applied, but remaining prepared-effect cleanup could not be confirmed: {rollback_error}; original refusal: {error}"
+                                )),
+                            };
+                        }
+                        return EffectReceipt::NotApplied {
+                            error: bounded_rollback_message(&error),
+                        };
                     }
+                    let rollback_detail = rollback
+                        .err()
+                        .map(|rollback_error| {
+                            format!("; remaining cleanup failed: {rollback_error}")
+                        })
+                        .unwrap_or_default();
                     return EffectReceipt::Applied {
-                        durability: EffectDurability::DurabilityFailed(format!(
-                            "composite partially applied: {applied_count} earlier sub-effect(s) \
-                             landed before a later sub-effect was not applied ({error})"
+                        durability: EffectDurability::DurabilityFailed(bounded_rollback_message(
+                            &format!(
+                                "composite partially applied: {applied_count} earlier sub-effect(s) \
+                                 landed before a later sub-effect was not applied ({error}){rollback_detail}"
+                            ),
                         )),
                         evidence: Some(evidence.finish()),
                     };
                 }
                 EffectReceipt::Unknown { error } => {
-                    rollback_remaining(
+                    let rollback = rollback_remaining(
                         effects,
                         "composite commit stopped after a sub-effect returned an unknown state",
                     )
                     .await;
+                    let rollback_detail = rollback
+                        .err()
+                        .map(|rollback_error| {
+                            format!("; remaining cleanup failed: {rollback_error}")
+                        })
+                        .unwrap_or_default();
                     if applied_count == 0 {
-                        return EffectReceipt::Unknown { error };
+                        return EffectReceipt::Unknown {
+                            error: bounded_rollback_message(&format!("{error}{rollback_detail}")),
+                        };
                     }
                     return EffectReceipt::Applied {
-                        durability: EffectDurability::DurabilityFailed(format!(
-                            "composite partially applied: {applied_count} earlier sub-effect(s) \
-                             definitely landed and a later sub-effect has unknown state ({error})"
+                        durability: EffectDurability::DurabilityFailed(bounded_rollback_message(
+                            &format!(
+                                "composite partially applied: {applied_count} earlier sub-effect(s) \
+                                 definitely landed and a later sub-effect has unknown state ({error}){rollback_detail}"
+                            ),
                         )),
                         evidence: Some(evidence.finish()),
                     };
@@ -1397,10 +1434,8 @@ impl Effect for Vec<Box<dyn Effect>> {
         }
     }
 
-    async fn rollback(self: Box<Self>, reason: &str) {
-        for effect in (*self).into_iter() {
-            effect.rollback(reason).await;
-        }
+    async fn rollback(self: Box<Self>, reason: &str) -> AgentResult<()> {
+        rollback_all((*self).into_iter().rev(), reason).await
     }
 }
 
@@ -1466,10 +1501,68 @@ impl CompositeEvidence {
     }
 }
 
-async fn rollback_remaining(effects: std::vec::IntoIter<Box<dyn Effect>>, reason: &str) {
+async fn rollback_remaining(
+    effects: std::vec::IntoIter<Box<dyn Effect>>,
+    reason: &str,
+) -> AgentResult<()> {
+    rollback_all(effects, reason).await
+}
+
+async fn rollback_all(
+    effects: impl IntoIterator<Item = Box<dyn Effect>>,
+    reason: &str,
+) -> AgentResult<()> {
+    let mut errors = String::new();
+    let mut failed = 0usize;
     for effect in effects {
-        effect.rollback(reason).await;
+        if let Err(error) = effect.rollback(reason).await {
+            failed = failed.saturating_add(1);
+            append_bounded_rollback_error(&mut errors, &error.to_string());
+        }
     }
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(AgentError::RecoveryRequired(bounded_rollback_message(
+            &format!("{failed} prepared effect rollback(s) could not be confirmed: {errors}"),
+        )))
+    }
+}
+
+fn merge_rollback_failure(error: String, rollback: Option<AgentError>) -> String {
+    match rollback {
+        Some(rollback) => bounded_rollback_message(&format!(
+            "{error}; remaining prepared-effect cleanup failed: {rollback}"
+        )),
+        None => bounded_rollback_message(&error),
+    }
+}
+
+fn append_bounded_rollback_error(target: &mut String, error: &str) {
+    if target.len() >= crate::MAX_OPERATION_DIAGNOSTIC_BYTES {
+        return;
+    }
+    if !target.is_empty() {
+        let separator = "; ";
+        if target.len().saturating_add(separator.len()) > crate::MAX_OPERATION_DIAGNOSTIC_BYTES {
+            return;
+        }
+        target.push_str(separator);
+    }
+    let remaining = crate::MAX_OPERATION_DIAGNOSTIC_BYTES.saturating_sub(target.len());
+    let mut end = error.len().min(remaining);
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    target.push_str(&error[..end]);
+}
+
+fn bounded_rollback_message(message: &str) -> String {
+    let mut end = message.len().min(crate::MAX_OPERATION_DIAGNOSTIC_BYTES);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message[..end].to_string()
 }
 
 /// Why an effect commit failed. The distinction is load-bearing: after a
@@ -2846,8 +2939,31 @@ mod tests {
                 },
             }
         }
-        async fn rollback(self: Box<Self>, _reason: &str) {
+        async fn rollback(self: Box<Self>, _reason: &str) -> AgentResult<()> {
             self.rollbacks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct FailingRollbackEffect {
+        rollbacks: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Effect for FailingRollbackEffect {
+        fn describe(&self) -> String {
+            "failing rollback effect".into()
+        }
+
+        async fn commit(self: Box<Self>) -> EffectReceipt {
+            panic!("failing rollback fixture must not commit")
+        }
+
+        async fn rollback(self: Box<Self>, _reason: &str) -> AgentResult<()> {
+            self.rollbacks.fetch_add(1, Ordering::SeqCst);
+            Err(AgentError::RecoveryRequired(
+                "simulated rollback failure".into(),
+            ))
         }
     }
 
@@ -3115,8 +3231,64 @@ mod tests {
                 result: RecordingCommit::Durable,
             }),
         ]);
-        effect.rollback("superseded").await;
+        effect.rollback("superseded").await.unwrap();
         assert_eq!(commits.load(Ordering::SeqCst), 0);
         assert_eq!(rollbacks.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn composite_rollback_attempts_every_child_and_propagates_failure() {
+        let commits = Arc::new(AtomicUsize::new(0));
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let effect = composite(vec![
+            Box::new(RecordingEffect {
+                label: "a".into(),
+                commits: commits.clone(),
+                rollbacks: rollbacks.clone(),
+                result: RecordingCommit::Durable,
+            }),
+            Box::new(FailingRollbackEffect {
+                rollbacks: rollbacks.clone(),
+            }),
+            Box::new(RecordingEffect {
+                label: "c".into(),
+                commits,
+                rollbacks: rollbacks.clone(),
+                result: RecordingCommit::Durable,
+            }),
+        ]);
+
+        let error = effect.rollback("superseded").await.unwrap_err();
+        assert!(
+            matches!(error, AgentError::RecoveryRequired(message) if message.contains("simulated rollback failure"))
+        );
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn composite_not_applied_with_unsettled_remainder_is_unknown() {
+        let commits = Arc::new(AtomicUsize::new(0));
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let receipt = composite(vec![
+            Box::new(RecordingEffect {
+                label: "first".into(),
+                commits,
+                rollbacks: rollbacks.clone(),
+                result: RecordingCommit::NotApplied,
+            }),
+            Box::new(FailingRollbackEffect {
+                rollbacks: rollbacks.clone(),
+            }),
+        ])
+        .commit()
+        .await;
+
+        assert!(matches!(
+            receipt,
+            EffectReceipt::Unknown { error }
+                if error.contains("remaining prepared-effect cleanup")
+                    && error.contains("simulated rollback failure")
+        ));
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
     }
 }

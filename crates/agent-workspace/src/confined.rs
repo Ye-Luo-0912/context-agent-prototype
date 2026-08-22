@@ -44,9 +44,10 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use windows_sys::Wdk::{
     Foundation::OBJECT_ATTRIBUTES,
     Storage::FileSystem::{
-        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
-        FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
-        FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile, NtSetInformationFile,
+        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_INFORMATION, FILE_NON_DIRECTORY_FILE,
+        FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT, FileDispositionInformation, FileRenameInformation,
+        NtCreateFile, NtSetInformationFile,
     },
 };
 #[cfg(windows)]
@@ -277,6 +278,116 @@ impl ConfinedDir {
         }
     }
 
+    /// Open a regular recovery target without following links and keep its
+    /// name stable enough to verify a bounded content snapshot. Unix still
+    /// needs explicit name-to-fd checks before and after the read; Windows
+    /// enforces the same interval by denying shared write/delete access.
+    pub(crate) fn open_recovery_target(&self, name: &OsStr) -> io::Result<std::fs::File> {
+        #[cfg(unix)]
+        {
+            let cname = to_cstring(name)?;
+            // O_NONBLOCK prevents a substituted FIFO from blocking recovery;
+            // it has no effect on reads from a regular file.
+            // SAFETY: `cname` is NUL-terminated; O_NOFOLLOW refuses links.
+            let fd = unsafe {
+                libc::openat(
+                    self.fd.as_raw_fd(),
+                    cname.as_ptr(),
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `fd` is a fresh descriptor with no other owner.
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "workspace recovery target is not a regular file",
+                ));
+            }
+            Ok(file)
+        }
+        #[cfg(windows)]
+        {
+            let child_display = self.display.join(name);
+            let handle = nt_open_relative_with_share(
+                self.handle.as_raw_handle(),
+                name,
+                GENERIC_READ | SYNCHRONIZE,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+                FILE_SHARE_READ,
+            )?;
+            // Own the handle before any later fallible validation so a
+            // rejected reparse point cannot leak a kernel handle.
+            // SAFETY: `handle` is a fresh kernel handle.
+            let file = unsafe { std::fs::File::from_raw_handle(handle) };
+            check_not_reparse(file.as_raw_handle(), &child_display)?;
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "workspace recovery target is not a regular file",
+                ));
+            }
+            Ok(file)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = name;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "verified recovery target opens are unsupported on this platform",
+            ))
+        }
+    }
+
+    /// Open an existing staged regular file for verified recovery cleanup.
+    /// Windows needs DELETE on this exact handle so cleanup never degrades to
+    /// close-then-delete by path; sharing denies a concurrent writer or
+    /// renamer while recovery hashes and removes the entry.
+    pub(crate) fn open_staged_for_cleanup(&self, name: &OsStr) -> io::Result<std::fs::File> {
+        #[cfg(unix)]
+        {
+            let cname = to_cstring(name)?;
+            // SAFETY: `cname` is NUL-terminated; O_NOFOLLOW refuses links.
+            let fd = unsafe {
+                libc::openat(
+                    self.fd.as_raw_fd(),
+                    cname.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `fd` is a fresh descriptor with no other owner.
+            Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+        }
+        #[cfg(windows)]
+        {
+            let child_display = self.display.join(name);
+            let handle = nt_open_relative_with_share(
+                self.handle.as_raw_handle(),
+                name,
+                GENERIC_READ | DELETE_ACCESS | SYNCHRONIZE,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+                FILE_SHARE_READ,
+            )?;
+            check_not_reparse(handle, &child_display)?;
+            // SAFETY: `handle` is a fresh kernel handle.
+            Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .open(self.display.join(name))
+        }
+    }
+
     /// Create a brand-new file under this handle. Exclusive creation means
     /// a pre-planted link at the name makes the operation fail instead of
     /// following it.
@@ -290,7 +401,7 @@ impl ConfinedDir {
                 libc::openat(
                     self.fd.as_raw_fd(),
                     cname.as_ptr(),
-                    libc::O_WRONLY
+                    libc::O_RDWR
                         | libc::O_CREAT
                         | libc::O_EXCL
                         | libc::O_NOFOLLOW
@@ -306,12 +417,13 @@ impl ConfinedDir {
         }
         #[cfg(windows)]
         {
-            let handle = nt_open_relative(
+            let handle = nt_open_relative_with_share(
                 self.handle.as_raw_handle(),
                 name,
-                GENERIC_WRITE | DELETE_ACCESS | SYNCHRONIZE,
+                GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS | SYNCHRONIZE,
                 FILE_CREATE,
                 FILE_OPEN_REPARSE_POINT,
+                FILE_SHARE_READ,
             )?;
             // SAFETY: `handle` is a fresh kernel handle with no other owner.
             Ok(unsafe { std::fs::File::from_raw_handle(handle) })
@@ -321,6 +433,54 @@ impl ConfinedDir {
             let mut options = std::fs::OpenOptions::new();
             options.create_new(true).write(true);
             options.open(self.display.join(name))
+        }
+    }
+
+    /// Return whether `name` still identifies the same object as `file`.
+    /// Unix rename/unlink operate on directory entries rather than open
+    /// handles, so callers use this around reads and immediately before
+    /// consuming a name. Windows callers must hold a handle that denies
+    /// shared write/delete; that sharing contract keeps the name bound.
+    pub(crate) fn named_entry_matches_file(
+        &self,
+        name: &OsStr,
+        file: &std::fs::File,
+    ) -> io::Result<bool> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let cname = to_cstring(name)?;
+            let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `cname` is NUL-terminated and `named` points to enough
+            // storage for fstatat. AT_SYMLINK_NOFOLLOW compares the directory
+            // entry itself and does not require read permission on the file.
+            let rc = unsafe {
+                libc::fstatat(
+                    self.fd.as_raw_fd(),
+                    cname.as_ptr(),
+                    named.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fstatat returned success and initialized `named`.
+            let named = unsafe { named.assume_init() };
+            let opened = file.metadata()?;
+            Ok(named.st_dev == opened.dev() && named.st_ino == opened.ino())
+        }
+        #[cfg(windows)]
+        {
+            let _ = (name, file);
+            Ok(true)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let named = std::fs::File::open(self.display.join(name))?.metadata()?;
+            let opened = file.metadata()?;
+            Ok(named.len() == opened.len() && named.modified().ok() == opened.modified().ok())
         }
     }
 
@@ -380,9 +540,15 @@ impl ConfinedDir {
     ) -> io::Result<()> {
         #[cfg(unix)]
         {
-            // Unix renames by name under the pinned directory; the handle
-            // is only needed for the Windows FileRenameInformation path.
-            let _ = from_file;
+            // Unix renames by name. Refuse a substituted staging entry: the
+            // bytes validated through `from_file` must be the inode consumed
+            // by renameat.
+            if !self.named_entry_matches_file(from_name, from_file)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "staged file name no longer identifies its open handle",
+                ));
+            }
             let from_c = to_cstring(from_name)?;
             let to_c = to_cstring(to_name)?;
             // SAFETY: both names are NUL-terminated; renameat resolves them
@@ -474,6 +640,50 @@ impl ConfinedDir {
         #[cfg(not(unix))]
         {
             std::fs::remove_file(self.display.join(name))
+        }
+    }
+
+    /// Remove the object pinned by `file`, refusing to unlink a substituted
+    /// directory entry. Windows marks the already-open handle for deletion,
+    /// avoiding a close-then-delete path race; Unix verifies inode identity
+    /// immediately before its directory-handle-relative unlink.
+    pub(crate) fn remove_open_file(&self, file: &std::fs::File, name: &OsStr) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            if !self.named_entry_matches_file(name, file)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "staged file name no longer identifies its open handle",
+                ));
+            }
+            self.remove_file(name)
+        }
+        #[cfg(windows)]
+        {
+            let _ = name;
+            let disposition = FILE_DISPOSITION_INFORMATION { DeleteFile: 1 };
+            let mut io_status: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+            // SAFETY: `file` is a live handle opened with DELETE access and
+            // `disposition` is a correctly sized fixed-layout input buffer.
+            let status = unsafe {
+                NtSetInformationFile(
+                    file.as_raw_handle(),
+                    &mut io_status,
+                    &disposition as *const FILE_DISPOSITION_INFORMATION as *const core::ffi::c_void,
+                    std::mem::size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
+                    FileDispositionInformation,
+                )
+            };
+            if status >= 0 {
+                Ok(())
+            } else {
+                Err(ntstatus_to_io(status))
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = file;
+            self.remove_file(name)
         }
     }
 }
@@ -592,6 +802,18 @@ fn nt_open_relative(
     disposition: u32,
     options: u32,
 ) -> io::Result<HANDLE> {
+    nt_open_relative_with_share(parent, name, access, disposition, options, SHARE_ALL)
+}
+
+#[cfg(windows)]
+fn nt_open_relative_with_share(
+    parent: std::os::windows::io::RawHandle,
+    name: &OsStr,
+    access: u32,
+    disposition: u32,
+    options: u32,
+    share_access: u32,
+) -> io::Result<HANDLE> {
     use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
 
     let wide: Vec<u16> = name.encode_wide().chain(Some(0)).collect();
@@ -623,7 +845,7 @@ fn nt_open_relative(
             &mut io_status,
             std::ptr::null(),
             0,
-            SHARE_ALL,
+            share_access,
             disposition,
             options | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT,
             std::ptr::null(),

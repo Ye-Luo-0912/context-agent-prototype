@@ -28,8 +28,9 @@ use agent_contracts::{
     ToolOperationIdentity, ToolOutcome, ToolOutput, ToolResultDisposition, ToolSpec,
     ToolSurfaceBlock, ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceSnapshot,
     TurnCancelAck, TurnCancellationReason, TurnFrame, TurnFrameStep, TurnId,
-    USER_INPUT_ARTIFACT_OWNER, USER_INPUT_PREVIEW_CHARS, USER_INPUT_QUEUE_CAP, bounded_preview,
-    context_maintenance_events, discovery_search_from_call,
+    USER_INPUT_ARTIFACT_OWNER, USER_INPUT_PREVIEW_CHARS, USER_INPUT_QUEUE_CAP,
+    apply_runtime_diagnosis, bounded_preview, context_maintenance_events,
+    discovery_search_from_call,
 };
 use agent_core::{
     ApprovalVerdict, CorePort, EffectCommitDisposition, EffectCommitRejection, EffectCommitRequest,
@@ -559,6 +560,9 @@ pub(crate) struct OperationCompletion {
     /// Runtime admits its result after the current-turn fence. Refusals and
     /// prepared effects are terminalized through their own paths.
     value_completion_pending: bool,
+    /// Core detected unresolved preparation cleanup while executing the tool.
+    /// This is trusted, bounded, and always fences later mutation.
+    recovery_required: Option<String>,
     /// A runtime directive (context control) the tool attached to its
     /// output. Executed at commit time, right after the effect — so a
     /// "manual collect now" is actually now, not at turn end.

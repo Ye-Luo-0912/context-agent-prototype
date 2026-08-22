@@ -225,8 +225,8 @@ impl EffectAuthority {
     /// Roll a staged effect back because its operation turned stale or the
     /// turn aborted. The reason is surfaced through the effect's own
     /// bookkeeping.
-    pub async fn rollback(&self, effect: Box<dyn Effect>, reason: &str) {
-        effect.rollback(reason).await;
+    pub async fn rollback(&self, effect: Box<dyn Effect>, reason: &str) -> AgentResult<()> {
+        effect.rollback(reason).await
     }
 }
 
@@ -389,9 +389,10 @@ mod tests {
                 evidence: Some("tx-1".into()),
             }
         }
-        async fn rollback(self: Box<Self>, reason: &str) {
+        async fn rollback(self: Box<Self>, reason: &str) -> AgentResult<()> {
             *self.action.lock().unwrap() =
                 Box::leak(format!("rolled back: {reason}").into_boxed_str());
+            Ok(())
         }
     }
 
@@ -595,7 +596,8 @@ mod tests {
                 }),
                 "stale operation",
             )
-            .await;
+            .await
+            .unwrap();
         assert!(
             action
                 .lock()

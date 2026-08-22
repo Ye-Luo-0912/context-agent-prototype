@@ -32,10 +32,38 @@ use std::path::Path;
 use agent_contracts::{
     ContextDiagnostics, ContextEngine, RunId, RuntimeEvent, RuntimeEventEnvelope,
 };
+use context_baselines::{AppendOnlyEngine, RollingConfig, RollingSummaryEngine};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 use serde_json::Value;
 
 use crate::{ReplayConfig, ReplayOutcome, run_engine_observing};
+
+/// Which context engine a recovery rebuild replays the trace against.
+/// Traces record runtime events, not the engine that produced them, so
+/// the caller must state the kind; silently defaulting every trace to C
+/// would make the rebuilt "truth" wrong for append/rolling runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReplayEngineKind {
+    /// `SimpleContextEngine` — the dynamic working set (policy C).
+    #[default]
+    Dynamic,
+    /// `AppendOnlyEngine` — baseline A.
+    Append,
+    /// `RollingSummaryEngine` — baseline B.
+    Rolling,
+}
+
+fn build_engine(kind: ReplayEngineKind) -> std::sync::Arc<dyn ContextEngine> {
+    match kind {
+        ReplayEngineKind::Dynamic => {
+            std::sync::Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()))
+        }
+        ReplayEngineKind::Append => std::sync::Arc::new(AppendOnlyEngine::new()),
+        ReplayEngineKind::Rolling => {
+            std::sync::Arc::new(RollingSummaryEngine::with_config(RollingConfig::default()))
+        }
+    }
+}
 
 /// Where the trace's durability barrier stands and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,15 +178,15 @@ pub fn first_seq_gap(events: &[RuntimeEventEnvelope]) -> Option<(u64, u64)> {
     None
 }
 
-/// Rebuild the context-engine state from one run's envelopes: a fresh engine
-/// replays every event deterministically. Returns the measurement outcome and
-/// the final diagnostics of that engine.
+/// Rebuild the context-engine state from one run's envelopes: a fresh
+/// engine of the requested kind replays every event deterministically.
+/// Returns the measurement outcome and the final diagnostics of that engine.
 pub async fn rebuild_engine_state(
     events: &[RuntimeEventEnvelope],
     config: &ReplayConfig,
+    kind: ReplayEngineKind,
 ) -> anyhow::Result<(ReplayOutcome, ContextDiagnostics)> {
-    let engine: std::sync::Arc<dyn ContextEngine> =
-        std::sync::Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
+    let engine = build_engine(kind);
     let outcome = run_engine_observing(engine.clone(), events, config, |_, _| {}).await?;
     let diagnostics = engine.diagnostics().await?;
     Ok((outcome, diagnostics))
@@ -170,6 +198,7 @@ pub async fn rebuild_engine_state(
 pub async fn recovery_replay_file(
     path: &Path,
     config: &ReplayConfig,
+    kind: ReplayEngineKind,
 ) -> anyhow::Result<RecoveryReport> {
     let content = tokio::fs::read_to_string(path)
         .await
@@ -192,13 +221,14 @@ pub async fn recovery_replay_file(
     let run_id = first.run_id;
     envelopes.retain(|envelope| envelope.run_id == run_id);
 
-    recovery_replay(&envelopes, config).await
+    recovery_replay(&envelopes, config, kind).await
 }
 
 /// Produce the crash-recovery report for one run's envelopes.
 pub async fn recovery_replay(
     events: &[RuntimeEventEnvelope],
     config: &ReplayConfig,
+    kind: ReplayEngineKind,
 ) -> anyhow::Result<RecoveryReport> {
     let run_id = events
         .first()
@@ -206,7 +236,7 @@ pub async fn recovery_replay(
         .ok_or_else(|| anyhow::anyhow!("recovery replay needs at least one event"))?;
     let barrier = analyze_barrier(events);
     let seq_gap = first_seq_gap(events);
-    let (rebuilt, rebuilt_diagnostics) = rebuild_engine_state(events, config).await?;
+    let (rebuilt, rebuilt_diagnostics) = rebuild_engine_state(events, config, kind).await?;
     Ok(RecoveryReport {
         run_id,
         envelopes: events.len(),
@@ -233,15 +263,15 @@ pub async fn verify_restore_consistency(
     checkpoint_cover_seq: u64,
     events: &[RuntimeEventEnvelope],
     config: &ReplayConfig,
+    kind: ReplayEngineKind,
 ) -> anyhow::Result<RestoreConsistencyReport> {
     // Full rebuild: fresh engine replaying every event.
-    let (_, full_diagnostics) = rebuild_engine_state(events, config).await?;
+    let (_, full_diagnostics) = rebuild_engine_state(events, config, kind).await?;
 
     // Incremental: restore the checkpoint, then replay only the events that
     // landed after it. The engine's own `restore` is a whole-state replace,
     // so the replayed tail applies on exactly the captured state.
-    let engine: std::sync::Arc<dyn ContextEngine> =
-        std::sync::Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
+    let engine = build_engine(kind);
     engine.restore(checkpoint.clone()).await?;
     let tail: Vec<RuntimeEventEnvelope> = events
         .iter()
@@ -545,7 +575,7 @@ mod tests {
     async fn recovery_locates_the_last_committed_barrier() {
         let run = RunId::new();
         let events = happy_trace(run);
-        let report = recovery_replay(&events, &ReplayConfig::default())
+        let report = recovery_replay(&events, &ReplayConfig::default(), ReplayEngineKind::Dynamic)
             .await
             .unwrap();
 
@@ -593,7 +623,7 @@ mod tests {
             },
         ));
 
-        let report = recovery_replay(&events, &ReplayConfig::default())
+        let report = recovery_replay(&events, &ReplayConfig::default(), ReplayEngineKind::Dynamic)
             .await
             .unwrap();
 
@@ -648,7 +678,7 @@ mod tests {
         // Drop seq 3 so the sequence is no longer contiguous.
         events.retain(|envelope| envelope.seq != 3);
 
-        let report = recovery_replay(&events, &ReplayConfig::default())
+        let report = recovery_replay(&events, &ReplayConfig::default(), ReplayEngineKind::Dynamic)
             .await
             .unwrap();
 
@@ -662,8 +692,12 @@ mod tests {
         let events = happy_trace(run);
         let config = ReplayConfig::default();
 
-        let first = recovery_replay(&events, &config).await.unwrap();
-        let second = recovery_replay(&events, &config).await.unwrap();
+        let first = recovery_replay(&events, &config, ReplayEngineKind::Dynamic)
+            .await
+            .unwrap();
+        let second = recovery_replay(&events, &config, ReplayEngineKind::Dynamic)
+            .await
+            .unwrap();
 
         // Same trace, same engine version, same rebuilt state.
         assert_eq!(
@@ -675,6 +709,30 @@ mod tests {
             second.rebuilt.input_tokens_total
         );
         assert!(first.rebuilt_diagnostics.total_items > 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_rebuild_honors_the_requested_engine_kind() {
+        let run = RunId::new();
+        let events = happy_trace(run);
+        let config = ReplayConfig::default();
+
+        let report = recovery_replay(&events, &config, ReplayEngineKind::Append)
+            .await
+            .unwrap();
+
+        assert_eq!(report.rebuilt.turns, 2);
+        assert!(report.rebuilt_diagnostics.total_items > 0);
+        assert_eq!(
+            report.rebuilt_diagnostics.resident_items, report.rebuilt_diagnostics.total_items,
+            "the append baseline keeps every record resident"
+        );
+
+        // The rolling kind must also construct and replay cleanly.
+        let rolling = recovery_replay(&events, &config, ReplayEngineKind::Rolling)
+            .await
+            .unwrap();
+        assert_eq!(rolling.rebuilt.turns, 2);
     }
 
     #[tokio::test]
@@ -698,9 +756,15 @@ mod tests {
             .unwrap();
         let checkpoint = engine.checkpoint().await.unwrap();
 
-        let report = verify_restore_consistency(&checkpoint, cover_seq, &events, &config)
-            .await
-            .unwrap();
+        let report = verify_restore_consistency(
+            &checkpoint,
+            cover_seq,
+            &events,
+            &config,
+            ReplayEngineKind::Dynamic,
+        )
+        .await
+        .unwrap();
 
         assert!(
             report.consistent,
@@ -734,9 +798,15 @@ mod tests {
             .map(|envelope| envelope.seq)
             .expect("happy trace has a TurnCompleted");
 
-        let report = verify_restore_consistency(&checkpoint, cover_seq, &events, &config)
-            .await
-            .unwrap();
+        let report = verify_restore_consistency(
+            &checkpoint,
+            cover_seq,
+            &events,
+            &config,
+            ReplayEngineKind::Dynamic,
+        )
+        .await
+        .unwrap();
 
         assert!(
             !report.consistent,

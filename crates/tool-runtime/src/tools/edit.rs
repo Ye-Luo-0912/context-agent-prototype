@@ -15,9 +15,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    ExactMatchError, LineEnding, Tool, candidate_regions, content_digest, exact_match,
-    hidden_path_output, is_not_found_error, missing_path_output, normalize_edit_line_endings,
-    ordinary_view_blocked, projected_replacement_len,
+    ExactMatchError, LineEnding, Tool, adapt_edit_replacement, candidate_regions, contains_lone_cr,
+    content_digest, exact_edit_match, hidden_path_output, is_not_found_error, missing_path_output,
+    model_json_string, normalize_edit_line_endings, ordinary_view_blocked,
+    projected_replacement_len, replace_all_logical_eol,
 };
 
 const MAX_FILE_BYTES: usize = MAX_MUTATION_BYTES;
@@ -48,25 +49,18 @@ struct ReplaceArgs {
     base_revision: Option<String>,
 }
 
-fn display_relative(workspace: &Workspace, path: &std::path::Path) -> String {
-    path.strip_prefix(workspace.root())
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
 #[async_trait]
 impl Tool for EditReplaceTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit.replace".into(),
-            description: "Replace one exact substring in a workspace file. Pass `base_revision` from fs.read so a stale file is refused. Matching is exact and never fuzzy; LF/CRLF arguments are adapted only to preserve a uniform target file's existing line endings. For several hunks or revision-checked multi-edit, use edit.patch. Records the change in the workspace change journal. On success the changed region and the new revision are echoed, so a chained edit needs no confirm re-read.".into(),
+            description: "Replace one exact substring in a workspace file. Pass `base_revision` from fs.read so a stale file is refused. Matching is exact and never fuzzy; LF and CRLF are equivalent only as logical newline tokens, while every other byte stays exact, and written newlines preserve the matched target region. For several hunks or revision-checked multi-edit, use edit.patch. Records the change in the workspace change journal. On success the changed region and the new revision are echoed, so a chained edit needs no confirm re-read.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path", "old", "new"],
                 "properties": {
                     "path": {"type": "string"},
-                    "old": {"type": "string", "description": "Exact text to replace (must match exactly once unless occurrence/replace_all is given; uniform LF/CRLF target style is preserved)"},
+                    "old": {"type": "string", "description": "Exact text to replace (must match exactly once unless occurrence/replace_all is given; only LF/CRLF encoding is token-equivalent)"},
                     "new": {"type": "string"},
                     "occurrence": {"type": "integer", "minimum": 1, "description": "1-based occurrence to replace"},
                     "replace_all": {"type": "boolean", "description": "Replace every occurrence"},
@@ -107,14 +101,17 @@ impl Tool for EditReplaceTool {
             )));
         }
 
-        // Reject state-dir targets up front (reads may legitimately reach
-        // into artifacts; editing them is a mutation policy decision).
-        let path = self.workspace.resolve_mutation(&args.path).await?;
-        // Validation and open are fused into a directory-handle-relative
-        // descent; the size check and the content read both go through the
-        // pinned handle, so a link swap cannot redirect them.
-        let confined = match self.workspace.confined_open_read(&args.path).await {
-            Ok(confined) => confined,
+        // Acquire the path lease first, then read one exact bounded snapshot
+        // that the returned transaction owns through commit/rollback. This
+        // removes the former preflight + begin_mutation double read and
+        // prevents another in-process edit from making that snapshot stale.
+        let requested = vec![args.path.clone()];
+        let mut snapshots = match self
+            .workspace
+            .begin_existing_mutations("edit.replace", "replace", &requested, MAX_FILE_BYTES)
+            .await
+        {
+            Ok(snapshots) => snapshots,
             Err(error) if is_not_found_error(&error) => {
                 return Ok(ToolOutcome::Value(
                     missing_path_output(&self.workspace, call_id, "edit.replace", &args.path).await,
@@ -122,31 +119,15 @@ impl Tool for EditReplaceTool {
             }
             Err(error) => return Err(error),
         };
-        let metadata = confined
-            .metadata()
-            .map_err(|e| AgentError::Io(format!("metadata {}: {e}", path.display())))?;
-        if metadata.len() > MAX_FILE_BYTES as u64 {
-            return Err(AgentError::InvalidRequest(format!(
-                "file is {} bytes; edit.replace is limited to {} bytes",
-                metadata.len(),
-                MAX_FILE_BYTES
-            )));
-        }
-
-        use tokio::io::AsyncReadExt;
-        let file = confined.into_tokio();
-        let mut original = String::new();
-        file.take(MAX_FILE_BYTES as u64 + 1)
-            .read_to_string(&mut original)
-            .await
-            .map_err(|e| AgentError::Io(format!("read {}: {e}", path.display())))?;
-        if original.len() > MAX_FILE_BYTES {
-            return Err(AgentError::InvalidRequest(format!(
-                "file grew beyond the edit.replace limit of {MAX_FILE_BYTES} bytes while it was read"
-            )));
-        }
-        let current_revision = content_digest(original.as_bytes());
-        let relative = display_relative(&self.workspace, &path);
+        let snapshot = snapshots
+            .pop()
+            .expect("one requested edit target yields one snapshot");
+        let relative = snapshot.relative_path().to_string();
+        let current_revision = snapshot.revision().to_string();
+        let (transaction, original) = snapshot.into_parts();
+        let original = String::from_utf8(original).map_err(|_| {
+            AgentError::InvalidRequest(format!("edit.replace target is not UTF-8 text: {relative}"))
+        })?;
         if let Some(expected) = args.base_revision.as_deref()
             && expected != current_revision
         {
@@ -164,26 +145,87 @@ impl Tool for EditReplaceTool {
         let line_ending = LineEnding::detect(&original);
         let old = normalize_edit_line_endings(&args.old, line_ending);
         let new = normalize_edit_line_endings(&args.new, line_ending);
-        let line_endings_normalized = old.as_ref() != args.old || new.as_ref() != args.new;
+        let mut line_endings_normalized = old.as_ref() != args.old || new.as_ref() != args.new;
 
-        let (count, replacements, selected) = if args.replace_all {
-            let count = original.match_indices(old.as_ref()).count();
-            if count == 0 {
-                return Ok(ToolOutcome::Value(edit_refusal(
-                    call_id,
-                    ToolFailureClass::NoExactMatch,
-                    &relative,
-                    current_revision,
-                    &original,
-                    old.as_ref(),
-                    "no_exact_match: `old` appears 0 times after target line-ending normalization. Matching stays exact; re-read and supply a current anchor.",
-                    0,
-                )));
+        let (count, replacements, updated) = if args.replace_all {
+            if line_ending == LineEnding::Mixed
+                || (line_ending == LineEnding::CrLf && contains_lone_cr(old.as_ref()))
+            {
+                let result =
+                    replace_all_logical_eol(&original, old.as_ref(), new.as_ref(), MAX_FILE_BYTES)
+                        .map_err(|()| {
+                            AgentError::InvalidRequest(format!(
+                                "edit.replace result exceeds the {MAX_FILE_BYTES}-byte file limit"
+                            ))
+                        })?;
+                if result.count == 0 {
+                    return Ok(ToolOutcome::Value(edit_refusal(
+                        call_id,
+                        ToolFailureClass::NoExactMatch,
+                        &relative,
+                        current_revision,
+                        &original,
+                        old.as_ref(),
+                        "no_exact_match: `old` appears 0 times after logical LF/CRLF normalization. Matching stays exact; re-read and supply a current anchor.",
+                        0,
+                    )));
+                }
+                line_endings_normalized |= result.line_endings_adapted;
+                (
+                    result.count,
+                    result.count,
+                    result
+                        .updated
+                        .expect("a non-empty match set is transformed"),
+                )
+            } else {
+                let count = original.match_indices(old.as_ref()).count();
+                if count == 0 {
+                    return Ok(ToolOutcome::Value(edit_refusal(
+                        call_id,
+                        ToolFailureClass::NoExactMatch,
+                        &relative,
+                        current_revision,
+                        &original,
+                        old.as_ref(),
+                        "no_exact_match: `old` appears 0 times after target line-ending normalization. Matching stays exact; re-read and supply a current anchor.",
+                        0,
+                    )));
+                }
+                projected_replacement_len(original.len(), old.len(), new.len(), count)
+                    .filter(|size| *size <= MAX_FILE_BYTES)
+                    .ok_or_else(|| {
+                        AgentError::InvalidRequest(format!(
+                            "edit.replace result exceeds the {MAX_FILE_BYTES}-byte file limit"
+                        ))
+                    })?;
+                (count, count, original.replace(old.as_ref(), new.as_ref()))
             }
-            (count, count, None)
         } else {
-            match exact_match(&original, old.as_ref(), args.occurrence) {
-                Ok(found) => (found.count, 1, Some(found)),
+            match exact_edit_match(&original, old.as_ref(), line_ending, args.occurrence) {
+                Ok(found) => {
+                    let replacement =
+                        adapt_edit_replacement(&original, found, new.as_ref(), line_ending);
+                    line_endings_normalized |= &original[found.start..found.end] != old.as_ref()
+                        || replacement.as_ref() != new.as_ref();
+                    let projected = projected_replacement_len(
+                        original.len(),
+                        found.end - found.start,
+                        replacement.len(),
+                        1,
+                    )
+                    .filter(|size| *size <= MAX_FILE_BYTES)
+                    .ok_or_else(|| {
+                        AgentError::InvalidRequest(format!(
+                            "edit.replace result exceeds the {MAX_FILE_BYTES}-byte file limit"
+                        ))
+                    })?;
+                    let mut result = String::with_capacity(projected);
+                    result.push_str(&original[..found.start]);
+                    result.push_str(replacement.as_ref());
+                    result.push_str(&original[found.end..]);
+                    (found.count, 1, result)
+                }
                 Err(ExactMatchError::NoMatch { count }) => {
                     let message = match args.occurrence {
                         Some(n) => format!(
@@ -219,32 +261,13 @@ impl Tool for EditReplaceTool {
             }
         };
 
-        let projected =
-            projected_replacement_len(original.len(), old.len(), new.len(), replacements)
-                .filter(|size| *size <= MAX_FILE_BYTES)
-                .ok_or_else(|| {
-                    AgentError::InvalidRequest(format!(
-                        "edit.replace result exceeds the {MAX_FILE_BYTES}-byte file limit"
-                    ))
-                })?;
-        let updated = if args.replace_all {
-            original.replace(old.as_ref(), new.as_ref())
-        } else {
-            let found = selected.expect("single replacement has one exact match");
-            let mut result = String::with_capacity(projected);
-            result.push_str(&original[..found.start]);
-            result.push_str(new.as_ref());
-            result.push_str(&original[found.end..]);
-            result
-        };
-
         if updated == original {
             return Ok(ToolOutcome::Value(ToolOutput {
                 call_id: call_id.into(),
                 tool_name: "edit.replace".into(),
                 ok: true,
                 summary: "no-op: replacement text equals original".into(),
-                model_content: format!("no change: {}", display_relative(&self.workspace, &path)),
+                model_content: format!("no change: {relative}"),
                 artifact_ref: None,
                 metadata: json!({
                     "path": relative,
@@ -257,26 +280,6 @@ impl Tool for EditReplaceTool {
             }));
         }
 
-        let transaction = self
-            .workspace
-            .begin_mutation("edit.replace", "replace", &args.path)
-            .await?;
-        let transaction_revision = transaction
-            .before_revision()
-            .map(|digest| digest.to_string());
-        if transaction_revision.as_deref() != Some(current_revision.as_str()) {
-            let actual = transaction_revision.unwrap_or_else(|| "missing".into());
-            return Ok(ToolOutcome::Value(edit_refusal(
-                call_id,
-                ToolFailureClass::StaleRevision,
-                &relative,
-                actual,
-                "",
-                old.as_ref(),
-                "stale_revision: target changed between edit preflight and staging; no content was staged. Re-read and retry.",
-                0,
-            )));
-        }
         // The new content is staged and journaled as prepared; the atomic
         // rename (the side effect) is committed by the runtime after the
         // generation fence, so a stale operation rolls back instead of
@@ -292,16 +295,13 @@ impl Tool for EditReplaceTool {
         let effect: Box<dyn Effect> = Box::new(prepared);
 
         let new_revision = content_digest(updated.as_bytes());
+        let updated_line_ending = LineEnding::detect(&updated);
         Ok(ToolOutcome::PreparedEffect {
             output: ToolOutput {
                 call_id: call_id.into(),
                 tool_name: "edit.replace".into(),
                 ok: true,
-                summary: format!(
-                    "replaced {} occurrence(s) in {}",
-                    replacements,
-                    display_relative(&self.workspace, &path)
-                ),
+                summary: format!("replaced {} occurrence(s) in {}", replacements, relative),
                 // The success line carries the new revision (so a chained
                 // edit can pass `base_revision` without a re-read) plus a
                 // bounded echo of the changed region: the model can anchor
@@ -309,7 +309,7 @@ impl Tool for EditReplaceTool {
                 // instead of spending a confirm `fs.read` round.
                 model_content: format!(
                     "edit applied: {} ({} occurrence(s) of old text; bytes {} -> {}; revision {})\n{}",
-                    display_relative(&self.workspace, &path),
+                    relative,
                     count,
                     original.len(),
                     updated.len(),
@@ -324,7 +324,11 @@ impl Tool for EditReplaceTool {
                     "bytes_before": original.len(),
                     "bytes_after": updated.len(),
                     "revision": new_revision,
-                    "line_ending": line_ending.as_str(),
+                    // `line_ending` describes the returned revision. Keep
+                    // the input style separately so chained edits never
+                    // receive stale metadata after adding/removing EOLs.
+                    "line_ending_before": line_ending.as_str(),
+                    "line_ending": updated_line_ending.as_str(),
                     "line_endings_normalized": line_endings_normalized,
                 }),
             },
@@ -345,6 +349,7 @@ fn edit_refusal(
     match_count: usize,
 ) -> ToolOutput {
     let candidates = candidate_regions(original, needle);
+    let quoted_path = model_json_string(path);
     let candidate_text = if candidates.is_empty() {
         "no candidate".to_string()
     } else {
@@ -355,7 +360,7 @@ fn edit_refusal(
         "edit.replace",
         class,
         format!("edit.replace refused: {}", class.as_str()),
-        format!("{message}\npath={path}\nrevision={revision}\n{candidate_text}"),
+        format!("{message}\npath={quoted_path}\nrevision={revision}\n{candidate_text}"),
         json!({
             "path": path,
             "revision": revision,
@@ -621,6 +626,7 @@ mod tests {
         let ToolOutcome::PreparedEffect { output, effect } = outcome else {
             panic!("LF arguments must match a uniform CRLF target");
         };
+        assert_eq!(output.metadata["line_ending_before"], "crlf");
         assert_eq!(output.metadata["line_ending"], "crlf");
         assert_eq!(output.metadata["line_endings_normalized"], true);
         assert!(matches!(
@@ -630,6 +636,147 @@ mod tests {
         assert_eq!(
             tfs::read(&file).await.unwrap(),
             b"ALPHA\r\nBETA\r\ngamma\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_metadata_describes_the_updated_revision_line_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let file = dir.path().join("line.txt");
+        tfs::write(&file, b"seed").await.unwrap();
+        let tool = EditReplaceTool::new(workspace);
+
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"path": "line.txt", "old": "seed", "new": "one\ntwo"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::PreparedEffect { output, effect } = outcome else {
+            panic!("replacement must prepare an effect");
+        };
+        assert_eq!(output.metadata["line_ending_before"], "none");
+        assert_eq!(output.metadata["line_ending"], "lf");
+        assert!(matches!(
+            effect.commit().await,
+            agent_contracts::EffectReceipt::Applied { .. }
+        ));
+        assert_eq!(tfs::read(&file).await.unwrap(), b"one\ntwo");
+    }
+
+    #[tokio::test]
+    async fn lone_cr_cannot_split_uniform_crlf_in_single_or_replace_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let file = dir.path().join("windows.txt");
+        let original = b"a\r\nb\r\n";
+        tfs::write(&file, original).await.unwrap();
+        let tool = EditReplaceTool::new(workspace);
+
+        for replace_all in [false, true] {
+            let outcome = tool
+                .execute(
+                    RunId::new(),
+                    "c",
+                    json!({
+                        "path": "windows.txt",
+                        "old": "\r",
+                        "new": "X",
+                        "replace_all": replace_all
+                    }),
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let ToolOutcome::Value(output) = outcome else {
+                panic!("a lone CR anchor must refuse instead of splitting CRLF");
+            };
+            assert_eq!(output.failure_class(), Some(ToolFailureClass::NoExactMatch));
+            assert_eq!(tfs::read(&file).await.unwrap(), original);
+        }
+        assert!(!dir.path().join(".focus-agent/changes.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn logical_newline_anchor_edits_mixed_file_and_preserves_local_styles() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let file = dir.path().join("mixed.txt");
+        let original = b"alpha\r\nbeta\ngamma\r\n";
+        tfs::write(&file, original).await.unwrap();
+
+        let tool = EditReplaceTool::new(workspace);
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({
+                    "path": "mixed.txt",
+                    "base_revision": content_digest(original),
+                    "old": "alpha\nbeta\ngamma",
+                    "new": "ALPHA\nBETA\nGAMMA\nEXTRA"
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::PreparedEffect { output, effect } = outcome else {
+            panic!("logical LF arguments must match CRLF tokens inside a mixed file");
+        };
+        assert_eq!(output.metadata["line_ending"], "mixed");
+        assert_eq!(output.metadata["line_endings_normalized"], true);
+        assert!(matches!(
+            effect.commit().await,
+            agent_contracts::EffectReceipt::Applied { .. }
+        ));
+        assert_eq!(
+            tfs::read(&file).await.unwrap(),
+            b"ALPHA\r\nBETA\nGAMMA\nEXTRA\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_eol_replace_all_reconstructs_each_occurrence_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let file = dir.path().join("mixed.txt");
+        tfs::write(&file, b"x\r\ny\n--\nx\ny\r\n").await.unwrap();
+
+        let tool = EditReplaceTool::new(workspace);
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({
+                    "path": "mixed.txt",
+                    "old": "x\ny",
+                    "new": "u\nv\nw",
+                    "replace_all": true
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::PreparedEffect { output, effect } = outcome else {
+            panic!("replace_all must transform every logical exact occurrence");
+        };
+        assert_eq!(output.metadata["occurrences"], 2);
+        assert_eq!(output.metadata["line_endings_normalized"], true);
+        assert!(matches!(
+            effect.commit().await,
+            agent_contracts::EffectReceipt::Applied { .. }
+        ));
+        assert_eq!(
+            tfs::read(&file).await.unwrap(),
+            b"u\r\nv\r\nw\n--\nu\nv\nw\r\n"
         );
     }
 

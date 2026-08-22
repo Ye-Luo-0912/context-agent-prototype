@@ -1,7 +1,8 @@
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::task::{Context, Poll};
 
 use agent_contracts::{
@@ -14,6 +15,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::io::AsyncWrite;
+use tokio::sync::OwnedMutexGuard;
 use uuid::Uuid;
 
 mod broker;
@@ -72,6 +74,10 @@ pub enum ChangeRecord {
 /// Old-content capture limit for `ChangeRecord::MutationPrepared` (bounded
 /// journal).
 pub const CHANGE_CAPTURE_LIMIT: usize = 256 * 1024;
+/// Serialized JSONL frame ceiling. This covers worst-case JSON escaping of
+/// the bounded old-content capture while keeping the indivisible append
+/// latency and memory use finite.
+const MAX_CHANGE_RECORD_BYTES: usize = 2 * 1024 * 1024;
 /// Hard ceiling for one ordinary workspace mutation. Large raw results
 /// belong in the artifact store; no builtin or capability handle may bypass
 /// this boundary by calling `MutationTransaction::prepare` directly.
@@ -87,6 +93,52 @@ fn content_hash(bytes: &[u8]) -> String {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{:016x}", hash)
+}
+
+/// Hash one already-open regular file without ever reading past the
+/// workspace mutation ceiling. The handle, not a path, is the authority.
+fn bounded_open_file_revision(
+    file: &mut std::fs::File,
+    max_bytes: usize,
+) -> io::Result<(u64, ContentDigest)> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mutation target is not a regular file",
+        ));
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "file is {} bytes; workspace mutations are limited to {max_bytes} bytes",
+                metadata.len()
+            ),
+        ));
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > max_bytes as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("file grew beyond the workspace mutation limit of {max_bytes} bytes"),
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((total, ContentDigest::from_bytes(hasher.finalize().into())))
 }
 
 /// 身份定位符到仓库内相对路径。URI 本身不再泄露 `.focus-agent` 路径。
@@ -247,6 +299,61 @@ fn normalize_canonical(path: PathBuf) -> PathBuf {
     }
 }
 
+#[derive(Debug, Default)]
+struct MutationLockRegistry {
+    locks: StdMutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl MutationLockRegistry {
+    async fn acquire_key(&self, key: &str) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Weak entries make the registry bounded by active/waiting
+            // mutations rather than by every path ever edited.
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key.to_string(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+}
+
+struct MutationLeaseGroup {
+    _guards: Vec<OwnedMutexGuard<()>>,
+}
+
+impl std::fmt::Debug for MutationLeaseGroup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MutationLeaseGroup")
+            .field("paths", &self._guards.len())
+            .finish()
+    }
+}
+
+fn mutation_lock_key(relative: &str) -> String {
+    let normalized = relative.replace('\\', "/");
+    #[cfg(windows)]
+    {
+        // Windows workspace paths are normally case-insensitive. It is safe
+        // to over-serialize a case-sensitive directory; under-serializing
+        // aliases could permit two in-process writers to race.
+        normalized.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        normalized
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
@@ -254,6 +361,33 @@ pub struct Workspace {
     effect_journal: Arc<journal::WorkspaceEffectJournal>,
     process_journal: Arc<process_journal::ProcessEffectJournal>,
     remote_journal: Arc<remote_journal::RemoteEffectJournal>,
+    mutation_locks: Arc<MutationLockRegistry>,
+    change_journal_lock: Arc<StdMutex<()>>,
+}
+
+/// One existing-file snapshot and the journal transaction that owns its
+/// mutation lease. The exact bytes are read once after every batch lease is
+/// acquired; callers transform those bytes and then consume the transaction
+/// into `prepare`.
+pub struct MutationSnapshot {
+    transaction: MutationTransaction,
+    bytes: Vec<u8>,
+}
+
+impl MutationSnapshot {
+    pub fn relative_path(&self) -> &str {
+        &self.transaction.relative
+    }
+
+    pub fn revision(&self) -> ContentDigest {
+        self.transaction
+            .before_revision
+            .expect("existing regular-file snapshots always carry a revision")
+    }
+
+    pub fn into_parts(self) -> (MutationTransaction, Vec<u8>) {
+        (self.transaction, self.bytes)
+    }
 }
 
 impl Workspace {
@@ -354,6 +488,8 @@ impl Workspace {
             effect_journal,
             process_journal,
             remote_journal,
+            mutation_locks: Arc::new(MutationLockRegistry::default()),
+            change_journal_lock: Arc::new(StdMutex::new(())),
         })
     }
 
@@ -363,6 +499,147 @@ impl Workspace {
 
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
+    }
+
+    async fn acquire_mutation_keys(&self, mut keys: Vec<String>) -> Arc<MutationLeaseGroup> {
+        keys.sort();
+        keys.dedup();
+        let mut guards = Vec::with_capacity(keys.len());
+        for key in keys {
+            guards.push(self.mutation_locks.acquire_key(&key).await);
+        }
+        Arc::new(MutationLeaseGroup { _guards: guards })
+    }
+
+    /// Capture one bounded, exact snapshot for every existing target while
+    /// holding their shared in-process mutation lease. All canonical lock
+    /// keys are acquired in sorted order before any file is read, so two
+    /// reversed multi-file batches cannot deadlock and every successful edit
+    /// can transform the same bytes its transaction journaled.
+    pub async fn begin_existing_mutations(
+        &self,
+        tool: &str,
+        action: &str,
+        relatives: &[String],
+        max_snapshot_bytes: usize,
+    ) -> AgentResult<Vec<MutationSnapshot>> {
+        if relatives.is_empty() {
+            return Err(AgentError::InvalidRequest(
+                "existing mutation snapshot requires at least one target".into(),
+            ));
+        }
+        if max_snapshot_bytes > MAX_MUTATION_BYTES {
+            return Err(AgentError::InvalidRequest(format!(
+                "mutation snapshot limit {max_snapshot_bytes} exceeds the workspace limit of {MAX_MUTATION_BYTES} bytes"
+            )));
+        }
+
+        struct Target {
+            target: PathBuf,
+            target_name: std::ffi::OsString,
+            relative: String,
+            key: String,
+        }
+
+        let mut targets = Vec::with_capacity(relatives.len());
+        let mut unique_keys = HashSet::with_capacity(relatives.len());
+        for requested in relatives {
+            let target = self.resolve_mutation(requested).await?;
+            let target_name = target
+                .file_name()
+                .ok_or_else(|| {
+                    AgentError::InvalidRequest(format!("no file name for {}", target.display()))
+                })?
+                .to_os_string();
+            let relative = display_relative(&self.root, &target);
+            let key = mutation_lock_key(&relative);
+            if !unique_keys.insert(key.clone()) {
+                return Err(AgentError::InvalidRequest(format!(
+                    "mutation target appears more than once: {relative}"
+                )));
+            }
+            targets.push(Target {
+                target,
+                target_name,
+                relative,
+                key,
+            });
+        }
+
+        let lease_group = self
+            .acquire_mutation_keys(targets.iter().map(|target| target.key.clone()).collect())
+            .await;
+        let mut snapshots = Vec::with_capacity(targets.len());
+        for target in targets {
+            let parent_rel = target
+                .target
+                .parent()
+                .and_then(|parent| parent.strip_prefix(&self.root).ok())
+                .unwrap_or_else(|| Path::new(""));
+            let parent = self.confined_existing_parent(parent_rel).await?;
+            let file = parent
+                .open_existing(&target.target_name)
+                .map_err(|error| confined_io_error("open", &target.target, error))?;
+            let metadata = file.metadata().map_err(|error| {
+                AgentError::Io(format!("metadata {}: {error}", target.target.display()))
+            })?;
+            if !metadata.is_file() {
+                return Err(AgentError::InvalidRequest(format!(
+                    "mutation target is not a regular file: {}",
+                    target.relative
+                )));
+            }
+            if metadata.len() > max_snapshot_bytes as u64 {
+                return Err(AgentError::InvalidRequest(format!(
+                    "file is {} bytes; mutation snapshot is limited to {max_snapshot_bytes} bytes",
+                    metadata.len()
+                )));
+            }
+            let original_permissions = Some(metadata.permissions());
+
+            use tokio::io::AsyncReadExt;
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            tokio::fs::File::from_std(file)
+                .take(max_snapshot_bytes as u64 + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| {
+                    AgentError::Io(format!("read {}: {error}", target.target.display()))
+                })?;
+            if bytes.len() > max_snapshot_bytes {
+                return Err(AgentError::InvalidRequest(format!(
+                    "file grew beyond the mutation snapshot limit of {max_snapshot_bytes} bytes while it was read"
+                )));
+            }
+
+            let before_revision = ContentDigest::sha256_bytes(&bytes);
+            let old_content = (bytes.len() <= CHANGE_CAPTURE_LIMIT)
+                .then(|| std::str::from_utf8(&bytes).ok().map(str::to_owned))
+                .flatten();
+            snapshots.push(MutationSnapshot {
+                transaction: MutationTransaction {
+                    workspace: self.clone(),
+                    parent,
+                    target_name: target.target_name,
+                    target: target.target,
+                    relative: target.relative,
+                    tool: tool.to_string(),
+                    action: action.to_string(),
+                    bytes_before: bytes.len() as u64,
+                    target_existed: true,
+                    before_hash: content_hash(&bytes),
+                    before_revision: Some(before_revision),
+                    old_content,
+                    original_permissions,
+                    tx_id: Uuid::new_v4().to_string(),
+                    lease_group: lease_group.clone(),
+                    #[cfg(test)]
+                    prepare_crash_point: None,
+                },
+                bytes,
+            });
+        }
+        Ok(snapshots)
     }
 
     /// Reconcile one exact Core-issued operation/effect identity against the
@@ -583,10 +860,10 @@ impl Workspace {
 
     /// SHA-256 hex of a workspace-relative file, matching `fs.read`'s
     /// content revision. Missing paths return `None`. Files above the
-    /// ordinary read cap are skipped (`InvalidRequest`) so this never
-    /// becomes a second full-file ingest path.
+    /// canonical workspace mutation cap are skipped (`InvalidRequest`) so
+    /// this never becomes an unbounded second full-file ingest path.
     pub async fn resource_revision(&self, key: &str) -> AgentResult<Option<String>> {
-        const MAX_REVISION_BYTES: u64 = 2 * 1024 * 1024;
+        const MAX_REVISION_BYTES: u64 = MAX_MUTATION_BYTES as u64;
         let path = agent_contracts::normalize_resource_path(key);
         if path.is_empty() {
             return Ok(None);
@@ -606,11 +883,19 @@ impl Workspace {
                     )));
                 }
                 use tokio::io::AsyncReadExt;
-                let mut file = confined.into_tokio();
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes).await.map_err(|error| {
-                    AgentError::Io(format!("read {path} for revision: {error}"))
-                })?;
+                let file = confined.into_tokio();
+                let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                file.take(MAX_REVISION_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .await
+                    .map_err(|error| {
+                        AgentError::Io(format!("read {path} for revision: {error}"))
+                    })?;
+                if bytes.len() as u64 > MAX_REVISION_BYTES {
+                    return Err(AgentError::InvalidRequest(format!(
+                        "file grew beyond the revision lookup limit of {MAX_REVISION_BYTES} bytes while it was read"
+                    )));
+                }
                 Ok(Some(ContentDigest::sha256_bytes(&bytes).to_string()))
             }
             Err(error) if revision_lookup_missing(&error) => Ok(None),
@@ -618,12 +903,11 @@ impl Workspace {
         }
     }
 
-    /// Confine a mutation's parent directory with validation and open fused
-    /// into one directory-handle-relative descent. Missing components are
-    /// created through the pinned handle chain (never by following a path
-    /// string), and the runtime state directory is rejected, mirroring
-    /// `resolve_mutation`.
-    pub(crate) async fn confined_parent(&self, relative: &Path) -> AgentResult<ConfinedDir> {
+    /// Open an already-existing mutation parent through one confined handle
+    /// chain. File effects never create directory topology implicitly: a
+    /// missing parent is refused before a transaction (and therefore before
+    /// any authority intent, staged file, or review evidence) can exist.
+    async fn confined_existing_parent(&self, relative: &Path) -> AgentResult<ConfinedDir> {
         let clean = clean_relative(relative)?;
         let mut dir = ConfinedDir::open_root(&self.root)
             .map_err(|e| AgentError::Io(format!("open workspace root handle: {e}")))?;
@@ -641,22 +925,10 @@ impl Workspace {
             match dir.open_child_dir(part.as_os_str()) {
                 Ok(child) => dir = child,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    // Create the missing component under the pinned parent,
-                    // then reopen it; a concurrent creator only means the
-                    // reopen succeeds.
-                    match dir.create_child_dir(part.as_os_str()) {
-                        Ok(()) => {}
-                        Err(ce) if ce.kind() == io::ErrorKind::AlreadyExists => {}
-                        Err(ce) => {
-                            return Err(AgentError::Io(format!(
-                                "create dir {}: {ce}",
-                                display.display()
-                            )));
-                        }
-                    }
-                    dir = dir
-                        .open_child_dir(part.as_os_str())
-                        .map_err(|e| confined_io_error("open created dir", &display, e))?;
+                    return Err(AgentError::InvalidRequest(format!(
+                        "mutation parent directory not found: {}; file mutations only create a file inside an existing parent directory",
+                        display_relative(&self.root, &display)
+                    )));
                 }
                 Err(e) => return Err(confined_io_error("open dir", &display, e)),
             }
@@ -668,11 +940,13 @@ impl Workspace {
     /// `resolve_mutation` and its old content is captured (bounded) as the
     /// journal backup before anything is written.
     ///
-    /// The parent directory is confined with validation and open fused into
-    /// a directory-handle-relative descent: the staged temp file and the
-    /// final atomic replace both happen relative to the pinned handle, so a
-    /// link swap after validation cannot redirect the write outside the
-    /// workspace. The old content is read through that same pinned handle.
+    /// The parent directory must already exist and is confined with validation
+    /// and open fused into a directory-handle-relative descent. The staged
+    /// temp file and final atomic replace both happen relative to the pinned
+    /// handle, so a link swap after validation cannot redirect the write
+    /// outside the workspace. The target file itself may be absent; for a
+    /// Core-managed write it is staged only after authority preparation,
+    /// inside that already-existing parent.
     pub async fn begin_mutation(
         &self,
         tool: &str,
@@ -683,17 +957,22 @@ impl Workspace {
         let target_name = target.file_name().ok_or_else(|| {
             AgentError::InvalidRequest(format!("no file name for {}", target.display()))
         })?;
+        let relative = display_relative(&self.root, &target);
+        let lease_group = self
+            .acquire_mutation_keys(vec![mutation_lock_key(&relative)])
+            .await;
         let parent_rel = target
             .parent()
             .and_then(|p| p.strip_prefix(&self.root).ok())
             .unwrap_or_else(|| Path::new(""));
-        let parent = self.confined_parent(parent_rel).await?;
+        let parent = self.confined_existing_parent(parent_rel).await?;
 
         let mut bytes_before = 0u64;
         let mut target_existed = false;
         let mut before_hash = content_hash(&[]);
         let mut before_revision = None;
         let mut old_content = None;
+        let mut original_permissions = None;
         match parent.open_existing(target_name) {
             Ok(file) => {
                 target_existed = true;
@@ -702,12 +981,18 @@ impl Workspace {
                     .map_err(|e| AgentError::Io(format!("metadata {}: {e}", target.display())))?;
                 bytes_before = meta.len();
                 if meta.is_file() {
-                    // The hash must always reflect the real content — a
-                    // recovery pass relies on it to tell "prepared but
-                    // never committed" from "committed". Only the *backup*
-                    // is bounded: big files get a hash but no journal copy.
-                    // The read goes through the pinned handle, so a swap
-                    // cannot change which object is hashed.
+                    if meta.len() > MAX_MUTATION_BYTES as u64 {
+                        return Err(AgentError::InvalidRequest(format!(
+                            "file is {} bytes; workspace mutations are limited to {MAX_MUTATION_BYTES} bytes",
+                            meta.len()
+                        )));
+                    }
+                    original_permissions = Some(meta.permissions());
+
+                    // Recovery identity and the optional backup are derived
+                    // from the same pinned, bounded read. A file that grows
+                    // while being read is rejected at MAX + 1 rather than
+                    // turning begin_mutation into unbounded synchronous I/O.
                     let mut file = file;
                     use std::io::Read;
                     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -718,12 +1003,27 @@ impl Workspace {
                         None
                     };
                     let mut buffer = [0_u8; 64 * 1024];
+                    let mut total = 0_usize;
                     loop {
-                        let read = file.read(&mut buffer).map_err(|e| {
-                            AgentError::Io(format!("read {}: {e}", target.display()))
-                        })?;
+                        let remaining = (MAX_MUTATION_BYTES + 1).saturating_sub(total);
+                        if remaining == 0 {
+                            return Err(AgentError::InvalidRequest(format!(
+                                "file grew beyond the workspace mutation limit of {MAX_MUTATION_BYTES} bytes while it was read"
+                            )));
+                        }
+                        let read =
+                            file.read(&mut buffer[..remaining.min(64 * 1024)])
+                                .map_err(|e| {
+                                    AgentError::Io(format!("read {}: {e}", target.display()))
+                                })?;
                         if read == 0 {
                             break;
+                        }
+                        total += read;
+                        if total > MAX_MUTATION_BYTES {
+                            return Err(AgentError::InvalidRequest(format!(
+                                "file grew beyond the workspace mutation limit of {MAX_MUTATION_BYTES} bytes while it was read"
+                            )));
                         }
                         for byte in &buffer[..read] {
                             hash ^= u64::from(*byte);
@@ -731,9 +1031,18 @@ impl Workspace {
                         }
                         revision_hasher.update(&buffer[..read]);
                         if let Some(bytes) = &mut captured {
-                            bytes.extend_from_slice(&buffer[..read]);
+                            if bytes.len().saturating_add(read) <= CHANGE_CAPTURE_LIMIT {
+                                bytes.extend_from_slice(&buffer[..read]);
+                            } else {
+                                // Metadata can become stale if an external
+                                // writer grows the file while it is read.
+                                // Never let the journal backup cross its
+                                // allocation boundary in that race.
+                                captured = None;
+                            }
                         }
                     }
+                    bytes_before = total as u64;
                     before_hash = format!("{hash:016x}");
                     before_revision =
                         Some(ContentDigest::from_bytes(revision_hasher.finalize().into()));
@@ -743,7 +1052,6 @@ impl Workspace {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(confined_io_error("inspect", &target, e)),
         }
-        let relative = display_relative(&self.root, &target);
         Ok(MutationTransaction {
             workspace: self.clone(),
             parent,
@@ -757,7 +1065,11 @@ impl Workspace {
             before_hash,
             before_revision,
             old_content,
+            original_permissions,
             tx_id: Uuid::new_v4().to_string(),
+            lease_group,
+            #[cfg(test)]
+            prepare_crash_point: None,
         })
     }
 
@@ -873,42 +1185,123 @@ impl Workspace {
     /// (`.focus-agent/changes.jsonl`). Mutating tools call this so every
     /// write is visible and reviewable.
     pub async fn record_change(&self, change: ChangeRecord) -> AgentResult<()> {
-        let journal = self.state_dir.join("changes.jsonl");
-        let line = serde_json::to_string(&change)
+        let mut line = serde_json::to_string(&change)
             .map_err(|e| AgentError::Storage(format!("serialize change: {e}")))?;
-        let mut options = tokio::fs::OpenOptions::new();
-        options.create(true).append(true);
-        let mut file = options
+        line.push('\n');
+        if line.len() > MAX_CHANGE_RECORD_BYTES {
+            return Err(AgentError::Storage(format!(
+                "change journal record is {} bytes; the limit is {MAX_CHANGE_RECORD_BYTES} bytes",
+                line.len()
+            )));
+        }
+        // This deliberately has no suspension point after taking the lock.
+        // Dropping an async caller can therefore happen before a record or
+        // after a complete JSON line, never halfway through `write_all`.
+        // Mutation staging/rename already uses bounded synchronous confined
+        // I/O; keeping this small audit append in the same indivisible poll
+        // is cheaper and safer than an independently cancellable async write.
+        let _journal_guard = self
+            .change_journal_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let journal = self.state_dir.join("changes.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
             .open(&journal)
-            .await
             .map_err(|e| AgentError::Storage(format!("open change journal: {e}")))?;
-        use tokio::io::AsyncWriteExt;
+        use std::io::Write;
         file.write_all(line.as_bytes())
-            .await
-            .map_err(|e| AgentError::Storage(format!("append change journal: {e}")))?;
-        file.write_all(b"\n")
-            .await
             .map_err(|e| AgentError::Storage(format!("append change journal: {e}")))?;
         file.flush()
-            .await
             .map_err(|e| AgentError::Storage(format!("flush change journal: {e}")))?;
         Ok(())
     }
 }
 
+/// Removes a newly-created staging entry unless ownership is explicitly
+/// transferred to `PreparedMutation`. The guard is installed immediately
+/// after exclusive creation, so every later error or unwind cleans the temp
+/// before releasing the path lease.
+struct StagedTempCleanup<'a> {
+    parent: &'a ConfinedDir,
+    temp_name: &'a std::ffi::OsStr,
+    file: Option<std::fs::File>,
+    armed: bool,
+}
+
+impl<'a> StagedTempCleanup<'a> {
+    fn new(parent: &'a ConfinedDir, temp_name: &'a std::ffi::OsStr, file: std::fs::File) -> Self {
+        Self {
+            parent,
+            temp_name,
+            file: Some(file),
+            armed: true,
+        }
+    }
+
+    fn file_mut(&mut self) -> &mut std::fs::File {
+        self.file
+            .as_mut()
+            .expect("staged cleanup owns the open file")
+    }
+
+    fn cleanup_now(&mut self) -> bool {
+        let cleaned = cleanup_staged_file(self.parent, self.temp_name, self.file.as_ref());
+        if cleaned {
+            // Windows deletion is pending until this final handle closes.
+            // Unix already unlinked the verified inode. Keep the handle on
+            // failure so a retry never degrades into an unverified path-only
+            // delete.
+            self.file.take();
+            self.armed = false;
+        }
+        cleaned
+    }
+
+    fn disarm_and_take_file(&mut self) -> std::fs::File {
+        self.armed = false;
+        self.file.take().expect("staged cleanup owns the open file")
+    }
+}
+
+impl Drop for StagedTempCleanup<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.cleanup_now();
+        }
+    }
+}
+
+fn cleanup_staged_file(
+    parent: &ConfinedDir,
+    temp_name: &std::ffi::OsStr,
+    open_file: Option<&std::fs::File>,
+) -> bool {
+    let removal = match open_file {
+        Some(file) => parent.remove_open_file(file, temp_name),
+        None => parent.remove_file(temp_name),
+    };
+    match removal {
+        Ok(()) => parent.sync_all().is_ok(),
+        // Without an open handle, NotFound proves there is no staging entry
+        // left to clean. With a handle it can mean the inode was renamed to
+        // an unknown name, so recovery must retain the uncertainty.
+        Err(error) if open_file.is_none() && error.kind() == io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
 /// A single journaled, atomic file mutation, split into prepare and commit.
 ///
-/// Ordering contract: `prepare` stages the new content in a hidden
-/// temporary file next to the target and records `MutationPrepared` *before*
-/// the target is swapped in, so a journal failure never leaves the target
-/// half-mutated and a caller retrying the tool cannot double-apply a
-/// mutation that already landed. `commit` then atomically renames the staged
-/// file over the target and records `MutationCommitted`; a commit failure
-/// rolls the staging back and records `MutationRolledBack`, so the journal
-/// never claims a mutation that did not land. The runtime owns the
-/// commit/rollback decision: it validates the operation is still current
-/// (generation fence) before committing, and rolls back when a stale
-/// operation's prepared effect would otherwise leak.
+/// For Core-managed effects, `prepare` first persists an authority intent
+/// that owns the deterministic staging name, then creates and syncs the
+/// hidden file, and only then writes the review journal's
+/// `MutationPrepared`. Thus every staging entry that can survive a crash is
+/// already mapped by durable authority evidence. `commit` atomically renames
+/// the staged file over the target and records `MutationCommitted`; a commit
+/// failure rolls the staging back and records `MutationRolledBack`. The
+/// runtime owns the commit/rollback decision behind its generation fence.
 pub struct MutationTransaction {
     workspace: Workspace,
     /// Pinned parent directory handle: staging and the atomic replace both
@@ -931,7 +1324,25 @@ pub struct MutationTransaction {
     /// commit-time compare-before-swap guard.
     before_revision: Option<ContentDigest>,
     old_content: Option<String>,
+    /// Platform permissions copied to the replacement. On Unix this retains
+    /// mode bits; on Windows it retains the readonly attribute expressible
+    /// through `std::fs::Permissions` (not the complete ACL/attribute set).
+    original_permissions: Option<std::fs::Permissions>,
     tx_id: String,
+    /// Shared lease from snapshot acquisition through final commit,
+    /// rollback, or drop. A multi-file batch gives every child the same
+    /// group so no in-process writer can enter between sibling commits.
+    lease_group: Arc<MutationLeaseGroup>,
+    #[cfg(test)]
+    prepare_crash_point: Option<PrepareCrashPoint>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrepareCrashPoint {
+    IntentPersisted,
+    StageSynced,
+    ReviewRecorded,
 }
 
 impl MutationTransaction {
@@ -941,11 +1352,18 @@ impl MutationTransaction {
         self.before_revision
     }
 
-    /// Stage `content`: write the temporary file and record
-    /// `MutationPrepared`. The target is not touched. Returns the prepared
-    /// mutation the runtime commits or rolls back.
+    /// Stage `content` without a Core effect identity. This is retained for
+    /// trusted tests and maintenance callers, but it is not crash-recoverable:
+    /// production model/capability writes must use
+    /// [`Self::prepare_with_effect_context`].
     pub async fn prepare(self, content: &[u8]) -> AgentResult<PreparedMutation> {
         self.prepare_inner(content, None).await
+    }
+
+    #[cfg(test)]
+    fn with_prepare_crash_point(mut self, point: PrepareCrashPoint) -> Self {
+        self.prepare_crash_point = Some(point);
+        self
     }
 
     pub async fn prepare_with_effect_context(
@@ -968,33 +1386,104 @@ impl MutationTransaction {
                 content.len()
             )));
         }
+        // One identity owns both journal evidence and the reserved staging
+        // name. For a Core-managed effect the durable authority intent must
+        // land before create_new: a torn/failed authority append therefore
+        // cannot leave a filesystem entry behind.
+        let temp_name = std::ffi::OsString::from(format!(".fa-{}.tmp", self.tx_id));
+        let after_hash = content_hash(content);
+        let staged_revision = ContentDigest::sha256_bytes(content);
+        let before_authority_hash = self
+            .before_revision
+            .unwrap_or_else(|| ContentDigest::sha256_bytes(&[]))
+            .to_string();
+        if let Some(context) = &effect_context {
+            self.workspace
+                .effect_journal
+                .append_prepared(journal::PreparedEvidence {
+                    tx_id: self.tx_id.clone(),
+                    context: context.clone(),
+                    relative_target: self.relative.clone(),
+                    temp_name: temp_name.to_string_lossy().into_owned(),
+                    target_existed: self.target_existed,
+                    before_hash: before_authority_hash,
+                    after_hash: staged_revision.to_string(),
+                    bytes_before: self.bytes_before,
+                    bytes_after: content.len() as u64,
+                })?;
+        }
+
+        #[cfg(test)]
+        if self.prepare_crash_point == Some(PrepareCrashPoint::IntentPersisted) {
+            return Err(AgentError::RecoveryRequired(
+                "simulated crash after workspace authority intent".into(),
+            ));
+        }
+
         // The parent is already confined (with missing components created
         // through the pinned handle chain); the staged file is created
         // exclusively under that handle, so a link swap cannot redirect it.
-        // Staging is a short synchronous write through the exclusive handle
-        // (the same style as the atomic replace below).
-        let file_name = self.target_name.to_string_lossy().to_string();
-        let temp_name = std::ffi::OsString::from(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
-        let mut file = self
-            .parent
-            .create_new_file(&temp_name)
-            .map_err(|e| confined_io_error("create temp", &self.target, e))?;
+        // If create_new fails, no entry owned by this transaction exists and
+        // it must never remove the colliding name.
+        let file = match self.parent.create_new_file(&temp_name) {
+            Ok(file) => file,
+            Err(error) => {
+                let create_error = confined_io_error("create temp", &self.target, error);
+                if effect_context.is_some()
+                    && let Err(rollback_error) = self
+                        .workspace
+                        .effect_journal
+                        .append_rolled_back(&self.tx_id)
+                {
+                    return Err(AgentError::RecoveryRequired(format!(
+                        "{create_error}; close workspace authority intent: {rollback_error}"
+                    )));
+                }
+                return Err(create_error);
+            }
+        };
+        let mut staged_cleanup = StagedTempCleanup::new(&self.parent, &temp_name, file);
 
-        use std::io::Write;
-        if let Err(e) = file.write_all(content) {
-            let _ = self.parent.remove_file(&temp_name);
-            return Err(AgentError::Io(format!("write temp file: {e}")));
-        }
-        if let Err(e) = file.flush() {
-            let _ = self.parent.remove_file(&temp_name);
-            return Err(AgentError::Io(format!("flush temp file: {e}")));
-        }
-        if let Err(e) = file.sync_all() {
-            let _ = self.parent.remove_file(&temp_name);
-            return Err(AgentError::Io(format!("sync temp file: {e}")));
+        let stage_result = (|| -> io::Result<()> {
+            use std::io::Write;
+
+            let file = staged_cleanup.file_mut();
+            file.write_all(content)?;
+            file.flush()?;
+            #[cfg(not(windows))]
+            if let Some(permissions) = &self.original_permissions {
+                file.set_permissions(permissions.clone())?;
+            }
+            file.sync_all()
+        })();
+        if let Err(error) = stage_result {
+            if !staged_cleanup.cleanup_now() {
+                return Err(AgentError::RecoveryRequired(format!(
+                    "stage mutation failed ({error}); staged file cleanup could not be confirmed"
+                )));
+            }
+            if effect_context.is_some()
+                && let Err(rollback_error) = self
+                    .workspace
+                    .effect_journal
+                    .append_rolled_back(&self.tx_id)
+            {
+                return Err(AgentError::RecoveryRequired(format!(
+                    "stage mutation failed ({error}); close workspace authority intent: {rollback_error}"
+                )));
+            }
+            return Err(AgentError::Io(format!("stage temp file: {error}")));
         }
 
-        let after_hash = content_hash(content);
+        #[cfg(test)]
+        if self.prepare_crash_point == Some(PrepareCrashPoint::StageSynced) {
+            let file = staged_cleanup.disarm_and_take_file();
+            drop(file);
+            drop(staged_cleanup);
+            return Err(AgentError::RecoveryRequired(
+                "simulated crash after staged file sync".into(),
+            ));
+        }
 
         let record = ChangeRecord::MutationPrepared {
             tx_id: self.tx_id.clone(),
@@ -1008,28 +1497,40 @@ impl MutationTransaction {
             after_hash: after_hash.clone(),
             old_content: self.old_content.take(),
         };
-        if let Err(e) = self.workspace.record_change(record).await {
-            let _ = self.parent.remove_file(&temp_name);
-            return Err(e);
-        }
-        if let Some(context) = &effect_context
-            && let Err(error) =
-                self.workspace
+        if let Err(error) = self.workspace.record_change(record).await {
+            if !staged_cleanup.cleanup_now() {
+                return Err(AgentError::RecoveryRequired(format!(
+                    "record mutation prepare failed ({error}); staged file cleanup could not be confirmed"
+                )));
+            }
+            if effect_context.is_some()
+                && let Err(rollback_error) = self
+                    .workspace
                     .effect_journal
-                    .append_prepared(journal::PreparedEvidence {
-                        tx_id: self.tx_id.clone(),
-                        context: context.clone(),
-                        relative_target: self.relative.clone(),
-                        temp_name: temp_name.to_string_lossy().into_owned(),
-                        target_existed: self.target_existed,
-                        before_hash: self.before_hash,
-                        after_hash,
-                    })
-        {
-            let _ = self.parent.remove_file(&temp_name);
+                    .append_rolled_back(&self.tx_id)
+            {
+                return Err(AgentError::RecoveryRequired(format!(
+                    "record mutation prepare failed ({error}); close workspace authority intent: {rollback_error}"
+                )));
+            }
             return Err(error);
         }
 
+        #[cfg(test)]
+        if self.prepare_crash_point == Some(PrepareCrashPoint::ReviewRecorded) {
+            let file = staged_cleanup.disarm_and_take_file();
+            drop(file);
+            drop(staged_cleanup);
+            return Err(AgentError::RecoveryRequired(
+                "simulated crash after mutation review record".into(),
+            ));
+        }
+
+        // From this point `PreparedMutation` owns both the name and cleanup
+        // responsibility. Disarm before moving the pinned parent/name out of
+        // the transaction.
+        let file = staged_cleanup.disarm_and_take_file();
+        drop(staged_cleanup);
         Ok(PreparedMutation {
             workspace: self.workspace,
             parent: self.parent,
@@ -1042,14 +1543,24 @@ impl MutationTransaction {
             finished: false,
             relative_target: self.relative,
             staged_bytes: content.len() as u64,
+            staged_revision,
+            bytes_before: self.bytes_before,
             target_existed: self.target_existed,
             before_revision: self.before_revision,
+            #[cfg(windows)]
+            original_permissions: self.original_permissions,
+            _lease_group: self.lease_group,
+            #[cfg(test)]
+            cleanup_failures_remaining: 0,
+            #[cfg(test)]
+            post_replace_corruption: None,
         })
     }
 
-    /// Convenience: prepare then commit immediately (used where the caller
-    /// is itself the only judge of the operation's validity — the runtime's
-    /// generation fence is bypassed, so only trusted core paths may use it).
+    /// Convenience for trusted, non-crash-recoverable maintenance paths.
+    /// This carries no [`OperationEffectContext`], writes no authority intent,
+    /// and bypasses the runtime generation fence; production model or
+    /// capability effects must use `prepare_with_effect_context` instead.
     pub async fn apply(self, content: &[u8]) -> AgentResult<()> {
         let prepared = self.prepare(content).await?;
         match prepared.commit().await {
@@ -1093,8 +1604,21 @@ pub struct PreparedMutation {
     /// Core for the commit-time Actual ⊆ Approved check (MOD-AUTH-02).
     relative_target: String,
     staged_bytes: u64,
+    /// Expected SHA-256 of the exact staged bytes. Commit re-derives this
+    /// from the still-open staging handle before any target replacement.
+    staged_revision: ContentDigest,
+    bytes_before: u64,
     target_existed: bool,
     before_revision: Option<ContentDigest>,
+    #[cfg(windows)]
+    original_permissions: Option<std::fs::Permissions>,
+    /// Retained solely for its drop semantics; releasing the final child
+    /// releases every sorted path lease held by the batch.
+    _lease_group: Arc<MutationLeaseGroup>,
+    #[cfg(test)]
+    cleanup_failures_remaining: usize,
+    #[cfg(test)]
+    post_replace_corruption: Option<Vec<u8>>,
 }
 
 impl PreparedMutation {
@@ -1122,51 +1646,119 @@ impl PreparedMutation {
     /// `SetFileInformationByHandle` with `FILE_RENAME_INFO`), so a link
     /// swap cannot redirect it outside the workspace.
     pub async fn commit(mut self) -> EffectReceipt {
-        let Some(temp_name) = self.temp_name.take() else {
-            return EffectReceipt::Applied {
-                durability: EffectDurability::Durable,
-                evidence: Some(self.tx_id.clone()),
+        let Some(temp_name) = self.temp_name.clone() else {
+            return EffectReceipt::Unknown {
+                error: "prepared mutation lost its staged temp identity".into(),
             };
         };
-        let from = self
-            .temp_file
-            .as_ref()
-            .expect("prepare created the staged file");
         match self.target_still_matches_snapshot() {
             Ok(true) => {}
             Ok(false) => {
-                let reason = "stale_revision: target changed after mutation preflight; staged content was not applied";
-                if self.cleanup_staged(&temp_name) {
-                    self.record_rolled_back(reason.into()).await;
-                }
-                return EffectReceipt::NotApplied {
-                    error: reason.into(),
-                };
+                return self
+                    .settle_not_applied(
+                        &temp_name,
+                        "stale_revision: target changed after mutation preflight; staged content was not applied"
+                            .into(),
+                    )
+                    .await;
             }
             Err(error) => {
                 let reason = format!(
                     "commit precondition could not inspect current target; staged content was not applied: {error}"
                 );
-                if self.cleanup_staged(&temp_name) {
-                    self.record_rolled_back(reason.clone()).await;
-                }
-                return EffectReceipt::NotApplied { error: reason };
+                return self.settle_not_applied(&temp_name, reason).await;
             }
         }
+
+        match self.staged_file_matches_expected(&temp_name) {
+            Ok(true) => {}
+            Ok(false) => {
+                return self
+                    .settle_not_applied(
+                        &temp_name,
+                        "staged_integrity: staged name, length, or content changed before commit"
+                            .into(),
+                    )
+                    .await;
+            }
+            Err(error) => {
+                return self
+                    .settle_not_applied(
+                        &temp_name,
+                        format!("staged_integrity: could not verify staged content: {error}"),
+                    )
+                    .await;
+            }
+        }
+
+        let from = self
+            .temp_file
+            .as_ref()
+            .expect("prepare created the staged file");
         if let Err(e) = self
             .parent
             .replace_file(from, &temp_name, &self.target_name)
         {
-            if self.cleanup_staged(&temp_name) {
-                self.record_rolled_back(format!("commit failed: {e}")).await;
-            }
-            return EffectReceipt::NotApplied {
-                error: confined_io_error("commit", &self.target, e).to_string(),
-            };
+            let reason = confined_io_error("commit", &self.target, e).to_string();
+            return self
+                .settle_not_applied(&temp_name, format!("commit failed: {reason}"))
+                .await;
         }
         // The target changed; from here on any failure is a durability
         // problem, not a "did not apply" one.
+        self.temp_name = None;
         self.finished = true;
+
+        #[cfg(windows)]
+        if let Some(permissions) = &self.original_permissions {
+            let from = self
+                .temp_file
+                .as_ref()
+                .expect("committed mutation retains its open handle");
+            if let Err(error) = from
+                .set_permissions(permissions.clone())
+                .and_then(|()| from.sync_all())
+            {
+                return EffectReceipt::Applied {
+                    durability: EffectDurability::DurabilityFailed(format!(
+                        "restore committed mutation permissions: {error}"
+                    )),
+                    evidence: Some(self.tx_id.clone()),
+                };
+            }
+        }
+
+        #[cfg(test)]
+        if let Some(content) = self.post_replace_corruption.take() {
+            use std::io::{Seek, SeekFrom, Write};
+            let from = self
+                .temp_file
+                .as_mut()
+                .expect("committed mutation retains its open handle");
+            let _ = from
+                .set_len(0)
+                .and_then(|()| from.seek(SeekFrom::Start(0)).map(|_| ()))
+                .and_then(|()| from.write_all(&content))
+                .and_then(|()| from.sync_all());
+        }
+
+        match self.committed_target_matches_staged() {
+            Ok(true) => {}
+            Ok(false) => {
+                return EffectReceipt::Unknown {
+                    error: "atomic replace returned success but the target does not contain the staged bytes"
+                        .into(),
+                };
+            }
+            Err(error) => {
+                return EffectReceipt::Unknown {
+                    error: format!(
+                        "atomic replace returned success but committed target verification failed: {error}"
+                    ),
+                };
+            }
+        }
+
         if let Err(error) = self.parent.sync_all() {
             return EffectReceipt::Applied {
                 durability: EffectDurability::DurabilityFailed(format!(
@@ -1193,6 +1785,25 @@ impl PreparedMutation {
                 evidence: Some(self.tx_id.clone()),
             };
         }
+        match self.committed_target_matches_staged() {
+            Ok(true) => {}
+            Ok(false) => {
+                return EffectReceipt::Applied {
+                    durability: EffectDurability::DurabilityFailed(
+                        "committed target changed before durable acknowledgement".into(),
+                    ),
+                    evidence: Some(self.tx_id.clone()),
+                };
+            }
+            Err(error) => {
+                return EffectReceipt::Applied {
+                    durability: EffectDurability::DurabilityFailed(format!(
+                        "final committed target verification failed: {error}"
+                    )),
+                    evidence: Some(self.tx_id.clone()),
+                };
+            }
+        }
         EffectReceipt::Applied {
             durability: EffectDurability::Durable,
             evidence: Some(self.tx_id.clone()),
@@ -1201,12 +1812,10 @@ impl PreparedMutation {
 
     /// Re-open through the pinned parent immediately before replace and
     /// compare the current bytes with the snapshot captured by
-    /// `begin_mutation`. This closes the common lost-update window between
-    /// prepare and commit; a conflicting prepared edit becomes NotApplied
-    /// instead of overwriting the winner.
+    /// `begin_mutation`. This detects drift already visible when the check
+    /// begins and narrows the lost-update window; hash then rename is not an
+    /// atomic filesystem CAS, so a simultaneous writer can still race it.
     fn target_still_matches_snapshot(&self) -> io::Result<bool> {
-        use std::io::Read;
-
         match self.parent.open_existing(&self.target_name) {
             Ok(mut file) => {
                 if !self.target_existed {
@@ -1216,70 +1825,136 @@ impl PreparedMutation {
                 if !metadata.is_file() {
                     return Ok(self.before_revision.is_none());
                 }
-                let mut hasher = Sha256::new();
-                let mut buffer = [0_u8; 64 * 1024];
-                loop {
-                    let read = file.read(&mut buffer)?;
-                    if read == 0 {
-                        break;
-                    }
-                    hasher.update(&buffer[..read]);
-                }
-                let current = ContentDigest::from_bytes(hasher.finalize().into());
-                Ok(self.before_revision == Some(current))
+                let (bytes, current) = bounded_open_file_revision(&mut file, MAX_MUTATION_BYTES)?;
+                Ok(bytes == self.bytes_before && self.before_revision == Some(current))
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(!self.target_existed),
             Err(error) => Err(error),
         }
     }
 
-    /// Remove the staged file and record `MutationRolledBack` (best effort).
+    fn staged_file_matches_expected(&mut self, temp_name: &std::ffi::OsStr) -> io::Result<bool> {
+        let file = self.temp_file.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "staged file handle is missing")
+        })?;
+        if !self.parent.named_entry_matches_file(temp_name, file)? {
+            return Ok(false);
+        }
+        let (bytes, revision) = bounded_open_file_revision(file, MAX_MUTATION_BYTES)?;
+        if !self.parent.named_entry_matches_file(temp_name, file)? {
+            return Ok(false);
+        }
+        Ok(bytes == self.staged_bytes && revision == self.staged_revision)
+    }
+
+    fn committed_target_matches_staged(&mut self) -> io::Result<bool> {
+        let file = self.temp_file.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "committed file handle is missing")
+        })?;
+        if !self
+            .parent
+            .named_entry_matches_file(&self.target_name, file)?
+        {
+            return Ok(false);
+        }
+        let (bytes, revision) = bounded_open_file_revision(file, MAX_MUTATION_BYTES)?;
+        if !self
+            .parent
+            .named_entry_matches_file(&self.target_name, file)?
+        {
+            return Ok(false);
+        }
+        Ok(bytes == self.staged_bytes && revision == self.staged_revision)
+    }
+
+    async fn settle_not_applied(
+        &mut self,
+        temp_name: &std::ffi::OsStr,
+        reason: String,
+    ) -> EffectReceipt {
+        if !self.cleanup_staged(temp_name) {
+            return EffectReceipt::Unknown {
+                error: format!(
+                    "{reason}; staged temp cleanup could not be confirmed and recovery is required"
+                ),
+            };
+        }
+        self.temp_name = None;
+        self.finished = true;
+        match self.record_rolled_back(reason.clone()).await {
+            Ok(()) => EffectReceipt::NotApplied { error: reason },
+            Err(error) => EffectReceipt::Unknown {
+                error: format!(
+                    "{reason}; rollback journal could not be confirmed and recovery is required: {error}"
+                ),
+            },
+        }
+    }
+
+    /// Remove the staged file and record `MutationRolledBack`.
     /// Called when the owning operation is stale and the mutation must not
     /// land. The staging file is deleted here, not left behind for the
     /// `Drop` impl — a stale or cancelled mutation must never leak temp
     /// files.
-    pub async fn rollback(mut self, reason: &str) {
-        let cleaned = self
-            .temp_name
-            .take()
-            .is_none_or(|temp_name| self.cleanup_staged(&temp_name));
+    pub async fn rollback(mut self, reason: &str) -> AgentResult<()> {
+        let cleaned = match self.temp_name.clone() {
+            Some(temp_name) => self.cleanup_staged(&temp_name),
+            None => true,
+        };
+        if !cleaned {
+            return Err(AgentError::RecoveryRequired(format!(
+                "workspace mutation {} staged temp cleanup could not be confirmed",
+                self.tx_id
+            )));
+        }
+        self.temp_name = None;
         self.finished = true;
+        self.record_rolled_back(reason.to_string())
+            .await
+            .map_err(|error| {
+                AgentError::RecoveryRequired(format!(
+                    "workspace mutation {} rollback journal could not be confirmed: {error}",
+                    self.tx_id
+                ))
+            })
+    }
+
+    fn cleanup_staged(&mut self, temp_name: &std::ffi::OsStr) -> bool {
+        #[cfg(test)]
+        if self.cleanup_failures_remaining > 0 {
+            self.cleanup_failures_remaining -= 1;
+            return false;
+        }
+        let cleaned = cleanup_staged_file(&self.parent, temp_name, self.temp_file.as_ref());
         if cleaned {
-            self.record_rolled_back(reason.to_string()).await;
+            self.temp_file.take();
         }
+        cleaned
     }
 
-    fn cleanup_staged(&self, temp_name: &std::ffi::OsStr) -> bool {
-        match self.parent.remove_file(temp_name) {
-            Ok(()) => self.parent.sync_all().is_ok(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-            Err(_) => false,
-        }
-    }
-
-    async fn record_rolled_back(&self, reason: String) {
+    async fn record_rolled_back(&self, reason: String) -> AgentResult<()> {
         if self.effect_context.is_some() {
-            let _ = self
-                .workspace
+            self.workspace
                 .effect_journal
-                .append_rolled_back(&self.tx_id);
+                .append_rolled_back(&self.tx_id)?;
         }
         let record = ChangeRecord::MutationRolledBack {
             tx_id: self.tx_id.clone(),
             timestamp_ms: now_ms(),
             reason,
         };
-        let _ = self.workspace.record_change(record).await;
+        self.workspace.record_change(record).await
     }
 }
 
 impl Drop for PreparedMutation {
     fn drop(&mut self) {
         if !self.finished
-            && let Some(temp_name) = &self.temp_name
-            && self.parent.remove_file(temp_name).is_ok()
+            && let Some(temp_name) = self.temp_name.clone()
+            && self.cleanup_staged(&temp_name)
         {
-            let _ = self.parent.sync_all();
+            self.temp_name = None;
+            self.finished = true;
         }
     }
 }
@@ -1308,8 +1983,8 @@ impl Effect for PreparedMutation {
         (*self).commit().await
     }
 
-    async fn rollback(self: Box<Self>, reason: &str) {
-        (*self).rollback(reason).await;
+    async fn rollback(self: Box<Self>, reason: &str) -> AgentResult<()> {
+        (*self).rollback(reason).await
     }
 }
 
@@ -1406,6 +2081,17 @@ mod tests {
         }
     }
 
+    async fn staged_temp_count(parent: &Path) -> usize {
+        let mut count = 0usize;
+        let mut entries = fs::read_dir(parent).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            if entry.file_name().to_string_lossy().ends_with(".tmp") {
+                count += 1;
+            }
+        }
+        count
+    }
+
     #[tokio::test]
     async fn rejects_parent_escape_and_absolute_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -1449,6 +2135,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resource_revision_uses_the_workspace_mutation_byte_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let at_limit = vec![b'x'; MAX_MUTATION_BYTES];
+        std::fs::write(dir.path().join("at-limit.txt"), &at_limit).unwrap();
+        std::fs::write(
+            dir.path().join("over-limit.txt"),
+            vec![b'x'; MAX_MUTATION_BYTES + 1],
+        )
+        .unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+
+        assert_eq!(
+            workspace.resource_revision("at-limit.txt").await.unwrap(),
+            Some(ContentDigest::sha256_bytes(&at_limit).to_string())
+        );
+        assert!(matches!(
+            workspace.resource_revision("over-limit.txt").await,
+            Err(AgentError::InvalidRequest(message))
+                if message.contains(&MAX_MUTATION_BYTES.to_string())
+        ));
+    }
+
+    #[tokio::test]
     async fn resolves_clean_relative_paths() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
@@ -1477,6 +2186,11 @@ mod tests {
             .unwrap();
         assert_eq!(resolved, workspace.root().join("missing/file.txt"));
 
+        // Directory topology is established explicitly; the file mutation
+        // only proves the missing lexical prefix did not alias the root file.
+        fs::create_dir(workspace.root().join("missing"))
+            .await
+            .unwrap();
         workspace
             .begin_mutation("fs.write", "write", "missing/file.txt")
             .await
@@ -1651,6 +2365,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_change_records_remain_complete_json_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let mut tasks = Vec::new();
+        for index in 0..32 {
+            let workspace = workspace.clone();
+            tasks.push(tokio::spawn(async move {
+                let tx_id = format!("concurrent-{index}");
+                workspace
+                    .record_change(ChangeRecord::MutationPrepared {
+                        tx_id: tx_id.clone(),
+                        timestamp_ms: index,
+                        tool: "test".into(),
+                        path: format!("file-{index}.txt"),
+                        action: "write".into(),
+                        bytes_before: 0,
+                        bytes_after: 16 * 1024,
+                        before_hash: content_hash(&[]),
+                        after_hash: content_hash(b"after"),
+                        // Make each append large enough to expose split-write
+                        // interleaving in the absence of serialization.
+                        old_content: Some("x".repeat(16 * 1024)),
+                    })
+                    .await
+                    .unwrap();
+                tokio::task::yield_now().await;
+                workspace
+                    .record_change(ChangeRecord::MutationCommitted {
+                        tx_id,
+                        timestamp_ms: index + 1,
+                    })
+                    .await
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let journal = fs::read_to_string(workspace.state_dir().join("changes.jsonl"))
+            .await
+            .unwrap();
+        let mut transitions: HashMap<String, Vec<String>> = HashMap::new();
+        for line in journal.lines() {
+            let record: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("journal line is not standalone JSON: {error}"));
+            transitions
+                .entry(record["tx_id"].as_str().unwrap().to_string())
+                .or_default()
+                .push(record["kind"].as_str().unwrap().to_string());
+        }
+        assert_eq!(transitions.len(), 32);
+        for kinds in transitions.values() {
+            assert_eq!(
+                kinds,
+                &["mutation_prepared", "mutation_committed"],
+                "each transaction must retain its own ordered terminal pair"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn prepared_mutation_rolls_back_without_touching_the_target() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
@@ -1667,7 +2443,7 @@ mod tests {
             "original",
             "prepare must not touch the target"
         );
-        prepared.rollback("stale operation").await;
+        prepared.rollback("stale operation").await.unwrap();
 
         assert_eq!(
             fs::read_to_string(&target).await.unwrap(),
@@ -1749,7 +2525,7 @@ mod tests {
 
         // A stale/cancelled mutation rolls back — and the staging file must
         // be gone, not leaked for the Drop impl to clean up later.
-        prepared.rollback("stale operation").await;
+        prepared.rollback("stale operation").await.unwrap();
         assert_eq!(temp_count().await, 0, "rollback must delete the temp file");
         assert_eq!(
             fs::read_to_string(&target).await.unwrap(),
@@ -1759,14 +2535,331 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn later_prepared_edit_cannot_overwrite_an_earlier_winner() {
+    async fn change_journal_append_completes_in_one_poll_as_one_json_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let future = workspace.record_change(ChangeRecord::MutationRolledBack {
+            tx_id: "one-poll".into(),
+            timestamp_ms: 1,
+            reason: "test".into(),
+        });
+        let mut future = std::pin::pin!(future);
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(
+            matches!(
+                std::future::Future::poll(future.as_mut(), &mut context),
+                std::task::Poll::Ready(Ok(()))
+            ),
+            "the append must not expose a cancellable partial-write await"
+        );
+
+        let journal = fs::read_to_string(workspace.state_dir().join("changes.jsonl"))
+            .await
+            .unwrap();
+        let lines = journal.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        let record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(record["tx_id"], "one-poll");
+    }
+
+    #[tokio::test]
+    async fn change_journal_refuses_an_oversized_serialized_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let error = workspace
+            .record_change(ChangeRecord::MutationRolledBack {
+                tx_id: "oversized".into(),
+                timestamp_ms: 1,
+                reason: "x".repeat(MAX_CHANGE_RECORD_BYTES + 1),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentError::Storage(message) if message.contains("limit")));
+        assert!(!workspace.state_dir().join("changes.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn rollback_cleanup_failure_keeps_temp_name_for_drop_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let target = workspace.resolve_relative("notes.txt").await.unwrap();
+        fs::write(&target, "original").await.unwrap();
+
+        let mut prepared = workspace
+            .begin_mutation("fs.write", "write", "notes.txt")
+            .await
+            .unwrap()
+            .prepare(b"staged")
+            .await
+            .unwrap();
+        prepared.cleanup_failures_remaining = 1;
+        let error = prepared
+            .rollback("injected cleanup failure")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AgentError::RecoveryRequired(message) if message.contains("cleanup could not be confirmed"))
+        );
+
+        assert_eq!(
+            staged_temp_count(dir.path()).await,
+            0,
+            "rollback must leave the name armed so Drop can retry cleanup"
+        );
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "original");
+    }
+
+    #[tokio::test]
+    async fn rollback_journal_failure_is_reported_after_confirmed_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let target = workspace.resolve_relative("notes.txt").await.unwrap();
+        fs::write(&target, "original").await.unwrap();
+
+        let prepared = workspace
+            .begin_mutation("fs.write", "write", "notes.txt")
+            .await
+            .unwrap()
+            .prepare(b"staged")
+            .await
+            .unwrap();
+        let error = prepared
+            .rollback(&"x".repeat(MAX_CHANGE_RECORD_BYTES + 1))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, AgentError::RecoveryRequired(message) if message.contains("rollback journal could not be confirmed"))
+        );
+        assert_eq!(
+            staged_temp_count(dir.path()).await,
+            0,
+            "journal failure occurs only after staged cleanup is confirmed"
+        );
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "original");
+    }
+
+    #[tokio::test]
+    async fn commit_cleanup_failure_keeps_temp_name_for_drop_retry() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         let target = workspace.resolve_relative("notes.txt").await.unwrap();
         fs::write(&target, "base").await.unwrap();
 
-        // Both operations observe the same base snapshot and prepare before
-        // either one commits, reproducing two concurrent agent edits.
+        let mut prepared = workspace
+            .begin_mutation("edit.patch", "patch", "notes.txt")
+            .await
+            .unwrap()
+            .prepare(b"agent")
+            .await
+            .unwrap();
+        prepared.cleanup_failures_remaining = 1;
+        fs::write(&target, "external").await.unwrap();
+
+        let receipt = prepared.commit().await;
+        assert!(
+            matches!(receipt, EffectReceipt::Unknown { ref error }
+                if error.contains("stale_revision") && error.contains("recovery is required")),
+            "cleanup uncertainty must fence the operation for recovery: {receipt:?}"
+        );
+        assert_eq!(
+            staged_temp_count(dir.path()).await,
+            0,
+            "commit must leave the name armed so Drop can retry cleanup"
+        );
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "external");
+    }
+
+    #[tokio::test]
+    async fn staged_temp_name_is_fixed_and_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        fs::write(dir.path().join("descriptive-target-name.txt"), "before")
+            .await
+            .unwrap();
+
+        let prepared = workspace
+            .begin_mutation("fs.write", "write", "descriptive-target-name.txt")
+            .await
+            .unwrap()
+            .prepare(b"after")
+            .await
+            .unwrap();
+        let temp_name = prepared
+            .temp_name
+            .as_ref()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(temp_name, format!(".fa-{}.tmp", prepared.tx_id));
+        assert!(temp_name.starts_with(".fa-"));
+        assert!(temp_name.ends_with(".tmp"));
+        assert!(temp_name.len() <= 48, "unexpected temp name: {temp_name}");
+        assert!(!temp_name.contains("descriptive-target-name"));
+
+        prepared.rollback("test complete").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn commit_rehashes_the_open_staged_file_before_replace() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let target = dir.path().join("notes.txt");
+        fs::write(&target, "before").await.unwrap();
+
+        let mut prepared = workspace
+            .begin_mutation("edit.replace", "replace", "notes.txt")
+            .await
+            .unwrap()
+            .prepare(b"approved bytes")
+            .await
+            .unwrap();
+        let staged = prepared.temp_file.as_mut().unwrap();
+        staged.set_len(0).unwrap();
+        staged.seek(SeekFrom::Start(0)).unwrap();
+        staged.write_all(b"tampered bytes").unwrap();
+        staged.sync_all().unwrap();
+
+        let receipt = prepared.commit().await;
+        assert!(
+            matches!(receipt, EffectReceipt::NotApplied { ref error }
+                if error.contains("staged_integrity")),
+            "staged tampering must be rejected before replace: {receipt:?}"
+        );
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "before");
+        assert_eq!(staged_temp_count(dir.path()).await, 0);
+    }
+
+    #[tokio::test]
+    async fn post_replace_verification_never_reports_durable_for_wrong_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let target = dir.path().join("notes.txt");
+        fs::write(&target, "before").await.unwrap();
+
+        let mut prepared = workspace
+            .begin_mutation("fs.write", "write", "notes.txt")
+            .await
+            .unwrap()
+            .prepare(b"approved bytes")
+            .await
+            .unwrap();
+        prepared.post_replace_corruption = Some(b"wrong bytes".to_vec());
+
+        let receipt = prepared.commit().await;
+        assert!(
+            matches!(receipt, EffectReceipt::Unknown { ref error }
+                if error.contains("does not contain the staged bytes")),
+            "a mismatched committed target must require recovery: {receipt:?}"
+        );
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "wrong bytes");
+    }
+
+    #[tokio::test]
+    async fn rollback_journal_uncertainty_returns_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let target = dir.path().join("notes.txt");
+        fs::write(&target, "base").await.unwrap();
+
+        let prepared = workspace
+            .begin_mutation("edit.patch", "patch", "notes.txt")
+            .await
+            .unwrap()
+            .prepare(b"agent")
+            .await
+            .unwrap();
+        let journal = workspace.state_dir().join("changes.jsonl");
+        fs::remove_file(&journal).await.unwrap();
+        fs::create_dir(&journal).await.unwrap();
+        fs::write(&target, "external").await.unwrap();
+
+        let receipt = prepared.commit().await;
+        assert!(
+            matches!(receipt, EffectReceipt::Unknown { ref error }
+                if error.contains("rollback journal") && error.contains("recovery")),
+            "a missing rollback terminal must not report a settled non-application: {receipt:?}"
+        );
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "external");
+        assert_eq!(staged_temp_count(dir.path()).await, 0);
+        fs::remove_dir(&journal).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn substituted_unix_temp_name_is_never_renamed_or_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let target = dir.path().join("notes.txt");
+        fs::write(&target, "before").await.unwrap();
+
+        let prepared = workspace
+            .begin_mutation("fs.write", "write", "notes.txt")
+            .await
+            .unwrap()
+            .prepare(b"approved")
+            .await
+            .unwrap();
+        let temp_name = prepared.temp_name.as_ref().unwrap().clone();
+        let temp_path = dir.path().join(&temp_name);
+        let moved_path = dir.path().join("moved-stage");
+        fs::rename(&temp_path, &moved_path).await.unwrap();
+        fs::write(&temp_path, "substitute").await.unwrap();
+
+        let receipt = prepared.commit().await;
+        assert!(
+            matches!(receipt, EffectReceipt::Unknown { ref error }
+                if error.contains("staged") && error.contains("cleanup")),
+            "a substituted staging name must fence the operation: {receipt:?}"
+        );
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "before");
+        assert_eq!(fs::read_to_string(&temp_path).await.unwrap(), "substitute");
+        assert_eq!(fs::read_to_string(&moved_path).await.unwrap(), "approved");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_staged_handle_denies_shared_write_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        fs::write(dir.path().join("notes.txt"), "before")
+            .await
+            .unwrap();
+
+        let prepared = workspace
+            .begin_mutation("fs.write", "write", "notes.txt")
+            .await
+            .unwrap()
+            .prepare(b"approved")
+            .await
+            .unwrap();
+        let temp_path = dir.path().join(prepared.temp_name.as_ref().unwrap());
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&temp_path)
+                .is_err(),
+            "the live staging handle must deny another writer"
+        );
+        assert!(
+            std::fs::remove_file(&temp_path).is_err(),
+            "the live staging handle must deny path-based deletion"
+        );
+        prepared.rollback("test complete").await.unwrap();
+        assert!(!temp_path.exists());
+    }
+
+    #[tokio::test]
+    async fn same_path_mutations_wait_and_snapshot_the_committed_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let target = workspace.resolve_relative("notes.txt").await.unwrap();
+        fs::write(&target, "base").await.unwrap();
+
+        // The first prepared effect owns the path lease through settlement.
         let first = workspace
             .begin_mutation("edit.patch", "patch", "notes.txt")
             .await
@@ -1774,24 +2867,173 @@ mod tests {
             .prepare(b"first")
             .await
             .unwrap();
-        let second = workspace
-            .begin_mutation("edit.patch", "patch", "notes.txt")
-            .await
-            .unwrap()
-            .prepare(b"second")
-            .await
-            .unwrap();
+
+        let contender_workspace = workspace.clone();
+        let mut contender = tokio::spawn(async move {
+            let transaction = contender_workspace
+                .begin_mutation("edit.patch", "patch", "notes.txt")
+                .await
+                .unwrap();
+            let revision = transaction.before_revision().unwrap();
+            let prepared = transaction.prepare(b"second").await.unwrap();
+            (revision, prepared)
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut contender)
+                .await
+                .is_err(),
+            "a same-path contender must wait while the prepared winner is unsettled"
+        );
 
         assert!(matches!(
             first.commit().await,
             EffectReceipt::Applied { .. }
         ));
-        let receipt = second.commit().await;
-        assert!(
-            matches!(receipt, EffectReceipt::NotApplied { ref error } if error.contains("stale_revision")),
-            "the losing prepared edit must be a typed non-application: {receipt:?}"
+        let (second_revision, second) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), contender)
+                .await
+                .expect("the contender must resume after settlement")
+                .unwrap();
+        assert_eq!(
+            second_revision,
+            ContentDigest::sha256_bytes(b"first"),
+            "the resumed writer must snapshot the committed winner, not the old base"
         );
-        assert_eq!(fs::read_to_string(&target).await.unwrap(), "first");
+        assert!(matches!(
+            second.commit().await,
+            EffectReceipt::Applied { .. }
+        ));
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "second");
+    }
+
+    #[tokio::test]
+    async fn different_path_mutations_remain_parallel() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        fs::write(dir.path().join("a.txt"), "a").await.unwrap();
+        fs::write(dir.path().join("b.txt"), "b").await.unwrap();
+
+        let first = workspace
+            .begin_mutation("fs.write", "write", "a.txt")
+            .await
+            .unwrap()
+            .prepare(b"held")
+            .await
+            .unwrap();
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            workspace.begin_mutation("fs.write", "write", "b.txt"),
+        )
+        .await
+        .expect("an unrelated path must not wait on the first lease")
+        .unwrap();
+        second
+            .prepare(b"independent")
+            .await
+            .unwrap()
+            .rollback("test complete")
+            .await
+            .unwrap();
+        first.rollback("test complete").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reversed_batches_share_one_deadlock_free_lock_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        fs::write(dir.path().join("a.txt"), "a").await.unwrap();
+        fs::write(dir.path().join("b.txt"), "b").await.unwrap();
+
+        let first_paths = vec!["b.txt".to_string(), "a.txt".to_string()];
+        let first = workspace
+            .begin_existing_mutations("edit.patch", "patch", &first_paths, 1024)
+            .await
+            .unwrap();
+        let contender_workspace = workspace.clone();
+        let mut contender = tokio::spawn(async move {
+            let paths = vec!["a.txt".to_string(), "b.txt".to_string()];
+            contender_workspace
+                .begin_existing_mutations("edit.patch", "patch", &paths, 1024)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut contender)
+                .await
+                .is_err(),
+            "the reverse batch must wait rather than entering with a partial lease set"
+        );
+        drop(first);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), contender)
+            .await
+            .expect("sorted acquisition must resume without deadlock")
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.len(), 2);
+        drop(second);
+
+        // A later acquisition prunes expired Weak entries; the registry is
+        // bounded by active/waiting paths, not path history.
+        let paths = vec!["a.txt".to_string()];
+        let active = workspace
+            .begin_existing_mutations("edit.replace", "replace", &paths, 1024)
+            .await
+            .unwrap();
+        let registry_len = workspace
+            .mutation_locks
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert_eq!(registry_len, 1);
+        drop(active);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_partial_batch_releases_every_acquired_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        fs::write(dir.path().join("a.txt"), "a").await.unwrap();
+        fs::write(dir.path().join("b.txt"), "b").await.unwrap();
+
+        // Hold b so the sorted [a, b] batch can acquire a and then wait.
+        let held_b = workspace
+            .begin_mutation("fs.write", "write", "b.txt")
+            .await
+            .unwrap()
+            .prepare(b"held")
+            .await
+            .unwrap();
+        let batch_workspace = workspace.clone();
+        let batch = tokio::spawn(async move {
+            let paths = vec!["a.txt".to_string(), "b.txt".to_string()];
+            batch_workspace
+                .begin_existing_mutations("edit.patch", "patch", &paths, 1024)
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let contender_workspace = workspace.clone();
+        let mut a_contender = tokio::spawn(async move {
+            contender_workspace
+                .begin_mutation("fs.write", "write", "a.txt")
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut a_contender)
+                .await
+                .is_err(),
+            "the partial batch must already own a while it waits for b"
+        );
+
+        batch.abort();
+        assert!(matches!(batch.await, Err(error) if error.is_cancelled()));
+        let a_transaction = tokio::time::timeout(std::time::Duration::from_secs(1), a_contender)
+            .await
+            .expect("cancelling the batch must release its already-acquired a lease")
+            .unwrap()
+            .unwrap();
+        drop(a_transaction);
+        held_b.rollback("test complete").await.unwrap();
     }
 
     #[tokio::test]
@@ -1838,6 +3080,65 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
             .count();
         assert_eq!(temp_files, 0);
+    }
+
+    #[tokio::test]
+    async fn begin_mutation_rejects_an_oversized_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        fs::write(
+            dir.path().join("large.bin"),
+            vec![b'x'; MAX_MUTATION_BYTES + 1],
+        )
+        .await
+        .unwrap();
+
+        let result = workspace
+            .begin_mutation("fs.write", "write", "large.bin")
+            .await;
+        assert!(
+            matches!(result, Err(AgentError::InvalidRequest(message)) if message.contains("limited")),
+            "existing targets must be bounded before hashing"
+        );
+        assert!(!workspace.state_dir().join("changes.jsonl").exists());
+        assert_eq!(staged_temp_count(dir.path()).await, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn batch_mutation_preserves_existing_unix_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("script.sh");
+        fs::write(&target, "#!/bin/sh\nexit 0\n").await.unwrap();
+        fs::set_permissions(&target, std::fs::Permissions::from_mode(0o751))
+            .await
+            .unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let paths = vec!["script.sh".to_string()];
+        let snapshot = workspace
+            .begin_existing_mutations("edit.patch", "patch", &paths, 1024)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let (transaction, _) = snapshot.into_parts();
+
+        let receipt = transaction
+            .prepare(b"#!/bin/sh\nexit 1\n")
+            .await
+            .unwrap()
+            .commit()
+            .await;
+        assert!(matches!(
+            receipt,
+            EffectReceipt::Applied {
+                durability: EffectDurability::Durable,
+                ..
+            }
+        ));
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o7777, 0o751);
     }
 
     #[tokio::test]
@@ -1956,10 +3257,9 @@ mod tests {
             // Hold the link in place so a racing open can hit it.
             std::thread::sleep(std::time::Duration::from_millis(1));
             saw_link_at_d = true;
-            // Swap back: link out, real dir back at `d`. The victim may
-            // have recreated `d` (confined_parent creates missing parents),
-            // which makes the restore fail — the write still landed inside
-            // the workspace, which is what the test asserts.
+            // Swap back: link out, real dir back at `d`. A racing file
+            // mutation refuses the temporary missing-parent gap; it never
+            // recreates directory topology while the attacker restores it.
             if !(retry_rename(&d, &hold) && retry_rename(&real, &d) && retry_rename(&hold, &link)) {
                 return saw_link_at_d;
             }
@@ -1988,8 +3288,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confined_mutation_creates_missing_parents() {
+    async fn confined_mutation_refuses_missing_parent_before_any_evidence() {
         let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let result = workspace
+            .begin_mutation("fs.write", "write", "a/b/c.txt")
+            .await;
+        let error = match result {
+            Ok(_) => panic!("a file mutation must not create missing parent directories"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &error,
+                AgentError::InvalidRequest(message)
+                    if message.contains("mutation parent directory not found: a")
+                        && message.contains("existing parent directory")
+            ),
+            "unexpected missing-parent error: {error}"
+        );
+        assert!(
+            !dir.path().join("a").exists(),
+            "begin_mutation must leave missing directory topology untouched"
+        );
+        assert_eq!(
+            staged_temp_count(dir.path()).await,
+            0,
+            "begin_mutation must fail before creating a staged file"
+        );
+        assert!(
+            !workspace.state_dir().join("changes.jsonl").exists(),
+            "begin_mutation must fail before recording review evidence"
+        );
+        let authority = fs::metadata(
+            workspace
+                .state_dir()
+                .join("authority/workspace-effects.jsonl"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            authority.len(),
+            0,
+            "begin_mutation must fail before recording workspace authority evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn confined_mutation_creates_file_inside_existing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("a/b")).await.unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
         workspace
             .begin_mutation("fs.write", "write", "a/b/c.txt")

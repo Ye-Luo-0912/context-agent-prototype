@@ -31,13 +31,15 @@ fn usage() -> ! {
          forbidden (stale) facts leaked. The completion-quality proxy that\n\
          needs no model.\n\
          \n\
-         usage: agent-replay --recover <trace.jsonl>\n\
+         usage: agent-replay --recover <trace.jsonl> [--engine dynamic|append|rolling]\n\
          \n\
          Crash-recovery replay (CORE-02): re-read the trace to locate the\n\
          durability barrier (last committed TurnCompleted, any\n\
          TurnCommitFailed/RecoveryRequired), check the envelope sequence is\n\
          contiguous, and rebuild the context-engine state from the events —\n\
-         the state a recovery can trust after a failed turn commit.\n"
+         the state a recovery can trust after a failed turn commit. The\n\
+         engine kind must match the run that wrote the trace; traces do not\n\
+         record it.\n"
     );
     std::process::exit(2);
 }
@@ -81,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
             usage();
         };
         let mut config = ReplayConfig::default();
+        let mut engine_kind = agent_replay::ReplayEngineKind::Dynamic;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--system-prompt" => {
@@ -105,13 +108,27 @@ async fn main() -> anyhow::Result<()> {
                     let workspace = agent_workspace::Workspace::open(&value).await?;
                     config.artifact_workspace = Some(Arc::new(workspace));
                 }
+                "--engine" => {
+                    let Some(value) = args.next() else {
+                        usage();
+                    };
+                    engine_kind = match value.as_str() {
+                        "dynamic" => agent_replay::ReplayEngineKind::Dynamic,
+                        "append" => agent_replay::ReplayEngineKind::Append,
+                        "rolling" => agent_replay::ReplayEngineKind::Rolling,
+                        other => {
+                            eprintln!("unknown engine kind: {other}");
+                            usage();
+                        }
+                    };
+                }
                 other => {
                     eprintln!("unknown argument: {other}");
                     usage();
                 }
             }
         }
-        let report = recovery_replay_file(Path::new(&path), &config).await?;
+        let report = recovery_replay_file(Path::new(&path), &config, engine_kind).await?;
         print!("{}", render_recovery_report(&report));
         return Ok(());
     }

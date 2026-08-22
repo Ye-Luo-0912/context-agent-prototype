@@ -56,9 +56,11 @@ pub enum InputKind {
 /// `Received -> Interpreted -> Applied/Queued/Rejected -> Consumed -> Archived`。
 /// ingest 成功后发 `Applied`。周转中第一条额外对话记 `Queued`（内存 1 槽，
 /// 非崩溃耐久）；槽满或清理中记 `Rejected`。`/cancel` 在 `TurnCancelled`
-/// 屏障之后补 `InterruptCommitted`（不经 UserMessage 解释）。模型消费 ack
-/// 后发 `Consumed`，`TurnCompleted` 耐久屏障之后发 `Archived`（输入记录
-/// 终态，不是 context GC）。`Received` / `Interpreted` 未接线。
+/// 屏障之后补 `InterruptCommitted`（不经 UserMessage 解释）。回合在模型轮
+/// 开始前失败或被拒绝时，Runtime 也以 `InterruptCommitted` 结算 Applied
+/// 输入（故障路径同时有 `TurnCommitFailed` 审计），使其不悬停在中间态。
+/// 模型消费 ack 后发 `Consumed`，`TurnCompleted` 耐久屏障之后发 `Archived`
+/// （输入记录终态，不是 context GC）。`Received` / `Interpreted` 未接线。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputLifecycle {

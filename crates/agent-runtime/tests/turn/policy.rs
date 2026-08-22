@@ -200,8 +200,9 @@ impl Effect for TracingWriteEffect {
             evidence: Some("tx-1".into()),
         }
     }
-    async fn rollback(self: Box<Self>, _reason: &str) {
+    async fn rollback(self: Box<Self>, _reason: &str) -> AgentResult<()> {
         self.rolled_back.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 

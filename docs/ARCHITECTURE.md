@@ -259,8 +259,10 @@ Two contracts must remain distinct:
    operation, generation and lease identity. Core validates run identity, its
    issued lease and its independently owned authority epoch; Runtime can only
    advance the epoch through compare-and-swap. Composition injects both the
-   persistent authority journal and the builtin workspace reconciler. Core can
-   recover exact workspace mutation truth. RuntimeCheckpoint v4 now carries a
+   persistent authority journal and the builtin workspace reconciler. Core
+   reconciles recorded managed mutations and fails closed on ambiguous state;
+   the preparation-order/hash limits documented under Mutation transactions
+   prevent claiming universal or cryptographic recovery truth. RuntimeCheckpoint v4 now carries a
    stable journal-lineage/generation/prefix/digest marker, validates it before
    restore mutation, and only advances the live epoch; it never embeds or
    rewinds operation truth. Typed operation query/cancel DTOs and the
@@ -630,8 +632,10 @@ and since V1-P0-5 it is a confinement boundary, not a path joiner:
   state directory (`.focus-agent/` — traces, checkpoints, artifacts,
   change journal); mutating tools (`fs.write`, `edit.replace`) resolve
   through it, so ordinary coding tools cannot overwrite runtime state.
-  `confined_parent` mirrors the same rejection while descending through
-  the pinned handle chain.
+  File mutations open only an already-existing parent through the confined
+  handle chain; they never create directory topology before effect authority.
+  Creating directories requires a future separately authorized/recoverable
+  effect rather than being hidden inside a file write.
 - Read tools (`fs.list`/`fs.read`/`search.grep`) use `resolve_relative`
   and can still read artifacts; `fs.read`/`edit.replace` read through the
   pinned handle, so their size checks and content reads describe the same
@@ -639,13 +643,18 @@ and since V1-P0-5 it is a confinement boundary, not a path joiner:
 
 ### Mutation transactions
 
-Since V1-P0-6 every file mutation is a `MutationTransaction` produced by
-`Workspace::begin_mutation`:
+Since V1-P0-6 every file mutation is a `MutationTransaction`. Existing-file
+edit batches enter through `Workspace::begin_existing_mutations`; create or
+replace paths use `Workspace::begin_mutation`. Both require the parent
+directory to exist; only the final file may be newly created:
 
 ```text
-resolve_mutation → confined parent handle → capture old content (bounded)
-→ stage temp file under the pinned handle → record change journal →
-handle-relative atomic replace
+resolve + canonical ordered leases → pinned bounded snapshot
+→ synced authority v2 Prepared (Core-managed) → exclusive short sibling temp
+→ stage sync → review Prepared
+→ target-revision and staged-identity/length/SHA checks
+→ handle-relative atomic replace → installed-byte checks + authority ack
+→ review terminal + final installed-byte check
 ```
 
 Since CORE-07 the staging and the swap are relative to the pinned parent
@@ -654,40 +663,83 @@ directory handle — `renameat` on Unix,
 `RootDirectory` on Windows — so neither the staged file nor the final
 replace can be redirected by a path swap.
 
-The journal entry lands *before* the swap, so a journal failure never
-leaves the target half-mutated (a retrying agent cannot double-apply an
-already-landed mutation); any failure removes the temp file and leaves
-the target untouched. `fs.write` and `edit.replace` both use it —
-`fs.write` now journals every write instead of bypassing the change
-journal.
+For Core-managed writes the synced authority v2 `Prepared` intent lands
+*before the staged entry is created*, so every temp that can survive a crash
+already has its deterministic name, target, byte lengths, SHA-256 revisions,
+and operation identity recorded. Failure to record intent therefore creates
+no temp and cannot mutate the target. The context-free `prepare` entry is only
+for trusted tests/maintenance and is explicitly not crash-recoverable. Before
+replace, commit reopens the target through the pinned parent and compares its
+exact revision, then verifies that the staged open handle still has the
+expected bounded length/SHA. Unix also
+checks that the sibling name still identifies that handle's device/inode
+immediately before its name-based rename. Windows instead creates the staging
+handle with shared read only and renames that handle itself, denying competing
+shared write/delete access. A pre-replace refusal removes the temp and records
+rollback; cleanup or rollback-journal uncertainty is `Unknown`, not a false
+`NotApplied`. `fs.write`, `edit.replace`, and `edit.patch` use this path.
 
-Since V1-M9 the journal is tri-state so recovery can tell what actually
-happened:
+On Unix the staged file receives the original mode bits before replace. On
+Windows the replacement's readonly permission is restored after replace;
+this does not preserve the complete ACL, alternate streams, hidden/system
+attributes, or timestamps. After a successful replace the runtime validates
+the installed entry against the retained open handle and staged length/SHA,
+syncs the parent, records the synced authority acknowledgement and flushed
+review terminal, then validates again before returning `Durable`. A mismatch
+immediately after replace is
+`Unknown`; drift before the final acknowledgement is
+`Applied + DurabilityFailed`.
+
+Two journals serve different purposes. `.focus-agent/changes.jsonl` is the
+serialized review/revert log. Its records are individually bounded and each
+complete line is `write_all` + `flush`, but the file is not `sync_all`'d or
+size-capped. Its normal transaction shape is:
 
 ```text
 MutationPrepared { tx_id, target, before_hash, after_hash }
         │
         ├─ atomic rename ok → MutationCommitted { tx_id }
-        └─ rename failed / stale operation → MutationRolledBack { tx_id }
+        └─ pre-replace refusal + successful cleanup/log
+                                      → MutationRolledBack { tx_id }
 ```
 
-`before_hash`/`after_hash` are content hashes captured at prepare time,
-so a later recovery pass can distinguish "prepared but never committed"
-(no rename landed) from "committed" (the target now carries
-`after_hash`). The single-record variant that claimed a mutation without
-proof is gone: a rename failure now rolls the transaction back instead of
-leaving the journal describing a mutation that never landed.
+`.focus-agent/authority/workspace-effects.jsonl` is the distinct authority
+journal: exclusive/pinned, framed and SHA-256-checksummed, `sync_all`'d, and
+bounded. New v2 `Prepared` records store the deterministic staged name,
+operation evidence, before/after byte lengths, and SHA-256 revisions needed
+for startup reconciliation. Real v1 frames remain read-compatible with their
+legacy FNV-1a-64 before/after hashes, but both versions now use 4 MiB-per-file
+and aggregate reconciliation read bounds.
 
-Commit failures are structured, because "the file did not change" and
+Reconciliation opens target and stage through confined handles. It deletes a
+stage only after proving regular-file type, complete expected bytes, and that
+the name still identifies the opened object before and after hashing; missing
+stage after a pre-allocation intent is safely `NotApplied`, while partial,
+substituted, colliding, or otherwise unprovable content is retained and
+reported `Ambiguous`. Authority `Committed` precedes review `Committed`, so a
+crash between them can still leave review history at `Prepared`; the authority
+journal, not the review log, governs recovery truth. `Effect::rollback`
+returns `AgentResult<()>`: success confirms owned
+preparations were cleaned and their required rollback terminals landed;
+cleanup/journal failure is bounded `RecoveryRequired`. Composite and staged
+rollback try every child in reverse order, Core installs its mutation recovery
+fence on any unconfirmed settlement, and Runtime distinguishes
+`not_applied_cleanup_recovery_required` from
+`execution_cleanup_recovery_required` rather than emitting a plain rejection
+or preserving proposed revisions as applied facts.
+
+Commit results are structured, because "the file did not change" and
 "the file changed but I could not record it" need different recovery:
-`EffectCommitError::NotApplied` (rename never landed — target intact) vs
-`EffectCommitError::AppliedButDurabilityFailed` (the swap landed but the
-`MutationCommitted` record could not be appended — the runtime must treat
-this as a degraded state needing recovery, never report "no change" to
-the model). The swap itself goes through `agent-workspace`'s
-`atomic_replace(src, dst)` primitive — a true atomic-overwrite on both
-platforms (Unix `rename`, Windows `MoveFileExW` with replace + write
-through), never a remove-then-rename that breaks atomicity.
+`EffectReceipt::NotApplied` (rename never landed — target intact),
+`EffectReceipt::Applied { durability: Durable | DurabilityFailed }`, and
+`EffectReceipt::Unknown` (terminal applied/cleanup state cannot be proved). A swap that
+lands but whose `MutationCommitted` record cannot be appended is
+`Applied + DurabilityFailed`; Runtime requires recovery and never reports
+"no change" to the model. The swap itself goes through the pinned-parent
+`replace_file` primitive — Unix `renameat`, or Windows
+`NtSetInformationFile(FileRenameInformation)` on the staging handle with
+`ReplaceIfExists` and the parent as `RootDirectory`. It never uses a
+remove-then-rename sequence that would break per-file replacement atomicity.
 
 
 ### Tool lifecycle (V1-P6)
@@ -999,40 +1051,76 @@ Ordinary `fs.list` / `fs.read` / search / code-navigation calls hide
 `artifact.read` and VCS through `git.*`. Missing paths return a bounded
 parent/topology hint without inventing manifests.
 
-`fs.read` reports the SHA-256 revision of the exact raw bytes plus
-`line_ending = none | lf | crlf | mixed`. `edit.replace` accepts that
-revision as `base_revision`; `edit.patch` is the revision-aware multi-hunk
-form and the single canonical mutation. Refusals distinguish
+`fs.read` starts model content with a JSON-quoted path, the SHA-256 revision
+of the exact raw bytes, and `line_ending = none | lf | crlf | mixed`; a mixed
+window also carries a bounded `C/L/N` physical-EOL token map. Its displayed
+body remains a numbered logical view capped at 400 lines. The full UTF-8 read
+and revision lookup share the 4 MiB mutation ceiling and use a `MAX + 1`
+bounded growth probe, so every admitted canonical edit target can first yield
+a revision without creating an unbounded ingest path. `edit.patch` is the single canonical
+mutation visible to the model: root `files[]`, with required `path`, a
+`base_revision` copied from `fs.read`, and nonempty `hunks` per entry (at most 16 files
+and 64 hunks total). The runtime still parses the old top-level single-file
+shortcut for compatibility, but does not advertise it; a top-level revision
+cannot be silently spread across multiple files. `edit.replace` remains
+catalog-only and also accepts a revision. Refusals distinguish
 `stale_revision`, `no_exact_match` and `ambiguous_match` and return the
 current revision plus at most three candidate regions.
 
-The matching contract is **exact after declared EOL adaptation**, never
-fuzzy. For a uniformly LF or CRLF target, model-provided `old`/`new` line
-breaks are adapted to the target style; every other byte (including spaces,
-indentation and case) must match exactly, and the written region retains the
-file's style. Mixed/legacy EOL files remain byte-exact rather than guessed.
-Matching streams positions in constant auxiliary memory; output length is
-projected before allocation and both the tool and `agent-workspace`
-enforce the 4 MiB mutation ceiling.
+Production `edit.patch` validates that `base_revision` equals the transaction
+snapshot SHA-256; it does not retain a per-run read ledger proving that the
+string came from the latest `fs.read`. The v3 Tool Surface gate verifies that
+provenance from the trace as evaluation evidence. The compatibility parser
+also still accepts the legacy top-level form and a missing revision; this is a
+wire-compatibility boundary, not a second model-visible schema.
 
-`edit.patch` resolves and rejects duplicate target aliases, reads and
-transforms every file, and validates every hunk before staging any one of
-them. It then verifies that each transaction's captured SHA-256 still equals
-the transformed snapshot. A prepared mutation re-hashes the current target
-immediately before replace; drift returns `NotApplied` with
-`stale_revision` instead of overwriting the winner. Each replace remains
-per-file atomic. A multi-file effect still commits sequentially — it is not
-a cross-file transaction — and a later conflict/failure truthfully reports
-already-applied files as recovery work.
+The matching contract is **newline-token exact**, never fuzzy. LF and CRLF
+are the only two physical encodings admitted for one logical newline token;
+lone CR and every other byte (including spaces, indentation, case and Unicode)
+must match exactly. Uniform targets keep their global style. For a mixed
+target, a canonical LF view authorizes only the logical exact raw span, then
+`new` newline j inherits physical style j from that span; extras inherit its
+last style or a deterministic local neighbor. Multiple logical occurrences
+remain ambiguous unless `occurrence` / `replace_all` is explicit. Ordinary
+occurrence matching streams positions in constant auxiliary memory; the
+mixed-EOL canonical view is bounded by the 4 MiB file cap, replace-all maps
+offsets monotonically without collecting matches, output length is computed
+before allocation, and both the tool and `agent-workspace` enforce the same
+4 MiB result ceiling.
+
+`Workspace::begin_existing_mutations` resolves and rejects duplicate target
+aliases, sorts canonical path keys, acquires the whole batch of in-process
+leases in that one order, and only then reads one pinned, bounded snapshot per
+file. The same scan supplies the bytes transformed by `edit.replace` /
+`edit.patch`, the SHA-256 revision, recovery hash, and bounded old-content
+capture; the transaction retains the shared lease group through final
+commit, rollback, or drop. Thus clones of the same `Workspace` writing one path queue and
+re-snapshot the settled winner, reverse-order batches cannot deadlock, and
+unrelated paths remain parallel. A prepared mutation still re-hashes the
+current target immediately before replace; drift from writers outside this
+in-process lease (direct or authority-bypassing filesystem access) settles as
+`NotApplied` with `stale_revision` when visible. A second official
+`Workspace::open` on the same root is refused by the exclusive authority-log
+lock. Hash→rename is still not an atomic filesystem CAS against bypassing
+writers. Each replace remains
+per-file atomic. A multi-file effect still commits sequentially — it is not a
+cross-file transaction — and a later conflict/failure truthfully reports that
+recovery is required after any earlier application. Change-journal appends
+are serialized per shared `Workspace`. Once the short append lock is held,
+one bounded synchronous `write_all(record + newline)` has no async suspension
+point, so task cancellation and parallel different-path transactions cannot
+splice partial JSON records together.
 
 Both edit success paths carry the new revision plus a bounded after-edit
 echo: a line-numbered window of the changed region in the *updated* bytes
-(±3 context lines, 120-char per-line clip). `edit.patch` applies one hard
-1200-character cap to the combined multi-file echo, including its
-truncation marker, so adding files cannot multiply the bound. This can
-remove a confirm `fs.read` round while remaining transient observation text
-— superseded by the next same-path echo and compacted with the exchange,
-never a residency commitment.
+(±3 context lines, 120-char per-line clip). Before that optional preview,
+`edit.patch` emits a complete `index:revision` manifest in submitted-file
+order; at most 16 SHA-256 values keep it bounded and no later revision can be
+lost to preview truncation. One hard 1200-character cap applies to the
+combined multi-file echo, including its truncation marker, so adding files
+cannot multiply the preview bound. This can remove a confirm `fs.read` round
+while remaining transient observation text — superseded by the next
+same-path echo and compacted with the exchange, never a residency commitment.
 
 Trusted tool results are projected at the Core output boundary. Producers may
 pass a typed class as a top-level hint; they cannot author `metadata._runtime`.
@@ -1135,11 +1223,11 @@ log incrementally to an artifact via `Workspace::create_artifact`.
 ### Workspace change journal
 
 Mutating tools record a `WorkspaceChange`
-(tool/path/action/byte sizes/old content when ≤ 256 KB) to
+(tool/path/action/byte sizes/old UTF-8 content when ≤ 256 KiB) to
 `.focus-agent/changes.jsonl` via `Workspace::record_change`. The journal is the
-review/revert substrate for the "mutating actions are visible and
-reversible/reviewable" acceptance criterion, without putting raw file content
-into context.
+review substrate; only entries with captured old content are directly
+revertible from this log. It is separate from the durable authority journal
+and does not put raw file content into context.
 
 ## 8. UI model
 
@@ -1268,10 +1356,12 @@ RuntimeHandle ── mpsc<RuntimeCommand> ──▶ RuntimeActor (owns mutable s
   `agent-workspace`'s `PreparedMutation` with its journal
   transaction). The actor checks its epoch mirror *between* the two phases and
   Core independently checks its authority epoch before
-  effect commit — a stale tool operation has its prepared effect rolled back
-  (temp file removed, `MutationRolledBack` journaled) instead of
-  committed, so an external side effect cannot slip through the fence
-  that protects model state;
+  effect commit — a stale tool operation requests rollback instead of commit,
+  so a prepared external side effect cannot deliberately cross the fence that
+  protects model state. Rollback returns a typed result: success means cleanup
+  and the required terminal journals were confirmed; failure fences Core,
+  publishes bounded recovery-required diagnostics, and cannot be mislabeled
+  as a successful rejection;
 - `CoreAuthority` is now a private, turn-stateless authority implementation
   behind the landed `CorePort`. Context/tool references needed to implement
   that port remain inside Core, while scheduling lives in `RuntimeServices`.
@@ -1879,10 +1969,12 @@ extra scoring coefficient:
   task_table`, `failed_clear_focus_never_mutates_the_task_table`);
   checkpoint → restore reproduces task ids, scopes and the current task
   with the engine focus aligned to the restored task;
-- stale `PreparedEffect` → target unchanged, staged temp deleted,
-  `MutationRolledBack` journaled; a landed rename whose journal record
-  fails is reported `AppliedButDurabilityFailed`, never "nothing
-  happened";
+- stale `PreparedEffect` normal-path test → target unchanged, staged temp
+  deleted, `MutationRolledBack` journaled; injected cleanup, child-composite,
+  review-terminal and Core operation-terminal faults return bounded recovery
+  errors and fence later mutation. A landed rename whose journal record
+  fails is reported `Applied + DurabilityFailed`, never "nothing
+  happened"; every non-durable settlement strips proposed revisions;
 - a `ContextAction` directive takes effect before the next model round
   (asserted on a shared activity timeline), not just at turn end;
 - process-capability cancellation terminates the child (a heartbeat file

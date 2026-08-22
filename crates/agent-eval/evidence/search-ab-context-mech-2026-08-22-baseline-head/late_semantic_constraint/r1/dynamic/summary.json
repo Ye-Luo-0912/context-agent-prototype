@@ -1,0 +1,175 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "outcome": "passed",
+  "error": null,
+  "passed": true,
+  "wall_ms": 362765,
+  "seq_contiguous": true,
+  "seq_gap": null,
+  "broadcast_lagged": 0,
+  "model_deltas_omitted": 2560,
+  "model_started": 57,
+  "model_used": 57,
+  "usage_incomplete": false,
+  "provider_tokens_lower_bound": false,
+  "workspace_sha256": "7ec4a5022d2883d01191e2a9cd654d9ac306ab41144d0c7f028231092477394e",
+  "workspace_files": 31,
+  "tools": [
+    {
+      "name": "artifact.read",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "capability.manage",
+      "calls": 25,
+      "failed": 1
+    },
+    {
+      "name": "context.manage",
+      "calls": 2,
+      "failed": 0
+    },
+    {
+      "name": "edit.patch",
+      "calls": 1,
+      "failed": 0
+    },
+    {
+      "name": "edit.replace",
+      "calls": 5,
+      "failed": 2
+    },
+    {
+      "name": "fs.list",
+      "calls": 7,
+      "failed": 0
+    },
+    {
+      "name": "fs.read",
+      "calls": 16,
+      "failed": 5
+    },
+    {
+      "name": "git.diff",
+      "calls": 5,
+      "failed": 0
+    },
+    {
+      "name": "git.status",
+      "calls": 3,
+      "failed": 0
+    },
+    {
+      "name": "process.run",
+      "calls": 5,
+      "failed": 3
+    },
+    {
+      "name": "search.grep",
+      "calls": 4,
+      "failed": 0
+    },
+    {
+      "name": "shell.exec",
+      "calls": 7,
+      "failed": 1
+    }
+  ],
+  "metrics": {
+    "access_admits": 0,
+    "access_consumption_acks": 0,
+    "access_fetches": 1,
+    "access_inspects": 0,
+    "access_search_hits": 0,
+    "admit_calls": 0,
+    "compaction_input_tokens": 0,
+    "compaction_output_tokens": 0,
+    "failed_tool_outputs": 12,
+    "fetch_calls": 1,
+    "final_resident_bytes": 1885,
+    "forgotten_items": 76,
+    "inspect_calls": 3,
+    "lifecycle_transitions": 138,
+    "materialize_rounds": 57,
+    "model_attempts": 57,
+    "model_input_tokens": 518711,
+    "model_output_tokens": 11214,
+    "model_retries": 0,
+    "peak_resident_bytes": 2079,
+    "prompt_current_focus_tokens": 2614,
+    "prompt_historical_context_tokens": 22981,
+    "prompt_runtime_facts_tokens": 1539,
+    "prompt_system_tokens": 4047,
+    "prompt_task_anchor_tokens": 1482,
+    "prompt_task_progress_tokens": 6466,
+    "prompt_tool_catalog_index_tokens": 11419,
+    "prompt_tool_schema_tokens": 49923,
+    "prompt_turn_frame_tokens": 125247,
+    "provider_tokens_lower_bound": false,
+    "provider_tokens_total": 529925,
+    "reactivated_tokens": 0,
+    "reactivation_consumed": 0,
+    "reactivation_consumed_tokens": 0,
+    "reactivation_events": 0,
+    "reactivation_file_observation_consumed": 0,
+    "reactivation_file_observation_selected": 0,
+    "reactivation_selected": 0,
+    "reactivation_selected_tokens": 0,
+    "reactivation_tool_observation_consumed": 0,
+    "reactivation_tool_observation_selected": 0,
+    "recovered_items": 1,
+    "recovery_auto_reactivation": 0,
+    "recovery_explicit_search": 1,
+    "recovery_failed": 75,
+    "recovery_workspace_reread": 10,
+    "repeated_fs_reads": 10,
+    "reread_external_descriptor": 0,
+    "reread_first_read": 6,
+    "reread_motive_body_visible_current": 0,
+    "reread_motive_changed": 0,
+    "reread_motive_checked_fresh": 0,
+    "reread_motive_descriptor_only": 7,
+    "reread_motive_first": 6,
+    "reread_motive_needs_revalidation": 3,
+    "reread_motive_stored": 0,
+    "reread_motive_warm": 0,
+    "reread_previously_selected": 0,
+    "reread_resident_unselected": 0,
+    "reread_selected_descriptor": 10,
+    "reread_stored": 0,
+    "reread_warm": 0,
+    "rounds": 57,
+    "schema_tokens_total": 49923,
+    "search_calls": 5,
+    "search_empty": 3,
+    "search_hits": 8,
+    "search_ms_p50": 2,
+    "search_ms_p95": 2,
+    "selected_tokens_by_kind": {
+      "assistant_message": 8734,
+      "tool_observation": 5512,
+      "user_message": 1188
+    },
+    "selected_tokens_by_reason": {
+      "latest_file_body": 5512,
+      "scored": 9922
+    },
+    "selected_tokens_by_source": {
+      "assistant": 8734,
+      "tool:fs.read": 5512,
+      "user": 1188
+    },
+    "selected_tokens_reactivated": 0,
+    "selected_tokens_resident": 15434,
+    "tool_calls": 81,
+    "tool_failure_classes": {
+      "invalid_request": 1,
+      "path_not_found": 8,
+      "stale_revision": 2,
+      "timeout": 1
+    },
+    "turns": 5,
+    "unique_reactivated": 0
+  }
+}

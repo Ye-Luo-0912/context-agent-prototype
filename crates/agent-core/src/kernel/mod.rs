@@ -262,9 +262,10 @@ impl CoreAuthority {
         self.ensure_mutation_allowed()?;
         let current = self.current_authority_epoch();
         if current != expected_epoch {
-            return Err(AgentError::InvalidRequest(format!(
-                "operation epoch {expected_epoch} is stale; current Core epoch is {current}"
-            )));
+            return Err(AgentError::StaleEpoch {
+                expected: expected_epoch,
+                current,
+            });
         }
         self.operations
             .finish_value(operation_id, argument_digest, expected_epoch)
@@ -343,9 +344,10 @@ impl CoreAuthority {
         self.ensure_mutation_allowed()?;
         let current = self.current_authority_epoch();
         if current != expected_epoch {
-            return Err(AgentError::InvalidRequest(format!(
-                "operation epoch {expected_epoch} is stale; current Core epoch is {current}"
-            )));
+            return Err(AgentError::StaleEpoch {
+                expected: expected_epoch,
+                current,
+            });
         }
         self.begin_operation_commit(operation_id, effect_id, argument_digest)
     }
@@ -360,9 +362,10 @@ impl CoreAuthority {
         self.ensure_mutation_allowed()?;
         let current = self.current_authority_epoch();
         if current != expected_epoch {
-            return Err(AgentError::InvalidRequest(format!(
-                "operation epoch {expected_epoch} is stale; current Core epoch is {current}"
-            )));
+            return Err(AgentError::StaleEpoch {
+                expected: expected_epoch,
+                current,
+            });
         }
         self.operations.mark_executing(operation_id, effect_id)
     }
@@ -374,6 +377,14 @@ impl CoreAuthority {
     ) -> AgentResult<()> {
         self.ensure_mutation_allowed()?;
         self.operations.finish_effect(operation_id, receipt)
+    }
+
+    /// Install Core's fail-closed mutation fence when an in-process effect
+    /// cannot prove rollback settlement. Runtime still decides *when* to
+    /// roll back; Core owns the authority fact that no later mutation may
+    /// commit on top of unresolved preparation state.
+    pub(crate) fn require_operation_recovery(&self, reason: impl AsRef<str>) {
+        self.operations.require_recovery(reason);
     }
 
     pub(crate) fn abort_prepared_operation(
@@ -906,6 +917,7 @@ impl CoreAuthority {
             effect_id: None,
             argument_digest,
             value_completion_pending: false,
+            recovery_required: None,
         };
         if let Err(error) = self.ensure_mutation_allowed() {
             return refused(ToolOutcome::Value(tool_error_output(
@@ -1121,9 +1133,24 @@ impl CoreAuthority {
                 format!("tool dispatch rejected: {error}"),
             )));
         }
-        let outcome = match self.tools.execute(request).await {
-            Ok(outcome) => outcome,
-            Err(error) => ToolOutcome::Value(tool_error_output(&call, error.to_string())),
+        let (outcome, mut recovery_required) = match self.tools.execute(request).await {
+            Ok(outcome) => (outcome, None),
+            Err(error @ AgentError::RecoveryRequired(_)) => {
+                let message = bound_utf8(
+                    &error.to_string(),
+                    agent_contracts::MAX_OPERATION_DIAGNOSTIC_BYTES,
+                )
+                .to_string();
+                self.operations.require_recovery(&message);
+                (
+                    ToolOutcome::Value(tool_error_output(&call, message.clone())),
+                    Some(message),
+                )
+            }
+            Err(error) => (
+                ToolOutcome::Value(tool_error_output(&call, error.to_string())),
+                None,
+            ),
         };
 
         let (outcome, effect_id, value_completion_pending) = match outcome {
@@ -1146,10 +1173,30 @@ impl CoreAuthority {
                         false,
                     ),
                     Err(error) => {
-                        effect
-                            .rollback(&format!("operation registry rejected preparation: {error}"))
+                        let rollback = self
+                            .effect
+                            .rollback(
+                                effect,
+                                &format!("operation registry rejected preparation: {error}"),
+                            )
                             .await;
-                        let _ = self.operations.cancel(identity.clone());
+                        let terminal = if rollback.is_ok() {
+                            self.operations.cancel(identity.clone())
+                        } else {
+                            Ok(())
+                        };
+                        if let Err(cleanup_error) = rollback.and(terminal) {
+                            let message = bound_utf8(
+                                &format!(
+                                    "operation {} preparation rollback could not be confirmed: {cleanup_error}",
+                                    identity.operation_id
+                                ),
+                                agent_contracts::MAX_OPERATION_DIAGNOSTIC_BYTES,
+                            )
+                            .to_string();
+                            self.operations.require_recovery(&message);
+                            recovery_required = Some(message);
+                        }
                         (
                             ToolOutcome::Value(tool_error_output(&call, error.to_string())),
                             None,
@@ -1192,6 +1239,7 @@ impl CoreAuthority {
             effect_id,
             argument_digest,
             value_completion_pending,
+            recovery_required,
         }
     }
 
@@ -1214,6 +1262,7 @@ impl CoreAuthority {
             effect_id: None,
             argument_digest,
             value_completion_pending: false,
+            recovery_required: None,
         };
         match self.admit_tool_operation(identity, &call, generation) {
             Ok(crate::port::ToolOperationAdmission::Accepted { permit, .. }) => {

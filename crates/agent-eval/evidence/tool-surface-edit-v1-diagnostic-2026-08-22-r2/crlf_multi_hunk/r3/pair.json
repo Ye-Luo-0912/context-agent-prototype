@@ -1,0 +1,22 @@
+{
+  "analysis_schema": "agent-eval.tool-edit.v1",
+  "arm_order": [
+    "production"
+  ],
+  "cells": [
+    {
+      "dir": "production",
+      "engine": "production"
+    }
+  ],
+  "context_engine": "dynamic",
+  "fixture_id": "crlf_multi_hunk",
+  "live": true,
+  "pack_digest": "ff115343761fd64b5d9d83a78e2be862abc8b89b9a2e4bfb8a579c3ede158aa4",
+  "repeat": 3,
+  "repeats": 3,
+  "schema": "agent-eval.pair.v1",
+  "spec_sha256": "6bf1f0d340b45125d90e14667f544d78923897d1c8bba525b829238057363322",
+  "surface": "production-default",
+  "task_sha256": "7c88de08fe5344fba5c402efe4e207c5d3751cd3ff050fd9dcc7a5b70824cf15"
+}

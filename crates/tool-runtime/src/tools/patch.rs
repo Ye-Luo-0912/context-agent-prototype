@@ -1,34 +1,83 @@
 //! `edit.patch` — multi-hunk, revision-checked text patching.
 //!
-//! The file-revision companion to `edit.replace` (TOOLS-05): one call
-//! applies several exact-match hunks to one workspace file, optionally
-//! gated on a `base_revision` the model captured from `fs.read`. When the
-//! revision is given, the file must still be exactly that revision, so an
-//! edit based on stale content is refused instead of silently applied to
-//! drifted text. Like `edit.replace`, the new content is staged as a
-//! prepared effect and journaled; the runtime commits it behind the
-//! generation fence.
+//! The file-revision companion to `edit.replace` (TOOLS-05): the canonical
+//! model-visible shape applies exact-match hunks through one `files[]` batch,
+//! including a path and `fs.read` revision for every entry. The parser keeps
+//! the older top-level single-file shortcut for wire compatibility, but does
+//! not advertise two competing shapes to the model. When a revision is
+//! given, the file must still be exactly that revision, so an edit based on
+//! stale content is refused instead of silently applying to drifted text.
+//! Like `edit.replace`, the new content is staged as a prepared effect and
+//! journaled; the runtime commits it behind the generation fence.
 
 use agent_contracts::{
     AgentError, AgentResult, CancellationToken, Effect, RunId, ToolFailureClass, ToolOutcome,
     ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec, tool_failure_output,
 };
-use agent_workspace::{MAX_MUTATION_BYTES, Workspace};
+use agent_workspace::{MAX_MUTATION_BYTES, MutationTransaction, Workspace};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashSet;
 
 use super::{
-    EDIT_ECHO_MAX_CHARS, ExactMatchError, LineEnding, Tool, bound_chars_with_marker,
-    candidate_regions, content_digest, edit_echo, exact_match, hidden_path_output,
-    is_not_found_error, missing_path_output, normalize_edit_line_endings, ordinary_view_blocked,
-    projected_replacement_len,
+    EDIT_ECHO_MAX_CHARS, ExactMatchError, LineEnding, Tool, adapt_edit_replacement,
+    bound_chars_with_marker, candidate_regions, content_digest, edit_echo, exact_edit_match,
+    hidden_path_output, is_not_found_error, missing_path_output, model_json_string,
+    normalize_edit_line_endings, ordinary_view_blocked, projected_replacement_len,
 };
 
 const MAX_FILE_BYTES: usize = MAX_MUTATION_BYTES;
 const MAX_HUNKS: usize = 64;
 const MAX_FILES: usize = 16;
+
+async fn rollback_staged_effects(effects: Vec<Box<dyn Effect>>, reason: &str) -> AgentResult<()> {
+    // Roll back in reverse staging order. This is not required for file
+    // correctness, but mirrors stack unwinding and keeps journal inspection
+    // intuitive when a later file fails to prepare.
+    let mut detail = String::new();
+    let mut failed = 0usize;
+    for effect in effects.into_iter().rev() {
+        if let Err(error) = effect.rollback(reason).await {
+            failed = failed.saturating_add(1);
+            append_bounded_rollback_detail(&mut detail, &error.to_string());
+        }
+    }
+    if failed == 0 {
+        Ok(())
+    } else {
+        let message = format!("{failed} staged edit rollback(s) could not be confirmed: {detail}");
+        Err(AgentError::RecoveryRequired(bound_diagnostic(&message)))
+    }
+}
+
+fn append_bounded_rollback_detail(target: &mut String, detail: &str) {
+    let limit = agent_contracts::MAX_OPERATION_DIAGNOSTIC_BYTES;
+    if target.len() >= limit {
+        return;
+    }
+    if !target.is_empty() {
+        if target.len().saturating_add(2) > limit {
+            return;
+        }
+        target.push_str("; ");
+    }
+    let remaining = limit.saturating_sub(target.len());
+    let mut end = detail.len().min(remaining);
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    target.push_str(&detail[..end]);
+}
+
+fn bound_diagnostic(message: &str) -> String {
+    let mut end = message
+        .len()
+        .min(agent_contracts::MAX_OPERATION_DIAGNOSTIC_BYTES);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message[..end].to_string()
+}
 
 pub struct EditPatchTool {
     workspace: Workspace,
@@ -80,23 +129,65 @@ struct Hunk {
     occurrence: Option<usize>,
 }
 
+/// Resolve the two wire shapes without silently dropping revision intent.
+/// Models commonly combine a one-entry `files[]` with the top-level
+/// `base_revision` shown beside the shortcut fields. Binding that value is
+/// safe for exactly one file; for a multi-file call it would be ambiguous.
+fn resolved_files(args: &PatchArgs) -> AgentResult<Vec<FilePatch>> {
+    match (&args.files, &args.path) {
+        (files, None) if !files.is_empty() => {
+            if !args.hunks.is_empty() {
+                return Err(AgentError::InvalidRequest(
+                    "edit.patch: top-level `hunks` cannot be combined with `files`".into(),
+                ));
+            }
+            if files.len() > 1 && args.base_revision.is_some() {
+                return Err(AgentError::InvalidRequest(
+                    "edit.patch: top-level `base_revision` is ambiguous for multiple files; pass one revision per files[] entry".into(),
+                ));
+            }
+            let mut files = files.clone();
+            if let Some(top_revision) = args.base_revision.as_ref() {
+                let file = &mut files[0];
+                match file.base_revision.as_ref() {
+                    Some(file_revision) if file_revision != top_revision => {
+                        return Err(AgentError::InvalidRequest(
+                            "edit.patch: conflicting top-level and files[0] base_revision values"
+                                .into(),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => file.base_revision = Some(top_revision.clone()),
+                }
+            }
+            Ok(files)
+        }
+        (files, Some(path)) if files.is_empty() => Ok(vec![FilePatch {
+            path: path.clone(),
+            base_revision: args.base_revision.clone(),
+            hunks: args.hunks.clone(),
+        }]),
+        (_, Some(_)) => Err(AgentError::InvalidRequest(
+            "edit.patch: use either `files` or `path`+`hunks`, not both".into(),
+        )),
+        (_, None) => Err(AgentError::InvalidRequest(
+            "edit.patch requires either `files` or `path`+`hunks`".into(),
+        )),
+    }
+}
+
 /// One resolved file patch: the confined path plus the content the hunks
 /// will transform and the arguments that produced it.
 struct ResolvedPatch {
+    transaction: MutationTransaction,
     relative: String,
     original: String,
     updated: String,
     bytes_before: u64,
     hunks: usize,
-    line_ending: LineEnding,
+    line_ending_before: LineEnding,
+    line_ending_after: LineEnding,
     line_endings_normalized: bool,
-}
-
-fn display_relative(workspace: &Workspace, path: &std::path::Path) -> String {
-    path.strip_prefix(workspace.root())
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 impl EditPatchTool {
@@ -108,16 +199,26 @@ impl EditPatchTool {
         old: &str,
         new: &str,
         occurrence: Option<usize>,
-    ) -> Result<usize, ApplyHunkError> {
-        let found = exact_match(original, old, occurrence).map_err(ApplyHunkError::Match)?;
-        let projected = projected_replacement_len(original.len(), old.len(), new.len(), 1)
-            .filter(|size| *size <= MAX_FILE_BYTES)
-            .ok_or(ApplyHunkError::ResultTooLarge)?;
+        line_ending: LineEnding,
+    ) -> Result<(usize, bool), ApplyHunkError> {
+        let found = exact_edit_match(original, old, line_ending, occurrence)
+            .map_err(ApplyHunkError::Match)?;
+        let matched_eol_adapted = &original[found.start..found.end] != old;
+        let replacement = adapt_edit_replacement(original, found, new, line_ending);
+        let replacement_eol_adapted = replacement.as_ref() != new;
+        let projected = projected_replacement_len(
+            original.len(),
+            found.end - found.start,
+            replacement.len(),
+            1,
+        )
+        .filter(|size| *size <= MAX_FILE_BYTES)
+        .ok_or(ApplyHunkError::ResultTooLarge)?;
         if projected > original.capacity() {
             original.reserve(projected - original.len());
         }
-        original.replace_range(found.start..found.end, new);
-        Ok(found.count)
+        original.replace_range(found.start..found.end, replacement.as_ref());
+        Ok((found.count, matched_eol_adapted || replacement_eol_adapted))
     }
 }
 
@@ -131,21 +232,24 @@ impl Tool for EditPatchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit.patch".into(),
-            description: "Apply exact-match text hunks to one or more workspace files, optionally gated on each file's fs.read `base_revision`; matching is never fuzzy, and LF/CRLF arguments are adapted only to preserve a uniform target file's existing line endings. The whole batch is preflighted before staging; each file commit is atomic, while a partial multi-file commit is reported for recovery. Success echoes a globally bounded changed region and each new revision, so chained hunks need no confirm re-read.".into(),
+            description: "Patch files[] exactly; each item: path, latest fs.read base_revision, hunks; max 64 hunks total.".into(),
             input_schema: json!({
                 "type": "object",
+                "required": ["files"],
+                "additionalProperties": false,
                 "properties": {
                     "files": {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 16,
-                        "description": "Multi-file form; either this or the single-file `path`+`hunks` shortcut",
+                        "description": "The only model-visible form; use one entry for a single-file edit and at most 64 hunks total",
                         "items": {
                             "type": "object",
-                            "required": ["path", "hunks"],
+                            "required": ["path", "base_revision", "hunks"],
+                            "additionalProperties": false,
                             "properties": {
-                                "path": {"type": "string"},
-                                "base_revision": {"type": "string", "description": "The fs.read `revision` this change is based on; a mismatch refuses the edit (file changed since it was read)"},
+                                "path": {"type": "string", "minLength": 1, "maxLength": 512},
+                                "base_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Exact `revision` from the latest fs.read of this path"},
                                 "hunks": {
                                     "type": "array",
                                     "minItems": 1,
@@ -153,30 +257,14 @@ impl Tool for EditPatchTool {
                                     "items": {
                                         "type": "object",
                                         "required": ["old", "new"],
+                                        "additionalProperties": false,
                                         "properties": {
-                                            "old": {"type": "string", "description": "Exact text to replace (must match exactly once unless occurrence is given; uniform LF/CRLF target style is preserved)"},
+                                            "old": {"type": "string", "minLength": 1, "description": "Exact text to replace (must match exactly once unless occurrence is given; only LF/CRLF encoding is token-equivalent)"},
                                             "new": {"type": "string"},
                                             "occurrence": {"type": "integer", "minimum": 1, "description": "1-based occurrence to replace"}
                                         }
                                     }
                                 }
-                            }
-                        }
-                    },
-                    "path": {"type": "string", "description": "Single-file shortcut: the target path (with `hunks`)"},
-                    "base_revision": {"type": "string", "description": "Single-file shortcut: the fs.read `revision` this change is based on"},
-                    "hunks": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": 64,
-                        "description": "Single-file shortcut: exact-match hunks applied in order",
-                        "items": {
-                            "type": "object",
-                            "required": ["old", "new"],
-                            "properties": {
-                                "old": {"type": "string", "description": "Exact text to replace (must match exactly once unless occurrence is given; uniform LF/CRLF target style is preserved)"},
-                                "new": {"type": "string"},
-                                "occurrence": {"type": "integer", "minimum": 1, "description": "1-based occurrence to replace"}
                             }
                         }
                     }
@@ -199,25 +287,9 @@ impl Tool for EditPatchTool {
         let args: PatchArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("edit.patch args: {e}")))?;
 
-        // Single-file shortcut or the multi-file form (mutually exclusive).
-        let files: Vec<FilePatch> = match (&args.files, &args.path) {
-            (files, None) if !files.is_empty() => files.clone(),
-            (files, Some(path)) if files.is_empty() => vec![FilePatch {
-                path: path.clone(),
-                base_revision: args.base_revision.clone(),
-                hunks: args.hunks.clone(),
-            }],
-            (_, Some(_)) => {
-                return Err(AgentError::InvalidRequest(
-                    "edit.patch: use either `files` or `path`+`hunks`, not both".into(),
-                ));
-            }
-            (_, None) => {
-                return Err(AgentError::InvalidRequest(
-                    "edit.patch requires either `files` or `path`+`hunks`".into(),
-                ));
-            }
-        };
+        // Resolve the single-file shortcut and files[] form without
+        // discarding an unambiguously supplied top-level revision.
+        let files = resolved_files(&args)?;
         if files.len() > MAX_FILES {
             return Err(AgentError::InvalidRequest(format!(
                 "edit.patch is limited to {MAX_FILES} files per call"
@@ -230,11 +302,10 @@ impl Tool for EditPatchTool {
             )));
         }
 
-        // Phase 1 — resolve and compute every file's new content *before*
-        // any mutation is staged, so an invalid hunk or stale revision
-        // anywhere refuses the whole call with no side effects.
-        let mut resolved: Vec<ResolvedPatch> = Vec::with_capacity(files.len());
-        let mut resolved_targets = HashSet::with_capacity(files.len());
+        // Phase 1 — acquire every canonical path lease in sorted order, then
+        // read one exact bounded snapshot per file. The returned transaction
+        // owns those leases through composite settlement, so preflight and
+        // staging operate on the same bytes without a second full read.
         for file in &files {
             if ordinary_view_blocked(&file.path) {
                 return Ok(ToolOutcome::Value(hidden_path_output(
@@ -243,62 +314,56 @@ impl Tool for EditPatchTool {
                     &file.path,
                 )));
             }
-            // Reject state-dir targets up front (reads may legitimately
-            // reach into artifacts; editing them is a mutation policy
-            // decision).
-            let path = self.workspace.resolve_mutation(&file.path).await?;
-            if !resolved_targets.insert(path.clone()) {
-                return Err(AgentError::InvalidRequest(format!(
-                    "edit.patch target appears more than once: {}",
-                    display_relative(&self.workspace, &path)
-                )));
-            }
-            // Validation and open are fused into a directory-handle-relative
-            // descent; the size check and the content read both go through
-            // the pinned handle, so a link swap cannot redirect them.
-            let confined = match self.workspace.confined_open_read(&file.path).await {
-                Ok(confined) => confined,
-                Err(error) if is_not_found_error(&error) => {
-                    return Ok(ToolOutcome::Value(
-                        missing_path_output(&self.workspace, call_id, "edit.patch", &file.path)
-                            .await,
-                    ));
+        }
+        let requested: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+        let snapshots = match self
+            .workspace
+            .begin_existing_mutations("edit.patch", "patch", &requested, MAX_FILE_BYTES)
+            .await
+        {
+            Ok(snapshots) => snapshots,
+            Err(error) if is_not_found_error(&error) => {
+                // Batch acquisition intentionally reports one typed error.
+                // Only on this failure path, locate the missing member so
+                // the model receives the existing bounded path suggestions.
+                for file in &files {
+                    if self
+                        .workspace
+                        .confined_open_read(&file.path)
+                        .await
+                        .is_err_and(|candidate| is_not_found_error(&candidate))
+                    {
+                        return Ok(ToolOutcome::Value(
+                            missing_path_output(&self.workspace, call_id, "edit.patch", &file.path)
+                                .await,
+                        ));
+                    }
                 }
-                Err(error) => return Err(error),
-            };
-            let metadata = confined
-                .metadata()
-                .map_err(|e| AgentError::Io(format!("metadata {}: {e}", path.display())))?;
-            if metadata.len() > MAX_FILE_BYTES as u64 {
-                return Err(AgentError::InvalidRequest(format!(
-                    "file is {} bytes; edit.patch is limited to {} bytes",
-                    metadata.len(),
-                    MAX_FILE_BYTES
-                )));
+                return Err(error);
             }
+            Err(error) => return Err(error),
+        };
 
-            use tokio::io::AsyncReadExt;
-            let handle = confined.into_tokio();
-            let mut original = String::new();
-            handle
-                .take(MAX_FILE_BYTES as u64 + 1)
-                .read_to_string(&mut original)
-                .await
-                .map_err(|e| AgentError::Io(format!("read {}: {e}", path.display())))?;
-            if original.len() > MAX_FILE_BYTES {
-                return Err(AgentError::InvalidRequest(format!(
-                    "file grew beyond the edit.patch limit of {MAX_FILE_BYTES} bytes while it was read"
-                )));
-            }
+        // Compute every file's new content before any mutation is staged, so
+        // an invalid hunk or stale revision anywhere refuses the whole call
+        // with no journal or filesystem side effect.
+        let mut resolved: Vec<ResolvedPatch> = Vec::with_capacity(files.len());
+        for (file, snapshot) in files.iter().zip(snapshots) {
+            let relative = snapshot.relative_path().to_string();
+            let current = snapshot.revision().to_string();
+            let (transaction, original) = snapshot.into_parts();
+            let original = String::from_utf8(original).map_err(|_| {
+                AgentError::InvalidRequest(format!(
+                    "edit.patch target is not UTF-8 text: {relative}"
+                ))
+            })?;
 
             // File-revision precondition: the model based its hunks on a
             // specific read; if the file moved on, the hunks may not apply
             // to what is actually there, so refuse instead of guessing.
-            let current = content_digest(original.as_bytes());
             if let Some(expected) = &file.base_revision
                 && current != *expected
             {
-                let relative = display_relative(&self.workspace, &path);
                 return Ok(ToolOutcome::Value(patch_refusal(
                     call_id,
                     ToolFailureClass::StaleRevision,
@@ -312,7 +377,7 @@ impl Tool for EditPatchTool {
             }
 
             let mut updated = original.clone();
-            let line_ending = LineEnding::detect(&original);
+            let original_line_ending = LineEnding::detect(&original);
             let mut line_endings_normalized = false;
             for hunk in &file.hunks {
                 if hunk.old.is_empty() {
@@ -320,18 +385,27 @@ impl Tool for EditPatchTool {
                         "edit.patch hunk `old` must not be empty".into(),
                     ));
                 }
-                let old = normalize_edit_line_endings(&hunk.old, line_ending);
-                let new = normalize_edit_line_endings(&hunk.new, line_ending);
+                // Every hunk sees the result of the previous hunk. Re-detect
+                // the current style as part of that chaining contract: an
+                // earlier hunk may introduce or remove the first newline.
+                let current_line_ending = LineEnding::detect(&updated);
+                let old = normalize_edit_line_endings(&hunk.old, current_line_ending);
+                let new = normalize_edit_line_endings(&hunk.new, current_line_ending);
                 line_endings_normalized |= old.as_ref() != hunk.old || new.as_ref() != hunk.new;
-                match Self::apply_hunk(&mut updated, old.as_ref(), new.as_ref(), hunk.occurrence) {
-                    Ok(_) => {}
+                match Self::apply_hunk(
+                    &mut updated,
+                    old.as_ref(),
+                    new.as_ref(),
+                    hunk.occurrence,
+                    current_line_ending,
+                ) {
+                    Ok((_, adapted)) => line_endings_normalized |= adapted,
                     Err(ApplyHunkError::ResultTooLarge) => {
                         return Err(AgentError::InvalidRequest(format!(
                             "edit.patch result exceeds the {MAX_FILE_BYTES}-byte file limit"
                         )));
                     }
                     Err(ApplyHunkError::Match(error)) => {
-                        let relative = display_relative(&self.workspace, &path);
                         let (class, count, message) = match error {
                             ExactMatchError::Ambiguous { count } => (
                                 ToolFailureClass::AmbiguousMatch,
@@ -362,13 +436,16 @@ impl Tool for EditPatchTool {
                 }
             }
             let bytes_before = original.len() as u64;
+            let line_ending_after = LineEnding::detect(&updated);
             resolved.push(ResolvedPatch {
-                relative: display_relative(&self.workspace, &path),
+                transaction,
+                relative,
                 original,
                 updated,
                 bytes_before,
                 hunks: file.hunks.len(),
-                line_ending,
+                line_ending_before: original_line_ending,
+                line_ending_after,
                 line_endings_normalized,
             });
         }
@@ -382,11 +459,13 @@ impl Tool for EditPatchTool {
         let mut effects: Vec<Box<dyn Effect>> = Vec::new();
         let mut file_reports: Vec<Value> = Vec::new();
         let mut echo_blocks: Vec<String> = Vec::new();
+        let mut revisions_in_files_order: Vec<String> = Vec::with_capacity(resolved.len());
         let mut changed_any = false;
         let mut total_hunks_applied = 0usize;
-        for patch in &resolved {
+        for (file_index, patch) in resolved.iter().enumerate() {
             let changed = patch.updated != patch.original;
             let revision = content_digest(patch.updated.as_bytes());
+            revisions_in_files_order.push(revision.clone());
             file_reports.push(json!({
                 "path": patch.relative,
                 "changed": changed,
@@ -396,7 +475,10 @@ impl Tool for EditPatchTool {
                 // The revision of the applied result, so a follow-up
                 // patch can chain on it.
                 "revision": revision,
-                "line_ending": patch.line_ending.as_str(),
+                // `line_ending` describes `revision`; the former style is
+                // retained explicitly for diagnostics.
+                "line_ending_before": patch.line_ending_before.as_str(),
+                "line_ending": patch.line_ending_after.as_str(),
                 "line_endings_normalized": patch.line_endings_normalized,
             }));
             if changed {
@@ -407,8 +489,8 @@ impl Tool for EditPatchTool {
                 // `base_revision`) on what the file looks like now,
                 // without a confirm `fs.read` per file.
                 echo_blocks.push(format!(
-                    "--- {} (revision {revision})\n{}",
-                    patch.relative,
+                    "--- file[{file_index}] path={}\n{}",
+                    model_json_string(&patch.relative),
                     edit_echo(&patch.original, &patch.updated, EDIT_ECHO_MAX_CHARS).trim_end()
                 ));
             }
@@ -426,56 +508,41 @@ impl Tool for EditPatchTool {
             }));
         }
 
-        // Start every transaction and compare its journal snapshot with the
-        // bytes transformed in phase 1 before staging any file. A concurrent
-        // change therefore refuses the whole batch without leaving prepared
-        // siblings behind. PreparedMutation performs the same comparison
-        // again immediately before each atomic replace.
-        let mut transactions = Vec::with_capacity(
-            resolved
-                .iter()
-                .filter(|patch| patch.updated != patch.original)
-                .count(),
-        );
         for patch in resolved
-            .iter()
+            .into_iter()
             .filter(|patch| patch.updated != patch.original)
         {
-            let transaction = self
-                .workspace
-                .begin_mutation("edit.patch", "patch", &patch.relative)
-                .await?;
-            let expected = content_digest(patch.original.as_bytes());
-            let actual = transaction
-                .before_revision()
-                .map(|digest| digest.to_string());
-            if actual.as_deref() != Some(expected.as_str()) {
-                let actual = actual.unwrap_or_else(|| "missing".into());
-                return Ok(ToolOutcome::Value(patch_refusal(
-                    call_id,
-                    ToolFailureClass::StaleRevision,
-                    &patch.relative,
-                    actual,
-                    "",
-                    "",
-                    "stale_revision: target changed between patch preflight and staging; no file was staged. Re-read and retry.",
-                    0,
-                )));
-            }
-            transactions.push((patch, transaction));
-        }
-
-        for (patch, transaction) in transactions {
             // The new content is staged and journaled as prepared; the
             // atomic rename (the side effect) is committed by the runtime
             // after the generation fence.
+            let ResolvedPatch {
+                transaction,
+                updated,
+                ..
+            } = patch;
             let prepared = match effect_context.clone() {
                 Some(context) => {
                     transaction
-                        .prepare_with_effect_context(patch.updated.as_bytes(), context)
-                        .await?
+                        .prepare_with_effect_context(updated.as_bytes(), context)
+                        .await
                 }
-                None => transaction.prepare(patch.updated.as_bytes()).await?,
+                None => transaction.prepare(updated.as_bytes()).await,
+            };
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if let Err(rollback_error) = rollback_staged_effects(
+                        effects,
+                        "edit.patch staging aborted after a later file failed to prepare",
+                    )
+                    .await
+                    {
+                        return Err(AgentError::RecoveryRequired(bound_diagnostic(&format!(
+                            "edit.patch staging failed ({error}); prior staged cleanup failed ({rollback_error})"
+                        ))));
+                    }
+                    return Err(error);
+                }
             };
             effects.push(Box::new(prepared));
         }
@@ -485,6 +552,16 @@ impl Tool for EditPatchTool {
             EDIT_ECHO_MAX_CHARS,
             "\n… (additional edit echoes omitted at global cap; use fs.read for full bodies)",
         );
+        // Keep every new revision outside the optional echo budget. The list
+        // is in the same order as the submitted `files[]`; with at most 16
+        // SHA-256 values it is bounded to roughly 1.1 KiB and cannot lose a
+        // later file merely because earlier changed-region previews are long.
+        let revision_manifest = revisions_in_files_order
+            .iter()
+            .enumerate()
+            .map(|(index, revision)| format!("{index}:{revision}"))
+            .collect::<Vec<_>>()
+            .join(",");
         Ok(ToolOutcome::PreparedEffect {
             output: ToolOutput {
                 call_id: call_id.into(),
@@ -496,9 +573,10 @@ impl Tool for EditPatchTool {
                     effects.len()
                 ),
                 model_content: format!(
-                    "patch applied: {} file(s), {} hunk(s)\n{}",
+                    "patch applied: {} file(s), {} hunk(s)\nrevisions_in_files_order={}\n{}",
                     effects.len(),
                     total_hunks_applied,
+                    revision_manifest,
                     echo
                 ),
                 artifact_ref: None,
@@ -524,6 +602,7 @@ fn patch_refusal(
     match_count: usize,
 ) -> ToolOutput {
     let candidates = candidate_regions(original, needle);
+    let quoted_path = model_json_string(path);
     let candidate_text = if candidates.is_empty() {
         "no candidate".to_string()
     } else {
@@ -534,7 +613,7 @@ fn patch_refusal(
         "edit.patch",
         class,
         format!("edit.patch refused: {}", class.as_str()),
-        format!("{message}\npath={path}\nrevision={revision}\n{candidate_text}"),
+        format!("{message}\npath={quoted_path}\nrevision={revision}\n{candidate_text}"),
         json!({
             "path": path,
             "revision": revision,
@@ -548,9 +627,51 @@ fn patch_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_contracts::{CancellationToken, ToolExecutionRequest};
+    use agent_contracts::{CancellationToken, EffectReceipt, ToolExecutionRequest};
     use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use tokio::fs as tfs;
+
+    struct RollbackProbe(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Effect for RollbackProbe {
+        fn describe(&self) -> String {
+            "rollback probe".into()
+        }
+
+        async fn commit(self: Box<Self>) -> EffectReceipt {
+            panic!("rollback probe must not commit")
+        }
+
+        async fn rollback(self: Box<Self>, _reason: &str) -> AgentResult<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct FailingRollbackProbe(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Effect for FailingRollbackProbe {
+        fn describe(&self) -> String {
+            "failing rollback probe".into()
+        }
+
+        async fn commit(self: Box<Self>) -> EffectReceipt {
+            panic!("rollback probe must not commit")
+        }
+
+        async fn rollback(self: Box<Self>, _reason: &str) -> AgentResult<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(AgentError::RecoveryRequired(
+                "simulated staged cleanup failure".into(),
+            ))
+        }
+    }
 
     fn request(run_id: RunId, args: Value) -> ToolExecutionRequest {
         ToolExecutionRequest {
@@ -568,6 +689,61 @@ mod tests {
     async fn read_revision(workspace: &Workspace, path: &str) -> String {
         let bytes = tfs::read(workspace.root().join(path)).await.unwrap();
         content_digest(&bytes)
+    }
+
+    #[tokio::test]
+    async fn model_schema_exposes_one_revision_checked_files_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let spec = EditPatchTool::new(workspace).spec();
+        assert!(spec.description.chars().count() <= 96);
+        assert!(spec.description.contains("max 64 hunks total"));
+        let schema = spec.input_schema;
+
+        assert_eq!(schema["required"], json!(["files"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema["properties"].get("path").is_none());
+        assert!(schema["properties"].get("base_revision").is_none());
+        assert!(schema["properties"].get("hunks").is_none());
+        assert_eq!(
+            schema["properties"]["files"]["items"]["required"],
+            json!(["path", "base_revision", "hunks"])
+        );
+        let file = &schema["properties"]["files"]["items"]["properties"];
+        assert_eq!(file["path"]["maxLength"], 512);
+        assert_eq!(file["base_revision"]["pattern"], "^[0-9a-f]{64}$");
+        assert_eq!(file["hunks"]["items"]["properties"]["old"]["minLength"], 1);
+    }
+
+    #[tokio::test]
+    async fn staging_abort_rolls_back_every_prepared_sibling() {
+        let rolled_back = Arc::new(AtomicUsize::new(0));
+        let effects: Vec<Box<dyn Effect>> = (0..3)
+            .map(|_| Box::new(RollbackProbe(rolled_back.clone())) as Box<dyn Effect>)
+            .collect();
+
+        rollback_staged_effects(effects, "later prepare failed")
+            .await
+            .unwrap();
+        assert_eq!(rolled_back.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn staging_abort_attempts_every_sibling_and_propagates_cleanup_failure() {
+        let rolled_back = Arc::new(AtomicUsize::new(0));
+        let effects: Vec<Box<dyn Effect>> = vec![
+            Box::new(RollbackProbe(rolled_back.clone())),
+            Box::new(FailingRollbackProbe(rolled_back.clone())),
+            Box::new(RollbackProbe(rolled_back.clone())),
+        ];
+
+        let error = rollback_staged_effects(effects, "later prepare failed")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AgentError::RecoveryRequired(message) if message.contains("simulated staged cleanup failure"))
+        );
+        assert_eq!(rolled_back.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -693,6 +869,144 @@ mod tests {
         assert_eq!(
             tfs::read_to_string(&file).await.unwrap(),
             "changed by someone else\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn top_revision_binds_exactly_one_files_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let file = dir.path().join("f.txt");
+        tfs::write(&file, "one\n").await.unwrap();
+        let revision = read_revision(&workspace, "f.txt").await;
+        let tool = EditPatchTool::new(workspace);
+
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({
+                    "base_revision": revision,
+                    "files": [{
+                        "path": "f.txt",
+                        "hunks": [{"old": "one", "new": "two"}]
+                    }]
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::PreparedEffect { effect, .. } = outcome else {
+            panic!("an unambiguous top revision must bind the one files[] entry");
+        };
+        assert!(matches!(
+            effect.commit().await,
+            agent_contracts::EffectReceipt::Applied {
+                durability: agent_contracts::EffectDurability::Durable,
+                ..
+            }
+        ));
+        assert_eq!(tfs::read_to_string(file).await.unwrap(), "two\n");
+    }
+
+    #[tokio::test]
+    async fn stale_top_revision_cannot_be_silently_dropped_from_one_file_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let file = dir.path().join("f.txt");
+        tfs::write(&file, "one\n").await.unwrap();
+        let stale_revision = read_revision(&workspace, "f.txt").await;
+        tfs::write(&file, "changed elsewhere\n").await.unwrap();
+        let tool = EditPatchTool::new(workspace);
+
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({
+                    "base_revision": stale_revision,
+                    "files": [{
+                        "path": "f.txt",
+                        "hunks": [{"old": "one", "new": "two"}]
+                    }]
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("a stale compatibility revision must refuse before staging");
+        };
+        assert_eq!(
+            output.failure_class(),
+            Some(ToolFailureClass::StaleRevision)
+        );
+        assert_eq!(
+            tfs::read_to_string(file).await.unwrap(),
+            "changed elsewhere\n"
+        );
+        assert!(!dir.path().join(".focus-agent/changes.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_or_conflicting_top_revision_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        tfs::write(dir.path().join("a.txt"), "a\n").await.unwrap();
+        tfs::write(dir.path().join("b.txt"), "b\n").await.unwrap();
+        let a_revision = read_revision(&workspace, "a.txt").await;
+        let b_revision = read_revision(&workspace, "b.txt").await;
+        let tool = EditPatchTool::new(workspace);
+
+        let conflict = tool
+            .execute(
+                RunId::new(),
+                "c1",
+                json!({
+                    "base_revision": a_revision.clone(),
+                    "files": [{
+                        "path": "a.txt",
+                        "base_revision": b_revision,
+                        "hunks": [{"old": "a", "new": "A"}]
+                    }]
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(conflict, AgentError::InvalidRequest(message) if message.contains("conflicting"))
+        );
+
+        let ambiguous = tool
+            .execute(
+                RunId::new(),
+                "c2",
+                json!({
+                    "base_revision": a_revision,
+                    "files": [
+                        {"path": "a.txt", "hunks": [{"old": "a", "new": "A"}]},
+                        {"path": "b.txt", "hunks": [{"old": "b", "new": "B"}]}
+                    ]
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(ambiguous, AgentError::InvalidRequest(message) if message.contains("ambiguous"))
+        );
+        assert_eq!(
+            tfs::read_to_string(dir.path().join("a.txt")).await.unwrap(),
+            "a\n"
+        );
+        assert_eq!(
+            tfs::read_to_string(dir.path().join("b.txt")).await.unwrap(),
+            "b\n"
         );
     }
 
@@ -949,6 +1263,7 @@ mod tests {
         let ToolOutcome::PreparedEffect { output, effect } = outcome else {
             panic!("LF hunks must match a uniform CRLF target");
         };
+        assert_eq!(output.metadata["files"][0]["line_ending_before"], "crlf");
         assert_eq!(output.metadata["files"][0]["line_ending"], "crlf");
         assert_eq!(output.metadata["files"][0]["line_endings_normalized"], true);
         assert!(matches!(
@@ -956,6 +1271,118 @@ mod tests {
             agent_contracts::EffectReceipt::Applied { .. }
         ));
         assert_eq!(tfs::read(&file).await.unwrap(), b"ONE\r\ntwo\r\nTHREE\r\n");
+    }
+
+    #[tokio::test]
+    async fn patch_lone_cr_cannot_split_uniform_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let file = dir.path().join("windows.txt");
+        let original = b"a\r\nb\r\n";
+        tfs::write(&file, original).await.unwrap();
+        let tool = EditPatchTool::new(workspace);
+
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({
+                    "path": "windows.txt",
+                    "hunks": [{"old": "\r", "new": "X"}]
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("a lone CR hunk must refuse instead of splitting CRLF");
+        };
+        assert_eq!(output.failure_class(), Some(ToolFailureClass::NoExactMatch));
+        assert_eq!(tfs::read(&file).await.unwrap(), original);
+        assert!(!dir.path().join(".focus-agent/changes.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn mixed_eol_hunks_chain_on_updated_logical_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let file = dir.path().join("mixed.txt");
+        tfs::write(&file, b"one\r\ntwo\nthree\r\nfour\n")
+            .await
+            .unwrap();
+        let revision = read_revision(&workspace, "mixed.txt").await;
+        let tool = EditPatchTool::new(workspace);
+
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({
+                    "path": "mixed.txt",
+                    "base_revision": revision,
+                    "hunks": [
+                        {"old": "one\ntwo\nthree", "new": "ONE\nTWO\nTHREE"},
+                        {"old": "THREE\nfour", "new": "three\nFOUR"}
+                    ]
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::PreparedEffect { output, effect } = outcome else {
+            panic!("mixed-EOL hunks must use logical newline exact matching");
+        };
+        assert_eq!(output.metadata["files"][0]["line_ending"], "mixed");
+        assert_eq!(output.metadata["files"][0]["line_endings_normalized"], true);
+        assert!(matches!(
+            effect.commit().await,
+            agent_contracts::EffectReceipt::Applied { .. }
+        ));
+        assert_eq!(
+            tfs::read(&file).await.unwrap(),
+            b"ONE\r\nTWO\nthree\r\nFOUR\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_hunk_uses_line_endings_introduced_by_earlier_hunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let file = dir.path().join("chain.txt");
+        tfs::write(&file, b"seed").await.unwrap();
+        let revision = read_revision(&workspace, "chain.txt").await;
+        let tool = EditPatchTool::new(workspace);
+
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({
+                    "path": "chain.txt",
+                    "base_revision": revision,
+                    "hunks": [
+                        {"old": "seed", "new": "one\nTWO"},
+                        {"old": "one\r\nTWO", "new": "done\r\nnext"}
+                    ]
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::PreparedEffect { output, effect } = outcome else {
+            panic!("later hunks must observe line endings introduced by earlier hunks");
+        };
+        assert_eq!(output.metadata["files"][0]["line_ending_before"], "none");
+        assert_eq!(output.metadata["files"][0]["line_ending"], "lf");
+        assert_eq!(output.metadata["files"][0]["line_endings_normalized"], true);
+        assert!(matches!(
+            effect.commit().await,
+            agent_contracts::EffectReceipt::Applied { .. }
+        ));
+        assert_eq!(tfs::read(&file).await.unwrap(), b"done\nnext");
     }
 
     #[tokio::test]
@@ -1013,12 +1440,65 @@ mod tests {
         let ToolOutcome::PreparedEffect { output, effect } = outcome else {
             panic!("both files should stage");
         };
-        let echo = output.model_content.split_once('\n').unwrap().1;
+        let mut sections = output.model_content.splitn(3, '\n');
+        let _summary = sections.next().unwrap();
+        let revisions = sections.next().unwrap();
+        let echo = sections.next().unwrap();
+        assert!(revisions.starts_with("revisions_in_files_order=0:"));
+        assert!(revisions.contains(",1:"));
         assert!(
             echo.chars().count() <= EDIT_ECHO_MAX_CHARS,
             "all file echoes share one hard cap: {}",
             echo.chars().count()
         );
-        effect.rollback("test cleanup").await;
+        effect.rollback("test cleanup").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sixteen_file_success_keeps_every_revision_outside_the_echo_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = EditPatchTool::new(workspace);
+        let mut files = Vec::new();
+        let mut expected_revisions = Vec::new();
+        for index in 0..MAX_FILES {
+            let path = format!("{index:x}");
+            let old = format!("old-{index}\n");
+            let new = format!("new-{index}\n");
+            tfs::write(dir.path().join(&path), old.as_bytes())
+                .await
+                .unwrap();
+            expected_revisions.push(content_digest(new.as_bytes()));
+            files.push(json!({
+                "path": path,
+                "hunks": [{"old": old, "new": new}],
+            }));
+        }
+
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"files": files}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::PreparedEffect { output, effect } = outcome else {
+            panic!("all files should stage");
+        };
+        let manifest = output.model_content.lines().nth(1).unwrap();
+        for (index, revision) in expected_revisions.iter().enumerate() {
+            assert!(
+                manifest.contains(&format!("{index}:{revision}")),
+                "revision {index} must survive regardless of echo truncation"
+            );
+        }
+        assert!(
+            output.model_content.chars().count() <= 2 * EDIT_ECHO_MAX_CHARS,
+            "revision manifest plus globally bounded echo stays small"
+        );
+        effect.rollback("test cleanup").await.unwrap();
     }
 }

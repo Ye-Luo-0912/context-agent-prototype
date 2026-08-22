@@ -28,15 +28,28 @@ copy them back.
 
 Dependency: M10 → M11 → M12 → M13 → M14 → M15 → V2.
 Engineering mainline is M12, then M13. Context live evidence runs in
-parallel and does not retune GC.
+parallel and does not retune GC. Tool Surface edit reliability may improve
+in parallel, but it does not reorder or close either gate.
 
 ## Ordered route
 
 1. Close M12 (brokerable effects; do not make raw shell transactional).
 2. Close M13 (attestation of actual enforced capabilities; WASI is V2).
 3. Keep M14 closed; do not reopen it as a sandbox dump.
-4. Context eval: `context-mech.v2` 12-cell evidence exists; then a V1
-   candidate. Do not retune GC from it.
+4. V1 candidate: `context-mech.v2` 12-cell Context evidence exists; do not
+   retune GC from it. Separately, canonical `edit.patch` has a current-source
+   r4 dirty-tree diagnostic pass on the versioned v2 pack/v3 gate: non-conflict
+   first patch 9/9, proactive stale route 3/3, raw truth and flow gate 12/12,
+   with no observed patch failure, fallback, confirm read, recovery or unknown
+   settlement. This supports the current path but is not formal acceptance or
+   a general failure-rate estimate. Next run the unchanged frozen pack on a
+   clean source tree. Core-managed prepare crash seams after authority intent,
+   stage sync, and review record now have bounded fail-closed unit coverage;
+   next extend external-race, abrupt-process, disk/journal fault, partial-batch
+   fixtures and staged-byte accounting before broader filesystem reliability
+   claims. Do not turn expected stale refusal into a first-attempt
+   defect: grade the bounded read→stale→reread→retry state machine. Unit fixes
+   or this diagnostic alone do not close M12, M13, or M15.
 5. Formal M15 only from versioned per-cell artifacts. Do not use one
    A/B/C for every layer.
 6. V2 Self-Iteration last.

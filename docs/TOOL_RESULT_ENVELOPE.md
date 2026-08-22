@@ -67,15 +67,25 @@ reason>, model_content: <bounded reason>, .. }`. The model sees `ok: false`
 plus a summary naming the failure; it never sees a stack trace or unbounded
 diagnostics. Error text passes through the same broker caps as success text.
 
-A `PreparedEffect` whose commit fails returns `EffectCommitError`
+A `PreparedEffect` settles as the current typed `EffectReceipt`
 (`agent-contracts/src/tool.rs`):
 
-- `NotApplied(error)` — the world is unchanged; "nothing happened" is the
-  truthful model story;
-- `AppliedButDurabilityFailed(error)` — the effect landed but its journal
-  record failed; the runtime must surface a degraded/recovery state, never
-  "nothing happened" (this is the `EffectReceipt::Unknown`-adjacent case in
-  the v2 draft).
+- `NotApplied { error }` — the world is unchanged; "nothing happened" is
+  the truthful model story;
+- `Applied { durability: Durable, evidence }` — the effect landed and its
+  required durability barrier completed;
+- `Applied { durability: DurabilityFailed(error), evidence }` — at least
+  one effect landed but its journal or a later sequential child failed;
+  Runtime requires recovery and never reports "nothing happened";
+- `Unknown { error }` — the applied state cannot be proved; Runtime fences
+  further mutation and never retries blindly.
+
+Prepared output metadata describes proposed bytes. Only fully durable
+`Applied` preserves its proposed `revision` / `files[]`. Every other
+settlement is projected to a bounded `commit_state` plus at most eight
+attempted paths (256 chars each); receipt detail is capped at 1 200 chars,
+and no proposed revision becomes a ResourceFact. Partial composites remain
+honest but conservative until receipts carry the exact committed subset.
 
 ### 2.3 Provider/model errors
 
@@ -99,9 +109,11 @@ the trace.
 
 All caps are enforced by the kernel-level trusted `OutputBroker`
 (`agent-workspace/src/broker.rs` `WorkspaceOutputBroker`) before any
-`ToolOutcome` reaches the actor, and again by the actor's last-line guard
-for dynamic/process capabilities. A producer may declare a *smaller* local
-limit; no producer may make the model-facing result larger.
+`ToolOutcome` reaches the actor. The actor's last-line guard re-enforces the
+`model_content` cap for dynamic/process capabilities; its post-commit
+settlement projection independently bounds rebuilt summary/detail/path
+metadata. A producer may declare a *smaller* local limit; no producer may
+make the model-facing result larger.
 
 | Constant | Value | Field/scope | Enforced where |
 | --- | --- | --- | --- |
@@ -139,11 +151,15 @@ matrix with schemas lives in [`docs/TOOL_INVENTORY.json`](TOOL_INVENTORY.json).
 | `search.grep` | `MAX_FILES_SCANNED` | 5 000 |
 | | `MAX_BYTES_PER_FILE` | 2 MiB |
 | | `MODEL_HITS` | 100 (overflow → artifact) |
-| `fs.read` | `MAX_READ_BYTES` | 2 MiB |
+| `fs.read` | `MAX_READ_BYTES` | 4 MiB (shared `MAX_MUTATION_BYTES`; canonical edit revisions cover every admitted mutation target) |
 | | `MAX_READ_LINES` | 400 |
+| | render working memory | O(returned window), not O(total file lines) |
 | `fs.list` | `MAX_LIST_ENTRIES` | 2 000 |
-| `edit.replace` / `fs.write` | `MAX_FILE_BYTES` | 4 MiB (reject, not truncate) |
+| `fs.write` / `edit.replace` / `edit.patch` | `MAX_MUTATION_BYTES` | 4 MiB per resulting file (tool preflight + workspace boundary; reject, not truncate) |
+| `edit.patch` | batch targets | 16; canonical keys locked in sorted order before one bounded snapshot per file |
+| `edit.replace` / `edit.patch` | success changed-region echo | 1 200 chars; one combined cap for all `edit.patch` files, marker included |
 | | change-journal old-content capture | 256 KiB (`CHANGE_CAPTURE_LIMIT`) |
+| | serialized change-journal record | 2 MiB; refused before the indivisible append |
 
 ## 5. Artifact contract
 

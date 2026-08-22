@@ -165,9 +165,38 @@ impl Tool for ProcessRunTool {
         #[cfg(unix)]
         command.process_group(0);
 
-        let mut child = command
-            .spawn()
-            .map_err(|e| AgentError::Tool(format!("spawn {}: {e}", args.argv[0])))?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 模型反复猜测不存在的程序名是实测最高频的失败循环
+                // （live 5 连败）：把有界的工作区清单附进类型化失败，
+                // 让一次错误就足以纠正，而不是再猜四个路径。
+                let entries = bounded_cwd_listing(&cwd);
+                return Ok(ToolOutcome::Value(agent_contracts::tool_failure_output(
+                    call_id,
+                    "process.run",
+                    agent_contracts::ToolFailureClass::PathNotFound,
+                    format!("process.run refused: program_not_found ({})", args.argv[0]),
+                    format!(
+                        "program `{}` was not found.\ncwd `{}` contains: {}\ncompile or install it first, or run a binary that exists in the listing.",
+                        args.argv[0],
+                        cwd.display(),
+                        if entries.is_empty() {
+                            "(empty)".into()
+                        } else {
+                            entries.join(", ")
+                        }
+                    ),
+                    json!({
+                        "argv0": args.argv[0],
+                        "cwd": cwd.display().to_string(),
+                        "entries": entries,
+                        "recovery_hint": "use a program that exists in the listing; compile sources before running their binaries",
+                    }),
+                )));
+            }
+            Err(e) => return Err(AgentError::Tool(format!("spawn {}: {e}", args.argv[0]))),
+        };
         let pid = match super::persist_spawned_process(
             &self.workspace,
             &effect_context,
@@ -337,6 +366,24 @@ impl Tool for ProcessRunTool {
     }
 }
 
+/// Bounded, deterministic listing of the spawn cwd for the
+/// program-not-found failure envelope. Dot-entries (.git,
+/// .focus-agent) are skipped to match the fs.list conventions.
+fn bounded_cwd_listing(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (!name.starts_with('.')).then_some(name)
+        })
+        .collect();
+    names.sort();
+    names.truncate(20);
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +452,44 @@ mod tests {
         {
             vec!["sh".into(), "-c".into(), "echo spawned > marker.txt".into()]
         }
+    }
+
+    #[tokio::test]
+    async fn process_run_missing_program_lists_the_cwd_instead_of_a_dead_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        std::fs::write(dir.path().join("src.rs"), "fn main() {}\n").unwrap();
+        let tool = ProcessRunTool::new(workspace);
+        let run_id = RunId::new();
+        let arguments = json!({"argv": ["protocol_tests.exe"]});
+        let context = ctx(run_id, &arguments);
+        let output = tool
+            .execute(
+                run_id,
+                "c",
+                arguments,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let output = value(output);
+        assert!(!output.ok, "a missing program must fail the call");
+        assert_eq!(
+            output.metadata[agent_contracts::TOOL_FAILURE_CLASS_KEY],
+            json!("path_not_found")
+        );
+        assert!(
+            output.model_content.contains("protocol_tests.exe"),
+            "the invented name must be echoed: {}",
+            output.model_content
+        );
+        assert!(
+            output.model_content.contains("src.rs"),
+            "the cwd listing must show what exists: {}",
+            output.model_content
+        );
+        assert_eq!(output.metadata["entries"], json!(["src.rs"]));
     }
 
     #[tokio::test]

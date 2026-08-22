@@ -1,0 +1,91 @@
+{
+  "context_engine": "dynamic",
+  "fixture_id": "crlf_multi_hunk",
+  "fixture_mutations": [],
+  "gate": {
+    "analysis_truncated": false,
+    "changed_bytes_after": 40,
+    "changed_bytes_before": 40,
+    "commit_not_applied": 0,
+    "commit_recovery_required": 0,
+    "commit_unknown": 0,
+    "confirm_reads_after_success": 0,
+    "edit_latency_ms_p50": 2,
+    "edit_latency_ms_p95": 2,
+    "edit_to_green_ms": 6501,
+    "first_patch_changed_success": false,
+    "first_patch_has_required_revisions": true,
+    "first_patch_raw_success": false,
+    "first_patch_shape_valid": false,
+    "fixture_id": "crlf_multi_hunk",
+    "forbidden_calls": 0,
+    "forbidden_tool_counts": {},
+    "fs_read_bytes": 40,
+    "model_rounds": 4,
+    "non_stale_failures": 1,
+    "passed": false,
+    "patch_attempts": 2,
+    "patch_changed_successes": 1,
+    "patch_failures": 1,
+    "patch_finished": 2,
+    "patch_noops": 0,
+    "patch_raw_successes": 1,
+    "patch_started": 2,
+    "schema": "agent-eval.tool-surface-edit.v1",
+    "seq_contiguous": true,
+    "session_ok": true,
+    "stale_refusals": 0,
+    "strict_passed": true,
+    "target_files_covered": [
+      "src/settings.cfg"
+    ],
+    "target_read_successes": 1,
+    "trace_complete": true,
+    "unfinished_patch_calls": 0,
+    "valid_call_first_attempt_success": false,
+    "violations": [
+      "patch attempts 2 exceed 1",
+      "first edit.patch call was missing or non-canonical",
+      "first edit.patch call did not commit a changed result",
+      "non-conflict fixture had 1 failed patch call(s)"
+    ]
+  },
+  "schema": "agent-eval.tool-edit.v1",
+  "strict": {
+    "files": [
+      {
+        "actual_sha256": "e8c281ca09a7e8907ff7ec5403959086a23bb85411ae31d768d0678a85537524",
+        "bytes": 40,
+        "expected_sha256": "e8c281ca09a7e8907ff7ec5403959086a23bb85411ae31d768d0678a85537524",
+        "passed": true,
+        "path": "src/settings.cfg"
+      }
+    ],
+    "fixture_id": "crlf_multi_hunk",
+    "passed": true,
+    "schema": "agent-eval.tool-edit.v1",
+    "unexpected_files": [],
+    "unexpected_files_truncated": false
+  },
+  "surface": "production-default",
+  "trace_contract": {
+    "conflict": "none",
+    "expected_files_per_success": 1,
+    "first_patch_must_succeed": true,
+    "forbidden_tools": [
+      "shell.exec",
+      "process.run",
+      "process.session",
+      "fs.write",
+      "edit.replace"
+    ],
+    "max_confirm_reads_after_success": 0,
+    "max_patch_calls": 1,
+    "min_hunks_per_success": 2,
+    "require_base_revision": true,
+    "required_successful_patch_calls": 1,
+    "target_files": [
+      "src/settings.cfg"
+    ]
+  }
+}

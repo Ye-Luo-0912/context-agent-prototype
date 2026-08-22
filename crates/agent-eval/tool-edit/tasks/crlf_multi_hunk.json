@@ -1,0 +1,44 @@
+{
+  "id": "crlf_multi_hunk",
+  "name": "Apply two exact hunks to a CRLF file",
+  "description": "Read src/settings.cfg, then use one edit.patch call with the fs.read revision and two hunks: change mode=legacy to mode=strict and timeout=30 to timeout=45. Preserve every other byte and the existing line-ending style. Do not rewrite the whole file.",
+  "expected_edit": "one revision-checked edit.patch with two hunks, preserving CRLF",
+  "target_rounds_lo": 2,
+  "target_rounds_hi": 6,
+  "seed_files": [
+    {
+      "path": "src/settings.cfg",
+      "content": "mode=legacy\r\ntimeout=30\r\nsentinel=keep\r\n",
+      "sha256": "5e5e640e7f60322d8f8737237840e9cb126fd8b79bff24594465f356bb1cd9fa"
+    }
+  ],
+  "golden_files": [
+    {
+      "path": "src/settings.cfg",
+      "content": "mode=strict\r\ntimeout=45\r\nsentinel=keep\r\n",
+      "sha256": "e8c281ca09a7e8907ff7ec5403959086a23bb85411ae31d768d0678a85537524"
+    }
+  ],
+  "ops": [
+    {
+      "op": "user",
+      "text": "Read src/settings.cfg, then use one edit.patch call with the fs.read revision and two hunks: change mode=legacy to mode=strict and timeout=30 to timeout=45. Preserve every other byte and the existing line-ending style. Do not rewrite the whole file."
+    }
+  ],
+  "trace": {
+    "target_files": ["src/settings.cfg"],
+    "required_successful_patch_calls": 1,
+    "max_patch_calls": 1,
+    "expected_files_per_success": 1,
+    "min_hunks_per_success": 2,
+    "exact_hunks": [
+      {"path": "src/settings.cfg", "old": "mode=legacy", "new": "mode=strict"},
+      {"path": "src/settings.cfg", "old": "timeout=30", "new": "timeout=45"}
+    ],
+    "require_base_revision": true,
+    "first_patch_must_succeed": true,
+    "conflict": "none",
+    "forbidden_tools": ["shell.exec", "process.run", "process.session", "fs.write", "edit.replace"],
+    "max_confirm_reads_after_success": 0
+  }
+}

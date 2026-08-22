@@ -39,8 +39,8 @@ pub use facts::{
     FactCoverage, FactOutcome, KeyFact, compare_facts, render_fact_comparison, scenario_key_facts,
 };
 pub use recovery::{
-    RecoveryBarrier, RecoveryFailure, RecoveryReport, RestoreConsistencyReport, analyze_barrier,
-    first_seq_gap, rebuild_engine_state, recovery_replay, recovery_replay_file,
+    RecoveryBarrier, RecoveryFailure, RecoveryReport, ReplayEngineKind, RestoreConsistencyReport,
+    analyze_barrier, first_seq_gap, rebuild_engine_state, recovery_replay, recovery_replay_file,
     render_recovery_report, verify_restore_consistency,
 };
 pub use scenarios::{
@@ -495,8 +495,15 @@ fn map_recorded_selection(
 fn selection_metadata_matches(left: &ContextSelection, right: &ContextSelection) -> bool {
     left.approx_tokens == right.approx_tokens
         && left.reason == right.reason
-        && (left.score - right.score).abs() <= f32::EPSILON
+        && (left.score - right.score).abs() <= SELECTION_SCORE_TOLERANCE
 }
+
+/// Score tolerance for mapping recorded selections onto replay previews.
+/// serde_json round-trips f32 exactly, so a same-version replay matches
+/// bit-for-bit; the tolerance only absorbs benign summation-order drift
+/// across engine patch versions. `f32::EPSILON` was too tight for scores
+/// accumulated from several weighted terms.
+const SELECTION_SCORE_TOLERANCE: f32 = 1e-4;
 
 /// Read a JSONL trace file (one `RuntimeEventEnvelope` per line) and replay it.
 /// If the file contains multiple runs, only the first run's events are used.

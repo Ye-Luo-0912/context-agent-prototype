@@ -80,15 +80,30 @@ tool arguments → HostToolPolicy → approved intent
   → Core checks approved ⊇ actual → commit
 ```
 
-The same commit boundary carries a content TOCTOU guard. The existing
-journal keeps its bounded recovery hashes; separately,
-`Workspace::begin_mutation` captures the target's exact SHA-256 in the
-in-memory transaction. Edit tools compare it with the raw snapshot they
-transformed, and the prepared effect re-hashes the target immediately
-before atomic rename. A detected intervening write cleans the staged file
-and settles as `NotApplied` (`stale_revision`) instead of clobbering the
-winner. This content precondition complements, but does not replace, the
-generation fence or Actual ⊆ Approved authority check.
+The same commit boundary carries a content TOCTOU guard. For existing edit targets,
+`Workspace::begin_existing_mutations` acquires canonical path-keyed leases
+in sorted batch order before taking one exact bounded snapshot; that one scan
+feeds transformation, SHA-256, recovery hash and bounded old-content capture.
+Every child retains the shared lease group through composite settlement, so
+same-`Workspace` writers cannot enter between snapshot, check and replace.
+For Core-managed effects, the synced authority-journal v2 intent precedes temp
+creation and carries the deterministic staged name, bounded byte lengths and
+SHA-256 before/after revisions. Reconciliation uses confined handles, bounded
+reads and content/name revalidation; it deletes only a stage proven to be the
+owned complete after-state. File effects require an already-existing parent;
+they cannot create unjournaled directory topology before this intent.
+Unprovable stage state is `Ambiguous`, not an unsafe cleanup. Typed rollback
+propagates cleanup/terminal uncertainty to the Core recovery fence.
+
+The prepared effect still re-hashes immediately before atomic rename: drift
+from a writer outside that lease already visible when the check begins cleans
+the staged file and settles as `NotApplied` (`stale_revision`). This is not an
+atomic filesystem CAS against direct or authority-bypassing filesystem
+writers; they can still race between hash and rename. A second official
+`Workspace::open` on the same root is instead refused by the exclusive
+authority-journal lock. The content precondition and in-process lease
+complement, but do not replace, the generation fence or Actual ⊆ Approved
+authority check.
 
 `process.session` start is `ExecArgv`. Poll/stop do not spawn and cannot
 spend an argv-prefix grant. Session recovery is keyed by the **start**

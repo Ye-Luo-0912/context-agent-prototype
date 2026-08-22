@@ -766,3 +766,51 @@ async fn effectful_capability_invoke_persists_remote_ack() {
         EffectReconciliation::CompletedValue { .. }
     ));
 }
+
+#[tokio::test]
+async fn a_repeat_load_is_a_cheap_no_op_that_names_the_loaded_set() {
+    let registry = Arc::new(CapabilityRegistry::new());
+    registry
+        .register(Arc::new(demo_capability("demo")))
+        .expect("registration succeeds");
+    let dispatcher = CapabilityAwareDispatcher::new(Arc::new(EmptyBase), registry.clone());
+
+    let manage = |name: &str| ToolExecutionRequest {
+        run_id: RunId::new(),
+        call: ToolCall {
+            id: format!("call-{name}"),
+            name: "capability.manage".into(),
+            arguments: json!({"op": "load", "name": name}),
+        },
+        effect_context: None,
+        cancel: CancellationToken::new(),
+    };
+
+    let first = match dispatcher.execute(manage("demo.one")).await.unwrap() {
+        ToolOutcome::Value(output) => output,
+        other => panic!("capability.manage must return a plain value: {other:?}"),
+    };
+    assert!(first.ok, "{}", first.summary);
+    assert_eq!(first.metadata["already_loaded"], json!(false));
+    assert!(first.model_content.contains("tool loaded: demo.one"));
+
+    let second = match dispatcher.execute(manage("demo.one")).await.unwrap() {
+        ToolOutcome::Value(output) => output,
+        other => panic!("capability.manage must return a plain value: {other:?}"),
+    };
+    assert_eq!(
+        second.metadata["already_loaded"],
+        json!(true),
+        "the second load must be recognized as a no-op"
+    );
+    assert!(
+        second.model_content.contains("already loaded: demo.one"),
+        "{}",
+        second.model_content
+    );
+    assert!(
+        second.model_content.contains("session-loaded: demo.one"),
+        "the trailer must name the loaded set so the model stops re-loading: {}",
+        second.model_content
+    );
+}

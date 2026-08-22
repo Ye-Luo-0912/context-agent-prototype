@@ -395,6 +395,21 @@ impl RuntimeActor {
             .await;
     }
 
+    /// Settle a turn that ends without its commit barrier (a refused round,
+    /// an exhausted round budget, a failed provider call): the applied user
+    /// input must not dangle at Applied forever. The committed interruption
+    /// is the input's terminal audit record, then the turn frame is dropped.
+    pub(super) async fn settle_aborted_turn(&mut self) {
+        if let Some(turn) = self.state.turn.take()
+            && !turn.input_consumed
+            && let Some(applied) = turn.applied_input
+        {
+            let _ = self
+                .emit_user_input(applied.with_lifecycle(InputLifecycle::InterruptCommitted))
+                .await;
+        }
+    }
+
     /// 周转中最多排队 `USER_INPUT_QUEUE_CAP` 条。槽满则 Rejected。
     pub(super) async fn queue_user_dialogue(&mut self, content: String) -> AgentResult<()> {
         if self.state.pending_user_input.is_some() {

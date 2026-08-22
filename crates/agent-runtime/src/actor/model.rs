@@ -53,25 +53,17 @@ impl RuntimeActor {
                     // The maintenance state change landed but its audit
                     // event did not: fence the turn instead of letting the
                     // state silently outrun its journal event.
-                    let _ = self
-                        .core
-                        .emit_event(RuntimeEvent::Error {
-                            message: error.to_string(),
-                        })
+                    self.fail_round_preparation("before_model_maintained_event", error)
                         .await;
-                    self.state.turn = None;
                     return;
                 }
                 has_external_context
             }
             Err(error) => {
-                let _ = self
-                    .core
-                    .emit_event(RuntimeEvent::Error {
-                        message: error.to_string(),
-                    })
+                // BeforeModel maintenance may have partially applied: the
+                // engine state can no longer be trusted without recovery.
+                self.fail_round_preparation("before_model_maintain", error)
                     .await;
-                self.state.turn = None;
                 return;
             }
         };
@@ -222,13 +214,7 @@ impl RuntimeActor {
             let surface_revision = match self.issue_surface_revision() {
                 Ok(revision) => revision,
                 Err(error) => {
-                    let _ = self
-                        .core
-                        .emit_event(RuntimeEvent::Error {
-                            message: error.to_string(),
-                        })
-                        .await;
-                    self.state.turn = None;
+                    self.fail_round_preparation("surface_revision", error).await;
                     return;
                 }
             };
@@ -248,17 +234,14 @@ impl RuntimeActor {
                 .emit_event(RuntimeEvent::ToolSurfacePlanned { report })
                 .await
             {
-                let _ = self
-                    .core
-                    .emit_event(RuntimeEvent::Error {
-                        message: format!(
-                            "failed to persist the unavailable-tool surface decision ({error}); refusing to start the model round"
-                        ),
-                    })
+                // The refusal decision itself could not be journaled: the
+                // audit trail must not lose why this round never started.
+                self.fail_round_preparation("tool_surface_planned_event", error)
                     .await;
-                self.state.turn = None;
                 return;
             }
+            // Deliberate refusal, not a fault: settle the applied input and
+            // drop the turn without fencing.
             let _ = self
                 .core
                 .emit_event(RuntimeEvent::Error {
@@ -266,7 +249,7 @@ impl RuntimeActor {
                         .into(),
                 })
                 .await;
-            self.state.turn = None;
+            self.settle_aborted_turn().await;
             return;
         }
 
@@ -274,13 +257,7 @@ impl RuntimeActor {
             let surface_revision = match self.issue_surface_revision() {
                 Ok(revision) => revision,
                 Err(error) => {
-                    let _ = self
-                        .core
-                        .emit_event(RuntimeEvent::Error {
-                            message: error.to_string(),
-                        })
-                        .await;
-                    self.state.turn = None;
+                    self.fail_round_preparation("surface_revision", error).await;
                     return;
                 }
             };
@@ -301,17 +278,14 @@ impl RuntimeActor {
                 .emit_event(RuntimeEvent::ToolSurfacePlanned { report })
                 .await
             {
-                let _ = self
-                    .core
-                    .emit_event(RuntimeEvent::Error {
-                        message: format!(
-                            "failed to persist the schema-budget surface decision ({error}); refusing to start the model round"
-                        ),
-                    })
+                // The refusal decision itself could not be journaled: the
+                // audit trail must not lose why this round never started.
+                self.fail_round_preparation("tool_surface_planned_event", error)
                     .await;
-                self.state.turn = None;
                 return;
             }
+            // Deliberate refusal, not a fault: settle the applied input and
+            // drop the turn without fencing.
             let _ = self
                 .core
                 .emit_event(RuntimeEvent::Error {
@@ -322,7 +296,7 @@ impl RuntimeActor {
                     ),
                 })
                 .await;
-            self.state.turn = None;
+            self.settle_aborted_turn().await;
             return;
         }
 
@@ -394,13 +368,11 @@ impl RuntimeActor {
         {
             Ok(materialized) => materialized,
             Err(error) => {
-                let _ = self
-                    .core
-                    .emit_event(RuntimeEvent::Error {
-                        message: error.to_string(),
-                    })
+                // Materialize advances engine clocks and may run through the
+                // process adapter: a failure here leaves the engine state
+                // unprovable, so fence instead of retrying blind.
+                self.fail_round_preparation("context_materialize", error)
                     .await;
-                self.state.turn = None;
                 return;
             }
         };
@@ -510,13 +482,7 @@ impl RuntimeActor {
         let surface_revision = match self.issue_surface_revision() {
             Ok(revision) => revision,
             Err(error) => {
-                let _ = self
-                    .core
-                    .emit_event(RuntimeEvent::Error {
-                        message: error.to_string(),
-                    })
-                    .await;
-                self.state.turn = None;
+                self.fail_round_preparation("surface_revision", error).await;
                 return;
             }
         };
@@ -532,13 +498,10 @@ impl RuntimeActor {
             })
             .await
         {
-            let _ = self
-                .core
-                .emit_event(RuntimeEvent::Error {
-                    message: error.to_string(),
-                })
+            // The consumption ack below references this preview; without
+            // the durable ContextPrepared record the round must not start.
+            self.fail_round_preparation("context_prepared_event", error)
                 .await;
-            self.state.turn = None;
             return;
         }
 
@@ -561,17 +524,14 @@ impl RuntimeActor {
                 .emit_event(RuntimeEvent::ToolSurfacePlanned { report })
                 .await
             {
-                let _ = self
-                    .core
-                    .emit_event(RuntimeEvent::Error {
-                        message: format!(
-                            "failed to persist the provider-budget surface decision ({error}); refusing to start the model round"
-                        ),
-                    })
+                // The refusal decision itself could not be journaled: the
+                // audit trail must not lose why this round never started.
+                self.fail_round_preparation("tool_surface_planned_event", error)
                     .await;
-                self.state.turn = None;
                 return;
             }
+            // Deliberate refusal, not a fault: settle the applied input and
+            // drop the turn without fencing.
             let _ = self
                 .core
                 .emit_event(RuntimeEvent::Error {
@@ -580,7 +540,7 @@ impl RuntimeActor {
                     ),
                 })
                 .await;
-            self.state.turn = None;
+            self.settle_aborted_turn().await;
             return;
         }
 
@@ -639,13 +599,8 @@ impl RuntimeActor {
             .emit_event(RuntimeEvent::ToolSurfacePlanned { report })
             .await
         {
-            let _ = self
-                .core
-                .emit_event(RuntimeEvent::Error {
-                    message: error.to_string(),
-                })
+            self.fail_round_preparation("tool_surface_planned_event", error)
                 .await;
-            self.state.turn = None;
             return;
         }
         if let Err(error) = self
@@ -669,13 +624,11 @@ impl RuntimeActor {
             })
             .await
         {
-            let _ = self
-                .core
-                .emit_event(RuntimeEvent::Error {
-                    message: error.to_string(),
-                })
+            // The operation is already installed in the turn; without the
+            // durable ModelStarted the live stream and every later event
+            // lose their envelope cursor. Fence instead of sending.
+            self.fail_round_preparation("model_started_event", error)
                 .await;
-            self.state.turn = None;
             return;
         }
 
@@ -740,6 +693,7 @@ impl RuntimeActor {
                     argument_digest: None,
                     tool_identity: None,
                     value_completion_pending: false,
+                    recovery_required: None,
                     directive: None,
                     disposition: ToolResultDisposition::PersistObservation,
                     context_ack: Some(context_ack),

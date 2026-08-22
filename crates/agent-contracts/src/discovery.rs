@@ -409,7 +409,7 @@ pub fn search_tool_catalog_filtered(
         return filtered.into_iter().take(limit).cloned().collect();
     };
     let needle = raw.to_lowercase();
-    let tokens: Vec<String> = tokenize(&needle).into_iter().collect();
+    let tokens: Vec<String> = crate::search::tokenize(&needle);
     let mut scored: Vec<(u32, usize)> = Vec::new();
     for (idx, entry) in filtered.iter().enumerate() {
         let score = catalog_search_score(entry, &needle, &tokens);
@@ -467,27 +467,11 @@ fn descriptor_matches(entry: &ToolCatalogEntry, needle: &str) -> bool {
 }
 
 fn tool_tokens(entry: &ToolCatalogEntry) -> HashSet<String> {
-    let mut tokens = tokenize(&entry.name);
-    tokens.extend(tokenize(&entry.description));
-    tokens.extend(tokenize(&entry.owner));
+    let mut tokens: HashSet<String> = crate::search::tokenize(&entry.name).into_iter().collect();
+    tokens.extend(crate::search::tokenize(&entry.description));
+    tokens.extend(crate::search::tokenize(&entry.owner));
     tokens.insert(entry.state.as_str().to_string());
     tokens.insert(entry.risk.as_str().to_string());
-    tokens
-}
-
-fn tokenize(text: &str) -> HashSet<String> {
-    let mut tokens = HashSet::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() {
-            current.push(ch.to_ascii_lowercase());
-        } else if !current.is_empty() {
-            tokens.insert(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        tokens.insert(current);
-    }
     tokens
 }
 

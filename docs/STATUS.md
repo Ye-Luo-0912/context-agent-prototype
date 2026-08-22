@@ -85,19 +85,60 @@ work is still a deterministic harness where the loop actually forms,
 not more Context live cells.
 
 **P1 — Tool Surface edit reliability.** `edit.patch` stays the only
-production-always-loaded mutation primitive; no fuzzy matcher or
-parallel edit schema was added. The 2026-08-22 first slice landed:
-uniform LF/CRLF-aware exact matching with target-style preservation,
-constant-memory occurrence scanning, projected and workspace-enforced
-4 MiB result caps, duplicate resolved-target rejection, bounded actual
-reads, typed missing-path topology, one 1200-char multi-file success
-echo cap, and compare-before-swap conflict refusal. Existing confined
-opens, journal/durability truth, Core generation/authority fences, and
-honest partial multi-file recovery remain unchanged. Unit coverage is
-green; product acceptance is still open until versioned Tool Surface
-fixtures show higher valid-call first-attempt success and edit-to-green
-without increasing task failures, shell fallback, rounds, or latency.
-This is a V1-candidate gate in parallel with — not a replacement for —
+production-always-loaded mutation primitive; matching remains exact and no
+parallel edit schema was added. The 2026-08-22 implementation now provides:
+
+- LF/CRLF newline-token equivalence with physical-EOL preservation, literal
+  lone CR/non-EOL bytes, bounded scans, and a 4 MiB result ceiling;
+- one model-visible, revision-required `files[]` schema (the legacy
+  single-file form remains parser-only compatibility), a JSON-quoted
+  `fs.read` header carrying raw-byte revision/EOL facts, and a complete
+  in-order revision manifest outside the bounded edit echo;
+- sorted canonical path leases, one pinned bounded snapshot, duplicate-alias
+  rejection, short exclusively-created staging names, staged handle/length/
+  SHA verification (plus Unix name/inode binding or Windows deny-sharing),
+  compare-before-replace, installed-byte verification before and after the
+  authority acknowledgement, and preservation of Unix mode bits or the
+  Windows readonly bit;
+- for Core-managed writes, a synced authority-journal v2 intent before temp
+  creation, carrying bounded byte lengths and SHA-256 before/after revisions;
+  bounded reopen reconciliation removes only a confined, regular staged file
+  whose name identity and complete content are reverified; file writes require
+  an existing parent and never create unjournaled directory topology; and
+- typed stale/exact-match refusals, bounded topology/candidate output, one
+  1200-character multi-file echo, and honest `NotApplied` / `Applied` /
+  `Unknown` settlement.
+
+Unit tests and clippy are green. The versioned `agent-eval.tool-edit.v2` pack
+plus `agent-eval.tool-surface-edit.v3` gate also produced a source-bound r4
+dirty-tree diagnostic pass over the current hardened implementation: 4
+fixtures × 3 repeats, 12/12 raw-byte truth,
+12/12 flow gate, 9/9 non-conflict first patch, 3/3 proactive stale routes,
+zero patch refusal/fallback/confirm-read/recovery/unknown, and 42 rounds. Its
+wall total was 164,417 ms and reported provider tokens were 258,325; it
+preserved all r3 call-quality results while observing lower wall p50/p95. See
+the r4 evidence `REPORT.md`. This proves the combined contract on that frozen
+surface, not a general task-failure rate or a causal performance gain.
+
+`TOOL-EDIT-02` remains open for the same frozen run on a clean source tree.
+Deterministic external-race/crash/disk/journal fault coverage and staged-byte
+accounting are the next breadth/reliability work; they are not evidence that
+the 12-cell diagnostic failed. Clones share the lease and a second official
+`Workspace::open` on the same root is refused by the authority-journal lock;
+direct or authority-bypassing filesystem writers remain outside it, and
+hash→replace is not a filesystem CAS. Typed rollback now confirms cleanup and
+terminal journals or returns `RecoveryRequired`; staged/composite rollback
+attempts every child with bounded diagnostics, and Core fences later mutation
+instead of reporting a plain rejection. Runtime projects preparation-time and
+commit-rejection cleanup uncertainty separately as
+`execution_cleanup_recovery_required` and
+`not_applied_cleanup_recovery_required`, without preserving proposed
+revisions as facts. Core-managed prepare crash seams after authority intent,
+stage sync, and review record are mapped and recover conservatively. The
+trusted context-free prepare entry remains non-crash-recoverable; partial,
+substituted, or colliding stage content is retained as `Ambiguous` rather than
+deleted. A multi-file effect remains sequential with honest partial recovery.
+This V1-candidate gate runs in parallel with — and does not replace or close —
 the M12 → M13 mainline.
 
 ## Next milestone

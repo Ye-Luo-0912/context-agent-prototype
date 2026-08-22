@@ -154,37 +154,41 @@ pub(crate) fn search_catalog(
     state: &State,
     query: &agent_contracts::ContextSearchQuery,
 ) -> Vec<ExternalizedContext> {
-    let projected: Vec<ExternalizedContext> = match state.catalog.search_ids(query) {
-        Some(ids) => ids
-            .into_iter()
-            .filter_map(|id| project_search_hit(state, id))
-            .collect(),
-        None => project_all_live(state),
-    };
-    search_entries(projected.iter(), query)
+    match state.catalog.search_ids(query) {
+        Some(ids) => search_entries(
+            ids.into_iter()
+                .filter_map(|id| project_search_hit(state, id)),
+            query,
+        ),
+        None => search_entries(residual_live_candidates(state), query),
+    }
 }
 
-fn project_all_live(state: &State) -> Vec<ExternalizedContext> {
-    let mut rows = Vec::new();
-    for item in state.items.iter() {
-        if item.semantic.is_live() {
-            rows.push(project_item(item));
-        }
-    }
-    for item in &state.eviction_buffer {
-        if item.semantic.is_live() {
-            rows.push(project_item(item));
-        }
-    }
-    rows.extend(
-        state
-            .external
-            .iter()
-            .filter(|entry| externally_retrievable(entry))
-            .cloned()
-            .map(prompt_evidence_descriptor),
-    );
-    rows
+/// Lazy residual scan for a free-text needle that hit no catalog index
+/// key. Candidates are projected one at a time — the bounded heap inside
+/// `search_entries` keeps only the best `limit` rows — so memory stays
+/// O(limit) instead of cloning every live projection up front.
+fn residual_live_candidates(state: &State) -> impl Iterator<Item = ExternalizedContext> + '_ {
+    state
+        .items
+        .iter()
+        .filter(|item| item.semantic.is_live())
+        .map(project_item)
+        .chain(
+            state
+                .eviction_buffer
+                .iter()
+                .filter(|item| item.semantic.is_live())
+                .map(project_item),
+        )
+        .chain(
+            state
+                .external
+                .iter()
+                .filter(|entry| externally_retrievable(entry))
+                .cloned()
+                .map(prompt_evidence_descriptor),
+        )
 }
 
 pub(crate) fn catalog_body(state: &State, id: ContextItemId) -> Option<ContextItem> {
@@ -291,9 +295,16 @@ fn evidence_ref_identity(entry: &ExternalizedContext) -> Option<String> {
     }
 }
 
-/// Rank and cap an iterator of map entries. Memory stays O(limit).
-pub(crate) fn search_entries<'a>(
-    entries: impl IntoIterator<Item = &'a ExternalizedContext>,
+/// Rank and cap owned candidate projections. Memory stays O(limit): the
+/// heap holds at most `limit` rows and every non-surviving candidate is
+/// dropped as soon as it loses.
+///
+/// A needle verifies against an entry by whole substring first; multi-word
+/// needles fall back to requiring *every* token (shared `tokenize` rule)
+/// to appear in that entry's matchable text, so catalog token recall
+/// survives verification without loosening precision to any-word matches.
+pub(crate) fn search_entries(
+    entries: impl IntoIterator<Item = ExternalizedContext>,
     query: &agent_contracts::ContextSearchQuery,
 ) -> Vec<ExternalizedContext> {
     let needle = query.query.to_lowercase();
@@ -301,6 +312,12 @@ pub(crate) fn search_entries<'a>(
     if limit == 0 {
         return Vec::new();
     }
+
+    // 多词 needle 的覆盖校验输入：共享 tokenize 规则，去重保序。单
+    // token 时兜底退化为整段子串本身，直接关闭；复用缓冲避免逐条分配。
+    let needle_tokens = agent_contracts::tokenize(&needle);
+    let token_verify = needle_tokens.len() > 1;
+    let mut haystack = String::new();
 
     // A max-heap of the `limit` *best* matches so far: the peek is the
     // current worst kept, and a better candidate (smaller under
@@ -311,7 +328,7 @@ pub(crate) fn search_entries<'a>(
     // externalization order, then id).
     let mut top: BinaryHeap<SearchEntry> = BinaryHeap::with_capacity(limit.min(64));
     for entry in entries {
-        if !externally_retrievable(entry) {
+        if !externally_retrievable(&entry) {
             continue;
         }
         if let Some(kind) = query.kind
@@ -353,7 +370,29 @@ pub(crate) fn search_entries<'a>(
             && !entry.context_ref.summary.to_lowercase().contains(&needle)
             && !entry.context_ref.uri.to_lowercase().contains(&needle)
         {
-            continue;
+            // 整段未命中时的确定性兜底：候选层已按 token 召回多词查询，
+            // 校验若仍要求整段子串会把它们全部拒掉。改为要求 needle 的
+            // 每个 token（共享 tokenize 规则，≥2 字符）都出现在本条目的
+            // 可匹配文本里——AND 语义，不放宽为任意单词命中。
+            if !token_verify {
+                continue;
+            }
+            haystack.clear();
+            for entity in &entry.entities {
+                haystack.push_str(entity);
+                haystack.push(' ');
+            }
+            if let Some(path) = entry.file_path.as_deref() {
+                haystack.push_str(path);
+                haystack.push(' ');
+            }
+            haystack.push_str(&entry.context_ref.summary);
+            haystack.push(' ');
+            haystack.push_str(&entry.context_ref.uri);
+            let lowered = haystack.to_lowercase();
+            if !needle_tokens.iter().all(|t| lowered.contains(t.as_str())) {
+                continue;
+            }
         }
         let candidate = SearchEntry {
             entity_match: entity_match || path_match,
@@ -371,36 +410,36 @@ pub(crate) fn search_entries<'a>(
     }
     let mut rows: Vec<SearchEntry> = top.into_vec();
     rows.sort();
-    rows.into_iter().map(|row| row.entry.clone()).collect()
+    rows.into_iter().map(|row| row.entry).collect()
 }
 
 /// One search hit under its ranking key, so the bounded heap can order by
 /// the exact same comparison the previous full sort used: entity matches
 /// first, then recency, then externalization order, then id (ascending).
 /// `ContextItemId` itself is not `Ord`; the id's `Uuid` is.
-struct SearchEntry<'a> {
+struct SearchEntry {
     entity_match: bool,
     last_access_tick: u64,
     externalized_at_tick: u64,
     id: ContextItemId,
-    entry: &'a ExternalizedContext,
+    entry: ExternalizedContext,
 }
 
-impl PartialEq for SearchEntry<'_> {
+impl PartialEq for SearchEntry {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
 }
 
-impl Eq for SearchEntry<'_> {}
+impl Eq for SearchEntry {}
 
-impl PartialOrd for SearchEntry<'_> {
+impl PartialOrd for SearchEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for SearchEntry<'_> {
+impl Ord for SearchEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         other
             .entity_match
@@ -1212,7 +1251,7 @@ mod tests {
         }
 
         let hits = search_entries(
-            &entries,
+            entries.clone(),
             &agent_contracts::ContextSearchQuery::new("AuthService", 2),
         );
         assert_eq!(hits.len(), 2, "the limit caps the answer");
@@ -1232,12 +1271,95 @@ mod tests {
 
         // No limit: all three matches, newest first.
         let all = search_entries(
-            &entries,
+            entries,
             &agent_contracts::ContextSearchQuery::new("AuthService", 0),
         );
         assert_eq!(all.len(), 3);
         let ticks: Vec<u64> = all.iter().map(|e| e.last_access_tick).collect();
         assert_eq!(ticks, vec![3, 2, 0], "recency-descending");
+    }
+
+    #[test]
+    fn multi_word_needles_verify_by_token_coverage() {
+        let entry_for = |summary: &str| {
+            let item = test_item(ContextItemId::new(), summary);
+            let reference = ContextRef {
+                uri: format!("context://run/{}", item.id),
+                item_id: item.id,
+                kind: item.kind,
+                scope: item.scope,
+                summary: summary.to_string(),
+                created_tick: 0,
+            };
+            to_external_entry(&item, reference, 1, 1, None)
+        };
+        let entries = vec![
+            entry_for("auth service token refresh timeout raised after load test"),
+            entry_for("db connection pool sized for burst traffic"),
+            entry_for("timeout budget documented for batch jobs"),
+        ];
+
+        // Every token must land in ONE entry: the auth doc passes even
+        // though "auth timeout" is nowhere contiguous, while the entry
+        // holding only "timeout" must not leak into the answer.
+        let both = search_entries(
+            entries.clone(),
+            &agent_contracts::ContextSearchQuery::new("auth timeout", 8),
+        );
+        assert_eq!(both.len(), 1);
+        assert!(both[0].context_ref.summary.contains("auth service"));
+
+        let split = search_entries(
+            entries,
+            &agent_contracts::ContextSearchQuery::new("pool timeout", 8),
+        );
+        assert!(
+            split.is_empty(),
+            "tokens spread across different entries must NOT merge-match"
+        );
+    }
+
+    #[test]
+    fn catalog_candidates_survive_verification_end_to_end() {
+        let mut state = State::default();
+        let mut resident = Vec::new();
+        for content in [
+            "Decision: auth service token refresh timeout raised after load test",
+            "Decision: db connection pool sized for burst traffic",
+            "Decision: cache eviction switched to lru approximation",
+        ] {
+            let mut item = make_item(
+                &state,
+                &SimpleContextConfig::default(),
+                content.into(),
+                ContextKind::Decision,
+                ContextScope::Task,
+                agent_contracts::ContextRetention::Working,
+                0.6,
+                Some("ab".into()),
+            );
+            item.id = ContextItemId::new();
+            state.items.push(item.clone());
+            resident.push(item);
+        }
+        state.catalog.rebuild(&resident[..], &[], &[]);
+
+        let hits = search_catalog(
+            &state,
+            &agent_contracts::ContextSearchQuery::new("auth timeout", 8),
+        );
+        assert_eq!(
+            hits.len(),
+            1,
+            "the inverted-index candidate must survive verification"
+        );
+        assert!(hits[0].context_ref.summary.contains("auth service"));
+
+        let none = search_catalog(
+            &state,
+            &agent_contracts::ContextSearchQuery::new("zzqq noth1ng", 8),
+        );
+        assert!(none.is_empty(), "a needle matching nothing stays empty");
     }
 
     #[test]
@@ -1960,6 +2082,373 @@ mod tests {
                 non_deletable(entry) || protected.contains(&entry.item_id),
                 "a strong-edge-reachable or non-deletable record must survive"
             );
+        }
+    }
+}
+
+// Search A/B harness: this SAME module runs against the pre-change
+// implementation (a HEAD worktree) and against the current one, measuring
+// store-level `search_catalog` hit rate and latency on a fixed non-file
+// corpus (Decision summaries/entities; file identity is out of scope).
+// Assertions cover only implementation-independent invariants so both
+// trees pass; the printed table carries the before/after numbers.
+#[cfg(test)]
+mod search_ab {
+    use super::{search_catalog, to_external_entry};
+    use crate::engine::{SimpleContextConfig, State};
+    use crate::item::make_item;
+    use agent_contracts::{
+        ContextItem, ContextItemId, ContextKind, ContextRef, ContextRetention, ContextScope,
+        ContextSearchQuery, ExternalizedContext,
+    };
+    use std::collections::HashMap;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    const LIMIT: usize = 50;
+    const ROUNDS: u32 = 200;
+
+    // Filler vocabulary shares no word with any planted needle token.
+    const TOPICS: [&str; 16] = [
+        "logging",
+        "metrics",
+        "tracing",
+        "config",
+        "schema",
+        "migration",
+        "index",
+        "queue",
+        "worker",
+        "cron",
+        "tls",
+        "dns",
+        "proxy",
+        "router",
+        "bundle",
+        "parser",
+    ];
+    const VERBS: [&str; 8] = [
+        "enabled",
+        "disabled",
+        "tuned",
+        "documented",
+        "reviewed",
+        "deferred",
+        "pinned",
+        "audited",
+    ];
+
+    struct Case {
+        name: &'static str,
+        category: &'static str,
+        needle: &'static str,
+        /// Keys into the planted-id map marking the relevant docs.
+        relevant: &'static [&'static str],
+    }
+
+    fn decision(state: &State, content: &str, tick: u64) -> ContextItem {
+        let mut item = make_item(
+            state,
+            &SimpleContextConfig::default(),
+            content.to_string(),
+            ContextKind::Decision,
+            ContextScope::Task,
+            ContextRetention::Working,
+            0.6,
+            Some("ab".into()),
+        );
+        item.last_access_tick = tick;
+        item
+    }
+
+    fn stored_entry(item: &ContextItem, tick: u64) -> ExternalizedContext {
+        let reference = ContextRef {
+            uri: format!("context://run/{}", item.id),
+            item_id: item.id,
+            kind: item.kind,
+            scope: item.scope,
+            summary: item.content.clone(),
+            created_tick: 0,
+        };
+        let mut entry = to_external_entry(item, reference, tick, 1, None);
+        entry.last_access_tick = tick;
+        entry
+    }
+
+    fn push_resident(
+        state: &mut State,
+        ids: &mut HashMap<&'static str, ContextItemId>,
+        key: &'static str,
+        content: &str,
+        tick: u64,
+    ) {
+        let item = decision(state, content, tick);
+        ids.insert(key, item.id);
+        state.items.push(item);
+    }
+
+    fn push_stored(
+        state: &mut State,
+        ids: &mut HashMap<&'static str, ContextItemId>,
+        key: &'static str,
+        content: &str,
+        tick: u64,
+    ) {
+        let item = decision(state, content, tick);
+        ids.insert(key, item.id);
+        let entry = stored_entry(&item, tick);
+        state.external.push(entry);
+    }
+
+    #[test]
+    fn ab_report() {
+        let build_start = Instant::now();
+        let mut state = State::default();
+        let mut ids: HashMap<&'static str, ContextItemId> = HashMap::new();
+
+        // Planted docs. Multi-word needles are never contiguous in any
+        // summary; partial-overlap distractors must never merge-match.
+        push_resident(
+            &mut state,
+            &mut ids,
+            "auth",
+            "Decision: auth service token refresh timeout raised after load test",
+            100,
+        );
+        push_resident(
+            &mut state,
+            &mut ids,
+            "pool",
+            "Decision: db pool sized for burst traffic; connection breaker added",
+            110,
+        );
+        push_resident(
+            &mut state,
+            &mut ids,
+            "retry",
+            "Decision: retry jitter added for flaky network calls under packet loss",
+            120,
+        );
+        push_resident(
+            &mut state,
+            &mut ids,
+            "pcache",
+            "Decision: cache eviction switched to lru approximation under memory pressure",
+            125,
+        );
+        push_resident(
+            &mut state,
+            &mut ids,
+            "entity",
+            "Decision: promote AuthGatewayService to production ring next week",
+            130,
+        );
+        push_resident(
+            &mut state,
+            &mut ids,
+            "d_timeout",
+            "Decision: timeout budget documented for batch jobs",
+            0,
+        );
+        push_resident(
+            &mut state,
+            &mut ids,
+            "d_pool",
+            "Decision: pool drain procedure sketched for maintenance",
+            0,
+        );
+        push_resident(
+            &mut state,
+            &mut ids,
+            "d_cache",
+            "Decision: cache warmup ordering sketched for rollout",
+            0,
+        );
+        let filler = |i: usize| {
+            format!(
+                "Decision: {} setup {} for component{}",
+                TOPICS[i % TOPICS.len()],
+                VERBS[(i / TOPICS.len()) % VERBS.len()],
+                i
+            )
+        };
+        let resident_count = 8 + 3 + 400;
+        for i in 0..400 {
+            let item = decision(&state, &filler(i), 0);
+            state.items.push(item);
+        }
+        push_stored(
+            &mut state,
+            &mut ids,
+            "rollback",
+            "Decision: deploy rollback shortened to a one-hour window",
+            140,
+        );
+        push_stored(
+            &mut state,
+            &mut ids,
+            "secret",
+            "Decision: secret rotation enforced nightly; lease bound to prod keys",
+            150,
+        );
+        let stored_count = 2 + 100;
+        for i in 400..500 {
+            let item = decision(&state, &filler(i), 0);
+            let entry = stored_entry(&item, 0);
+            state.external.push(entry);
+        }
+
+        state
+            .catalog
+            .rebuild(&state.items[..], &[], &state.external[..]);
+        println!(
+            "AB,meta,resident={},stored={},build_and_rebuild_us={}",
+            resident_count,
+            stored_count,
+            build_start.elapsed().as_micros()
+        );
+
+        let cases = [
+            Case {
+                name: "auth_timeout",
+                category: "multi_word",
+                needle: "auth timeout",
+                relevant: &["auth"],
+            },
+            Case {
+                name: "connection_pool",
+                category: "multi_word",
+                needle: "connection pool",
+                relevant: &["pool"],
+            },
+            Case {
+                name: "retry_flaky_network",
+                category: "multi_word",
+                needle: "retry flaky network",
+                relevant: &["retry"],
+            },
+            Case {
+                name: "cache_eviction_lru",
+                category: "multi_word",
+                needle: "cache eviction lru",
+                relevant: &["pcache"],
+            },
+            Case {
+                name: "rollback_window_stored",
+                category: "stored_multi_word",
+                needle: "rollback window",
+                relevant: &["rollback"],
+            },
+            Case {
+                name: "secret_rotation_stored",
+                category: "stored_multi_word",
+                needle: "secret rotation lease",
+                relevant: &["secret"],
+            },
+            Case {
+                name: "exact_entity",
+                category: "legacy_exact",
+                needle: "AuthGatewayService",
+                relevant: &["entity"],
+            },
+            Case {
+                name: "exact_entity_lowercase",
+                category: "legacy_exact",
+                needle: "authgatewayservice",
+                relevant: &["entity"],
+            },
+            Case {
+                name: "entity_substring",
+                category: "legacy_substring",
+                needle: "gatewayservice",
+                relevant: &["entity"],
+            },
+            Case {
+                name: "absent_terms",
+                category: "control",
+                needle: "zzqq noth1ng",
+                relevant: &[],
+            },
+        ];
+
+        println!("AB,row,name,category,hit1,hit5,first_rank,total_hits,us_per_query");
+        let mut first_rank_by_case: Vec<Option<usize>> = Vec::new();
+        let mut sequences: Vec<Vec<ContextItemId>> = Vec::new();
+        for case in &cases {
+            let relevant_ids: Vec<ContextItemId> = case
+                .relevant
+                .iter()
+                .filter_map(|k| ids.get(*k).copied())
+                .collect();
+            let start = Instant::now();
+            let mut last_hits: Vec<ContextItemId> = Vec::new();
+            for _ in 0..ROUNDS {
+                let hits = search_catalog(&state, &ContextSearchQuery::new(case.needle, LIMIT));
+                last_hits = hits.iter().map(|e| e.item_id).collect();
+            }
+            black_box(&last_hits);
+            let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(ROUNDS);
+
+            let total = last_hits
+                .iter()
+                .filter(|id| relevant_ids.contains(id))
+                .count();
+            let first_rank = last_hits
+                .iter()
+                .position(|id| relevant_ids.contains(id))
+                .map(|p| p + 1);
+            first_rank_by_case.push(first_rank);
+            sequences.push(last_hits);
+            let hit1 = u32::from(first_rank == Some(1));
+            let hit5 = u32::from(first_rank.is_some_and(|r| r <= 5));
+            let rank = first_rank.map_or("-".to_string(), |r| r.to_string());
+            println!(
+                "AB,row,{},{},{},{},{},{},{:.1}",
+                case.name, case.category, hit1, hit5, rank, total, us
+            );
+        }
+
+        // Determinism: a second pass must reproduce identical id order.
+        for (case, first) in cases.iter().zip(sequences.clone()) {
+            let again = search_catalog(&state, &ContextSearchQuery::new(case.needle, LIMIT));
+            let again_ids: Vec<ContextItemId> = again.iter().map(|e| e.item_id).collect();
+            assert_eq!(first, again_ids, "case {} must be deterministic", case.name);
+        }
+
+        // Implementation-independent invariants (hold on BOTH sides).
+        for (case, first_rank) in cases.iter().zip(&first_rank_by_case) {
+            if case.category == "control" {
+                assert_eq!(*first_rank, None, "absent terms must stay empty");
+            }
+            if case.category == "legacy_exact" || case.category == "legacy_substring" {
+                assert_eq!(
+                    *first_rank,
+                    Some(1),
+                    "legacy whole-hit semantics must survive: {}",
+                    case.name
+                );
+            }
+        }
+
+        // Category rollup.
+        let mut categories: Vec<(&str, usize, u32, u32)> = Vec::new();
+        for (case, first_rank) in cases.iter().zip(&first_rank_by_case) {
+            let entry = categories
+                .iter_mut()
+                .find(|(name, _, _, _)| *name == case.category);
+            let hit1 = u32::from(*first_rank == Some(1));
+            let hit5 = u32::from(first_rank.is_some_and(|r| r <= 5));
+            match entry {
+                Some(row) => {
+                    row.1 += 1;
+                    row.2 += hit1;
+                    row.3 += hit5;
+                }
+                None => categories.push((case.category, 1, hit1, hit5)),
+            }
+        }
+        for (category, n, hit1, hit5) in categories {
+            println!("AB,summary,{category},cases={n},hit1={hit1}/{n},hit5={hit5}/{n}");
         }
     }
 }

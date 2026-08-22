@@ -491,6 +491,16 @@ pub(crate) fn eval_pred(
             let count = content.matches(needle).count();
             (count >= min.unwrap_or(0), count)
         }
+        // Exact raw-byte fixtures are UTF-8 and stored in verify.json only
+        // when the bounded body is complete. Hashing the preserved body
+        // makes CRLF/mixed-EOL checks replayable after the workspace is
+        // gone instead of relying on platform text normalization.
+        "sha256" => {
+            let expected = needles.first().copied().unwrap_or("");
+            let actual = hex_encode(Sha256::digest(content.as_bytes()));
+            let passed = !expected.is_empty() && actual == expected;
+            (passed, usize::from(passed))
+        }
         _ => (false, 0),
     }
 }
@@ -918,6 +928,17 @@ mod tests {
         assert!(report.replay_complete);
         drop(dir);
         assert!(reverify_from_report(&report).unwrap());
+    }
+
+    #[test]
+    fn sha256_predicate_distinguishes_raw_line_endings() {
+        let crlf = "alpha\r\nbeta\r\n";
+        let digest = hex_encode(Sha256::digest(crlf.as_bytes()));
+        assert_eq!(eval_pred(crlf, "sha256", &[&digest], None), (true, 1));
+        assert_eq!(
+            eval_pred("alpha\nbeta\n", "sha256", &[&digest], None),
+            (false, 0)
+        );
     }
 
     #[test]

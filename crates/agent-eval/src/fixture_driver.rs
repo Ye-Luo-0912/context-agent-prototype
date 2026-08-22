@@ -26,7 +26,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 use crate::context_bench::{self, BenchPack, BenchTask, TurnOp};
-use crate::{bundle, harvest, metrics, mock_model::ScriptedModel, suite, workload};
+use crate::tool_edit_pack::{self, FixtureMutationRecord, ToolEditOp, ToolEditPack, ToolEditTask};
+use crate::{bundle, harvest, metrics, mock_model::ScriptedModel, suite, tool_edit_gate, workload};
 
 /// 脚本化 fixture：事件之间最多等这么久（本机工具面，不该接近这个上限）。
 const SCRIPTED_IDLE: Duration = Duration::from_secs(120);
@@ -306,6 +307,168 @@ pub async fn compare_engines_live(
     pair: Option<&bundle::PairSink>,
 ) -> anyhow::Result<Vec<EngineRun>> {
     compare_engines_with_model(fixture, workspace_root, Some(model), pair).await
+}
+
+/// Focused Tool Edit V1 cell. This is intentionally one fixed dynamic
+/// context engine on the production default tool surface: it measures the
+/// canonical editor rather than comparing context policies.
+pub async fn run_tool_edit_live(
+    pack: &ToolEditPack,
+    task: &ToolEditTask,
+    workspace_root: &Path,
+    model: Arc<dyn ModelTransport>,
+    pair: Option<&bundle::PairSink>,
+) -> anyhow::Result<EngineRun> {
+    const CELL: &str = "production";
+
+    let root = workspace_root.join(CELL);
+    std::fs::create_dir_all(&root)?;
+    tool_edit_pack::seed_task(task, &root)?;
+    suite::ensure_workspace_git(&root)?;
+
+    let engine = named_engine("dynamic", Some(model.clone()))?;
+    let ops: Vec<HarnessOp> = task.file.ops.iter().map(HarnessOp::from).collect();
+    let session = run_workspace_session_harness_ops(
+        &root,
+        model,
+        engine.clone(),
+        &ops,
+        LIVE_LIMITS,
+        true,
+        EvalToolSurface::Production,
+    )
+    .await?;
+    let strict = tool_edit_pack::evaluate_strict(task, &root)?;
+    let gate = tool_edit_gate::analyze_cell(
+        task,
+        &session.events,
+        &session.fixture_mutations,
+        strict.passed,
+        session.error.is_none() && session.lagged == 0,
+    );
+    let passed = gate.passed;
+    let run_metrics = metrics::aggregate_metrics(&session.events);
+    let eval = FixtureEval {
+        fixture_id: task.id().to_string(),
+        passed,
+        metrics: run_metrics,
+        wall_ms: session.wall_ms,
+        error: session.error.clone(),
+    };
+
+    if let Some(pair) = pair {
+        let hidden_files: Vec<workload::HiddenFileBody> = task
+            .file
+            .golden_files
+            .iter()
+            .map(|file| workload::read_hidden_file(&root, &file.path))
+            .collect();
+        let assertions: Vec<workload::HiddenAssertionResult> = strict
+            .files
+            .iter()
+            .map(|file| workload::HiddenAssertionResult {
+                path: file.path.clone(),
+                pred: "sha256".into(),
+                needles: vec![file.expected_sha256.clone()],
+                min: None,
+                count: Some(usize::from(file.passed)),
+                passed: file.passed,
+                file_exists: file.actual_sha256.is_some(),
+            })
+            .collect();
+        let no_unexpected_files_passed =
+            strict.unexpected_files.is_empty() && !strict.unexpected_files_truncated;
+        let no_unexpected_files = workload::HiddenCommandResult {
+            argv: vec!["tool-edit.no-unexpected-files".into()],
+            expect_exit: 0,
+            exit: Some(if no_unexpected_files_passed { 0 } else { 1 }),
+            stderr: if no_unexpected_files_passed {
+                String::new()
+            } else if strict.unexpected_files.is_empty() {
+                "workspace scan truncated before proving no unexpected files".into()
+            } else {
+                let suffix = if strict.unexpected_files_truncated {
+                    ", ... (truncated)"
+                } else {
+                    ""
+                };
+                format!(
+                    "unexpected files: {}{suffix}",
+                    strict.unexpected_files.join(", ")
+                )
+            },
+            passed: no_unexpected_files_passed,
+            ..workload::HiddenCommandResult::default()
+        };
+        let hidden = workload::HiddenReport {
+            schema: workload::VERIFY_SCHEMA.to_string(),
+            kind: "file_content+command".into(),
+            fixture_id: task.id().to_string(),
+            expected_edit: task.file.expected_edit.clone(),
+            passed: strict.passed,
+            replay_complete: hidden_files.iter().all(|file| !file.truncated),
+            assertions,
+            files: hidden_files,
+            commands: vec![no_unexpected_files],
+        };
+        let cell_dir = pair.cell_dir(CELL);
+        bundle::write_cell_parts(
+            &cell_dir,
+            task.id(),
+            &tool_edit_pack::task_sha256(task)?,
+            CELL,
+            pair,
+            &session.events,
+            &eval.metrics,
+            eval.passed,
+            eval.wall_ms,
+            eval.error.as_deref(),
+            &root,
+            session.lagged,
+            session.deltas_omitted,
+            &hidden,
+        )?;
+        let sidecar = serde_json::json!({
+            "schema": tool_edit_pack::SCHEMA,
+            "fixture_id": task.id(),
+            "surface": "production-default",
+            "context_engine": "dynamic",
+            "gate_schema": tool_edit_gate::SCHEMA,
+            "gate_implementation_sha256": tool_edit_gate::implementation_sha256(),
+            "strict": &strict,
+            "gate": &gate,
+            "trace_contract": &task.file.trace,
+            "fixture_mutations": &session.fixture_mutations,
+        });
+        std::fs::write(
+            cell_dir.join("tool-edit.json"),
+            serde_json::to_string_pretty(&sidecar)?,
+        )?;
+        std::fs::write(
+            cell_dir.join("gate.json"),
+            serde_json::to_string_pretty(&gate)?,
+        )?;
+        bundle::write_pair_doc(
+            pair,
+            &[CELL],
+            tool_edit_pack::SCHEMA,
+            &serde_json::json!({
+                "spec_sha256": tool_edit_pack::spec_sha256(),
+                "pack_digest": tool_edit_pack::pack_digest(pack)?,
+                "task_sha256": tool_edit_pack::task_sha256(task)?,
+                "surface": "production-default",
+                "context_engine": "dynamic",
+                "gate_schema": tool_edit_gate::SCHEMA,
+                "gate_implementation_sha256": tool_edit_gate::implementation_sha256(),
+            }),
+        )?;
+    }
+
+    Ok(EngineRun {
+        engine: CELL,
+        manager_tokens: manager_token_cost(engine.as_ref()).await?,
+        eval,
+    })
 }
 
 /// 套件 live：独立 workspace、打乱臂序、可执行 hidden command。
@@ -796,6 +959,55 @@ struct WorkspaceSession {
     deltas_omitted: u64,
     wall_ms: u64,
     error: Option<String>,
+    fixture_mutations: Vec<FixtureMutationRecord>,
+}
+
+enum HarnessOp {
+    User {
+        text: String,
+    },
+    Suspend,
+    Activate {
+        slot: String,
+    },
+    Complete {
+        summary: Option<String>,
+    },
+    FixtureReplace {
+        path: String,
+        expected_sha256: String,
+        content: String,
+    },
+}
+
+impl From<&TurnOp> for HarnessOp {
+    fn from(op: &TurnOp) -> Self {
+        match op {
+            TurnOp::User { text } => Self::User { text: text.clone() },
+            TurnOp::Suspend => Self::Suspend,
+            TurnOp::Activate { slot } => Self::Activate { slot: slot.clone() },
+            TurnOp::Complete { summary } => Self::Complete {
+                summary: summary.clone(),
+            },
+        }
+    }
+}
+
+impl From<&ToolEditOp> for HarnessOp {
+    fn from(op: &ToolEditOp) -> Self {
+        match op {
+            ToolEditOp::User { text } => Self::User { text: text.clone() },
+            ToolEditOp::FixtureReplace {
+                path,
+                expected_sha256,
+                content,
+            } => Self::FixtureReplace {
+                path: path.clone(),
+                expected_sha256: expected_sha256.clone(),
+                content: content.clone(),
+            },
+        }
+    }
 }
 
 async fn run_workspace_session(
@@ -806,13 +1018,13 @@ async fn run_workspace_session(
     limits: TurnLimits,
     tool_surface: EvalToolSurface,
 ) -> anyhow::Result<WorkspaceSession> {
-    let ops: Vec<TurnOp> = turns
+    let ops: Vec<HarnessOp> = turns
         .iter()
-        .map(|text| TurnOp::User {
+        .map(|text| HarnessOp::User {
             text: (*text).to_string(),
         })
         .collect();
-    run_workspace_session_ops(
+    run_workspace_session_harness_ops(
         workspace_root,
         model,
         context_engine,
@@ -834,10 +1046,34 @@ async fn run_workspace_session_ops(
     project_task_progress: bool,
     tool_surface: EvalToolSurface,
 ) -> anyhow::Result<WorkspaceSession> {
+    let ops: Vec<HarnessOp> = ops.iter().map(HarnessOp::from).collect();
+    run_workspace_session_harness_ops(
+        workspace_root,
+        model,
+        context_engine,
+        &ops,
+        limits,
+        project_task_progress,
+        tool_surface,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_workspace_session_harness_ops(
+    workspace_root: &Path,
+    model: Arc<dyn ModelTransport>,
+    context_engine: Arc<dyn ContextEngine>,
+    ops: &[HarnessOp],
+    limits: TurnLimits,
+    project_task_progress: bool,
+    tool_surface: EvalToolSurface,
+) -> anyhow::Result<WorkspaceSession> {
     let started = Instant::now();
     let approval: Arc<dyn ApprovalGate> = Arc::new(AllowAllGate);
 
     let workspace = agent_workspace::Workspace::open(workspace_root).await?;
+    let fixture_workspace = workspace.clone();
     let tools: Arc<dyn ToolDispatcher> =
         Arc::new(tool_runtime::BuiltinToolDispatcher::with_config(
             workspace.clone(),
@@ -864,9 +1100,10 @@ async fn run_workspace_session_ops(
     let mut capture = EventCapture::default();
     let mut error = None;
     let mut slots: HashMap<String, TaskId> = HashMap::new();
+    let mut fixture_mutations = Vec::new();
     for (index, op) in ops.iter().enumerate() {
         let result = match op {
-            TurnOp::User { text } => {
+            HarnessOp::User { text } => {
                 composed.handle().user_message(text.clone()).await?;
                 let waited =
                     wait_for_turn(&mut events, &mut capture, composed.handle(), limits).await;
@@ -882,12 +1119,12 @@ async fn run_workspace_session_ops(
                 }
                 waited
             }
-            TurnOp::Suspend => composed
+            HarnessOp::Suspend => composed
                 .handle()
                 .suspend_task()
                 .await
                 .map_err(|err| err.to_string()),
-            TurnOp::Activate { slot } => {
+            HarnessOp::Activate { slot } => {
                 let Some(task_id) = slots.get(slot).copied() else {
                     error = Some(format!("op {} activate: unknown slot {slot}", index + 1));
                     break;
@@ -898,11 +1135,26 @@ async fn run_workspace_session_ops(
                     .await
                     .map_err(|err| err.to_string())
             }
-            TurnOp::Complete { summary } => composed
+            HarnessOp::Complete { summary } => composed
                 .handle()
                 .complete_current_task(summary.clone().unwrap_or_else(|| "done".into()))
                 .await
                 .map_err(|err| err.to_string()),
+            HarnessOp::FixtureReplace {
+                path,
+                expected_sha256,
+                content,
+            } => apply_fixture_replace(
+                &fixture_workspace,
+                index + 1,
+                path,
+                expected_sha256,
+                content,
+                capture.events.last().map(|event| event.seq),
+            )
+            .await
+            .map(|record| fixture_mutations.push(record))
+            .map_err(|err| err.to_string()),
         };
         if let Err(reason) = result {
             error = Some(format!("op {} failed: {reason}", index + 1));
@@ -921,7 +1173,64 @@ async fn run_workspace_session_ops(
         deltas_omitted: capture.deltas_omitted,
         wall_ms: started.elapsed().as_millis() as u64,
         error,
+        fixture_mutations,
     })
+}
+
+const FIXTURE_REPLACE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+async fn apply_fixture_replace(
+    workspace: &agent_workspace::Workspace,
+    op_index: usize,
+    path: &str,
+    expected_sha256: &str,
+    content: &str,
+    event_seq_before: Option<u64>,
+) -> anyhow::Result<FixtureMutationRecord> {
+    anyhow::ensure!(
+        content.len() <= FIXTURE_REPLACE_MAX_BYTES,
+        "fixture replacement for {path} exceeds {FIXTURE_REPLACE_MAX_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        expected_sha256.len() == 64
+            && expected_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "fixture replacement for {path} has an invalid expected sha256"
+    );
+    let mut snapshots = workspace
+        .begin_existing_mutations(
+            "agent-eval.fixture",
+            "replace between completed turns",
+            &[path.to_string()],
+            FIXTURE_REPLACE_MAX_BYTES,
+        )
+        .await?;
+    let snapshot = snapshots
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("fixture replacement snapshot missing for {path}"))?;
+    let (transaction, before) = snapshot.into_parts();
+    let before_sha256 = sha256_hex(&before);
+    anyhow::ensure!(
+        before_sha256 == expected_sha256,
+        "fixture replacement CAS refused for {path}: expected {expected_sha256}, observed {before_sha256}"
+    );
+    transaction.apply(content.as_bytes()).await?;
+    Ok(FixtureMutationRecord {
+        op_index,
+        path: path.replace('\\', "/"),
+        before_sha256,
+        after_sha256: sha256_hex(content.as_bytes()),
+        bytes_after: content.len(),
+        event_seq_before,
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 async fn drain_after_shutdown(
@@ -1133,6 +1442,79 @@ pub async fn compare_mech_live(
             &serde_json::json!({
                 "mechanism": task.file.scenario,
                 "spec_sha256": crate::context_mech::spec_sha256(),
+                "task_id": task.id(),
+            }),
+        )?;
+    }
+    Ok(runs)
+}
+
+/// Same cells as [`compare_mech_live`], but the A and C engines run
+/// concurrently in independent workspaces. The model calls dominate wall
+/// time, so pairing them roughly halves cell latency without changing
+/// either engine's trajectory. Results are returned in arm order.
+/// `schema` / `spec_sha256` stamp the pair document with the caller's
+/// pack identity so longflow evidence is not mislabeled as mech v2.
+pub async fn compare_mech_live_parallel(
+    pack: &BenchPack,
+    task: &BenchTask,
+    workspace_root: &Path,
+    model: Arc<dyn ModelTransport>,
+    pair: Option<&bundle::PairSink>,
+    schema: &str,
+    spec_sha256: String,
+) -> anyhow::Result<Vec<EngineRun>> {
+    let limits = LIVE_LIMITS;
+    let repeat = pair.map(|p| p.repeat).unwrap_or(1);
+    let order = bench_arm_order(task, repeat);
+    anyhow::ensure!(
+        order.len() == crate::context_mech::MECH_ENGINES
+            && order.contains(&"append")
+            && order.contains(&"dynamic")
+            && !order.contains(&"rolling"),
+        "{} mech live must be A/C, got {order:?}",
+        task.id()
+    );
+    let first = order[0];
+    let second = order[1];
+    let run_one = |name: &'static str| {
+        let model = model.clone();
+        async move {
+            let engine = named_engine(name, Some(model.clone()))?;
+            let root = workspace_root.join(name);
+            std::fs::create_dir_all(&root)?;
+            context_bench::seed_task(pack, task, &root)?;
+            suite::ensure_workspace_git(&root)?;
+            let eval = run_bench_with_engine(
+                pack,
+                task,
+                &root,
+                model.clone(),
+                engine.clone(),
+                limits,
+                name,
+                pair,
+                true,
+            )
+            .await?;
+            let manager_tokens = manager_token_cost(engine.as_ref()).await?;
+            anyhow::Ok(EngineRun {
+                engine: name,
+                eval,
+                manager_tokens,
+            })
+        }
+    };
+    let (first_run, second_run) = tokio::join!(run_one(first), run_one(second));
+    let runs = vec![first_run?, second_run?];
+    if let Some(pair) = pair {
+        bundle::write_pair_doc(
+            pair,
+            &order,
+            schema,
+            &serde_json::json!({
+                "mechanism": task.file.scenario,
+                "spec_sha256": spec_sha256,
                 "task_id": task.id(),
             }),
         )?;
@@ -1419,6 +1801,179 @@ mod tests {
                 .iter()
                 .any(|envelope| matches!(envelope.event, RuntimeEvent::RunCompleted)),
             "shutdown must drain RunCompleted into the evidence stream"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fixture_replace_is_cas_checked_and_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.txt");
+        std::fs::write(&path, "before\r\n").unwrap();
+        let expected_sha256 = sha256_hex(b"before\r\n");
+        let ops = vec![HarnessOp::FixtureReplace {
+            path: "state.txt".into(),
+            expected_sha256: expected_sha256.clone(),
+            content: "after\r\n".into(),
+        }];
+        let session = run_workspace_session_harness_ops(
+            dir.path(),
+            Arc::new(ScriptedModel::new(Vec::new(), "ok")),
+            named_engine("append", None).unwrap(),
+            &ops,
+            SCRIPTED_LIMITS,
+            true,
+            EvalToolSurface::ScriptedPin,
+        )
+        .await
+        .unwrap();
+        assert!(session.error.is_none(), "{:?}", session.error);
+        assert_eq!(std::fs::read(&path).unwrap(), b"after\r\n");
+        assert_eq!(session.fixture_mutations.len(), 1);
+        assert_eq!(session.fixture_mutations[0].before_sha256, expected_sha256);
+        assert_eq!(
+            session.fixture_mutations[0].after_sha256,
+            sha256_hex(b"after\r\n")
+        );
+
+        let workspace = agent_workspace::Workspace::open(dir.path()).await.unwrap();
+        let error = apply_fixture_replace(
+            &workspace,
+            2,
+            "state.txt",
+            &sha256_hex(b"stale\r\n"),
+            "must-not-land\r\n",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("CAS refused"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"after\r\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fixture_mutation_records_the_completed_turn_event_boundary() {
+        let pack = tool_edit_pack::load_pack().unwrap();
+        let task = pack.task("stale_revision_recovery").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tool_edit_pack::seed_task(task, dir.path()).unwrap();
+        let path = "src/retry.cfg";
+        let model: Arc<dyn ModelTransport> = Arc::new(
+            ScriptedModel::new(
+                vec![
+                    ToolCall {
+                        id: "before".into(),
+                        name: "fs.read".into(),
+                        arguments: json!({"path": path}),
+                    },
+                    ToolCall {
+                        id: "after".into(),
+                        name: "fs.read".into(),
+                        arguments: json!({"path": path}),
+                    },
+                ],
+                "done",
+            )
+            .one_tool_per_turn(),
+        );
+        let ops: Vec<HarnessOp> = task.file.ops.iter().map(HarnessOp::from).collect();
+        let session = run_workspace_session_harness_ops(
+            dir.path(),
+            model,
+            named_engine("dynamic", None).unwrap(),
+            &ops,
+            SCRIPTED_LIMITS,
+            true,
+            EvalToolSurface::Production,
+        )
+        .await
+        .unwrap();
+
+        assert!(session.error.is_none(), "{:?}", session.error);
+        let [mutation] = session.fixture_mutations.as_slice() else {
+            panic!("expected one fixture mutation")
+        };
+        let boundary = mutation
+            .event_seq_before
+            .expect("new runs bind mutation seq");
+        assert!(session.events.iter().any(|event| {
+            event.seq == boundary && matches!(event.event, RuntimeEvent::TurnCompleted)
+        }));
+        assert!(session.events.iter().any(|event| event.seq > boundary));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tool_edit_cell_uses_production_surface_and_writes_sidecars() {
+        let pack = tool_edit_pack::load_pack().unwrap();
+        let task = pack.task("crlf_multi_hunk").unwrap();
+        let revision = task.file.seed_files[0].sha256.clone();
+        let model: Arc<dyn ModelTransport> = Arc::new(ScriptedModel::new(
+            vec![
+                ToolCall {
+                    id: "read".into(),
+                    name: "fs.read".into(),
+                    arguments: json!({"path": "src/settings.cfg"}),
+                },
+                ToolCall {
+                    id: "patch".into(),
+                    name: "edit.patch".into(),
+                    arguments: json!({
+                        "files": [{
+                            "path": "src/settings.cfg",
+                            "base_revision": revision,
+                            "hunks": [
+                                {"old": "mode=legacy", "new": "mode=strict"},
+                                {"old": "timeout=30", "new": "timeout=45"}
+                            ]
+                        }]
+                    }),
+                },
+            ],
+            "done",
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = dir.path().join("evidence");
+        let workspace = dir.path().join("workspace");
+        let pair = bundle::PairSink {
+            root: evidence,
+            fixture_id: task.id().to_string(),
+            repeat: 1,
+            repeats: 1,
+            live: false,
+        };
+
+        let run = run_tool_edit_live(&pack, task, &workspace, model, Some(&pair))
+            .await
+            .unwrap();
+        let strict = tool_edit_pack::evaluate_strict(task, &workspace.join("production")).unwrap();
+        assert!(
+            run.eval.passed,
+            "error={:?} strict={strict:?} actual={:?}",
+            run.eval.error,
+            std::fs::read(workspace.join("production/src/settings.cfg"))
+        );
+        assert_eq!(run.engine, "production");
+        let cell = pair.cell_dir("production");
+        assert!(cell.join("manifest.json").is_file());
+        assert!(cell.join("summary.json").is_file());
+        assert!(cell.join("verify.json").is_file());
+        assert!(cell.join("gate.json").is_file());
+        let hidden: workload::HiddenReport =
+            serde_json::from_str(&std::fs::read_to_string(cell.join("verify.json")).unwrap())
+                .unwrap();
+        assert!(workload::reverify_from_report(&hidden).unwrap());
+        let sidecar: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cell.join("tool-edit.json")).unwrap())
+                .unwrap();
+        assert_eq!(sidecar["surface"], "production-default");
+        assert_eq!(sidecar["context_engine"], "dynamic");
+        assert_eq!(sidecar["strict"]["passed"], true);
+        assert_eq!(sidecar["gate"]["passed"], true);
+        assert!(
+            pair.root
+                .join(task.id())
+                .join("r1")
+                .join("pair.json")
+                .is_file()
         );
     }
 

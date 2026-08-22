@@ -1,10 +1,10 @@
 {
-  "generated": "2026-08-11",
+  "generated": "2026-08-22",
   "purpose": "TOOLS-01 machine-readable matrix: inventory of the current tool schemas, limits, context dispositions, effects and platform behavior as of this commit. The code remains authoritative; this file is the ACI specification input for TOOLS-02/03/04.",
   "surface": {
-    "core": ["fs.list", "fs.read", "artifact.read", "search.grep", "task.complete"],
+    "core": ["fs.list", "fs.read", "artifact.read", "search.grep", "edit.patch", "task.complete"],
     "control": ["capability.manage"],
-    "catalog_optional": ["fs.write", "edit.replace", "edit.patch", "git.status", "git.diff", "shell.exec", "process.run", "process.session", "code.symbols", "code.diagnostics", "context.manage"]
+    "catalog_optional": ["fs.write", "edit.replace", "git.status", "git.diff", "shell.exec", "process.run", "process.session", "code.symbols", "code.diagnostics", "context.manage"]
   },
   "global_limits": {
     "MAX_TOOL_MODEL_CONTENT_CHARS": 16000,
@@ -18,7 +18,8 @@
     "MAX_TOOL_SURFACE_REPORT_BLOCKED": 32,
     "MAX_TOOL_SURFACE_REPORT_NAME_BYTES": 64,
     "CONTEXT_SEARCH_MAX_LIMIT": 50,
-    "CONTEXT_MAP_VIEW_CAP": 32
+    "CONTEXT_MAP_VIEW_CAP": 32,
+    "MAX_CHANGE_RECORD_BYTES": 2097152
   },
   "tools": {
     "fs.list": {
@@ -46,12 +47,13 @@
         "end_line": {"type": "integer", "minimum": 1}
       },
       "limits": {
-        "max_read_bytes": 2097152,
+        "max_read_bytes": 4194304,
         "max_read_lines": 400,
-        "note": "file larger than max_read_bytes is rejected outright (use a narrower tool)"
+        "note": "file larger than max_read_bytes is rejected outright (use a narrower tool); line rendering scans once and allocates only the returned at-most-400-line window, not an index for every line in the file"
       },
       "output": {
-        "revision": "SHA-256 hex of the file bytes; stable for identical content, changes with any edit — the edit.patch base_revision precondition is checked against it"
+        "revision": "SHA-256 hex of the exact file bytes; stable for identical content, changes with any edit — the edit.patch base_revision precondition is checked against it",
+        "line_ending": "none | lf | crlf | mixed; raw-file style used by the newline-token-exact edit contract"
       },
       "effects": ["read:workspace"],
       "context_disposition": "PersistObservation",
@@ -103,27 +105,26 @@
         "path": {"type": "string", "required": true},
         "content": {"type": "string", "required": true}
       },
-      "limits": {"note": "state dir (.focus-agent) rejected via resolve_mutation; journaled transaction"},
-      "effects": ["write:workspace", "journal:changes.jsonl"],
+      "limits": {"max_file_bytes": 4194304, "note": "content above the real-byte cap is refused before staging; the parent directory must already exist and directory topology is never created implicitly; state dir (.focus-agent) is rejected via resolve_mutation; same-Workspace same-path writers hold one canonical path lease from begin through settlement; the prepared effect compares the target snapshot again before replace, detecting external drift already visible at that check without claiming filesystem atomic CAS"},
+      "effects": ["write:workspace", "journal:changes.jsonl", "journal:authority/workspace-effects.jsonl"],
       "context_disposition": "PersistObservation",
       "platform": {}
     },
     "edit.patch": {
       "risk": "WorkspaceWrite",
-      "surface_class": "catalog_optional",
+      "surface_class": "core",
       "schema": {
-        "files": {"type": "array", "note": "multi-file form: [{path, base_revision?, hunks:[{old, new, occurrence?}]}]; max 16 files, max 64 hunks per call"},
-        "path": {"type": "string", "note": "single-file shortcut, mutually exclusive with files"},
-        "base_revision": {"type": "string", "note": "single-file shortcut revision from fs.read"},
-        "hunks": {"type": "array", "note": "single-file shortcut hunks"}
+        "files": {"type": "array", "required": true, "note": "the only model-visible form: [{path, base_revision, hunks:[{old, new, occurrence?}]}]; every base_revision is required lower-hex SHA-256 copied from fs.read; max 16 files and 64 total hunks per call"}
       },
+      "parser_compatibility": "legacy top-level path/base_revision/hunks and omitted revisions remain input-only compatibility for older callers; they are not advertised to the model",
       "limits": {
         "max_file_bytes": 4194304,
         "max_files": 16,
         "max_hunks": 64,
-        "note": "base_revision mismatch refuses the edit (file changed since it was read); hunks apply in order and each old must match exactly once unless occurrence is given; each file commit is atomic, but a multi-file composite commits sequentially and is not a cross-file transaction; a later failure cleans unattempted preparations and reports any partial application as recovery-required; old content captured to the change journal"
+        "success_echo_chars": 1200,
+        "note": "canonical target keys are deduplicated and locked in sorted order before any read; one pinned bounded snapshot per file feeds transform, revision, recovery hash and bounded backup, and the shared lease group is held through composite settlement; base_revision refuses stale input; matching is newline-token exact (LF equals CRLF only, lone CR and every non-EOL byte remain literal), with mixed matches mapped back to exact raw spans and new EOLs reconstructed from the matched region; ordinary occurrence scanning is constant-memory and mixed replace-all uses monotonic mapping without collecting offsets; projected output and the workspace boundary both enforce max_file_bytes; the commit-time re-check detects external drift already visible but hash-to-rename is not atomic CAS against writers outside the shared Workspace; each file commit is atomic, while a multi-file composite commits sequentially and is not a cross-file transaction; a later staging failure rolls back prepared siblings, and a later commit conflict/failure reports any partial application as recovery-required; the combined multi-file success echo, including its marker, has one hard cap"
       },
-      "effects": ["write:workspace", "journal:changes.jsonl"],
+      "effects": ["write:workspace", "journal:changes.jsonl", "journal:authority/workspace-effects.jsonl"],
       "context_disposition": "PersistObservation",
       "platform": {}
     },
@@ -135,13 +136,15 @@
         "old": {"type": "string", "required": true, "note": "exact text; unambiguous single match unless occurrence/replace_all"},
         "new": {"type": "string", "required": true},
         "occurrence": {"type": "integer", "minimum": 1},
-        "replace_all": {"type": "boolean"}
+        "replace_all": {"type": "boolean"},
+        "base_revision": {"type": "string", "note": "exact raw revision returned by fs.read"}
       },
       "limits": {
         "max_file_bytes": 4194304,
-        "note": "no-op edits rejected; occurrence and replace_all are mutually exclusive; old content captured to the change journal when the file is small enough"
+        "success_echo_chars": 1200,
+        "note": "occurrence and replace_all are mutually exclusive; a canonical path lease is acquired before one pinned bounded snapshot supplies transform, revision, recovery hash and bounded backup; matching is newline-token exact (LF equals CRLF only), mixed matches preserve physical EOLs by ordinal, and lone CR/every non-EOL byte remain literal; ordinary occurrence scan is constant-memory, mixed replace-all does not collect offsets, and projected output is checked before allocation; the commit-time re-check rejects external drift already visible without claiming filesystem atomic CAS; old content is captured to the change journal when small enough"
       },
-      "effects": ["write:workspace", "journal:changes.jsonl"],
+      "effects": ["write:workspace", "journal:changes.jsonl", "journal:authority/workspace-effects.jsonl"],
       "context_disposition": "PersistObservation",
       "platform": {}
     },

@@ -1,0 +1,57 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "late_semantic_constraint",
+  "expected_edit": "add v2 Hello while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 3,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "5df913d2c2458b113be0513a7969f470c8c67b6cc4dd87f7b4839655db38e0e0",
+      "bytes": 899,
+      "truncated": false,
+      "body": "pub enum Msg {\r\n    Ping,\r\n    Hello(String),\r\n}\r\n\r\npub fn decode(bytes: &str) -> Result<Msg, String> {\r\n    if let Some(value) = bytes.strip_prefix(\"v:2:hello:\") {\r\n        return Ok(Msg::Hello(value.into()));\r\n    }\r\n    if bytes.contains(\"ping\") {\r\n        return Ok(Msg::Ping);\r\n    }\r\n    Err(\"unknown\".into())\r\n}\r\n\r\npub fn encode(msg: &Msg) -> String {\r\n    match msg {\r\n        Msg::Ping => \"ping\".into(),\r\n        Msg::Hello(value) => format!(\"v:2:hello:{value}\"),\r\n    }\r\n}\r\n\r\n#[cfg(test)]\r\nmod tests {\r\n    use super::{decode, encode, Msg};\r\n\r\n    #[test]\r\n    fn ping_encode_roundtrip() {\r\n        assert!(matches!(decode(&encode(&Msg::Ping)), Ok(Msg::Ping)));\r\n    }\r\n\r\n    #[test]\r\n    fn hello_v2_encode_roundtrip() {\r\n        assert!(matches!(\r\n            decode(&encode(&Msg::Hello(\"world\".into()))),\r\n            Ok(Msg::Hello(value)) if value == \"world\"\r\n        ));\r\n    }\r\n}\r\n\r\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\context-mech\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpYdGBCq\\append"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

@@ -12,10 +12,12 @@ use tokio::fs;
 
 use super::{
     LineEnding, Tool, content_digest, hidden_path_output, is_hidden_name, is_not_found_error,
-    missing_path_output, ordinary_view_blocked,
+    missing_path_output, model_json_string, ordinary_view_blocked,
 };
 
-const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
+// A revision returned by `fs.read` must be usable by the canonical edit
+// tools for every file the workspace mutation layer admits.
+const MAX_READ_BYTES: u64 = MAX_MUTATION_BYTES as u64;
 const MAX_WRITE_BYTES: usize = MAX_MUTATION_BYTES;
 const MAX_READ_LINES: usize = 400;
 const MAX_LIST_ENTRIES: usize = 2_000;
@@ -273,6 +275,39 @@ fn default_end_line() -> usize {
     200
 }
 
+/// Compact physical newline map for the same logical lines `str::lines`
+/// renders. It is only shown for mixed-EOL files: `C` = CRLF, `L` = LF,
+/// `N` = no terminating newline. At most the configured 400-line window is
+/// returned, so exposing exact edit evidence cannot grow with file size.
+fn mixed_eol_tokens(text: &str, requested_start: usize, requested_end: usize) -> String {
+    let bytes = text.as_bytes();
+    let mut tokens = String::new();
+    let mut line = 0usize;
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let Some(relative_newline) = bytes[cursor..].iter().position(|byte| *byte == b'\n') else {
+            if (requested_start..requested_end).contains(&line) {
+                tokens.push('N');
+            }
+            break;
+        };
+        let newline = cursor + relative_newline;
+        if (requested_start..requested_end).contains(&line) {
+            tokens.push(if newline > cursor && bytes[newline - 1] == b'\r' {
+                'C'
+            } else {
+                'L'
+            });
+        }
+        line += 1;
+        if line >= requested_end {
+            break;
+        }
+        cursor = newline + 1;
+    }
+    tokens
+}
+
 #[async_trait]
 impl Tool for FsReadTool {
     fn spec(&self) -> ToolSpec {
@@ -307,7 +342,9 @@ impl Tool for FsReadTool {
         if args.start_line == 0 || args.end_line < args.start_line {
             return Err(AgentError::InvalidRequest("invalid line range".into()));
         }
-        if args.end_line - args.start_line + 1 > MAX_READ_LINES {
+        // Compare the inclusive span as a difference so an adversarial
+        // `usize::MAX` end cannot overflow before the boundedness check.
+        if args.end_line - args.start_line >= MAX_READ_LINES {
             return Err(AgentError::InvalidRequest(format!(
                 "fs.read is limited to {MAX_READ_LINES} lines per call"
             )));
@@ -355,37 +392,62 @@ impl Tool for FsReadTool {
             )));
         }
         let line_ending = LineEnding::detect(&text);
-        let lines: Vec<&str> = text.lines().collect();
-        let start = args.start_line.saturating_sub(1).min(lines.len());
-        let end = args.end_line.min(lines.len());
-        let selected = lines[start..end]
-            .iter()
-            .enumerate()
-            .map(|(offset, line)| format!("{:>6} | {}", start + offset + 1, line))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let requested_start = args.start_line.saturating_sub(1);
+        let requested_end = args.end_line;
+        let mut line_count = 0usize;
+        let mut selected = String::new();
+        use std::fmt::Write as _;
+        for (index, line) in text.lines().enumerate() {
+            line_count = index + 1;
+            if index < requested_start || index >= requested_end {
+                continue;
+            }
+            if !selected.is_empty() {
+                selected.push('\n');
+            }
+            write!(&mut selected, "{:>6} | {}", index + 1, line)
+                .expect("writing to a String cannot fail");
+        }
+        let start = requested_start.min(line_count);
+        let end = requested_end.min(line_count);
+
+        let relative = display_relative(&self.workspace, &display_path);
+        let quoted_relative = model_json_string(&relative);
+        let revision = content_digest(text.as_bytes());
+        // Metadata drives trusted Runtime freshness, but model protocol tool
+        // messages carry only `model_content`. Put the edit-critical facts
+        // in a compact header so the model need not infer a digest from
+        // TaskProgress or load a shell to inspect mixed physical newlines.
+        let mut model_content = format!(
+            "file={quoted_relative} revision={revision} line_ending={}",
+            line_ending.as_str()
+        );
+        if line_ending == LineEnding::Mixed {
+            let tokens = mixed_eol_tokens(&text, requested_start, requested_end);
+            model_content.push_str(" eol_tokens(C=CRLF,L=LF,N=none)=");
+            model_content.push_str(&tokens);
+        }
+        if !selected.is_empty() {
+            model_content.push('\n');
+            model_content.push_str(&selected);
+        }
 
         Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
             tool_name: "fs.read".into(),
             ok: true,
-            summary: format!(
-                "read lines {}-{} of {}",
-                start + 1,
-                end,
-                display_relative(&self.workspace, &display_path)
-            ),
-            model_content: selected,
+            summary: format!("read lines {}-{} of {}", start + 1, end, relative),
+            model_content,
             artifact_ref: None,
             metadata: json!({
-                "path": display_relative(&self.workspace, &display_path),
-                "line_count": lines.len(),
+                "path": relative,
+                "line_count": line_count,
                 "bytes": text.len(),
                 "line_ending": line_ending.as_str(),
                 // The content revision (SHA-256 hex): stable for the same
                 // bytes, changes with any edit — the patch tool's
                 // `base_revision` precondition is checked against this.
-                "revision": content_digest(text.as_bytes()),
+                "revision": revision,
             }),
         }))
     }
@@ -467,7 +529,7 @@ impl Tool for FsWriteTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "fs.write".into(),
-            description: "Write/replace a UTF-8 text file inside the workspace (maximum 4 MiB). Prefer edit.patch for existing files.".into(),
+            description: "Write/replace a UTF-8 text file inside an existing workspace directory (maximum 4 MiB; parent directories are never created implicitly). Prefer edit.patch for existing files.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path", "content"],
@@ -506,6 +568,16 @@ mod tests {
     use super::*;
     use agent_contracts::{CancellationToken, ToolExecutionRequest, ToolFailureClass};
     use serde_json::json;
+
+    #[test]
+    fn mixed_eol_map_matches_rendered_line_windows_at_boundaries() {
+        assert_eq!(mixed_eol_tokens("", 0, 400), "");
+        assert_eq!(mixed_eol_tokens("a\r\nb\nc", 0, 400), "CLN");
+        assert_eq!(mixed_eol_tokens("a\r\nb\nc", 1, 2), "L");
+        assert_eq!(mixed_eol_tokens("a\r\nb\n", 0, 400), "CL");
+        assert_eq!(mixed_eol_tokens("\n\r\nx", 0, 400), "LCN");
+        assert_eq!(mixed_eol_tokens("a\rb", 0, 400), "N");
+    }
 
     #[tokio::test]
     async fn fs_write_journals_a_change() {
@@ -705,9 +777,154 @@ mod tests {
         };
         assert_eq!(output.metadata["line_ending"], "crlf");
         assert!(!output.model_content.contains('\r'));
+        assert!(
+            output
+                .model_content
+                .starts_with("file=\"windows.txt\" revision=")
+        );
+        assert!(output.model_content.contains(" line_ending=crlf\n"));
         assert_eq!(
             output.metadata["revision"],
             content_digest(b"one\r\ntwo\r\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_read_exposes_a_bounded_mixed_eol_map_without_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        fs::write(dir.path().join("mixed.txt"), b"one\r\ntwo\nthree\r\nfour")
+            .await
+            .unwrap();
+        let tool = FsReadTool::new(workspace);
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"path": "mixed.txt"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("fs.read returns a value");
+        };
+        assert_eq!(output.metadata["line_ending"], "mixed");
+        assert!(
+            output
+                .model_content
+                .contains("line_ending=mixed eol_tokens(C=CRLF,L=LF,N=none)=CLCN")
+        );
+        assert!(output.model_content.contains(&format!(
+            "revision={}",
+            content_digest(b"one\r\ntwo\nthree\r\nfour")
+        )));
+        assert!(!output.model_content.contains('\r'));
+    }
+
+    #[tokio::test]
+    async fn fs_read_newline_dense_file_returns_only_the_requested_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let line_count = MAX_READ_BYTES as usize;
+        std::fs::write(dir.path().join("dense.txt"), vec![b'\n'; line_count]).unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = FsReadTool::new(workspace);
+        let start_line = line_count - MAX_READ_LINES + 1;
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({
+                    "path": "dense.txt",
+                    "start_line": start_line,
+                    "end_line": line_count,
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("fs.read returns a value");
+        };
+
+        assert_eq!(output.metadata["line_count"], line_count);
+        assert_eq!(output.model_content.lines().count(), MAX_READ_LINES + 1);
+        assert!(
+            output
+                .model_content
+                .lines()
+                .nth(1)
+                .is_some_and(|line| line.starts_with(&format!("{start_line:>6} | "))),
+            "the selected window must retain its original line numbers"
+        );
+        assert!(
+            output
+                .model_content
+                .ends_with(&format!("{line_count:>6} | ")),
+            "the selected window must end at the requested line"
+        );
+        assert!(
+            output.model_content.len() < 8 * 1024,
+            "a newline-dense file must produce output proportional to the requested window"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_read_rejects_files_above_the_workspace_mutation_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("too-large.txt"),
+            vec![b'x'; MAX_MUTATION_BYTES + 1],
+        )
+        .unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = FsReadTool::new(workspace);
+
+        let error = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({"path": "too-large.txt"}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, AgentError::InvalidRequest(message)
+                if message.contains(&MAX_READ_BYTES.to_string())),
+            "fs.read and workspace mutations must reject at the same byte boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_read_rejects_an_overflowing_line_window() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("small.txt"), b"one\n")
+            .await
+            .unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = FsReadTool::new(workspace);
+
+        let error = tool
+            .execute(
+                RunId::new(),
+                "c",
+                json!({
+                    "path": "small.txt",
+                    "start_line": 1,
+                    "end_line": usize::MAX,
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AgentError::InvalidRequest(message) if message.contains("limited"))
         );
     }
 

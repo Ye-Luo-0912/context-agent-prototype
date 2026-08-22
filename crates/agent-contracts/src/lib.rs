@@ -17,6 +17,7 @@ pub mod operation;
 pub mod plugin;
 pub mod runtime;
 pub mod runtime_facts;
+pub mod search;
 pub mod tokens;
 pub mod tool;
 
@@ -41,5 +42,6 @@ pub use operation::*;
 pub use plugin::*;
 pub use runtime::*;
 pub use runtime_facts::*;
+pub use search::{ScoredMatch, TextIndex, TokenRarity, tokenize};
 pub use tokens::*;
 pub use tool::*;

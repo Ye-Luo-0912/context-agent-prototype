@@ -1,0 +1,15 @@
+{
+  "schema": "agent-eval.cell.v1",
+  "fixture_id": "late_constraint_long",
+  "engine": "dynamic",
+  "repeat": 1,
+  "repeats": 1,
+  "live": true,
+  "fixture_sha256": "7ac50d28968134c8a6b30a5ba10b004bc4f7c6fdb9872b0c6e635cb0a88771da",
+  "git_head": "0b1b999e6799d6cf304b41f3418f21fbeb9654ab",
+  "git_dirty": true,
+  "git_dirty_sha256": "cecdc77047d2830b3d5cdb1a706922156ae81e30c18c79534309d86f315b2dae",
+  "source_tree_digest": "43838d6f5b4f1fdba81451d834f579b97c9ec45d5f62f49c53fafea938517ee4",
+  "openai_model": "gpt-5.6-luna",
+  "openai_base_url": "https://api.pinaic.com/v1"
+}

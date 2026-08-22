@@ -45,8 +45,9 @@ impl agent_contracts::Effect for FlagEffect {
             evidence: None,
         }
     }
-    async fn rollback(self: Box<Self>, _reason: &str) {
+    async fn rollback(self: Box<Self>, _reason: &str) -> AgentResult<()> {
         self.rolled_back.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -518,8 +519,9 @@ impl Effect for ReceiptEffect {
             },
         }
     }
-    async fn rollback(self: Box<Self>, _reason: &str) {
+    async fn rollback(self: Box<Self>, _reason: &str) -> AgentResult<()> {
         self.rolled_back.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -561,6 +563,35 @@ impl ToolDispatcher for ReceiptEffectDispatcher {
                 rolled_back: self.rolled_back.clone(),
             }),
         })
+    }
+}
+
+/// Models a mutating dispatcher that staged some internal state but could
+/// not prove cleanup before returning. Core must retain the operation for
+/// recovery instead of terminalizing it as an ordinary failed value.
+struct ExecutionCleanupRecoveryDispatcher;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for ExecutionCleanupRecoveryDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "fs.read".into(),
+            description: "fails while settling staged cleanup".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::WorkspaceWrite,
+            output_budget: None,
+            roles: vec![ToolSemanticRole::ReadResource],
+        }]
+    }
+
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        assert!(
+            request.effect_context.is_some(),
+            "mutating execution must receive its recovery identity"
+        );
+        Err(AgentError::RecoveryRequired(
+            "simulated prepared cleanup failure".into(),
+        ))
     }
 }
 
@@ -636,6 +667,85 @@ async fn assert_normal_mutation_is_fenced(handle: &RuntimeHandle) {
         matches!(next_task_mutation, AgentError::RecoveryRequired(_)),
         "task mutation must require recovery: {next_task_mutation}"
     );
+}
+
+#[tokio::test]
+async fn execution_cleanup_recovery_is_structured_fenced_and_queryable() {
+    let handle = spawn_with_approval(
+        Arc::new(TwoRoundToolModel::default()),
+        Arc::new(TestContextEngine),
+        Arc::new(ExecutionCleanupRecoveryDispatcher),
+        Arc::new(PolicyApprovalGate::permissive()),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle.user_message("go".into()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut operation_id = None;
+    let mut finished = None;
+    let mut recovery_required = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+        {
+            match envelope.event {
+                RuntimeEvent::OperationAccepted { snapshot }
+                    if snapshot.identity.call_id == "call-1" =>
+                {
+                    operation_id = Some(snapshot.identity.operation_id);
+                }
+                RuntimeEvent::ToolFinished { output } if output.call_id == "call-1" => {
+                    finished = Some(output);
+                }
+                RuntimeEvent::RecoveryRequired => recovery_required = true,
+                _ => {}
+            }
+        }
+        if operation_id.is_some() && finished.is_some() && recovery_required {
+            break;
+        }
+    }
+
+    let output = finished.expect("the cleanup failure must reach ToolFinished");
+    assert!(!output.ok);
+    assert_eq!(
+        output.metadata["commit_state"],
+        "execution_cleanup_recovery_required"
+    );
+    assert_eq!(output.metadata["attempted_paths"], json!([]));
+    assert!(output.metadata.get("files").is_none());
+    assert!(output.metadata.get("revision").is_none());
+    assert!(output.resource_touches().is_empty());
+    assert!(!output.model_content.contains("deadbeef"));
+    assert!(
+        output
+            .model_content
+            .contains("preparation cleanup could not be confirmed")
+    );
+    assert!(
+        recovery_required,
+        "the runtime must publish the recovery fence"
+    );
+
+    let operation_id = operation_id.expect("OperationAccepted must expose the recovery identity");
+    let queried = handle.query_operation(operation_id).await.unwrap();
+    assert!(matches!(
+        queried,
+        agent_contracts::OperationQueryResult::Found { snapshot }
+            if matches!(
+                snapshot.state,
+                agent_contracts::OperationState::Executing {
+                    effect_id: Some(_)
+                }
+            )
+    ));
+    assert_normal_mutation_is_fenced(&handle).await;
+    assert!(matches!(
+        handle.query_operation(operation_id).await.unwrap(),
+        agent_contracts::OperationQueryResult::Found { .. }
+    ));
+    handle.stop().await.unwrap();
 }
 
 #[tokio::test]
