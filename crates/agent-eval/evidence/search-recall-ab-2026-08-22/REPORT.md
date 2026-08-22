@@ -173,6 +173,41 @@ for tolerant parsing or a schema-description tweak. fs.read repeats
 reached 21 reads/18 rereads here, reinforcing the read-onlease decision
 item below.
 
+## Full-chain waste audit (longflow dynamic cell, quantified)
+
+Cadence: `BeforeModel` maintenance fired x77 (every model round),
+AfterModel/UserInput x15 (per turn), AfterTool x11. Average provider
+input ~= 8.2k tokens/round, so every saved round is worth ~8k input
+tokens directly. Identified waste buckets:
+
+| bucket | evidence | est. rounds | est. input tokens |
+| --- | --- | --- | --- |
+| capability churn (forced reloads after idle cooling) | 20 loads, all real, zero already-loaded hits | ~13 | ~105k |
+| invented-program retry loop | 8x typed path_not_found, 4 spellings incl. one NUL-byte argv | ~7 | ~55k |
+| fs.read repeats / recovery rereads | 21 reads, 18 rereads | ~9 | ~75k |
+| strict-arg rejections (missing `path` x2, unknown scope variant x1) | serde invalid_request | ~3 | ~25k |
+
+Stability proposals, layered by approval need:
+
+- **L0 (no policy change, dispatcher/contracts only)**: tolerate-and-map
+  unknown `ContextScope` variants instead of hard serde rejection;
+  enrich `missing field` rejections with the expected arg shape; keep
+  argv validation messages naming the offending bytes. Each converts a
+  dead-end retry into a same-round self-correction; adds zero tokens.
+- **L1-a (ToolLifecycle policy, needs sign-off)**: anchor tools on use
+  so idle cooling cannot drop them mid-task (kills the ~13-round churn).
+  Cost: kept schemas (~100-165 tokens/tool from surface telemetry)
+  persist on later rounds; net still strongly positive vs 8k/round.
+- **L1-b (retention policy, freeze-marked, needs explicit approval)**:
+  batch closed-scope evictions at turn boundaries (grace within a user
+  turn) — targets the 18 rereads; mid-turn frames grow slightly, total
+  rounds drop.
+- **L1-c (runtime tracking)**: escalate repeated invented-program
+  misses after 2 consecutive failures for the same basename.
+
+Validate every item with the paired mech + longflow instruments, n>=2,
+comparing rounds/tools/tokens/pass-rate before/after.
+
 ## Known boundaries
 
 - Body text is indexed to its first 512 chars; deeper body keywords still
