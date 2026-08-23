@@ -118,6 +118,12 @@ pub struct AuthorityLease {
     pub decision: ApprovalDecision,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
+    /// 授予本意图的宿主策略版本（M12 P0）：由
+    /// [`crate::HostToolPolicies::policy_revision`] 盖章，审计可回答
+    /// "这条授权当时依据哪一版策略"。旧快照缺省为 None；强制校验
+    /// （revision 失配即回滚）属于 M12 版本化运行时准入线。
+    #[serde(default)]
+    pub policy_revision: Option<u64>,
 }
 
 impl AuthorityLease {
@@ -173,13 +179,16 @@ mod tests {
             decision: ApprovalDecision::Allow,
             issued_at_ms: 1_000,
             expires_at_ms: 2_000,
+            policy_revision: Some(3),
         };
 
         // Serialization is the wire contract: the lease travels with the
-        // operation and is journaled in audit events.
+        // operation and is journaled in audit events. The policy revision
+        // stamp survives the round trip.
         let value = serde_json::to_value(&lease).unwrap();
         let back: AuthorityLease = serde_json::from_value(value).unwrap();
         assert_eq!(back, lease);
+        assert_eq!(back.policy_revision, Some(3));
 
         // Current generation, inside the window: authorizes.
         assert!(lease.valid_at(1_500, 7, lease.operation_id, lease.argument_digest));

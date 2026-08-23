@@ -1532,6 +1532,7 @@ mod tests {
             },
             grant_id: None,
             decision: ApprovalDecision::Allow,
+            policy_revision: None,
             issued_at_ms: 0,
             expires_at_ms,
         }

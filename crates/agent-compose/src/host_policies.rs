@@ -101,6 +101,10 @@ impl HostToolPolicies for HostToolPolicyRegistry {
                     .find(|policy| policy.tool_name == tool_name)
             })
     }
+
+    fn policy_revision(&self) -> Option<u64> {
+        Some(self.resolve_policy().revision())
+    }
 }
 
 #[cfg(test)]

@@ -1084,6 +1084,13 @@ impl CoreAuthority {
                 decision: agent_contracts::ApprovalDecision::Allow,
                 issued_at_ms,
                 expires_at_ms: issued_at_ms.saturating_add(ttl),
+                // M12 P0：记录本意图依据的策略版本（可审计）；强制
+                // 校验属于版本化运行时准入线。
+                policy_revision: self
+                    .config
+                    .host_policies
+                    .as_ref()
+                    .and_then(|policies| policies.policy_revision()),
             };
             if let Err(error) = self
                 .operations

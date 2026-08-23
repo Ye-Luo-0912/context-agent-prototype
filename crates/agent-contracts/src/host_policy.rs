@@ -49,6 +49,12 @@ pub enum HostEffectBinding {
 /// 唯一路径——这里没有的策略退回声明风险的空界限，绝不变成授权。
 pub trait HostToolPolicies: Send + Sync {
     fn policy_for(&self, tool_name: &str) -> Option<&HostToolPolicy>;
+
+    /// 当前策略集的版本号：实现了 [`HostPolicySnapshot`] 的提供方返回
+    /// `Some(revision)`，供租约盖章与审计；无版本概念的实现返回 None。
+    fn policy_revision(&self) -> Option<u64> {
+        None
+    }
     /// 在本映射下推导一次调用的具体效果意图。所有消费方（审批门、
     /// 租约铸造、提交检查）共用这一份推导，不会漂移。
     fn effect_intent(&self, call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
@@ -120,6 +126,10 @@ impl HostToolPolicies for HostPolicySnapshot {
         self.entries
             .iter()
             .find(|policy| policy.tool_name == tool_name)
+    }
+
+    fn policy_revision(&self) -> Option<u64> {
+        Some(self.revision)
     }
 }
 
