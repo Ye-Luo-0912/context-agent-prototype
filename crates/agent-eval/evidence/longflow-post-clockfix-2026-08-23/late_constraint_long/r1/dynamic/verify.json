@@ -1,0 +1,85 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "late_constraint_long",
+  "expected_edit": "add v2 Hello and Heartbeat while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Heartbeat"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "RELEASE.md",
+      "pred": "contains",
+      "needles": [
+        "v2"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "RELEASE.md",
+      "exists": true,
+      "sha256": "94b60d5892042a7b6c5a3d0e4f2440b2978b103c4e0c5d74d787a77b5f863bcb",
+      "bytes": 457,
+      "truncated": false,
+      "body": "Version 2 is planned to expand the protocol beyond the current `Ping` message with additional message types, more robust decoding and validation, and clearer compatibility guarantees for future clients and servers; the work will preserve the existing ping round-trip behavior while establishing a foundation for versioned protocol evolution.\n\nShipped: v2 `Hello` messages, encoded as `v:2|hello:<name>` with matching decode support and round-trip behavior.\n"
+    },
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "be059f10643df6a050847269258d07be5d2346a2939ca97abc678d94d2080f02",
+      "bytes": 1544,
+      "truncated": false,
+      "body": "pub enum Msg {\r\n    Ping,\r\n    Hello(String),\r\n    Heartbeat(u32),\r\n}\r\n\r\npub fn decode(bytes: &str) -> Result<Msg, String> {\r\n    if bytes.contains(\"ping\") {\r\n        return Ok(Msg::Ping);\r\n    }\r\n    if let Some(name) = bytes.strip_prefix(\"v:2|hello:\") {\r\n        return Ok(Msg::Hello(name.into()));\r\n    }\r\n    if let Some(sequence) = bytes.strip_prefix(\"v:2|heartbeat:\") {\r\n        return sequence.parse::<u32>().map(Msg::Heartbeat).map_err(|_| \"unknown\".into());\r\n    }\r\n    Err(\"unknown\".into())\r\n}\r\n\r\npub fn encode(msg: &Msg) -> String {\r\n    match msg {\r\n        Msg::Ping => \"ping\".into(),\r\n        Msg::Hello(name) => format!(\"v:2|hello:{name}\"),\r\n        Msg::Heartbeat(sequence) => format!(\"v:2|heartbeat:{sequence}\"),\r\n    }\r\n}\r\n\r\npub fn ping_roundtrip() -> Result<Msg, String> {\r\n    decode(&encode(&Msg::Ping))\r\n}\r\n\r\n#[cfg(test)]\r\nmod tests {\r\n    use super::{decode, Msg};\r\n\r\n    #[test]\r\n    fn decodes_ping_frame() {\r\n        assert!(matches!(decode(\"ping\"), Ok(Msg::Ping)));\r\n    }\r\n\r\n    #[test]\r\n    fn hello_roundtrips_with_v2_envelope() {\r\n        let encoded = super::encode(&Msg::Hello(\"Ada\".into()));\r\n        assert_eq!(encoded, \"v:2|hello:Ada\");\r\n        assert!(matches!(decode(&encoded), Ok(Msg::Hello(name)) if name == \"Ada\"));\r\n    }\r\n\r\n    #[test]\r\n    fn heartbeat_roundtrips_with_v2_envelope() {\r\n        let encoded = super::encode(&Msg::Heartbeat(42));\r\n        assert_eq!(encoded, \"v:2|heartbeat:42\");\r\n        assert!(matches!(decode(&encoded), Ok(Msg::Heartbeat(sequence)) if sequence == 42));\r\n    }\r\n}\r\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\longflow\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpBJhU1I\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

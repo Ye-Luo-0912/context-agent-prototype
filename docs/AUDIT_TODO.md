@@ -270,6 +270,17 @@ motive shows up in live runs.
 
 ## Freeze (not a defect)
 
+### TOOL-GC-PHASE2 — surface pressure hysteresis (landed 2026-08-23)
+
+Post-clock-fix long-flow (`longflow-post-clockfix-2026-08-23`) kept
+re-loading optional builtins mid-task (13 loads, git.diff x4) and the
+model even guessed `warm.<tool>` names, so the phase-2 gate was met.
+`BuiltinToolDispatcher::gc` now cools only above a soft schema-bytes high
+watermark, oldest-idle first, down to a low watermark (defaults
+18_000/9_000; 0 restores pure idle semantics). The protocol evidence LRU
+gate also fired (8 `protocol-checkpoint-body-missing` reads); that cache
+remains a separate open slice.
+
 ### CTX-11 — Execution Coherence V1
 
 **Status: RC** (MOD-OBS-01 / MOD-PROG-01 / turn checkpointing landed

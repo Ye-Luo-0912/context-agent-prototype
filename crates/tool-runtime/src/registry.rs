@@ -43,6 +43,12 @@ pub struct ToolLifecycleConfig {
     /// Idle model rounds before a warm tool is unloaded from the model
     /// surface.
     pub warm_to_unload_ticks: usize,
+    /// 已加载 schema 的软高水位（字节估算）：低于它时不冷却任何可选
+    /// 工具——保留一个紧凑 schema 数十轮的期望成本仍低于一次因重载
+    /// 而多出的模型轮。0 表示永远视为超压（纯闲置语义）。
+    pub surface_soft_high_bytes: usize,
+    /// 开始冷却后回收到该水位即停止：滞回避免在阈值附近来回抖动。
+    pub surface_low_watermark_bytes: usize,
 }
 
 impl Default for ToolLifecycleConfig {
@@ -78,6 +84,11 @@ impl Default for ToolLifecycleConfig {
             ],
             idle_to_warm_ticks: 8,
             warm_to_unload_ticks: 24,
+            // 生产水位：全部内置 schema 合计约 6–9KB，远低于高水位，
+            // 因此可选工具在正常任务里不再被冷却；超大目录仍受滞回
+            // 约束。测试要旧行为时显式置 0。
+            surface_soft_high_bytes: 18_000,
+            surface_low_watermark_bytes: 9_000,
         }
     }
 }
@@ -86,6 +97,11 @@ struct ToolEntry {
     tool: Arc<dyn Tool>,
     state: ToolLifecycle,
     last_used_tick: u64,
+}
+
+/// schema 的粗略字节估算，用作表面压力水位。
+fn schema_bytes(tool: &Arc<dyn Tool>) -> usize {
+    serde_json::to_string(&tool.spec()).map(|text| text.len()).unwrap_or(0)
 }
 
 pub struct BuiltinToolDispatcher {
@@ -258,6 +274,47 @@ impl BuiltinToolDispatcher {
         let tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
         let mut catalog = self.catalog.write().expect("tool catalog poisoned");
         let mut changed = false;
+        // 表面压力滞回：已加载 schema 总量低于高水位时不冷却任何可选
+        // 工具（保留成本 < 重载轮成本）；超高水位才按最久未用冷却到
+        // 低水位为止。水位为 0 视为永远超压，即纯闲置语义。
+        let loaded_bytes = |catalog: &HashMap<String, ToolEntry>| -> usize {
+            catalog
+                .values()
+                .filter(|entry| entry.state == ToolLifecycle::Loaded)
+                .map(|entry| schema_bytes(&entry.tool))
+                .sum()
+        };
+        let mut pressure = if self.config.surface_soft_high_bytes > 0 {
+            loaded_bytes(&catalog)
+        } else {
+            usize::MAX
+        };
+        let over_pressure = pressure > self.config.surface_soft_high_bytes;
+        if over_pressure {
+            let mut aging: Vec<(&String, &mut ToolEntry, usize)> = catalog
+                .iter_mut()
+                .filter_map(|(name, entry)| {
+                    if self.config.always_loaded.iter().any(|core| core == name)
+                        || roots.iter().any(|root| root == name)
+                        || entry.state != ToolLifecycle::Loaded
+                    {
+                        return None;
+                    }
+                    let idle = tick.saturating_sub(entry.last_used_tick) as usize;
+                    (idle >= self.config.idle_to_warm_ticks).then_some((name, entry, idle))
+                })
+                .collect();
+            aging.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
+            for (_, entry, _) in aging {
+                if pressure <= self.config.surface_low_watermark_bytes {
+                    break;
+                }
+                let bytes = schema_bytes(&entry.tool);
+                entry.state = ToolLifecycle::Warm;
+                pressure = pressure.saturating_sub(bytes);
+                changed = true;
+            }
+        }
         for (name, entry) in catalog.iter_mut() {
             if self.config.always_loaded.iter().any(|core| core == name)
                 || roots.iter().any(|root| root == name)
@@ -266,10 +323,6 @@ impl BuiltinToolDispatcher {
             }
             let idle = tick.saturating_sub(entry.last_used_tick);
             match entry.state {
-                ToolLifecycle::Loaded if idle >= self.config.idle_to_warm_ticks as u64 => {
-                    entry.state = ToolLifecycle::Warm;
-                    changed = true;
-                }
                 ToolLifecycle::Warm if idle >= self.config.warm_to_unload_ticks as u64 => {
                     entry.state = ToolLifecycle::Unloaded;
                     changed = true;
@@ -1058,6 +1111,9 @@ mod tests {
                 always_loaded: vec!["fs.read".into()],
                 idle_to_warm_ticks: 2,
                 warm_to_unload_ticks: 4,
+                // 旧语义：永远视为超压，闲置即冷却。
+                surface_soft_high_bytes: 0,
+                surface_low_watermark_bytes: 0,
             },
         );
         dispatcher.load("fs.write").unwrap();
@@ -1081,6 +1137,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_surface_pressure_keeps_idle_tools_loaded() {
+        let (workspace, _dir) = open_workspace().await;
+        let dispatcher = BuiltinToolDispatcher::with_config(
+            workspace,
+            ToolLifecycleConfig {
+                always_loaded: vec!["fs.read".into()],
+                idle_to_warm_ticks: 2,
+                warm_to_unload_ticks: 4,
+                // 水位远超全部 schema：无表面压力，闲置工具留在表面。
+                surface_soft_high_bytes: 1_000_000,
+                surface_low_watermark_bytes: 500_000,
+            },
+        );
+        dispatcher.load("fs.write").unwrap();
+        for _ in 0..10 {
+            dispatcher.gc(&[]);
+        }
+        assert!(
+            surface(&dispatcher).contains(&"fs.write".to_string()),
+            "低于高水位不得冷却可选工具：保留成本低于一次重载轮"
+        );
+    }
+
+    #[tokio::test]
+    async fn pressure_cools_oldest_first_to_the_low_watermark() {
+        let (workspace, _dir) = open_workspace().await;
+        let legacy = |workspace| {
+            BuiltinToolDispatcher::with_config(
+                workspace,
+                ToolLifecycleConfig {
+                    always_loaded: vec!["fs.read".into()],
+                    idle_to_warm_ticks: 2,
+                    warm_to_unload_ticks: 100,
+                    surface_soft_high_bytes: 0,
+                    surface_low_watermark_bytes: 0,
+                },
+            )
+        };
+        // 先量出 gc 所见的全部已加载条目（不含 meta 控制工具）的 schema
+        // 总量，再把高水位压到总量之下：恰好必须冷却一个，低水位等于
+        // 高水位使冷却在一条后立即停止。
+        let measuring = legacy(open_workspace().await.0);
+        measuring.load("fs.write").unwrap();
+        measuring.load("git.status").unwrap();
+        let total: usize = measuring
+            .specs()
+            .iter()
+            .filter(|spec| spec.name != CAPABILITY_MANAGE)
+            .map(|spec| serde_json::to_string(spec).unwrap().len())
+            .sum();
+        drop(measuring);
+        let (workspace, _dir) = open_workspace().await;
+        let watermark = total - 1;
+        let dispatcher = BuiltinToolDispatcher::with_config(
+            workspace,
+            ToolLifecycleConfig {
+                always_loaded: vec!["fs.read".into()],
+                idle_to_warm_ticks: 2,
+                warm_to_unload_ticks: 100,
+                surface_soft_high_bytes: watermark,
+                surface_low_watermark_bytes: watermark,
+            },
+        );
+        dispatcher.load("fs.write").unwrap();
+        dispatcher.load("git.status").unwrap();
+        for _ in 0..4 {
+            dispatcher.gc(&[]);
+        }
+        assert!(
+            !surface(&dispatcher).contains(&"fs.write".to_string()),
+            "最久未用先冷却"
+        );
+        assert!(
+            surface(&dispatcher).contains(&"git.status".to_string()),
+            "到达低水位即停止：较新的工具保留"
+        );
+        for _ in 0..4 {
+            dispatcher.gc(&[]);
+        }
+        assert!(
+            surface(&dispatcher).contains(&"git.status".to_string()),
+            "滞回：已到低水位，后续轮不再继续冷却"
+        );
+    }
+
+    #[tokio::test]
     async fn task_roots_protect_required_tools_from_idle_gc() {
         let (workspace, _dir) = open_workspace().await;
         let dispatcher = BuiltinToolDispatcher::with_config(
@@ -1089,6 +1231,9 @@ mod tests {
                 always_loaded: vec!["fs.read".into()],
                 idle_to_warm_ticks: 2,
                 warm_to_unload_ticks: 4,
+                // 旧语义：永远视为超压，闲置即冷却。
+                surface_soft_high_bytes: 0,
+                surface_low_watermark_bytes: 0,
             },
         );
         dispatcher.load("fs.write").unwrap();
