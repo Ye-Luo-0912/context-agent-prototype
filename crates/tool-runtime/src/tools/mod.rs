@@ -970,7 +970,9 @@ pub(crate) fn require_covered_process_spawn(
     arguments: &Value,
     actual: &agent_contracts::EffectIntent,
 ) -> AgentResult<()> {
-    if process_spawn_is_covered(tool_name, arguments, actual) {
+    // The dispatcher's own builtin table is the host mapping for the
+    // names it dispatches (CORE-11).
+    if process_spawn_is_covered(&crate::BuiltinToolPolicies, tool_name, arguments, actual) {
         Ok(())
     } else {
         Err(AgentError::InvalidRequest(

@@ -49,19 +49,24 @@ first cut.
 Named pipes/UDS are not a fix for CORE-01. V1 still trusts Runtime in
 the same address space.
 
-### CORE-11 — HostToolPolicy registry & plugin admission (open, M12 next)
+### CORE-11 — HostToolPolicy registry & plugin admission (registry landed 2026-08-23)
 
-`agent-contracts/src/host_policy.rs` statically enumerates builtin
-names (`fs.read`, `edit.patch`, `process.run`, ...). The fail-closed
-direction is right — ToolSpec cannot self-authorize, and unknown names
-get an empty `WorkspaceWrite` (no grant) — but the layering is wrong
-long-term: contracts should define the vocabulary (`EffectIntent`,
-`HostEffectBinding`, `HostToolPolicy` types); trusted composition
-should own a `BuiltinHostPolicyRegistry`; `tool-runtime` provides the
-implementations. Plugin admission (required before Self-Iteration)
-must install operator-reviewed `HostToolPolicy` bindings — a manifest
-schema is not an authority mapping. Until the registry exists,
-external write plugins stay safely non-functional.
+Landed: `agent-contracts/src/host_policy.rs` is vocabulary only —
+`HostToolPolicy`/`HostEffectBinding` carry owned names (serde-ready) plus
+the `HostToolPolicies` lookup trait whose provided `effect_intent` is the
+one derivation every consumer shares. The builtin table moved next to
+its handlers in `tool-runtime` (`BuiltinToolPolicies`). Trusted
+composition owns `agent-compose::HostToolPolicyRegistry`: builtins at
+construction, operator-reviewed plugin bindings via `admit()`, which
+refuses to shadow a builtin or duplicate an admission. One registry
+instance is wired into the kernel lease path
+(`CoreAuthorityConfig.host_policies`), the approval gate
+(`TaskApprovalGate::with_host_policies`) and the capability dispatcher;
+with no injection everything falls back to the declared-risk empty bound.
+
+Still open (M12): the plugin manifest → operator review → `admit()` flow
+itself. Until that lands, external write plugins stay safely
+non-functional.
 
 ### CORE-12 — M13 attestation depth (open)
 

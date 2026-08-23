@@ -1184,6 +1184,7 @@ async fn execute_tool_mints_a_commit_time_lease_for_side_effecting_calls() {
         CoreAuthorityConfig {
             shadow_gate: Some(shadow),
             lease_ttl_ms: Some(5_000),
+            host_policies: Some(Arc::new(tool_runtime::BuiltinToolPolicies)),
             ..CoreAuthorityConfig::default()
         },
         Arc::new(RecordingEngine {
@@ -1472,6 +1473,7 @@ async fn lease_is_minted_even_when_the_shadow_gate_denies() {
     let kernel = Arc::new(CoreAuthority::new(
         CoreAuthorityConfig {
             shadow_gate: Some(shadow),
+            host_policies: Some(Arc::new(tool_runtime::BuiltinToolPolicies)),
             ..CoreAuthorityConfig::default()
         },
         Arc::new(RecordingEngine {

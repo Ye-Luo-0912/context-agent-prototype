@@ -91,6 +91,7 @@ dependencies = [
  "async-trait",
  "serde_json",
  "tokio",
+ "tool-runtime",
  "tracing",
  "uuid",
 ]

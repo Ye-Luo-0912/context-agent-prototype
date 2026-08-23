@@ -2,133 +2,85 @@
 //! an authority document.
 //!
 //! A plugin manifest may *request* permissions. Only a host-installed
-//! policy decides which argument is which real resource. Builtin tools are
-//! listed here; an unknown name with `ToolRisk::ProcessExecution` does not
-//! become a process grant just because it has a `command` field.
+//! policy decides which argument is which real resource. An unknown name
+//! with `ToolRisk::ProcessExecution` does not become a process grant just
+//! because it has a `command` field.
+//!
+//! Layering (CORE-11): this module defines the *vocabulary* only — the
+//! policy types, the [`HostToolPolicies`] lookup trait, and the one
+//! derivation every consumer shares. The builtin implementations live in
+//! `tool-runtime`; trusted composition (`agent-compose`) owns the
+//! registry that combines them with operator-admitted plugin bindings.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{EffectIntent, ToolCall, ToolRisk, ToolSpec, exec_argv_intent, shell_exec_intent};
 
 /// Host-installed mapping from one tool's arguments onto a real effect.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Argument/name references are owned so plugin admission can install
+/// bindings for non-builtin names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostToolPolicy {
-    pub tool_name: &'static str,
+    pub tool_name: String,
     pub binding: HostEffectBinding,
 }
 
 /// How the host interprets this tool's arguments. Not carried on
 /// [`crate::ToolSpec`]: a generated plugin cannot bind itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HostEffectBinding {
     ReadOnly,
     WorkspaceWrite {
-        path_arg: &'static str,
-        content_args: &'static [&'static str],
+        path_arg: String,
+        content_args: Vec<String>,
     },
     ExecArgv {
-        argv_arg: &'static str,
+        argv_arg: String,
     },
     ShellExec {
-        command_arg: &'static str,
-        dialect_arg: &'static str,
+        command_arg: String,
+        dialect_arg: String,
     },
     /// `process.session`: `start` is ExecArgv; poll/stop do not spawn.
     SessionExec {
-        argv_arg: &'static str,
-        action_arg: &'static str,
+        argv_arg: String,
+        action_arg: String,
     },
 }
 
-const BUILTIN_POLICIES: &[HostToolPolicy] = &[
-    HostToolPolicy {
-        tool_name: "fs.list",
-        binding: HostEffectBinding::ReadOnly,
-    },
-    HostToolPolicy {
-        tool_name: "fs.read",
-        binding: HostEffectBinding::ReadOnly,
-    },
-    HostToolPolicy {
-        tool_name: "search.grep",
-        binding: HostEffectBinding::ReadOnly,
-    },
-    HostToolPolicy {
-        tool_name: "artifact.read",
-        binding: HostEffectBinding::ReadOnly,
-    },
-    HostToolPolicy {
-        tool_name: "git.status",
-        binding: HostEffectBinding::ReadOnly,
-    },
-    HostToolPolicy {
-        tool_name: "git.diff",
-        binding: HostEffectBinding::ReadOnly,
-    },
-    HostToolPolicy {
-        tool_name: "capability.manage",
-        binding: HostEffectBinding::ReadOnly,
-    },
-    HostToolPolicy {
-        tool_name: "context.manage",
-        binding: HostEffectBinding::ReadOnly,
-    },
-    HostToolPolicy {
-        tool_name: "task.complete",
-        binding: HostEffectBinding::ReadOnly,
-    },
-    HostToolPolicy {
-        tool_name: "fs.write",
-        binding: HostEffectBinding::WorkspaceWrite {
-            path_arg: "path",
-            content_args: &["content"],
-        },
-    },
-    HostToolPolicy {
-        tool_name: "edit.replace",
-        binding: HostEffectBinding::WorkspaceWrite {
-            path_arg: "path",
-            content_args: &["new"],
-        },
-    },
-    HostToolPolicy {
-        tool_name: "edit.patch",
-        binding: HostEffectBinding::WorkspaceWrite {
-            path_arg: "path",
-            content_args: &[],
-        },
-    },
-    HostToolPolicy {
-        tool_name: "process.run",
-        binding: HostEffectBinding::ExecArgv { argv_arg: "argv" },
-    },
-    HostToolPolicy {
-        tool_name: "shell.exec",
-        binding: HostEffectBinding::ShellExec {
-            command_arg: "command",
-            dialect_arg: "dialect",
-        },
-    },
-    HostToolPolicy {
-        tool_name: "process.session",
-        binding: HostEffectBinding::SessionExec {
-            argv_arg: "argv",
-            action_arg: "action",
-        },
-    },
-];
+/// Operator-owned lookup from tool name to host policy. Trusted
+/// composition provides the implementation: builtin entries contributed
+/// by `tool-runtime` plus admitted plugin bindings. Lookup results are
+/// the only route to a concrete [`EffectIntent`] — a policy absent here
+/// falls back to the declared-risk empty bound (never a grant).
+pub trait HostToolPolicies: Send + Sync {
+    fn policy_for(&self, tool_name: &str) -> Option<&HostToolPolicy>;
 
-/// Host policy for a builtin name. Unknown plugins have none: their
-/// manifest cannot authorize an effect.
-pub fn builtin_host_tool_policy(tool_name: &str) -> Option<&'static HostToolPolicy> {
-    BUILTIN_POLICIES
-        .iter()
-        .find(|policy| policy.tool_name == tool_name)
+    /// Derive the concrete effect intent of one call under this mapping.
+    /// Provided so every consumer (approval gate, lease minting, commit
+    /// checks) shares one derivation and cannot drift.
+    fn effect_intent(&self, call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
+        match self.policy_for(&call.name) {
+            Some(policy) => policy.intent_from(&call.arguments),
+            // A plugin ToolSpec with ProcessExecution / WorkspaceWrite and
+            // lucky argument names does not become an intent: empty bounds
+            // never match a grant.
+            None => match spec.risk {
+                ToolRisk::ReadOnly => EffectIntent::ReadOnly,
+                ToolRisk::WorkspaceWrite => EffectIntent::WorkspaceWrite {
+                    path: String::new(),
+                    content_bytes: 0,
+                },
+                ToolRisk::ProcessExecution => exec_argv_intent(&[]),
+            },
+        }
+    }
 }
 
 impl HostToolPolicy {
     pub fn intent_from(&self, arguments: &Value) -> EffectIntent {
-        match self.binding {
+        match &self.binding {
             HostEffectBinding::ReadOnly => EffectIntent::ReadOnly,
             HostEffectBinding::WorkspaceWrite {
                 path_arg,
@@ -157,14 +109,11 @@ impl HostToolPolicy {
     }
 }
 
-/// Derive the conservative effect bound. Builtins use the host policy
-/// table. A plugin `ToolSpec` with `ProcessExecution` / `WorkspaceWrite`
-/// and lucky argument names does not become an intent: empty bounds never
-/// match a grant.
-pub fn derive_effect_intent(call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
-    if let Some(policy) = builtin_host_tool_policy(&call.name) {
-        return policy.intent_from(&call.arguments);
-    }
+/// Derive the concrete effect bound under an empty policy source: every
+/// non-read-only call collapses to its declared-risk empty bound, which
+/// can never match a grant. Used by compositions that admit no tools and
+/// by tests of the fail-closed floor.
+pub fn unbound_effect_intent(spec: &ToolSpec) -> EffectIntent {
     match spec.risk {
         ToolRisk::ReadOnly => EffectIntent::ReadOnly,
         ToolRisk::WorkspaceWrite => EffectIntent::WorkspaceWrite {
@@ -205,12 +154,12 @@ fn string_list(arguments: &Value, key: &str) -> Vec<String> {
 fn workspace_write_intent(
     arguments: &Value,
     path_arg: &str,
-    content_args: &[&str],
+    content_args: &[String],
 ) -> EffectIntent {
     let path = string_arg(arguments, path_arg);
     let mut content_bytes = 0u64;
     for key in content_args {
-        if let Some(content) = arguments.get(*key).and_then(Value::as_str) {
+        if let Some(content) = arguments.get(key).and_then(Value::as_str) {
             content_bytes = content_bytes.saturating_add(content.len() as u64);
         }
     }
@@ -304,6 +253,15 @@ mod tests {
         }
     }
 
+    /// Empty source: the fail-closed floor every composition starts from.
+    struct NoPolicies;
+
+    impl HostToolPolicies for NoPolicies {
+        fn policy_for(&self, _tool_name: &str) -> Option<&HostToolPolicy> {
+            None
+        }
+    }
+
     #[test]
     fn plugin_process_risk_does_not_bind_command_or_argv() {
         let call = ToolCall {
@@ -315,7 +273,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            derive_effect_intent(&call, &spec("plugin.process", ToolRisk::ProcessExecution)),
+            NoPolicies.effect_intent(&call, &spec("plugin.process", ToolRisk::ProcessExecution)),
             exec_argv_intent(&[])
         );
         assert!(!exec_argv_intent(&[]).covers(&exec_argv_intent(&[
@@ -333,7 +291,7 @@ mod tests {
             arguments: json!({"destination": "src/a.rs", "payload": "fn main() {}"}),
         };
         assert_eq!(
-            derive_effect_intent(&call, &spec("plugin.write", ToolRisk::WorkspaceWrite)),
+            NoPolicies.effect_intent(&call, &spec("plugin.write", ToolRisk::WorkspaceWrite)),
             EffectIntent::WorkspaceWrite {
                 path: String::new(),
                 content_bytes: 0,
@@ -348,7 +306,13 @@ mod tests {
         // rest of the set. Every distinct target must be in the intent,
         // each with its own per-file byte estimate (duplicate paths merge
         // their hunks into one bound).
-        let policy = builtin_host_tool_policy("edit.patch").unwrap();
+        let policy = HostToolPolicy {
+            tool_name: "edit.patch".into(),
+            binding: HostEffectBinding::WorkspaceWrite {
+                path_arg: "path".into(),
+                content_args: vec![],
+            },
+        };
         let intent = policy.intent_from(&json!({
             "files": [
                 {"path": "src/a.rs", "hunks": [{"old": "a", "new": "aa"}]},
@@ -375,7 +339,13 @@ mod tests {
 
     #[test]
     fn edit_patch_single_file_forms_stay_single_resource() {
-        let policy = builtin_host_tool_policy("edit.patch").unwrap();
+        let policy = HostToolPolicy {
+            tool_name: "edit.patch".into(),
+            binding: HostEffectBinding::WorkspaceWrite {
+                path_arg: "path".into(),
+                content_args: vec![],
+            },
+        };
         // One `files[]` entry keeps the single-resource shape.
         assert_eq!(
             policy.intent_from(&json!({

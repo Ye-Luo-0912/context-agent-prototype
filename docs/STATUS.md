@@ -35,6 +35,11 @@ and sandbox contracts live elsewhere. Experiment facts live in
   same-class-across-targets `EXECUTION STALL` cluster escalation; and
   the `protocol-checkpoint-body-missing` reread motive instrument
   (body-cache LRU stays conditional on live evidence).
+- CORE-11 registry layering landed 2026-08-23: builtin host policies
+  moved out of contracts into `tool-runtime`; `agent-compose` owns the
+  `HostToolPolicyRegistry` (builtins + fail-closed plugin `admit()`),
+  wired into the kernel lease path, approval gate and dispatcher. The
+  manifest → operator-review flow is still open (M12).
 - Production always-load: `fs.list`, `fs.read`, `search.grep`,
   `artifact.read`, `edit.patch`, `task.complete`, `capability.manage`.
   Git / shell / write / `edit.replace` / `context.manage` are catalog-only

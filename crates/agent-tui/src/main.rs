@@ -8,7 +8,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use agent_compose::{ComposeConfig, ContextPolicy, build_context_engine, compose, model_from_env};
+use agent_compose::{
+    ComposeConfig, ContextPolicy, HostToolPolicyRegistry, build_context_engine, compose,
+    model_from_env,
+};
 use agent_contracts::{ApprovalDecision, StandingGrant};
 use agent_core::{ApprovalBroker, InteractiveApprovalGate, PolicyApprovalGate, TaskApprovalGate};
 use agent_runtime::{RuntimeHandle, RuntimeInstance};
@@ -67,6 +70,10 @@ async fn main() -> anyhow::Result<()> {
     if read_only && !grant_args.is_empty() {
         anyhow::bail!("--grant cannot be combined with --read-only");
     }
+    // The authority mapping is a composition-root decision (CORE-11): one
+    // builtin-backed registry shared by the approval gate, the capability
+    // dispatcher and the kernel's lease path.
+    let host_policies = Arc::new(HostToolPolicyRegistry::with_builtins());
     let (approval, interactive) = if read_only {
         (
             Arc::new(PolicyApprovalGate::read_only()) as Arc<dyn agent_contracts::ApprovalGate>,
@@ -75,7 +82,9 @@ async fn main() -> anyhow::Result<()> {
     } else {
         let broker = ApprovalBroker::new();
         let gate = Arc::new(InteractiveApprovalGate::new(broker.clone()));
-        let task_gate = Arc::new(TaskApprovalGate::new(gate.clone()));
+        let task_gate = Arc::new(
+            TaskApprovalGate::new(gate.clone()).with_host_policies(host_policies.clone()),
+        );
         for json in &grant_args {
             let grant: StandingGrant = serde_json::from_str(json)
                 .with_context(|| format!("invalid --grant JSON: {json}"))?;
@@ -112,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
         output_broker: Some(output_broker),
         max_tool_rounds: None,
         project_task_progress: true,
+        host_policies: Some(host_policies),
     })
     .await?;
     let mut runtime_events = composed.subscribe();

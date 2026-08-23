@@ -19,7 +19,14 @@ self-authorize via `ToolRisk` plus parameter names (`command`, `argv`,
 becomes an empty `ExecArgv`; WorkspaceWrite becomes an empty path / 0
 bytes.
 
-Code: `crates/agent-contracts/src/host_policy.rs`.
+Layering (CORE-11, landed 2026-08-23): `agent-contracts/src/host_policy.rs`
+defines the vocabulary and the `HostToolPolicies` lookup trait whose
+`effect_intent` derivation every consumer shares; the builtin table lives
+in `tool-runtime` (`BuiltinToolPolicies`); trusted composition owns
+`agent-compose::HostToolPolicyRegistry`, which admits operator-reviewed
+plugin bindings and never lets them shadow a builtin. The same registry
+reaches the kernel lease path, the approval gate, and the capability
+dispatcher — approval and lease minting cannot drift.
 
 ## EffectIntent (M12 first cut)
 

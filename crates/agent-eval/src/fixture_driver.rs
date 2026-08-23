@@ -1093,6 +1093,11 @@ async fn run_workspace_session_harness_ops(
         output_broker: None,
         max_tool_rounds: limits.max_model_rounds.map(|n| n as usize),
         project_task_progress,
+        // Same builtin authority mapping the production composition wires
+        // (CORE-11); `None` would compose builtins anyway.
+        host_policies: Some(Arc::new(
+            agent_compose::HostToolPolicyRegistry::with_builtins(),
+        )),
     })
     .await?;
     let mut events = composed.subscribe();

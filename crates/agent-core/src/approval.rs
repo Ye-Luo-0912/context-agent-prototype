@@ -7,7 +7,7 @@ use std::{
 
 use agent_contracts::{
     AgentError, AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, EffectIntent,
-    IntentShadowGate, ShadowVerdict, StandingGrant, ToolCall, ToolRisk, ToolSpec,
+    HostToolPolicies, IntentShadowGate, ShadowVerdict, StandingGrant, ToolCall, ToolRisk, ToolSpec,
 };
 use tokio::sync::{Mutex, broadcast, oneshot};
 use uuid::Uuid;
@@ -231,6 +231,11 @@ pub struct TaskApprovalGate {
     grants: Mutex<HashMap<String, GrantEntry>>,
     audit: Mutex<VecDeque<GrantAuditEntry>>,
     now: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// Host policy mapping (CORE-11): builtin and admitted-plugin
+    /// argument→effect bindings. Composition injects the same source it
+    /// gave the kernel's lease path so the two can never drift. `None`
+    /// keeps only the declared-risk empty bound (fail-closed floor).
+    host_policies: Option<Arc<dyn HostToolPolicies>>,
 }
 
 struct GrantEntry {
@@ -253,7 +258,15 @@ impl TaskApprovalGate {
             grants: Mutex::new(HashMap::new()),
             audit: Mutex::new(VecDeque::new()),
             now,
+            host_policies: None,
         }
+    }
+
+    /// Install the host policy mapping. Must be the same source the
+    /// kernel's lease minting received (see [`CoreAuthorityConfig`]).
+    pub fn with_host_policies(mut self, policies: Arc<dyn HostToolPolicies>) -> Self {
+        self.host_policies = Some(policies);
+        self
     }
 
     /// Establish a standing grant. The grant is validated (target scope is
@@ -421,13 +434,16 @@ impl TaskApprovalGate {
     }
 
     /// Derive the concrete effect intent of one call from its validated
-    /// arguments. Shared with the v2 lease path through the contracts-level
-    /// `derive_effect_intent` so approval and lease minting can never
-    /// drift; missing or malformed arguments produce the empty intent of
-    /// that class (an empty path/command can never match a grant), which
-    /// is the same fail-closed behavior as the legacy argument parsing.
-    fn derive_effect_intent(call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
-        agent_contracts::derive_effect_intent(call, spec)
+    /// arguments through the injected host policy mapping. Shared with the
+    /// v2 lease path so approval and lease minting can never drift;
+    /// missing or malformed arguments produce the empty intent of that
+    /// class (an empty path/command can never match a grant), which is the
+    /// same fail-closed behavior as the legacy argument parsing.
+    fn derive_effect_intent(&self, call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
+        match &self.host_policies {
+            Some(policies) => policies.effect_intent(call, spec),
+            None => agent_contracts::unbound_effect_intent(spec),
+        }
     }
 
     async fn record(&self, call_name: &str, risk: ToolRisk, grant_id: Option<String>) {
@@ -488,7 +504,7 @@ impl IntentShadowGate for TaskApprovalGate {
                 reason: "read-only calls need no standing grant".into(),
             };
         }
-        let intent = Self::derive_effect_intent(call, spec);
+        let intent = self.derive_effect_intent(call, spec);
         if matches!(intent, EffectIntent::ReadOnly) {
             return ShadowVerdict::Granted {
                 grant_id: "session-control".into(),
@@ -548,7 +564,7 @@ impl ApprovalGate for TaskApprovalGate {
 
         // Approval is effect-derived: derive the concrete intent from the
         // validated arguments and match grants against it.
-        let intent = Self::derive_effect_intent(call, spec);
+        let intent = self.derive_effect_intent(call, spec);
         // `process.session` poll/stop keep ProcessExecution dispatch
         // identity but do not spawn. They must not consume an argv-prefix
         // or shell-digest grant and must not fall through as an empty
@@ -636,6 +652,18 @@ mod tests {
     use super::*;
     use agent_contracts::{EffectIntent, GrantTarget, ToolRisk, ToolSemanticRole, ToolSpec};
     use serde_json::json;
+
+    /// The builtin host mapping, straight from tool-runtime: the tests
+    /// assert real argument bindings without a second table in core.
+    fn builtin_effect_intent(call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
+        tool_runtime::BuiltinToolPolicies.effect_intent(call, spec)
+    }
+
+    /// Gate wired to the real builtin mapping — the production shape.
+    fn builtin_gate(inner: Arc<dyn ApprovalGate>) -> TaskApprovalGate {
+        TaskApprovalGate::new(inner)
+            .with_host_policies(Arc::new(tool_runtime::BuiltinToolPolicies))
+    }
 
     fn write_call() -> ToolCall {
         ToolCall {
@@ -920,7 +948,7 @@ mod tests {
     #[tokio::test]
     async fn standing_grant_allows_matching_write_without_prompt() {
         let inner = RecordingGate::denying();
-        let gate = TaskApprovalGate::new(inner.clone());
+        let gate = builtin_gate(inner.clone());
         gate.grant(write_grant("g-src", "src/", u64::MAX))
             .await
             .unwrap();
@@ -950,7 +978,7 @@ mod tests {
     #[tokio::test]
     async fn write_outside_grant_delegates_to_inner() {
         let inner = RecordingGate::denying();
-        let gate = TaskApprovalGate::new(inner.clone());
+        let gate = builtin_gate(inner.clone());
         gate.grant(write_grant("g-src", "src/", u64::MAX))
             .await
             .unwrap();
@@ -978,7 +1006,7 @@ mod tests {
     #[tokio::test]
     async fn grant_prefix_is_component_aware() {
         let inner = RecordingGate::denying();
-        let gate = TaskApprovalGate::new(inner.clone());
+        let gate = builtin_gate(inner.clone());
         gate.grant(write_grant("g-src", "src", u64::MAX))
             .await
             .unwrap();
@@ -1015,7 +1043,7 @@ mod tests {
     #[tokio::test]
     async fn parent_and_absolute_writes_never_match_a_grant() {
         let inner = RecordingGate::denying();
-        let gate = TaskApprovalGate::new(inner.clone());
+        let gate = builtin_gate(inner.clone());
         gate.grant(write_grant("g", "src/", u64::MAX))
             .await
             .unwrap();
@@ -1056,7 +1084,8 @@ mod tests {
         let gate = TaskApprovalGate::with_clock(
             inner.clone(),
             Box::new(move || clock_for_gate.load(Ordering::Relaxed)),
-        );
+        )
+        .with_host_policies(Arc::new(tool_runtime::BuiltinToolPolicies));
         gate.grant(write_grant("g-exp", "src/", 1_000))
             .await
             .unwrap();
@@ -1093,7 +1122,7 @@ mod tests {
     #[tokio::test]
     async fn revoked_grant_stops_matching() {
         let inner = RecordingGate::denying();
-        let gate = TaskApprovalGate::new(inner.clone());
+        let gate = builtin_gate(inner.clone());
         gate.grant(write_grant("g-r", "src/", u64::MAX))
             .await
             .unwrap();
@@ -1118,7 +1147,7 @@ mod tests {
     #[tokio::test]
     async fn process_run_grant_is_structured_argv_prefix() {
         let inner = RecordingGate::denying();
-        let gate = TaskApprovalGate::new(inner.clone());
+        let gate = builtin_gate(inner.clone());
         gate.grant(exec_grant("g-test", &["cargo", "test"], Some(2)))
             .await
             .unwrap();
@@ -1170,7 +1199,7 @@ mod tests {
     #[tokio::test]
     async fn shell_grant_is_exact_digest_and_rejects_conjunction() {
         let inner = RecordingGate::denying();
-        let gate = TaskApprovalGate::new(inner);
+        let gate = builtin_gate(inner);
         gate.grant(shell_grant("g-shell", "git status", Some(2)))
             .await
             .unwrap();
@@ -1211,7 +1240,7 @@ mod tests {
     #[tokio::test]
     async fn content_cap_rejects_oversized_write() {
         let inner = RecordingGate::denying();
-        let gate = TaskApprovalGate::new(inner.clone());
+        let gate = builtin_gate(inner.clone());
         gate.grant(StandingGrant {
             id: "g-small".into(),
             risk: ToolRisk::WorkspaceWrite,
@@ -1283,14 +1312,14 @@ mod tests {
         // intent now carries the whole target set and the grant must
         // cover each path.
         let inner = RecordingGate::denying();
-        let gate = TaskApprovalGate::new(inner.clone());
+        let gate = builtin_gate(inner.clone());
         gate.grant(write_grant("g-src", "src/", u64::MAX))
             .await
             .unwrap();
 
         let widened = multi_file_patch_call(&[("src/a.rs", "a", "aa"), ("secret/b.rs", "b", "bb")]);
         assert_eq!(
-            TaskApprovalGate::derive_effect_intent(&widened, &patch_spec()),
+            builtin_effect_intent(&widened, &patch_spec()),
             EffectIntent::WorkspaceWriteSet {
                 writes: vec![
                     agent_contracts::WorkspaceWriteBound {
@@ -1326,7 +1355,7 @@ mod tests {
         // grants minted from single-file calls still match exactly.
         let single = multi_file_patch_call(&[("src/a.rs", "a", "aa")]);
         assert_eq!(
-            TaskApprovalGate::derive_effect_intent(&single, &patch_spec()),
+            builtin_effect_intent(&single, &patch_spec()),
             EffectIntent::WorkspaceWrite {
                 path: "src/a.rs".into(),
                 content_bytes: 2,
@@ -1337,7 +1366,7 @@ mod tests {
     #[tokio::test]
     async fn multi_file_patch_content_cap_counts_the_whole_set() {
         let inner = RecordingGate::denying();
-        let gate = TaskApprovalGate::new(inner.clone());
+        let gate = builtin_gate(inner.clone());
         gate.grant(StandingGrant {
             id: "g-small".into(),
             risk: ToolRisk::WorkspaceWrite,
@@ -1367,7 +1396,7 @@ mod tests {
 
     #[tokio::test]
     async fn grant_rejects_invalid_targets_and_shapes() {
-        let gate = TaskApprovalGate::new(RecordingGate::denying());
+        let gate = builtin_gate(RecordingGate::denying());
         let now = now_ms();
         for bad in [
             write_grant("g1", "../escape", now + 10_000),
@@ -1431,7 +1460,7 @@ mod tests {
             InteractiveApprovalGate::new(broker.clone())
                 .with_answer_timeout(Duration::from_millis(50)),
         );
-        let gate = TaskApprovalGate::new(interactive.clone());
+        let gate = builtin_gate(interactive.clone());
         gate.grant(write_grant("g-src", "src/", u64::MAX))
             .await
             .unwrap();
@@ -1485,7 +1514,7 @@ mod tests {
             roles: vec![ToolSemanticRole::Mutate],
         };
         assert_eq!(
-            TaskApprovalGate::derive_effect_intent(&write, &write_spec),
+            builtin_effect_intent(&write, &write_spec),
             EffectIntent::WorkspaceWrite {
                 path: "src/main.rs".into(),
                 content_bytes: "fn main() {}".len() as u64,
@@ -1499,7 +1528,7 @@ mod tests {
             arguments: json!({"path": "src/main.rs", "old": "a", "new": "b"}),
         };
         assert_eq!(
-            TaskApprovalGate::derive_effect_intent(&edit, &write_spec),
+            builtin_effect_intent(&edit, &write_spec),
             EffectIntent::WorkspaceWrite {
                 path: "src/main.rs".into(),
                 content_bytes: 1,
@@ -1520,7 +1549,7 @@ mod tests {
             roles: vec![ToolSemanticRole::EscapeHatch],
         };
         assert_eq!(
-            TaskApprovalGate::derive_effect_intent(&process, &process_spec),
+            builtin_effect_intent(&process, &process_spec),
             agent_contracts::shell_exec_intent("", "cargo test -- --nocapture")
         );
 
@@ -1538,7 +1567,7 @@ mod tests {
             roles: vec![ToolSemanticRole::ReadResource],
         };
         assert_eq!(
-            TaskApprovalGate::derive_effect_intent(&read, &read_spec),
+            builtin_effect_intent(&read, &read_spec),
             EffectIntent::ReadOnly
         );
     }
@@ -1546,7 +1575,7 @@ mod tests {
     #[tokio::test]
     async fn process_run_grant_matches_argv_not_an_unused_command_field() {
         let inner = RecordingGate::denying();
-        let gate = TaskApprovalGate::new(inner);
+        let gate = builtin_gate(inner);
         gate.grant(exec_grant("g-cargo", &["cargo"], None))
             .await
             .unwrap();
@@ -1584,7 +1613,7 @@ mod tests {
     #[tokio::test]
     async fn process_session_poll_does_not_consume_a_process_grant() {
         let inner = RecordingGate::denying();
-        let gate = TaskApprovalGate::new(inner);
+        let gate = builtin_gate(inner);
         gate.grant(exec_grant("g-cargo", &["cargo"], Some(1)))
             .await
             .unwrap();
@@ -1667,7 +1696,7 @@ mod tests {
             roles: vec![ToolSemanticRole::Mutate],
         };
         assert_eq!(
-            TaskApprovalGate::derive_effect_intent(&missing, &write_spec),
+            builtin_effect_intent(&missing, &write_spec),
             EffectIntent::WorkspaceWrite {
                 path: String::new(),
                 content_bytes: 1,
@@ -1685,7 +1714,7 @@ mod tests {
             constraint: Default::default(),
             expires_at_ms: u64::MAX,
         };
-        let intent = TaskApprovalGate::derive_effect_intent(&missing, &write_spec);
+        let intent = builtin_effect_intent(&missing, &write_spec);
         assert!(!TaskApprovalGate::grant_matches(&grant, &intent));
     }
 
@@ -1693,7 +1722,7 @@ mod tests {
 
     #[tokio::test]
     async fn shadow_verdict_grants_read_only_without_a_grant() {
-        let gate = TaskApprovalGate::new(RecordingGate::denying());
+        let gate = builtin_gate(RecordingGate::denying());
         let read_only = ToolSpec {
             name: "fs.read".into(),
             description: "read".into(),
@@ -1720,7 +1749,7 @@ mod tests {
 
     #[tokio::test]
     async fn shadow_verdict_grants_when_a_grant_matches_and_denies_otherwise() {
-        let gate = TaskApprovalGate::new(RecordingGate::denying());
+        let gate = builtin_gate(RecordingGate::denying());
         gate.grant(write_grant("g-src", "src/", u64::MAX))
             .await
             .unwrap();
@@ -1770,7 +1799,7 @@ mod tests {
         // Run-capped process grant: after the cap is consumed on the legacy
         // path, shadow must not grant — otherwise shadow would look wider
         // than the legacy gate.
-        let process = TaskApprovalGate::new(RecordingGate::denying());
+        let process = builtin_gate(RecordingGate::denying());
         process
             .grant(shell_grant("g-run", "cargo test", Some(2)))
             .await
@@ -1801,7 +1830,7 @@ mod tests {
         // the legacy path must say Allow. Exercise a mix of granted and
         // ungranted writes/process calls against a permissive inner gate.
         let inner = RecordingGate::allowing();
-        let gate = TaskApprovalGate::new(inner.clone());
+        let gate = builtin_gate(inner.clone());
         gate.grant(write_grant("g-src", "src/", u64::MAX))
             .await
             .unwrap();
@@ -1839,5 +1868,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn injected_host_policies_drive_the_gate_derivation() {
+        // CORE-11 wiring: the gate derives through the same source the
+        // kernel lease path uses, and stays on the fail-closed empty bound
+        // when composition injected nothing.
+        let write = ToolCall {
+            id: "c".into(),
+            name: "fs.write".into(),
+            arguments: json!({"path": "src/a.rs", "content": "x"}),
+        };
+        let spec = write_spec();
+        let bound = builtin_gate(RecordingGate::denying());
+        assert_eq!(
+            bound.derive_effect_intent(&write, &spec),
+            builtin_effect_intent(&write, &spec)
+        );
+        let unbound = TaskApprovalGate::with_clock(RecordingGate::denying(), Box::new(now_ms));
+        assert_eq!(
+            unbound.derive_effect_intent(&write, &spec),
+            agent_contracts::unbound_effect_intent(&spec)
+        );
     }
 }

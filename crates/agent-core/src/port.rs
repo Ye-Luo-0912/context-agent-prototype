@@ -1697,7 +1697,10 @@ mod tests {
             executions: executions.clone(),
         });
         let port = build_core_port(
-            CoreAuthorityConfig::default(),
+            CoreAuthorityConfig {
+                host_policies: Some(Arc::new(tool_runtime::BuiltinToolPolicies)),
+                ..CoreAuthorityConfig::default()
+            },
             Arc::new(StubContext),
             tools.clone(),
             Arc::new(Allow),
@@ -1855,7 +1858,10 @@ mod tests {
             name: "prepared.effect",
         });
         let port = build_core_port(
-            CoreAuthorityConfig::default(),
+            CoreAuthorityConfig {
+                host_policies: Some(Arc::new(tool_runtime::BuiltinToolPolicies)),
+                ..CoreAuthorityConfig::default()
+            },
             Arc::new(StubContext),
             tools.clone(),
             Arc::new(Allow),
@@ -1929,7 +1935,10 @@ mod tests {
             name: "fs.write",
         });
         let port = build_core_port(
-            CoreAuthorityConfig::default(),
+            CoreAuthorityConfig {
+                host_policies: Some(Arc::new(tool_runtime::BuiltinToolPolicies)),
+                ..CoreAuthorityConfig::default()
+            },
             Arc::new(StubContext),
             tools.clone(),
             Arc::new(Allow),
@@ -2262,7 +2271,10 @@ mod tests {
     async fn rejected_preparation_with_failed_rollback_reports_recovery() {
         let tools = Arc::new(FailingRollbackPreparedEffectTools);
         let port = build_core_port(
-            CoreAuthorityConfig::default(),
+            CoreAuthorityConfig {
+                host_policies: Some(Arc::new(tool_runtime::BuiltinToolPolicies)),
+                ..CoreAuthorityConfig::default()
+            },
             Arc::new(StubContext),
             tools.clone(),
             Arc::new(Allow),

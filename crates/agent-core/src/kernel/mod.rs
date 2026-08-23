@@ -12,7 +12,7 @@ use agent_contracts::{
     OperationQueryResult, OperationSnapshot, OperationState, OperationTerminal, OutputBroker,
     ResourceDescriptor, RunId, RuntimeEvent, TaskId, ToolCall, ToolDispatcher,
     ToolExecutionRequest, ToolOperationIdentity, ToolOutcome, ToolOutput, ToolRisk,
-    ToolSurfaceSnapshot, context_maintenance_events, derive_effect_intent,
+    ToolSurfaceSnapshot, context_maintenance_events,
 };
 
 use crate::authority::{
@@ -51,6 +51,12 @@ pub struct CoreAuthorityConfig {
     /// long after approval; the actor refuses to commit a staged effect
     /// whose lease has expired and rolls it back instead.
     pub lease_ttl_ms: Option<u64>,
+    /// Host policy mapping (CORE-11): the trusted composition installs
+    /// builtin implementations plus admitted plugin bindings here, and
+    /// gives the same source to the approval gate. `None` derives every
+    /// intent from the declared risk alone (the fail-closed empty bound),
+    /// which can never match a grant.
+    pub host_policies: Option<Arc<dyn agent_contracts::HostToolPolicies>>,
 }
 
 impl std::fmt::Debug for CoreAuthorityConfig {
@@ -62,6 +68,7 @@ impl std::fmt::Debug for CoreAuthorityConfig {
             .field("output_broker", &"<output broker>")
             .field("shadow_gate", &"<shadow gate>")
             .field("lease_ttl_ms", &self.lease_ttl_ms)
+            .field("host_policies", &"<host policies>")
             .finish()
     }
 }
@@ -75,6 +82,7 @@ impl Default for CoreAuthorityConfig {
             output_broker: None,
             shadow_gate: None,
             lease_ttl_ms: None,
+            host_policies: None,
         }
     }
 }
@@ -1070,7 +1078,10 @@ impl CoreAuthority {
                 operation_id: identity.operation_id,
                 argument_digest: identity.argument_digest,
                 operation_generation: generation,
-                intent: derive_effect_intent(&call, &spec),
+                intent: match &self.config.host_policies {
+                    Some(policies) => policies.effect_intent(&call, &spec),
+                    None => agent_contracts::unbound_effect_intent(&spec),
+                },
                 grant_id,
                 decision: agent_contracts::ApprovalDecision::Allow,
                 issued_at_ms,

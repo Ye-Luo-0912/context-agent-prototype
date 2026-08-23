@@ -19,10 +19,10 @@ use agent_contracts::{
     AgentError, AgentResult, ArtifactHandle, CAPABILITY_MANAGE, CAPABILITY_SEARCH_DEFAULT_LIMIT,
     CAPABILITY_SEARCH_MAX_LIMIT, Capability, CapabilityActivation, CapabilityInvocationContext,
     CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
-    CapabilityTransport, Effect, RUNTIME_CONTEXT_CONTROL, ResourceDescriptor, ToolCatalogEntry,
-    ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput, ToolSemanticRole,
-    ToolSpec, ToolSurfaceSnapshot, WORKSPACE_READ, WORKSPACE_WRITE, WorkspaceHandle,
-    compact_tool_purpose, derive_effect_intent, search_tool_catalog_filtered,
+    CapabilityTransport, Effect, RUNTIME_CONTEXT_CONTROL, HostToolPolicies, ResourceDescriptor,
+    ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput,
+    ToolSemanticRole, ToolSpec, ToolSurfaceSnapshot, WORKSPACE_READ, WORKSPACE_WRITE,
+    WorkspaceHandle, compact_tool_purpose, search_tool_catalog_filtered, unbound_effect_intent,
 };
 use agent_core::{CapabilityAdmission, CapabilityState, CapabilityStateAuthority};
 use agent_workspace::{ArtifactStoreHandle, ConfinedWorkspaceHandle, RemoteEffectAck, Workspace};
@@ -1068,6 +1068,11 @@ pub struct CapabilityAwareDispatcher {
     /// gets a `CapabilityInvocationContext` whose confined handles are
     /// built from it.
     workspace: Option<Arc<Workspace>>,
+    /// Host policy mapping (CORE-11) for deriving an admitted plugin's
+    /// approved intent. Composition injects the same source the kernel
+    /// lease path uses; `None` keeps the declared-risk empty bound, so an
+    /// unadmitted plugin can never widen authority through this path.
+    host_policies: Option<std::sync::Arc<dyn HostToolPolicies>>,
 }
 
 impl CapabilityAwareDispatcher {
@@ -1094,7 +1099,17 @@ impl CapabilityAwareDispatcher {
             base,
             capabilities,
             workspace,
+            host_policies: None,
         }
+    }
+
+    /// Install the host policy mapping (same source as the kernel config).
+    pub fn with_host_policies(
+        mut self,
+        policies: std::sync::Arc<dyn HostToolPolicies>,
+    ) -> Self {
+        self.host_policies = Some(policies);
+        self
     }
 
     /// The unified control tool schemas (always visible).
@@ -1485,7 +1500,10 @@ impl CapabilityAwareDispatcher {
         };
         let approved_intent = self
             .inspect_tool(&request.call.name)
-            .map(|spec| derive_effect_intent(&request.call, &spec));
+            .map(|spec| match &self.host_policies {
+                Some(policies) => policies.effect_intent(&request.call, &spec),
+                None => unbound_effect_intent(&spec),
+            });
         CapabilityInvocationContext {
             granted_permissions: grant.to_vec(),
             workspace,

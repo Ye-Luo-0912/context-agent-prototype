@@ -34,7 +34,10 @@ use provider_openai::{OpenAiConfig, OpenAiProvider, RetryingTransport};
 use tokio::sync::broadcast;
 
 mod compactor;
+mod host_policies;
 mod mock_model;
+
+pub use host_policies::HostToolPolicyRegistry;
 
 pub use compactor::ModelBackedCompactor;
 pub use mock_model::MockModelTransport;
@@ -199,6 +202,11 @@ pub struct ComposeConfig {
     pub max_tool_rounds: Option<usize>,
     /// Ablation: omit TaskProgress from the Focus frame. Default true.
     pub project_task_progress: bool,
+    /// The trusted host policy registry (CORE-11). `None` composes the
+    /// builtin table only; plugin tools then stay fail-closed (no entry,
+    /// no grant). The same source is wired into the kernel config and the
+    /// capability dispatcher.
+    pub host_policies: Option<Arc<HostToolPolicyRegistry>>,
 }
 
 /// A composed runtime. Owns the workspace and the spawned `RuntimeInstance`
@@ -253,7 +261,13 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         output_broker,
         max_tool_rounds,
         project_task_progress,
+        host_policies,
     } = config;
+
+    // The authority mapping is a composition-root decision: builtins plus
+    // operator-admitted plugin bindings, shared by kernel and dispatcher.
+    let host_policies =
+        host_policies.unwrap_or_else(|| Arc::new(HostToolPolicyRegistry::with_builtins()));
 
     let mut host = ModuleHost::new();
     host.add_module(Arc::new(ContextModule::new(context_engine)))?;
@@ -264,14 +278,17 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     // added.
     let capability_registry = host.capability_registry();
     let tools: Arc<dyn ToolDispatcher> = if capability_aware {
-        Arc::new(CapabilityAwareDispatcher::with_workspace(
-            base_tools,
-            capability_registry,
-            // Capabilities that declare workspace/artifact permissions
-            // receive confined handles into the same workspace the builtin
-            // tools use.
-            Some(Arc::new(workspace.clone())),
-        ))
+        Arc::new(
+            CapabilityAwareDispatcher::with_workspace(
+                base_tools,
+                capability_registry,
+                // Capabilities that declare workspace/artifact permissions
+                // receive confined handles into the same workspace the builtin
+                // tools use.
+                Some(Arc::new(workspace.clone())),
+            )
+            .with_host_policies(host_policies.clone()),
+        )
     } else {
         base_tools
     };
@@ -299,6 +316,7 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     );
     let mut authority = CoreAuthorityConfig {
         output_broker,
+        host_policies: Some(host_policies),
         ..CoreAuthorityConfig::default()
     };
     if let Some(max_tool_rounds) = max_tool_rounds {

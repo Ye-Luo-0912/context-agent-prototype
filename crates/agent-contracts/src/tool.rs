@@ -314,8 +314,15 @@ pub fn shell_exec_intent(dialect: &str, command: &str) -> EffectIntent {
 }
 
 /// Whether the actual spawn sits inside the host-derived approved bound
-/// for this call. Empty approved bounds never cover a spawn.
-pub fn process_spawn_is_covered(tool_name: &str, arguments: &Value, actual: &EffectIntent) -> bool {
+/// for this call. Empty approved bounds never cover a spawn. The caller
+/// supplies the host policy mapping (CORE-11): builtin names resolve
+/// through it, unknown names collapse to the empty process bound.
+pub fn process_spawn_is_covered(
+    policies: &dyn crate::HostToolPolicies,
+    tool_name: &str,
+    arguments: &Value,
+    actual: &EffectIntent,
+) -> bool {
     let spec = ToolSpec {
         name: tool_name.into(),
         description: String::new(),
@@ -324,7 +331,7 @@ pub fn process_spawn_is_covered(tool_name: &str, arguments: &Value, actual: &Eff
         output_budget: None,
         roles: Vec::new(),
     };
-    crate::derive_effect_intent(
+    policies.effect_intent(
         &ToolCall {
             id: String::new(),
             name: tool_name.into(),
@@ -2096,9 +2103,58 @@ pub trait ToolDispatcher: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::derive_effect_intent;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Process-only host mapping mirroring the tool-runtime builtin
+    /// entries (CORE-11): contracts carries no builtin table, so the
+    /// coverage tests install the three process bindings locally.
+    use crate::host_policy::HostToolPolicies as _;
+    struct ProcessPolicies;
+
+    impl crate::HostToolPolicies for ProcessPolicies {
+        fn policy_for(&self, tool_name: &str) -> Option<&crate::HostToolPolicy> {
+            static POLICIES: std::sync::LazyLock<Vec<crate::HostToolPolicy>> =
+                std::sync::LazyLock::new(|| {
+                    vec![
+                        crate::HostToolPolicy {
+                            tool_name: "process.run".into(),
+                            binding: crate::HostEffectBinding::ExecArgv {
+                                argv_arg: "argv".into(),
+                            },
+                        },
+                        crate::HostToolPolicy {
+                            tool_name: "shell.exec".into(),
+                            binding: crate::HostEffectBinding::ShellExec {
+                                command_arg: "command".into(),
+                                dialect_arg: "dialect".into(),
+                            },
+                        },
+                        crate::HostToolPolicy {
+                            tool_name: "process.session".into(),
+                            binding: crate::HostEffectBinding::SessionExec {
+                                argv_arg: "argv".into(),
+                                action_arg: "action".into(),
+                            },
+                        },
+                    ]
+                });
+            POLICIES.iter().find(|policy| policy.tool_name == tool_name)
+        }
+    }
+
+    fn derive_effect_intent(call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
+        ProcessPolicies.effect_intent(call, spec)
+    }
+
+    fn process_spawn_is_covered(
+        tool_name: &str,
+        arguments: &Value,
+        actual: &EffectIntent,
+    ) -> bool {
+        crate::process_spawn_is_covered(&ProcessPolicies, tool_name, arguments, actual)
+    }
+
 
     #[test]
     fn effect_intent_round_trips_and_maps_to_risk() {
