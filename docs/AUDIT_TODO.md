@@ -268,39 +268,96 @@ be sized against real demand. Residency loosening stays rejected on
 current evidence; the tiny current-turn LRU gets built only if this
 motive shows up in live runs.
 
-### CONV-01 — Execution Evidence Frontier (open)
+### CONV-01 / CONV-02 / PROTO-EVID-01 — closed 2026-08-23
 
-Successful read-only observations (git.status/diff clean, fs.list
-listing digest, successful process.run) leave no persistent operational
-fact: when dynamic context recycles them, the model re-runs git 18 extra
-times per task (2026-08-23 long-flow). Define minimal
-`ExecutionEvidence { key, outcome, observed_world_revision, validity,
-argument_digest, evidence_ref }` with validity ∈ {Turn,
-WorkspaceRevision(N), Resource(path@digest)}; same-revision repeats are
-RedundantEvidence. TASK PROGRESS renders typed fields only — raw bodies
-stay in user-role/artifact layers.
+All three landed in Execution Convergence V1 (see
+[`EXECUTION_CONVERGENCE_V1.md`](EXECUTION_CONVERGENCE_V1.md) and
+[`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md)); write-ups moved to
+the second-round section below and to the closed archive. The remaining,
+narrower residuals are CAP-OBS-01 and CONV-03 there.
 
-### CONV-02 — cross-tool convergence debt (open)
+## Second-round review 2026-08-23 — trust & obligation
 
-SCHED-03's advisory landed but product convergence is not solved: the
-same pass burned ~20 rounds on an executable-guessing loop, and any
-unrelated Evidence progress clears the cluster today (progress is a
-global scalar; blockers are local). Upgrade RoundProgress to a
-FrontierDelta set where Unknown world invalidation is NOT progress, add
-ConvergenceState { evidence_revision, actions_since_frontier_advance,
-recent deltas } with a soft FRONTIER-UNCHANGED advisory, and split
-FailureClass from RetryDomain (hard refusal only on provable
-precondition equivalence; no K-strikes name bans).
+Source: the 2026-08-23 post-convergence full-repo review
+([`TRUST_AND_OBLIGATION_TODO.md`](TRUST_AND_OBLIGATION_TODO.md), items
+4–31). Clean n=2 longflow evidence: all four arm-runs passed hidden
+verification, but C r2 rebuilt a process-guessing chain while global
+frontier metrics stayed under threshold — progress-as-global-scalar
+cannot see blocker debt, and three correctness/trust holes were
+confirmed.
 
-### PROTO-EVID-01 — current-turn protocol body cache (open, gate met)
+### PROMPT-AUTH-01 — restored raw body entered System role (fixed 2026-08-23)
 
-`protocol-checkpoint-body-missing` fired 8 times in both 2026-08-23 live
-runs, so its gate is satisfied. Tiny ActiveTurn-scoped LRU keyed
-path@revision (~4 entries / 4–8 KiB, sources fs.read + edit echo);
-rehydrate only when the checkpoint removed the body AND the fact is
-Fresh at the identical revision; known mutations invalidate their path,
-unknown mutations stale everything. Never enters Context, never Admits,
-never durable.
+The protocol body cache rehydrated file bodies through the runtime Focus
+frame, which renders as a System-policy message — elevating attacker-
+influenceable file content above the operator's instructions. Landed:
+RESTORED TURN BODIES now ride the user-role context frame; regression
+test asserts restored content never reaches focus_frame/system_policy.
+
+### EXEC-EVID-01 — resource evidence had no currentness bound (fixed 2026-08-23)
+
+Resource-validity evidence rows stayed visible after their file changed
+(the digest was checked only against a fact table that the mutation
+itself had already refreshed). Restore trusted no bounds on the new
+convergence fields. Landed: one `evidence_is_current` predicate shared
+by projection and sweeping (WorkspaceRevision equality; Resource needs a
+Fresh fact at the identical digest, evaluated after this round's facts
+land; Turn requires the current turn); `validate_execution_state`
+additionally rejects oversized evidence/deltas/targets/obligations and
+per-row string overruns, so restore cannot trust an unbounded checkpoint.
+
+### CAP-OBS-01 — dynamic producer metadata must not become trusted execution facts (open, narrowed)
+
+`ToolOutput::file_path/file_revision/resource_touches/is_verification/
+may_mutate_workspace` read producer-stamped metadata, and
+`take_runtime_diagnosis` read producer `failure_class`/`recovery_hint`.
+Operator-trusted builtins are fine; a dynamic capability could forge
+`path`/`revision`/`verification`/`mutates_workspace: false` and feed
+ResourceFact, Verification, WorkingSetSignal, TASK PROGRESS authority.
+Landed 2026-08-23: fail-closed routing-layer sanitizer
+(`sanitize_untrusted_producer_output`) strips reserved diagnosis keys
+before Core reads them plus the producer-authority keys from every
+capability output; contract direction written into
+[`TOOL_RESULT_ENVELOPE.md`](TOOL_RESULT_ENVELOPE.md). Still open before
+Self-Iteration: introduce the typed host-trusted `ToolExecutionFacts`
+channel so context heating, ExecutionState, Evidence Frontier,
+RetryDomain and Verification consume runtime/verified facts instead of
+producer metadata at all (capability default = empty facts; effect
+receipts and workspace handles generate Runtime-owned facts).
+
+### PROTO-EVID-02 — cache correctness + observability (fixed 2026-08-23)
+
+Two findings: edit echo was cached as if it were the exact body (it is
+a patch echo, not the file), and "remaining rereads are not cache
+misses" was unverifiable because no counters existed. Landed:
+`record_protocol_body` accepts fs.read bodies only (edits invalidate
+their paths); assembly emits per-round `ProtocolBodyCacheStats`
+{eligible, hit, miss, invalidated, oversize, restored_body_tokens} which
+agent-eval aggregates into summary.json — hit rate is now independently
+verifiable from any bundle.
+
+### CONV-03 — obligation-scoped convergence (mechanism landed 2026-08-23, live evidence pending)
+
+Global frontier advance does not prove blocker resolution (C r2's
+13-attempt guessing loop kept peak=4 < advisory 5 via interleaved
+advances). Landed: typed `ExecutionObligation` ledger keyed by domain +
+precondition fingerprint (`resolution_fingerprint` = cwd listing + PATH
++ env overrides stamped host-trusted on process NotFound); unrelated
+progress can never resolve an obligation; resolution requires
+precondition change or same-domain success; ≤2 bounded UNRESOLVED
+BLOCKER warning lines render beside the global advisory. Evidence
+argument identity now uses the Runtime-computed ArgumentDigest.
+Pending: longflow/bench evidence under the new ROADMAP gate, and the
+LaunchResolutionFact hard-refusal note that its revision guard is
+deliberately conservative until fingerprints are recomputable
+pre-dispatch without I/O.
+
+### EVAL-IMMUTABLE-01 — live evidence attempts must not overwrite (fixed 2026-08-23)
+
+A provider-503 retry overwrote good r1 artifacts; reconstruction had to
+come from harness logs. Landed: `PairSink::claim` resolves the repeat
+directory once per run — existing directories are never reused;
+reruns land in `r{n}-attempt{k}` and failed attempts stay auditable.
 
 ## Freeze (not a defect)
 
@@ -312,14 +369,14 @@ model even guessed `warm.<tool>` names, so the phase-2 gate was met.
 `BuiltinToolDispatcher::gc` now cools only above a soft schema-bytes high
 watermark, oldest-idle first, down to a low watermark (defaults
 18_000/9_000; 0 restores pure idle semantics). The protocol evidence LRU
-gate also fired (8 `protocol-checkpoint-body-missing` reads); that cache
-remains a separate open slice.
+gate also fired; that cache landed 2026-08-23 (see PROTO-EVID-02).
 
 ### CTX-11 — Execution Coherence V1
 
-**Status: RC** (MOD-OBS-01 / MOD-PROG-01 / turn checkpointing landed
-2026-08-21; freeze waits for the next live evidence pass). Do not
-reimplement `ResumePoint`.
+**Status: Freeze Candidate** (MOD-OBS-01 / MOD-PROG-01 / turn
+checkpointing landed 2026-08-21; the clean post-outage longflow pass
+2026-08-23 held — Warm=Stored rereads stayed 0 and capability churn
+stayed gone). Do not reimplement `ResumePoint`.
 Contract: [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md).
 
 ## Open P2 — evaluation
@@ -363,6 +420,13 @@ Full text: git history of this file.
 | EVAL-04 | Source-identity self-pollution: a live run's own untracked evidence output made every cell after the first report `git_dirty=true` (the `context-mech-convergence` manifests record this). Identity scans now exclude `crates/agent-eval/evidence` — run outputs are not tested sources (2026-08-21) |
 | CTX-12 | Not a code divergence: the parity tests had spawned a 9-day-stale `target/debug/agent-context-service.exe` (cargo test never refreshes that artifact; `serde(default)` hid the wire drift). Fixed with a test freshness guard that fails closed with a rebuild hint (2026-08-21). Scoped test runs need `cargo build -p agent-context-service` first. |
 | PROV-01 | `provider-openai` loopback wire test failed through machine-wide proxies (Clash/V2Ray WinINET interception → gateway 502). Fixed with `OpenAiProvider::with_client` + a `no_proxy` test client (2026-08-21); production `new` keeps auto system proxy. |
+| CONV-01 | Execution Evidence Frontier: ExecutionEvidence + FrontierDelta + ConvergenceState + `ExecutionFrontier` events + eval metrics; replay rebuild + conformance serde contracts (2026-08-23) |
+| CONV-02 | Cross-tool convergence debt: FailureClass/FailureDomain split, RetryDomain::ExecutableResolution with host-trusted launch facts, no K-strikes decision recorded (2026-08-23) |
+| PROTO-EVID-01 | Current-turn protocol body cache: ActiveTurn LRU, checkpoint+Fresh-gated rehydration, mutation invalidation; superseded by PROTO-EVID-02 correctness/observability fixes (2026-08-23) |
+| PROMPT-AUTH-01 | Restored turn bodies moved from System-role focus frame to user-role context frame with regression test (2026-08-23) |
+| EXEC-EVID-01 | Unified evidence currentness predicate shared by projection and sweep + restore bounds on convergence fields (2026-08-23) |
+| PROTO-EVID-02 | Body cache source narrowed to fs.read exact bodies + per-round ProtocolBodyCacheStats event accounting in eval bundles (2026-08-23) |
+| EVAL-IMMUTABLE-01 | Pair sink claims fresh repeat directories (`r{n}-attempt{k}`); existing evidence is never implicitly overwritten (2026-08-23) |
 
 Do not start sourced `EpisodeOutcome`, GC retune, or a second ResumePoint
 from this index.

@@ -52,12 +52,20 @@ in parallel, but it does not reorder or close either gate.
    or this diagnostic alone do not close M12, M13, or M15.
 5. Formal M15 only from versioned per-cell artifacts. Do not use one
    A/B/C for every layer.
-6. Execution Convergence V1 candidate gate (2026-08-23 review): before any
-   V1 candidate claim, the Convergence Bench must be green — three
-   deterministic scripted-model scenarios (`retry_domain`,
-   `operational_evidence`, `protocol_body`) — and the live A/C longflow
-   must show no structural no-progress loop (`frontier_no_advance_peak`
-   below the advisory threshold on both arms). Metrics come from the
-   `ExecutionFrontier` event stream; n=1 longflow runs are directional
-   only. This gate does not close M12/M13/M15 and does not reorder them.
+6. Execution Convergence V1 candidate gate (revised 2026-08-23 second
+   review): before any V1 candidate claim, all of the following hold —
+   (a) the Convergence Bench is green: three deterministic
+   scripted-model scenarios (`retry_domain`, `operational_evidence`,
+   `protocol_body`); (b) no unresolved typed obligation exceeds its
+   bounded attempts under unchanged preconditions — read from the
+   Obligation Ledger's UNRESOLVED BLOCKER warnings and the
+   `ExecutionFrontier` event stream, not from the global scalar; and
+   (c) hidden verification is green on the live A/C longflow cells.
+   The global `frontier_no_advance_peak` metric is demoted to a
+   diagnostic only: C r2 proved it can stay under threshold while a
+   13-attempt process-guessing loop runs, because interleaved unrelated
+   advances reset the counter. Evidence identity uses the Runtime
+   `ArgumentDigest`; cache hit-rate claims must be backed by
+   `ProtocolBodyCacheStats` events. This gate does not close
+   M12/M13/M15 and does not reorder them.
 7. V2 Self-Iteration last.

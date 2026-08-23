@@ -1,11 +1,12 @@
 # Execution Coherence V1
 
-RC (release candidate). Code: `crates/agent-runtime/src/execution/`.
+**Freeze candidate** (2026-08-23). Code: `crates/agent-runtime/src/execution/`.
 The 2026-08-21 blockers — MOD-OBS-01 (refusal-as-observation),
-MOD-PROG-01 (progress / stall), turn checkpointing — landed; freeze
-re-designation waits for the next live evidence pass (production-surface
-convergence), not for new code here. Checkpoint field is still `resume`
-on `TaskRecord` so old snapshots load.
+MOD-PROG-01 (progress / stall), turn checkpointing — landed, and the
+clean post-outage A/C longflow pass (n=2, all four arm-runs hidden-pass)
+held the machinery: Warm=Stored rereads stayed 0 and capability churn
+stayed gone. Do not retune or extend this layer as product work.
+Checkpoint field is still `resume` on `TaskRecord` so old snapshots load.
 Do not add a second task table and do not reimplement `ResumePoint`.
 
 Context packing, GC, and retrieval live in
@@ -39,6 +40,32 @@ Context packing, GC, and retrieval live in
    Do not clone `ExecutionState` and replay `TurnFrame` per consumer.
    Durable `TaskRecord.resume` is installed only after `TurnCompleted`.
    Cancel / fail / stale drops the ephemeral turn projection.
+
+5. **Global frontier advance ≠ blocker resolution.**
+   Reading a new file, learning a status, or seeing a new error are all
+   real frontier advances, yet none of them moves the current blocker.
+   Convergence is therefore two-layered: the Global Evidence Frontier
+   answers "did the agent recently gain new world facts at all" (metrics,
+   stall advisory, evidence working set); the Obligation Ledger answers
+   "has this known blocker's own precondition changed". Unrelated
+   progress must never clear an obligation.
+
+6. **Evidence stored ≠ evidence still valid.**
+   A row in the evidence table is a claim with a validity binding
+   (world revision / resource digest / turn), not a durable truth. One
+   shared `evidence_is_current` predicate governs both projection and
+   sweeping; restore may not assume a checkpoint was written by trusted
+   code, so converged state carries bounds and validation like any other
+   restored input.
+
+7. **Raw evidence ≠ Runtime authority.**
+   Producer-stamped output metadata (path/revision/verification/mutation
+   flags/failure class) is model-facing payload. Runtime-trusted facts
+   come from operator-builtins, effect receipts, workspace handles and
+   the process host — or from nothing. Dynamic capability outputs are
+   sanitized at the routing layer and contribute no authority facts
+   (CAP-OBS-01); the typed host-trusted facts channel is the follow-up
+   mainline before Self-Iteration.
 
 There is no planner. The LLM still chooses actions. Runtime only
 maintains what the world can currently prove.
@@ -229,22 +256,50 @@ legal under provable precondition equivalence: the edit duplicate guard
 (argument digest + all target identities Fresh), plus
 `ExecutableResolution` for process/shell launches — same argument digest
 (argv0/cwd/env overrides) with no workspace-revision advance since the
-failure. Timeout, exit codes, cancellations stay `NonDeterministic` and
+failure; the ledger's precondition is the host-trusted
+`resolution_fingerprint` (cwd listing + PATH + env), so a rebuilt binary
+changes the precondition while an unrelated source edit does not.
+Timeout, exit codes, cancellations stay `NonDeterministic` and
 are never refused hard; cross-name guessing loops are suppressed by the
 soft convergence debt above. There is deliberately **no K-strikes name
 ban**: the cwd listing is bounded, PATH/extensions/later builds can
 change any conclusion.
 
-### Protocol body cache (PROTO-EVID-01, landed)
+### Protocol body cache (PROTO-EVID-01/02, landed)
 
 A per-turn LRU (≤4 entries, ≤8 KiB each, `ActiveTurn` lifetime) keeps
-recently observed file bodies from successful `fs.read` results and edit
-echoes. A Known mutation invalidates its touched paths; an Unknown
+recently observed file bodies from successful `fs.read` results only —
+an edit echo is a patch echo, not the exact body, and never enters the
+cache. A Known mutation invalidates its touched paths; an Unknown
 mutation invalidates everything. During assembly a body is re-injected
-into the user-role focus layer only when the turn checkpoint actually
-truncated that read, the TASK PROGRESS fact is still Fresh, and the
-digest is identical. Cache rows never enter the context engine, are
-never admitted, and never persist.
+as a **user-role context-frame message** (never the Focus frame, which
+renders as System policy — PROMPT-AUTH-01) only when the turn checkpoint
+actually truncated that read, the TASK PROGRESS fact is still Fresh, and
+the digest is identical. Cache rows never enter the context engine, are
+never admitted, and never persist. Every assembly emits one bounded
+`ProtocolBodyCacheStats` event (eligible / hit / miss / invalidated /
+oversize / restored_body_tokens), so hit-rate claims are verifiable from
+the event stream alone.
+
+### Obligation Ledger (CONV-03, landed)
+
+The frontier's global counters cannot see blocker debt: interleaved
+unrelated advances keep `frontier_no_advance_peak` under threshold while
+a guessing loop burns rounds. The ledger is per-blocker: a failed output
+whose failure domain is typed (`ExecutableResolution`, `EditTarget`,
+`ResourcePath`, `ProjectMarker`) opens an `ExecutionObligation` keyed by
+domain + precondition fingerprint. For process launch failures the
+runtime stamps a host-trusted `resolution_fingerprint` (cwd listing +
+PATH + env overrides) into the failure metadata — source edits do not
+change it, builds do. Rules: unrelated progress never resolves an
+obligation; resolution requires the same domain to succeed or the
+recorded precondition to demonstrably change (new target digest, known
+mutation touching the path); same domain with a different precondition
+supersedes the old row; `NonDeterministic` domains open nothing. TASK
+PROGRESS renders at most two bounded UNRESOLVED BLOCKER lines beside the
+global advisory. Evidence argument identity uses the Runtime-computed
+`ArgumentDigest` (not producer strings), so same-argv/different-env and
+same-path/different-cursor calls no longer collide on evidence identity.
 
 ### Protocol working set (turn checkpointing)
 

@@ -23,21 +23,29 @@ and sandbox contracts live elsewhere. Experiment facts live in
   coherence machinery (MOD-OBS-01 observation, MOD-PROG-01 stall,
   turn checkpointing) held; Warm=Stored rereads stayed 0. Do not retune
   or extend them as product work.
-- **Execution Convergence V1 is an active P1**
-  ([`EXECUTION_CONVERGENCE_TODO.md`](EXECUTION_CONVERGENCE_TODO.md)):
-  the same pass exposed structural convergence gaps (executable-guessing
-  loop burned ~20 rounds; successful observations vanish with transcript
-  eviction). Track via CONV-01/CONV-02/PROTO-EVID-01 in AUDIT_TODO.
-  All 22 checklist items landed 2026-08-23 (same doc, all checked):
+- **Execution Convergence V1 mechanism landed** (2026-08-23, all 22
+  items checked — the checklist is now the historical record
+  [`EXECUTION_CONVERGENCE_V1.md`](EXECUTION_CONVERGENCE_V1.md)):
   Evidence Frontier + FrontierDelta + `ExecutionFrontier` events and
   eval metrics; RetryDomain (`ExecutableResolution`, no K-strikes);
-  per-turn protocol body cache with checkpoint-gated rehydration;
-  versioned `HostPolicySnapshot`; unified surface pressure budget for
-  builtin+capability; replay frontier rebuild + conformance serde
-  contracts; ROADMAP V1-candidate gate. Verification:
-  `agent-eval --convergence-bench` three deterministic scenarios PASS on
-  the real runtime + real tool surface. Live A/C longflow rerun to
-  measure round impact is the next evidence step, not a gate.
+  per-turn protocol body cache with checkpoint-gated rehydration and
+  event-level hit/miss accounting (`ProtocolBodyCacheStats`);
+  versioned `HostPolicySnapshot`; unified surface pressure budget;
+  replay frontier rebuild + conformance serde contracts. Verification:
+  `agent-eval --convergence-bench` three deterministic scenarios PASS
+  on the real runtime + real tool surface.
+- Clean post-outage A/C longflow rerun completed 2026-08-23
+  (n=2, all four arm-runs passed hidden verification): C r1 57 rounds,
+  C r2 67 rounds (one rebuilt process-guessing chain), A r1 48 rounds,
+  A r2 40 rounds. Facts in
+  [`crates/agent-eval/evidence/longflow-post-convergence-2026-08-23/REPORT.md`](../crates/agent-eval/evidence/longflow-post-convergence-2026-08-23/REPORT.md).
+  Residual convergence work is **obligation-scoped convergence**
+  (CONV-03) plus the trust/observability fixes tracked in
+  [`AUDIT_TODO.md`](AUDIT_TODO.md) and executed via
+  [`TRUST_AND_OBLIGATION_TODO.md`](TRUST_AND_OBLIGATION_TODO.md):
+  global frontier advances do not prove blocker progress; restored
+  bodies must stay out of System role; dynamic capability producer
+  metadata must not become trusted runtime facts.
 - M12 first cut: structured `EffectIntent` + trusted `HostToolPolicy`,
   multi-file `WorkspaceWriteSet` bounds, and commit-time
   Actual ⊆ Approved (`MOD-AUTH-01`/`02`).
@@ -48,8 +56,9 @@ and sandbox contracts live elsewhere. Experiment facts live in
   SCHED-01–04): idle-round `BeforeModel` maintenance gate; explicit
   search candidate completeness with bounded residual verification;
   same-class-across-targets `EXECUTION STALL` cluster escalation; and
-  the `protocol-checkpoint-body-missing` reread motive instrument
-  (body-cache LRU stays conditional on live evidence).
+  the `protocol-checkpoint-body-missing` reread motive instrument.
+  The body cache itself is implemented (see above) with counters, so
+  cache claims are verifiable from the event stream.
 - CORE-11 registry layering landed 2026-08-23: builtin host policies
   moved out of contracts into `tool-runtime`; `agent-compose` owns the
   `HostToolPolicyRegistry` (builtins + fail-closed plugin `admit()`),
@@ -85,12 +94,19 @@ and sandbox contracts live elsewhere. Experiment facts live in
 runtime admission flow itself — manifest → operator review → versioned,
 mutable snapshot install (`HostPolicySnapshot{policy, revision, digest}`)
 with the policy revision bound to operation authority, so an operator
-update never re-interprets an in-flight operation. Do not build a second
-registry. Attestation is actual enforced capabilities; generic process
-tools stay non-transactional.
+update never re-interprets an in-flight operation. Revision enforcement
+is **per binding** (`tool_name` + policy digest): adding `plugin.foo`
+policy must not stale an already-approved `fs.write`; only replacing or
+revoking the same binding affects that tool's later authority. Global
+"revision changed → all old leases invalid" is rejected by design.
+Do not build a second registry. Attestation is actual enforced
+capabilities; generic process tools stay non-transactional.
 UntrustedGenerated stays fail-closed on native. Multi-file
 `EffectIntent` and commit-time Actual ⊆ Approved (`MOD-AUTH-01`/`02`)
 landed 2026-08-21 — do not reopen them without new authority evidence.
+Tool Surface utility scoring stays out of scope until
+obligation-scoped convergence has stabilized; do not couple the two
+variables again.
 
 **P1 — Context live evidence, not Context retune.** `context-mech.v2`
 12-cell A/C live ran 2026-08-21; facts in

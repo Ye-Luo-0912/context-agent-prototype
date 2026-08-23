@@ -1,8 +1,13 @@
-# Execution Convergence 执行清单（2026-08-23 评审）
+# Execution Convergence V1（历史落地记录）
 
-来源：2026-08-23 全仓复审（第 2–38 条）。本文是唯一推进清单，完成一项
-勾一项；事实结论进对应 REPORT，架构语义进 EXECUTION_COHERENCE.md。
-原则不变：单 orchestrator；advisory 不做 planner；Context GC 维持冻结。
+Status: completed implementation program（2026-08-23 全部 22 项 [x]）。
+本文件是当时的推进清单与落地注释存档，不再是活跃 TODO；残余缺陷与
+后续工作见 [`AUDIT_TODO.md`](AUDIT_TODO.md) 与
+[`TRUST_AND_OBLIGATION_TODO.md`](TRUST_AND_OBLIGATION_TODO.md)。
+
+来源：2026-08-23 全仓复审（第 2–38 条）。事实结论进对应 REPORT，架构
+语义进 EXECUTION_COHERENCE.md。原则不变：单 orchestrator；advisory 不做
+planner；Context GC 维持冻结。
 
 ## P0 — 文档与语义修正
 
