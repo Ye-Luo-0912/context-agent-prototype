@@ -32,14 +32,41 @@ pub struct PairSink {
     pub repeat: u32,
     pub repeats: u32,
     pub live: bool,
+    /// 已解析的 repeat 目录名：`r{n}`，或被上一次运行占用时的
+    /// `r{n}-attempt{k}`。由 [`PairSink::claim`] 在运行开始时解析一次，
+    /// cell 与 pair.json 落进同一目录。
+    pub repeat_dir: String,
 }
 
 impl PairSink {
+    /// EVAL-IMMUTABLE-01：为一次运行认领 repeat 目录。已存在的目录
+    /// （上一次运行，包括 provider 失败的尝试）永不隐式覆盖；本次
+    /// 运行改写 `-attempt{k}` 后缀，失败尝试原样保留供审计。
+    pub fn claim(root: PathBuf, fixture_id: String, repeat: u32, repeats: u32, live: bool) -> Self {
+        let base = root.join(&fixture_id);
+        let mut repeat_dir = format!("r{repeat}");
+        let mut attempt = 1;
+        while base.join(&repeat_dir).exists() {
+            attempt += 1;
+            repeat_dir = format!("r{repeat}-attempt{attempt}");
+        }
+        Self {
+            root,
+            fixture_id,
+            repeat,
+            repeats,
+            live,
+            repeat_dir,
+        }
+    }
+
     pub fn cell_dir(&self, engine: &str) -> PathBuf {
-        self.root
-            .join(&self.fixture_id)
-            .join(format!("r{}", self.repeat))
-            .join(engine)
+        self.repeat_path().join(engine)
+    }
+
+    /// 本次运行认领的 pair 目录。
+    pub fn repeat_path(&self) -> PathBuf {
+        self.root.join(&self.fixture_id).join(&self.repeat_dir)
     }
 }
 
@@ -295,10 +322,7 @@ pub fn write_pair_doc(
     analysis_schema: &str,
     extra: &serde_json::Value,
 ) -> anyhow::Result<PathBuf> {
-    let dir = pair
-        .root
-        .join(&pair.fixture_id)
-        .join(format!("r{}", pair.repeat));
+    let dir = pair.repeat_path();
     fs::create_dir_all(&dir)?;
     let cells: Vec<_> = engines
         .iter()
@@ -655,6 +679,12 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
         "redundant_evidence_calls": metrics.redundant_evidence_calls,
         "frontier_no_advance_peak": metrics.frontier_no_advance_peak,
         "evidence_invalidations": metrics.evidence_invalidations,
+        "protocol_cache_eligible": metrics.protocol_cache_eligible,
+        "protocol_cache_hit": metrics.protocol_cache_hit,
+        "protocol_cache_miss": metrics.protocol_cache_miss,
+        "protocol_cache_invalidated": metrics.protocol_cache_invalidated,
+        "protocol_cache_oversize": metrics.protocol_cache_oversize,
+        "restored_body_tokens": metrics.restored_body_tokens,
         "failed_tool_outputs": metrics.failed_tool_outputs,
         "tool_failure_classes": metrics.tool_failure_classes,
         "repeated_fs_reads": metrics.repeated_fs_reads,
@@ -927,6 +957,22 @@ mod tests {
         }
     }
 
+    /// EVAL-IMMUTABLE-01：已有 repeat 目录（上一次运行，包括失败的
+    /// provider 尝试）不被隐式覆盖；后续运行认领 `-attempt{k}` 后缀。
+    #[test]
+    fn claim_never_reuses_an_existing_repeat_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("evidence");
+        let first = PairSink::claim(root.clone(), "fix".into(), 1, 2, true);
+        assert_eq!(first.repeat_dir, "r1");
+        std::fs::create_dir_all(first.repeat_path()).unwrap();
+        let second = PairSink::claim(root.clone(), "fix".into(), 1, 2, true);
+        assert_eq!(second.repeat_dir, "r1-attempt2");
+        std::fs::create_dir_all(second.repeat_path()).unwrap();
+        let third = PairSink::claim(root, "fix".into(), 1, 2, true);
+        assert_eq!(third.repeat_dir, "r1-attempt3");
+    }
+
     #[test]
     fn journaled_seq_skips_model_delta_repeats() {
         let events = vec![
@@ -957,13 +1003,13 @@ mod tests {
         fs::create_dir_all(workspace.join("src")).unwrap();
         fs::write(workspace.join("src/util.py"), "ok\n").unwrap();
         let fixture = &crate::workload::FIXTURES[0];
-        let pair = PairSink {
-            root: tmp.path().join("evidence"),
-            fixture_id: fixture.id.to_string(),
-            repeat: 1,
-            repeats: 1,
-            live: false,
-        };
+        let pair = PairSink::claim(
+            tmp.path().join("evidence"),
+            fixture.id.to_string(),
+            1,
+            1,
+            false,
+        );
         let events = vec![
             envelope(1, RuntimeEvent::RunStarted),
             envelope(
@@ -1044,13 +1090,7 @@ mod tests {
             .iter()
             .find(|task| task.id == "python-itertools-batched")
             .expect("file task");
-        let pair = PairSink {
-            root: tmp.path().join("evidence"),
-            fixture_id: task.id.clone(),
-            repeat: 1,
-            repeats: 1,
-            live: true,
-        };
+        let pair = PairSink::claim(tmp.path().join("evidence"), task.id.clone(), 1, 1, true);
         let commands = vec![crate::workload::HiddenCommandResult {
             argv: vec!["python".into(), "-m".into(), "unittest".into()],
             expect_exit: 0,

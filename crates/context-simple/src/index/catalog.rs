@@ -898,7 +898,7 @@ mod tests {
         // 碎片查询），由候选并集的第二层提供。
         let decision = item(ContextItemId::new(), "AuthService.rs", None);
         let mut catalog = ContextCatalog::default();
-        catalog.rebuild(&[decision.clone()], &[], &[]);
+        catalog.rebuild(std::slice::from_ref(&decision), &[], &[]);
 
         let hits = catalog
             .search_ids(&ContextSearchQuery::new("hService", 8))
@@ -942,7 +942,7 @@ mod tests {
         catalog.rebuild(&[item(ContextItemId::new(), "alpha", None)], &[], &[]);
         catalog.rebuild(&[], &[], &[]);
         let second = item(ContextItemId::new(), "alpha", None);
-        catalog.rebuild(&[second.clone()], &[], &[]);
+        catalog.rebuild(std::slice::from_ref(&second), &[], &[]);
 
         let hits = catalog
             .search_ids(&ContextSearchQuery::new("alpha", 4))

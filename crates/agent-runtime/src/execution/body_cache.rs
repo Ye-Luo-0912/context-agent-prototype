@@ -23,20 +23,42 @@ struct ProtocolBodyEntry {
     body: String,
 }
 
+/// record 的结果：入账 / 超限拒收 / 空值忽略。超限计入 PROTO-EVID-02b
+/// 的 oversize 账目。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyRecordOutcome {
+    Stored,
+    Oversize,
+    Empty,
+}
+
+/// 自上一条账目以来的增量计数（PROTO-EVID-02b）。actor 在每次模型输入
+/// 组装后 drain 一次，以 `ProtocolBodyCacheStats` 事件出账，报告可以
+/// 从事件流独立验证命中率，而不是靠推断。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProtocolBodyCacheDeltas {
+    /// 因 Known/Unknown mutation 失效而丢弃的条目数。
+    pub invalidated: u64,
+    /// 因超过单份正文字节上限被拒绝缓存的正文数。
+    pub oversize: u64,
+}
+
 /// ActiveTurn 生命周期的小 LRU：key = path，命中要求 digest 一致。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProtocolBodyCache {
     entries: VecDeque<ProtocolBodyEntry>,
+    pending: ProtocolBodyCacheDeltas,
 }
 
 impl ProtocolBodyCache {
     /// 记录一份成功观察到的正文。同 path 覆盖并移到最新位。
-    pub(crate) fn record(&mut self, path: &str, digest: &str, body: &str) {
+    pub(crate) fn record(&mut self, path: &str, digest: &str, body: &str) -> BodyRecordOutcome {
         if path.is_empty() || digest.is_empty() || body.is_empty() {
-            return;
+            return BodyRecordOutcome::Empty;
         }
         if body.len() > MAX_PROTOCOL_BODY_BYTES {
-            return;
+            self.pending.oversize += 1;
+            return BodyRecordOutcome::Oversize;
         }
         self.entries.retain(|entry| entry.path != path);
         self.entries.push_back(ProtocolBodyEntry {
@@ -47,16 +69,28 @@ impl ProtocolBodyCache {
         while self.entries.len() > MAX_PROTOCOL_BODIES {
             self.entries.pop_front();
         }
+        BodyRecordOutcome::Stored
     }
 
-    /// Known mutation：这个 path 的旧正文不再是当前身份。
-    pub(crate) fn invalidate_path(&mut self, path: &str) {
+    /// Known mutation：这个 path 的旧正文不再是当前身份。返回失效条数。
+    pub(crate) fn invalidate_path(&mut self, path: &str) -> usize {
+        let before = self.entries.len();
         self.entries.retain(|entry| entry.path != path);
+        self.pending.invalidated += (before - self.entries.len()) as u64;
+        before - self.entries.len()
     }
 
-    /// Unknown mutation：所有正文都可能过期，全部作废。
-    pub(crate) fn invalidate_all(&mut self) {
+    /// Unknown mutation：所有正文都可能过期，全部作废。返回失效条数。
+    pub(crate) fn invalidate_all(&mut self) -> usize {
+        let removed = self.entries.len();
         self.entries.clear();
+        self.pending.invalidated += removed as u64;
+        removed
+    }
+
+    /// 取走自上一条账目以来的增量计数。
+    pub(crate) fn drain_deltas(&mut self) -> ProtocolBodyCacheDeltas {
+        std::mem::take(&mut self.pending)
     }
 
     /// 当前可回注行：(path@digest, body)，最新在前。调用方还要核对
@@ -65,7 +99,12 @@ impl ProtocolBodyCache {
         self.entries
             .iter()
             .rev()
-            .map(|entry| (format!("{}@{}", entry.path, entry.digest), entry.body.clone()))
+            .map(|entry| {
+                (
+                    format!("{}@{}", entry.path, entry.digest),
+                    entry.body.clone(),
+                )
+            })
             .collect()
     }
 
@@ -104,8 +143,14 @@ mod tests {
     fn oversized_bodies_are_never_cached() {
         let mut cache = ProtocolBodyCache::default();
         let big = "x".repeat(MAX_PROTOCOL_BODY_BYTES + 1);
-        cache.record("src/big.rs", "r1", &big);
+        assert_eq!(
+            cache.record("src/big.rs", "r1", &big),
+            BodyRecordOutcome::Oversize
+        );
         assert_eq!(cache.len(), 0);
+        // 超限拒收计入增量账目，drain 后归零。
+        assert_eq!(cache.drain_deltas().oversize, 1);
+        assert_eq!(cache.drain_deltas(), ProtocolBodyCacheDeltas::default());
     }
 
     #[test]
@@ -114,11 +159,12 @@ mod tests {
         cache.record("src/a.rs", "r1", "a-body");
         cache.record("src/b.rs", "r1", "b-body");
         // Known mutation 只杀对应 path。
-        cache.invalidate_path("src/a.rs");
+        assert_eq!(cache.invalidate_path("src/a.rs"), 1);
         assert!(cache.lookup("src/a.rs", "r1").is_none());
         assert!(cache.lookup("src/b.rs", "r1").is_some());
         // Unknown mutation 全部作废。
-        cache.invalidate_all();
+        assert_eq!(cache.invalidate_all(), 1);
         assert_eq!(cache.len(), 0);
+        assert_eq!(cache.drain_deltas().invalidated, 2);
     }
 }

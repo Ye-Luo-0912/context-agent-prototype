@@ -389,7 +389,7 @@ impl RuntimeActor {
         // silently over-budget send.
         let max_input_budget = send_window.saturating_sub(output_reserve);
         let mut materialized = materialized;
-        let mut input = self.assemble_model_input(
+        let (mut input, mut body_cache_stats) = self.assemble_model_input(
             runtime_focus.as_ref(),
             task_view.as_ref(),
             progress_view.as_ref(),
@@ -428,7 +428,7 @@ impl RuntimeActor {
             materialized.approx_tokens = materialized
                 .approx_tokens
                 .saturating_sub(approx_tokens(&dropped.content));
-            input = self.assemble_model_input(
+            (input, body_cache_stats) = self.assemble_model_input(
                 runtime_focus.as_ref(),
                 task_view.as_ref(),
                 progress_view.as_ref(),
@@ -448,7 +448,7 @@ impl RuntimeActor {
                 break;
             };
             materialized.foreground.remove(drop_index);
-            input = self.assemble_model_input(
+            (input, body_cache_stats) = self.assemble_model_input(
                 runtime_focus.as_ref(),
                 task_view.as_ref(),
                 progress_view.as_ref(),
@@ -468,7 +468,7 @@ impl RuntimeActor {
             if surface_plan.omit_largest_for_provider_budget().is_none() {
                 break;
             }
-            input = self.assemble_model_input(
+            (input, body_cache_stats) = self.assemble_model_input(
                 runtime_focus.as_ref(),
                 task_view.as_ref(),
                 progress_view.as_ref(),
@@ -479,6 +479,25 @@ impl RuntimeActor {
         }
 
         let estimated_input_tokens = assembled_total(&input);
+        // PROTO-EVID-02b：正文缓存账目出账（增量）。候选行数取最终一次
+        // 组装；失效/超限计数是自上一条账目以来的累计，drain 后归零。
+        // 只记账不设障：事件失败不影响本轮准备。
+        if let Some(turn) = self.state.turn.as_mut() {
+            let deltas = turn.protocol_bodies.drain_deltas();
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::ProtocolBodyCacheStats {
+                    eligible: body_cache_stats.eligible,
+                    hit: body_cache_stats.restored,
+                    miss: body_cache_stats
+                        .eligible
+                        .saturating_sub(body_cache_stats.restored),
+                    invalidated: deltas.invalidated,
+                    oversize: deltas.oversize,
+                    restored_body_tokens: body_cache_stats.restored_body_tokens,
+                })
+                .await;
+        }
         let surface_revision = match self.issue_surface_revision() {
             Ok(revision) => revision,
             Err(error) => {
@@ -710,7 +729,7 @@ impl RuntimeActor {
         history: &MaterializedContext,
         turn_frame: &TurnFrame,
         tools: Vec<ToolSpec>,
-    ) -> ModelInput {
+    ) -> (ModelInput, crate::prompt::ProtocolBodyAssemblyStats) {
         // PROTO-EVID-01：当轮正文缓存的可回注行交给组装器；是否回注由
         // 组装器按 checkpoint 截断 + Fresh 事实一致判定。
         let protocol_bodies = self
@@ -719,7 +738,7 @@ impl RuntimeActor {
             .as_ref()
             .map(|turn| turn.protocol_bodies.rows())
             .unwrap_or_default();
-        self.assembler.assemble_with_catalog(
+        self.assembler.assemble_with_catalog_stats(
             focus,
             task,
             progress,

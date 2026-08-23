@@ -184,6 +184,25 @@ pub enum RuntimeEvent {
         #[serde(default)]
         invalidated: u64,
     },
+    /// PROTO-EVID-02b：当轮正文缓存账目，每次模型输入组装出一条增量。
+    /// eligible/hit/miss 为本次组装的候选/回注/未回注行数；
+    /// invalidated/oversize 为自上一条账目以来因 mutation 失效、因超限
+    /// 拒缓存的条数；restored_body_tokens 为本次回注正文的近似 token。
+    /// 缓存命中率由此可从事件流独立验证。
+    ProtocolBodyCacheStats {
+        #[serde(default)]
+        eligible: u64,
+        #[serde(default)]
+        hit: u64,
+        #[serde(default)]
+        miss: u64,
+        #[serde(default)]
+        invalidated: u64,
+        #[serde(default)]
+        oversize: u64,
+        #[serde(default)]
+        restored_body_tokens: u64,
+    },
     /// A tool frame closed: the runtime published the lifecycle transitions
     /// the close produced (durable outcomes promoted out of the tool frame),
     /// so a tool scope close is an auditable result instead of a silent

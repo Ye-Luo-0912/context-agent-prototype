@@ -408,8 +408,7 @@ mod tests {
             "verifications": [],
             "failed_commands": [],
         });
-        let view: TaskProgressView =
-            serde_json::from_value(old).expect("old shape must parse");
+        let view: TaskProgressView = serde_json::from_value(old).expect("old shape must parse");
         assert!(view.operational_evidence.is_empty());
         assert!(view.stall_warning.is_none());
         assert!(view.frontier_warning.is_none());

@@ -6,7 +6,8 @@ use super::state::{
 };
 use super::*;
 use agent_contracts::{
-    ResourceFreshness, ResourceVersionOracle, ToolOutput, ToolResultDisposition, TurnFrame,
+    MAX_TASK_ANCHOR_ITEM_CHARS, ResourceFreshness, ResourceVersionOracle, ToolOutput,
+    ToolResultDisposition, TurnFrame,
 };
 use serde_json::json;
 
@@ -885,7 +886,10 @@ fn git_status() -> ToolOutput {
 fn git_status_repeat_at_same_revision_is_redundant_evidence() {
     let mut resume = ExecutionState::default();
     let first = resume.observe_tool(&git_status(), 1, 1);
-    assert_eq!(first.delta, agent_contracts::FrontierDelta::EvidenceAdvanced);
+    assert_eq!(
+        first.delta,
+        agent_contracts::FrontierDelta::EvidenceAdvanced
+    );
     assert_eq!(first.actions_since_frontier_advance, 0);
     assert_eq!(resume.evidence.len(), 1);
     assert_eq!(resume.evidence[0].key, "git.status");
@@ -930,7 +934,10 @@ fn redundant_round_does_not_clear_active_failure_cluster() {
 
     // 真正的新证据（新文件身份）才清账。
     let fresh = resume.observe_tool(&read_output("src/other.rs", "r1"), 1, 5);
-    assert_eq!(fresh.delta, agent_contracts::FrontierDelta::EvidenceAdvanced);
+    assert_eq!(
+        fresh.delta,
+        agent_contracts::FrontierDelta::EvidenceAdvanced
+    );
     assert_eq!(fresh.actions_since_frontier_advance, 0);
     assert!(resume.failure_cluster.tried_targets.is_empty());
 }
@@ -940,10 +947,16 @@ fn fs_read_same_digest_is_redundant_and_new_digest_advances() {
     let mut resume = ExecutionState::default();
     resume.observe_tool(&read_output("src/auth.rs", "abc123"), 1, 1);
     let repeat = resume.observe_tool(&read_output("src/auth.rs", "abc123"), 1, 2);
-    assert_eq!(repeat.delta, agent_contracts::FrontierDelta::RedundantEvidence);
+    assert_eq!(
+        repeat.delta,
+        agent_contracts::FrontierDelta::RedundantEvidence
+    );
 
     let changed = resume.observe_tool(&read_output("src/auth.rs", "def456"), 1, 3);
-    assert_eq!(changed.delta, agent_contracts::FrontierDelta::EvidenceAdvanced);
+    assert_eq!(
+        changed.delta,
+        agent_contracts::FrontierDelta::EvidenceAdvanced
+    );
     assert_eq!(resume.evidence.len(), 1);
 }
 
@@ -1040,7 +1053,161 @@ fn repeated_identical_verification_pass_is_redundant_not_progress() {
         out
     };
     let first = resume.observe_tool(&verify(), 1, 1);
-    assert_eq!(first.delta, agent_contracts::FrontierDelta::EvidenceAdvanced);
+    assert_eq!(
+        first.delta,
+        agent_contracts::FrontierDelta::EvidenceAdvanced
+    );
     let second = resume.observe_tool(&verify(), 1, 2);
-    assert_eq!(second.delta, agent_contracts::FrontierDelta::RedundantEvidence);
+    assert_eq!(
+        second.delta,
+        agent_contracts::FrontierDelta::RedundantEvidence
+    );
+}
+
+// ---- CONV-03 Obligation Ledger + EXEC-EVID-01（第二轮评审）----
+
+fn missing_program(argv0: &str, fingerprint: &str) -> ToolOutput {
+    let mut out = pathless_command("process.run", false, argv0, "program not found");
+    out.metadata = json!({
+        // 与真实 process.run 一致：argv 是 join 过的字符串。
+        "argv": argv0,
+        "cwd": ".",
+        "resolution_fingerprint": fingerprint,
+        "failure_class": "path_not_found",
+    });
+    out
+}
+
+#[test]
+fn executable_obligation_opens_and_survives_unrelated_progress() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&missing_program("prog_a", "fp-1"), 1, 1);
+    assert_eq!(resume.obligations.len(), 1);
+    assert_eq!(resume.obligations[0].attempts, 1);
+
+    // 无关进展 #1：新文件证据。全局债务清零，义务纹丝不动。
+    resume.observe_tool(&read_output("src/new.rs", "r1"), 1, 2);
+    // 无关进展 #2：已知 mutation 推进世界。
+    let mut edit = output("edit.replace", true, "edited other");
+    edit.metadata = json!({ "path": "src/other.rs", "revision": "v2" });
+    resume.observe_tool(&edit, 1, 3);
+
+    assert_eq!(
+        resume.obligations.len(),
+        1,
+        "unrelated progress must not resolve a blocker"
+    );
+    assert_eq!(
+        resume.convergence.actions_since_frontier_advance, 0,
+        "global debt still resets on real advances"
+    );
+    let view = resume.view();
+    assert_eq!(view.unresolved_blockers.len(), 1);
+    assert!(view.unresolved_blockers[0].contains("executable_resolution"));
+}
+
+#[test]
+fn same_fingerprint_accumulates_and_new_fingerprint_supersedes() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&missing_program("prog_a", "fp-1"), 1, 1);
+    resume.observe_tool(&missing_program("prog_b", "fp-1"), 1, 2);
+    assert_eq!(resume.obligations[0].attempts, 2);
+    assert_eq!(resume.obligations[0].tried_targets.len(), 2);
+
+    // 环境变化（build 完成 / PATH 改变）→ 新前置取代旧 blocker。
+    resume.observe_tool(&missing_program("prog_c", "fp-2"), 1, 3);
+    assert_eq!(resume.obligations.len(), 1);
+    assert_eq!(resume.obligations[0].precondition, "fp-2");
+    assert_eq!(resume.obligations[0].attempts, 1);
+}
+
+#[test]
+fn launch_success_resolves_the_executable_obligation() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&missing_program("app.exe", "fp-1"), 1, 1);
+    assert!(!resume.obligations.is_empty());
+    resume.observe_tool(
+        &pathless_command("process.run", true, "app.exe", "ran"),
+        1,
+        2,
+    );
+    assert!(
+        resume.obligations.is_empty(),
+        "a successful launch proves resolution works now"
+    );
+}
+
+#[test]
+fn edit_target_obligation_resolves_only_at_new_digest() {
+    let mut resume = ExecutionState::default();
+    let refusal = {
+        let mut out = output("edit.replace", false, "stale");
+        out.metadata = json!({
+            "path": "src/auth.rs",
+            "revision": "rOLD",
+            "failure_class": "stale_revision",
+        });
+        out
+    };
+    resume.observe_tool(&refusal, 1, 1);
+    assert_eq!(resume.obligations.len(), 1);
+    assert_eq!(resume.obligations[0].precondition, "src/auth.rs@rOLD");
+
+    // 同一文件以旧 digest 变 Fresh：blocker 未变，不清账。
+    resume.observe_tool(&read_output("src/auth.rs", "rOLD"), 1, 2);
+    assert_eq!(resume.obligations.len(), 1);
+
+    // 文件移动到新身份：唯一解除方式。
+    resume.observe_tool(&read_output("src/auth.rs", "rNEW"), 1, 3);
+    assert!(resume.obligations.is_empty());
+}
+
+#[test]
+fn stale_resource_evidence_is_hidden_and_swept() {
+    // 评审第 8 条的原始 bug 场景：edit 之后 Resource 行不得残留 AAA。
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&read_output("src/foo.rs", "AAA"), 1, 1);
+    assert_eq!(resume.view().operational_evidence.len(), 1);
+    let mut edit = output("edit.replace", true, "edited");
+    edit.metadata = json!({ "path": "src/foo.rs", "revision": "BBB" });
+    resume.observe_tool(&edit, 1, 2);
+    assert!(
+        resume.view().operational_evidence.is_empty(),
+        "evidence for a changed file must not render"
+    );
+    assert!(!resume.evidence.iter().any(|row| row.validity
+        == agent_contracts::EvidenceValidity::Resource {
+            path: "src/foo.rs".into(),
+            digest: "AAA".into(),
+        }));
+}
+
+#[test]
+fn restore_rejects_oversized_frontier_fields() {
+    use super::state::validate_execution_state;
+    let mut state = ExecutionState::default();
+    for index in 0..20 {
+        state.evidence.push(agent_contracts::ExecutionEvidence {
+            key: format!("fs.read:f{index}.rs"),
+            outcome: "ok".into(),
+            observed_world_revision: 1,
+            validity: agent_contracts::EvidenceValidity::WorkspaceRevision(1),
+            argument_digest: String::new(),
+            turn: 1,
+            evidence_ref: None,
+        });
+    }
+    assert!(validate_execution_state(&state).is_err());
+
+    let mut long_key = ExecutionState::default();
+    long_key.evidence.push(agent_contracts::ExecutionEvidence {
+        key: "k".repeat(MAX_TASK_ANCHOR_ITEM_CHARS + 1),
+        outcome: "ok".into(),
+        observed_world_revision: 1,
+        validity: agent_contracts::EvidenceValidity::WorkspaceRevision(1),
+        argument_digest: String::new(),
+        turn: 1,
+        evidence_ref: None,
+    });
+    assert!(validate_execution_state(&long_key).is_err());
 }

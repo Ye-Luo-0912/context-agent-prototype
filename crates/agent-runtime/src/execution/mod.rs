@@ -45,10 +45,10 @@
 //! intercepts writes, patches, or shell side-effects, and it cannot
 //! replace this algorithm (the model round has already happened).
 
+pub mod body_cache;
 mod classify;
 mod freshness;
 pub mod memo;
-pub mod body_cache;
 mod needs;
 mod snapshot;
 mod state;
@@ -62,8 +62,7 @@ pub use snapshot::RoundExecutionSnapshot;
 pub use snapshot::VerificationProjection;
 pub use state::{
     ExecutionState, FrontierObservation, ResourceFact, ResourceProvenance, VerificationCause,
-    VerificationCoverage,
-    VerificationState,
+    VerificationCoverage, VerificationState,
 };
 
 /// Checkpoint/wire name for [`ExecutionState`]. The `TaskRecord` field is

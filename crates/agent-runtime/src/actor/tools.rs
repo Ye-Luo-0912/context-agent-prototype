@@ -155,6 +155,7 @@ impl RuntimeActor {
                 let frontier = self.observe_persistable_tool(
                     &output,
                     ToolResultDisposition::PersistObservation,
+                    "",
                 );
                 self.report_frontier(frontier).await;
             }
@@ -918,7 +919,16 @@ impl RuntimeActor {
                         turn.pending_scope_closes.push_back(scope_id);
                     }
                 }
-                let frontier = self.observe_persistable_tool(&output, completion.disposition);
+                let frontier = self.observe_persistable_tool(
+                    &output,
+                    completion.disposition,
+                    completion
+                        .argument_digest
+                        .as_ref()
+                        .map(|digest| digest.to_string())
+                        .unwrap_or_default()
+                        .as_str(),
+                );
                 // MOD-PROG-01: remember deterministic edit refusals so an
                 // identical retry can be refused without dispatch.
                 if let Some(digest) = completion.argument_digest
@@ -1027,33 +1037,34 @@ impl RuntimeActor {
         &mut self,
         output: &ToolOutput,
         disposition: ToolResultDisposition,
+        argument_digest: &str,
     ) -> Option<crate::execution::FrontierObservation> {
         if disposition != ToolResultDisposition::PersistObservation {
             return None;
         }
-        let Some(task_id) = self.state.task_id else {
-            return None;
-        };
-        let Some(task) = self.state.tasks.get(task_id) else {
-            return None;
-        };
+        let task_id = self.state.task_id?;
+        let task = self.state.tasks.get(task_id)?;
         if task.status == crate::task::TaskStatus::Completed {
             return None;
         }
         let anchor_revision = task.anchor.revision;
-        let Some(turn) = self.state.turn.as_mut() else {
-            return None;
-        };
+        let turn = self.state.turn.as_mut()?;
         let turn_number = turn.model_round as u64;
-        let observation =
-            turn.execution
-                .observe_tool(output, anchor_revision, turn_number);
+        let observation = turn.execution.observe_tool_with_digest(
+            output,
+            anchor_revision,
+            turn_number,
+            argument_digest,
+        );
         Some(observation)
     }
 
     /// 把一轮前沿分类作为 `ExecutionFrontier` 事件上报。事件是有界
     /// 计数，不含任何工具正文；收敛指标从这里聚合。
-    async fn report_frontier(&mut self, observation: Option<crate::execution::FrontierObservation>) {
+    async fn report_frontier(
+        &mut self,
+        observation: Option<crate::execution::FrontierObservation>,
+    ) {
         let Some(observation) = observation else {
             return;
         };
@@ -1077,8 +1088,7 @@ impl RuntimeActor {
         failure_class: agent_contracts::ToolFailureClass,
         op_tx: &tokio::sync::mpsc::Sender<OperationCompletion>,
     ) {
-        let output =
-            duplicate_no_progress_output(&call.id, &call.name, target, failure_class);
+        let output = duplicate_no_progress_output(&call.id, &call.name, target, failure_class);
         let _ = self
             .core
             .emit_event(RuntimeEvent::ToolFinished {
@@ -1089,7 +1099,7 @@ impl RuntimeActor {
             turn.turn_frame.push_tool_result(output.clone(), None);
         }
         let frontier =
-            self.observe_persistable_tool(&output, ToolResultDisposition::PersistObservation);
+            self.observe_persistable_tool(&output, ToolResultDisposition::PersistObservation, "");
         self.report_frontier(frontier).await;
         self.spawn_next_model_or_end(op_tx).await;
     }

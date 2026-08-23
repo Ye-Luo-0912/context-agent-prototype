@@ -9,8 +9,8 @@
 //! without a model and reused by the live harness.
 
 use agent_contracts::{
-    CAPABILITY_MANAGE, CONTEXT_MANAGE, ContextItemId, FS_READ_MOTIVE_KEY, FsReadMotive,
-    FrontierDelta, RuntimeEvent, RuntimeEventEnvelope,
+    CAPABILITY_MANAGE, CONTEXT_MANAGE, ContextItemId, FS_READ_MOTIVE_KEY, FrontierDelta,
+    FsReadMotive, RuntimeEvent, RuntimeEventEnvelope,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -71,6 +71,15 @@ pub struct RunMetrics {
     pub frontier_no_advance_peak: u64,
     /// 因 world revision 推进而失效的前沿证据条数。
     pub evidence_invalidations: u64,
+    /// PROTO-EVID-02b：当轮正文缓存账目（事件增量求和）。hit/eligible
+    /// 给出可独立验证的命中率；invalidated/oversize 解释缓存为何丢。
+    pub protocol_cache_eligible: u64,
+    pub protocol_cache_hit: u64,
+    pub protocol_cache_miss: u64,
+    pub protocol_cache_invalidated: u64,
+    pub protocol_cache_oversize: u64,
+    /// 实际回注进模型输入的正文近似 token 总量。
+    pub restored_body_tokens: u64,
     /// Engine-classified `fs.read` attribution (last diagnostics snapshot).
     pub reread_previously_selected: u64,
     pub reread_selected_descriptor: u64,
@@ -519,6 +528,23 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     .frontier_no_advance_peak
                     .max(u64::from(*actions_since_frontier_advance));
                 metrics.evidence_invalidations += *invalidated;
+            }
+            RuntimeEvent::ProtocolBodyCacheStats {
+                eligible,
+                hit,
+                miss,
+                invalidated,
+                oversize,
+                restored_body_tokens,
+            } => {
+                // PROTO-EVID-02b：缓存命中率可从事件流独立验证——每条
+                // 事件是一次组装的增量，全部求和即整轮总量。
+                metrics.protocol_cache_eligible += *eligible;
+                metrics.protocol_cache_hit += *hit;
+                metrics.protocol_cache_miss += *miss;
+                metrics.protocol_cache_invalidated += *invalidated;
+                metrics.protocol_cache_oversize += *oversize;
+                metrics.restored_body_tokens += *restored_body_tokens;
             }
             RuntimeEvent::ContextMaintained { report, .. } => {
                 metrics.lifecycle_transitions += report.transitions.len() as u64;
@@ -1929,10 +1955,7 @@ mod tests {
             },
         )];
         let metrics = aggregate_metrics(&events);
-        assert_eq!(
-            metrics.reread_motive_protocol_checkpoint_body_missing,
-            1
-        );
+        assert_eq!(metrics.reread_motive_protocol_checkpoint_body_missing, 1);
         assert!(render_metrics(&metrics).contains("protocol_checkpoint_body_missing=1"));
     }
 }

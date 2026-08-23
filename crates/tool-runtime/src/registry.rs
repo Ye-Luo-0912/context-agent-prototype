@@ -298,7 +298,8 @@ impl BuiltinToolDispatcher {
             loaded_bytes(&catalog)
         } else {
             usize::MAX
-        };        let over_pressure = pressure > self.config.surface_soft_high_bytes;
+        };
+        let over_pressure = pressure > self.config.surface_soft_high_bytes;
         if over_pressure {
             let mut aging: Vec<(&String, &mut ToolEntry, usize)> = catalog
                 .iter_mut()
@@ -1175,7 +1176,7 @@ mod tests {
 
     #[tokio::test]
     async fn pressure_cools_oldest_first_to_the_low_watermark() {
-        let (workspace, _dir) = open_workspace().await;
+        let (_workspace, _dir) = open_workspace().await;
         let legacy = |workspace| {
             BuiltinToolDispatcher::with_config(
                 workspace,

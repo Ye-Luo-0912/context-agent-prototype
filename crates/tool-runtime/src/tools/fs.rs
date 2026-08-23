@@ -191,8 +191,10 @@ impl Tool for FsListTool {
             model_content: format!("{}{}", visible.join("\n"), truncated_note),
             artifact_ref,
             metadata: json!({
+                // digest 对完整 listing 计算：visible 只是分页窗口，
+                // 窗口外的条目变化同样改变目录身份（评审第 10 条）。
                 "path": listed,
-                "revision": content_digest(visible.join("\n").as_bytes()),
+                "revision": content_digest(full.as_bytes()),
                 "entry_count": entries.len(),
                 "returned": visible.len(),
                 "has_more": has_more,

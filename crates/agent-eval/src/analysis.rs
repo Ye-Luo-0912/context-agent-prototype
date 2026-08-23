@@ -1419,13 +1419,13 @@ mod tests {
     fn loads_a_written_pair_as_itt_cells() {
         let tmp = tempfile::tempdir().unwrap();
         let fixture = &crate::workload::FIXTURES[0];
-        let pair = crate::bundle::PairSink {
-            root: tmp.path().join("evidence"),
-            fixture_id: fixture.id.to_string(),
-            repeat: 1,
-            repeats: 1,
-            live: false,
-        };
+        let pair = crate::bundle::PairSink::claim(
+            tmp.path().join("evidence"),
+            fixture.id.to_string(),
+            1,
+            1,
+            false,
+        );
         let workspace = tmp.path().join("ws");
         fs::create_dir_all(&workspace).unwrap();
         let events = Vec::new();

@@ -139,11 +139,9 @@ mod tests {
             name: "process.run".into(),
             arguments: json!({"argv": ["cargo", "test"]}),
         };
-        let intent = source().effect_intent(&call, &spec("process.run", ToolRisk::ProcessExecution));
-        assert_eq!(
-            intent,
-            exec_argv_intent(&["cargo".into(), "test".into()])
-        );
+        let intent =
+            source().effect_intent(&call, &spec("process.run", ToolRisk::ProcessExecution));
+        assert_eq!(intent, exec_argv_intent(&["cargo".into(), "test".into()]));
     }
 
     #[test]

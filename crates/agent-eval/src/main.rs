@@ -14,9 +14,9 @@
 mod acceptance;
 mod analysis;
 mod bundle;
-mod convergence_bench;
 mod context_bench;
 mod context_mech;
+mod convergence_bench;
 mod driver;
 mod envfile;
 mod fixture_driver;
@@ -611,13 +611,13 @@ async fn run_live_compare(
                 analysis::arm_order(fixture.id, round)
             );
             let dir = tempfile::tempdir()?;
-            let pair = bundle::PairSink {
-                root: evidence_root.clone(),
-                fixture_id: fixture.id.to_string(),
-                repeat: round,
+            let pair = bundle::PairSink::claim(
+                evidence_root.clone(),
+                fixture.id.to_string(),
+                round,
                 repeats,
-                live: true,
-            };
+                true,
+            );
             let runs = fixture_driver::compare_engines_live(
                 fixture,
                 dir.path(),
@@ -629,10 +629,7 @@ async fn run_live_compare(
                 println!("fixture {} repeat {round}/{repeats}", fixture.id);
             }
             print!("{}", fixture_driver::render_live_comparison(&runs));
-            print!(
-                "{}",
-                bundle::render_evidence(&pair.root.join(fixture.id).join(format!("r{round}")))?
-            );
+            print!("{}", bundle::render_evidence(&pair.repeat_path())?);
         }
     }
     Ok(())
@@ -706,22 +703,19 @@ async fn run_pilot_live(
                 analysis::arm_order(&task.id, round)
             );
             let dir = tempfile::tempdir()?;
-            let pair = bundle::PairSink {
-                root: evidence_root.clone(),
-                fixture_id: task.id.clone(),
-                repeat: round,
+            let pair = bundle::PairSink::claim(
+                evidence_root.clone(),
+                task.id.clone(),
+                round,
                 repeats,
-                live: true,
-            };
+                true,
+            );
             let runs =
                 fixture_driver::compare_suite_live(task, dir.path(), model.clone(), Some(&pair))
                     .await?;
             println!("task {} repeat {round}/{repeats}", task.id);
             print!("{}", fixture_driver::render_live_comparison(&runs));
-            print!(
-                "{}",
-                bundle::render_evidence(&pair.root.join(&task.id).join(format!("r{round}")))?
-            );
+            print!("{}", bundle::render_evidence(&pair.repeat_path())?);
         }
     }
     eprintln!(
@@ -763,13 +757,13 @@ async fn run_context_bench_live(
                 fixture_driver::bench_arm_order(task, round)
             );
             let dir = tempfile::tempdir()?;
-            let pair = bundle::PairSink {
-                root: evidence_root.clone(),
-                fixture_id: task.id().to_string(),
-                repeat: round,
+            let pair = bundle::PairSink::claim(
+                evidence_root.clone(),
+                task.id().to_string(),
+                round,
                 repeats,
-                live: true,
-            };
+                true,
+            );
             let runs = fixture_driver::compare_bench_live(
                 &pack,
                 task,
@@ -779,7 +773,7 @@ async fn run_context_bench_live(
             )
             .await?;
             print!("{}", fixture_driver::render_live_comparison(&runs));
-            let pair_dir = pair.root.join(task.id()).join(format!("r{round}"));
+            let pair_dir = pair.repeat_path();
             print!("{}", bundle::render_evidence(&pair_dir)?);
         }
     }
@@ -811,13 +805,13 @@ async fn run_context_bench_ablation(
             fixture_driver::ablation_arm_order(round)
         );
         let dir = tempfile::tempdir()?;
-        let pair = bundle::PairSink {
-            root: evidence_root.clone(),
-            fixture_id: task.id().to_string(),
-            repeat: round,
+        let pair = bundle::PairSink::claim(
+            evidence_root.clone(),
+            task.id().to_string(),
+            round,
             repeats,
-            live: true,
-        };
+            true,
+        );
         let runs = fixture_driver::compare_ablation_live(
             &pack,
             task,
@@ -827,7 +821,7 @@ async fn run_context_bench_ablation(
         )
         .await?;
         print!("{}", fixture_driver::render_live_comparison(&runs));
-        let pair_dir = pair.root.join(task.id()).join(format!("r{round}"));
+        let pair_dir = pair.repeat_path();
         print!("{}", bundle::render_evidence(&pair_dir)?);
     }
     Ok(())
@@ -860,13 +854,13 @@ async fn run_context_mech_live(
                 task.id()
             );
             let dir = tempfile::tempdir()?;
-            let pair = bundle::PairSink {
-                root: evidence_root.clone(),
-                fixture_id: task.id().to_string(),
-                repeat: round,
+            let pair = bundle::PairSink::claim(
+                evidence_root.clone(),
+                task.id().to_string(),
+                round,
                 repeats,
-                live: true,
-            };
+                true,
+            );
             let runs = fixture_driver::compare_mech_live(
                 &pack,
                 task,
@@ -876,7 +870,7 @@ async fn run_context_mech_live(
             )
             .await?;
             print!("{}", fixture_driver::render_live_comparison(&runs));
-            let pair_dir = pair.root.join(task.id()).join(format!("r{round}"));
+            let pair_dir = pair.repeat_path();
             print!("{}", bundle::render_evidence(&pair_dir)?);
         }
     }
@@ -911,13 +905,13 @@ async fn run_longflow_live(
                 task.id()
             );
             let dir = tempfile::tempdir()?;
-            let pair = bundle::PairSink {
-                root: evidence_root.clone(),
-                fixture_id: task.id().to_string(),
-                repeat: round,
+            let pair = bundle::PairSink::claim(
+                evidence_root.clone(),
+                task.id().to_string(),
+                round,
                 repeats,
-                live: true,
-            };
+                true,
+            );
             let runs = fixture_driver::compare_mech_live_parallel(
                 &pack,
                 task,
@@ -929,7 +923,7 @@ async fn run_longflow_live(
             )
             .await?;
             print!("{}", fixture_driver::render_live_comparison(&runs));
-            let pair_dir = pair.root.join(task.id()).join(format!("r{round}"));
+            let pair_dir = pair.repeat_path();
             print!("{}", bundle::render_evidence(&pair_dir)?);
         }
     }
@@ -1128,20 +1122,20 @@ async fn collect_tool_edit_cell(
     planned_model_identity: &str,
 ) -> anyhow::Result<ToolEditRecord> {
     let dir = tempfile::tempdir()?;
-    let pair = bundle::PairSink {
-        root: evidence_root.to_path_buf(),
-        fixture_id: task.id().to_string(),
-        repeat: round,
+    let pair = bundle::PairSink::claim(
+        evidence_root.to_path_buf(),
+        task.id().to_string(),
+        round,
         repeats,
-        live: true,
-    };
+        true,
+    );
     let run =
         fixture_driver::run_tool_edit_live(pack, task, dir.path(), model, Some(&pair)).await?;
     print!(
         "{}",
         fixture_driver::render_live_comparison(std::slice::from_ref(&run))
     );
-    let pair_dir = pair.root.join(task.id()).join(format!("r{round}"));
+    let pair_dir = pair.repeat_path();
     print!("{}", bundle::render_evidence(&pair_dir)?);
     let cell_dir = pair.cell_dir("production");
     for required in [

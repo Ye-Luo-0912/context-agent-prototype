@@ -19,10 +19,11 @@ use agent_contracts::{
     AgentError, AgentResult, ArtifactHandle, CAPABILITY_MANAGE, CAPABILITY_SEARCH_DEFAULT_LIMIT,
     CAPABILITY_SEARCH_MAX_LIMIT, Capability, CapabilityActivation, CapabilityInvocationContext,
     CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
-    CapabilityTransport, Effect, RUNTIME_CONTEXT_CONTROL, HostToolPolicies, ResourceDescriptor,
+    CapabilityTransport, Effect, HostToolPolicies, RUNTIME_CONTEXT_CONTROL, ResourceDescriptor,
     ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput,
     ToolSemanticRole, ToolSpec, ToolSurfaceSnapshot, WORKSPACE_READ, WORKSPACE_WRITE,
-    WorkspaceHandle, compact_tool_purpose, search_tool_catalog_filtered, unbound_effect_intent,
+    WorkspaceHandle, compact_tool_purpose, sanitize_untrusted_producer_output,
+    search_tool_catalog_filtered, unbound_effect_intent,
 };
 use agent_core::{CapabilityAdmission, CapabilityState, CapabilityStateAuthority};
 use agent_workspace::{ArtifactStoreHandle, ConfinedWorkspaceHandle, RemoteEffectAck, Workspace};
@@ -66,7 +67,9 @@ pub(crate) const SURFACE_LOW_WATERMARK_BYTES: usize = 9_000;
 
 /// 一个 ToolSpec 的 schema 序列化字节数，表面压力的计量单位。
 fn spec_schema_bytes(spec: &ToolSpec) -> usize {
-    serde_json::to_vec(&spec.input_schema).unwrap_or_default().len()
+    serde_json::to_vec(&spec.input_schema)
+        .unwrap_or_default()
+        .len()
 }
 
 /// 把名为 `name` 的 Loaded 工具冷却到 Warm。持写锁调用；找到并修改
@@ -729,8 +732,7 @@ impl CapabilityRegistry {
             let mut inner = self.inner.write().expect("capability registry poisoned");
             let own = Self::loaded_bytes_locked(&inner);
             let total = own.saturating_add(external_loaded_bytes);
-            let over_pressure =
-                SURFACE_SOFT_HIGH_BYTES > 0 && total > SURFACE_SOFT_HIGH_BYTES;
+            let over_pressure = SURFACE_SOFT_HIGH_BYTES > 0 && total > SURFACE_SOFT_HIGH_BYTES;
             // 压力路径：与 builtin 相同的资格规则（非 root、已达闲置
             // 阈值），按最久未用把 Loaded 冷却到 Warm，到低水位为止。
             // 低水位以下不再有纯 TTL 冷却——Loaded 驻留完全由统一
@@ -808,7 +810,7 @@ impl CapabilityRegistry {
                         .tool_specs
                         .iter()
                         .find(|spec| spec.name == name)
-                        .map(|spec| spec_schema_bytes(spec))
+                        .map(spec_schema_bytes)
                 })
             })
             .sum()
@@ -1202,10 +1204,7 @@ impl CapabilityAwareDispatcher {
     }
 
     /// 安装宿主授权映射（与内核配置同一来源）。
-    pub fn with_host_policies(
-        mut self,
-        policies: std::sync::Arc<dyn HostToolPolicies>,
-    ) -> Self {
+    pub fn with_host_policies(mut self, policies: std::sync::Arc<dyn HostToolPolicies>) -> Self {
         self.host_policies = Some(policies);
         self
     }
@@ -1528,13 +1527,22 @@ impl CapabilityAwareDispatcher {
         // generation fence) or attach a runtime directive —
         // which is refused unless the registered grant declares
         // `runtime:context-control`. A plain value passes
-        // through unchanged.
+        // through with producer-authority metadata stripped.
         match outcome? {
-            CapabilityOutcome::Value(output) => Ok(ToolOutcome::Value(output)),
-            CapabilityOutcome::EffectRequest { output, effect } => {
+            CapabilityOutcome::Value(mut output) => {
+                // CAP-OBS-01：动态 capability 的 metadata 不是 Runtime 事实。
+                sanitize_untrusted_producer_output(&mut output);
+                Ok(ToolOutcome::Value(output))
+            }
+            CapabilityOutcome::EffectRequest { mut output, effect } => {
+                sanitize_untrusted_producer_output(&mut output);
                 Ok(ToolOutcome::PreparedEffect { output, effect })
             }
-            CapabilityOutcome::RuntimeDirective { output, directive } => {
+            CapabilityOutcome::RuntimeDirective {
+                mut output,
+                directive,
+            } => {
+                sanitize_untrusted_producer_output(&mut output);
                 if grant
                     .iter()
                     .any(|permission| permission == RUNTIME_CONTEXT_CONTROL)
@@ -1601,12 +1609,12 @@ impl CapabilityAwareDispatcher {
         } else {
             None
         };
-        let approved_intent = self
-            .inspect_tool(&request.call.name)
-            .map(|spec| match &self.host_policies {
-                Some(policies) => policies.effect_intent(&request.call, &spec),
-                None => unbound_effect_intent(&spec),
-            });
+        let approved_intent =
+            self.inspect_tool(&request.call.name)
+                .map(|spec| match &self.host_policies {
+                    Some(policies) => policies.effect_intent(&request.call, &spec),
+                    None => unbound_effect_intent(&spec),
+                });
         CapabilityInvocationContext {
             granted_permissions: grant.to_vec(),
             workspace,
@@ -1676,9 +1684,11 @@ impl CapabilityAwareDispatcher {
             .collect();
         names.sort_unstable();
         names.truncate(16);
-        (!names.is_empty())
-            .then(|| format!("\nsession-loaded: {}", names.join(" ")))
-            .unwrap_or_default()
+        if names.is_empty() {
+            String::new()
+        } else {
+            format!("\nsession-loaded: {}", names.join(" "))
+        }
     }
 
     async fn run_search(

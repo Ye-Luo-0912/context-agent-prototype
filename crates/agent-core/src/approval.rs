@@ -657,8 +657,7 @@ mod tests {
 
     /// 接好内置映射的门，即生产形态。
     fn builtin_gate(inner: Arc<dyn ApprovalGate>) -> TaskApprovalGate {
-        TaskApprovalGate::new(inner)
-            .with_host_policies(Arc::new(tool_runtime::BuiltinToolPolicies))
+        TaskApprovalGate::new(inner).with_host_policies(Arc::new(tool_runtime::BuiltinToolPolicies))
     }
 
     fn write_call() -> ToolCall {

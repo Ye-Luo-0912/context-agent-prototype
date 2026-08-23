@@ -3,9 +3,9 @@
 use std::path::Path;
 
 use agent_contracts::{
-    MAX_FOREGROUND_RESOURCES, MAX_TASK_ANCHOR_ITEM_CHARS, EvidenceValidity, ExecutionEvidence,
-    FrontierDelta, ResourceFreshness, ResourceKey, TaskProgressView, ToolFailureClass, ToolOutput,
-    path_exactly_in_directive,
+    EvidenceValidity, ExecutionEvidence, FrontierDelta, MAX_FOREGROUND_RESOURCES,
+    MAX_TASK_ANCHOR_ITEM_CHARS, ResourceFreshness, ResourceKey, TaskProgressView, ToolFailureClass,
+    ToolFailureDomain, ToolOutput, path_exactly_in_directive,
 };
 #[cfg(test)]
 use agent_contracts::{ToolResultDisposition, TurnFrame, TurnFrameStep};
@@ -28,6 +28,9 @@ const MAX_EVIDENCE_ROWS: usize = 16;
 const MAX_RECENT_DELTAS: usize = 8;
 /// 单条证据 outcome / 参数摘要的字符上限。
 const EVIDENCE_TEXT_CHARS: usize = 80;
+/// 义务账本上限（最旧淘汰）与单义务目标数上限。
+pub(super) const MAX_OBLIGATIONS: usize = 8;
+const MAX_OBLIGATION_TARGETS: usize = 8;
 
 /// 一轮工具观察的确定性前沿分类结果，随 `ExecutionFrontier` 事件上报。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +109,27 @@ pub struct ExecutionState {
     /// 收敛账目：无推进动作连击、证据版本与最近 delta 环形缓冲。
     #[serde(default)]
     pub convergence: ConvergenceState,
+    /// 最近一次观察的模型轮号，Turn 有效性的判定基准。
+    #[serde(default)]
+    pub last_turn: u64,
+    /// CONV-03 义务账本：只能由 typed 失效事实产生；无关推进不清除，
+    /// 仅前置变化或同类成功解除。
+    #[serde(default)]
+    pub obligations: Vec<ExecutionObligation>,
+}
+
+/// 一条已证明存在的执行 blocker。`precondition` 是域特定的前置指纹：
+/// ExecutableResolution = resolution_fingerprint；EditTarget =
+/// path@被拒revision；ResourcePath / ProjectMarker = 目标路径。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ExecutionObligation {
+    pub domain: ToolFailureDomain,
+    pub precondition: String,
+    pub attempts: u32,
+    pub tried_targets: Vec<String>,
+    #[serde(default)]
+    pub opened_at_evidence_revision: u64,
 }
 
 /// 收敛状态。`evidence_revision` 在前沿内容变化（新证据/失效）时单调
@@ -509,20 +533,26 @@ impl ExecutionState {
                 })
                 .collect(),
             operational_evidence: self.evidence_rows(),
+            unresolved_blockers: self.obligation_warnings(),
             stall_warning: self.stall_warning(),
             frontier_warning: self.frontier_warning(),
         }
     }
 
     /// 类型化证据行，最新在前、有界。只含 key + 结果 + world 版本；
-    /// Resource 有效性附带 path@digest 身份。无任何正文。
+    /// Resource 有效性附带 path@digest 身份。无任何正文。投影前先按
+    /// currentness 谓词过滤——过期证据不渲染。
     fn evidence_rows(&self) -> Vec<String> {
         self.evidence
             .iter()
+            .filter(|row| self.evidence_is_current(row))
             .take(6)
             .map(|row| match &row.validity {
                 EvidenceValidity::Resource { digest, .. } if !digest.is_empty() => {
-                    format!("{}@{}: {} @ world={}", row.key, digest, row.outcome, row.observed_world_revision)
+                    format!(
+                        "{}@{}: {} @ world={}",
+                        row.key, digest, row.outcome, row.observed_world_revision
+                    )
                 }
                 _ => format!(
                     "{}: {} @ world={}",
@@ -601,8 +631,10 @@ impl ExecutionState {
             self.convergence.actions_since_frontier_advance = 0;
             return;
         }
-        self.convergence.actions_since_frontier_advance =
-            self.convergence.actions_since_frontier_advance.saturating_add(1);
+        self.convergence.actions_since_frontier_advance = self
+            .convergence
+            .actions_since_frontier_advance
+            .saturating_add(1);
         // 失败聚类：任何带失败类别的非推进轮都累计——包括未知足迹的
         // 失败运行，换拼写的连击躲不开聚类。
         if let Some(class) = failure {
@@ -616,7 +648,9 @@ impl ExecutionState {
                     .any(|target| target == &identity.target)
                     && self.failure_cluster.tried_targets.len() < 8
                 {
-                    self.failure_cluster.tried_targets.push(identity.target.clone());
+                    self.failure_cluster
+                        .tried_targets
+                        .push(identity.target.clone());
                 }
             } else {
                 self.failure_cluster = FailureCluster {
@@ -650,7 +684,11 @@ impl ExecutionState {
 
     fn push_delta(&mut self, delta: FrontierDelta) {
         self.convergence.recent_deltas.push(delta);
-        let excess = self.convergence.recent_deltas.len().saturating_sub(MAX_RECENT_DELTAS);
+        let excess = self
+            .convergence
+            .recent_deltas
+            .len()
+            .saturating_sub(MAX_RECENT_DELTAS);
         if excess > 0 {
             self.convergence.recent_deltas.drain(0..excess);
         }
@@ -660,17 +698,176 @@ impl ExecutionState {
     /// 这是"证据因世界变化而死亡"的可解释计数，不是知识损失：事实表
     /// 与事件流仍在。
     pub(super) fn invalidate_stale_evidence(&mut self) -> u64 {
-        let revision = self.workspace_revision;
         let before = self.evidence.len();
-        self.evidence.retain(|row| match row.validity {
-            EvidenceValidity::WorkspaceRevision(at) => at >= revision,
-            EvidenceValidity::Turn | EvidenceValidity::Resource { .. } => true,
+        // EXEC-EVID-01a：清理与投影共用同一个 currentness 谓词；
+        // 先物化事实表快照，避免借用冲突。
+        let revision = self.workspace_revision;
+        let last_turn = self.last_turn;
+        let fresh: std::collections::HashMap<&str, &str> = self
+            .checked_files
+            .iter()
+            .filter(|fact| fact.freshness == ResourceFreshness::Fresh)
+            .map(|fact| (fact.path.as_str(), fact.digest.as_str()))
+            .collect();
+        self.evidence.retain(|row| match &row.validity {
+            EvidenceValidity::WorkspaceRevision(at) => *at == revision,
+            EvidenceValidity::Resource { path, digest } => fresh
+                .get(path.as_str())
+                .is_some_and(|current| *current == digest),
+            EvidenceValidity::Turn => row.turn != 0 && row.turn == last_turn,
         });
         let invalidated = (before - self.evidence.len()) as u64;
         if invalidated > 0 {
-            self.convergence.evidence_revision = self.convergence.evidence_revision.saturating_add(invalidated);
+            self.convergence.evidence_revision = self
+                .convergence
+                .evidence_revision
+                .saturating_add(invalidated);
         }
         invalidated
+    }
+
+    /// "这条证据现在还能证明为真吗"——唯一裁决点（评审第 8 条）。
+    /// WorkspaceRevision 绑定当前世界版本；Resource 要求事实表存在
+    /// 同 path@digest 的 Fresh 行；Turn 要求仍是当轮。
+    pub(super) fn evidence_is_current(&self, row: &ExecutionEvidence) -> bool {
+        match &row.validity {
+            EvidenceValidity::WorkspaceRevision(at) => *at == self.workspace_revision,
+            EvidenceValidity::Resource { path, digest } => {
+                self.fact_for(path).is_some_and(|fact| {
+                    fact.freshness == ResourceFreshness::Fresh && fact.digest == *digest
+                })
+            }
+            EvidenceValidity::Turn => row.turn != 0 && row.turn == self.last_turn,
+        }
+    }
+
+    /// CONV-03：由 typed 失效事实登记/累计义务。无关推进永远到不了
+    /// 这里——只有失败输出才开义务；同域不同前置 = 旧义务被取代。
+    pub(super) fn record_obligation(&mut self, output: &ToolOutput, identity: &OperationIdentity) {
+        if output.ok {
+            return;
+        }
+        // 注意走 output 的域判定而非裸 class 映射：外壳工具的
+        // path_not_found 属于 ExecutableResolution，不是 ResourcePath。
+        let domain = output.failure_domain();
+        if matches!(domain, ToolFailureDomain::NonDeterministic) {
+            return;
+        }
+        let touches = output.resource_touches();
+        let precondition = match domain {
+            ToolFailureDomain::ExecutableResolution => output
+                .metadata
+                .get("resolution_fingerprint")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            ToolFailureDomain::EditTarget | ToolFailureDomain::ResourcePath => {
+                let Some(touch) = touches.first() else {
+                    return;
+                };
+                match (domain, touch.revision.as_deref()) {
+                    (ToolFailureDomain::EditTarget, Some(revision)) if !revision.is_empty() => {
+                        format!("{}@{}", touch.path, revision)
+                    }
+                    _ => touch.path.clone(),
+                }
+            }
+            ToolFailureDomain::ProjectMarker => {
+                bound_evidence_text(output.operation_target().unwrap_or_default())
+            }
+            ToolFailureDomain::NonDeterministic => return,
+        };
+        if precondition.is_empty() {
+            return;
+        }
+        // 同域不同前置：旧 blocker 的世界已不存在（被取代），不是被解决。
+        self.obligations
+            .retain(|row| !(row.domain == domain && row.precondition != precondition));
+        let target = bound_evidence_text(&identity.target);
+        if let Some(existing) = self
+            .obligations
+            .iter_mut()
+            .find(|row| row.domain == domain && row.precondition == precondition)
+        {
+            existing.attempts = existing.attempts.saturating_add(1);
+            if !existing.tried_targets.iter().any(|t| t == &target)
+                && existing.tried_targets.len() < MAX_OBLIGATION_TARGETS
+            {
+                existing.tried_targets.push(target);
+            }
+            return;
+        }
+        self.obligations.push(ExecutionObligation {
+            domain,
+            precondition,
+            attempts: 1,
+            tried_targets: vec![target],
+            opened_at_evidence_revision: self.convergence.evidence_revision,
+        });
+        let excess = self.obligations.len().saturating_sub(MAX_OBLIGATIONS);
+        if excess > 0 {
+            self.obligations.drain(0..excess);
+        }
+    }
+
+    /// CONV-03：义务只被自己的前置变化解除——同类成功、目标身份以新
+    /// digest 出现、mutation 触碰目标路径。读文件 / 改别的代码不清账。
+    pub(super) fn resolve_obligations(&mut self, output: &ToolOutput) {
+        let launch_ok = output.ok && is_command_tool(&output.tool_name);
+        let mutated_paths: Vec<String> = match output.mutation_footprint() {
+            agent_contracts::MutationFootprint::Known(_) if output.ok => output
+                .resource_touches()
+                .into_iter()
+                .map(|touch| touch.path)
+                .collect(),
+            _ => Vec::new(),
+        };
+        // 物化事实表快照，retain 闭包里不再借 self。
+        let fresh: std::collections::HashMap<&str, &str> = self
+            .checked_files
+            .iter()
+            .filter(|fact| fact.freshness == ResourceFreshness::Fresh)
+            .map(|fact| (fact.path.as_str(), fact.digest.as_str()))
+            .collect();
+        self.obligations.retain(|row| {
+            let resolved = match row.domain {
+                ToolFailureDomain::ExecutableResolution => launch_ok,
+                ToolFailureDomain::EditTarget => {
+                    let (path, old) = match row.precondition.split_once('@') {
+                        Some((path, old)) => (path, old),
+                        None => (row.precondition.as_str(), ""),
+                    };
+                    fresh.get(path).is_some_and(|digest| *digest != old)
+                }
+                ToolFailureDomain::ResourcePath => {
+                    mutated_paths.iter().any(|p| p == &row.precondition)
+                        || fresh.contains_key(row.precondition.as_str())
+                }
+                ToolFailureDomain::ProjectMarker => {
+                    mutated_paths.iter().any(|p| p == &row.precondition)
+                }
+                ToolFailureDomain::NonDeterministic => true,
+            };
+            !resolved
+        });
+    }
+
+    /// 有界的逐义务警告行（≤2 条）：与全局 advisory 正交，模型仍自主
+    /// 选择解法，但"换名字再猜"不再能靠无关进展隐藏。
+    fn obligation_warnings(&self) -> Vec<String> {
+        self.obligations
+            .iter()
+            .take(2)
+            .map(|row| {
+                format!(
+                    "UNRESOLVED BLOCKER [{}] attempts={} targets={:?} precondition={} — change the preconditions (build/install/create the target), not more identical guesses",
+                    row.domain.as_str(),
+                    row.attempts,
+                    row.tried_targets,
+                    row.precondition
+                )
+            })
+            .collect()
     }
 
     /// 成功观察入前沿（评审第 9/15 条）。键化规则：
@@ -686,9 +883,13 @@ impl ExecutionState {
         &mut self,
         output: &ToolOutput,
         turn: u64,
+        argument_digest: &str,
     ) -> ObservationEvidence {
         let target = output.operation_target().unwrap_or("").to_string();
-        let is_git_read = matches!(output.tool_name.as_str(), "git.status" | "git.diff" | "git.log");
+        let is_git_read = matches!(
+            output.tool_name.as_str(),
+            "git.status" | "git.diff" | "git.log"
+        );
         let touches = output.resource_touches();
         let (key, validity) = if is_git_read {
             (
@@ -713,12 +914,14 @@ impl ExecutionState {
             return ObservationEvidence::None;
         };
         let outcome = bound_evidence_text(output.summary.trim());
-        let argument_digest = bound_evidence_text(&target);
-        if let Some(existing) = self
-            .evidence
-            .iter_mut()
-            .find(|row| row.key == key)
-        {
+        // Runtime 传入的真 ArgumentDigest（OperationCompletion 计算）；
+        // 空串时退化为参数摘要，保持旧轨迹可用。
+        let argument_digest = if argument_digest.is_empty() {
+            bound_evidence_text(&target)
+        } else {
+            bound_evidence_text(argument_digest)
+        };
+        if let Some(existing) = self.evidence.iter_mut().find(|row| row.key == key) {
             let identical = existing.validity == validity
                 && existing.outcome == outcome
                 && existing.argument_digest == argument_digest;
@@ -877,6 +1080,23 @@ pub(crate) fn validate_execution_state(state: &ExecutionState) -> Result<(), Str
         || state.failed_commands.len() > MAX_RESUME_FAILURES
     {
         return Err("resume list exceeds its cap".into());
+    }
+    // EXEC-EVID-01b：restore 契约不得假定 checkpoint 由当前 Runtime
+    // 生成且未损坏——新增字段同样受界。
+    if state.evidence.len() > MAX_EVIDENCE_ROWS
+        || state.convergence.recent_deltas.len() > MAX_RECENT_DELTAS
+        || state.failure_cluster.tried_targets.len() > 8
+        || state.obligations.len() > MAX_OBLIGATIONS
+    {
+        return Err("execution frontier exceeds its cap".into());
+    }
+    for row in &state.evidence {
+        if row.key.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || row.outcome.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || row.argument_digest.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+        {
+            return Err("evidence row exceeds its text bound".into());
+        }
     }
     Ok(())
 }

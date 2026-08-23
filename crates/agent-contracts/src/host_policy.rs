@@ -142,7 +142,6 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
     hash
 }
 
-
 impl HostToolPolicy {
     pub fn intent_from(&self, arguments: &Value) -> EffectIntent {
         match &self.binding {

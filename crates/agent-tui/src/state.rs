@@ -496,6 +496,9 @@ impl AppState {
                 // 收敛账目不进消息面板：advisory 已由 TASK PROGRESS 渲染，
                 // 这里只是保持 match 穷尽。
             }
+            RuntimeEvent::ProtocolBodyCacheStats { .. } => {
+                // 正文缓存账目同理：指标归 eval 聚合，UI 不重复渲染。
+            }
             RuntimeEvent::Diagnostics { diagnostics } => {
                 self.context = diagnostics.clone();
                 self.push_system(format!(

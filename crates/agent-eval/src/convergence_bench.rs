@@ -14,9 +14,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use agent_compose::{compose, ComposeConfig};
+use agent_compose::{ComposeConfig, compose};
 use agent_contracts::{
-    ApprovalDecision, ApprovalGate, AgentResult, ContextEngine, ModelOutput, ModelRequest,
+    AgentResult, ApprovalDecision, ApprovalGate, ContextEngine, ModelOutput, ModelRequest,
     ModelTransport, RuntimeEventEnvelope, ToolCall, ToolSpec,
 };
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
@@ -118,11 +118,9 @@ async fn run_session(
         ],
         ..Default::default()
     };
-    let tools: Arc<dyn agent_contracts::ToolDispatcher> =
-        Arc::new(tool_runtime::BuiltinToolDispatcher::with_config(
-            workspace.clone(),
-            lifecycle,
-        ));
+    let tools: Arc<dyn agent_contracts::ToolDispatcher> = Arc::new(
+        tool_runtime::BuiltinToolDispatcher::with_config(workspace.clone(), lifecycle),
+    );
     let context_engine: Arc<dyn ContextEngine> =
         Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
     let composed = compose(ComposeConfig {
@@ -265,10 +263,12 @@ pub async fn scenario_operational_evidence() -> anyhow::Result<ConvergenceBenchR
                 actions_since_frontier_advance,
                 invalidated,
                 ..
-            } => Some(format!(
-                "{}(debt={invalidated},no_advance={actions_since_frontier_advance})",
-                format!("{:?}", delta)
-            )),
+            } => {
+                let delta_name = format!("{delta:?}");
+                Some(format!(
+                    "{delta_name}(debt={invalidated},no_advance={actions_since_frontier_advance})"
+                ))
+            }
             _ => None,
         })
         .collect();
@@ -319,11 +319,7 @@ pub async fn scenario_protocol_body() -> anyhow::Result<ConvergenceBenchReport> 
         script,
         "protocol done",
     )));
-    let dir = seed_workspace(&[
-        ("src/main.rs", body),
-        ("src/filler.md", "filler\n"),
-    ])
-    .await?;
+    let dir = seed_workspace(&[("src/main.rs", body), ("src/filler.md", "filler\n")]).await?;
     let events = run_session(dir.path(), probe.clone(), &["inspect main"]).await?;
     let rereads = count_started(&events, "fs.read");
     // 脚本共 8 次读取：首次 + 7 个填充交换把首次挤出保留尾。

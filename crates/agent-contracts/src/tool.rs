@@ -330,15 +330,16 @@ pub fn process_spawn_is_covered(
         output_budget: None,
         roles: Vec::new(),
     };
-    policies.effect_intent(
-        &ToolCall {
-            id: String::new(),
-            name: tool_name.into(),
-            arguments: arguments.clone(),
-        },
-        &spec,
-    )
-    .covers(actual)
+    policies
+        .effect_intent(
+            &ToolCall {
+                id: String::new(),
+                name: tool_name.into(),
+                arguments: arguments.clone(),
+            },
+            &spec,
+        )
+        .covers(actual)
 }
 
 /// Semantic capability a catalog tool offers. Tool-surface policy maps an
@@ -894,8 +895,8 @@ impl ToolFailureClass {
                 ToolFailureDomain::ExecutableResolution
             }
             Self::MissingProjectMarker => ToolFailureDomain::ProjectMarker,
-            Self::StaleRevision
-            | Self::NoExactMatch
+            Self::StaleRevision => ToolFailureDomain::EditTarget,
+            Self::NoExactMatch
             | Self::AmbiguousMatch
             | Self::NoSearchMatch
             | Self::HiddenPath
@@ -918,12 +919,28 @@ pub enum ToolFailureDomain {
     /// 程序解析：argv0 × cwd × 环境。同参数 + 世界版本未推进时重试
     /// 可证等价（进程/外壳工具的 program-not-found 属于这里）。
     ExecutableResolution,
+    /// 编辑目标身份：path@被拒revision。仅当该文件以新身份存在时解除。
+    EditTarget,
     /// 资源路径身份：path@digest / 锚点匹配 / 搜索命中。
     ResourcePath,
     /// 项目标记缺失：manifest 级前置条件，模型不得自行补造。
     ProjectMarker,
     /// 时间、调度或退出码相关：不可证等价。
     NonDeterministic,
+}
+
+impl ToolFailureDomain {
+    /// 与 serde wire 名一致的 snake_case 标识，用于 TASK PROGRESS 的
+    /// 义务警告行与事件文本。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecutableResolution => "executable_resolution",
+            Self::EditTarget => "edit_target",
+            Self::ResourcePath => "resource_path",
+            Self::ProjectMarker => "project_marker",
+            Self::NonDeterministic => "non_deterministic",
+        }
+    }
 }
 
 /// Insert `failure_class` and strip any producer-supplied `retryable` flag.
@@ -1037,12 +1054,39 @@ pub fn apply_runtime_diagnosis(output: &mut ToolOutput, diagnosis: Option<Runtim
 }
 
 fn strip_reserved_runtime_metadata(metadata: &mut Value) {
+    strip_metadata_keys(metadata, RESERVED_RUNTIME_METADATA_KEYS);
+}
+
+fn strip_metadata_keys(metadata: &mut Value, keys: &[&str]) {
     let Some(object) = metadata.as_object_mut() else {
         return;
     };
-    for key in RESERVED_RUNTIME_METADATA_KEYS {
+    for key in keys {
         object.remove(*key);
     }
+}
+
+/// Producer-stamped metadata 键：一旦保留，就会经由 [`ToolOutput`] 的
+/// 访问器（`file_path` / `file_revision` / `resource_touches` /
+/// `is_verification` / `may_mutate_workspace`）变成受信 Runtime 事实
+/// （ResourceFact、Verification、WorkingSetSignal、mutation 上界）。
+/// 只有 operator-trusted 的 builtin host 允许盖章这些键。
+pub const PRODUCER_AUTHORITY_METADATA_KEYS: &[&str] = &[
+    "path",
+    "revision",
+    "files",
+    "verification",
+    "intent",
+    "mutates_workspace",
+];
+
+/// 动态 Capability 输出的统一净化（CAP-OBS-01，fail-closed）：先剥
+/// reserved 键（否则 [`take_runtime_diagnosis`] 会先读走 producer 自选
+/// 的 failure_class），再剥权威键。untrusted producer 只留下
+/// summary / model_content / artifact_ref 与无权威语义的自由键。
+pub fn sanitize_untrusted_producer_output(output: &mut ToolOutput) {
+    strip_metadata_keys(&mut output.metadata, RESERVED_RUNTIME_METADATA_KEYS);
+    strip_metadata_keys(&mut output.metadata, PRODUCER_AUTHORITY_METADATA_KEYS);
 }
 
 fn write_runtime_metadata(metadata: &mut Value, class: ToolFailureClass, hint: &str) {
@@ -2211,14 +2255,9 @@ mod tests {
         ProcessPolicies.effect_intent(call, spec)
     }
 
-    fn process_spawn_is_covered(
-        tool_name: &str,
-        arguments: &Value,
-        actual: &EffectIntent,
-    ) -> bool {
+    fn process_spawn_is_covered(tool_name: &str, arguments: &Value, actual: &EffectIntent) -> bool {
         crate::process_spawn_is_covered(&ProcessPolicies, tool_name, arguments, actual)
     }
-
 
     #[test]
     fn effect_intent_round_trips_and_maps_to_risk() {

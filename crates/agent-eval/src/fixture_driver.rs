@@ -1938,13 +1938,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let evidence = dir.path().join("evidence");
         let workspace = dir.path().join("workspace");
-        let pair = bundle::PairSink {
-            root: evidence,
-            fixture_id: task.id().to_string(),
-            repeat: 1,
-            repeats: 1,
-            live: false,
-        };
+        let pair = bundle::PairSink::claim(evidence, task.id().to_string(), 1, 1, false);
 
         let run = run_tool_edit_live(&pack, task, &workspace, model, Some(&pair))
             .await
@@ -2306,13 +2300,13 @@ mod tests {
     async fn compare_engines_writes_a_rebuildable_evidence_pair() {
         let fixture = &FIXTURES[0];
         let dir = tempfile::tempdir().unwrap();
-        let pair = bundle::PairSink {
-            root: dir.path().join("evidence"),
-            fixture_id: fixture.id.to_string(),
-            repeat: 1,
-            repeats: 1,
-            live: false,
-        };
+        let pair = bundle::PairSink::claim(
+            dir.path().join("evidence"),
+            fixture.id.to_string(),
+            1,
+            1,
+            false,
+        );
         let runs = compare_engines_with_model(fixture, dir.path(), None, Some(&pair))
             .await
             .unwrap();

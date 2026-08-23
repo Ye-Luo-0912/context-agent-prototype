@@ -81,9 +81,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         let broker = ApprovalBroker::new();
         let gate = Arc::new(InteractiveApprovalGate::new(broker.clone()));
-        let task_gate = Arc::new(
-            TaskApprovalGate::new(gate.clone()).with_host_policies(host_policies.clone()),
-        );
+        let task_gate =
+            Arc::new(TaskApprovalGate::new(gate.clone()).with_host_policies(host_policies.clone()));
         for json in &grant_args {
             let grant: StandingGrant = serde_json::from_str(json)
                 .with_context(|| format!("invalid --grant JSON: {json}"))?;

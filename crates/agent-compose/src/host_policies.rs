@@ -37,13 +37,21 @@ impl HostToolPolicyRegistry {
     /// 安装一条运维审核过的插件绑定。撞内置名或重复准入一律失败：
     /// 内置工具的授权不重新下放。成功后使快照失效。
     pub fn admit(&mut self, policy: HostToolPolicy) -> Result<(), String> {
-        if self.builtins.iter().any(|p| p.tool_name == policy.tool_name) {
+        if self
+            .builtins
+            .iter()
+            .any(|p| p.tool_name == policy.tool_name)
+        {
             return Err(format!(
                 "plugin admission may not shadow builtin tool '{}'",
                 policy.tool_name
             ));
         }
-        if self.admitted.iter().any(|p| p.tool_name == policy.tool_name) {
+        if self
+            .admitted
+            .iter()
+            .any(|p| p.tool_name == policy.tool_name)
+        {
             return Err(format!(
                 "tool '{}' already has an admitted binding",
                 policy.tool_name
@@ -133,7 +141,10 @@ mod tests {
         };
         assert!(registry.admit(shadow).is_err());
         assert!(
-            !matches!(registry.policy_for("fs.write").unwrap().binding, HostEffectBinding::ReadOnly),
+            !matches!(
+                registry.policy_for("fs.write").unwrap().binding,
+                HostEffectBinding::ReadOnly
+            ),
             "a failed admission must leave the builtin binding in place"
         );
     }
@@ -150,8 +161,16 @@ mod tests {
 
         registry.admit(write_binding()).unwrap();
         let after = registry.resolve_policy();
-        assert_ne!(after.revision(), before.revision(), "admission bumps revision");
-        assert_ne!(after.digest(), before.digest(), "admission changes content digest");
+        assert_ne!(
+            after.revision(),
+            before.revision(),
+            "admission bumps revision"
+        );
+        assert_ne!(
+            after.digest(),
+            before.digest(),
+            "admission changes content digest"
+        );
         assert_eq!(after.len(), before.len() + 1);
         // 旧消费方持有的快照仍可独立工作（Arc 隔离）。
         assert!(before.policy_for("plugin.notes.write").is_none());

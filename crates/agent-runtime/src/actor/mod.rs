@@ -412,9 +412,8 @@ impl ActiveTurn {
         let Some(class) = output.failure_class() else {
             return;
         };
-        self.launch_failures.retain(|fact| {
-            !(fact.tool_name == output.tool_name && fact.argument_digest == digest)
-        });
+        self.launch_failures
+            .retain(|fact| !(fact.tool_name == output.tool_name && fact.argument_digest == digest));
         self.launch_failures.push(LaunchResolutionFact {
             tool_name: output.tool_name.clone(),
             argument_digest: digest,
@@ -422,43 +421,31 @@ impl ActiveTurn {
             workspace_revision: self.execution.workspace_revision,
             failure_class: class,
         });
-        let excess = self
-            .launch_failures
-            .len()
-            .saturating_sub(MAX_EDIT_ATTEMPTS);
+        let excess = self.launch_failures.len().saturating_sub(MAX_EDIT_ATTEMPTS);
         self.launch_failures.drain(0..excess);
     }
 
-    /// PROTO-EVID-01：把成功观察到的正文记入当轮缓存。fs.read 是直接
-    /// 来源；edit echo 覆盖同 path 的旧正文。失效规则：Known mutation
-    /// 使被触 path 失效（除非本输出就是它的新 echo），Unknown mutation
-    /// 全部作废。
+    /// PROTO-EVID-02a：把成功观察到的正文记入当轮缓存。唯一正文来源
+    /// 是 fs.read——edit 的 model_content 是 patch echo 不是完整文件，
+    /// 不得冒充 exact body。失效规则：任何 Known mutation 使被触 path
+    /// 失效；Unknown mutation 全部作废。
     fn record_protocol_body(&mut self, output: &ToolOutput) {
         if !output.ok {
             return;
         }
         let touches = output.resource_touches();
-        let is_echo_tool =
-            matches!(output.tool_name.as_str(), "fs.read" | "edit.replace" | "edit.patch");
         match output.mutation_footprint() {
             agent_contracts::MutationFootprint::Unknown => {
                 self.protocol_bodies.invalidate_all();
             }
             agent_contracts::MutationFootprint::Known(mutated) => {
                 for touch in mutated {
-                    // 本输出若正是该 path 的新 echo，record 会覆盖，无需先删。
-                    let echoed_by_this = is_echo_tool
-                        && touches
-                            .first()
-                            .is_some_and(|first| first.path == touch.path);
-                    if !echoed_by_this {
-                        self.protocol_bodies.invalidate_path(&touch.path);
-                    }
+                    self.protocol_bodies.invalidate_path(&touch.path);
                 }
             }
             agent_contracts::MutationFootprint::None => {}
         }
-        if !is_echo_tool {
+        if output.tool_name != "fs.read" {
             return;
         }
         let Some(touch) = touches.first() else {
@@ -675,7 +662,10 @@ mod edit_attempt_tests {
             &launch_failure("app.exe", ToolFailureClass::PathNotFound),
             &digest,
         );
-        assert!(turn.duplicate_launch_failure(&launch_call(args.clone())).is_some());
+        assert!(
+            turn.duplicate_launch_failure(&launch_call(args.clone()))
+                .is_some()
+        );
 
         let mut success = launch_failure("app.exe", ToolFailureClass::PathNotFound);
         success.ok = true;

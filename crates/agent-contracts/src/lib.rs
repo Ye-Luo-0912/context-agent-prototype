@@ -43,7 +43,7 @@ pub use plugin::*;
 pub use runtime::*;
 pub use runtime_facts::*;
 pub use search::{
-    SearchCandidates, SearchIncompleteReason, ScoredMatch, TextIndex, TokenRarity, tokenize,
+    ScoredMatch, SearchCandidates, SearchIncompleteReason, TextIndex, TokenRarity, tokenize,
 };
 pub use tokens::*;
 pub use tool::*;

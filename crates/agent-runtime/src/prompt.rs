@@ -109,6 +109,33 @@ impl PromptAssembler {
         catalog: &[ToolCatalogEntry],
         protocol_bodies: &[(String, String)],
     ) -> ModelInput {
+        self.assemble_with_catalog_stats(
+            runtime_focus,
+            task_anchor,
+            task_progress,
+            history,
+            turn,
+            tools,
+            catalog,
+            protocol_bodies,
+        )
+        .0
+    }
+
+    /// 同 [`Self::assemble_with_catalog`]，同时返回 PROTO-EVID-02b 的
+    /// 本次组装账目（候选/回注行数与回注 token）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble_with_catalog_stats(
+        &self,
+        runtime_focus: Option<&FocusState>,
+        task_anchor: Option<&TaskAnchorView>,
+        task_progress: Option<&TaskProgressView>,
+        history: &MaterializedContext,
+        turn: &TurnFrame,
+        tools: Vec<ToolSpec>,
+        catalog: &[ToolCatalogEntry],
+        protocol_bodies: &[(String, String)],
+    ) -> (ModelInput, ProtocolBodyAssemblyStats) {
         let tools: Vec<ToolSpec> = tools
             .into_iter()
             .map(ToolSpec::compact_for_model_surface)
@@ -193,30 +220,57 @@ impl PromptAssembler {
         // frame (audit, turn-end persistence) is never mutated here.
         let (turn_frame, compacted_exchanges) =
             turn.checkpoint_tail(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
-        let mut focus = render_focus_frame(runtime_focus, task_anchor, task_progress)
-            .unwrap_or_default();
         let restored =
             rehydrated_protocol_bodies(turn, &turn_frame, task_progress, protocol_bodies);
+        let body_stats = ProtocolBodyAssemblyStats {
+            eligible: protocol_bodies.len() as u64,
+            restored: restored.len() as u64,
+            restored_body_tokens: restored
+                .iter()
+                .map(|(_, body)| agent_contracts::tokens::approx_tokens(body) as u64)
+                .sum(),
+        };
         if !restored.is_empty() {
-            focus.push_str("\nRESTORED TURN BODIES (this turn's cache; identity verified)\n");
+            // PROMPT-AUTH-01：正文是低权限内容，必须走 user-role 的
+            // context frame；focus_frame 会渲染成 System policy，把
+            // 文件正文（可能含对抗指令）提权到系统层。
+            let mut restored_block =
+                String::from("RESTORED TURN BODIES (this turn's cache; identity verified)\n");
             for (identity, body) in restored {
-                focus.push_str(&identity);
-                focus.push('\n');
-                focus.push_str(&body);
-                focus.push('\n');
+                restored_block.push_str(&identity);
+                restored_block.push('\n');
+                restored_block.push_str(&body);
+                restored_block.push('\n');
             }
+            context_frame.push(ModelMessage::user(restored_block));
         }
-        ModelInput {
-            system_policy,
-            focus_frame: (!focus.is_empty()).then_some(focus),
-            context_frame,
-            turn_frame,
-            tool_schemas: tools,
-            turn_checkpoint: (compacted_exchanges > 0).then_some(agent_contracts::TurnCheckpoint {
-                compacted_exchanges,
-            }),
-        }
+        (
+            ModelInput {
+                system_policy,
+                focus_frame: render_focus_frame(runtime_focus, task_anchor, task_progress),
+                context_frame,
+                turn_frame,
+                tool_schemas: tools,
+                turn_checkpoint: (compacted_exchanges > 0).then_some(
+                    agent_contracts::TurnCheckpoint {
+                        compacted_exchanges,
+                    },
+                ),
+            },
+            body_stats,
+        )
     }
+}
+
+/// PROTO-EVID-02b：一次模型输入组装的正文缓存账目（增量，不是累计）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProtocolBodyAssemblyStats {
+    /// 提交给回注挑选的候选行数（当轮缓存非空行）。
+    pub eligible: u64,
+    /// 实际回注的行数。
+    pub restored: u64,
+    /// 回注正文的近似 token 数。
+    pub restored_body_tokens: u64,
 }
 
 /// PROTO-EVID-01 回注挑选：某行的正文只有同时满足
@@ -251,15 +305,11 @@ fn rehydrated_protocol_bodies(
                 ))
             })
             .collect()
-    };    let full = carried_identities(full_turn);
+    };
+    let full = carried_identities(full_turn);
     let retained_set = carried_identities(retained);
-    let fresh_facts: Option<HashSet<String>> = progress.map(|progress| {
-        progress
-            .checked_files
-            .iter()
-            .cloned()
-            .collect()
-    });
+    let fresh_facts: Option<HashSet<String>> =
+        progress.map(|progress| progress.checked_files.iter().cloned().collect());
     protocol_bodies
         .iter()
         .filter(|(identity, body)| {
@@ -437,6 +487,7 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
         &verifications,
         &failed,
         &evidence,
+        &progress.unresolved_blockers,
         progress.stall_warning.as_deref(),
         progress.frontier_warning.as_deref(),
     );
@@ -459,6 +510,7 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
             &verifications,
             &failed,
             &evidence,
+            &progress.unresolved_blockers,
             progress.stall_warning.as_deref(),
             progress.frontier_warning.as_deref(),
         );
@@ -473,6 +525,7 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_task_progress(
     anchor_revision: u64,
     workspace_revision: u64,
@@ -480,6 +533,7 @@ fn format_task_progress(
     verifications: &[String],
     failed: &[String],
     evidence: &[String],
+    blockers: &[String],
     stall_warning: Option<&str>,
     frontier_warning: Option<&str>,
 ) -> String {
@@ -496,6 +550,9 @@ fn format_task_progress(
         out.push_str(warning);
         out.push('\n');
     }
+    // 逐义务 blocker（CONV-03，≤2 行有界）：无关推进清不掉它们，
+    // 与全局 advisory 的语义不同，必须分开可见。
+    append_list(&mut out, "Unresolved blockers", blockers);
     append_list(&mut out, "Checked", checked);
     append_list(&mut out, "Verification", verifications);
     append_list(&mut out, "Failed commands", failed);
@@ -1313,9 +1370,25 @@ mod tests {
             assembled.turn_checkpoint.is_some(),
             "the first read must be compacted away before rehydration applies"
         );
-        let focus = assembled.focus_frame.expect("progress must render");
-        assert!(focus.contains("RESTORED TURN BODIES"), "{focus}");
-        assert!(focus.contains("fn secret_body()"), "{focus}");
+        // PROMPT-AUTH-01：正文只能以 user-role 进 context frame，
+        // 永不进 System 层（focus_frame / system_policy）。
+        let restored_message = assembled
+            .context_frame
+            .iter()
+            .find(|message| message.content.contains("RESTORED TURN BODIES"))
+            .expect("restored bodies must render in the context frame");
+        assert_eq!(restored_message.role, agent_contracts::ModelRole::User);
+        assert!(restored_message.content.contains("fn secret_body()"));
+        if let Some(focus) = &assembled.focus_frame {
+            assert!(
+                !focus.contains("RESTORED TURN BODIES") && !focus.contains("fn secret_body()"),
+                "file bodies must never reach the System focus layer: {focus}"
+            );
+        }
+        assert!(!assembled.system_policy.iter().any(|message| {
+            message.content.contains("RESTORED TURN BODIES")
+                || message.content.contains("fn secret_body()")
+        }));
 
         // 身份不一致（文件已换版或事实非 Fresh）：不回注。
         let stale = vec![("src/auth.rs@old".to_string(), "stale body".to_string())];
@@ -1329,10 +1402,12 @@ mod tests {
             &[],
             &stale,
         );
-        let focus = not_restored.focus_frame.expect("progress must render");
         assert!(
-            !focus.contains("RESTORED TURN BODIES"),
-            "a stale identity must never be rehydrated: {focus}"
+            !not_restored
+                .context_frame
+                .iter()
+                .any(|message| message.content.contains("RESTORED TURN BODIES")),
+            "a stale identity must never be rehydrated"
         );
 
         // 正文仍在保留尾（未截断）：不重复回注。
@@ -1354,10 +1429,12 @@ mod tests {
             &bodies,
         );
         assert!(still_there.turn_checkpoint.is_none());
-        let focus = still_there.focus_frame.expect("progress must render");
         assert!(
-            !focus.contains("RESTORED TURN BODIES"),
-            "a retained body must not be duplicated: {focus}"
+            !still_there
+                .context_frame
+                .iter()
+                .any(|message| message.content.contains("RESTORED TURN BODIES")),
+            "a retained body must not be duplicated"
         );
     }
 

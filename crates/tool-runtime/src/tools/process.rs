@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 use tokio::{io::BufWriter, process::Command, sync::mpsc, time::Duration};
 
 use super::Tool;
+use super::content_digest;
 use super::stream::{
     MAX_ARTIFACT_BYTES, StreamCapture, StreamChunk, spawn_stderr_reader, spawn_stdout_reader,
 };
@@ -172,6 +173,15 @@ impl Tool for ProcessRunTool {
                 // （live 5 连败）：把有界的工作区清单附进类型化失败，
                 // 让一次错误就足以纠正，而不是再猜四个路径。
                 let entries = bounded_cwd_listing(&cwd);
+                // CONV-03：解析前置指纹 = cwd listing + PATH + env 覆盖。
+                // 源码普通 edit 不改变它；build 产生 binary 才会变——
+                // 义务账本用它判定 blocker 的前置是否真的变化。
+                let fingerprint_source = format!(
+                    "{}\u{0}{}\u{0}{}",
+                    entries.join("\n"),
+                    std::env::var("PATH").unwrap_or_default(),
+                    serde_json::to_string(&args.env).unwrap_or_default(),
+                );
                 return Ok(ToolOutcome::Value(agent_contracts::tool_failure_output(
                     call_id,
                     "process.run",
@@ -191,6 +201,7 @@ impl Tool for ProcessRunTool {
                         "argv0": args.argv[0],
                         "cwd": cwd.display().to_string(),
                         "entries": entries,
+                        "resolution_fingerprint": content_digest(fingerprint_source.as_bytes()),
                         "recovery_hint": "use a program that exists in the listing; compile sources before running their binaries",
                     }),
                 )));

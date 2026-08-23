@@ -360,7 +360,7 @@ pub async fn run_retrieval_complex_baseline() -> anyhow::Result<String> {
         let relevant =
             |h: &agent_contracts::ExternalizedContext| h.context_ref.summary.contains(marker);
         let total_relevant = hits.iter().filter(|h| relevant(h)).count();
-        let first_rank = hits.iter().position(|h| relevant(h)).map(|p| p + 1);
+        let first_rank = hits.iter().position(&relevant).map(|p| p + 1);
         let recovered = hits
             .iter()
             .filter(|h| relevant(h) && gc.externalized_ids.contains(&h.item_id))

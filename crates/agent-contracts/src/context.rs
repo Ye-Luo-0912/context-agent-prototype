@@ -1088,6 +1088,10 @@ pub struct TaskProgressView {
     /// key + 结果 + world 版本，不含任何工具正文。
     #[serde(default)]
     pub operational_evidence: Vec<String>,
+    /// CONV-03：未解析执行 blocker 的有界警告行（≤2）。每行对应一个
+    /// 由 typed 失效事实开出的义务；无关推进不清除它们。
+    #[serde(default)]
+    pub unresolved_blockers: Vec<String>,
     /// Deterministic stall signal (MOD-PROG-01): the same operation
     /// signature has produced no world progress for consecutive rounds.
     /// Advisory prompt line, never an execution block.
@@ -1109,6 +1113,7 @@ impl TaskProgressView {
             && self.verifications.is_empty()
             && self.failed_commands.is_empty()
             && self.operational_evidence.is_empty()
+            && self.unresolved_blockers.is_empty()
     }
 
     /// Whether `Checked` already names this workspace path (`path` or
