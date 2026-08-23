@@ -81,6 +81,31 @@ wire compatible).
 
 ## Open P1 — Tool Surface reliability
 
+### TOOL-PROC-01 — explicit ProgramResolver for process.run (fixed 2026-08-23)
+
+Reproduction on Windows confirmed a tool-side semantic defect, not model
+guessing: with `Command::new(argv0)` + `current_dir(cwd)`, a binary that
+exists in the child cwd still failed to spawn under bare-name, `.\` and
+`./` forms (CreateProcess does not search the child's cwd) while the
+typed failure listing showed the same binary present — manufacturing the
+exact contradiction that drives `foo` / `./foo` / `.\foo` guessing
+loops. Landed: a host-owned resolver defines resolution explicitly —
+absolute paths as-is; separator-relative forms join the call cwd (`..`
+traversal rejected); bare names search the cwd first, then effective
+PATH, PATHEXT-completed on Windows — and spawn always uses the resolved
+absolute path. preflight, RetryDomain fingerprints and spawn share one
+semantics; failures report the bounded candidate list they tried.
+
+### Fingerprint v2 — preview ≠ identity (fixed 2026-08-23)
+
+The old `resolution_fingerprint` hashed only the 20-name cwd preview and
+serialized `env` as an unordered map. Landed: scope_key =
+digest(cwd identity + effective PATH + resolver rules version) is stable
+across epochs; fingerprint additionally digests the full bounded
+directory state (all entries sorted, 4096-entry/128 KiB caps, truncation
+flag hashed) plus canonically sorted env pairs. Beyond-preview changes
+move the epoch; HashMap iteration order cannot.
+
 ### TOOL-EDIT-02 — canonical edit first-attempt success (open)
 
 Do not reopen `TOOL-EDIT-01`: revision-aware exact refusals and bounded
@@ -336,44 +361,56 @@ their paths); assembly emits per-round `ProtocolBodyCacheStats`
 agent-eval aggregates into summary.json — hit rate is now independently
 verifiable from any bundle.
 
-### CONV-03 — obligation-scoped convergence (mechanism landed 2026-08-23, residual narrowed by live evidence)
+### CONV-03 — obligation lineage + precondition epochs (landed 2026-08-23, second refinement)
 
-Global frontier advance does not prove blocker resolution (C r2's
-13-attempt guessing loop kept peak=4 < advisory 5 via interleaved
-advances). Landed: typed `ExecutionObligation` ledger keyed by domain +
-precondition fingerprint (`resolution_fingerprint` = cwd listing + PATH
-+ env overrides stamped host-trusted on process NotFound); unrelated
-progress can never resolve an obligation; resolution requires
-precondition change or same-domain success; ≤2 bounded UNRESOLVED
-BLOCKER warning lines render beside the global advisory. Evidence
-argument identity now uses the Runtime-computed ArgumentDigest.
-Pending: longflow/bench evidence under the new ROADMAP gate, and the
-LaunchResolutionFact hard-refusal note that its revision guard is
+Global frontier advance does not prove blocker resolution. Landed in
+two steps: first the typed `ExecutionObligation` ledger with host-
+trusted `resolution_fingerprint` preconditions and bounded UNRESOLVED
+BLOCKER warnings; then — after the live run showed attempts never
+escalating — the lineage model. `ExecutionObligation` now carries a
+stable `scope_key` (ExecutableResolution = resolver-context digest;
+path or target identity for the other domains), a per-epoch
+`precondition` fingerprint, `epoch`, per-epoch `attempts`, and cross-
+epoch `total_attempts`. Same scope + same fingerprint accumulates; same
+scope + new fingerprint advances the epoch (**PreconditionChanged ≠
+ObligationResolved**); resolution requires blocker-specific proof — an
+ExecutableResolution obligation is cleared only by a success carrying
+the *same* scope_key *and* fingerprint (a successful rustc build no
+longer clears "compiled tests exe not found"), while EditTarget /
+ResourcePath / ProjectMarker keep their target-specific proofs. Hard
+refusal stays exactly as narrow as before: provably equivalent retries
+only. The LaunchResolutionFact revision guard note remains: it is
 deliberately conservative until fingerprints are recomputable
 pre-dispatch without I/O.
 
-Live narrowing (`../crates/agent-eval/evidence/longflow-post-obligation-2026-08-23/REPORT.md`,
-2026-08-23): guessing chains rebuilt in *both* C repeats. Fingerprints
-are stable within a chain, but attempts never escalate because (a) any
-successful command resolves all ExecutableResolution obligations — a
-successful `rustc` build clears the unrelated "compiled tests exe not
-found" blocker — and (b) successful builds change the cwd listing, so
-the next failure carries a new fingerprint and supersedes the old row.
-Open work: resolution must require a precondition-matched success (same
-fingerprint), not domain-any-success; and obligation warnings are
-TASK PROGRESS-only, so bundles cannot yet prove they fired.
+### CONV-OBS-01 — obligation lifecycle is event-visible (fixed 2026-08-23)
 
-### PROTO-EVID-03 — body cache starves under Unknown-footprint command pressure (observed 2026-08-23, no retune)
+Bundles could not prove whether blocker warnings fired. Landed:
+`RuntimeEvent::ExecutionObligation {kind, domain, scope_digest, epoch,
+attempts_in_epoch, total_attempts}` with kinds opened / attempted /
+precondition_changed / resolved / dropped, emitted from the observation
+pipeline; agent-eval aggregates `obligation_*`,
+`avoidable_failure_calls` (failures after the first in one lineage),
+`max_obligation_attempts_per_epoch`, `max_total_attempts_per_lineage`,
+and per-user-turn tail metrics (`max_turn_rounds`, `p95_turn_rounds`)
+so optimization targets long turns, not task-round means. Deferred
+honestly: a `warning_surfaced` kind needs the render path to report
+surfacing; do not fake it from attempt counts.
 
-First live `ProtocolBodyCacheStats` accounting: eligibility is high
-(20–31 offered rows per longflow cell) but hit rate is exactly 0. Every
-`process.run` / `shell.exec` has an Unknown mutation footprint and each
-one invalidates the whole turn cache (invalidated 6–16 per cell), so
-command-dense trajectories starve the cache the checkpoint-missing
-motive was measured on. The all-entries invalidation is deliberately
-conservative and stays frozen; this entry records the measured fact so
-any future policy change must bring its own evidence and design, not a
-threshold tweak.
+### PROTO-EVID-03 — Unknown suspends body reuse instead of deleting it (fixed 2026-08-23)
+
+First live `ProtocolBodyCacheStats` accounting showed eligibility of
+20–31 rows per longflow cell with hit rate exactly 0: every command
+tool carries an Unknown footprint and each one physically cleared the
+whole turn cache. Fix keeps correctness and reuses the existing
+revalidation loop: Unknown mutations now *suspend* entries — bytes stay
+in cache but are ineligible (**CachedBytesPresent ≠ BodyCurrentlyTrusted**);
+BeforeModel hash revalidation restoring the same path@digest Fresh makes
+the entry eligible again, a changed digest never passes the identity gate
+and is left to LRU eviction. Known mutations keep physically dropping
+their touched paths; counters split `invalidated` (physical) from
+`suspended` (dormant). Deterministic regressions cover both branches.
+Not a Context GC change: Context policy stays frozen.
 
 ### EVAL-IMMUTABLE-01 — live evidence attempts must not overwrite (fixed 2026-08-23)
 

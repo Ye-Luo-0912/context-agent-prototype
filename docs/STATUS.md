@@ -34,18 +34,34 @@ and sandbox contracts live elsewhere. Experiment facts live in
   replay frontier rebuild + conformance serde contracts. Verification:
   `agent-eval --convergence-bench` three deterministic scenarios PASS
   on the real runtime + real tool surface.
-- Clean post-outage A/C longflow rerun completed 2026-08-23
-  (n=2, all four arm-runs passed hidden verification): C r1 57 rounds,
-  C r2 67 rounds (one rebuilt process-guessing chain), A r1 48 rounds,
-  A r2 40 rounds. Facts in
-  [`crates/agent-eval/evidence/longflow-post-convergence-2026-08-23/REPORT.md`](../crates/agent-eval/evidence/longflow-post-convergence-2026-08-23/REPORT.md).
-  Residual convergence work is **obligation-scoped convergence**
-  (CONV-03) plus the trust/observability fixes tracked in
-  [`AUDIT_TODO.md`](AUDIT_TODO.md) and executed via
-  [`TRUST_AND_OBLIGATION_TODO.md`](TRUST_AND_OBLIGATION_TODO.md):
-  global frontier advances do not prove blocker progress; restored
-  bodies must stay out of System role; dynamic capability producer
-  metadata must not become trusted runtime facts.
+- Clean A/C longflow runs completed 2026-08-23. The post-obligation
+  run (n=2, all four arm-runs passed hidden verification): C r1 61
+  rounds / C r2 64 rounds, A r1 61 rounds / A r2 47 rounds — first run
+  with live cache accounting, which showed hit rate 0 under command
+  pressure (every Unknown-footprint command cleared the whole turn
+  cache) and guessing chains whose attempts never escalated because any
+  same-domain success cleared the obligation. Both findings are fixed:
+  the body cache now suspends on Unknown mutations and revives entries
+  after BeforeModel revalidation proves the identical digest
+  (PROTO-EVID-03); obligations are lineages with precondition epochs and
+  fingerprint-matched resolution (CONV-03), event-visible end to end
+  (CONV-OBS-01). Facts in
+  [`crates/agent-eval/evidence/longflow-post-obligation-2026-08-23/REPORT.md`](../crates/agent-eval/evidence/longflow-post-obligation-2026-08-23/REPORT.md).
+  Context GC and compaction policy stay frozen — C carried ~4.7 KB peak
+  resident vs A's 231K historical-context tokens at equal rounds; do not
+  reopen either from these numbers.
+- Trust & Obligation first cut landed (22-item program complete,
+  historical record
+  [`TRUST_AND_OBLIGATION_TODO.md`](TRUST_AND_OBLIGATION_TODO.md)):
+  Evidence Frontier + FrontierDelta + `ExecutionFrontier` events;
+  RetryDomain (`ExecutableResolution`, no K-strikes); per-turn protocol
+  body cache with checkpoint-gated rehydration and `ProtocolBodyCacheStats`
+  accounting; capability-output metadata sanitizing; real
+  `ArgumentDigest` evidence identity; versioned `HostPolicySnapshot`;
+  unified surface pressure budget; replay frontier rebuild +
+  conformance serde contracts. Verification:
+  `agent-eval --convergence-bench` three deterministic scenarios PASS
+  on the real runtime + real tool surface.
 - M12 first cut: structured `EffectIntent` + trusted `HostToolPolicy`,
   multi-file `WorkspaceWriteSet` bounds, and commit-time
   Actual ⊆ Approved (`MOD-AUTH-01`/`02`).
@@ -98,7 +114,11 @@ update never re-interprets an in-flight operation. Revision enforcement
 is **per binding** (`tool_name` + policy digest): adding `plugin.foo`
 policy must not stale an already-approved `fs.write`; only replacing or
 revoking the same binding affects that tool's later authority. Global
-"revision changed → all old leases invalid" is rejected by design.
+"revision changed → all old leases invalid" is rejected by design, and
+two concerns stay separate: the policy snapshot identity prevents
+*reinterpretation* of approved operations, while an explicit authority
+revocation epoch is the only mechanism that may fence live leases — one
+revision field must not carry both meanings.
 Do not build a second registry. Attestation is actual enforced
 capabilities; generic process tools stay non-transactional.
 UntrustedGenerated stays fail-closed on native. Multi-file

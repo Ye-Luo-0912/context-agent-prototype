@@ -67,6 +67,22 @@ Context packing, GC, and retrieval live in
    (CAP-OBS-01); the typed host-trusted facts channel is the follow-up
    mainline before Self-Iteration.
 
+8. **PreconditionChanged ≠ ObligationResolved.**
+   A blocker obligation is a lineage: stable scope identity, per-epoch
+   precondition fingerprint, attempts in epoch, total attempts. World
+   movement (a build landing, PATH changing) advances the epoch and
+   gives the model room to retry once more; it never clears the debt.
+   Only blocker-specific proof resolves an obligation — for
+   ExecutableResolution, a successful launch carrying the same scope
+   key *and* fingerprint.
+
+9. **CachedBytesPresent ≠ BodyCurrentlyTrusted.**
+   Unknown-footprint mutations suspend cached protocol bodies (bytes
+   retained, eligibility frozen) instead of deleting them. Eligibility
+   returns only when BeforeModel revalidation proves the identical
+   path@digest Fresh again; a changed identity can never pass the gate.
+   Known-footprint mutations still physically drop their touched paths.
+
 There is no planner. The LLM still chooses actions. Runtime only
 maintains what the world can currently prove.
 
@@ -265,41 +281,52 @@ soft convergence debt above. There is deliberately **no K-strikes name
 ban**: the cwd listing is bounded, PATH/extensions/later builds can
 change any conclusion.
 
-### Protocol body cache (PROTO-EVID-01/02, landed)
+### Protocol body cache (PROTO-EVID-01/02/03, landed)
 
 A per-turn LRU (≤4 entries, ≤8 KiB each, `ActiveTurn` lifetime) keeps
 recently observed file bodies from successful `fs.read` results only —
 an edit echo is a patch echo, not the exact body, and never enters the
-cache. A Known mutation invalidates its touched paths; an Unknown
-mutation invalidates everything. During assembly a body is re-injected
+cache. A Known mutation physically drops its touched paths; an Unknown
+mutation **suspends** every entry — bytes retained, eligibility frozen
+(CachedBytesPresent ≠ BodyCurrentlyTrusted) — and BeforeModel
+revalidation proving the identical path@digest Fresh revives it.
+During assembly a body is re-injected
 as a **user-role context-frame message** (never the Focus frame, which
 renders as System policy — PROMPT-AUTH-01) only when the turn checkpoint
 actually truncated that read, the TASK PROGRESS fact is still Fresh, and
 the digest is identical. Cache rows never enter the context engine, are
 never admitted, and never persist. Every assembly emits one bounded
 `ProtocolBodyCacheStats` event (eligible / hit / miss / invalidated /
-oversize / restored_body_tokens), so hit-rate claims are verifiable from
-the event stream alone.
+suspended / oversize / restored_body_tokens), so hit-rate claims are
+verifiable from the event stream alone.
 
-### Obligation Ledger (CONV-03, landed)
+### ProgramResolver + Obligation Ledger (TOOL-PROC-01 / CONV-03, landed)
 
 The frontier's global counters cannot see blocker debt: interleaved
 unrelated advances keep `frontier_no_advance_peak` under threshold while
-a guessing loop burns rounds. The ledger is per-blocker: a failed output
+a guessing loop burns rounds. The ledger is per-lineage: a failed output
 whose failure domain is typed (`ExecutableResolution`, `EditTarget`,
-`ResourcePath`, `ProjectMarker`) opens an `ExecutionObligation` keyed by
-domain + precondition fingerprint. For process launch failures the
-runtime stamps a host-trusted `resolution_fingerprint` (cwd listing +
-PATH + env overrides) into the failure metadata — source edits do not
-change it, builds do. Rules: unrelated progress never resolves an
-obligation; resolution requires the same domain to succeed or the
-recorded precondition to demonstrably change (new target digest, known
-mutation touching the path); same domain with a different precondition
-supersedes the old row; `NonDeterministic` domains open nothing. TASK
-PROGRESS renders at most two bounded UNRESOLVED BLOCKER lines beside the
-global advisory. Evidence argument identity uses the Runtime-computed
-`ArgumentDigest` (not producer strings), so same-argv/different-env and
-same-path/different-cursor calls no longer collide on evidence identity.
+`ResourcePath`, `ProjectMarker`) opens an `ExecutionObligation` with a
+stable scope identity and a per-epoch precondition fingerprint. For
+process launches the host-owned resolver defines resolution explicitly —
+absolute paths as-is; separator-relative forms join the call cwd; bare
+names search the cwd first, then effective PATH (PATHEXT-aware on
+Windows) — and stamps both the stable scope digest and the epoch
+fingerprint (full bounded cwd state + effective PATH + canonically
+sorted env overrides) into success *and* failure metadata: preflight,
+RetryDomain and spawn share one interpretation. Source edits do not move
+the epoch; a build that changes the directory state does.
+Rules: unrelated progress never resolves an obligation; world movement
+advances the epoch (**PreconditionChanged ≠ ObligationResolved**) and
+keeps total attempts; resolution requires blocker-specific proof — a
+launch success with matching scope key *and* fingerprint, or the target
+identity proofs for the other domains; `NonDeterministic` domains open
+nothing. TASK PROGRESS renders at most two bounded UNRESOLVED BLOCKER
+lines beside the global advisory, and every ledger transition is
+event-visible (`ExecutionObligation`). Evidence argument identity uses
+the Runtime-computed `ArgumentDigest` (not producer strings), so
+same-argv/different-env and same-path/different-cursor calls no longer
+collide on evidence identity.
 
 ### Protocol working set (turn checkpointing)
 

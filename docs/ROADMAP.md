@@ -53,19 +53,20 @@ in parallel, but it does not reorder or close either gate.
 5. Formal M15 only from versioned per-cell artifacts. Do not use one
    A/B/C for every layer.
 6. Execution Convergence V1 candidate gate (revised 2026-08-23 second
-   review): before any V1 candidate claim, all of the following hold —
+   review; lineage metrics added after the obligation-run evidence):
+   before any V1 candidate claim, all of the following hold —
    (a) the Convergence Bench is green: three deterministic
    scripted-model scenarios (`retry_domain`, `operational_evidence`,
-   `protocol_body`); (b) no unresolved typed obligation exceeds its
-   bounded attempts under unchanged preconditions — read from the
-   Obligation Ledger's UNRESOLVED BLOCKER warnings and the
-   `ExecutionFrontier` event stream, not from the global scalar; and
-   (c) hidden verification is green on the live A/C longflow cells.
-   The global `frontier_no_advance_peak` metric is demoted to a
-   diagnostic only: C r2 proved it can stay under threshold while a
-   13-attempt process-guessing loop runs, because interleaved unrelated
-   advances reset the counter. Evidence identity uses the Runtime
-   `ArgumentDigest`; cache hit-rate claims must be backed by
-   `ProtocolBodyCacheStats` events. This gate does not close
-   M12/M13/M15 and does not reorder them.
+   `protocol_body`); (b) the event-visible Obligation Ledger shows no
+   unresolved blocker with excessive same-epoch attempts and no lineage
+   accumulating repeated failed epochs without resolution
+   (`max_obligation_attempts_per_epoch`, `max_total_attempts_per_lineage`,
+   from `ExecutionObligation` events); and (c) hidden verification is
+   green on the live A/C longflow cells. The global
+   `frontier_no_advance_peak` metric stays a diagnostic only: C r2
+   proved it can stay under threshold while a 13-attempt process-guessing
+   loop runs, because interleaved unrelated advances reset the counter.
+   Evidence identity uses the Runtime `ArgumentDigest`; cache hit-rate
+   claims must be backed by `ProtocolBodyCacheStats` events. This gate
+   does not close M12/M13/M15 and does not reorder them.
 7. V2 Self-Iteration last.
