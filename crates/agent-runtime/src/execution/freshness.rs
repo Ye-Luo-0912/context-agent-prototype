@@ -5,22 +5,28 @@
 //! write bumps `workspace_revision` (old PASS is omitted) but keeps
 //! `path@revision` facts and marks them `NeedsRevalidation`.
 
-use agent_contracts::{MutationFootprint, ResourceFreshness, ResourceVersionOracle, ToolOutput};
+use agent_contracts::{
+    FrontierDelta, MutationFootprint, ResourceFreshness, ResourceVersionOracle, ToolOutput,
+};
 
 use super::ResourceProvenance;
 use super::state::{
-    ExecutionState, MAX_REVALIDATE_PER_ROUND, RoundProgress, VerificationCause,
-    VerificationCoverage, bound_item, is_command_tool, operation_identity, path_mentioned_in_query,
-    same_operation,
+    ExecutionState, MAX_REVALIDATE_PER_ROUND, ObservationEvidence, VerificationCause,
+    VerificationCoverage, bound_item, is_command_tool, operation_identity,
+    path_mentioned_in_query, same_operation,
 };
 
 impl ExecutionState {
-    pub fn observe_tool(&mut self, output: &ToolOutput, anchor_revision: u64, turn: u64) {
+    pub fn observe_tool(
+        &mut self,
+        output: &ToolOutput,
+        anchor_revision: u64,
+        turn: u64,
+    ) -> super::state::FrontierObservation {
         self.anchor_revision = anchor_revision;
         // MOD-PROG-01 progress probe: capture the before-state so one
         // deterministic classification can answer "did this round move
         // the world or our knowledge of it?"
-        let before_world_revision = self.workspace_revision;
         let before_files = self.checked_files.len();
         let before_failures = self.failed_commands.len();
         let before_verifications = self.verifications.len();
@@ -36,6 +42,8 @@ impl ExecutionState {
                 self.workspace_revision = self.workspace_revision.saturating_add(1);
             }
         }
+        // 版本推进使版本绑定的前沿证据过期；失效条数随事件上报。
+        let invalidated = self.invalidate_stale_evidence();
         match footprint {
             MutationFootprint::None => {}
             MutationFootprint::Unknown => {
@@ -135,10 +143,11 @@ impl ExecutionState {
         }
         self.cap();
         self.refresh_validity();
-        // Deterministic progress classification (MOD-PROG-01): world
-        // change > fact/evidence gain > failure recovery > nothing.
-        // A repeated identical verification row is not new evidence.
-        let world_changed = self.workspace_revision > before_world_revision;
+        // Deterministic frontier classification (CONV-01): a verification
+        // result is always typed evidence; otherwise footprint decides —
+        // Known is provable world change, Unknown is only invalidation,
+        // and read-only rounds split into evidence gain vs redundant
+        // repeat vs obligation resolution vs nothing.
         let facts_gained = observation_changed || self.checked_files.len() > before_files;
         let evidence_gained = self.verifications.len() > before_verifications
             && self
@@ -147,16 +156,49 @@ impl ExecutionState {
                 .map(|row| (row.ok, row.summary.clone()))
                 != before_last_evidence;
         let failure_resolved = self.failed_commands.len() < before_failures;
-        let progress = if world_changed {
-            RoundProgress::Meaningful
-        } else if facts_gained || evidence_gained {
-            RoundProgress::Evidence
-        } else if failure_resolved {
-            RoundProgress::Control
+        let obs_evidence = if output.ok
+            && !output.is_verification()
+            && !output.may_mutate_workspace()
+        {
+            self.record_observation_evidence(output, turn)
         } else {
-            RoundProgress::None
+            ObservationEvidence::None
         };
-        self.update_stall(&identity, output.failure_class(), progress);
+        let delta = if output.is_verification() && output.ok {
+            if evidence_gained {
+                FrontierDelta::EvidenceAdvanced
+            } else {
+                FrontierDelta::RedundantEvidence
+            }
+        } else {
+            match &footprint {
+                MutationFootprint::Known(_) => FrontierDelta::ObservedWorldChange,
+                MutationFootprint::Unknown => {
+                    // 每个未知足迹轮都推进世界时钟，"同版本重复"对
+                    // 命令运行不成立；失效本身不是进展。
+                    FrontierDelta::WorldInvalidatedUnknown
+                }
+                MutationFootprint::None => {
+                    if facts_gained || evidence_gained || obs_evidence == ObservationEvidence::Advanced
+                    {
+                        FrontierDelta::EvidenceAdvanced
+                    } else if failure_resolved {
+                        FrontierDelta::ObligationResolved
+                    } else if matches!(obs_evidence, ObservationEvidence::Repeated) {
+                        FrontierDelta::RedundantEvidence
+                    } else {
+                        FrontierDelta::NoProgress
+                    }
+                }
+            }
+        };
+        self.update_convergence(&identity, output.failure_class(), delta);
+        super::state::FrontierObservation {
+            delta,
+            actions_since_frontier_advance: self.convergence.actions_since_frontier_advance,
+            evidence_revision: self.convergence.evidence_revision,
+            invalidated,
+        }
     }
 
     /// Runtime hash check at BeforeModel. Cap N=8; no file body enters the

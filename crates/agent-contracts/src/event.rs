@@ -170,6 +170,20 @@ pub enum RuntimeEvent {
     ToolFinished {
         output: ToolOutput,
     },
+    /// 证据前沿账目：每个持久化工具观察一条。收敛指标（前沿推进数 /
+    /// 冗余证据调用 / 无推进动作连击 / 证据失效数）从这里确定性聚合；
+    /// 字段全部有界，不含任何工具正文。
+    ExecutionFrontier {
+        #[serde(default)]
+        delta: crate::FrontierDelta,
+        #[serde(default)]
+        actions_since_frontier_advance: u32,
+        #[serde(default)]
+        evidence_revision: u64,
+        /// 本轮因 world revision 推进而失效的前沿证据条数。
+        #[serde(default)]
+        invalidated: u64,
+    },
     /// A tool frame closed: the runtime published the lifecycle transitions
     /// the close produced (durable outcomes promoted out of the tool frame),
     /// so a tool scope close is an auditable result instead of a silent

@@ -194,13 +194,57 @@ time and environment make them non-deterministic.
 
 **Coherence vs convergence.** The guarantees above are coherence: the
 runtime states what the world can prove and never blocks on guesses.
-They do not by themselves establish that the *task* moved forward —
-successful observations still vanish with transcript recycling, and any
-unrelated Evidence progress clears a failure cluster today. The
-convergence extension (Execution Evidence Frontier, FrontierDelta,
-cross-tool ConvergenceDebt, RetryDomain) is specified in
-[`AUDIT_TODO.md`](AUDIT_TODO.md) CONV-01/CONV-02 and sequenced in
-[`EXECUTION_CONVERGENCE_TODO.md`](EXECUTION_CONVERGENCE_TODO.md).
+They do not by themselves establish that the *task* moved forward.
+The convergence extension below landed 2026-08-23; it stays advisory
+only and never becomes a planner.
+
+### Execution Evidence Frontier (CONV-01, landed)
+
+Every persistable tool observation is classified into one deterministic
+[`FrontierDelta`]: `ObservedWorldChange` (Known footprint applied),
+`WorldInvalidatedUnknown` (Unknown footprint — knowledge may be stale,
+but this is **not** progress), `EvidenceAdvanced`, `ObligationResolved`,
+`RedundantEvidence`, `NoProgress`. Only the first, third, and fourth
+clear the stall signature, the failure cluster, and
+`actions_since_frontier_advance`; a redundant re-read cannot launder an
+active failure cluster. Successful read-only observations
+(`git.status`/`git.diff` keyed by tool at `WorkspaceRevision(n)`;
+path-carrying reads keyed `tool:path` at `Resource{path@digest}`) enter
+a bounded evidence table (≤16 rows, newest-first); a world-revision
+advance expires revision-bound rows and counts as
+`evidence_invalidations`. Each round emits one bounded
+`ExecutionFrontier` event; eval aggregates `frontier_advances`,
+`redundant_evidence_calls`, `frontier_no_advance_peak`,
+`evidence_invalidations` from the event stream alone. After 5
+non-advance actions the TASK PROGRESS view renders a soft advisory:
+"EXECUTION FRONTIER UNCHANGED …". TASK PROGRESS carries typed fields
+only (identities / enums / digests / counts); raw bodies stay in the
+user-role layer or artifacts.
+
+### RetryDomain (CONV-02, landed)
+
+`FailureClass` ("what broke") and failure domain ("which preconditions
+does a retry depend on") are separate vocabularies. Hard refusal is only
+legal under provable precondition equivalence: the edit duplicate guard
+(argument digest + all target identities Fresh), plus
+`ExecutableResolution` for process/shell launches — same argument digest
+(argv0/cwd/env overrides) with no workspace-revision advance since the
+failure. Timeout, exit codes, cancellations stay `NonDeterministic` and
+are never refused hard; cross-name guessing loops are suppressed by the
+soft convergence debt above. There is deliberately **no K-strikes name
+ban**: the cwd listing is bounded, PATH/extensions/later builds can
+change any conclusion.
+
+### Protocol body cache (PROTO-EVID-01, landed)
+
+A per-turn LRU (≤4 entries, ≤8 KiB each, `ActiveTurn` lifetime) keeps
+recently observed file bodies from successful `fs.read` results and edit
+echoes. A Known mutation invalidates its touched paths; an Unknown
+mutation invalidates everything. During assembly a body is re-injected
+into the user-role focus layer only when the turn checkpoint actually
+truncated that read, the TASK PROGRESS fact is still Fresh, and the
+digest is identical. Cache rows never enter the context engine, are
+never admitted, and never persist.
 
 ### Protocol working set (turn checkpointing)
 

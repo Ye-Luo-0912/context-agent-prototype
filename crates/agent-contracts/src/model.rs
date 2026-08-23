@@ -251,6 +251,10 @@ impl TurnFrame {
 /// TASK PROGRESS, artifacts, and the run journal.
 pub const TURN_FRAME_KEEP_EXCHANGES: usize = 6;
 
+/// PROTO-EVID-01：单轮最多回注的协议正文行数。与运行时当轮缓存的
+/// 容量一致；回注内容只进 user-role 焦点层，不进 Context / 不持久。
+pub const MAX_PROTOCOL_BODY_ROWS: usize = 4;
+
 /// The bounded deterministic checkpoint note injected into the wire
 /// view when older exchanges are compacted away.
 pub fn turn_checkpoint_note(compacted_exchanges: usize) -> String {

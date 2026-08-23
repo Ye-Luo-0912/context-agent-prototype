@@ -350,4 +350,68 @@ mod tests {
         let tokens = tokens::approx_tokens(&serde_json::to_string(&wide.input_schema).unwrap());
         assert!(tokens > 0);
     }
+
+    /// checkpoint 向后兼容契约（评审第 27 条）：旧形状的执行状态与
+    /// 进度视图必须带缺省值反序列化，新字段不破坏旧 checkpoint。
+    #[test]
+    fn old_execution_state_json_deserializes_with_default_frontier() {
+        use agent_runtime::ExecutionState;
+        // 2026-08-23 之前的 checkpoint 形状：无 evidence / convergence。
+        let old = json!({
+            "anchor_revision": 4,
+            "workspace_revision": 9,
+            "checked_files": [],
+            "verifications": [],
+            "failed_commands": [],
+        });
+        let state: ExecutionState = serde_json::from_value(old).expect("old shape must parse");
+        assert!(state.evidence.is_empty());
+        assert_eq!(state.convergence.evidence_revision, 0);
+        assert_eq!(state.convergence.actions_since_frontier_advance, 0);
+        assert!(state.convergence.recent_deltas.is_empty());
+    }
+
+    #[test]
+    fn frontier_state_round_trips_through_serde() {
+        use agent_contracts::ToolOutput;
+        use agent_runtime::ExecutionState;
+        let mut state = ExecutionState::default();
+        for turn in 1..=2u64 {
+            state.observe_tool(
+                &ToolOutput {
+                    call_id: "c".into(),
+                    tool_name: "git.status".into(),
+                    ok: true,
+                    summary: "clean".into(),
+                    model_content: String::new(),
+                    artifact_ref: None,
+                    metadata: json!({}),
+                },
+                1,
+                turn,
+            );
+        }
+        let text = serde_json::to_string(&state).expect("serialize");
+        let back: ExecutionState = serde_json::from_str(&text).expect("round trip");
+        assert_eq!(back, state);
+        assert_eq!(back.evidence.len(), 1);
+        assert_eq!(back.convergence.actions_since_frontier_advance, 1);
+    }
+
+    #[test]
+    fn old_task_progress_view_json_parses_with_default_warnings() {
+        use agent_contracts::TaskProgressView;
+        let old = json!({
+            "anchor_revision": 1,
+            "workspace_revision": 2,
+            "checked_files": ["src/a.rs@abc"],
+            "verifications": [],
+            "failed_commands": [],
+        });
+        let view: TaskProgressView =
+            serde_json::from_value(old).expect("old shape must parse");
+        assert!(view.operational_evidence.is_empty());
+        assert!(view.stall_warning.is_none());
+        assert!(view.frontier_warning.is_none());
+    }
 }

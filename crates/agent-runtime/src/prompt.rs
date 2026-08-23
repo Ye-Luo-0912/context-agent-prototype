@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use agent_contracts::{
     ContextKind, FocusState, MaterializedContext, MaterializedItem, ModelInput, ModelMessage,
     RuntimeFactsView, TaskAnchorView, TaskProgressView, ToolCatalogEntry, ToolSpec, TurnFrame,
-    render_tool_catalog_index,
+    TurnFrameStep, render_tool_catalog_index,
 };
 use agent_workspace::capture_host_runtime_facts;
 
@@ -88,12 +88,15 @@ impl PromptAssembler {
             turn,
             tools,
             &[],
+            &[],
         )
     }
 
     /// Assemble including the bounded catalog index for tools not on this
     /// round's schema surface. `assemble` is the empty-index form used by
-    /// unit tests.
+    /// unit tests. `protocol_bodies` 是当轮正文缓存的可回注行
+    /// (path@digest, body)：只有 checkpoint 确实截掉了该次读取、且
+    /// TASK PROGRESS 的 Fresh 事实仍是同一身份时才会回注。
     #[allow(clippy::too_many_arguments)]
     pub fn assemble_with_catalog(
         &self,
@@ -104,6 +107,7 @@ impl PromptAssembler {
         turn: &TurnFrame,
         tools: Vec<ToolSpec>,
         catalog: &[ToolCatalogEntry],
+        protocol_bodies: &[(String, String)],
     ) -> ModelInput {
         let tools: Vec<ToolSpec> = tools
             .into_iter()
@@ -189,9 +193,22 @@ impl PromptAssembler {
         // frame (audit, turn-end persistence) is never mutated here.
         let (turn_frame, compacted_exchanges) =
             turn.checkpoint_tail(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
+        let mut focus = render_focus_frame(runtime_focus, task_anchor, task_progress)
+            .unwrap_or_default();
+        let restored =
+            rehydrated_protocol_bodies(turn, &turn_frame, task_progress, protocol_bodies);
+        if !restored.is_empty() {
+            focus.push_str("\nRESTORED TURN BODIES (this turn's cache; identity verified)\n");
+            for (identity, body) in restored {
+                focus.push_str(&identity);
+                focus.push('\n');
+                focus.push_str(&body);
+                focus.push('\n');
+            }
+        }
         ModelInput {
             system_policy,
-            focus_frame: render_focus_frame(runtime_focus, task_anchor, task_progress),
+            focus_frame: (!focus.is_empty()).then_some(focus),
             context_frame,
             turn_frame,
             tool_schemas: tools,
@@ -200,6 +217,62 @@ impl PromptAssembler {
             }),
         }
     }
+}
+
+/// PROTO-EVID-01 回注挑选：某行的正文只有同时满足
+/// (a) 完整帧里有它的非空读取结果、(b) 保留尾已不含该结果（checkpoint
+/// 截掉）、(c) TASK PROGRESS 的 Fresh 事实仍是同一 path@digest，才会
+/// 被回注。行本身来自有界当轮缓存。
+fn rehydrated_protocol_bodies(
+    full_turn: &TurnFrame,
+    retained: &TurnFrame,
+    progress: Option<&TaskProgressView>,
+    protocol_bodies: &[(String, String)],
+) -> Vec<(String, String)> {
+    if protocol_bodies.is_empty() {
+        return Vec::new();
+    }
+    let carried_identities = |frame: &TurnFrame| -> HashSet<String> {
+        frame
+            .steps
+            .iter()
+            .filter_map(|step| {
+                let TurnFrameStep::ToolResult { output, .. } = step else {
+                    return None;
+                };
+                if !output.ok || output.model_content.is_empty() {
+                    return None;
+                }
+                let touch = output.resource_touches().into_iter().next()?;
+                Some(format!(
+                    "{}@{}",
+                    touch.path,
+                    touch.revision.clone().unwrap_or_default()
+                ))
+            })
+            .collect()
+    };    let full = carried_identities(full_turn);
+    let retained_set = carried_identities(retained);
+    let fresh_facts: Option<HashSet<String>> = progress.map(|progress| {
+        progress
+            .checked_files
+            .iter()
+            .cloned()
+            .collect()
+    });
+    protocol_bodies
+        .iter()
+        .filter(|(identity, body)| {
+            !body.is_empty()
+                && full.contains(identity)
+                && !retained_set.contains(identity)
+                && fresh_facts
+                    .as_ref()
+                    .is_some_and(|facts| facts.contains(identity))
+        })
+        .take(agent_contracts::MAX_PROTOCOL_BODY_ROWS)
+        .cloned()
+        .collect()
 }
 
 /// Token cost of the runtime-owned Focus frame (TaskAnchor + TaskProgress +
@@ -233,6 +306,7 @@ pub fn prompt_layer_costs_with_catalog(
         turn,
         tools.to_vec(),
         catalog,
+        &[],
     );
     let historical = assembled
         .context_frame
@@ -355,13 +429,16 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
     let mut checked = progress.checked_files.clone();
     let mut verifications = progress.verifications.clone();
     let mut failed = progress.failed_commands.clone();
+    let mut evidence = progress.operational_evidence.clone();
     let mut rendered = format_task_progress(
         progress.anchor_revision,
         progress.workspace_revision,
         &checked,
         &verifications,
         &failed,
+        &evidence,
         progress.stall_warning.as_deref(),
+        progress.frontier_warning.as_deref(),
     );
     while rendered.chars().count() > agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS {
         if !failed.is_empty() {
@@ -370,6 +447,8 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
             checked.remove(0);
         } else if !verifications.is_empty() {
             verifications.remove(0);
+        } else if !evidence.is_empty() {
+            evidence.remove(0);
         } else {
             break;
         }
@@ -379,7 +458,9 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
             &checked,
             &verifications,
             &failed,
+            &evidence,
             progress.stall_warning.as_deref(),
+            progress.frontier_warning.as_deref(),
         );
     }
     if rendered.chars().count() > agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS {
@@ -398,7 +479,9 @@ fn format_task_progress(
     checked: &[String],
     verifications: &[String],
     failed: &[String],
+    evidence: &[String],
     stall_warning: Option<&str>,
+    frontier_warning: Option<&str>,
 ) -> String {
     let mut out =
         format!("TASK PROGRESS anchor_rev={anchor_revision} world_rev={workspace_revision}\n");
@@ -408,9 +491,15 @@ fn format_task_progress(
         out.push_str(warning);
         out.push('\n');
     }
+    // 收敛 advisory 同样不参与裁剪：它是重复行为的最后提醒。
+    if let Some(warning) = frontier_warning {
+        out.push_str(warning);
+        out.push('\n');
+    }
     append_list(&mut out, "Checked", checked);
     append_list(&mut out, "Verification", verifications);
     append_list(&mut out, "Failed commands", failed);
+    append_list(&mut out, "Operational evidence", evidence);
     while out.ends_with('\n') {
         out.pop();
     }
@@ -1169,6 +1258,110 @@ mod tests {
     }
 
     #[test]
+    fn protocol_body_cache_rehydrates_only_lost_fresh_identities() {
+        use agent_contracts::ContextMapView;
+        let assembler = PromptAssembler::new("policy");
+        let mut turn = TurnFrame::new("inspect auth");
+        let read_output = |index: usize, path: &str| agent_contracts::ToolOutput {
+            call_id: format!("call-{index}"),
+            tool_name: "fs.read".into(),
+            ok: true,
+            summary: "read".into(),
+            model_content: if index == 0 {
+                "fn secret_body() {}".into()
+            } else {
+                format!("content {index}")
+            },
+            artifact_ref: None,
+            metadata: serde_json::json!({ "path": path, "revision": "abc123" }),
+        };
+        // 第一个交换读取 src/auth.rs；随后足够的交换把它挤出保留尾。
+        turn.push_tool_calls(vec![agent_contracts::ToolCall {
+            id: "call-0".into(),
+            name: "fs.read".into(),
+            arguments: serde_json::json!({ "path": "src/auth.rs" }),
+        }]);
+        turn.push_tool_result(read_output(0, "src/auth.rs"), None);
+        for index in 1..9 {
+            turn.push_tool_calls(vec![agent_contracts::ToolCall {
+                id: format!("call-{index}"),
+                name: "fs.read".into(),
+                arguments: serde_json::json!({ "path": "src/other.rs" }),
+            }]);
+            turn.push_tool_result(read_output(index, "src/other.rs"), None);
+        }
+        let progress = TaskProgressView {
+            checked_files: vec!["src/auth.rs@abc123".into()],
+            ..Default::default()
+        };
+        let bodies = vec![(
+            "src/auth.rs@abc123".to_string(),
+            "fn secret_body() {}".to_string(),
+        )];
+        let history = materialized_with(Vec::new(), ContextMapView::default());
+        let assembled = assembler.assemble_with_catalog(
+            None,
+            None,
+            Some(&progress),
+            &history,
+            &turn,
+            Vec::new(),
+            &[],
+            &bodies,
+        );
+        assert!(
+            assembled.turn_checkpoint.is_some(),
+            "the first read must be compacted away before rehydration applies"
+        );
+        let focus = assembled.focus_frame.expect("progress must render");
+        assert!(focus.contains("RESTORED TURN BODIES"), "{focus}");
+        assert!(focus.contains("fn secret_body()"), "{focus}");
+
+        // 身份不一致（文件已换版或事实非 Fresh）：不回注。
+        let stale = vec![("src/auth.rs@old".to_string(), "stale body".to_string())];
+        let not_restored = assembler.assemble_with_catalog(
+            None,
+            None,
+            Some(&progress),
+            &history,
+            &turn,
+            Vec::new(),
+            &[],
+            &stale,
+        );
+        let focus = not_restored.focus_frame.expect("progress must render");
+        assert!(
+            !focus.contains("RESTORED TURN BODIES"),
+            "a stale identity must never be rehydrated: {focus}"
+        );
+
+        // 正文仍在保留尾（未截断）：不重复回注。
+        let mut short_turn = TurnFrame::new("inspect auth");
+        short_turn.push_tool_calls(vec![agent_contracts::ToolCall {
+            id: "call-0".into(),
+            name: "fs.read".into(),
+            arguments: serde_json::json!({ "path": "src/auth.rs" }),
+        }]);
+        short_turn.push_tool_result(read_output(0, "src/auth.rs"), None);
+        let still_there = assembler.assemble_with_catalog(
+            None,
+            None,
+            Some(&progress),
+            &history,
+            &short_turn,
+            Vec::new(),
+            &[],
+            &bodies,
+        );
+        assert!(still_there.turn_checkpoint.is_none());
+        let focus = still_there.focus_frame.expect("progress must render");
+        assert!(
+            !focus.contains("RESTORED TURN BODIES"),
+            "a retained body must not be duplicated: {focus}"
+        );
+    }
+
+    #[test]
     fn stall_warning_renders_and_survives_list_trimming() {
         let warning = "EXECUTION STALL: edit.replace on src/a.rs repeated 3 time(s) without world progress (last failure: stale_revision). Choose another strategy or finish with the current state.";
         let progress = TaskProgressView {
@@ -1190,6 +1383,38 @@ mod tests {
         // Overflowing lists are trimmed away; the deterministic stall
         // signal is the one line that must survive.
         assert!(rendered.chars().count() <= agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS);
+    }
+
+    #[test]
+    fn frontier_warning_and_typed_evidence_render_under_the_cap() {
+        let warning = "EXECUTION FRONTIER UNCHANGED: 5 action(s) without a provable frontier advance (recent deltas: redundant,redundant). Re-reading known state or repeating outcomes does not move the task; act on what you know, change strategy, or finish.";
+        let progress = TaskProgressView {
+            operational_evidence: vec![
+                "git.status: on branch main, clean @ world=0".into(),
+                "fs.read:src/auth.rs@abc123: ok @ world=0".into(),
+            ],
+            frontier_warning: Some(warning.into()),
+            ..Default::default()
+        };
+        let rendered = render_task_progress(&progress);
+        assert!(
+            rendered.contains("EXECUTION FRONTIER UNCHANGED"),
+            "the convergence advisory must render: {rendered}"
+        );
+        assert!(
+            rendered.contains("Operational evidence"),
+            "typed evidence rows render under their label: {rendered}"
+        );
+        // 类型化证据行不含任何正文形态的长文本。
+        assert!(!rendered.contains("fn "), "no file bodies in evidence rows");
+        assert!(rendered.chars().count() <= agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS);
+
+        // 只有证据行时进度块也要渲染（is_empty 必须把证据算作内容）。
+        let evidence_only = TaskProgressView {
+            operational_evidence: vec!["git.status: clean @ world=3".into()],
+            ..Default::default()
+        };
+        assert!(!evidence_only.is_empty());
     }
 
     #[test]
@@ -1257,6 +1482,7 @@ mod tests {
             &TurnFrame::new("continue"),
             tools,
             &catalog,
+            &[],
         );
         let index = input
             .system_policy

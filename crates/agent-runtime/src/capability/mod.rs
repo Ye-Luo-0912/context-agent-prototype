@@ -59,6 +59,30 @@ impl CapabilityRunState {
     }
 }
 
+/// 统一表面驻留预算：与 builtin 侧共用同一组水位（评审第 20 条）。
+/// 合并（本侧 + builtin 侧）已加载字节数超高位才冷却，回到低位即停。
+pub(crate) const SURFACE_SOFT_HIGH_BYTES: usize = 18_000;
+pub(crate) const SURFACE_LOW_WATERMARK_BYTES: usize = 9_000;
+
+/// 一个 ToolSpec 的 schema 序列化字节数，表面压力的计量单位。
+fn spec_schema_bytes(spec: &ToolSpec) -> usize {
+    serde_json::to_vec(&spec.input_schema).unwrap_or_default().len()
+}
+
+/// 把名为 `name` 的 Loaded 工具冷却到 Warm。持写锁调用；找到并修改
+/// 返回 true。
+fn set_tool_warm(inner: &mut HashMap<String, Entry>, name: &str) -> bool {
+    for entry in inner.values_mut() {
+        if let Some(state) = entry.tool_states.get_mut(name)
+            && state.lifecycle == ToolLifecycle::Loaded
+        {
+            state.lifecycle = ToolLifecycle::Warm;
+            return true;
+        }
+    }
+    false
+}
+
 struct Entry {
     capability: Arc<dyn Capability>,
     /// Manifest snapshot captured once at registration. The registry never
@@ -688,28 +712,77 @@ impl CapabilityRegistry {
     /// from idle aging, so TaskAnchor-driven roots cover the whole unified
     /// surface, not just the builtin half.
     pub fn gc(&self, roots: &[String]) {
+        self.gc_with_pressure(roots, 0)
+    }
+
+    /// 统一表面驻留预算下的安全点（评审第 20 条）：Loaded→Warm 冷却
+    /// 只由合并压力驱动（本侧 + builtin 侧字节数共用同一组水位，超
+    /// 高位才按最久未用冷却到低水位），替代 capability 侧原纯 TTL；
+    /// Warm→Unloaded 的闲置卸载保持不变。外部表面先于核心表面承担
+    /// 压力；`external_loaded_bytes` 为 0 时本侧只在自身超预算时冷却。
+    pub fn gc_with_pressure(&self, roots: &[String], external_loaded_bytes: usize) {
         // The single place this clock advances: once per model round, at
         // the same safe point that ages the builtin catalog.
         let tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
         let mut changed = false;
         {
             let mut inner = self.inner.write().expect("capability registry poisoned");
+            let own = Self::loaded_bytes_locked(&inner);
+            let total = own.saturating_add(external_loaded_bytes);
+            let over_pressure =
+                SURFACE_SOFT_HIGH_BYTES > 0 && total > SURFACE_SOFT_HIGH_BYTES;
+            // 压力路径：与 builtin 相同的资格规则（非 root、已达闲置
+            // 阈值），按最久未用把 Loaded 冷却到 Warm，到低水位为止。
+            // 低水位以下不再有纯 TTL 冷却——Loaded 驻留完全由统一
+            // 预算驱动（评审第 20 条：替代 capability 侧纯 TTL）。
+            if over_pressure {
+                let mut aging: Vec<(String, u64, usize)> = Vec::new();
+                for entry in inner.values() {
+                    let bytes_by_name: std::collections::HashMap<&str, usize> = entry
+                        .tool_specs
+                        .iter()
+                        .map(|spec| (spec.name.as_str(), spec_schema_bytes(spec)))
+                        .collect();
+                    for (name, state) in &entry.tool_states {
+                        if roots.iter().any(|root| root == name)
+                            || state.lifecycle != ToolLifecycle::Loaded
+                        {
+                            continue;
+                        }
+                        let idle = tick.saturating_sub(state.last_used_tick);
+                        if idle < self.idle_to_warm_ticks {
+                            continue;
+                        }
+                        if let Some(bytes) = bytes_by_name.get(name.as_str()) {
+                            aging.push((name.clone(), idle, *bytes));
+                        }
+                    }
+                }
+                aging.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                let mut running_total = total;
+                for (name, _, bytes) in aging {
+                    if running_total <= SURFACE_LOW_WATERMARK_BYTES {
+                        break;
+                    }
+                    if set_tool_warm(&mut inner, &name) {
+                        running_total = running_total.saturating_sub(bytes);
+                        changed = true;
+                    }
+                }
+            }
+            // Warm→Unloaded 的闲置卸载保持不变（与 builtin 一致）：Warm
+            // 已不在模型表面，卸载只影响重载成本，不占表面预算。
             for entry in inner.values_mut() {
                 for (name, state) in entry.tool_states.iter_mut() {
                     if roots.iter().any(|root| root == name) {
                         continue;
                     }
                     let idle = tick.saturating_sub(state.last_used_tick);
-                    match state.lifecycle {
-                        ToolLifecycle::Loaded if idle >= self.idle_to_warm_ticks => {
-                            state.lifecycle = ToolLifecycle::Warm;
-                            changed = true;
-                        }
-                        ToolLifecycle::Warm if idle >= self.warm_to_unload_ticks => {
-                            state.lifecycle = ToolLifecycle::Unloaded;
-                            changed = true;
-                        }
-                        _ => {}
+                    if matches!(state.lifecycle, ToolLifecycle::Warm)
+                        && idle >= self.warm_to_unload_ticks
+                    {
+                        state.lifecycle = ToolLifecycle::Unloaded;
+                        changed = true;
                     }
                 }
             }
@@ -718,6 +791,33 @@ impl CapabilityRegistry {
             self.generation.fetch_add(1, Ordering::Relaxed);
             self.catalog_version.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// 本侧当前 Loaded 工具的 schema 字节总量。持锁调用。
+    fn loaded_bytes_locked(inner: &HashMap<String, Entry>) -> usize {
+        inner
+            .values()
+            .flat_map(|entry| {
+                entry.tool_states.iter().filter_map(|(name, state)| {
+                    (state.lifecycle == ToolLifecycle::Loaded).then_some(name.as_str())
+                })
+            })
+            .filter_map(|name| {
+                inner.values().find_map(|entry| {
+                    entry
+                        .tool_specs
+                        .iter()
+                        .find(|spec| spec.name == name)
+                        .map(|spec| spec_schema_bytes(spec))
+                })
+            })
+            .sum()
+    }
+
+    /// 当前 Loaded 工具的 schema 字节总量（统一预算的压力输入之一）。
+    pub fn loaded_surface_bytes(&self) -> usize {
+        let inner = self.inner.read().expect("capability registry poisoned");
+        Self::loaded_bytes_locked(&inner)
     }
 
     /// Snapshot of every registered capability's surface state (activation +
@@ -1217,13 +1317,18 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
     }
 
     fn gc(&self, roots: &[String]) {
-        // One unified safe point: the builtin catalog ages (with its
-        // always-loaded core), and the capability registry ages its loaded
-        // tools with the same thresholds and the same TaskAnchor roots —
-        // external tools receive the same idle-cooling + root semantics as
-        // builtins.
-        self.capabilities.gc(roots);
+        // 统一表面驻留预算（评审第 20 条）：先取 builtin 侧已加载字节
+        // 数作为外部压力输入，能力侧与 builtin 共用同一组水位；外部
+        // 表面优先承担冷却，builtin 核心随后按自身水位评估。
+        let base_bytes = self.base.loaded_surface_bytes();
+        self.capabilities.gc_with_pressure(roots, base_bytes);
         self.base.gc(roots);
+    }
+
+    fn loaded_surface_bytes(&self) -> usize {
+        self.base
+            .loaded_surface_bytes()
+            .saturating_add(self.capabilities.loaded_surface_bytes())
     }
 
     fn catalog(&self) -> Vec<ToolCatalogEntry> {

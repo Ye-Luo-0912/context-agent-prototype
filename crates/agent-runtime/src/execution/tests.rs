@@ -854,3 +854,193 @@ fn foreground_resources_are_exact_mentions_of_known_paths() {
         "Missing paths are not known resources"
     );
 }
+
+// ---- Evidence Frontier / ConvergenceState（评审第 8–12 条）----
+
+fn pathless_command(name: &str, ok: bool, command: &str, summary: &str) -> ToolOutput {
+    ToolOutput {
+        call_id: "c".into(),
+        tool_name: name.into(),
+        ok,
+        summary: summary.into(),
+        model_content: summary.into(),
+        artifact_ref: None,
+        metadata: json!({ "command": command }),
+    }
+}
+
+fn read_output(path: &str, revision: &str) -> ToolOutput {
+    let mut out = output("fs.read", true, "read");
+    out.metadata = json!({ "path": path, "revision": revision });
+    out
+}
+
+fn git_status() -> ToolOutput {
+    let mut out = output("git.status", true, "on branch main, clean");
+    out.metadata = json!({});
+    out
+}
+
+#[test]
+fn git_status_repeat_at_same_revision_is_redundant_evidence() {
+    let mut resume = ExecutionState::default();
+    let first = resume.observe_tool(&git_status(), 1, 1);
+    assert_eq!(first.delta, agent_contracts::FrontierDelta::EvidenceAdvanced);
+    assert_eq!(first.actions_since_frontier_advance, 0);
+    assert_eq!(resume.evidence.len(), 1);
+    assert_eq!(resume.evidence[0].key, "git.status");
+
+    let second = resume.observe_tool(&git_status(), 1, 2);
+    assert_eq!(
+        second.delta,
+        agent_contracts::FrontierDelta::RedundantEvidence
+    );
+    assert_eq!(second.actions_since_frontier_advance, 1);
+    // 重复不新增行，只保留原证据。
+    assert_eq!(resume.evidence.len(), 1);
+}
+
+#[test]
+fn redundant_round_does_not_clear_active_failure_cluster() {
+    let mut resume = ExecutionState::default();
+    // 先建立已知证据，后面的同版本重读才是冗余而非新证据。
+    resume.observe_tool(&git_status(), 1, 1);
+    let miss_a = {
+        let mut out = pathless_command("process.run", false, "protocol_tests.exe", "not found");
+        out.metadata["failure_class"] = json!("command_unavailable");
+        out
+    };
+    resume.observe_tool(&miss_a, 1, 2);
+    assert_eq!(resume.failure_cluster.tried_targets.len(), 1);
+    let miss_b = {
+        let mut out = pathless_command("process.run", false, ".\\protocol_tests.exe", "not found");
+        out.metadata["failure_class"] = json!("command_unavailable");
+        out
+    };
+    resume.observe_tool(&miss_b, 1, 3);
+    assert_eq!(resume.failure_cluster.tried_targets.len(), 2);
+
+    // 冗余观察不清聚类：换拼写的连击不能靠一次重读洗掉。
+    resume.observe_tool(&git_status(), 1, 4);
+    assert_eq!(
+        resume.convergence.actions_since_frontier_advance, 3,
+        "redundant round adds debt without clearing it"
+    );
+    assert_eq!(resume.failure_cluster.tried_targets.len(), 2);
+
+    // 真正的新证据（新文件身份）才清账。
+    let fresh = resume.observe_tool(&read_output("src/other.rs", "r1"), 1, 5);
+    assert_eq!(fresh.delta, agent_contracts::FrontierDelta::EvidenceAdvanced);
+    assert_eq!(fresh.actions_since_frontier_advance, 0);
+    assert!(resume.failure_cluster.tried_targets.is_empty());
+}
+
+#[test]
+fn fs_read_same_digest_is_redundant_and_new_digest_advances() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&read_output("src/auth.rs", "abc123"), 1, 1);
+    let repeat = resume.observe_tool(&read_output("src/auth.rs", "abc123"), 1, 2);
+    assert_eq!(repeat.delta, agent_contracts::FrontierDelta::RedundantEvidence);
+
+    let changed = resume.observe_tool(&read_output("src/auth.rs", "def456"), 1, 3);
+    assert_eq!(changed.delta, agent_contracts::FrontierDelta::EvidenceAdvanced);
+    assert_eq!(resume.evidence.len(), 1);
+}
+
+#[test]
+fn known_edit_advances_world_and_invalidates_revision_bound_evidence() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&git_status(), 1, 1);
+    let edit = {
+        let mut out = output("edit.replace", true, "edited");
+        out.metadata = json!({ "path": "src/auth.rs", "revision": "after1" });
+        out
+    };
+    let observation = resume.observe_tool(&edit, 1, 2);
+    assert_eq!(
+        observation.delta,
+        agent_contracts::FrontierDelta::ObservedWorldChange
+    );
+    assert_eq!(observation.invalidated, 1, "git.status@rev0 expired");
+    assert!(resume.evidence.is_empty());
+    assert_eq!(observation.actions_since_frontier_advance, 0);
+}
+
+#[test]
+fn unknown_footprint_never_claims_progress_but_accumulates_debt() {
+    let mut resume = ExecutionState::default();
+    let first = resume.observe_tool(
+        &pathless_command("process.run", true, "cargo build", "compiled"),
+        1,
+        1,
+    );
+    assert_eq!(
+        first.delta,
+        agent_contracts::FrontierDelta::WorldInvalidatedUnknown,
+        "unknown footprint never claims provable progress"
+    );
+    assert_eq!(first.actions_since_frontier_advance, 1);
+
+    let second = resume.observe_tool(
+        &pathless_command("process.run", true, "cargo build", "compiled"),
+        1,
+        2,
+    );
+    // 每个未知足迹轮都推进世界时钟，重复命令构不成"同版本重复"；
+    // 债务持续累计，advisory 阈值负责软性压制。
+    assert_eq!(
+        second.delta,
+        agent_contracts::FrontierDelta::WorldInvalidatedUnknown
+    );
+    assert_eq!(second.actions_since_frontier_advance, 2);
+}
+
+#[test]
+fn frontier_advisory_fires_after_threshold_and_view_rows_are_typed() {
+    let mut resume = ExecutionState::default();
+    for turn in 1..6 {
+        resume.observe_tool(&git_status(), 1, turn);
+    }
+    assert_eq!(
+        resume.convergence.actions_since_frontier_advance, 4,
+        "first observation advanced; four repeats since"
+    );
+    assert!(resume.frontier_warning().is_none());
+    resume.observe_tool(&git_status(), 1, 6);
+    let warning = resume.frontier_warning().expect("advisory at threshold");
+    assert!(warning.starts_with("EXECUTION FRONTIER UNCHANGED"));
+    assert!(warning.contains("recent deltas"));
+
+    let view = resume.view();
+    assert_eq!(view.operational_evidence.len(), 1);
+    assert!(
+        view.operational_evidence[0].starts_with("git.status: on branch main, clean @ world=0"),
+        "typed row only, got {}",
+        view.operational_evidence[0]
+    );
+    assert_eq!(view.frontier_warning.as_deref(), Some(warning.as_str()));
+}
+
+#[test]
+fn evidence_vec_and_delta_ring_stay_bounded() {
+    let mut resume = ExecutionState::default();
+    for index in 0..24 {
+        resume.observe_tool(&read_output(&format!("src/f{index}.rs"), "r"), 1, index + 1);
+    }
+    assert_eq!(resume.evidence.len(), 16);
+    assert_eq!(resume.convergence.recent_deltas.len(), 8);
+}
+
+#[test]
+fn repeated_identical_verification_pass_is_redundant_not_progress() {
+    let mut resume = ExecutionState::default();
+    let verify = || {
+        let mut out = output("shell.exec", true, "tests passed");
+        out.metadata = json!({ "command": "cargo test", "verification": true });
+        out
+    };
+    let first = resume.observe_tool(&verify(), 1, 1);
+    assert_eq!(first.delta, agent_contracts::FrontierDelta::EvidenceAdvanced);
+    let second = resume.observe_tool(&verify(), 1, 2);
+    assert_eq!(second.delta, agent_contracts::FrontierDelta::RedundantEvidence);
+}

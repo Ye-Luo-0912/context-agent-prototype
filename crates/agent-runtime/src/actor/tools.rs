@@ -152,7 +152,11 @@ impl RuntimeActor {
                 if let Some(turn) = self.state.turn.as_mut() {
                     turn.turn_frame.push_tool_result(output.clone(), None);
                 }
-                self.observe_persistable_tool(&output, ToolResultDisposition::PersistObservation);
+                let frontier = self.observe_persistable_tool(
+                    &output,
+                    ToolResultDisposition::PersistObservation,
+                );
+                self.report_frontier(frontier).await;
             }
             self.spawn_next_model_or_end(op_tx).await;
             return;
@@ -210,19 +214,20 @@ impl RuntimeActor {
                         .map(str::to_owned)
                 })
                 .unwrap_or_default();
-            let output =
-                duplicate_no_progress_output(&call.id, &call.name, &target, attempt.failure_class);
-            let _ = self
-                .core
-                .emit_event(RuntimeEvent::ToolFinished {
-                    output: output.clone(),
-                })
+            self.refuse_duplicate_call(&call, &target, attempt.failure_class, op_tx)
                 .await;
-            if let Some(turn) = self.state.turn.as_mut() {
-                turn.turn_frame.push_tool_result(output.clone(), None);
-            }
-            self.observe_persistable_tool(&output, ToolResultDisposition::PersistObservation);
-            self.spawn_next_model_or_end(op_tx).await;
+            return;
+        }
+        // CONV-02：可证等价的启动失败重试（同参数 + 世界版本未推进）
+        // 同样无派发拒绝；超时/退出码等非确定失败永不走这里。
+        let duplicate_launch = self
+            .state
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.duplicate_launch_failure(&call));
+        if let Some(attempt) = duplicate_launch {
+            self.refuse_duplicate_call(&call, &attempt.argv0, attempt.failure_class, op_tx)
+                .await;
             return;
         }
         let Some(turn) = self.state.turn.as_mut() else {
@@ -913,18 +918,25 @@ impl RuntimeActor {
                         turn.pending_scope_closes.push_back(scope_id);
                     }
                 }
-                self.observe_persistable_tool(&output, completion.disposition);
+                let frontier = self.observe_persistable_tool(&output, completion.disposition);
                 // MOD-PROG-01: remember deterministic edit refusals so an
                 // identical retry can be refused without dispatch.
                 if let Some(digest) = completion.argument_digest
                     && let Some(turn) = self.state.turn.as_mut()
                 {
                     turn.record_edit_attempt(&output, &digest);
+                    // CONV-02：程序解析失败同样入账（可证等价域才收）。
+                    turn.record_launch_failure(&output, &digest);
+                }
+                // PROTO-EVID-01：正文入当轮缓存（含失效规则）。
+                if let Some(turn) = self.state.turn.as_mut() {
+                    turn.record_protocol_body(&output);
                 }
                 let _ = self
                     .core
                     .emit_event(RuntimeEvent::ToolFinished { output })
                     .await;
+                self.report_frontier(frontier).await;
                 if completion.value_completion_pending
                     && let Some(argument_digest) = completion.argument_digest
                     && let Err(error) = self.core.finish_value_operation(
@@ -1015,26 +1027,71 @@ impl RuntimeActor {
         &mut self,
         output: &ToolOutput,
         disposition: ToolResultDisposition,
-    ) {
+    ) -> Option<crate::execution::FrontierObservation> {
         if disposition != ToolResultDisposition::PersistObservation {
-            return;
+            return None;
         }
         let Some(task_id) = self.state.task_id else {
-            return;
+            return None;
         };
         let Some(task) = self.state.tasks.get(task_id) else {
-            return;
+            return None;
         };
         if task.status == crate::task::TaskStatus::Completed {
-            return;
+            return None;
         }
         let anchor_revision = task.anchor.revision;
         let Some(turn) = self.state.turn.as_mut() else {
-            return;
+            return None;
         };
         let turn_number = turn.model_round as u64;
-        turn.execution
-            .observe_tool(output, anchor_revision, turn_number);
+        let observation =
+            turn.execution
+                .observe_tool(output, anchor_revision, turn_number);
+        Some(observation)
+    }
+
+    /// 把一轮前沿分类作为 `ExecutionFrontier` 事件上报。事件是有界
+    /// 计数，不含任何工具正文；收敛指标从这里聚合。
+    async fn report_frontier(&mut self, observation: Option<crate::execution::FrontierObservation>) {
+        let Some(observation) = observation else {
+            return;
+        };
+        let _ = self
+            .core
+            .emit_event(RuntimeEvent::ExecutionFrontier {
+                delta: observation.delta,
+                actions_since_frontier_advance: observation.actions_since_frontier_advance,
+                evidence_revision: observation.evidence_revision,
+                invalidated: observation.invalidated,
+            })
+            .await;
+    }
+
+    /// 无派发拒绝一次可证等价的重试：类型化 ToolFinished 入账、推进
+    /// turn frame、观察与前沿上报，然后结束本轮。
+    async fn refuse_duplicate_call(
+        &mut self,
+        call: &ToolCall,
+        target: &str,
+        failure_class: agent_contracts::ToolFailureClass,
+        op_tx: &tokio::sync::mpsc::Sender<OperationCompletion>,
+    ) {
+        let output =
+            duplicate_no_progress_output(&call.id, &call.name, target, failure_class);
+        let _ = self
+            .core
+            .emit_event(RuntimeEvent::ToolFinished {
+                output: output.clone(),
+            })
+            .await;
+        if let Some(turn) = self.state.turn.as_mut() {
+            turn.turn_frame.push_tool_result(output.clone(), None);
+        }
+        let frontier =
+            self.observe_persistable_tool(&output, ToolResultDisposition::PersistObservation);
+        self.report_frontier(frontier).await;
+        self.spawn_next_model_or_end(op_tx).await;
     }
 
     /// Poison the normal-mutation lane after an effect result proves that

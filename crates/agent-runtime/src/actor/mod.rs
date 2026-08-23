@@ -212,6 +212,12 @@ struct ActiveTurn {
     /// identities is refused without dispatch. Turn-scoped on purpose:
     /// a new user directive may legitimately ask for the same edit.
     edit_attempts: Vec<EditAttemptFact>,
+    /// CONV-02：本轮的程序解析失败记录（可证等价重试域）。同轮内
+    /// 同参数重试在版本未推进时被无派发拒绝。
+    launch_failures: Vec<LaunchResolutionFact>,
+    /// PROTO-EVID-01：本轮协议正文缓存。只在组装下一轮请求时按严格
+    /// 条件回注；不进 Context、不被 admit、不落盘。
+    protocol_bodies: crate::execution::body_cache::ProtocolBodyCache,
     /// Captured once per BeforeModel after revalidate. Prompt, ContextHints,
     /// and tool-surface policy all read this — not per-consumer clones.
     round_snapshot: Option<RoundExecutionSnapshot>,
@@ -254,6 +260,20 @@ struct EditAttemptFact {
     tool_name: String,
     argument_digest: String,
     targets: Vec<String>,
+    failure_class: agent_contracts::ToolFailureClass,
+}
+
+/// CONV-02：一次程序解析失败的可证等价记录。参数摘要覆盖 argv0/cwd/env
+/// 覆盖项；世界版本未推进 ⇒ 解析输入未变 ⇒ 同参数重试可证等价，可
+/// 硬拒绝。残余假设：运行外环境（如 PATH）变化不在观察模型内，由
+/// 收敛债务软性兜底；不做按名字的 K-strikes 硬封禁——listing 有界、
+/// PATH/扩展名/后续构建都可能改变结论。
+#[derive(Debug, Clone)]
+struct LaunchResolutionFact {
+    tool_name: String,
+    argument_digest: String,
+    argv0: String,
+    workspace_revision: u64,
     failure_class: agent_contracts::ToolFailureClass,
 }
 
@@ -340,6 +360,116 @@ impl ActiveTurn {
         let excess = self.edit_attempts.len().saturating_sub(MAX_EDIT_ATTEMPTS);
         self.edit_attempts.drain(0..excess);
     }
+
+    /// Whether `call` repeats a provably-equivalent launch failure: same
+    /// tool, same argument digest (covers argv0/cwd/env overrides), and
+    /// no world-revision advance since the failure. Such a retry resolves
+    /// the same program and fails the same way; the runtime refuses it
+    /// without dispatch.
+    fn duplicate_launch_failure(&self, call: &ToolCall) -> Option<LaunchResolutionFact> {
+        if !matches!(call.name.as_str(), "process.run" | "shell.exec") {
+            return None;
+        }
+        let digest = ArgumentDigest::from_json(&call.arguments).to_string();
+        self.launch_failures
+            .iter()
+            .find(|fact| {
+                fact.tool_name == call.name
+                    && fact.argument_digest == digest
+                    && fact.workspace_revision == self.execution.workspace_revision
+            })
+            .cloned()
+    }
+
+    /// Record (or clear) the launch-failure domain for one completed
+    /// process/shell call. A success consumes the attempt: the world or
+    /// environment moved enough for the same arguments to resolve now.
+    fn record_launch_failure(&mut self, output: &ToolOutput, digest: &ArgumentDigest) {
+        if !matches!(output.tool_name.as_str(), "process.run" | "shell.exec") {
+            return;
+        }
+        let digest = digest.to_string();
+        if output.ok {
+            self.launch_failures.retain(|fact| {
+                !(fact.tool_name == output.tool_name && fact.argument_digest == digest)
+            });
+            return;
+        }
+        // 只有可证等价域（程序解析）入账；超时/退出码等非确定失败
+        // 永不硬拒绝，只走收敛债务。
+        if output.failure_domain() != agent_contracts::ToolFailureDomain::ExecutableResolution {
+            return;
+        }
+        let Some(argv0) = output
+            .metadata
+            .get("argv0")
+            .and_then(|value| value.as_str())
+            .filter(|argv0| !argv0.is_empty())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let Some(class) = output.failure_class() else {
+            return;
+        };
+        self.launch_failures.retain(|fact| {
+            !(fact.tool_name == output.tool_name && fact.argument_digest == digest)
+        });
+        self.launch_failures.push(LaunchResolutionFact {
+            tool_name: output.tool_name.clone(),
+            argument_digest: digest,
+            argv0,
+            workspace_revision: self.execution.workspace_revision,
+            failure_class: class,
+        });
+        let excess = self
+            .launch_failures
+            .len()
+            .saturating_sub(MAX_EDIT_ATTEMPTS);
+        self.launch_failures.drain(0..excess);
+    }
+
+    /// PROTO-EVID-01：把成功观察到的正文记入当轮缓存。fs.read 是直接
+    /// 来源；edit echo 覆盖同 path 的旧正文。失效规则：Known mutation
+    /// 使被触 path 失效（除非本输出就是它的新 echo），Unknown mutation
+    /// 全部作废。
+    fn record_protocol_body(&mut self, output: &ToolOutput) {
+        if !output.ok {
+            return;
+        }
+        let touches = output.resource_touches();
+        let is_echo_tool =
+            matches!(output.tool_name.as_str(), "fs.read" | "edit.replace" | "edit.patch");
+        match output.mutation_footprint() {
+            agent_contracts::MutationFootprint::Unknown => {
+                self.protocol_bodies.invalidate_all();
+            }
+            agent_contracts::MutationFootprint::Known(mutated) => {
+                for touch in mutated {
+                    // 本输出若正是该 path 的新 echo，record 会覆盖，无需先删。
+                    let echoed_by_this = is_echo_tool
+                        && touches
+                            .first()
+                            .is_some_and(|first| first.path == touch.path);
+                    if !echoed_by_this {
+                        self.protocol_bodies.invalidate_path(&touch.path);
+                    }
+                }
+            }
+            agent_contracts::MutationFootprint::None => {}
+        }
+        if !is_echo_tool {
+            return;
+        }
+        let Some(touch) = touches.first() else {
+            return;
+        };
+        let Some(digest) = touch.revision.clone().filter(|digest| !digest.is_empty()) else {
+            return;
+        };
+        self.protocol_bodies
+            .record(&touch.path, &digest, &output.model_content);
+    }
 }
 
 #[cfg(test)]
@@ -358,6 +488,8 @@ mod edit_attempt_tests {
             op: None,
             execution: ExecutionState::default(),
             edit_attempts: Vec::new(),
+            launch_failures: Vec::new(),
+            protocol_bodies: crate::execution::body_cache::ProtocolBodyCache::default(),
             round_snapshot: None,
             pending_completion: None,
             applied_input: None,
@@ -484,6 +616,90 @@ mod edit_attempt_tests {
             .remove("revision");
         turn.record_edit_attempt(&no_revision, &digest);
         assert!(turn.edit_attempts.is_empty());
+    }
+
+    // ---- CONV-02：程序解析重试域（可证等价才硬拒绝）----
+
+    fn launch_failure(argv0: &str, class: ToolFailureClass) -> ToolOutput {
+        ToolOutput {
+            call_id: "c".into(),
+            tool_name: "process.run".into(),
+            ok: false,
+            summary: format!("program `{argv0}` was not found"),
+            model_content: String::new(),
+            artifact_ref: None,
+            metadata: serde_json::json!({
+                "argv": [argv0],
+                "cwd": ".",
+                "argv0": argv0,
+                "failure_class": class.as_str(),
+            }),
+        }
+    }
+
+    fn launch_call(arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "c2".into(),
+            name: "process.run".into(),
+            arguments,
+        }
+    }
+
+    #[test]
+    fn identical_launch_retry_at_unchanged_revision_is_provably_equivalent() {
+        let args = serde_json::json!({"argv": ["protocol_tests.exe"], "cwd": "."});
+        let call = launch_call(args.clone());
+        let mut turn = turn_with_fact("src/a.rs", "rev1", ResourceFreshness::Fresh);
+        assert!(turn.duplicate_launch_failure(&call).is_none());
+
+        turn.record_launch_failure(
+            &launch_failure("protocol_tests.exe", ToolFailureClass::PathNotFound),
+            &ArgumentDigest::from_json(&args),
+        );
+        assert!(
+            turn.duplicate_launch_failure(&call).is_some(),
+            "same argv/cwd + unchanged world revision is a provable retry"
+        );
+
+        // 世界推进（例如刚完成一次构建）：结论可能改变，必须放行。
+        turn.execution.workspace_revision += 1;
+        assert!(turn.duplicate_launch_failure(&call).is_none());
+    }
+
+    #[test]
+    fn launch_success_consumes_the_resolution_fact() {
+        let args = serde_json::json!({"argv": ["app.exe"], "cwd": "."});
+        let digest = ArgumentDigest::from_json(&args);
+        let mut turn = turn_with_fact("src/a.rs", "rev1", ResourceFreshness::Fresh);
+        turn.record_launch_failure(
+            &launch_failure("app.exe", ToolFailureClass::PathNotFound),
+            &digest,
+        );
+        assert!(turn.duplicate_launch_failure(&launch_call(args.clone())).is_some());
+
+        let mut success = launch_failure("app.exe", ToolFailureClass::PathNotFound);
+        success.ok = true;
+        success.metadata["exit_code"] = serde_json::json!(0);
+        turn.record_launch_failure(&success, &digest);
+        assert!(turn.duplicate_launch_failure(&launch_call(args)).is_none());
+    }
+
+    #[test]
+    fn non_deterministic_and_non_process_failures_stay_out_of_the_launch_ledger() {
+        let mut turn = turn_with_fact("src/a.rs", "rev1", ResourceFreshness::Fresh);
+        // 退出码失败属于非确定域：重试结果不可证，永不硬拒绝。
+        turn.record_launch_failure(
+            &launch_failure("cargo", ToolFailureClass::ProcessExit),
+            &ArgumentDigest::from_json(&serde_json::json!({"argv": ["cargo"]})),
+        );
+        // 文件工具的 PathNotFound 是资源路径域，不是程序解析。
+        let mut fs_miss = launch_failure("missing.txt", ToolFailureClass::PathNotFound);
+        fs_miss.tool_name = "fs.read".into();
+        turn.record_launch_failure(
+            &fs_miss,
+            &ArgumentDigest::from_json(&serde_json::json!({"path": "missing.txt"})),
+        );
+        assert!(turn.launch_failures.is_empty());
     }
 }
 

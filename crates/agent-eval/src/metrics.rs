@@ -10,7 +10,7 @@
 
 use agent_contracts::{
     CAPABILITY_MANAGE, CONTEXT_MANAGE, ContextItemId, FS_READ_MOTIVE_KEY, FsReadMotive,
-    RuntimeEvent, RuntimeEventEnvelope,
+    FrontierDelta, RuntimeEvent, RuntimeEventEnvelope,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -63,6 +63,14 @@ pub struct RunMetrics {
     /// Repeated `fs.read` of the same workspace path (the second and later
     /// reads of one path — a proxy for search/re-read inefficiency).
     pub repeated_fs_reads: u64,
+    /// 可证明的前沿推进轮数（world/evidence/obligation 三种 delta）。
+    pub frontier_advances: u64,
+    /// 同版本重复已知证据的调用数。
+    pub redundant_evidence_calls: u64,
+    /// 无前沿推进动作的连击峰值（advisory 阈值为 5）。
+    pub frontier_no_advance_peak: u64,
+    /// 因 world revision 推进而失效的前沿证据条数。
+    pub evidence_invalidations: u64,
     /// Engine-classified `fs.read` attribution (last diagnostics snapshot).
     pub reread_previously_selected: u64,
     pub reread_selected_descriptor: u64,
@@ -492,6 +500,25 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                         RecoverPath::Search,
                     );
                 }
+            }
+            RuntimeEvent::ExecutionFrontier {
+                delta,
+                actions_since_frontier_advance,
+                invalidated,
+                ..
+            } => {
+                // 收敛指标（评审第 30 条）：可证明推进数、冗余证据调用、
+                // 无推进连击峰值与证据失效数，全部来自事件流。
+                if delta.advances_frontier() {
+                    metrics.frontier_advances += 1;
+                }
+                if *delta == FrontierDelta::RedundantEvidence {
+                    metrics.redundant_evidence_calls += 1;
+                }
+                metrics.frontier_no_advance_peak = metrics
+                    .frontier_no_advance_peak
+                    .max(u64::from(*actions_since_frontier_advance));
+                metrics.evidence_invalidations += *invalidated;
             }
             RuntimeEvent::ContextMaintained { report, .. } => {
                 metrics.lifecycle_transitions += report.transitions.len() as u64;

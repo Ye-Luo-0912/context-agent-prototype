@@ -2,9 +2,12 @@
 //! 的插件绑定经准入安装——清单请求本身永远不等于授权。同一实例必须
 //! 同时交给内核配置与审批门，两边才不会漂移。
 
-use std::sync::Arc;
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 
-use agent_contracts::{HostToolPolicies, HostToolPolicy};
+use agent_contracts::{HostPolicySnapshot, HostToolPolicies, HostToolPolicy};
 
 pub struct HostToolPolicyRegistry {
     /// 构造时装好的内置项。准入不得遮蔽它们：`fs.write` 的授权属于
@@ -12,6 +15,11 @@ pub struct HostToolPolicyRegistry {
     builtins: Vec<HostToolPolicy>,
     /// 运维准入的插件绑定。
     admitted: Vec<HostToolPolicy>,
+    /// 版本化快照缓存（M12 P0）：`admit` 后失效，下一次
+    /// [`Self::resolve_policy`] 以递增 revision 重建。消费方持有
+    /// Arc 并绑定 revision；revision 变化即策略已换版。
+    snapshot: RwLock<Option<Arc<HostPolicySnapshot>>>,
+    revision: AtomicU64,
 }
 
 impl HostToolPolicyRegistry {
@@ -21,11 +29,13 @@ impl HostToolPolicyRegistry {
         Self {
             builtins: tool_runtime::BUILTIN_TOOL_POLICIES.clone(),
             admitted: Vec::new(),
+            snapshot: RwLock::new(None),
+            revision: AtomicU64::new(1),
         }
     }
 
     /// 安装一条运维审核过的插件绑定。撞内置名或重复准入一律失败：
-    /// 内置工具的授权不重新下放。
+    /// 内置工具的授权不重新下放。成功后使快照失效。
     pub fn admit(&mut self, policy: HostToolPolicy) -> Result<(), String> {
         if self.builtins.iter().any(|p| p.tool_name == policy.tool_name) {
             return Err(format!(
@@ -40,7 +50,38 @@ impl HostToolPolicyRegistry {
             ));
         }
         self.admitted.push(policy);
+        *self
+            .snapshot
+            .write()
+            .expect("host policy snapshot poisoned") = None;
         Ok(())
+    }
+
+    /// 解析当前策略为版本化不可变快照：同一 revision 下重复调用返回
+    /// 同一 Arc（零拷贝），`admit` 之后 revision 前进并重建。
+    pub fn resolve_policy(&self) -> Arc<HostPolicySnapshot> {
+        if let Some(snapshot) = self
+            .snapshot
+            .read()
+            .expect("host policy snapshot poisoned")
+            .clone()
+        {
+            return snapshot;
+        }
+        let mut guard = self
+            .snapshot
+            .write()
+            .expect("host policy snapshot poisoned");
+        // 双检：并发重建只发生一次，revision 只被真正的新表消费。
+        if let Some(snapshot) = guard.clone() {
+            return snapshot;
+        }
+        let revision = self.revision.fetch_add(1, Ordering::Relaxed);
+        let mut entries = self.builtins.clone();
+        entries.extend(self.admitted.iter().cloned());
+        let snapshot = Arc::new(HostPolicySnapshot::resolve(entries, revision));
+        *guard = Some(snapshot.clone());
+        snapshot
     }
 
     /// 共享句柄：内核配置、审批门与分发器从同一来源接线。
@@ -91,6 +132,26 @@ mod tests {
             !matches!(registry.policy_for("fs.write").unwrap().binding, HostEffectBinding::ReadOnly),
             "a failed admission must leave the builtin binding in place"
         );
+    }
+
+    /// M12 P0：resolve_policy 返回版本化不可变快照；同一 revision 下
+    /// 重复解析是同一 Arc，admission 换版后 revision 前进、digest 变化。
+    #[test]
+    fn resolve_policy_returns_versioned_snapshots() {
+        let mut registry = HostToolPolicyRegistry::with_builtins();
+        let before = registry.resolve_policy();
+        assert!(std::sync::Arc::ptr_eq(&before, &registry.resolve_policy()));
+        assert_eq!(before.revision(), 1);
+        assert!(!before.is_empty());
+
+        registry.admit(write_binding()).unwrap();
+        let after = registry.resolve_policy();
+        assert_ne!(after.revision(), before.revision(), "admission bumps revision");
+        assert_ne!(after.digest(), before.digest(), "admission changes content digest");
+        assert_eq!(after.len(), before.len() + 1);
+        // 旧消费方持有的快照仍可独立工作（Arc 隔离）。
+        assert!(before.policy_for("plugin.notes.write").is_none());
+        assert!(after.policy_for("plugin.notes.write").is_some());
     }
 
     #[test]

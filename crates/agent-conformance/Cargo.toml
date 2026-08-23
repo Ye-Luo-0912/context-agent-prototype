@@ -20,3 +20,4 @@ agent-platform-protocol.workspace = true
 agent-context-service = { path = "../agent-context-service" }
 context-baselines.workspace = true
 context-contextcore.workspace = true
+agent-runtime.workspace = true

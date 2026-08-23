@@ -715,6 +715,24 @@ impl ToolOutput {
             crate::MutationFootprint::Known(touches)
         }
     }
+
+    /// 失败域 = 类别 × 工具。process/shell 的 `PathNotFound` 是"程序没
+    /// 找到"（ExecutableResolution），文件工具的同名类别是路径身份问题
+    /// （ResourcePath）；其余按 [`ToolFailureClass::failure_domain`]。
+    pub fn failure_domain(&self) -> ToolFailureDomain {
+        let Some(class) = self.failure_class() else {
+            return ToolFailureDomain::NonDeterministic;
+        };
+        if matches!(class, ToolFailureClass::PathNotFound)
+            && matches!(
+                self.tool_name.as_str(),
+                "process.run" | "shell.exec" | "process.session"
+            )
+        {
+            return ToolFailureDomain::ExecutableResolution;
+        }
+        class.failure_domain()
+    }
 }
 
 /// Metadata key for [`ToolFailureClass`]. Producers must not set `retryable`.
@@ -865,6 +883,47 @@ impl ToolFailureClass {
                 | Self::DuplicateNoProgress
         )
     }
+
+    /// FailureDomain：这条失败依赖哪组前置条件。与 [`ToolFailureClass`]
+    /// （"错在哪"）正交——域回答"重试等价性取决于什么"。只有确定性域
+    /// 才可能构成可证明等价的重试域；非确定域的重试天然可能产生不同
+    /// 结果，只能软性压制，永不硬拒绝。
+    pub const fn failure_domain(self) -> ToolFailureDomain {
+        match self {
+            Self::ShellDialectMismatch | Self::CommandUnavailable => {
+                ToolFailureDomain::ExecutableResolution
+            }
+            Self::MissingProjectMarker => ToolFailureDomain::ProjectMarker,
+            Self::StaleRevision
+            | Self::NoExactMatch
+            | Self::AmbiguousMatch
+            | Self::NoSearchMatch
+            | Self::HiddenPath
+            | Self::PathNotFound => ToolFailureDomain::ResourcePath,
+            Self::ProcessExit
+            | Self::VerificationFailure
+            | Self::Timeout
+            | Self::Cancellation
+            | Self::DuplicateNoProgress
+            | Self::InvalidRequest
+            | Self::Io => ToolFailureDomain::NonDeterministic,
+        }
+    }
+}
+
+/// 失败域枚举，见 [`ToolFailureClass::failure_domain`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolFailureDomain {
+    /// 程序解析：argv0 × cwd × 环境。同参数 + 世界版本未推进时重试
+    /// 可证等价（进程/外壳工具的 program-not-found 属于这里）。
+    ExecutableResolution,
+    /// 资源路径身份：path@digest / 锚点匹配 / 搜索命中。
+    ResourcePath,
+    /// 项目标记缺失：manifest 级前置条件，模型不得自行补造。
+    ProjectMarker,
+    /// 时间、调度或退出码相关：不可证等价。
+    NonDeterministic,
 }
 
 /// Insert `failure_class` and strip any producer-supplied `retryable` flag.
@@ -2067,6 +2126,13 @@ pub trait ToolDispatcher: Send + Sync {
     /// may still be unloaded explicitly; roots only protect against the
     /// silent idle path. The default ignores roots.
     fn gc(&self, _roots: &[String]) {}
+
+    /// 当前已加载 schema 的字节总量（表面压力度量）。默认 0：无生命
+    /// 周期状态的 dispatcher 无压力。统一表面驻留规划用它把 builtin
+    /// 与 capability 两侧放进同一个压力预算。
+    fn loaded_surface_bytes(&self) -> usize {
+        0
+    }
 
     /// Unified discovery surface: every known tool (builtin and dynamic
     /// capability) with its lifecycle state and owner, for

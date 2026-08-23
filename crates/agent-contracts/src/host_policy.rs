@@ -49,7 +49,6 @@ pub enum HostEffectBinding {
 /// 唯一路径——这里没有的策略退回声明风险的空界限，绝不变成授权。
 pub trait HostToolPolicies: Send + Sync {
     fn policy_for(&self, tool_name: &str) -> Option<&HostToolPolicy>;
-
     /// 在本映射下推导一次调用的具体效果意图。所有消费方（审批门、
     /// 租约铸造、提交检查）共用这一份推导，不会漂移。
     fn effect_intent(&self, call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
@@ -69,6 +68,70 @@ pub trait HostToolPolicies: Send + Sync {
         }
     }
 }
+
+/// 版本化策略快照（M12 P0）：一次解析拿到的不可变表项集合 + 单调
+/// revision + 内容摘要。消费方持有 [`std::sync::Arc`] 并绑定 revision；
+/// 注册表安装新准入后 revision 前进，旧租约/旧准入凭据可据此检测失配。
+/// digest 是 FNV-1a 完整性标记（排序后的 JCS 规范字节），不是安全哈希。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPolicySnapshot {
+    entries: Vec<HostToolPolicy>,
+    revision: u64,
+    digest: String,
+}
+
+impl HostPolicySnapshot {
+    /// 由（按工具名排序去重前的）表项构建一个快照。`revision` 由调用
+    /// 方（注册表）单调分配。
+    pub fn resolve(mut entries: Vec<HostToolPolicy>, revision: u64) -> Self {
+        entries.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
+        let canonical = crate::jcs::serialize(
+            &serde_json::to_value(&entries).unwrap_or(Value::Array(Vec::new())),
+        )
+        .unwrap_or_default();
+        let digest = format!("fnv1a-{:016x}", fnv1a_64(canonical.as_bytes()));
+        Self {
+            entries,
+            revision,
+            digest,
+        }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// 表项数（审计/日志用，有界）。
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl HostToolPolicies for HostPolicySnapshot {
+    fn policy_for(&self, tool_name: &str) -> Option<&HostToolPolicy> {
+        self.entries
+            .iter()
+            .find(|policy| policy.tool_name == tool_name)
+    }
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 
 impl HostToolPolicy {
     pub fn intent_from(&self, arguments: &Value) -> EffectIntent {

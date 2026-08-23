@@ -45,6 +45,7 @@ dependencies = [
  "agent-contracts",
  "agent-platform-protocol",
  "agent-process",
+ "agent-runtime",
  "agent-workspace",
  "context-baselines",
  "context-contextcore",
@@ -150,6 +151,7 @@ name = "agent-replay"
 version = "0.1.0"
 dependencies = [
  "agent-contracts",
+ "agent-runtime",
  "agent-workspace",
  "anyhow",
  "context-baselines",

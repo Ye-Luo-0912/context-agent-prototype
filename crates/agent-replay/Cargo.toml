@@ -8,6 +8,7 @@ description = "Deterministic replay of a context-engine lifecycle from a JSONL e
 [dependencies]
 agent-contracts.workspace = true
 agent-workspace.workspace = true
+agent-runtime.workspace = true
 context-simple.workspace = true
 context-baselines.workspace = true
 anyhow.workspace = true

@@ -492,6 +492,10 @@ impl AppState {
                 self.push_system(format!("tool scope {scope_id} closed"));
                 self.record_transitions(transitions);
             }
+            RuntimeEvent::ExecutionFrontier { .. } => {
+                // 收敛账目不进消息面板：advisory 已由 TASK PROGRESS 渲染，
+                // 这里只是保持 match 穷尽。
+            }
             RuntimeEvent::Diagnostics { diagnostics } => {
                 self.context = diagnostics.clone();
                 self.push_system(format!(

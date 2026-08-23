@@ -18,6 +18,7 @@
 //! measure input-token cost, over-budget turns and context churn.
 
 mod facts;
+mod frontier;
 mod recovery;
 mod scenarios;
 
@@ -38,6 +39,7 @@ use context_simple::{SimpleContextConfig, SimpleContextEngine};
 pub use facts::{
     FactCoverage, FactOutcome, KeyFact, compare_facts, render_fact_comparison, scenario_key_facts,
 };
+pub use frontier::{FrontierRebuild, rebuild_frontier};
 pub use recovery::{
     RecoveryBarrier, RecoveryFailure, RecoveryReport, ReplayEngineKind, RestoreConsistencyReport,
     analyze_barrier, first_seq_gap, rebuild_engine_state, recovery_replay, recovery_replay_file,

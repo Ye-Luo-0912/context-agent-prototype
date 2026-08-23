@@ -258,6 +258,17 @@ impl BuiltinToolDispatcher {
         self.tick.load(Ordering::Relaxed)
     }
 
+    /// 当前 Loaded 状态条目的 schema 字节总量。统一表面驻留规划把它
+    /// 与 capability 侧的字节数放进同一个压力预算。
+    pub fn loaded_surface_bytes(&self) -> usize {
+        let catalog = self.catalog.read().expect("tool catalog poisoned");
+        catalog
+            .values()
+            .filter(|entry| entry.state == ToolLifecycle::Loaded)
+            .map(|entry| entry.schema_bytes)
+            .sum()
+    }
+
     /// Age transitions at an explicit runtime safe point: idle tools cool
     /// Loaded -> Warm and then Warm -> Unloaded, so the model surface
     /// tracks recent use. Core tools (`always_loaded`) never age out, and
@@ -287,8 +298,7 @@ impl BuiltinToolDispatcher {
             loaded_bytes(&catalog)
         } else {
             usize::MAX
-        };
-        let over_pressure = pressure > self.config.surface_soft_high_bytes;
+        };        let over_pressure = pressure > self.config.surface_soft_high_bytes;
         if over_pressure {
             let mut aging: Vec<(&String, &mut ToolEntry, usize)> = catalog
                 .iter_mut()
@@ -418,6 +428,10 @@ impl ToolDispatcher for BuiltinToolDispatcher {
         // model round; delegates to the inherent method so callers on the
         // concrete type and through the trait observe the same aging.
         Self::gc(self, roots);
+    }
+
+    fn loaded_surface_bytes(&self) -> usize {
+        Self::loaded_surface_bytes(self)
     }
 
     fn snapshot(&self) -> ToolSurfaceSnapshot {

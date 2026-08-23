@@ -28,6 +28,16 @@ and sandbox contracts live elsewhere. Experiment facts live in
   the same pass exposed structural convergence gaps (executable-guessing
   loop burned ~20 rounds; successful observations vanish with transcript
   eviction). Track via CONV-01/CONV-02/PROTO-EVID-01 in AUDIT_TODO.
+  All 22 checklist items landed 2026-08-23 (same doc, all checked):
+  Evidence Frontier + FrontierDelta + `ExecutionFrontier` events and
+  eval metrics; RetryDomain (`ExecutableResolution`, no K-strikes);
+  per-turn protocol body cache with checkpoint-gated rehydration;
+  versioned `HostPolicySnapshot`; unified surface pressure budget for
+  builtin+capability; replay frontier rebuild + conformance serde
+  contracts; ROADMAP V1-candidate gate. Verification:
+  `agent-eval --convergence-bench` three deterministic scenarios PASS on
+  the real runtime + real tool surface. Live A/C longflow rerun to
+  measure round impact is the next evidence step, not a gate.
 - M12 first cut: structured `EffectIntent` + trusted `HostToolPolicy`,
   multi-file `WorkspaceWriteSet` bounds, and commit-time
   Actual ⊆ Approved (`MOD-AUTH-01`/`02`).

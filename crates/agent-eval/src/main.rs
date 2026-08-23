@@ -8,10 +8,13 @@
 //! question only answerable from what the context frame retained. The
 //! endpoint does accept function calling; dotted Core ids are mapped by
 //! `provider-openai`. Coding live runs use `--fixture-live`.
+// metrics/bundle 的大 json! 字面量需要更深的宏展开。
+#![recursion_limit = "256"]
 
 mod acceptance;
 mod analysis;
 mod bundle;
+mod convergence_bench;
 mod context_bench;
 mod context_mech;
 mod driver;
@@ -512,6 +515,21 @@ async fn main() -> anyhow::Result<()> {
                 let only = args.next().filter(|value| !value.starts_with('-'));
                 let repeats = if repeats_set { repeats } else { 1 };
                 run_longflow_live(only, repeats, evidence_dir, allow_dirty).await?;
+                return Ok(());
+            }
+            "--convergence-bench" => {
+                let reports = convergence_bench::run_convergence_bench().await?;
+                for report in &reports {
+                    println!(
+                        "{:22} {} {}",
+                        report.scenario,
+                        if report.passed { "PASS" } else { "FAIL" },
+                        report.detail
+                    );
+                }
+                if !reports.iter().all(|report| report.passed) {
+                    anyhow::bail!("convergence bench failed");
+                }
                 return Ok(());
             }
             "--all" => engines = vec!["append", "rolling", "dynamic"],

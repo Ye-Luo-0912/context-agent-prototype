@@ -20,6 +20,22 @@ struct BlockingBase {
 /// capability tools.
 struct EmptyBase;
 
+/// 统一预算测试用 base：自身表面字节推过共享高水位。
+struct HeavyBase;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for HeavyBase {
+    fn specs(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        Err(AgentError::Tool("heavy base".into()))
+    }
+    fn loaded_surface_bytes(&self) -> usize {
+        super::SURFACE_SOFT_HIGH_BYTES + 1
+    }
+}
+
 #[async_trait::async_trait]
 impl ToolDispatcher for EmptyBase {
     fn specs(&self) -> Vec<ToolSpec> {
@@ -82,9 +98,10 @@ fn unified_gc_cools_capability_tools_with_builtin_root_semantics() {
     registry.load_tool("demo.two").expect("load two");
 
     // The merged dispatcher's gc is the one safe point the runtime
-    // calls per round: it must age the capability registry exactly like
-    // the builtin catalog, with the same TaskAnchor roots.
-    let dispatcher = CapabilityAwareDispatcher::new(Arc::new(EmptyBase), registry.clone());
+    // calls per round: under a heavy base surface the combined budget is
+    // over pressure, so unrooted capability tools cool exactly like
+    // builtins while TaskAnchor roots survive.
+    let dispatcher = CapabilityAwareDispatcher::new(Arc::new(HeavyBase), registry.clone());
     let roots = vec!["demo.one".to_string()];
     for _ in 0..4 {
         dispatcher.gc(&roots);
@@ -480,7 +497,7 @@ fn unloading_one_capability_tool_keeps_siblings_loaded() {
 }
 
 #[test]
-fn capability_tools_cool_and_unload_with_task_root_protection() {
+fn capability_tools_cool_under_the_unified_surface_budget_with_root_protection() {
     let registry = CapabilityRegistry::with_idle_thresholds(2, 4);
     registry
         .register(Arc::new(demo_capability("demo")))
@@ -490,21 +507,29 @@ fn capability_tools_cool_and_unload_with_task_root_protection() {
     assert_eq!(registry.tool_state("demo.one"), Some(ToolLifecycle::Loaded));
     assert_eq!(registry.tool_state("demo.two"), Some(ToolLifecycle::Loaded));
 
-    // The active task roots demo.one: idle GC must not cool it, while
-    // the unrooted demo.two ages Loaded -> Warm -> Unloaded exactly
-    // like a builtin tool.
     let roots = vec!["demo.one".to_string()];
-    registry.gc(&roots);
-    registry.gc(&roots);
+    // 走过两轮安全点：两个工具都达到闲置资格（idle >= threshold），
+    // 但合并字节量在低位以下——统一预算下不发生纯 TTL 冷却。
+    registry.gc_with_pressure(&roots, 0);
+    registry.gc_with_pressure(&roots, 0);
+    assert_eq!(
+        registry.tool_state("demo.two"),
+        Some(ToolLifecycle::Loaded),
+        "below the shared watermark nothing cools (pure TTL replaced)"
+    );
+
+    // 外部（builtin 侧）表面把合并总量推过高水位：未 rooted 的
+    // demo.two 按最久未用被预算冷却，rooted 的 demo.one 保留。
+    registry.gc_with_pressure(&roots, SURFACE_SOFT_HIGH_BYTES + 1);
     assert_eq!(
         registry.tool_state("demo.one"),
         Some(ToolLifecycle::Loaded),
-        "a task-rooted capability tool must survive idle GC"
+        "a task-rooted capability tool must survive budget cooling"
     );
     assert_eq!(
         registry.tool_state("demo.two"),
         Some(ToolLifecycle::Warm),
-        "an unrooted capability tool must cool to Warm first"
+        "an unrooted capability tool cools when the unified budget is over pressure"
     );
     assert!(
         !registry
@@ -514,21 +539,22 @@ fn capability_tools_cool_and_unload_with_task_root_protection() {
         "Warm is off the model surface, like the builtin catalog"
     );
 
-    registry.gc(&roots);
-    registry.gc(&roots);
+    // Warm→Unloaded 仍按闲置阈值：demo.two 自加载起 idle 随每轮增长，
+    // 到第 4 轮越过 warm_to_unload_ticks。
+    registry.gc_with_pressure(&roots, 0);
     assert_eq!(
         registry.tool_state("demo.two"),
         Some(ToolLifecycle::Unloaded),
         "a warm capability tool must unload past the second threshold"
     );
 
-    // Roots dropped: demo.one cools too — first past the idle
-    // threshold...
-    registry.gc(&[]);
+    // Roots dropped: demo.one 已远超闲置阈值，推高外部压力后同一轮
+    // 先被预算冷却、随即越过卸载阈值——Loaded 直接落到 Unloaded。
+    registry.gc_with_pressure(&[], SURFACE_SOFT_HIGH_BYTES + 1);
     assert_eq!(
         registry.tool_state("demo.one"),
-        Some(ToolLifecycle::Warm),
-        "without the task root the capability tool must cool"
+        Some(ToolLifecycle::Unloaded),
+        "without the task root an over-threshold tool leaves under budget"
     );
     // ...then past the unload threshold.
     registry.gc(&[]);

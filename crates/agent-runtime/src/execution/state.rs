@@ -3,8 +3,9 @@
 use std::path::Path;
 
 use agent_contracts::{
-    MAX_FOREGROUND_RESOURCES, MAX_TASK_ANCHOR_ITEM_CHARS, ResourceFreshness, ResourceKey,
-    TaskProgressView, ToolFailureClass, ToolOutput, path_exactly_in_directive,
+    MAX_FOREGROUND_RESOURCES, MAX_TASK_ANCHOR_ITEM_CHARS, EvidenceValidity, ExecutionEvidence,
+    FrontierDelta, ResourceFreshness, ResourceKey, TaskProgressView, ToolFailureClass, ToolOutput,
+    path_exactly_in_directive,
 };
 #[cfg(test)]
 use agent_contracts::{ToolResultDisposition, TurnFrame, TurnFrameStep};
@@ -19,19 +20,32 @@ pub(super) const STALL_THRESHOLD: u32 = 3;
 /// 连续同类失败命中的不同目标数达到该值即上报聚类提示：换拼写的
 /// 连击在任一单独签名上永远到不了 [`STALL_THRESHOLD`]。
 pub(super) const STALL_CLUSTER_DISTINCT_TARGETS: u32 = 2;
+/// 连续无前沿推进的动作数达到该值即给收敛 advisory（软提示，不阻断）。
+pub(super) const FRONTIER_ADVISORY_THRESHOLD: u32 = 5;
+/// 前沿证据行数上限（最新在前）。
+const MAX_EVIDENCE_ROWS: usize = 16;
+/// recent_deltas 环形缓冲长度上限。
+const MAX_RECENT_DELTAS: usize = 8;
+/// 单条证据 outcome / 参数摘要的字符上限。
+const EVIDENCE_TEXT_CHARS: usize = 80;
 
-/// Deterministic progress classification of one tool result. Not a
-/// planner: it only states what the world can prove changed.
+/// 一轮工具观察的确定性前沿分类结果，随 `ExecutionFrontier` 事件上报。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RoundProgress {
-    /// A successful mutation changed the world.
-    Meaningful,
-    /// New or updated facts/evidence without a world change.
-    Evidence,
-    /// A previously failed operation now succeeds (or a failure row
-    /// cleared) without new facts.
-    Control,
-    /// Nothing above: the round produced no provable change.
+pub struct FrontierObservation {
+    pub delta: FrontierDelta,
+    pub actions_since_frontier_advance: u32,
+    pub evidence_revision: u64,
+    pub invalidated: u64,
+}
+
+/// [`ExecutionState::record_observation_evidence`] 的三值结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ObservationEvidence {
+    /// 新证据或证据内容变化。
+    Advanced,
+    /// 同 key 同 validity 同结果的重复观察。
+    Repeated,
+    /// 该输出不产生前沿证据（无可键化路径且非命令成功）。
     None,
 }
 
@@ -85,6 +99,27 @@ pub struct ExecutionState {
     pub stall: StallState,
     #[serde(default)]
     pub failure_cluster: FailureCluster,
+    /// 证据前沿：成功只读观察与成功命令运行的有界记录（最新在前）。
+    /// 只存身份/结果/版本，不存正文。
+    #[serde(default)]
+    pub evidence: Vec<ExecutionEvidence>,
+    /// 收敛账目：无推进动作连击、证据版本与最近 delta 环形缓冲。
+    #[serde(default)]
+    pub convergence: ConvergenceState,
+}
+
+/// 收敛状态。`evidence_revision` 在前沿内容变化（新证据/失效）时单调
+/// 递增；`actions_since_frontier_advance` 只被可证明推进的 delta 清零。
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConvergenceState {
+    #[serde(default)]
+    pub evidence_revision: u64,
+    #[serde(default)]
+    pub actions_since_frontier_advance: u32,
+    /// 最近 delta，最旧在前，有界环形。
+    #[serde(default)]
+    pub recent_deltas: Vec<FrontierDelta>,
 }
 
 /// How one [`ResourceFact`] was last observed. Observability only: it
@@ -473,8 +508,47 @@ impl ExecutionState {
                     }
                 })
                 .collect(),
+            operational_evidence: self.evidence_rows(),
             stall_warning: self.stall_warning(),
+            frontier_warning: self.frontier_warning(),
         }
+    }
+
+    /// 类型化证据行，最新在前、有界。只含 key + 结果 + world 版本；
+    /// Resource 有效性附带 path@digest 身份。无任何正文。
+    fn evidence_rows(&self) -> Vec<String> {
+        self.evidence
+            .iter()
+            .take(6)
+            .map(|row| match &row.validity {
+                EvidenceValidity::Resource { digest, .. } if !digest.is_empty() => {
+                    format!("{}@{}: {} @ world={}", row.key, digest, row.outcome, row.observed_world_revision)
+                }
+                _ => format!(
+                    "{}: {} @ world={}",
+                    row.key, row.outcome, row.observed_world_revision
+                ),
+            })
+            .collect()
+    }
+
+    /// 收敛 advisory：连续 [`FRONTIER_ADVISORY_THRESHOLD`] 个动作无可证明
+    /// 前沿推进即触发。软提示：模型仍自主选择下一步。
+    pub(super) fn frontier_warning(&self) -> Option<String> {
+        if self.convergence.actions_since_frontier_advance < FRONTIER_ADVISORY_THRESHOLD {
+            return None;
+        }
+        let recent = self
+            .convergence
+            .recent_deltas
+            .iter()
+            .map(|delta| delta.token())
+            .collect::<Vec<_>>()
+            .join(",");
+        Some(format!(
+            "EXECUTION FRONTIER UNCHANGED: {} action(s) without a provable frontier advance (recent deltas: {}). Re-reading known state or repeating outcomes does not move the task; act on what you know, change strategy, or finish.",
+            self.convergence.actions_since_frontier_advance, recent
+        ))
     }
 
     /// 有界的确定性停滞提示。两个检测器共用：同签名重复与跨目标同类
@@ -510,18 +584,54 @@ impl ExecutionState {
         None
     }
 
-    /// 停滞记账：任何进展清零；无进展且操作签名（工具+目标+失败类别）
-    /// 重复时递增。同类失败跨目标变化另记入聚类，换拼写的连击躲不开
-    /// 逐签名计数器的盲区。
-    pub(super) fn update_stall(
+    /// 收敛记账：可证明推进的 delta 清空停滞签名、失败聚类与无推进
+    /// 债务；其余 delta 只推进入环形缓冲并累计债务。逐签名停滞与跨
+    /// 目标聚类只在重复行为（NoProgress / RedundantEvidence）下累计，
+    /// Unknown 失效不冒充停滞也不清账。
+    pub(super) fn update_convergence(
         &mut self,
         identity: &OperationIdentity,
         failure: Option<ToolFailureClass>,
-        progress: RoundProgress,
+        delta: FrontierDelta,
     ) {
-        if progress != RoundProgress::None {
+        self.push_delta(delta);
+        if delta.advances_frontier() {
             self.stall = StallState::default();
             self.failure_cluster = FailureCluster::default();
+            self.convergence.actions_since_frontier_advance = 0;
+            return;
+        }
+        self.convergence.actions_since_frontier_advance =
+            self.convergence.actions_since_frontier_advance.saturating_add(1);
+        // 失败聚类：任何带失败类别的非推进轮都累计——包括未知足迹的
+        // 失败运行，换拼写的连击躲不开聚类。
+        if let Some(class) = failure {
+            if self.failure_cluster.tool == identity.tool_name
+                && self.failure_cluster.failure == Some(class)
+            {
+                if !self
+                    .failure_cluster
+                    .tried_targets
+                    .iter()
+                    .any(|target| target == &identity.target)
+                    && self.failure_cluster.tried_targets.len() < 8
+                {
+                    self.failure_cluster.tried_targets.push(identity.target.clone());
+                }
+            } else {
+                self.failure_cluster = FailureCluster {
+                    tool: identity.tool_name.clone(),
+                    failure: Some(class),
+                    tried_targets: vec![identity.target.clone()],
+                };
+            }
+        }
+        // 逐签名停滞只在重复行为（NoProgress / RedundantEvidence）下
+        // 累计；无失败的未知失效只记债务，不冒充停滞。
+        if !matches!(
+            delta,
+            FrontierDelta::NoProgress | FrontierDelta::RedundantEvidence
+        ) {
             return;
         }
         if self.stall.tool != identity.tool_name
@@ -535,29 +645,116 @@ impl ExecutionState {
                 failure,
             };
         }
-        if self.failure_cluster.tool == identity.tool_name
-            && self.failure_cluster.failure == failure
-            && failure.is_some()
-        {
-            if !self
-                .failure_cluster
-                .tried_targets
-                .iter()
-                .any(|target| target == &identity.target)
-                && self.failure_cluster.tried_targets.len() < 8
-            {
-                self.failure_cluster.tried_targets.push(identity.target.clone());
-            }
-        } else {
-            // A no-progress round without a failure class carries no
-            // cluster evidence; start over rather than mix classes.
-            self.failure_cluster = FailureCluster {
-                tool: identity.tool_name.clone(),
-                failure,
-                tried_targets: vec![identity.target.clone()],
-            };
-        }
         self.stall.consecutive_no_progress = self.stall.consecutive_no_progress.saturating_add(1);
+    }
+
+    fn push_delta(&mut self, delta: FrontierDelta) {
+        self.convergence.recent_deltas.push(delta);
+        let excess = self.convergence.recent_deltas.len().saturating_sub(MAX_RECENT_DELTAS);
+        if excess > 0 {
+            self.convergence.recent_deltas.drain(0..excess);
+        }
+    }
+
+    /// world revision 推进后使版本绑定的证据过期。返回失效条数——
+    /// 这是"证据因世界变化而死亡"的可解释计数，不是知识损失：事实表
+    /// 与事件流仍在。
+    pub(super) fn invalidate_stale_evidence(&mut self) -> u64 {
+        let revision = self.workspace_revision;
+        let before = self.evidence.len();
+        self.evidence.retain(|row| match row.validity {
+            EvidenceValidity::WorkspaceRevision(at) => at >= revision,
+            EvidenceValidity::Turn | EvidenceValidity::Resource { .. } => true,
+        });
+        let invalidated = (before - self.evidence.len()) as u64;
+        if invalidated > 0 {
+            self.convergence.evidence_revision = self.convergence.evidence_revision.saturating_add(invalidated);
+        }
+        invalidated
+    }
+
+    /// 成功观察入前沿（评审第 9/15 条）。键化规则：
+    /// - `git.status` / `git.diff` / `git.log`：key=工具名，
+    ///   validity=`WorkspaceRevision(当前)`；
+    /// - 其他带 path 的成功读：key=`工具:path`，
+    ///   validity=`Resource{path,digest}`；
+    /// - 成功命令运行（未知足迹）：key=`工具:参数摘要`，
+    ///   validity=`WorkspaceRevision(当前)`。
+    ///
+    /// 同 key 同 validity 同结果同参数即重复；否则插入为新证据。
+    pub(super) fn record_observation_evidence(
+        &mut self,
+        output: &ToolOutput,
+        turn: u64,
+    ) -> ObservationEvidence {
+        let target = output.operation_target().unwrap_or("").to_string();
+        let is_git_read = matches!(output.tool_name.as_str(), "git.status" | "git.diff" | "git.log");
+        let touches = output.resource_touches();
+        let (key, validity) = if is_git_read {
+            (
+                output.tool_name.clone(),
+                EvidenceValidity::WorkspaceRevision(self.workspace_revision),
+            )
+        } else if let Some(touch) = touches.first() {
+            let digest = touch.revision.clone().unwrap_or_default();
+            (
+                format!("{}:{}", output.tool_name, bound_item(&touch.path)),
+                EvidenceValidity::Resource {
+                    path: touch.path.clone(),
+                    digest,
+                },
+            )
+        } else if is_command_tool(&output.tool_name) && !target.is_empty() {
+            (
+                format!("{}:{}", output.tool_name, bound_item(&target)),
+                EvidenceValidity::WorkspaceRevision(self.workspace_revision),
+            )
+        } else {
+            return ObservationEvidence::None;
+        };
+        let outcome = bound_evidence_text(output.summary.trim());
+        let argument_digest = bound_evidence_text(&target);
+        if let Some(existing) = self
+            .evidence
+            .iter_mut()
+            .find(|row| row.key == key)
+        {
+            let identical = existing.validity == validity
+                && existing.outcome == outcome
+                && existing.argument_digest == argument_digest;
+            if identical {
+                return ObservationEvidence::Repeated;
+            }
+            existing.outcome = outcome;
+            existing.observed_world_revision = self.workspace_revision;
+            existing.validity = validity;
+            existing.argument_digest = argument_digest;
+            existing.turn = turn;
+            existing.evidence_ref = output.artifact_ref.clone();
+            self.bump_evidence_revision();
+            return ObservationEvidence::Advanced;
+        }
+        self.evidence.insert(
+            0,
+            ExecutionEvidence {
+                key,
+                outcome,
+                observed_world_revision: self.workspace_revision,
+                validity,
+                argument_digest,
+                turn,
+                evidence_ref: output.artifact_ref.clone(),
+            },
+        );
+        if self.evidence.len() > MAX_EVIDENCE_ROWS {
+            self.evidence.truncate(MAX_EVIDENCE_ROWS);
+        }
+        self.bump_evidence_revision();
+        ObservationEvidence::Advanced
+    }
+
+    fn bump_evidence_revision(&mut self) {
+        self.convergence.evidence_revision = self.convergence.evidence_revision.saturating_add(1);
     }
 
     pub(super) fn mark_facts_needs_revalidation(&mut self) {
@@ -700,6 +897,11 @@ pub(super) fn path_mentioned_in_query(query: &str, path: &str) -> bool {
 
 pub(super) fn is_command_tool(name: &str) -> bool {
     name == "shell.exec" || name == "process.run" || name.starts_with("git.")
+}
+
+/// 证据文本的收紧界：outcome / 参数摘要不需要事实表级别的长度。
+fn bound_evidence_text(text: &str) -> String {
+    text.chars().take(EVIDENCE_TEXT_CHARS).collect()
 }
 
 pub(super) fn bound_item(text: &str) -> String {

@@ -711,6 +711,14 @@ impl RuntimeActor {
         turn_frame: &TurnFrame,
         tools: Vec<ToolSpec>,
     ) -> ModelInput {
+        // PROTO-EVID-01：当轮正文缓存的可回注行交给组装器；是否回注由
+        // 组装器按 checkpoint 截断 + Fresh 事实一致判定。
+        let protocol_bodies = self
+            .state
+            .turn
+            .as_ref()
+            .map(|turn| turn.protocol_bodies.rows())
+            .unwrap_or_default();
         self.assembler.assemble_with_catalog(
             focus,
             task,
@@ -719,6 +727,7 @@ impl RuntimeActor {
             turn_frame,
             tools,
             &self.services.tool_catalog(),
+            &protocol_bodies,
         )
     }
 

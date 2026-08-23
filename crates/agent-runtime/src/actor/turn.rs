@@ -140,6 +140,8 @@ impl RuntimeActor {
             op: None,
             execution,
             edit_attempts: Vec::new(),
+            launch_failures: Vec::new(),
+            protocol_bodies: crate::execution::body_cache::ProtocolBodyCache::default(),
             round_snapshot: None,
             pending_completion: None,
             applied_input: Some(applied),

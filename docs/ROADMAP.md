@@ -52,4 +52,12 @@ in parallel, but it does not reorder or close either gate.
    or this diagnostic alone do not close M12, M13, or M15.
 5. Formal M15 only from versioned per-cell artifacts. Do not use one
    A/B/C for every layer.
-6. V2 Self-Iteration last.
+6. Execution Convergence V1 candidate gate (2026-08-23 review): before any
+   V1 candidate claim, the Convergence Bench must be green — three
+   deterministic scripted-model scenarios (`retry_domain`,
+   `operational_evidence`, `protocol_body`) — and the live A/C longflow
+   must show no structural no-progress loop (`frontier_no_advance_peak`
+   below the advisory threshold on both arms). Metrics come from the
+   `ExecutionFrontier` event stream; n=1 longflow runs are directional
+   only. This gate does not close M12/M13/M15 and does not reorder them.
+7. V2 Self-Iteration last.

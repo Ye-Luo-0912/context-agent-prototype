@@ -1001,6 +1001,76 @@ impl TaskAnchorView {
     }
 }
 
+/// 证据前沿的一轮确定性分类。只陈述世界能证明改变了什么，不是 planner。
+/// 只有 [`FrontierDelta::advances_frontier`] 为真的三种清停滞与收敛债务；
+/// Unknown 失效只是"世界可能变了"，不等于可证明的世界进展。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontierDelta {
+    /// 已知足迹的成功 mutation：世界确实变了。
+    ObservedWorldChange,
+    /// 未知足迹：世界可能变了但不可证明。不清停滞、不清收敛债务。
+    WorldInvalidatedUnknown,
+    /// 世界未变而知识改进：新事实、新验证行或新前沿证据。
+    EvidenceAdvanced,
+    /// 一条未满足义务解除（失败清除等）且无新证据。
+    ObligationResolved,
+    /// 同 world revision 下重复了已知证据或结果。
+    RedundantEvidence,
+    #[default]
+    NoProgress,
+}
+
+impl FrontierDelta {
+    /// 是否为可证明的前沿推进。只有推进轮清停滞签名、失败聚类与
+    /// 收敛债务；其余 delta 只累计债务。
+    pub fn advances_frontier(self) -> bool {
+        matches!(
+            self,
+            Self::ObservedWorldChange | Self::EvidenceAdvanced | Self::ObligationResolved
+        )
+    }
+
+    /// 提示行里的紧凑记号，供 recent-deltas 摘要使用。
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::ObservedWorldChange => "world",
+            Self::WorldInvalidatedUnknown => "unknown",
+            Self::EvidenceAdvanced => "evidence",
+            Self::ObligationResolved => "obligation",
+            Self::RedundantEvidence => "redundant",
+            Self::NoProgress => "none",
+        }
+    }
+}
+
+/// 一条前沿证据的有效域。决定它在没有新观察时何时自然失效：
+/// `Turn` 只在当轮可信；`WorkspaceRevision` 绑定世界版本，版本推进即
+/// 过期；`Resource` 绑定 path@digest 身份，身份不变则持续为真。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceValidity {
+    Turn,
+    WorkspaceRevision(u64),
+    Resource { path: String, digest: String },
+}
+
+/// 最小操作事实词汇：一条成功只读观察（或成功命令运行）的有界记录。
+/// raw body 永不入内——正文留在 user-role / artifact 层。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ExecutionEvidence {
+    pub key: String,
+    pub outcome: String,
+    pub observed_world_revision: u64,
+    pub validity: EvidenceValidity,
+    pub argument_digest: String,
+    #[serde(default)]
+    pub turn: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<String>,
+}
+
 /// Bounded prompt projection of an `ExecutionState`. Operational cache only:
 /// checked resources, revision-bound verification facts, failed operations.
 /// Goal/blockers/next-actions belong to `TaskAnchor`. Bodies stay in storage.
@@ -1014,11 +1084,19 @@ pub struct TaskProgressView {
     pub checked_files: Vec<String>,
     pub verifications: Vec<String>,
     pub failed_commands: Vec<String>,
+    /// 类型化操作证据行（身份/digest/计数），最新在前、有界。只含
+    /// key + 结果 + world 版本，不含任何工具正文。
+    #[serde(default)]
+    pub operational_evidence: Vec<String>,
     /// Deterministic stall signal (MOD-PROG-01): the same operation
     /// signature has produced no world progress for consecutive rounds.
     /// Advisory prompt line, never an execution block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall_warning: Option<String>,
+    /// 收敛软提示：连续多轮无可证明前沿推进时的 advisory 行，
+    /// 不阻断执行。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier_warning: Option<String>,
 }
 
 /// Hard cap on the assembled TASK PROGRESS prompt block. List-length caps
@@ -1030,6 +1108,7 @@ impl TaskProgressView {
         self.checked_files.is_empty()
             && self.verifications.is_empty()
             && self.failed_commands.is_empty()
+            && self.operational_evidence.is_empty()
     }
 
     /// Whether `Checked` already names this workspace path (`path` or

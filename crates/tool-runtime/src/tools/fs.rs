@@ -170,6 +170,15 @@ impl Tool for FsListTool {
             })
             .unwrap_or_default();
 
+        // 目录身份戳：path@digest 让重复列举能被证据前沿识别为同版本
+        // 冗余，而不是无身份的纯 stdout。根目录的相对路径是空串，用
+        // "." 表示。
+        let listed_relative = display_relative(&self.workspace, &path);
+        let listed = if listed_relative.is_empty() {
+            ".".to_string()
+        } else {
+            listed_relative
+        };
         Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
             tool_name: "fs.list".into(),
@@ -182,6 +191,8 @@ impl Tool for FsListTool {
             model_content: format!("{}{}", visible.join("\n"), truncated_note),
             artifact_ref,
             metadata: json!({
+                "path": listed,
+                "revision": content_digest(visible.join("\n").as_bytes()),
                 "entry_count": entries.len(),
                 "returned": visible.len(),
                 "has_more": has_more,

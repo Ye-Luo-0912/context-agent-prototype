@@ -30,7 +30,9 @@ pub use context::*;
 pub use discovery::*;
 pub use error::*;
 pub use event::*;
-pub use host_policy::{HostEffectBinding, HostToolPolicies, HostToolPolicy, unbound_effect_intent};
+pub use host_policy::{
+    HostEffectBinding, HostPolicySnapshot, HostToolPolicies, HostToolPolicy, unbound_effect_intent,
+};
 pub use ids::*;
 pub use input::*;
 pub use jcs::{JcsError, serialize as jcs_serialize};
