@@ -94,14 +94,10 @@ impl Default for ToolLifecycleConfig {
 }
 
 struct ToolEntry {
+    schema_bytes: usize,
     tool: Arc<dyn Tool>,
     state: ToolLifecycle,
     last_used_tick: u64,
-}
-
-/// schema 的粗略字节估算，用作表面压力水位。
-fn schema_bytes(tool: &Arc<dyn Tool>) -> usize {
-    serde_json::to_string(&tool.spec()).map(|text| text.len()).unwrap_or(0)
 }
 
 pub struct BuiltinToolDispatcher {
@@ -160,6 +156,9 @@ impl BuiltinToolDispatcher {
                 (
                     spec.name.clone(),
                     ToolEntry {
+                        schema_bytes: serde_json::to_string(&spec)
+                            .map(|text| text.len())
+                            .unwrap_or(0),
                         tool,
                         state,
                         last_used_tick: 0,
@@ -281,7 +280,7 @@ impl BuiltinToolDispatcher {
             catalog
                 .values()
                 .filter(|entry| entry.state == ToolLifecycle::Loaded)
-                .map(|entry| schema_bytes(&entry.tool))
+                .map(|entry| entry.schema_bytes)
                 .sum()
         };
         let mut pressure = if self.config.surface_soft_high_bytes > 0 {
@@ -309,7 +308,7 @@ impl BuiltinToolDispatcher {
                 if pressure <= self.config.surface_low_watermark_bytes {
                     break;
                 }
-                let bytes = schema_bytes(&entry.tool);
+                let bytes = entry.schema_bytes;
                 entry.state = ToolLifecycle::Warm;
                 pressure = pressure.saturating_sub(bytes);
                 changed = true;

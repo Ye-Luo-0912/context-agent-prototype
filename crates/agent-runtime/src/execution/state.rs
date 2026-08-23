@@ -60,10 +60,10 @@ pub struct FailureCluster {
     pub tool: String,
     #[serde(default)]
     pub failure: Option<ToolFailureClass>,
+    /// 本轮聚类里真实尝试过的目标（有界去重，按首次顺序）。
+    /// 数量取 len；A→B→A 只算两个，不再按变化次数虚增。
     #[serde(default)]
-    pub distinct_targets: u32,
-    #[serde(default)]
-    pub last_target: String,
+    pub tried_targets: Vec<String>,
 }
 
 /// Bounded operational cache bound to `task_id + anchor_revision +
@@ -498,13 +498,13 @@ impl ExecutionState {
         }
         if self.stall.consecutive_no_progress > 0
             && let Some(failure) = self.failure_cluster.failure
-            && self.failure_cluster.distinct_targets >= STALL_CLUSTER_DISTINCT_TARGETS
+            && self.failure_cluster.tried_targets.len() >= STALL_CLUSTER_DISTINCT_TARGETS as usize
         {
             return Some(format!(
                 "EXECUTION STALL: {} hit {} across {} different targets in a row without world progress. Choose another strategy or finish with the current state.",
                 self.failure_cluster.tool,
                 failure.as_str(),
-                self.failure_cluster.distinct_targets
+                self.failure_cluster.tried_targets.len()
             ));
         }
         None
@@ -539,9 +539,14 @@ impl ExecutionState {
             && self.failure_cluster.failure == failure
             && failure.is_some()
         {
-            if self.failure_cluster.last_target != identity.target {
-                self.failure_cluster.distinct_targets += 1;
-                self.failure_cluster.last_target = identity.target.clone();
+            if !self
+                .failure_cluster
+                .tried_targets
+                .iter()
+                .any(|target| target == &identity.target)
+                && self.failure_cluster.tried_targets.len() < 8
+            {
+                self.failure_cluster.tried_targets.push(identity.target.clone());
             }
         } else {
             // A no-progress round without a failure class carries no
@@ -549,8 +554,7 @@ impl ExecutionState {
             self.failure_cluster = FailureCluster {
                 tool: identity.tool_name.clone(),
                 failure,
-                distinct_targets: 1,
-                last_target: identity.target.clone(),
+                tried_targets: vec![identity.target.clone()],
             };
         }
         self.stall.consecutive_no_progress = self.stall.consecutive_no_progress.saturating_add(1);

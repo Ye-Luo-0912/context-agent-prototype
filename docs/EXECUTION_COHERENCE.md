@@ -192,6 +192,16 @@ directive may legitimately ask for the same edit, and facts not Fresh
 fail open to dispatch. Process/shell tools are never deduplicated —
 time and environment make them non-deterministic.
 
+**Coherence vs convergence.** The guarantees above are coherence: the
+runtime states what the world can prove and never blocks on guesses.
+They do not by themselves establish that the *task* moved forward —
+successful observations still vanish with transcript recycling, and any
+unrelated Evidence progress clears a failure cluster today. The
+convergence extension (Execution Evidence Frontier, FrontierDelta,
+cross-tool ConvergenceDebt, RetryDomain) is specified in
+[`AUDIT_TODO.md`](AUDIT_TODO.md) CONV-01/CONV-02 and sequenced in
+[`EXECUTION_CONVERGENCE_TODO.md`](EXECUTION_CONVERGENCE_TODO.md).
+
 ### Protocol working set (turn checkpointing)
 
 The current turn is itself a working set. The wire view of `TurnFrame`
@@ -204,9 +214,12 @@ always retained. The runtime's full frame is never mutated — audit,
 `ToolFinished` events, and turn-end persistence still see every step.
 `ModelInput.turn_checkpoint` records the compacted count; token
 accounting (`PromptLayerCosts.turn_frame_tokens`) measures the wire
-view. No LLM summary is involved anywhere: the checkpoint is a pointer
-to TASK PROGRESS / artifacts / the run journal, where the compacted
-exchanges' reliable facts already live.
+view. No LLM summary is involved anywhere: the checkpoint is safe only
+where a compacted exchange's facts are already projected as typed
+operational evidence (Execution Frontier, CONV-01) or its raw body is
+still reachable by reference / the current-turn protocol cache; the
+journal is an audit backing store and does not by itself make facts
+model-visible.
 
 ## ObservationMemo
 

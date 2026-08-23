@@ -18,11 +18,16 @@ and sandbox contracts live elsewhere. Experiment facts live in
 ## Now
 
 - M10, M11, and M14 are closed at their named gates.
-- Context V1 operational core is a **freeze candidate**; Execution
-  Coherence V1 is **RC** (its blockers — MOD-OBS-01 observation,
-  MOD-PROG-01 progress/stall, turn checkpointing — landed 2026-08-21;
-  freeze re-designation waits for the next live evidence pass). Code
-  still runs; do not retune or extend them as product work.
+- Context V1 operational core and **Execution Coherence V1 are both
+  freeze candidates**: the 2026-08-23 long-flow pass confirmed the
+  coherence machinery (MOD-OBS-01 observation, MOD-PROG-01 stall,
+  turn checkpointing) held; Warm=Stored rereads stayed 0. Do not retune
+  or extend them as product work.
+- **Execution Convergence V1 is an active P1**
+  ([`EXECUTION_CONVERGENCE_TODO.md`](EXECUTION_CONVERGENCE_TODO.md)):
+  the same pass exposed structural convergence gaps (executable-guessing
+  loop burned ~20 rounds; successful observations vanish with transcript
+  eviction). Track via CONV-01/CONV-02/PROTO-EVID-01 in AUDIT_TODO.
 - M12 first cut: structured `EffectIntent` + trusted `HostToolPolicy`,
   multi-file `WorkspaceWriteSet` bounds, and commit-time
   Actual ⊆ Approved (`MOD-AUTH-01`/`02`).
@@ -66,10 +71,13 @@ and sandbox contracts live elsewhere. Experiment facts live in
 
 **P0 — trusted execution.** Finish M12/M13 gates in
 [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md): one brokerable
-`EffectRequest` path; a `HostToolPolicyRegistry` so plugin admission
-can install operator-reviewed bindings (external write plugins fail
-closed today — safely non-functional); attestation is actual enforced
-capabilities; generic process tools stay non-transactional.
+`EffectRequest` path; the landed `HostToolPolicyRegistry` now needs the
+runtime admission flow itself — manifest → operator review → versioned,
+mutable snapshot install (`HostPolicySnapshot{policy, revision, digest}`)
+with the policy revision bound to operation authority, so an operator
+update never re-interprets an in-flight operation. Do not build a second
+registry. Attestation is actual enforced capabilities; generic process
+tools stay non-transactional.
 UntrustedGenerated stays fail-closed on native. Multi-file
 `EffectIntent` and commit-time Actual ⊆ Approved (`MOD-AUTH-01`/`02`)
 landed 2026-08-21 — do not reopen them without new authority evidence.

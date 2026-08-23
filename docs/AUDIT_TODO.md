@@ -268,6 +268,40 @@ be sized against real demand. Residency loosening stays rejected on
 current evidence; the tiny current-turn LRU gets built only if this
 motive shows up in live runs.
 
+### CONV-01 — Execution Evidence Frontier (open)
+
+Successful read-only observations (git.status/diff clean, fs.list
+listing digest, successful process.run) leave no persistent operational
+fact: when dynamic context recycles them, the model re-runs git 18 extra
+times per task (2026-08-23 long-flow). Define minimal
+`ExecutionEvidence { key, outcome, observed_world_revision, validity,
+argument_digest, evidence_ref }` with validity ∈ {Turn,
+WorkspaceRevision(N), Resource(path@digest)}; same-revision repeats are
+RedundantEvidence. TASK PROGRESS renders typed fields only — raw bodies
+stay in user-role/artifact layers.
+
+### CONV-02 — cross-tool convergence debt (open)
+
+SCHED-03's advisory landed but product convergence is not solved: the
+same pass burned ~20 rounds on an executable-guessing loop, and any
+unrelated Evidence progress clears the cluster today (progress is a
+global scalar; blockers are local). Upgrade RoundProgress to a
+FrontierDelta set where Unknown world invalidation is NOT progress, add
+ConvergenceState { evidence_revision, actions_since_frontier_advance,
+recent deltas } with a soft FRONTIER-UNCHANGED advisory, and split
+FailureClass from RetryDomain (hard refusal only on provable
+precondition equivalence; no K-strikes name bans).
+
+### PROTO-EVID-01 — current-turn protocol body cache (open, gate met)
+
+`protocol-checkpoint-body-missing` fired 8 times in both 2026-08-23 live
+runs, so its gate is satisfied. Tiny ActiveTurn-scoped LRU keyed
+path@revision (~4 entries / 4–8 KiB, sources fs.read + edit echo);
+rehydrate only when the checkpoint removed the body AND the fact is
+Fresh at the identical revision; known mutations invalidate their path,
+unknown mutations stale everything. Never enters Context, never Admits,
+never durable.
+
 ## Freeze (not a defect)
 
 ### TOOL-GC-PHASE2 — surface pressure hysteresis (landed 2026-08-23)
