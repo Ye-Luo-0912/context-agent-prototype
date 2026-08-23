@@ -336,7 +336,7 @@ their paths); assembly emits per-round `ProtocolBodyCacheStats`
 agent-eval aggregates into summary.json — hit rate is now independently
 verifiable from any bundle.
 
-### CONV-03 — obligation-scoped convergence (mechanism landed 2026-08-23, live evidence pending)
+### CONV-03 — obligation-scoped convergence (mechanism landed 2026-08-23, residual narrowed by live evidence)
 
 Global frontier advance does not prove blocker resolution (C r2's
 13-attempt guessing loop kept peak=4 < advisory 5 via interleaved
@@ -351,6 +351,29 @@ Pending: longflow/bench evidence under the new ROADMAP gate, and the
 LaunchResolutionFact hard-refusal note that its revision guard is
 deliberately conservative until fingerprints are recomputable
 pre-dispatch without I/O.
+
+Live narrowing (`../crates/agent-eval/evidence/longflow-post-obligation-2026-08-23/REPORT.md`,
+2026-08-23): guessing chains rebuilt in *both* C repeats. Fingerprints
+are stable within a chain, but attempts never escalate because (a) any
+successful command resolves all ExecutableResolution obligations — a
+successful `rustc` build clears the unrelated "compiled tests exe not
+found" blocker — and (b) successful builds change the cwd listing, so
+the next failure carries a new fingerprint and supersedes the old row.
+Open work: resolution must require a precondition-matched success (same
+fingerprint), not domain-any-success; and obligation warnings are
+TASK PROGRESS-only, so bundles cannot yet prove they fired.
+
+### PROTO-EVID-03 — body cache starves under Unknown-footprint command pressure (observed 2026-08-23, no retune)
+
+First live `ProtocolBodyCacheStats` accounting: eligibility is high
+(20–31 offered rows per longflow cell) but hit rate is exactly 0. Every
+`process.run` / `shell.exec` has an Unknown mutation footprint and each
+one invalidates the whole turn cache (invalidated 6–16 per cell), so
+command-dense trajectories starve the cache the checkpoint-missing
+motive was measured on. The all-entries invalidation is deliberately
+conservative and stays frozen; this entry records the measured fact so
+any future policy change must bring its own evidence and design, not a
+threshold tweak.
 
 ### EVAL-IMMUTABLE-01 — live evidence attempts must not overwrite (fixed 2026-08-23)
 
