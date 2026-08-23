@@ -6,10 +6,10 @@
   "repeats": 2,
   "live": true,
   "fixture_sha256": "7ac50d28968134c8a6b30a5ba10b004bc4f7c6fdb9872b0c6e635cb0a88771da",
-  "git_head": "0fdc4868a7d04fa99873c2f7092387ba770b099c",
-  "git_dirty": true,
-  "git_dirty_sha256": "b0914cf7d1e6ccae2483ba621633c4ee987de529a5aab5eae555b8a80b055d0a",
-  "source_tree_digest": "4a8736658fecbd0e51bb3e921ad61b9665e3d46dff0294efd84ef8642720b1ac",
+  "git_head": "07c6430cc4fd5c947ad90fc03325235b89bab6dc",
+  "git_dirty": false,
+  "git_dirty_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "source_tree_digest": "96dae40de62fc1031bf72f2e7910fee5627fd2e67ab6b4ef31e204470e564da3",
   "openai_model": "gpt-5.6-luna",
   "openai_base_url": "https://api.pinaic.com/v1"
 }

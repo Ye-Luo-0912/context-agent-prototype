@@ -1,5 +1,5 @@
 {
-  "files": 30,
+  "files": 32,
   "listed": [
     ".git/COMMIT_EDITMSG",
     ".git/HEAD",
@@ -23,14 +23,16 @@
     ".git/info/exclude",
     ".git/logs/HEAD",
     ".git/logs/refs/heads/master",
+    ".git/objects/38/1c29e1562540ae10e8c55a71dcd73573ef9516",
     ".git/objects/4e/1dc18b6b1dbd5b91235279ebe480bd7444a955",
     ".git/objects/a5/5b06b2754a0517bc4c4249f39dba95b2e673fc",
-    ".git/objects/a8/152ac4fa040289ad1153a945b621ae62535fb6",
     ".git/objects/cf/a3d737aba5be0d1f5f02e1d9d5435a7af3fbe3",
     ".git/objects/fa/c34eac2c93344bbe580ae92dad292f3dbfae15",
     ".git/refs/heads/master",
     ".gitignore",
+    "NOTES.md",
+    "RELEASE.md",
     "src/protocol.rs"
   ],
-  "sha256": "04838592a31d01ca2b786059457969c97a049a5ceb1d95067a5ef52b20da6da4"
+  "sha256": "c4b789794ee935af518b59101514968fcf4eb7f90029822992b29fb3bb3bd4d7"
 }

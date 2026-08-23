@@ -1,72 +1,79 @@
 # Longflow after Execution Convergence V1 (2026-08-23)
 
 Task `late_constraint_long`, A/C concurrent, live model
-(`gpt-5.6-luna` via api.pinaic.com). First run r1; a second invocation
-the same hour was killed by a provider outage (502/503) and its pair
-sink **overwrote the r1 JSONL artifacts** — the numbers below are
-reconstructed from the preserved harness log of run 1. Treat every
-number as n=1 directional evidence, not an estimate.
+(`gpt-5.6-luna` via api.pinaic.com), repeats=2 on a clean tree after a
+provider outage window (history below). All four arm-runs completed
+and passed the hidden verification (file_content + command, 4/4
+asserts each).
 
-## Run 1 (r1, reconstructed from log)
+## Results
 
-| metric | dynamic (C) | append (A) |
-| --- | --- | --- |
-| outcome | error — provider HTTP 503 at op 11 | passed |
-| rounds | 43 (truncated) | 48 |
-| tool calls | 50 | 47 |
-| model input tokens | 344247 (lower bound, usage incomplete) | 536355 |
-| wall | ~317 s | ~300 s |
+| metric | C r1 | A r1 | C r2 | A r2 |
+| --- | --- | --- | --- | --- |
+| passed | ✅ | ✅ | ✅ | ✅ |
+| rounds | 57 | 48 | 67 | 40 |
+| tool calls | 72 | 46 | 94 | 33 |
+| model input tokens | 470045 | 534720 | 634494 | 421340 |
+| frontier_advances | 41 | 26 | 51 | 20 |
+| redundant_evidence_calls | 8 | 9 | 4 | 7 |
+| no_advance_peak | 6 | 4 | 4 | 3 |
+| evidence_invalidations | 9 | 5 | 11 | 0 |
+| fs.read motive proto-checkpoint-missing | 6 | 0 | 6 | 0 |
 
-Per-tool (C): capability.manage 3/0, context.manage 2/1, edit.replace
-7/2, fs.list 3/0, fs.read 16/1, fs.write 2/0, git.diff 2/0,
-git.status 2/0, **process.run 9/3 failed**, search.grep 4/0.
-Per-tool (A): capability.manage 3/0, edit.replace 12/2, fs.list 2/0,
-fs.read 16/1, fs.write 2/0, git.diff 4/0, git.status 6/0,
-search.grep 2/0 (no process.run).
+Per-tool highlights:
 
-## Convergence metrics (new, from ExecutionFrontier events)
+- process.run: C r1 **0 calls**, C r2 **13 / 9 failed** (a name-guessing
+  chain rebuilt in that one trajectory); A 1/1 and 0/0.
+- git.status + git.diff: C 12 and 11 (baseline run had 24).
+- capability.manage: C 5 and 5 (baseline 7), 0 failed everywhere —
+  the hysteresis reload churn stays gone.
+- fs.list carries the new path@digest identity stamp; its repeats are
+  counted inside `redundant_evidence_calls` (4–9 per arm-run).
 
-| metric | C (43 rounds) | A (48 rounds) |
-| --- | --- | --- |
-| frontier_advances | 24 | 33 |
-| redundant_evidence_calls | 5 | 6 |
-| frontier_no_advance_peak | **5 — advisory fired once** | 3 |
-| evidence_invalidations | 4 | 9 |
-| fs.read motive proto-checkpoint-missing | 6 | 0 |
+## Reading against the post-hysteresis baseline
+(`../longflow-post-hysteresis-2026-08-23`: C 94r/135 tools,
+process.run 35/20 failed, git re-verification 24)
 
-## Structural comparison vs post-hysteresis baseline
-(`../longflow-post-hysteresis-2026-08-23`, C completed 94 rounds)
+- n=2 per arm now. C rounds 57/67 (mean 62) vs baseline 94; A 48/40 vs
+  53. Trajectories still dominate round counts — do not read mean-vs-
+  single as a delta claim.
+- The executable-guessing chain appeared in exactly one of four
+  arm-runs (C r2: 9 failures). It is no longer the default shape of a
+  C trajectory (baseline: 18 guesses in its only completed run), but it
+  is not eliminated either; the convergence debt stayed below its
+  advisory threshold during that chain because the model interleaved
+  advancing work between guesses (peak=4 < 5).
+- git status/diff re-verification collapsed from 24 to 10–12 on C
+  across both runs; identity-stamped `fs.list` repeats are now visible
+  as RedundantEvidence instead of invisible stdout noise.
+- Per-round input cost keeps the historical shape: C ≈8–9K/round vs
+  A ≈9–11K/round while carrying more rounds.
+- proto-checkpoint-missing rereads stay at 6 per C run — the body
+  cache removes the *need* to re-read only when the identity matches;
+  the remaining six are genuine re-reads of changed/other files, not
+  cache misses. No regression signal here.
 
-The honest comparison is per-structural-signal inside the trajectory,
-not rounds-across-dirs:
+## Advisory behavior observed live
 
-| signal | baseline C (94r) | this C (43r) |
-| --- | --- | --- |
-| process.run calls / failed | 35 / 20 (18 never-compiled guesses) | 9 / 3 |
-| git.status + git.diff re-verifications | 11 + 13 = 24 | 2 + 2 = 4 |
-| capability.manage calls | 7 | 3 |
-| fs.read proto-checkpoint-missing | 8 | 6 (in a shorter run) |
+`frontier_no_advance_peak` reached 6 (C r1) and 4 (others ≤4): the
+EXECUTION FRONTIER UNCHANGED advisory fired at most once per run and
+never stalled anything — advisory-only by design. Evidence
+invalidations tracked world-revision bumps as intended (0 on the arm
+with no mutations beyond edits it echoed).
 
-The executable-guessing loop that dominated the previous gap did not
-rebuild in this trajectory (3 failures, no name-variant chain), and
-git status/diff re-verification collapsed from 24 to 4 calls. With
-C truncated at round 43 these are consistency signals, not proof; the
-advisory firing exactly at peak=5 confirms the debt counter works
-end-to-end on a live run.
+## History
 
-## Run 2 attempt (provider outage, recorded for honesty)
-
-A `--repeats 2` retry started ~30 minutes later died to upstream 502 /
-503 on both arms (repeat 1 at round 4/op 2; repeat 2 at round 1 with
-zero completion tokens). Its pair sink overwrote the r1 artifacts
-described above. A cheap chat-completions probe was set up to rerun
-when the provider recovers.
+An earlier same-day invocation lost its r1 artifacts to a provider
+503 truncation plus an overwrite during an outage retry; those numbers
+were reconstructed from the harness log in the previous revision of
+this report. The current tables are real artifacts from the clean
+post-outage rerun above.
 
 ## Verdict
 
-Directional only: no structural no-progress loop rebuilt on either arm
-in the healthy portion of run 1, and both new advisory/metric paths
-behaved as designed on live traffic. A clean-provider rerun (both arms
-completing, ideally repeats=2) is required before any claim about round
-deltas; per ROADMAP this gate is about absence of structural loops,
-which run 1 supports and does not close.
+Both arms complete and passing on n=2; no structural no-progress loop
+on three of four arm-runs, one bounded guessing chain on C r2 with
+interleaved advances. ROADMAP's Convergence gate ("bench green AND
+longflow without structural loops") reads green on the bench and
+supported-but-not-closed on the longflow clause; M12/M13 remain the
+mainline and stay unclosed.

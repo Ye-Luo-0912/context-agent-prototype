@@ -3,7 +3,7 @@
   "kind": "file_content+command",
   "fixture_id": "late_constraint_long",
   "expected_edit": "add v2 Hello and Heartbeat while keeping unversioned ping",
-  "passed": false,
+  "passed": true,
   "replay_complete": true,
   "assertions": [
     {
@@ -12,8 +12,8 @@
       "needles": [
         "Hello"
       ],
-      "count": 0,
-      "passed": false,
+      "count": 5,
+      "passed": true,
       "file_exists": true
     },
     {
@@ -22,8 +22,8 @@
       "needles": [
         "Heartbeat"
       ],
-      "count": 0,
-      "passed": false,
+      "count": 5,
+      "passed": true,
       "file_exists": true
     },
     {
@@ -32,7 +32,7 @@
       "needles": [
         "ping"
       ],
-      "count": 2,
+      "count": 5,
       "passed": true,
       "file_exists": true
     },
@@ -42,27 +42,27 @@
       "needles": [
         "v2"
       ],
-      "count": 0,
-      "passed": false,
-      "file_exists": false
+      "count": 2,
+      "passed": true,
+      "file_exists": true
     }
   ],
   "files": [
     {
       "path": "RELEASE.md",
-      "exists": false,
-      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "bytes": 0,
+      "exists": true,
+      "sha256": "b509f1923822feab4319154fae193015eb21da2a6fdddaa98b13ba793b9e10b2",
+      "bytes": 327,
       "truncated": false,
-      "body": ""
+      "body": "Planned v2 work will extend the protocol with request identifiers for correlating messages, timestamps for recording message creation time, and an optional payload field for carrying message data while preserving the existing Ping roundtrip behavior.\n\nShipped: v2 `Hello(String)` with the explicit `v:2|hello|<name>` envelope.\n"
     },
     {
       "path": "src/protocol.rs",
       "exists": true,
-      "sha256": "5fb28ca7e3bdf1e8e8417fdaa52416575bf3d5fe9c052badf59c284244c6551a",
-      "bytes": 290,
+      "sha256": "425ab4d6379f527599f157087c261948f1caf8bde934a1d74621a7dfae56b476",
+      "bytes": 1524,
       "truncated": false,
-      "body": "pub enum Msg {\r\n    Ping,\r\n}\r\n\r\npub fn decode(bytes: &str) -> Result<Msg, String> {\r\n    if bytes.contains(\"ping\") {\r\n        return Ok(Msg::Ping);\r\n    }\r\n    Err(\"unknown\".into())\r\n}\r\n\r\npub fn encode(msg: &Msg) -> String {\r\n    match msg {\r\n        Msg::Ping => \"ping\".into(),\r\n    }\r\n}\r\n"
+      "body": "pub enum Msg {\r\n    Ping,\r\n    Hello(String),\r\n    Heartbeat(u32),\r\n}\r\n\r\npub fn decode(bytes: &str) -> Result<Msg, String> {\r\n    if let Some(name) = bytes.strip_prefix(\"v:2|hello|\") {\r\n        return Ok(Msg::Hello(name.into()));\r\n    }\r\n    if bytes.contains(\"ping\") {\r\n        return Ok(Msg::Ping);\r\n    }\r\n    if let Some(sequence) = bytes.strip_prefix(\"v:2|heartbeat|\") {\r\n        if let Ok(sequence) = sequence.parse() {\r\n            return Ok(Msg::Heartbeat(sequence));\r\n        }\r\n    }\r\n    Err(\"unknown\".into())\r\n}\r\n\r\npub fn encode(msg: &Msg) -> String {\r\n    match msg {\r\n        Msg::Ping => \"ping\".into(),\r\n        Msg::Hello(name) => format!(\"v:2|hello|{}\", name),\r\n        Msg::Heartbeat(sequence) => format!(\"v:2|heartbeat|{}\", sequence),\r\n    }\r\n}\r\n\r\npub fn ping_roundtrip() -> Result<Msg, String> {\r\n    decode(&encode(&Msg::Ping))\r\n}\r\n\r\n#[cfg(test)]\r\nmod tests {\r\n    use super::*;\r\n\r\n    #[test]\r\n    fn decodes_ping_frame() {\r\n        assert!(matches!(decode(\"ping\"), Ok(Msg::Ping)));\r\n    }\r\n\r\n    #[test]\r\n    fn hello_uses_v2_envelope() {\r\n        let msg = Msg::Hello(\"Ada\".into());\r\n        assert_eq!(encode(&msg), \"v:2|hello|Ada\");\r\n        assert!(matches!(decode(&encode(&msg)), Ok(Msg::Hello(name)) if name == \"Ada\"));\r\n    }\r\n\r\n    #[test]\r\n    fn heartbeat_roundtrips_sequence_number() {\r\n        let msg = Msg::Heartbeat(42);\r\n        assert_eq!(encode(&msg), \"v:2|heartbeat|42\");\r\n        assert!(matches!(decode(&encode(&msg)), Ok(Msg::Heartbeat(sequence)) if sequence == 42));\r\n    }\r\n}\r\n"
     }
   ],
   "commands": [
@@ -70,16 +70,16 @@
       "argv": [
         "python",
         "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\longflow\\checks\\wire_v1.py",
-        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpzl9wFh\\append"
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpDJ2RNw\\append"
       ],
       "expect_exit": 0,
-      "exit": 1,
+      "exit": 0,
       "timed_out": false,
       "stdout": "",
-      "stderr": "wire_v1 failed",
+      "stderr": "",
       "stdout_truncated": false,
       "stderr_truncated": false,
-      "passed": false
+      "passed": true
     }
   ]
 }

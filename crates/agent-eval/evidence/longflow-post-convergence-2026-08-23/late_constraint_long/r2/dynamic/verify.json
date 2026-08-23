@@ -3,7 +3,7 @@
   "kind": "file_content+command",
   "fixture_id": "late_constraint_long",
   "expected_edit": "add v2 Hello and Heartbeat while keeping unversioned ping",
-  "passed": false,
+  "passed": true,
   "replay_complete": true,
   "assertions": [
     {
@@ -12,8 +12,8 @@
       "needles": [
         "Hello"
       ],
-      "count": 0,
-      "passed": false,
+      "count": 5,
+      "passed": true,
       "file_exists": true
     },
     {
@@ -22,8 +22,8 @@
       "needles": [
         "Heartbeat"
       ],
-      "count": 0,
-      "passed": false,
+      "count": 5,
+      "passed": true,
       "file_exists": true
     },
     {
@@ -32,7 +32,7 @@
       "needles": [
         "ping"
       ],
-      "count": 2,
+      "count": 5,
       "passed": true,
       "file_exists": true
     },
@@ -42,27 +42,27 @@
       "needles": [
         "v2"
       ],
-      "count": 0,
-      "passed": false,
-      "file_exists": false
+      "count": 2,
+      "passed": true,
+      "file_exists": true
     }
   ],
   "files": [
     {
       "path": "RELEASE.md",
-      "exists": false,
-      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "bytes": 0,
+      "exists": true,
+      "sha256": "536f760ae537b1e09462cb71e87862caf4efe8303be5f8e8ce788d7725377621",
+      "bytes": 381,
       "truncated": false,
-      "body": ""
+      "body": "Planned v2 work will expand the protocol beyond the current `Msg::Ping` message with additional message types, clearer and more robust serialization and validation, and round-trip coverage for each supported message, while preserving compatibility with existing ping clients where practical.\n\nShipped v2 `Msg::Hello(String)` with an explicit `v:2` envelope and round-trip coverage."
     },
     {
       "path": "src/protocol.rs",
       "exists": true,
-      "sha256": "5fb28ca7e3bdf1e8e8417fdaa52416575bf3d5fe9c052badf59c284244c6551a",
-      "bytes": 290,
+      "sha256": "b58359e9481295d6a7fd226824224623cc9735485f45c9f5f154094200b69e1b",
+      "bytes": 1863,
       "truncated": false,
-      "body": "pub enum Msg {\r\n    Ping,\r\n}\r\n\r\npub fn decode(bytes: &str) -> Result<Msg, String> {\r\n    if bytes.contains(\"ping\") {\r\n        return Ok(Msg::Ping);\r\n    }\r\n    Err(\"unknown\".into())\r\n}\r\n\r\npub fn encode(msg: &Msg) -> String {\r\n    match msg {\r\n        Msg::Ping => \"ping\".into(),\r\n    }\r\n}\r\n"
+      "body": "pub enum Msg {\r\n    Ping,\r\n    Hello(String),\r\n    Heartbeat(u32),\r\n}\r\n\r\npub fn decode(bytes: &str) -> Result<Msg, String> {\r\n    if bytes.contains(\"ping\") {\r\n        return Ok(Msg::Ping);\r\n    }\r\n\r\n    const HEARTBEAT_PREFIX: &str = \"{\\\"v\\\":2,\\\"type\\\":\\\"heartbeat\\\",\\\"value\\\":\";\r\n    if let Some(value) = bytes.strip_prefix(HEARTBEAT_PREFIX).and_then(|rest| rest.strip_suffix(\"}\")) {\r\n        if let Ok(sequence) = value.parse() {\r\n            return Ok(Msg::Heartbeat(sequence));\r\n        }\r\n    }\r\n\r\n    const PREFIX: &str = \"{\\\"v\\\":2,\\\"type\\\":\\\"hello\\\",\\\"value\\\":\\\"\";\r\n    if let Some(value) = bytes.strip_prefix(PREFIX).and_then(|rest| rest.strip_suffix(\"\\\"}\")) {\r\n        return Ok(Msg::Hello(value.replace(\"\\\\\\\"\", \"\\\"\")));\r\n    }\r\n\r\n    Err(\"unknown\".into())\r\n}\r\n\r\npub fn encode(msg: &Msg) -> String {\r\n    match msg {\r\n        Msg::Ping => \"ping\".into(),\r\n        Msg::Hello(value) => format!(\r\n            \"{{\\\"v\\\":2,\\\"type\\\":\\\"hello\\\",\\\"value\\\":\\\"{}\\\"}}\",\r\n            value.replace('\\\\', \"\\\\\\\\\").replace('\\\"', \"\\\\\\\"\")\r\n        ),\r\n        Msg::Heartbeat(sequence) => format!(\r\n            \"{{\\\"v\\\":2,\\\"type\\\":\\\"heartbeat\\\",\\\"value\\\":{}}}\",\r\n            sequence\r\n        ),\r\n    }\r\n}\r\n\r\npub fn ping_roundtrip() -> Result<Msg, String> {\r\n    decode(&encode(&Msg::Ping))\r\n}\r\n\r\n#[cfg(test)]\r\nmod tests {\r\n    use super::*;\r\n\r\n    #[test]\r\n    fn decodes_ping_frame() {\r\n        assert!(matches!(decode(\"ping\"), Ok(Msg::Ping)));\r\n    }\r\n\r\n    #[test]\r\n    fn roundtrips_hello_v2_frame() {\r\n        let message = Msg::Hello(\"hello\".into());\r\n        assert!(matches!(decode(&encode(&message)), Ok(Msg::Hello(value)) if value == \"hello\"));\r\n    }\r\n\r\n    #[test]\r\n    fn roundtrips_heartbeat_frame() {\r\n        let message = Msg::Heartbeat(42);\r\n        assert!(matches!(decode(&encode(&message)), Ok(Msg::Heartbeat(sequence)) if sequence == 42));\r\n    }\r\n}\r\n"
     }
   ],
   "commands": [
@@ -70,16 +70,16 @@
       "argv": [
         "python",
         "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\longflow\\checks\\wire_v1.py",
-        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpzl9wFh\\dynamic"
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpDJ2RNw\\dynamic"
       ],
       "expect_exit": 0,
-      "exit": 1,
+      "exit": 0,
       "timed_out": false,
       "stdout": "",
-      "stderr": "wire_v1 failed",
+      "stderr": "",
       "stdout_truncated": false,
       "stderr_truncated": false,
-      "passed": false
+      "passed": true
     }
   ]
 }
