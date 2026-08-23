@@ -233,10 +233,8 @@ pub(crate) struct State {
     /// events and measures event-distance, not age.
     #[serde(default, alias = "tick")]
     pub(crate) event_seq: u64,
-    /// Sequence value as of the last completed maintenance pass
-    /// (SCHED-01): when it equals `event_seq`, no state has changed and a
-    /// skippable maintenance trigger becomes a true no-op — no scan, no
-    /// sequence consumption.
+    /// 上一次维护完成时的序列值：与 `event_seq` 相等说明状态无变化，
+    /// 此类维护触发可直接跳过——不扫描，也不消耗序列。
     #[serde(default)]
     pub(crate) last_maintained_seq: u64,
     /// User-turn clock: advances once per user message. Rules measuring
@@ -1178,11 +1176,9 @@ impl ContextEngine for SimpleContextEngine {
         trigger: ContextMaintenanceTrigger,
     ) -> AgentResult<ContextMaintenanceReport> {
         let mut state = self.state.lock().await;
-        // Maintenance-debt gate (SCHED-01): a pass consumes sequence space
-        // and rescans Resident+Warm. Lifecycle-closure triggers always run
-        // — they carry semantics beyond dirty work. A clean `BeforeModel`
-        // (no state change since the last completed pass) is a true no-op:
-        // no scan, no `event_seq` consumption.
+        // 维护债务门：无变化时 BeforeModel 是真正的空操作——不扫描、
+        // 不消耗序列。生命周期关闭类触发始终执行，它们携带的语义超出
+        // 脏工作本身。
         if matches!(trigger, ContextMaintenanceTrigger::BeforeModel)
             && state.last_maintained_seq == state.event_seq
         {

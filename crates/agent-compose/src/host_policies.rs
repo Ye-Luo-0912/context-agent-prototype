@@ -1,26 +1,22 @@
-//! The trusted host policy registry (CORE-11). Composition owns the
-//! mapping from tool names to real effects: builtin implementations come
-//! from `tool-runtime`, and operator-reviewed plugin bindings are
-//! admitted here — a manifest request never becomes an entry by itself.
-//! The same registry instance must reach the kernel config and the
-//! approval gate so approval and lease minting cannot drift.
+//! 组合根持有的宿主授权注册表：内置实现来自 tool-runtime，运维审核过
+//! 的插件绑定经准入安装——清单请求本身永远不等于授权。同一实例必须
+//! 同时交给内核配置与审批门，两边才不会漂移。
 
 use std::sync::Arc;
 
 use agent_contracts::{HostToolPolicies, HostToolPolicy};
 
 pub struct HostToolPolicyRegistry {
-    /// Builtin entries, installed once at construction. Admissions may
-    /// not shadow them: `fs.write`'s authority is the host's, not a
-    /// manifest's.
+    /// 构造时装好的内置项。准入不得遮蔽它们：`fs.write` 的授权属于
+    /// 宿主，不属于清单。
     builtins: Vec<HostToolPolicy>,
-    /// Operator-admitted plugin bindings.
+    /// 运维准入的插件绑定。
     admitted: Vec<HostToolPolicy>,
 }
 
 impl HostToolPolicyRegistry {
-    /// Builtins only — the fail-closed starting point every composition
-    /// shares. Plugin tools have no entry until explicitly admitted.
+    /// 仅内置表——所有组合共用的 fail-closed 起点。未准入的插件工具
+    /// 没有条目。
     pub fn with_builtins() -> Self {
         Self {
             builtins: tool_runtime::BUILTIN_TOOL_POLICIES.clone(),
@@ -28,9 +24,8 @@ impl HostToolPolicyRegistry {
         }
     }
 
-    /// Install one operator-reviewed plugin binding. Fails closed on a
-    /// builtin name (the host does not re-delegate its own tools) and on
-    /// a duplicate admission.
+    /// 安装一条运维审核过的插件绑定。撞内置名或重复准入一律失败：
+    /// 内置工具的授权不重新下放。
     pub fn admit(&mut self, policy: HostToolPolicy) -> Result<(), String> {
         if self.builtins.iter().any(|p| p.tool_name == policy.tool_name) {
             return Err(format!(
@@ -48,8 +43,7 @@ impl HostToolPolicyRegistry {
         Ok(())
     }
 
-    /// Shared handle for wiring into kernel config, approval gate and
-    /// dispatcher from one source.
+    /// 共享句柄：内核配置、审批门与分发器从同一来源接线。
     pub fn shared(self) -> Arc<Self> {
         Arc::new(self)
     }

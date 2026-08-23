@@ -156,10 +156,9 @@ pub(crate) struct ContextCatalog {
     /// never collide within a generation).
     text_ids: HashMap<ContextItemId, u32>,
     text_docs: Vec<ContextItemId>,
-    /// Set once any indexed doc's body hit the prefix bound: keywords
-    /// beyond it are invisible to the index, so needle searches must
-    /// report incomplete recall (SCHED-02). Monotonic on purpose — the
-    /// extra residual verification it triggers is bounded and safe.
+    /// 一旦有已索引文档的正文在索引前缀处被截断就置位：深处的关键词
+    /// 索引看不见，词检索必须如实报告召回不完整。只置位不清除——它
+    /// 触发的残差校验有界且安全。
     any_body_truncated: bool,
     fingerprint: CatalogFingerprint,
     #[cfg(test)]
@@ -282,20 +281,17 @@ impl ContextCatalog {
             .unwrap_or_default()
     }
 
-    /// Catalog candidate ids for `context.search` (Resident, Warm, Stored).
-    /// Test-only convenience over [`Self::search_candidates`]; production
-    /// callers need the completeness statement too.
+    /// 目录候选 id。仅测试用；生产调用方需要完备性说明，走
+    /// [`Self::search_candidates`]。
     #[cfg(test)]
     pub(crate) fn search_ids(&self, query: &ContextSearchQuery) -> Option<Vec<ContextItemId>> {
         self.search_candidates(query)
             .map(|candidates| candidates.ids)
     }
 
-    /// Candidates plus an explicit completeness statement (SCHED-02):
-    /// when the index could not have seen everything (saturated postings,
-    /// truncated bodies), `incomplete` tells the caller to run a bounded
-    /// residual verification over non-candidates. Search is the GC safety
-    /// net — recall completeness must be explicit, not implied.
+    /// 目录候选 id 加显式完备性说明：索引有上限（饱和倒排、截断正文）
+    /// 时 `incomplete` 非空，调用方须对非候选做有界残差校验。检索是
+    /// GC 的兜底网，召回是否完整必须明说。
     pub(crate) fn search_candidates(&self, query: &ContextSearchQuery) -> Option<SearchCandidates> {
         let done = |ids: Vec<ContextItemId>, incomplete: Option<SearchIncompleteReason>| {
             Some(SearchCandidates { ids, incomplete })
@@ -427,8 +423,7 @@ impl ContextCatalog {
         done(ids, None)
     }
 
-    /// Why the text index may have missed matches for this needle. Only
-    /// meaningful once the text layer was consulted.
+    /// 文本索引为何可能漏掉该词的命中：仅在文本层已被查询过时有意义。
     fn index_incomplete_reason(&self, needle: &str) -> Option<SearchIncompleteReason> {
         let tokens = tokenize(needle);
         if self.text.has_saturated_token(&tokens) {
@@ -855,8 +850,7 @@ mod tests {
 
     #[test]
     fn truncated_bodies_report_incomplete_candidates() {
-        // The keyword lives ONLY in the body beyond the index bound:
-        // entities are indexed untruncated, so they must not carry it.
+        // 关键词只出现在超出索引前缀的正文里：实体不截断，不能替它携带。
         let mut long = item(ContextItemId::new(), "", None);
         long.content = format!("{} zebra tail beyond the bound", "x".repeat(600));
         long.entities.clear();

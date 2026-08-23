@@ -16,9 +16,8 @@ pub(super) const MAX_COVERAGE_PATHS: usize = 8;
 /// Consecutive identical no-progress rounds before the runtime tells the
 /// model its repeated behavior is not moving the world (MOD-PROG-01).
 pub(super) const STALL_THRESHOLD: u32 = 3;
-/// Distinct targets hit by consecutive same-class failures before the
-/// cluster line surfaces (SCHED-03): a spelling-variation streak never
-/// reaches [`STALL_THRESHOLD`] on any one signature.
+/// 连续同类失败命中的不同目标数达到该值即上报聚类提示：换拼写的
+/// 连击在任一单独签名上永远到不了 [`STALL_THRESHOLD`]。
 pub(super) const STALL_CLUSTER_DISTINCT_TARGETS: u32 = 2;
 
 /// Deterministic progress classification of one tool result. Not a
@@ -52,9 +51,8 @@ pub struct StallState {
     pub failure: Option<ToolFailureClass>,
 }
 
-/// SCHED-03: consecutive same-class failures across different targets
-/// over an unchanged world. The per-signature counter cannot see
-/// invented-path streaks that vary the spelling on every attempt.
+/// 同类失败跨不同目标的连击：逐签名的计数器看不见"每次换一个拼写"
+/// 的虚构路径连击。
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct FailureCluster {
@@ -479,10 +477,8 @@ impl ExecutionState {
         }
     }
 
-    /// Bounded deterministic stall message. Two detectors feed it: the
-    /// MOD-PROG-01 identical-signature repeat and the SCHED-03
-    /// same-class-across-targets cluster; whichever fires first wins.
-    /// Advisory only: the model still chooses the next action.
+    /// 有界的确定性停滞提示。两个检测器共用：同签名重复与跨目标同类
+    /// 聚类，先触发者生效。仅建议，模型仍自主选择。
     pub(super) fn stall_warning(&self) -> Option<String> {
         if self.stall.consecutive_no_progress >= STALL_THRESHOLD {
             let target = if self.stall.target.is_empty() {
@@ -514,11 +510,9 @@ impl ExecutionState {
         None
     }
 
-    /// MOD-PROG-01 stall accounting: any progress resets the counter; a
-    /// no-progress round increments it when the operation signature
-    /// (tool + target + failure class) repeats. SCHED-03 additionally
-    /// aggregates same-class failures across changing targets so a
-    /// spelling-variation streak cannot dodge the per-signature counter.
+    /// 停滞记账：任何进展清零；无进展且操作签名（工具+目标+失败类别）
+    /// 重复时递增。同类失败跨目标变化另记入聚类，换拼写的连击躲不开
+    /// 逐签名计数器的盲区。
     pub(super) fn update_stall(
         &mut self,
         identity: &OperationIdentity,

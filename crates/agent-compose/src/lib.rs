@@ -202,10 +202,8 @@ pub struct ComposeConfig {
     pub max_tool_rounds: Option<usize>,
     /// Ablation: omit TaskProgress from the Focus frame. Default true.
     pub project_task_progress: bool,
-    /// The trusted host policy registry (CORE-11). `None` composes the
-    /// builtin table only; plugin tools then stay fail-closed (no entry,
-    /// no grant). The same source is wired into the kernel config and the
-    /// capability dispatcher.
+    /// 受信的宿主授权注册表。缺省只装内置表；插件工具没有条目就没有
+    /// 授权，保持 fail-closed。同一来源接入内核配置与能力分发器。
     pub host_policies: Option<Arc<HostToolPolicyRegistry>>,
 }
 
@@ -264,8 +262,8 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         host_policies,
     } = config;
 
-    // The authority mapping is a composition-root decision: builtins plus
-    // operator-admitted plugin bindings, shared by kernel and dispatcher.
+    // 授权映射是组合根的决定：内置表加运维准入的插件绑定，内核与
+    // 分发器共用一份。
     let host_policies =
         host_policies.unwrap_or_else(|| Arc::new(HostToolPolicyRegistry::with_builtins()));
 

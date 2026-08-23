@@ -163,12 +163,9 @@ pub(crate) fn search_catalog(
                 .into_iter()
                 .filter_map(|id| project_search_hit(state, id));
             if candidates.incomplete.is_some() {
-                // Completeness guarantee (SCHED-02): the index could not
-                // have seen everything, so non-candidates go through the
-                // same bounded heap — lazy projection keeps memory at
-                // O(limit), and the body closure lets deep-body keywords
-                // verify against actual content, not just the bounded
-                // projected summary.
+                // 完备性保证：索引可能没看全，非候选走同一个有界堆——
+                // 惰性投影把内存保持在 O(limit)，正文闭包让深正文关键
+                // 词对真实内容校验，而不是只对有界的投影摘要。
                 let residual = residual_live_candidates(state)
                     .filter(move |entry| !seen.contains(&entry.item_id));
                 let body_of = |id: ContextItemId| catalog_body(state, id).map(|item| item.content);
@@ -327,10 +324,9 @@ pub(crate) fn search_entries(
     search_entries_with(entries, query, None)
 }
 
-/// Same ranking/verification as [`search_entries`], with an optional
-/// full-body lookup used only by the incomplete-recall residual pass
-/// (SCHED-02): projected summaries are bounded, so a deep-body keyword
-/// can only be verified against the item's actual content.
+/// 与 [`search_entries`] 相同的排序与校验，另带一个可选的全文读取，
+/// 仅供召回不完整时的残差通道使用：投影摘要有界，深正文关键词只有
+/// 对条目真实内容校验才能确认。
 pub(crate) fn search_entries_with(
     entries: impl IntoIterator<Item = ExternalizedContext>,
     query: &agent_contracts::ContextSearchQuery,
@@ -402,8 +398,8 @@ pub(crate) fn search_entries_with(
             // 整段未命中时的确定性兜底：候选层已按 token 召回多词查询，
             // 校验若仍要求整段子串会把它们全部拒掉。改为要求 needle 的
             // 每个 token（共享 tokenize 规则，≥2 字符）都出现在本条目的
-            // 可匹配文本里——AND 语义，不放宽为任意单词命中。残差通道
-            // （带正文闭包）对单 token 也生效：深正文关键词只有正文里有。
+            // 可匹配文本里——AND 语义，不放宽为任意单词命中。带正文闭包
+            // 的残差通道对单 token 同样生效：深正文关键词只有正文里有。
             if !token_verify && body_of.is_none() {
                 continue;
             }
@@ -1357,10 +1353,8 @@ mod tests {
 
     #[test]
     fn deep_body_keywords_are_rescued_when_candidates_are_incomplete() {
-        // The index sees only the first 512 chars: the long doc's "zebra"
-        // sits beyond it, so candidates name just the short doc — but
-        // incompleteness must trigger the residual verification that
-        // rescues the deep-body target (SCHED-02).
+        // 索引只见前 512 字符：长文档的 "zebra" 在其之外，候选只会有短
+        // 文档——不完备标记必须触发残差校验，把深正文目标救回来。
         let mut state = State::default();
         let mut resident = Vec::new();
         let mut item_ids = Vec::new();
@@ -1393,9 +1387,8 @@ mod tests {
             &state,
             &agent_contracts::ContextSearchQuery::new("zebra", 8),
         );
-        // Identity, not summary text: the projection is bounded by design,
-        // so the deep doc's summary never shows the phrase — the rescue is
-        // visible only in which items surface.
+        // 按条目身份断言，不按摘要文本：投影有界是设计使然，深文档的摘
+        // 要永远不会出现那个短语——救援效果只体现在哪些条目浮现。
         assert!(
             hits.iter().any(|h| h.item_id == deep_id),
             "the deep-body target must be rescued by the residual pass: {:?}",

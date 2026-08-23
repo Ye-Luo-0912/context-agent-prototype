@@ -164,9 +164,8 @@ pub struct CapabilityRegistry {
     /// unchanged catalog answers `capability.search` without rebuilding
     /// every row from the registry lock.
     rows_cache: RwLock<Option<(u64, Arc<Vec<ToolCatalogEntry>>)>>,
-    /// Monotonic lifecycle tick: bumped at every load and every gc() safe
-    /// point, so per-tool idle aging measures rounds, like the builtin
-    /// catalog.
+    /// 单调生命周期时钟：只在每次模型轮的 gc 安全点推进。load 与使用
+    /// 只打戳不推进，空闲阈值才真正表示"多少个推理轮没用过"。
     tick: AtomicU64,
     /// Idle model rounds before a loaded capability tool cools to Warm.
     idle_to_warm_ticks: u64,
@@ -1068,10 +1067,9 @@ pub struct CapabilityAwareDispatcher {
     /// gets a `CapabilityInvocationContext` whose confined handles are
     /// built from it.
     workspace: Option<Arc<Workspace>>,
-    /// Host policy mapping (CORE-11) for deriving an admitted plugin's
-    /// approved intent. Composition injects the same source the kernel
-    /// lease path uses; `None` keeps the declared-risk empty bound, so an
-    /// unadmitted plugin can never widen authority through this path.
+    /// 宿主授权映射：为已准入插件推导批准意图。组合根注入与内核租约
+    /// 路径相同的来源；缺省时退回按声明风险的空意图，未准入插件无法
+    /// 借此扩权。
     host_policies: Option<std::sync::Arc<dyn HostToolPolicies>>,
 }
 
@@ -1103,7 +1101,7 @@ impl CapabilityAwareDispatcher {
         }
     }
 
-    /// Install the host policy mapping (same source as the kernel config).
+    /// 安装宿主授权映射（与内核配置同一来源）。
     pub fn with_host_policies(
         mut self,
         policies: std::sync::Arc<dyn HostToolPolicies>,

@@ -70,9 +70,8 @@ async fn main() -> anyhow::Result<()> {
     if read_only && !grant_args.is_empty() {
         anyhow::bail!("--grant cannot be combined with --read-only");
     }
-    // The authority mapping is a composition-root decision (CORE-11): one
-    // builtin-backed registry shared by the approval gate, the capability
-    // dispatcher and the kernel's lease path.
+    // 授权映射是组合根的决定：一份内置注册表同时交给审批门、能力
+    // 分发器与内核租约路径。
     let host_policies = Arc::new(HostToolPolicyRegistry::with_builtins());
     let (approval, interactive) = if read_only {
         (

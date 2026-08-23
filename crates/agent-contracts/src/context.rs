@@ -241,7 +241,7 @@ impl FsRereadClass {
 /// | `first` | Normal first exploration |
 /// | `body-visible-current` | Body was in the last prompt; model trajectory |
 /// | `descriptor-only` | Last prompt had identity only; model needed the body |
-/// | `protocol-checkpoint-body-missing` | Read earlier, digest unchanged, frame lost the body |
+/// | `protocol-checkpoint-body-missing` | 之前读过、摘要未变，帧里丢了正文 |
 /// | `checked-fresh` | Identity known and the body had no clear need |
 /// | `needs-revalidation` | Runtime should hash; the model should not `fs.read` |
 /// | `warm` | GC moved the body to the eviction buffer |
@@ -256,10 +256,8 @@ pub enum FsReadMotive {
     BodyVisibleCurrent,
     /// Last prompt only had `path@rev` (selected or external descriptor).
     DescriptorOnly,
-    /// The model consumed this exact body before (read-provenance fact,
-    /// unchanged digest), but the current frame carries identity only —
-    /// the turn/checkpoint boundary dropped it. This is the population a
-    /// protocol evidence body cache could serve (SCHED-04).
+    /// 正文此前已被模型消费（来源为真实读取、摘要未变），当前帧却只剩身份：
+    /// 轮次/检查点边界丢掉了正文。协议层正文缓存服务的正是这一类。
     ProtocolCheckpointBodyMissing,
     /// Runtime already knew `path@revision` was Fresh.
     CheckedFresh,

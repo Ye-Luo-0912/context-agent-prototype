@@ -208,9 +208,8 @@ fn progress_resets_the_stall_counter() {
 
 #[test]
 fn stall_signature_change_resets_the_counter() {
-    // Alternating targets keep the per-signature counter alone, and a
-    // refusal that observes a NEW file is Evidence progress, which
-    // clears the cluster too.
+    // 换目标让逐签名计数器各自为政，而拒绝时观察到新文件属于 Evidence
+    // 进展，同样会清掉聚类。
     let mut resume = ExecutionState::default();
     resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
     resume.observe_tool(&refused_edit("src/a.rs", "rev-a", "stale_revision"), 1, 2);
@@ -232,9 +231,8 @@ fn failed_read(path: &str, class: &str) -> ToolOutput {
 
 #[test]
 fn invented_path_streak_across_spellings_surfaces_the_cluster_stall() {
-    // SCHED-03: an invented-program streak varies the spelling every
-    // attempt, so no single signature accumulates. The class cluster
-    // sees two distinct targets fail alike over an unchanged world.
+    // 虚构路径连击每次换拼写，任何单一签名都积不起来；类别聚类看到的
+    // 是两个不同目标在同一世界里以同一方式失败。
     let mut resume = ExecutionState::default();
     resume.observe_tool(&output("fs.read", true, "read protocol"), 1, 1);
     resume.observe_tool(&failed_read("src/lib.rs", "path_not_found"), 1, 2);
@@ -254,8 +252,7 @@ fn invented_path_streak_across_spellings_surfaces_the_cluster_stall() {
 
 #[test]
 fn failure_cluster_needs_the_same_failure_class() {
-    // Different classes are different evidence: mixing them must not
-    // manufacture a streak.
+    // 类别不同就是不同的证据：混在一起不能制造连击。
     let mut resume = ExecutionState::default();
     resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
     resume.observe_tool(&failed_read("src/a.rs", "path_not_found"), 1, 2);
@@ -265,8 +262,8 @@ fn failure_cluster_needs_the_same_failure_class() {
 
 #[test]
 fn world_progress_clears_the_failure_cluster() {
-    // A real observation between failures means the model is exploring,
-    // not looping: the cluster restarts.
+    // 两次失败之间出现真实观察，说明模型在探索而不是打转：聚类重新
+    // 开始计数。
     let mut resume = ExecutionState::default();
     resume.observe_tool(&output("fs.read", true, "read auth"), 1, 1);
     resume.observe_tool(&failed_read("src/lib.rs", "path_not_found"), 1, 2);

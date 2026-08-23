@@ -970,8 +970,7 @@ pub(crate) fn require_covered_process_spawn(
     arguments: &Value,
     actual: &agent_contracts::EffectIntent,
 ) -> AgentResult<()> {
-    // The dispatcher's own builtin table is the host mapping for the
-    // names it dispatches (CORE-11).
+    // 分发器自己的内置表就是它所分发名字的宿主授权映射。
     if process_spawn_is_covered(&crate::BuiltinToolPolicies, tool_name, arguments, actual) {
         Ok(())
     } else {

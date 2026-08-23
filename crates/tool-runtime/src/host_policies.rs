@@ -1,8 +1,6 @@
-//! Builtin host policy implementations (CORE-11): the concrete
-//! argument→effect bindings for the tools this crate dispatches. The
-//! table lives here, next to the handlers that read those same argument
-//! names — `agent-contracts` carries only the vocabulary, and trusted
-//! composition installs these entries into its registry.
+//! 内置工具的宿主授权实现：本 crate 所分发工具的具体"参数→效果"绑定
+//! 表。表放在处理器旁边——两边读同一批参数名；契约层只承载词汇，
+//! 组合根负责把这里的内容装进注册表。
 
 use std::sync::LazyLock;
 
@@ -15,8 +13,8 @@ fn readonly(tool_name: &str) -> HostToolPolicy {
     }
 }
 
-/// The builtin policies of this dispatcher. One entry per dispatched
-/// name; an unknown name has none and stays fail-closed.
+/// 本分发器的内置授权项，每个被分发的工具名一条；未知名字没有条目，
+/// 保持 fail-closed。
 pub static BUILTIN_TOOL_POLICIES: LazyLock<Vec<HostToolPolicy>> = LazyLock::new(|| {
     vec![
         readonly("fs.list"),
@@ -72,8 +70,7 @@ pub static BUILTIN_TOOL_POLICIES: LazyLock<Vec<HostToolPolicy>> = LazyLock::new(
     ]
 });
 
-/// [`HostToolPolicies`] over the builtin table. Stateless; share one
-/// instance per composition.
+/// 内置表之上的 [`HostToolPolicies`] 实现。无状态，组合内共享一份即可。
 pub struct BuiltinToolPolicies;
 
 impl HostToolPolicies for BuiltinToolPolicies {

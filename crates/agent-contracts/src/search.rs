@@ -15,21 +15,17 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ids::ContextItemId;
 
-/// Why a candidate set may be incomplete against the full corpus
-/// (SCHED-02). Each reason names the bound that hid potential matches.
+/// 候选集可能不完整的原因：对应是哪个索引上限藏住了潜在命中。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchIncompleteReason {
-    /// A queried token's posting list was capped at
-    /// [`MAX_POSTINGS_PER_TOKEN`]; later documents were rejected.
+    /// 查询词的倒排列表写入时触顶，后来的文档被拒绝。
     SaturatedPosting,
-    /// Some indexed docs truncated their text at the index prefix bound,
-    /// so keywords beyond it cannot match inside the index.
+    /// 部分已索引文档的正文在索引前缀处截断，深处的关键词索引看不见。
     TruncatedIndexedText,
 }
 
-/// Candidate ids plus an explicit completeness statement. Search is the
-/// GC safety net: when `incomplete` is set, callers must run a bounded
-/// residual verification over non-candidates instead of trusting the set.
+/// 候选 id 加显式完备性说明。检索是 GC 的兜底网：`incomplete` 非空时，
+/// 调用方必须对非候选做有界残差校验，不能默认集合完整。
 #[derive(Debug, Clone, Default)]
 pub struct SearchCandidates {
     pub ids: Vec<ContextItemId>,

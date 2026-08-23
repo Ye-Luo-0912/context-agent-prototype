@@ -51,11 +51,9 @@ pub struct CoreAuthorityConfig {
     /// long after approval; the actor refuses to commit a staged effect
     /// whose lease has expired and rolls it back instead.
     pub lease_ttl_ms: Option<u64>,
-    /// Host policy mapping (CORE-11): the trusted composition installs
-    /// builtin implementations plus admitted plugin bindings here, and
-    /// gives the same source to the approval gate. `None` derives every
-    /// intent from the declared risk alone (the fail-closed empty bound),
-    /// which can never match a grant.
+    /// 宿主授权映射：组合根在此安装内置实现与已准入的插件绑定，并把
+    /// 同一来源交给审批门。缺省时一切意图按声明风险的空界限推导，
+    /// 永远匹配不到授权。
     pub host_policies: Option<Arc<dyn agent_contracts::HostToolPolicies>>,
 }
 

@@ -1,25 +1,20 @@
-//! Trusted host effect binding: the model-facing [`crate::ToolSpec`] is not
-//! an authority document.
+//! 受信的宿主效果绑定：模型可见的 [`crate::ToolSpec`] 不是授权文书。
 //!
-//! A plugin manifest may *request* permissions. Only a host-installed
-//! policy decides which argument is which real resource. An unknown name
-//! with `ToolRisk::ProcessExecution` does not become a process grant just
-//! because it has a `command` field.
+//! 插件清单可以*请求*权限，但只有宿主安装的策略决定哪个参数对应哪个
+//! 真实资源。未知名字即使带着 `ToolRisk::ProcessExecution` 和 `command`
+//! 字段，也不会因此变成进程授权。
 //!
-//! Layering (CORE-11): this module defines the *vocabulary* only — the
-//! policy types, the [`HostToolPolicies`] lookup trait, and the one
-//! derivation every consumer shares. The builtin implementations live in
-//! `tool-runtime`; trusted composition (`agent-compose`) owns the
-//! registry that combines them with operator-admitted plugin bindings.
+//! 分层：本模块只定义词汇——策略类型、[`HostToolPolicies`] 查找
+//! trait、以及所有消费方共用的那一个意图推导。内置表实现在
+//! tool-runtime；组合根持有把内置项与插件准入合并的注册表。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{EffectIntent, ToolCall, ToolRisk, ToolSpec, exec_argv_intent, shell_exec_intent};
 
-/// Host-installed mapping from one tool's arguments onto a real effect.
-/// Argument/name references are owned so plugin admission can install
-/// bindings for non-builtin names.
+/// 宿主安装的"单个工具参数 → 真实效果"映射。参数/名字用 owned 字符串，
+/// 插件准入才能装非内置的名字。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostToolPolicy {
     pub tool_name: String,
@@ -49,17 +44,14 @@ pub enum HostEffectBinding {
     },
 }
 
-/// Operator-owned lookup from tool name to host policy. Trusted
-/// composition provides the implementation: builtin entries contributed
-/// by `tool-runtime` plus admitted plugin bindings. Lookup results are
-/// the only route to a concrete [`EffectIntent`] — a policy absent here
-/// falls back to the declared-risk empty bound (never a grant).
+/// 工具名到宿主策略的查找。实现由组合根提供：tool-runtime 贡献内置
+/// 项，加上准入的插件绑定。查到的结果是通往具体 [`EffectIntent`] 的
+/// 唯一路径——这里没有的策略退回声明风险的空界限，绝不变成授权。
 pub trait HostToolPolicies: Send + Sync {
     fn policy_for(&self, tool_name: &str) -> Option<&HostToolPolicy>;
 
-    /// Derive the concrete effect intent of one call under this mapping.
-    /// Provided so every consumer (approval gate, lease minting, commit
-    /// checks) shares one derivation and cannot drift.
+    /// 在本映射下推导一次调用的具体效果意图。所有消费方（审批门、
+    /// 租约铸造、提交检查）共用这一份推导，不会漂移。
     fn effect_intent(&self, call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
         match self.policy_for(&call.name) {
             Some(policy) => policy.intent_from(&call.arguments),
@@ -109,10 +101,8 @@ impl HostToolPolicy {
     }
 }
 
-/// Derive the concrete effect bound under an empty policy source: every
-/// non-read-only call collapses to its declared-risk empty bound, which
-/// can never match a grant. Used by compositions that admit no tools and
-/// by tests of the fail-closed floor.
+/// 空策略源下的效果界限：一切非只读调用塌缩为声明风险的空界限，
+/// 永远匹配不到授权。供未准入任何工具的组合与 fail-closed 底线测试用。
 pub fn unbound_effect_intent(spec: &ToolSpec) -> EffectIntent {
     match spec.risk {
         ToolRisk::ReadOnly => EffectIntent::ReadOnly,
@@ -253,7 +243,7 @@ mod tests {
         }
     }
 
-    /// Empty source: the fail-closed floor every composition starts from.
+    /// 空来源：所有组合共用的 fail-closed 底线。
     struct NoPolicies;
 
     impl HostToolPolicies for NoPolicies {

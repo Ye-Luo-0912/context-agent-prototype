@@ -313,10 +313,9 @@ pub fn shell_exec_intent(dialect: &str, command: &str) -> EffectIntent {
     }
 }
 
-/// Whether the actual spawn sits inside the host-derived approved bound
-/// for this call. Empty approved bounds never cover a spawn. The caller
-/// supplies the host policy mapping (CORE-11): builtin names resolve
-/// through it, unknown names collapse to the empty process bound.
+/// 实际 spawn 是否落在宿主推导的批准界限内；空批准界限永不覆盖任何
+/// spawn。策略映射由调用方提供：内置名经它解析，未知名字塌缩为空的
+/// 进程界限。
 pub fn process_spawn_is_covered(
     policies: &dyn crate::HostToolPolicies,
     tool_name: &str,
@@ -2106,9 +2105,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Process-only host mapping mirroring the tool-runtime builtin
-    /// entries (CORE-11): contracts carries no builtin table, so the
-    /// coverage tests install the three process bindings locally.
+    /// 进程相关的宿主映射镜像 tool-runtime 的内置项：契约层没有内置
+    /// 表，覆盖测试在本地装这三条绑定。
     use crate::host_policy::HostToolPolicies as _;
     struct ProcessPolicies;
 

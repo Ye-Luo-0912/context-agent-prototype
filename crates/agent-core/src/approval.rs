@@ -231,10 +231,9 @@ pub struct TaskApprovalGate {
     grants: Mutex<HashMap<String, GrantEntry>>,
     audit: Mutex<VecDeque<GrantAuditEntry>>,
     now: Box<dyn Fn() -> u64 + Send + Sync>,
-    /// Host policy mapping (CORE-11): builtin and admitted-plugin
-    /// argument→effect bindings. Composition injects the same source it
-    /// gave the kernel's lease path so the two can never drift. `None`
-    /// keeps only the declared-risk empty bound (fail-closed floor).
+    /// 宿主授权映射：内置与已准入插件的"参数→效果"绑定。组合根注入与
+    /// 内核租约路径相同的来源，审批与租约铸造不会漂移；缺省时只有按
+    /// 声明风险的空界限（fail-closed 底线）。
     host_policies: Option<Arc<dyn HostToolPolicies>>,
 }
 
@@ -433,12 +432,9 @@ impl TaskApprovalGate {
         }
     }
 
-    /// Derive the concrete effect intent of one call from its validated
-    /// arguments through the injected host policy mapping. Shared with the
-    /// v2 lease path so approval and lease minting can never drift;
-    /// missing or malformed arguments produce the empty intent of that
-    /// class (an empty path/command can never match a grant), which is the
-    /// same fail-closed behavior as the legacy argument parsing.
+    /// 从校验过的参数推导一次调用的具体效果意图。与租约路径共用同一
+    /// 来源；参数缺失或畸形时产出该类别的空意图——空路径/空命令永远
+    /// 匹配不到授权，与旧参数解析行为一致。
     fn derive_effect_intent(&self, call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
         match &self.host_policies {
             Some(policies) => policies.effect_intent(call, spec),
@@ -653,13 +649,13 @@ mod tests {
     use agent_contracts::{EffectIntent, GrantTarget, ToolRisk, ToolSemanticRole, ToolSpec};
     use serde_json::json;
 
-    /// The builtin host mapping, straight from tool-runtime: the tests
-    /// assert real argument bindings without a second table in core.
+    /// 直接使用 tool-runtime 的内置映射：断言真实参数绑定，core 内不
+    /// 复制第二张表。
     fn builtin_effect_intent(call: &ToolCall, spec: &ToolSpec) -> EffectIntent {
         tool_runtime::BuiltinToolPolicies.effect_intent(call, spec)
     }
 
-    /// Gate wired to the real builtin mapping — the production shape.
+    /// 接好内置映射的门，即生产形态。
     fn builtin_gate(inner: Arc<dyn ApprovalGate>) -> TaskApprovalGate {
         TaskApprovalGate::new(inner)
             .with_host_policies(Arc::new(tool_runtime::BuiltinToolPolicies))
@@ -1872,9 +1868,8 @@ mod tests {
 
     #[test]
     fn injected_host_policies_drive_the_gate_derivation() {
-        // CORE-11 wiring: the gate derives through the same source the
-        // kernel lease path uses, and stays on the fail-closed empty bound
-        // when composition injected nothing.
+        // 门必须经由与内核租约路径相同的来源推导；未注入时停在
+        // fail-closed 的空界限上。
         let write = ToolCall {
             id: "c".into(),
             name: "fs.write".into(),

@@ -78,8 +78,8 @@ pub struct RunMetrics {
     pub reread_motive_first: u64,
     pub reread_motive_body_visible_current: u64,
     pub reread_motive_descriptor_only: u64,
-    /// Body consumed earlier, digest unchanged, frame identity-only —
-    /// the population a protocol evidence body cache could serve.
+    /// 正文此前被消费、摘要未变、当前帧只剩身份——协议层正文缓存
+    /// 可服务的群体。
     pub reread_motive_protocol_checkpoint_body_missing: u64,
     pub reread_motive_checked_fresh: u64,
     pub reread_motive_needs_revalidation: u64,
