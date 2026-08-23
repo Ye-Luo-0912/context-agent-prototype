@@ -1069,11 +1069,25 @@ fn repeated_identical_verification_pass_is_redundant_not_progress() {
 fn missing_program(argv0: &str, fingerprint: &str) -> ToolOutput {
     let mut out = pathless_command("process.run", false, argv0, "program not found");
     out.metadata = json!({
-        // 与真实 process.run 一致：argv 是 join 过的字符串。
+        // 与真实 process.run 一致：argv 是 join 过的字符串；resolver
+        // 在 preflight 统一盖章 scope 与 epoch 指纹。
         "argv": argv0,
         "cwd": ".",
+        "resolution_scope_key": "scope-a",
         "resolution_fingerprint": fingerprint,
         "failure_class": "path_not_found",
+    });
+    out
+}
+
+/// 成功的命令运行同样携带解析身份（CONV-03 matched-success 的依据）。
+fn resolved_command(argv0: &str, scope: &str, fingerprint: &str) -> ToolOutput {
+    let mut out = pathless_command("process.run", true, argv0, "ran");
+    out.metadata = json!({
+        "argv": argv0,
+        "cwd": ".",
+        "resolution_scope_key": scope,
+        "resolution_fingerprint": fingerprint,
     });
     out
 }
@@ -1107,33 +1121,50 @@ fn executable_obligation_opens_and_survives_unrelated_progress() {
 }
 
 #[test]
-fn same_fingerprint_accumulates_and_new_fingerprint_supersedes() {
+fn same_fingerprint_accumulates_and_new_fingerprint_advances_the_epoch() {
     let mut resume = ExecutionState::default();
     resume.observe_tool(&missing_program("prog_a", "fp-1"), 1, 1);
     resume.observe_tool(&missing_program("prog_b", "fp-1"), 1, 2);
     assert_eq!(resume.obligations[0].attempts, 2);
+    assert_eq!(resume.obligations[0].total_attempts, 2);
     assert_eq!(resume.obligations[0].tried_targets.len(), 2);
 
-    // 环境变化（build 完成 / PATH 改变）→ 新前置取代旧 blocker。
+    // 前置变化（build 完成 / PATH 改变）→ epoch 推进，血统与累计
+    // 账目保持：Runtime 不忘掉这个方向已经浪费过两次。
     resume.observe_tool(&missing_program("prog_c", "fp-2"), 1, 3);
     assert_eq!(resume.obligations.len(), 1);
     assert_eq!(resume.obligations[0].precondition, "fp-2");
+    assert_eq!(resume.obligations[0].epoch, 2);
     assert_eq!(resume.obligations[0].attempts, 1);
+    assert_eq!(resume.obligations[0].total_attempts, 3);
 }
 
 #[test]
-fn launch_success_resolves_the_executable_obligation() {
+fn only_precondition_matched_success_resolves_the_executable_obligation() {
     let mut resume = ExecutionState::default();
     resume.observe_tool(&missing_program("app.exe", "fp-1"), 1, 1);
     assert!(!resume.obligations.is_empty());
-    resume.observe_tool(
-        &pathless_command("process.run", true, "app.exe", "ran"),
+
+    // 同 scope 但不同指纹的成功（例如 rustc 构建成功）：只推进 epoch，
+    // blocker 未被证明解决。
+    resume.observe_tool(&resolved_command("rustc", "scope-a", "fp-2"), 1, 2);
+    assert_eq!(
+        resume.obligations.len(),
         1,
-        2,
+        "world change is not resolution"
     );
+    assert_eq!(resume.obligations[0].epoch, 2);
+    assert_eq!(resume.obligations[0].attempts, 0);
+
+    // 另一个 scope 的成功与本 blocker 无关。
+    resume.observe_tool(&resolved_command("other.exe", "scope-b", "fp-2"), 1, 3);
+    assert_eq!(resume.obligations.len(), 1);
+
+    // 同 scope 同指纹的成功：blocker 特定的证明，义务解除。
+    resume.observe_tool(&resolved_command("app.exe", "scope-a", "fp-2"), 1, 4);
     assert!(
         resume.obligations.is_empty(),
-        "a successful launch proves resolution works now"
+        "a fingerprint-matched launch proves resolution works now"
     );
 }
 

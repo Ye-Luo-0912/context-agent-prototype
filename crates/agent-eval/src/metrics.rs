@@ -80,6 +80,23 @@ pub struct RunMetrics {
     pub protocol_cache_oversize: u64,
     /// 实际回注进模型输入的正文近似 token 总量。
     pub restored_body_tokens: u64,
+    /// PROTO-EVID-03：Unknown footprint 挂起（休眠保留）的条目数。
+    pub protocol_cache_suspended: u64,
+    /// CONV-OBS-01：义务账本生命周期计数（事件流求和）。
+    pub obligation_opened: u64,
+    pub obligation_attempted: u64,
+    pub obligation_precondition_changes: u64,
+    pub obligation_resolved: u64,
+    /// 同血统第 2 次及以后的失败调用数——真正可避免的浪费
+    /// （第一次失败是诚实拒绝，不是优化目标）。
+    pub avoidable_failure_calls: u64,
+    /// 单 epoch 内最大失败尝试数（gate 指标）。
+    pub max_obligation_attempts_per_epoch: u32,
+    /// 单血统跨全部 epoch 的最大累计失败尝试数（gate 指标）。
+    pub max_total_attempts_per_lineage: u32,
+    /// §25 长尾 turn：单个 user directive 内的最大 round 数与 p95。
+    pub max_turn_rounds: u64,
+    pub p95_turn_rounds: u64,
     /// Engine-classified `fs.read` attribution (last diagnostics snapshot).
     pub reread_previously_selected: u64,
     pub reread_selected_descriptor: u64,
@@ -274,10 +291,22 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     let mut recovered_path: HashMap<ContextItemId, RecoverPath> = HashMap::new();
     let mut unique_reactivated: HashSet<ContextItemId> = HashSet::new();
     let mut seen_context_compacted = false;
+    // CONV-OBS-01 血统累计 + §25 每 turn 长尾归因。
+    let mut obligation_lineage_totals: HashMap<String, u32> = HashMap::new();
+    let mut turn_round_buckets: Vec<u64> = Vec::new();
+    let mut current_turn_rounds: u64 = 0;
 
     for envelope in events {
         match &envelope.event {
-            RuntimeEvent::UserMessageAccepted { input } if input.is_applied() => metrics.turns += 1,
+            RuntimeEvent::UserMessageAccepted { input } if input.is_applied() => {
+                // 新 user directive：上一 turn 的 round 数入桶，重新计数
+                // （§25 长尾归因）。
+                if current_turn_rounds > 0 {
+                    turn_round_buckets.push(current_turn_rounds);
+                    current_turn_rounds = 0;
+                }
+                metrics.turns += 1;
+            }
             RuntimeEvent::ToolStarted { call } => {
                 metrics.tool_calls += 1;
                 if is_edit_tool(&call.name) {
@@ -534,6 +563,7 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 hit,
                 miss,
                 invalidated,
+                suspended,
                 oversize,
                 restored_body_tokens,
             } => {
@@ -543,8 +573,46 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 metrics.protocol_cache_hit += *hit;
                 metrics.protocol_cache_miss += *miss;
                 metrics.protocol_cache_invalidated += *invalidated;
+                metrics.protocol_cache_suspended += *suspended;
                 metrics.protocol_cache_oversize += *oversize;
                 metrics.restored_body_tokens += *restored_body_tokens;
+            }
+            RuntimeEvent::ExecutionObligation {
+                kind,
+                domain,
+                scope_digest,
+                epoch,
+                attempts_in_epoch,
+                total_attempts,
+            } => {
+                // CONV-OBS-01：义务账本生命周期指标。avoidable = 同血统
+                // 第 2 次及以后的失败（第一次是诚实失败，其后才是浪费）。
+                match kind {
+                    agent_contracts::ObligationEventKind::Opened => {
+                        metrics.obligation_opened += 1;
+                    }
+                    agent_contracts::ObligationEventKind::Attempted => {
+                        metrics.obligation_attempted += 1;
+                        if *total_attempts >= 2 {
+                            metrics.avoidable_failure_calls += 1;
+                        }
+                        let _ = scope_digest;
+                    }
+                    agent_contracts::ObligationEventKind::PreconditionChanged => {
+                        metrics.obligation_precondition_changes += 1;
+                    }
+                    agent_contracts::ObligationEventKind::Resolved => {
+                        metrics.obligation_resolved += 1;
+                    }
+                    agent_contracts::ObligationEventKind::Dropped => {}
+                }
+                metrics.max_obligation_attempts_per_epoch = metrics
+                    .max_obligation_attempts_per_epoch
+                    .max(*attempts_in_epoch);
+                let lineage_key = format!("{domain:?}:{scope_digest}");
+                let lineage_total = obligation_lineage_totals.entry(lineage_key).or_insert(0u32);
+                *lineage_total = (*lineage_total).max(*total_attempts);
+                let _ = epoch;
             }
             RuntimeEvent::ContextMaintained { report, .. } => {
                 metrics.lifecycle_transitions += report.transitions.len() as u64;
@@ -604,6 +672,7 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             }
             RuntimeEvent::ToolSurfacePlanned { report } => {
                 metrics.rounds += 1;
+                current_turn_rounds = current_turn_rounds.saturating_add(1);
                 metrics.schema_tokens_total += report.selected_schema_tokens as u64;
             }
             RuntimeEvent::ModelStarted { prompt_layers, .. } => {
@@ -731,6 +800,24 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     metrics.recovery_workspace_reread = metrics.repeated_fs_reads;
     metrics.recovery_failed = forgotten.difference(&recovered).count() as u64;
     metrics.unique_reactivated = unique_reactivated.len() as u64;
+    // CONV-OBS-01：血统累计的跨事件上界。
+    metrics.max_total_attempts_per_lineage = obligation_lineage_totals
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    // §25 长尾 turn：任务级 round 均值看不出哪个 directive 是长尾。
+    if current_turn_rounds > 0 {
+        turn_round_buckets.push(current_turn_rounds);
+    }
+    metrics.max_turn_rounds = turn_round_buckets.iter().copied().max().unwrap_or(0);
+    let mut buckets = turn_round_buckets.clone();
+    buckets.sort_unstable();
+    metrics.p95_turn_rounds = buckets
+        .get(((buckets.len() as f64) * 0.95).ceil() as usize)
+        .or_else(|| buckets.last())
+        .copied()
+        .unwrap_or(0);
     metrics
 }
 
@@ -954,7 +1041,9 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          reread: previously_selected={} selected_descriptor={} external_descriptor={} resident_unselected={} warm={} stored={} first_read={}\n\
          reread_motive: first={} body_visible_current={} descriptor_only={} protocol_checkpoint_body_missing={} checked_fresh={} needs_revalidation={} warm={} stored={} changed={}\n\
          selected_attr: kind={:?} reason={:?} source={:?} reactivated={} resident={}\n\
-         tool_failures: {:?}\n",
+         tool_failures: {:?}\n\
+         obligations: opened={} attempted={} precond_changed={} resolved={} avoidable={} max_epoch_attempts={} max_lineage_total={}\n\
+         turn_tail: max_rounds={} p95_rounds={}\n",
         metrics.model_input_tokens,
         metrics.model_output_tokens,
         metrics.model_attempts,
@@ -1076,6 +1165,15 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.selected_tokens_reactivated,
         metrics.selected_tokens_resident,
         metrics.tool_failure_classes,
+        metrics.obligation_opened,
+        metrics.obligation_attempted,
+        metrics.obligation_precondition_changes,
+        metrics.obligation_resolved,
+        metrics.avoidable_failure_calls,
+        metrics.max_obligation_attempts_per_epoch,
+        metrics.max_total_attempts_per_lineage,
+        metrics.max_turn_rounds,
+        metrics.p95_turn_rounds,
     )
 }
 

@@ -436,7 +436,9 @@ impl ActiveTurn {
         let touches = output.resource_touches();
         match output.mutation_footprint() {
             agent_contracts::MutationFootprint::Unknown => {
-                self.protocol_bodies.invalidate_all();
+                // PROTO-EVID-03：Unknown 只挂起不删除——字节保留、资格
+                // 冻结；BeforeModel 重验证同身份后可再次回注。
+                self.protocol_bodies.suspend_all();
             }
             agent_contracts::MutationFootprint::Known(mutated) => {
                 for touch in mutated {

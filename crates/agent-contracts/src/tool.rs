@@ -913,7 +913,7 @@ impl ToolFailureClass {
 }
 
 /// 失败域枚举，见 [`ToolFailureClass::failure_domain`]。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolFailureDomain {
     /// 程序解析：argv0 × cwd × 环境。同参数 + 世界版本未推进时重试
@@ -926,6 +926,7 @@ pub enum ToolFailureDomain {
     /// 项目标记缺失：manifest 级前置条件，模型不得自行补造。
     ProjectMarker,
     /// 时间、调度或退出码相关：不可证等价。
+    #[default]
     NonDeterministic,
 }
 
@@ -941,6 +942,38 @@ impl ToolFailureDomain {
             Self::NonDeterministic => "non_deterministic",
         }
     }
+}
+
+/// CONV-OBS-01：义务账目事件的类型。warning_surfaced 暂缺——警告行
+/// 目前只渲染进 TASK PROGRESS，不经过观察管线，无法在此出账。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObligationEventKind {
+    /// 失败输出首次开出一个 blocker 血统。
+    #[default]
+    Opened,
+    /// 同血统同 epoch 的再次失败。
+    Attempted,
+    /// 前置指纹变化：epoch 推进，血统与累计账目保持。
+    PreconditionChanged,
+    /// blocker 特定的证明到达（如同指纹成功、目标以新身份落地）。
+    Resolved,
+    /// 超出账本容量被淘汰（最旧优先）。
+    Dropped,
+}
+
+/// 义务账本的一条有界账目（不含任何工具正文）。scope_digest 是跨
+/// epoch 稳定的血统身份；epoch/attempts/total 支撑
+/// max_attempts_per_epoch 与 max_total_attempts_per_lineage 指标。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ExecutionObligationEvent {
+    pub kind: ObligationEventKind,
+    pub domain: ToolFailureDomain,
+    pub scope_digest: String,
+    pub epoch: u32,
+    pub attempts_in_epoch: u32,
+    pub total_attempts: u32,
 }
 
 /// Insert `failure_class` and strip any producer-supplied `retryable` flag.

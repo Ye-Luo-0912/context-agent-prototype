@@ -499,6 +499,10 @@ impl AppState {
             RuntimeEvent::ProtocolBodyCacheStats { .. } => {
                 // 正文缓存账目同理：指标归 eval 聚合，UI 不重复渲染。
             }
+            RuntimeEvent::ExecutionObligation { .. } => {
+                // 义务账目同理：typed 计数归 eval 聚合，advisory 已由
+                // TASK PROGRESS 渲染。
+            }
             RuntimeEvent::Diagnostics { diagnostics } => {
                 self.context = diagnostics.clone();
                 self.push_system(format!(

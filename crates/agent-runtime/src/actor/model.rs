@@ -493,6 +493,7 @@ impl RuntimeActor {
                         .eligible
                         .saturating_sub(body_cache_stats.restored),
                     invalidated: deltas.invalidated,
+                    suspended: deltas.suspended,
                     oversize: deltas.oversize,
                     restored_body_tokens: body_cache_stats.restored_body_tokens,
                 })
@@ -730,13 +731,24 @@ impl RuntimeActor {
         turn_frame: &TurnFrame,
         tools: Vec<ToolSpec>,
     ) -> (ModelInput, crate::prompt::ProtocolBodyAssemblyStats) {
-        // PROTO-EVID-01：当轮正文缓存的可回注行交给组装器；是否回注由
-        // 组装器按 checkpoint 截断 + Fresh 事实一致判定。
+        // PROTO-EVID-01/03：当轮正文缓存的可回注行交给组装器。休眠
+        // 条目只有在事实表里同 path@digest 重新 Fresh（BeforeModel 重
+        // 验证通过）时才恢复资格；是否回注由组装器再核对 checkpoint
+        // 截断 + Fresh 事实一致。
         let protocol_bodies = self
             .state
             .turn
             .as_ref()
-            .map(|turn| turn.protocol_bodies.rows())
+            .map(|turn| {
+                let fresh_identities: Vec<(String, String)> = turn
+                    .execution
+                    .checked_files
+                    .iter()
+                    .filter(|fact| fact.freshness == agent_contracts::ResourceFreshness::Fresh)
+                    .map(|fact| (fact.path.clone(), fact.digest.clone()))
+                    .collect();
+                turn.protocol_bodies.eligible_rows(&fresh_identities)
+            })
             .unwrap_or_default();
         self.assembler.assemble_with_catalog_stats(
             focus,

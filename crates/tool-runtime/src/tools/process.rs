@@ -33,6 +33,219 @@ const MAX_ARG_CHARS: usize = 16_384;
 const MAX_ENV_KEYS: usize = 64;
 const MAX_ENV_VALUE_CHARS: usize = 16_384;
 
+// TOOL-PROC-01：argv0 的解析语义由 host 显式定义，不再依赖
+// `Command::new(argv0)` + `current_dir` 的平台隐式行为。Windows 的
+// CreateProcess 不搜索子进程 cwd——cwd 里确实存在的 binary 会被报
+// not_found，直接诱发模型的 `foo` / `./foo` / `.\foo` 猜测循环。
+//
+// 规则（与 cmd.exe 直觉一致、对模型可见）：
+// - 绝对路径：原样使用；
+// - 带分隔符的相对路径（./x、.\x、sub/x）：相对本次调用的 cwd；
+// - 裸名：先查 cwd，再按 effective PATH 顺序；Windows 下末段无扩展名
+//   时依次尝试 PATHEXT 补全。
+// spawn 一律使用解析出的绝对路径。preflight / RetryDomain 指纹 /
+// spawn 三处共享同一份解释。
+const RESOLVER_RULES_VERSION: &[u8] = b"program-resolver-v1";
+/// 指纹目录状态的有界上限：条目数与缓冲字节双界，超限以截断标记入哈希。
+const MAX_FINGERPRINT_ENTRIES: usize = 4096;
+const MAX_FINGERPRINT_BUFFER_BYTES: usize = 128 * 1024;
+const MAX_ATTEMPTED_CANDIDATES: usize = 8;
+
+struct ProgramResolution {
+    /// 传给 `Command::new` 的绝对路径。
+    executable: std::path::PathBuf,
+    /// 稳定 lineage scope（CONV-03）：digest(cwd 身份 + effective PATH
+    /// + 规则版本)。目录内容变化不改变它。
+    scope_key: String,
+    /// 当前 epoch 前置指纹：完整有界目录状态 + PATH + 规范化 env 覆盖。
+    /// build 产出 binary 会改变它；普通源码 edit 不变名字集时也不变。
+    fingerprint: String,
+}
+
+struct ProgramResolutionFailure {
+    candidates_tried: Vec<String>,
+}
+
+fn has_path_separator(argv0: &str) -> bool {
+    argv0.contains('/') || argv0.contains('\\')
+}
+
+fn is_absolute(argv0: &str) -> bool {
+    std::path::Path::new(argv0).is_absolute()
+}
+
+/// Windows 下末段无扩展名的候选按 PATHEXT 顺序补全；其余平台只做直查。
+/// 返回第一个真实存在的具体路径。
+fn candidate_executable(path: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    if path.is_file() {
+        return Some(path);
+    }
+    #[cfg(windows)]
+    {
+        let has_extension = path.extension().is_some_and(|ext| !ext.is_empty());
+        if !has_extension {
+            let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+            for ext in pathext.split(';') {
+                let ext = ext.trim();
+                if ext.is_empty() {
+                    continue;
+                }
+                let ext = ext.strip_prefix('.').unwrap_or(ext);
+                let mut candidate = path.as_os_str().to_owned();
+                candidate.push(".");
+                candidate.push(ext);
+                let candidate = std::path::PathBuf::from(candidate);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn effective_path_dirs() -> Vec<std::path::PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .collect()
+}
+
+/// 完整有界目录状态摘要：全部条目（含点文件）排序后逐个入哈希
+/// （kind 字节 + 名字），条目数与缓冲字节双界，超限以截断标记收尾。
+/// 显示给模型的是前 20 个名字的 preview；identity 绝不只哈希显示窗口
+/// ——这与 fs.list 的修正同理。
+fn directory_state_bytes(dir: &std::path::Path) -> Vec<u8> {
+    let mut names: Vec<(bool, String)> = Vec::new();
+    let mut truncated = false;
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if names.len() >= MAX_FINGERPRINT_ENTRIES {
+            truncated = true;
+            break;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        names.push((is_dir, entry.file_name().to_string_lossy().into_owned()));
+    }
+    names.sort();
+    let mut buffer = Vec::with_capacity(256);
+    for (is_dir, name) in &names {
+        if buffer.len() >= MAX_FINGERPRINT_BUFFER_BYTES {
+            truncated = true;
+            break;
+        }
+        buffer
+            .extend_from_slice(format!("{}{}\n", if *is_dir { 'd' } else { 'f' }, name).as_bytes());
+    }
+    buffer.extend_from_slice(
+        format!(
+            "entries={}truncated={}\n",
+            names.len(),
+            if truncated { 1 } else { 0 }
+        )
+        .as_bytes(),
+    );
+    buffer
+}
+
+fn canonical_env_bytes(env_overrides: &HashMap<String, String>) -> Vec<u8> {
+    let mut pairs: Vec<(&String, &String)> = env_overrides.iter().collect();
+    pairs.sort();
+    let mut buffer = Vec::new();
+    for (key, value) in pairs {
+        buffer.extend_from_slice(key.as_bytes());
+        buffer.extend_from_slice(b"=");
+        buffer.extend_from_slice(value.as_bytes());
+        buffer.push(0);
+    }
+    buffer
+}
+
+/// 解析身份二元组：(scope_key, fingerprint)。scope 只含 cwd 身份 +
+/// PATH + 规则版本（跨 epoch 稳定）；fingerprint 另含完整目录状态与
+/// 规范化 env（epoch 随世界变化）。HashMap 序列化顺序不稳定，env 一律
+/// 先规范化排序再入哈希。
+fn resolution_identity(
+    cwd: &std::path::Path,
+    env_overrides: &HashMap<String, String>,
+) -> (String, String) {
+    let path_text = std::env::var("PATH").unwrap_or_default();
+    let scope_source: Vec<u8> = RESOLVER_RULES_VERSION
+        .iter()
+        .copied()
+        .chain(cwd.to_string_lossy().as_bytes().iter().copied())
+        .chain(b"\0PATH=".iter().copied())
+        .chain(path_text.as_bytes().iter().copied())
+        .collect();
+    let mut fingerprint_source = directory_state_bytes(cwd);
+    fingerprint_source.extend_from_slice(b"\0PATH=");
+    fingerprint_source.extend_from_slice(path_text.as_bytes());
+    fingerprint_source.push(0);
+    fingerprint_source.extend_from_slice(&canonical_env_bytes(env_overrides));
+    fingerprint_source.push(0);
+    fingerprint_source.extend_from_slice(RESOLVER_RULES_VERSION);
+    (
+        content_digest(&scope_source),
+        content_digest(&fingerprint_source),
+    )
+}
+
+fn resolve_program(
+    argv0: &str,
+    cwd: &std::path::Path,
+    env_overrides: &HashMap<String, String>,
+) -> Result<ProgramResolution, ProgramResolutionFailure> {
+    let mut attempted: Vec<String> = Vec::new();
+    let try_candidate = |candidate: std::path::PathBuf, attempted: &mut Vec<String>| {
+        if attempted.len() < MAX_ATTEMPTED_CANDIDATES {
+            attempted.push(candidate.to_string_lossy().into_owned());
+        }
+        candidate_executable(candidate)
+    };
+
+    // 相对路径禁止 `..` 逃逸出本次调用的 cwd（cwd 本身已被工作区约束，
+    // argv0 不能绕过这层围栏）。
+    if !is_absolute(argv0) && has_path_separator(argv0) {
+        let escapes = std::path::Path::new(argv0)
+            .components()
+            .any(|component| component == std::path::Component::ParentDir);
+        if escapes {
+            return Err(ProgramResolutionFailure {
+                candidates_tried: Vec::new(),
+            });
+        }
+    }
+
+    let resolved = if is_absolute(argv0) {
+        try_candidate(std::path::PathBuf::from(argv0), &mut attempted)
+    } else if has_path_separator(argv0) {
+        try_candidate(cwd.join(argv0), &mut attempted)
+    } else {
+        // 裸名：cwd 优先（cmd.exe 语义），再按 PATH 顺序。
+        try_candidate(cwd.join(argv0), &mut attempted).or_else(|| {
+            effective_path_dirs().into_iter().find_map(|dir| {
+                let full = dir.join(argv0);
+                if attempted.len() < MAX_ATTEMPTED_CANDIDATES {
+                    attempted.push(full.to_string_lossy().into_owned());
+                }
+                candidate_executable(full)
+            })
+        })
+    };
+
+    match resolved {
+        Some(executable) => {
+            let (scope_key, fingerprint) = resolution_identity(cwd, env_overrides);
+            Ok(ProgramResolution {
+                executable,
+                scope_key,
+                fingerprint,
+            })
+        }
+        None => Err(ProgramResolutionFailure {
+            candidates_tried: attempted,
+        }),
+    }
+}
+
 pub struct ProcessRunTool {
     workspace: Workspace,
 }
@@ -66,7 +279,7 @@ impl Tool for ProcessRunTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "process.run".into(),
-            description: "Run a program with an explicit argv (no shell), optionally in a workspace-relative cwd with explicit env overrides. A bounded output prefix streams to an artifact; only a bounded tail reaches the model. Timeout/cancel kill the whole process tree.".into(),
+            description: "Run a program with an explicit argv (no shell), optionally in a workspace-relative cwd with explicit env overrides. Program resolution: absolute paths as-is; ./name, .\\name and sub/name resolve inside the cwd; a bare name searches the cwd first, then PATH (PATHEXT-aware on Windows). A bounded output prefix streams to an artifact; only a bounded tail reaches the model. Timeout/cancel kill the whole process tree.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["argv"],
@@ -149,7 +362,50 @@ impl Tool for ProcessRunTool {
             &agent_contracts::exec_argv_intent(&args.argv),
         )?;
 
-        let mut command = Command::new(&args.argv[0]);
+        // TOOL-PROC-01：preflight 显式解析。失败在这里以类型化输出返回
+        // （附尝试过的候选与完整身份指纹），不再把隐式语义留给 spawn。
+        let resolution = match resolve_program(&args.argv[0], &cwd, &args.env) {
+            Ok(resolution) => resolution,
+            Err(failure) => {
+                // 模型反复猜测不存在的程序名是实测最高频的失败循环：
+                // 一次错误必须足以纠正。preview 只列前 20 个名字，
+                // 身份指纹则覆盖完整有界目录状态（PROTO-EVID-03 同理）。
+                let entries = bounded_cwd_listing(&cwd);
+                let (scope_key, fingerprint) = resolution_identity(&cwd, &args.env);
+                return Ok(ToolOutcome::Value(agent_contracts::tool_failure_output(
+                    call_id,
+                    "process.run",
+                    agent_contracts::ToolFailureClass::PathNotFound,
+                    format!("process.run refused: program_not_found ({})", args.argv[0]),
+                    format!(
+                        "program `{}` was not found.\ncwd `{}` contains: {}\ntried: {}\ncompile or install it first, or run a binary that exists in the listing.",
+                        args.argv[0],
+                        cwd.display(),
+                        if entries.is_empty() {
+                            "(empty)".into()
+                        } else {
+                            entries.join(", ")
+                        },
+                        if failure.candidates_tried.is_empty() {
+                            "(nothing: argv[0] may not traverse outside cwd)".into()
+                        } else {
+                            failure.candidates_tried.join(", ")
+                        }
+                    ),
+                    json!({
+                        "argv0": args.argv[0],
+                        "cwd": cwd.display().to_string(),
+                        "entries": entries,
+                        "attempted": failure.candidates_tried,
+                        "resolution_scope_key": scope_key,
+                        "resolution_fingerprint": fingerprint,
+                        "recovery_hint": "use a program that exists in the listing; compile sources before running their binaries",
+                    }),
+                )));
+            }
+        };
+
+        let mut command = Command::new(&resolution.executable);
         command
             .args(&args.argv[1..])
             .current_dir(&cwd)
@@ -169,26 +425,16 @@ impl Tool for ProcessRunTool {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // 模型反复猜测不存在的程序名是实测最高频的失败循环
-                // （live 5 连败）：把有界的工作区清单附进类型化失败，
-                // 让一次错误就足以纠正，而不是再猜四个路径。
+                // preflight 与 spawn 之间目标被删除（或平台补全竞态）：
+                // 仍走同一条类型化路径，身份取 preflight 时盖章的值。
                 let entries = bounded_cwd_listing(&cwd);
-                // CONV-03：解析前置指纹 = cwd listing + PATH + env 覆盖。
-                // 源码普通 edit 不改变它；build 产生 binary 才会变——
-                // 义务账本用它判定 blocker 的前置是否真的变化。
-                let fingerprint_source = format!(
-                    "{}\u{0}{}\u{0}{}",
-                    entries.join("\n"),
-                    std::env::var("PATH").unwrap_or_default(),
-                    serde_json::to_string(&args.env).unwrap_or_default(),
-                );
                 return Ok(ToolOutcome::Value(agent_contracts::tool_failure_output(
                     call_id,
                     "process.run",
                     agent_contracts::ToolFailureClass::PathNotFound,
                     format!("process.run refused: program_not_found ({})", args.argv[0]),
                     format!(
-                        "program `{}` was not found.\ncwd `{}` contains: {}\ncompile or install it first, or run a binary that exists in the listing.",
+                        "program `{}` disappeared before spawn.\ncwd `{}` contains: {}",
                         args.argv[0],
                         cwd.display(),
                         if entries.is_empty() {
@@ -201,8 +447,9 @@ impl Tool for ProcessRunTool {
                         "argv0": args.argv[0],
                         "cwd": cwd.display().to_string(),
                         "entries": entries,
-                        "resolution_fingerprint": content_digest(fingerprint_source.as_bytes()),
-                        "recovery_hint": "use a program that exists in the listing; compile sources before running their binaries",
+                        "resolution_scope_key": resolution.scope_key,
+                        "resolution_fingerprint": resolution.fingerprint,
+                        "recovery_hint": "rebuild or reinstall the binary before running it",
                     }),
                 )));
             }
@@ -349,6 +596,10 @@ impl Tool for ProcessRunTool {
             "outcome": outcome,
             "cwd": if cwd_text.is_empty() { "." } else { &cwd_text },
             "argv": argv_text,
+            // CONV-03 matched-success：成功也携带解析身份，义务账本只
+            // 在 scope 与指纹都匹配时才认定 blocker 被真正解决。
+            "resolution_scope_key": resolution.scope_key,
+            "resolution_fingerprint": resolution.fingerprint,
         });
         if let Some(class) = super::classify_process_outcome(
             outcome,
@@ -424,6 +675,122 @@ mod tests {
 
     fn ctx(run_id: RunId, arguments: &Value) -> agent_contracts::OperationEffectContext {
         crate::tools::test_process_effect_context(run_id, "c", "process.run", arguments)
+    }
+
+    /// TOOL-PROC-01 回归：cwd 里真实存在的可执行文件，裸名 / `.\` /
+    /// `./` 三种写法都必须能跑（Windows CreateProcess 不搜子进程 cwd
+    /// 的平台行为被 resolver 显式抹平），绝对路径照常；不存在的名字
+    /// 返回类型化失败并附尝试过的候选。
+    #[tokio::test]
+    async fn resolution_forms_for_a_binary_in_cwd_all_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        #[cfg(windows)]
+        let src = std::path::PathBuf::from(
+            std::env::var("ComSpec").unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".into()),
+        );
+        #[cfg(not(windows))]
+        let src = std::path::PathBuf::from("/bin/echo");
+        assert!(src.is_file(), "source exe missing: {}", src.display());
+        let program_name = if cfg!(windows) { "probe.exe" } else { "probe" };
+        std::fs::copy(&src, dir.path().join(program_name)).unwrap();
+
+        let tool = ProcessRunTool::new(workspace.clone());
+        for form in [
+            program_name.to_string(),
+            format!(".\\{program_name}"),
+            format!("./{program_name}"),
+            dir.path().join(program_name).to_string_lossy().to_string(),
+        ] {
+            let run_id = RunId::new();
+            let arguments = json!({"argv": [form, "hi"], "cwd": "."});
+            let context = ctx(run_id, &arguments);
+            let output = tool
+                .execute(
+                    run_id,
+                    "c",
+                    arguments,
+                    Some(context),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let output = value(output);
+            assert!(
+                output.ok,
+                "argv0 [{form}] must resolve inside cwd: {}",
+                output.summary
+            );
+            assert!(
+                output.metadata["resolution_scope_key"].is_string()
+                    && !output.metadata["resolution_scope_key"]
+                        .as_str()
+                        .unwrap()
+                        .is_empty(),
+                "success metadata carries the resolution identity"
+            );
+        }
+
+        // 不存在的名字：类型化失败，候选列表里能看到 resolver 试过的路径。
+        let run_id = RunId::new();
+        let arguments = json!({"argv": ["nope.exe"], "cwd": "."});
+        let context = ctx(run_id, &arguments);
+        let output = tool
+            .execute(
+                run_id,
+                "c",
+                arguments,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let output = value(output);
+        assert!(!output.ok);
+        let attempted: Vec<String> =
+            serde_json::from_value(output.metadata["attempted"].clone()).unwrap();
+        assert!(
+            attempted.iter().any(|candidate| candidate.contains("nope")),
+            "tried candidates are reported: {attempted:?}"
+        );
+        // 失败与成功使用同一套身份语义：scope 稳定，指纹随目录状态变化。
+        assert!(output.metadata["resolution_scope_key"].is_string());
+        assert!(output.metadata["resolution_fingerprint"].is_string());
+    }
+
+    /// 指纹 v2：目录状态超过 preview 的 20 个名字后，第 25 个条目变化
+    /// 也必须改变指纹（identity ≠ 显示窗口）；env 顺序不影响指纹；
+    /// scope 在内容变化时保持稳定。
+    #[test]
+    fn fingerprint_covers_full_directory_state_and_canonical_env() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..30 {
+            std::fs::write(dir.path().join(format!("file{index:02}.txt")), "x").unwrap();
+        }
+        let env_a: HashMap<String, String> =
+            [("K1".into(), "v1".into()), ("K2".into(), "v2".into())].into();
+        let (scope_a, fp_a) = resolution_identity(dir.path(), &env_a);
+
+        // 同一状态：指纹稳定（HashMap 迭代顺序无关）。
+        let env_b: HashMap<String, String> =
+            [("K2".into(), "v2".into()), ("K1".into(), "v1".into())].into();
+        let (scope_b, fp_b) = resolution_identity(dir.path(), &env_b);
+        assert_eq!(scope_a, scope_b);
+        assert_eq!(fp_a, fp_b);
+
+        // 第 25 个条目消失：preview 前 20 名不变，但指纹必须变。
+        // （目录状态指纹覆盖名字集合——解析域的前置是“存在与否”，
+        // 同名文件的字节重建不属于解析前置。）
+        std::fs::remove_file(dir.path().join("file24.txt")).unwrap();
+        let (_scope_c, fp_c) = resolution_identity(dir.path(), &env_a);
+        assert_ne!(fp_a, fp_c, "beyond-preview changes must move the epoch");
+        assert_eq!(scope_a, _scope_c, "content changes never move the scope");
+
+        // 新增文件同样推进 epoch，scope 不变。
+        std::fs::write(dir.path().join("zz_new.bin"), "y").unwrap();
+        let (_scope_d, fp_d) = resolution_identity(dir.path(), &env_a);
+        assert_ne!(fp_c, fp_d);
+        assert_eq!(scope_a, _scope_d);
     }
 
     #[tokio::test]

@@ -159,9 +159,11 @@ impl ExecutionState {
         // edit 的新 digest 必须当场杀死绑定旧 digest 的证据行，而不是
         // 等到下一轮。失效条数随事件上报。
         let invalidated = self.invalidate_stale_evidence();
-        // 义务账本：先解析（本输出可能已解除旧义务），再登记新失败。
-        self.resolve_obligations(output);
-        self.record_obligation(output, &identity);
+        // 义务账本：先解析（本输出可能已解除旧义务或推进 epoch），再
+        // 登记新失败；账目事件随 FrontierObservation 出账（CONV-OBS-01）。
+        let mut obligation_events = Vec::new();
+        self.resolve_obligations(output, &mut obligation_events);
+        self.record_obligation(output, &identity, &mut obligation_events);
         self.cap();
         self.refresh_validity();
         // Deterministic frontier classification (CONV-01): a verification
@@ -221,6 +223,7 @@ impl ExecutionState {
             actions_since_frontier_advance: self.convergence.actions_since_frontier_advance,
             evidence_revision: self.convergence.evidence_revision,
             invalidated,
+            obligation_events,
         }
     }
 

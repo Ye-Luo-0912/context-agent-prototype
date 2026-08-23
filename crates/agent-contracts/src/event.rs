@@ -186,9 +186,10 @@ pub enum RuntimeEvent {
     },
     /// PROTO-EVID-02b：当轮正文缓存账目，每次模型输入组装出一条增量。
     /// eligible/hit/miss 为本次组装的候选/回注/未回注行数；
-    /// invalidated/oversize 为自上一条账目以来因 mutation 失效、因超限
-    /// 拒缓存的条数；restored_body_tokens 为本次回注正文的近似 token。
-    /// 缓存命中率由此可从事件流独立验证。
+    /// invalidated 为物理丢弃条数（Known mutation / LRU 挤出），
+    /// suspended 为 Unknown footprint 挂起（休眠保留）的条数，
+    /// oversize 为因超限拒缓存的条数；restored_body_tokens 为本次
+    /// 回注正文的近似 token。缓存命中率由此可从事件流独立验证。
     ProtocolBodyCacheStats {
         #[serde(default)]
         eligible: u64,
@@ -199,9 +200,31 @@ pub enum RuntimeEvent {
         #[serde(default)]
         invalidated: u64,
         #[serde(default)]
+        suspended: u64,
+        #[serde(default)]
         oversize: u64,
         #[serde(default)]
         restored_body_tokens: u64,
+    },
+    /// CONV-OBS-01：义务账本生命周期事件（typed、有界，不含任何工具
+    /// 正文）。kind ∈ opened / attempted / precondition_changed /
+    /// resolved / dropped；scope_digest 是稳定的血统身份
+    /// （ExecutableResolution = 解析上下文 digest），epoch 是前置指纹
+    /// 的代数。收敛报告由此验证 max_attempts_per_epoch /
+    /// max_total_attempts_per_lineage 等指标。
+    ExecutionObligation {
+        #[serde(default)]
+        kind: crate::ObligationEventKind,
+        #[serde(default)]
+        domain: crate::ToolFailureDomain,
+        #[serde(default)]
+        scope_digest: String,
+        #[serde(default)]
+        epoch: u32,
+        #[serde(default)]
+        attempts_in_epoch: u32,
+        #[serde(default)]
+        total_attempts: u32,
     },
     /// A tool frame closed: the runtime published the lifecycle transitions
     /// the close produced (durable outcomes promoted out of the tool frame),

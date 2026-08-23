@@ -33,12 +33,14 @@ pub(super) const MAX_OBLIGATIONS: usize = 8;
 const MAX_OBLIGATION_TARGETS: usize = 8;
 
 /// 一轮工具观察的确定性前沿分类结果，随 `ExecutionFrontier` 事件上报。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrontierObservation {
     pub delta: FrontierDelta,
     pub actions_since_frontier_advance: u32,
     pub evidence_revision: u64,
     pub invalidated: u64,
+    /// CONV-OBS-01：本次观察产生的义务账目事件（有界）。
+    pub obligation_events: Vec<agent_contracts::ExecutionObligationEvent>,
 }
 
 /// [`ExecutionState::record_observation_evidence`] 的三值结果。
@@ -118,18 +120,39 @@ pub struct ExecutionState {
     pub obligations: Vec<ExecutionObligation>,
 }
 
-/// 一条已证明存在的执行 blocker。`precondition` 是域特定的前置指纹：
-/// ExecutableResolution = resolution_fingerprint；EditTarget =
-/// path@被拒revision；ResourcePath / ProjectMarker = 目标路径。
+/// 一条已证明存在的执行 blocker（CONV-03 lineage 模型）。
+/// `scope_key` 是稳定 lineage 身份（ExecutableResolution = 解析上下文
+/// digest：cwd + effective PATH + 规则版本；EditTarget/ResourcePath =
+/// 路径；ProjectMarker = 目标身份），跨 epoch 不变。`precondition` 是
+/// 当前 epoch 的前置指纹（ExecutableResolution = resolution_fingerprint，
+/// 覆盖完整有界目录状态；EditTarget = path@被拒revision；其余 = 目标
+/// 路径）。世界推进只推进 epoch、不解除义务——PreconditionChanged ≠
+/// ObligationResolved；只有 blocker 特定的证明（同 scope 同指纹的
+/// 成功，或目标以新身份落地）才解除。`attempts` 计当前 epoch 内失败，
+/// `total_attempts` 计整个 lineage 累计。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ExecutionObligation {
     pub domain: ToolFailureDomain,
+    #[serde(default)]
+    pub scope_key: String,
     pub precondition: String,
     pub attempts: u32,
+    #[serde(default)]
+    pub epoch: u32,
+    #[serde(default)]
+    pub total_attempts: u32,
     pub tried_targets: Vec<String>,
     #[serde(default)]
     pub opened_at_evidence_revision: u64,
+}
+
+impl ExecutionObligation {
+    /// 旧 checkpoint 行没有 total_attempts（反序列化为 0）；显示取两者
+    /// 较大值即可兼容，无需迁移。
+    pub fn effective_total(&self) -> u32 {
+        self.total_attempts.max(self.attempts)
+    }
 }
 
 /// 收敛状态。`evidence_revision` 在前沿内容变化（新证据/失效）时单调
@@ -741,9 +764,16 @@ impl ExecutionState {
         }
     }
 
-    /// CONV-03：由 typed 失效事实登记/累计义务。无关推进永远到不了
-    /// 这里——只有失败输出才开义务；同域不同前置 = 旧义务被取代。
-    pub(super) fn record_obligation(&mut self, output: &ToolOutput, identity: &OperationIdentity) {
+    /// CONV-03 lineage：由 typed 失效事实登记/累计义务。同 scope 的
+    /// 行是同一个 blocker 的同一血统——同指纹累计 epoch 内尝试，异
+    /// 指纹推进 epoch（PreconditionChanged ≠ Resolved）；不同 scope
+    /// 是不同 blocker，互不取代。只有失败输出才开义务。
+    pub(super) fn record_obligation(
+        &mut self,
+        output: &ToolOutput,
+        identity: &OperationIdentity,
+        events: &mut Vec<agent_contracts::ExecutionObligationEvent>,
+    ) {
         if output.ok {
             return;
         }
@@ -753,67 +783,144 @@ impl ExecutionState {
         if matches!(domain, ToolFailureDomain::NonDeterministic) {
             return;
         }
-        let touches = output.resource_touches();
-        let precondition = match domain {
-            ToolFailureDomain::ExecutableResolution => output
+        let metadata_str = |key: &str| {
+            output
                 .metadata
-                .get("resolution_fingerprint")
+                .get(key)
                 .and_then(|value| value.as_str())
                 .unwrap_or_default()
-                .to_string(),
+                .to_string()
+        };
+        let touches = output.resource_touches();
+        let (scope_key, fingerprint) = match domain {
+            // resolver 在 preflight 统一盖章；旧格式失败只有指纹时退化为
+            // 单一 scope（scope 为空按匿名血统处理，仍可累计）。
+            ToolFailureDomain::ExecutableResolution => (
+                metadata_str("resolution_scope_key"),
+                metadata_str("resolution_fingerprint"),
+            ),
             ToolFailureDomain::EditTarget | ToolFailureDomain::ResourcePath => {
                 let Some(touch) = touches.first() else {
                     return;
                 };
-                match (domain, touch.revision.as_deref()) {
+                let fingerprint = match (domain, touch.revision.as_deref()) {
                     (ToolFailureDomain::EditTarget, Some(revision)) if !revision.is_empty() => {
                         format!("{}@{}", touch.path, revision)
                     }
-                    _ => touch.path.clone(),
-                }
+                    _ => String::new(),
+                };
+                (touch.path.clone(), fingerprint)
             }
-            ToolFailureDomain::ProjectMarker => {
-                bound_evidence_text(output.operation_target().unwrap_or_default())
-            }
+            ToolFailureDomain::ProjectMarker => (
+                bound_evidence_text(output.operation_target().unwrap_or_default()),
+                String::new(),
+            ),
             ToolFailureDomain::NonDeterministic => return,
         };
-        if precondition.is_empty() {
+        let scope_key = bound_evidence_text(&scope_key);
+        if scope_key.is_empty() && fingerprint.is_empty() {
             return;
         }
-        // 同域不同前置：旧 blocker 的世界已不存在（被取代），不是被解决。
-        self.obligations
-            .retain(|row| !(row.domain == domain && row.precondition != precondition));
         let target = bound_evidence_text(&identity.target);
-        if let Some(existing) = self
+        if let Some(row) = self
             .obligations
             .iter_mut()
-            .find(|row| row.domain == domain && row.precondition == precondition)
+            .find(|row| row.domain == domain && row.scope_key == scope_key)
         {
-            existing.attempts = existing.attempts.saturating_add(1);
-            if !existing.tried_targets.iter().any(|t| t == &target)
-                && existing.tried_targets.len() < MAX_OBLIGATION_TARGETS
+            let kind = if row.precondition == fingerprint {
+                row.attempts = row.attempts.saturating_add(1);
+                agent_contracts::ObligationEventKind::Attempted
+            } else {
+                // 前置变化：epoch 推进、本 epoch 失败计数从这次失败起算；
+                // 血统与累计账目保持——Runtime 不会忘掉这个方向浪费过多少次。
+                row.epoch = row.epoch.saturating_add(1);
+                row.precondition = fingerprint.clone();
+                row.attempts = 1;
+                agent_contracts::ObligationEventKind::PreconditionChanged
+            };
+            row.total_attempts = row.total_attempts.saturating_add(1);
+            if !row.tried_targets.iter().any(|t| t == &target)
+                && row.tried_targets.len() < MAX_OBLIGATION_TARGETS
             {
-                existing.tried_targets.push(target);
+                row.tried_targets.push(target);
             }
+            events.push(agent_contracts::ExecutionObligationEvent {
+                kind,
+                domain,
+                scope_digest: scope_key,
+                epoch: row.epoch,
+                attempts_in_epoch: row.attempts,
+                total_attempts: row.total_attempts,
+            });
             return;
         }
         self.obligations.push(ExecutionObligation {
             domain,
-            precondition,
+            scope_key,
+            precondition: fingerprint.clone(),
             attempts: 1,
+            epoch: 1,
+            total_attempts: 1,
             tried_targets: vec![target],
             opened_at_evidence_revision: self.convergence.evidence_revision,
         });
+        let row = self.obligations.last().expect("just pushed");
+        events.push(agent_contracts::ExecutionObligationEvent {
+            kind: agent_contracts::ObligationEventKind::Opened,
+            domain,
+            scope_digest: row.scope_key.clone(),
+            epoch: row.epoch,
+            attempts_in_epoch: row.attempts,
+            total_attempts: row.total_attempts,
+        });
         let excess = self.obligations.len().saturating_sub(MAX_OBLIGATIONS);
         if excess > 0 {
-            self.obligations.drain(0..excess);
+            for dropped in self.obligations.drain(0..excess) {
+                let total = dropped.effective_total();
+                events.push(agent_contracts::ExecutionObligationEvent {
+                    kind: agent_contracts::ObligationEventKind::Dropped,
+                    domain: dropped.domain,
+                    scope_digest: dropped.scope_key,
+                    epoch: dropped.epoch,
+                    attempts_in_epoch: dropped.attempts,
+                    total_attempts: total,
+                });
+            }
         }
     }
 
-    /// CONV-03：义务只被自己的前置变化解除——同类成功、目标身份以新
-    /// digest 出现、mutation 触碰目标路径。读文件 / 改别的代码不清账。
-    pub(super) fn resolve_obligations(&mut self, output: &ToolOutput) {
+    /// CONV-03：义务只被 blocker 特定的证明解除——ExecutableResolution
+    /// 要求同 scope 且同前置指纹的成功（"同类成功"太宽：rustc 编译成功
+    /// 不能证明 tests.exe 的解析 blocker 已解决）；世界推进只把 epoch
+    /// 推进一格（PreconditionChanged ≠ Resolved）。EditTarget 以新
+    /// digest 落地、ResourcePath 被 Known mutation 触碰或出现 Fresh
+    /// 事实、ProjectMarker 被触碰——这些本身就是 blocker 消失的证明。
+    pub(super) fn resolve_obligations(
+        &mut self,
+        output: &ToolOutput,
+        events: &mut Vec<agent_contracts::ExecutionObligationEvent>,
+    ) {
         let launch_ok = output.ok && is_command_tool(&output.tool_name);
+        let success_scope = if launch_ok {
+            output
+                .metadata
+                .get("resolution_scope_key")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            String::new()
+        };
+        let success_fingerprint = if launch_ok {
+            output
+                .metadata
+                .get("resolution_fingerprint")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            String::new()
+        };
         let mutated_paths: Vec<String> = match output.mutation_footprint() {
             agent_contracts::MutationFootprint::Known(_) if output.ok => output
                 .resource_touches()
@@ -822,34 +929,108 @@ impl ExecutionState {
                 .collect(),
             _ => Vec::new(),
         };
-        // 物化事实表快照，retain 闭包里不再借 self。
+        // 物化事实表快照，闭包里不再借 self。
         let fresh: std::collections::HashMap<&str, &str> = self
             .checked_files
             .iter()
             .filter(|fact| fact.freshness == ResourceFreshness::Fresh)
             .map(|fact| (fact.path.as_str(), fact.digest.as_str()))
             .collect();
-        self.obligations.retain(|row| {
-            let resolved = match row.domain {
-                ToolFailureDomain::ExecutableResolution => launch_ok,
+
+        enum Outcome {
+            Keep,
+            AdvanceEpoch,
+            Resolve,
+        }
+        let mut kept = Vec::with_capacity(self.obligations.len());
+        for mut row in self.obligations.drain(..) {
+            let outcome = match row.domain {
+                ToolFailureDomain::ExecutableResolution => {
+                    if !launch_ok || row.scope_key != success_scope {
+                        Outcome::Keep
+                    } else if row.scope_key.is_empty() && success_scope.is_empty() {
+                        // 旧行/旧输出的退化匹配：指纹一致才认解决。
+                        if !success_fingerprint.is_empty()
+                            && row.precondition == success_fingerprint
+                        {
+                            Outcome::Resolve
+                        } else {
+                            Outcome::Keep
+                        }
+                    } else if row.precondition == success_fingerprint {
+                        Outcome::Resolve
+                    } else {
+                        Outcome::AdvanceEpoch
+                    }
+                }
                 ToolFailureDomain::EditTarget => {
-                    let (path, old) = match row.precondition.split_once('@') {
-                        Some((path, old)) => (path, old),
-                        None => (row.precondition.as_str(), ""),
+                    let path = if row.scope_key.is_empty() {
+                        row.precondition
+                            .split_once('@')
+                            .map(|(path, _)| path)
+                            .unwrap_or(row.precondition.as_str())
+                    } else {
+                        row.scope_key.as_str()
                     };
-                    fresh.get(path).is_some_and(|digest| *digest != old)
+                    let old = row
+                        .precondition
+                        .rsplit_once('@')
+                        .map(|(_, rev)| rev)
+                        .unwrap_or_default();
+                    if fresh.get(path).is_some_and(|digest| *digest != old) {
+                        Outcome::Resolve
+                    } else {
+                        Outcome::Keep
+                    }
                 }
                 ToolFailureDomain::ResourcePath => {
-                    mutated_paths.iter().any(|p| p == &row.precondition)
-                        || fresh.contains_key(row.precondition.as_str())
+                    let touched = mutated_paths.iter().any(|p| p == &row.scope_key)
+                        || fresh.contains_key(row.scope_key.as_str());
+                    if touched {
+                        Outcome::Resolve
+                    } else {
+                        Outcome::Keep
+                    }
                 }
                 ToolFailureDomain::ProjectMarker => {
-                    mutated_paths.iter().any(|p| p == &row.precondition)
+                    if mutated_paths.iter().any(|p| p == &row.scope_key) {
+                        Outcome::Resolve
+                    } else {
+                        Outcome::Keep
+                    }
                 }
-                ToolFailureDomain::NonDeterministic => true,
+                ToolFailureDomain::NonDeterministic => Outcome::Keep,
             };
-            !resolved
-        });
+            match outcome {
+                Outcome::Keep => kept.push(row),
+                Outcome::AdvanceEpoch => {
+                    row.epoch = row.epoch.saturating_add(1);
+                    row.attempts = 0;
+                    row.precondition = success_fingerprint.clone();
+                    events.push(agent_contracts::ExecutionObligationEvent {
+                        kind: agent_contracts::ObligationEventKind::PreconditionChanged,
+                        domain: row.domain,
+                        scope_digest: row.scope_key.clone(),
+                        epoch: row.epoch,
+                        attempts_in_epoch: row.attempts,
+                        total_attempts: row.effective_total(),
+                    });
+                    kept.push(row);
+                }
+                Outcome::Resolve => {
+                    let total = row.effective_total();
+                    events.push(agent_contracts::ExecutionObligationEvent {
+                        kind: agent_contracts::ObligationEventKind::Resolved,
+                        domain: row.domain,
+                        scope_digest: row.scope_key,
+                        epoch: row.epoch,
+                        attempts_in_epoch: row.attempts,
+                        total_attempts: total,
+                    });
+                }
+            }
+        }
+        self.obligations = kept;
     }
 
     /// 有界的逐义务警告行（≤2 条）：与全局 advisory 正交，模型仍自主
@@ -860,9 +1041,11 @@ impl ExecutionState {
             .take(2)
             .map(|row| {
                 format!(
-                    "UNRESOLVED BLOCKER [{}] attempts={} targets={:?} precondition={} — change the preconditions (build/install/create the target), not more identical guesses",
+                    "UNRESOLVED BLOCKER [{}] epoch={} attempts={} total={} targets={:?} precondition={} — change the preconditions (build/install/create the target), not more identical guesses",
                     row.domain.as_str(),
+                    row.epoch,
                     row.attempts,
+                    row.effective_total(),
                     row.tried_targets,
                     row.precondition
                 )

@@ -1060,7 +1060,9 @@ impl RuntimeActor {
     }
 
     /// 把一轮前沿分类作为 `ExecutionFrontier` 事件上报。事件是有界
-    /// 计数，不含任何工具正文；收敛指标从这里聚合。
+    /// 计数，不含任何工具正文；收敛指标从这里聚合。同批的义务账目
+    /// 事件（CONV-OBS-01）逐条出账，报告可从事件流独立验证
+    /// max_attempts_per_epoch / max_total_attempts_per_lineage。
     async fn report_frontier(
         &mut self,
         observation: Option<crate::execution::FrontierObservation>,
@@ -1068,6 +1070,19 @@ impl RuntimeActor {
         let Some(observation) = observation else {
             return;
         };
+        for event in observation.obligation_events {
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::ExecutionObligation {
+                    kind: event.kind,
+                    domain: event.domain,
+                    scope_digest: event.scope_digest,
+                    epoch: event.epoch,
+                    attempts_in_epoch: event.attempts_in_epoch,
+                    total_attempts: event.total_attempts,
+                })
+                .await;
+        }
         let _ = self
             .core
             .emit_event(RuntimeEvent::ExecutionFrontier {
