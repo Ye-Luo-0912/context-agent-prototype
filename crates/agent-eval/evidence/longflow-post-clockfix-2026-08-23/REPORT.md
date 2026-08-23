@@ -41,3 +41,12 @@ warm=0 stored=0 changed=0.
    implementation stays separate and is not part of this slice.
 
 Append arm passed at 47 rounds / capability.manage 6 as usual.
+
+## Post-hysteresis re-run (longflow-post-hysteresis-2026-08-23)
+
+Dynamic arm after the watermark landed: capability.manage 20 -> 7
+(6 loads = first-time only, 0 re-loads, 0 failed warm.* guesses), fs.read
+25, proto motive 8, desc 6, reval 8. Rounds 94 vs 84 is trajectory noise
+(the run also hit usage_lower_bound accounting); the targeted failure mode
+— mid-task reload rounds and invented warm-prefixed names — is gone.
+Append arm passed at 53 rounds / capability.manage 4.

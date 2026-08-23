@@ -1,0 +1,85 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "late_constraint_long",
+  "expected_edit": "add v2 Hello and Heartbeat while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Heartbeat"
+      ],
+      "count": 7,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "RELEASE.md",
+      "pred": "contains",
+      "needles": [
+        "v2"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "RELEASE.md",
+      "exists": true,
+      "sha256": "428f7369681febb6b18a168496f948584e88c6ca59dcd7e956f7676235d4d583",
+      "bytes": 378,
+      "truncated": false,
+      "body": "Version 2 is planned to expand the protocol beyond the current `Ping` message with additional message types, more explicit and robust encoding and decoding, clearer handling of unknown or malformed input, and compatibility-focused tests to support future protocol evolution.\n\nShipped: v2 `Hello` message support, including explicit encoding and decoding and round-trip coverage."
+    },
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "283d5812c8e265b01f21056225a736ee88980bf5ac0fb96b4e25cd56efb22fbe",
+      "bytes": 1861,
+      "truncated": false,
+      "body": "pub enum Msg {\r\n    Ping,\r\n    Hello(String),\r\n    Heartbeat(u32),\r\n}\r\n\r\npub fn decode(bytes: &str) -> Result<Msg, String> {\r\n    if let Some(sequence) = bytes.strip_prefix(\"v:2|heartbeat:\") {\r\n        return sequence\r\n            .parse::<u32>()\r\n            .map(Msg::Heartbeat)\r\n            .map_err(|_| \"invalid heartbeat\".into());\r\n    }\r\n    if let Some(name) = bytes.strip_prefix(\"v:2|hello:\") {\r\n        return Ok(Msg::Hello(name.into()));\r\n    }\r\n    if bytes.contains(\"ping\") {\r\n        return Ok(Msg::Ping);\r\n    }\r\n    Err(\"unknown\".into())\r\n}\r\n\r\npub fn encode(msg: &Msg) -> String {\r\n    match msg {\r\n        Msg::Ping => \"ping\".into(),\r\n        Msg::Hello(name) => format!(\"v:2|hello:{name}\"),\r\n        Msg::Heartbeat(sequence) => format!(\"v:2|heartbeat:{sequence}\"),\r\n    }\r\n}\r\n\r\npub fn ping_roundtrip() -> Result<Msg, String> {\r\n    decode(&encode(&Msg::Ping))\r\n}\r\n\r\n#[cfg(test)]\r\nmod tests {\r\n    use super::{decode, encode, Msg};\r\n\r\n    #[test]\r\n    fn decodes_ping_frame() {\r\n        assert!(matches!(decode(\"ping\"), Ok(Msg::Ping)));\r\n    }\r\n\r\n    #[test]\r\n    fn hello_uses_v2_envelope() {\r\n        let msg = Msg::Hello(\"world\".into());\r\n        assert_eq!(encode(&msg), \"v:2|hello:world\");\r\n        assert!(matches!(decode(\"v:2|hello:world\"), Ok(Msg::Hello(name)) if name == \"world\"));\r\n    }\r\n\r\n    #[test]\r\n    fn heartbeat_preserves_sequence_number() {\r\n        let msg = Msg::Heartbeat(42);\r\n        assert_eq!(encode(&msg), \"v:2|heartbeat:42\");\r\n        assert!(matches!(decode(\"v:2|heartbeat:42\"), Ok(Msg::Heartbeat(42))));\r\n    }\r\n\r\n    #[test]\r\n    fn heartbeat_roundtrip() {\r\n        let msg = Msg::Heartbeat(42);\r\n        assert!(matches!(decode(&encode(&msg)), Ok(Msg::Heartbeat(42))));\r\n    }\r\n\r\n    #[test]\r\n    fn invalid_heartbeat_is_rejected() {\r\n        assert!(decode(\"v:2|heartbeat:not-a-number\").is_err());\r\n    }\r\n}\r\n\r\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\longflow\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmp2kQN8D\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}
