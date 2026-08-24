@@ -83,6 +83,7 @@ impl RuntimeActor {
         let joined = join_checkpoint_write(handle).await;
         match joined {
             Ok((bytes, artifact)) => {
+                self.state.checkpoint_write_failed = false;
                 let _ = self
                     .core
                     .emit_event(RuntimeEvent::CheckpointDurable { bytes, artifact })
@@ -91,6 +92,7 @@ impl RuntimeActor {
             Err(error) => {
                 // The debt reasons were already cleared when the write was
                 // scheduled; re-accrue so the next safe point retries.
+                self.state.checkpoint_write_failed = true;
                 self.accrue_checkpoint_debt(CheckpointDebtReason::TaskAnchorChanged);
                 let _ = self
                     .core
@@ -162,6 +164,7 @@ impl RuntimeActor {
         let snapshot = match capture {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                self.state.checkpoint_write_failed = true;
                 let _ = self
                     .core
                     .emit_event(RuntimeEvent::CheckpointWriteFailed {
@@ -177,6 +180,7 @@ impl RuntimeActor {
         let bytes = match serde_json::to_vec(&snapshot) {
             Ok(bytes) => bytes,
             Err(error) => {
+                self.state.checkpoint_write_failed = true;
                 let _ = self
                     .core
                     .emit_event(RuntimeEvent::CheckpointWriteFailed {
@@ -192,6 +196,7 @@ impl RuntimeActor {
         let byte_len = bytes.len() as u64;
         let Some(store) = self.checkpoint_store() else {
             self.state.checkpoint_debt.clear();
+            self.state.checkpoint_write_failed = true;
             let _ = self
                 .core
                 .emit_event(RuntimeEvent::CheckpointWriteFailed {
@@ -226,6 +231,7 @@ impl RuntimeActor {
                     .await;
             }
             Ok(Err(error)) => {
+                self.state.checkpoint_write_failed = true;
                 self.accrue_checkpoint_debt(CheckpointDebtReason::TaskAnchorChanged);
                 let _ = self
                     .core
@@ -238,6 +244,7 @@ impl RuntimeActor {
                     .await;
             }
             Err(join_error) => {
+                self.state.checkpoint_write_failed = true;
                 self.accrue_checkpoint_debt(CheckpointDebtReason::TaskAnchorChanged);
                 let _ = self
                     .core
@@ -250,5 +257,22 @@ impl RuntimeActor {
                     .await;
             }
         }
+    }
+
+    /// Final barrier for a durable completion: wait out any in-flight
+    /// write, capture and write one final snapshot, then wait for its
+    /// acknowledgement. Returns an error when the last write failed so the
+    /// caller can surface uncertainty instead of claiming resumability.
+    pub(super) async fn durable_final_checkpoint(&mut self) -> AgentResult<()> {
+        self.await_pending_checkpoint().await;
+        self.schedule_checkpoint_write().await;
+        self.await_pending_checkpoint().await;
+        if self.state.checkpoint_write_failed {
+            self.state.checkpoint_write_failed = false;
+            return Err(AgentError::InvalidRequest(
+                "the final checkpoint write did not land durably".into(),
+            ));
+        }
+        Ok(())
     }
 }

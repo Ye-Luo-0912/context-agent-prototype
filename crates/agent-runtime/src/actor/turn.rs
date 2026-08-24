@@ -260,6 +260,9 @@ impl RuntimeActor {
         if batch.terminal != batch.requested
             || batch.failed != 0
             || completion_from_execution(&turn.execution).is_err()
+            // A gated proposal must not ride the one-shot path past its
+            // refusal: the decision returns to the model instead.
+            || self.completion_gate().is_err()
         {
             return None;
         }
@@ -456,6 +459,8 @@ impl RuntimeActor {
             ));
         };
         turn.pending_completion = Some(proposal);
+        // A fresh proposal gets a fresh gate refusal surface.
+        self.state.completion_refusal_surfaced_for = None;
         Ok(())
     }
 
@@ -594,12 +599,63 @@ impl RuntimeActor {
     /// heap (durable retention; a GC failure after the commit is surfaced,
     /// never allowed to undo the outcome). Shared by the `/done` command
     /// and the model's `task.complete` proposal.
+    /// Acceptance gate for a SUCCESSFUL durable completion: no recovery
+    /// fence, no unsettled cancelled operation, every failure obligation
+    /// resolved, required verification current (re-checked by
+    /// `completion_from_execution`), and no open loops silently erased.
+    fn completion_gate(&self) -> AgentResult<()> {
+        if self.state.recovery_required {
+            return Err(AgentError::InvalidRequest(
+                "recovery is required; completion is fenced until a known-good restore".into(),
+            ));
+        }
+        if self.state.pending_tool_cleanup.is_some() {
+            return Err(AgentError::InvalidRequest(
+                "a cancelled tool operation is still unsettled".into(),
+            ));
+        }
+        let Some(task_id) = self.state.tasks.active() else {
+            return Err(AgentError::InvalidRequest(
+                "no active task to complete".into(),
+            ));
+        };
+        let task = self.state.tasks.get(task_id).expect("active id resolves");
+        if !task.anchor.open_loops.is_empty() {
+            return Err(AgentError::InvalidRequest(format!(
+                "{} explicit open loop(s) remain; success cannot erase them",
+                task.anchor.open_loops.len()
+            )));
+        }
+        let execution = match self.state.turn.as_ref() {
+            Some(turn) => &turn.execution,
+            None => &task.resume,
+        };
+        let open = execution.open_obligation_count();
+        if open > 0 {
+            return Err(AgentError::InvalidRequest(format!(
+                "{open} unresolved execution obligation(s) block completion"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Some(reason) when a pending proposal exists but the acceptance gate
+    /// refuses it: the decision returns to the model instead of committing.
+    pub(super) fn completion_gate_refusal(&self) -> Option<String> {
+        let turn = self.state.turn.as_ref()?;
+        turn.pending_completion.as_ref()?;
+        self.completion_gate().err().map(|error| error.to_string())
+    }
+
     pub(super) async fn commit_completion(
         &mut self,
         summary: String,
         artifacts: Vec<String>,
         next_focus_revision: u64,
     ) -> AgentResult<()> {
+        // The acceptance gate runs again at the commit safe point: state
+        // may have moved since the proposal was stored.
+        self.completion_gate()?;
         let active_task = self
             .state
             .tasks
@@ -725,6 +781,17 @@ impl RuntimeActor {
             .await
             .map_err(|error| self.context_transition_failed(error))?;
         self.state.tasks.commit(txn);
+        // Final durable checkpoint after TurnCompleted and before the
+        // completed scope is reported closed. A failed final write never
+        // un-completes the task, but it is surfaced instead of claimed.
+        if let Err(error) = self.durable_final_checkpoint().await {
+            let _ = self
+                .core
+                .emit_warning(format!(
+                    "task {task_id} completed without a durable final checkpoint: {error}"
+                ))
+                .await;
+        }
         self.state.task_id = None;
         self.state.last_assistant_artifact = None;
         self.state.focus_revision = next_focus_revision;

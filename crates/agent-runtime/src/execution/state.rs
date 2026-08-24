@@ -450,6 +450,13 @@ impl ExecutionState {
         ) || self.last_evidence().is_some_and(|row| !row.ok)
     }
 
+    /// How many failure-obligation rows are still open. The ledger only
+    /// drains through typed resolution evidence, so any positive count
+    /// blocks a successful completion gate.
+    pub fn open_obligation_count(&self) -> usize {
+        self.obligations.len()
+    }
+
     /// Latest verification evidence, including epoch-stale rows.
     /// `workspace_revision` omits old PASS from the prompt view; validity
     /// still needs the last result.

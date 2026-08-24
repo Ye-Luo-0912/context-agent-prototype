@@ -1269,6 +1269,19 @@ impl RuntimeActor {
                 self.safe_point_resume_commit().await;
                 if let Some(summary) = self.terminal_completion_summary() {
                     self.finalize_terminal_completion(summary).await;
+                } else if let Some(reason) = self.completion_gate_refusal() {
+                    // The proposal exists but the acceptance gate refuses:
+                    // surface it once per turn and return the decision to
+                    // the model instead of committing.
+                    let turn_id = self.state.turn.as_ref().map(|turn| turn.turn_id);
+                    if self.state.completion_refusal_surfaced_for != turn_id {
+                        let _ = self
+                            .core
+                            .emit_warning(format!("completion gate refused: {reason}"))
+                            .await;
+                        self.state.completion_refusal_surfaced_for = turn_id;
+                    }
+                    self.advance_turn(op_tx).await;
                 } else {
                     self.advance_turn(op_tx).await;
                 }

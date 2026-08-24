@@ -183,6 +183,19 @@ The final durable checkpoint is taken after `TurnCompleted` and before the
 task scope is reported safely closed. This slice extends existing completion
 tests; it does not make `task.complete` permanently visible.
 
+Status: landed deterministically 2026-08-25. The acceptance gate re-runs at
+every completion edge: no recovery fence, no unsettled cancelled operation,
+zero open failure obligations, required verification current, and no open
+loops silently erased. A gated proposal on the one-shot path returns the
+decision to the model with one warning per turn instead of committing;
+the deferred and `/done` paths fail their transaction with the typed
+reason. Success orders `TurnCompleted` -> final `CheckpointDurable` ->
+`TaskCompleted`, so JSONL proves closure was durably checkpointed before
+it was reported. A failed final write surfaces as a warning that never
+un-completes the task and never claims resumability. Deterministic
+coverage: refusal with later resolution, ordering proof, and store
+failure semantics.
+
 ## First concrete development task: `retry_policy_dev`
 
 Use a frozen, network-free Rust fixture rather than this repository itself.

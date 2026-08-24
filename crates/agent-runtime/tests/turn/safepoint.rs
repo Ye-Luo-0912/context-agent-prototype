@@ -353,3 +353,237 @@ async fn checkpoint_store_writes_atomically_and_fails_closed_on_a_bad_dir() {
         "an unwritable location must fail closed"
     );
 }
+
+/// Serves `task.complete` by attaching the typed completion directive,
+/// exactly like the real tool.
+#[derive(Debug)]
+struct CompletionDispatcher;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for CompletionDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "task.complete".into(),
+            description: "propose completion".into(),
+            input_schema: json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        }]
+    }
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        Ok(ToolOutcome::RuntimeDirective {
+            output: ToolOutput {
+                call_id: request.call.id,
+                tool_name: "task.complete".into(),
+                ok: true,
+                summary: "completion proposed".into(),
+                model_content: String::new(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            directive: agent_contracts::RuntimeDirective::CompleteTask(
+                agent_contracts::CompletionProposal {
+                    summary: "the retry policy is done".into(),
+                    artifacts: Vec::new(),
+                },
+            ),
+        })
+    }
+}
+
+/// Round pattern per turn: complete, done, complete, done ...
+#[derive(Debug)]
+struct CompletionTwiceModel {
+    rounds: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for CompletionTwiceModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        if round.is_multiple_of(2) {
+            Ok(ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: format!("call-{round}"),
+                    name: "task.complete".into(),
+                    arguments: json!({"summary": "done"}),
+                }],
+                usage: Default::default(),
+            })
+        } else {
+            Ok(ModelOutput {
+                content: "done".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            })
+        }
+    }
+}
+
+async fn completion_instance(dir: &std::path::Path) -> RuntimeInstance {
+    let workspace = agent_workspace::Workspace::open(dir).await.unwrap();
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(CompletionTwiceModel {
+            rounds: AtomicUsize::new(0),
+        }),
+        Arc::new(CompletionDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    )
+    .with_artifact_workspace(Arc::new(workspace));
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    instance.handle().start().await.unwrap();
+    instance
+}
+
+#[tokio::test]
+async fn open_loops_return_completion_to_the_model_until_resolved() {
+    let dir = tempfile::tempdir().unwrap();
+    let instance = completion_instance(dir.path()).await;
+    let handle = instance.handle();
+    handle
+        .set_focus("implement bounded retry".into())
+        .await
+        .unwrap();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    // An explicit open loop exists before the first completion attempt.
+    let revision = handle
+        .patch_task_anchor(
+            task_id,
+            0,
+            agent_runtime::AnchorPatch {
+                open_loops: Some(vec!["prove saturation at the delay cap".into()]),
+                ..agent_runtime::AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(revision, 1);
+
+    // Turn 1: the proposal is stored but the gate refuses it; the decision
+    // returns to the model and the turn ends without committing the task.
+    let mut events = handle.subscribe();
+    handle.user_message("wrap it up".into()).await.unwrap();
+    let mut labels: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let mut done = false;
+    while tokio::time::Instant::now() < deadline && !done {
+        while let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::Warning { message }
+                    if message.contains("completion gate refused") =>
+                {
+                    labels.push(format!("gate_refused:{message}"));
+                }
+                RuntimeEvent::TaskCompleted { .. } => labels.push("task_completed".into()),
+                RuntimeEvent::TurnCompleted => {
+                    labels.push("turn_completed".into());
+                    done = true;
+                }
+                _ => {}
+            }
+        }
+        if !done {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    assert!(done, "turn one must finish inside the test deadline");
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.starts_with("gate_refused:") && label.contains("open loop")),
+        "the open-loop refusal must surface once: {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|label| label == "task_completed"),
+        "a gated completion must never commit: {labels:?}"
+    );
+    let after_turn_one = handle.list_tasks().await.unwrap();
+    assert_eq!(
+        after_turn_one[0].anchor_revision, 1,
+        "the anchor keeps its open loop while the gate holds"
+    );
+
+    // The operator/model resolves the loop through the boundary CAS.
+    handle
+        .patch_task_anchor(
+            task_id,
+            1,
+            agent_runtime::AnchorPatch {
+                open_loops: Some(Vec::new()),
+                ..agent_runtime::AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Turn 2: the same proposal flow now passes the gate; JSONL proves
+    // TurnCompleted -> durable checkpoint -> TaskCompleted. TaskCompleted
+    // trails TurnCompleted, so keep draining through a quiet grace window
+    // instead of stopping at the first completion event.
+    handle.user_message("wrap it up".into()).await.unwrap();
+    let mut labels = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut turn_completed_at: Option<tokio::time::Instant> = None;
+    while tokio::time::Instant::now() < deadline {
+        let mut quiet = true;
+        while let Ok(envelope) = events.try_recv() {
+            quiet = false;
+            match envelope.event {
+                RuntimeEvent::CheckpointDurable { .. } => labels.push("checkpoint_durable"),
+                RuntimeEvent::TaskCompleted { .. } => labels.push("task_completed"),
+                RuntimeEvent::TurnCompleted => {
+                    labels.push("turn_completed");
+                    turn_completed_at.get_or_insert(tokio::time::Instant::now());
+                }
+                _ => {}
+            }
+        }
+        if turn_completed_at
+            .is_some_and(|seen| seen.elapsed() > Duration::from_millis(400) && quiet)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        turn_completed_at.is_some(),
+        "turn two must finish inside the test deadline"
+    );
+    let turn_at = labels
+        .iter()
+        .position(|label| *label == "turn_completed")
+        .expect("turn completes");
+    // A mid-turn safe point may also land a write; the gate requirement is
+    // that the FINAL durable acknowledgement precedes the completed report.
+    let durable_at = labels
+        .iter()
+        .rposition(|label| *label == "checkpoint_durable")
+        .expect("the final checkpoint lands durably");
+    let completed_at = labels
+        .iter()
+        .position(|label| *label == "task_completed")
+        .expect("the task completes once loops resolve");
+    assert!(
+        turn_at < durable_at && durable_at < completed_at,
+        "final checkpoint order must be provable: {labels:?}"
+    );
+    let tasks = handle.list_tasks().await.unwrap();
+    let closed = tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .expect("the completed task stays listed");
+    assert!(
+        matches!(closed.status, agent_runtime::TaskStatus::Completed),
+        "the task must be closed after the gate passes: {:?}",
+        closed.status
+    );
+    instance.shutdown().await.unwrap();
+}

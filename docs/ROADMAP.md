@@ -225,7 +225,13 @@ in parallel, but it does not reorder or close either gate.
     state-directory writes with durable/failure events in provable order,
     completion barriers that wait for in-flight writes, and
     `continue_active_task` continuation without minting a new directive
-    identity. Slice (c) remains open.
+    identity. Slice (c) landed deterministically 2026-08-25: the acceptance
+    gate re-runs at every completion edge (recovery fence, cancelled-op
+    cleanup, open obligations, verification currency, un-erased open loops),
+    gated one-shot proposals return to the model instead of committing, and
+    success orders `TurnCompleted` -> final durable checkpoint ack ->
+    `TaskCompleted`. The deterministic long-task Runtime slices are green;
+    the frozen `retry_policy_dev` pilot remains the next step.
 
     Then run the frozen one-directive `retry_policy_dev` diagnostic described
     in [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md): first C normal vs

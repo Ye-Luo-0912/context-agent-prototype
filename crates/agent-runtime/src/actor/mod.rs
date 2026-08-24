@@ -1029,6 +1029,12 @@ struct ActorState {
     /// In-flight background checkpoint write; its outcome is published
     /// lazily at the next safe point or eagerly at a barrier wait.
     checkpoint_write: Option<tokio::task::JoinHandle<AgentResult<(u64, String)>>>,
+    /// Last background write ended in `CheckpointWriteFailed` and has not
+    /// been followed by a durable one yet.
+    checkpoint_write_failed: bool,
+    /// Turn id whose completion-gate refusal was already surfaced, so one
+    /// unresolved proposal warns once instead of every round.
+    completion_refusal_surfaced_for: Option<TurnId>,
 }
 
 /// 已入账但尚未开转的对话。`input` 是 Queued 信封，`content` 是 ingest 全文。

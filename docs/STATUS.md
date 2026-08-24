@@ -336,6 +336,20 @@ and sandbox contracts live elsewhere. Experiment facts live in
   fail-closed locations, and continuation identity. LT-RUN-03
   (completion/recovery gates) and the `retry_policy_dev` pilot remain
   open per [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+- The third long-task Runtime slice landed (deterministic only): the
+  completion acceptance gate re-runs at every edge — no recovery fence,
+  no unsettled cancelled operation, zero open failure obligations,
+  required verification current, and no open loops silently erased. A
+  gated one-shot proposal returns its decision to the model with one
+  warning per turn instead of committing; deferred and `/done`
+  completions fail with the typed reason. Successful closure orders
+  `TurnCompleted` -> final durable checkpoint acknowledgement ->
+  `TaskCompleted`, provable from JSONL; a failed final write surfaces as
+  a warning that never un-completes the task nor claims resumability.
+  Deterministic coverage: open-loop refusal with later resolution and
+  full ordering proof. All three LT-RUN slices are green; the frozen
+  `retry_policy_dev` normal/resume pilot is the next step per
+  [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
 - **Execution Convergence V1 mechanism landed** (2026-08-23, all 22
   items checked — the checklist is now the historical record
   [`EXECUTION_CONVERGENCE_V1.md`](EXECUTION_CONVERGENCE_V1.md)):
