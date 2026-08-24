@@ -568,6 +568,14 @@ async fn main() -> anyhow::Result<()> {
                 if !report.passed() {
                     anyhow::bail!("long-task gate failed");
                 }
+                let opportunity = long_task::run_opportunity_replay().await?;
+                println!(
+                    "completion_opportunity off/on replay: {}",
+                    if opportunity.passed() { "PASS" } else { "FAIL" }
+                );
+                if !opportunity.passed() {
+                    anyhow::bail!("completion-opportunity replay failed");
+                }
                 return Ok(());
             }
             "--long-task-live" => {

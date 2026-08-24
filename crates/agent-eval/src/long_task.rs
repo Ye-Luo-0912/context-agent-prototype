@@ -22,10 +22,10 @@ use std::sync::{
 use std::time::Duration;
 
 use agent_contracts::{
-    AgentResult, ContextEngine, ContextIngress, ContextItemSummary, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextQuery, ContextStateTransition, MaterializedContext,
-    ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, RuntimeEvent,
-    RuntimeEventEnvelope, ScopeId, ScopeKind, ToolCall,
+    AgentResult, CompletionOpportunityDisposition, ContextEngine, ContextIngress,
+    ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
+    ContextStateTransition, MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest,
+    ModelTransport, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, ToolCall,
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{ModuleHost, RuntimeCheckpoint, RuntimeInstance};
@@ -355,9 +355,27 @@ async fn spawn_instance(
     root: &Path,
     journal_path: &Path,
     model: Arc<dyn ModelTransport>,
+    opportunity_switch: bool,
 ) -> anyhow::Result<RuntimeInstance> {
     let workspace = agent_workspace::Workspace::open(root).await?;
-    let dispatcher = tool_runtime::BuiltinToolDispatcher::new(workspace.clone());
+    // One pinned source-read-only exact-world verifier, registered through
+    // the real host recipe path so the replay exercises production
+    // attribution and execution rather than a harness stand-in.
+    let recipe = tool_runtime::VerificationRecipe::new(
+        "gate",
+        "pinned deterministic verifier for the opportunity replay",
+        "v1",
+        vec!["cargo".into(), "--version".into()],
+    )
+    .map_err(|e| anyhow!("gate recipe: {e}"))?
+    .with_exact_current_world_reuse();
+    let recipes = tool_runtime::VerificationRecipes::new(vec![recipe])
+        .map_err(|e| anyhow!("gate recipes: {e}"))?;
+    let dispatcher = tool_runtime::BuiltinToolDispatcher::with_config_and_verification_recipes(
+        workspace.clone(),
+        tool_runtime::ToolLifecycleConfig::default(),
+        recipes,
+    );
     // Both phases share one durable operation journal, so the restored
     // runtime inherits the authority lineage of the stopped one.
     let operation_journal = Arc::new(agent_storage::FileOperationJournal::open(journal_path)?.0);
@@ -370,7 +388,8 @@ async fn spawn_instance(
         None,
         agent_runtime::AuthorityRecoveryServices::new(operation_journal, None),
     )?
-    .with_artifact_workspace(Arc::new(workspace));
+    .with_artifact_workspace(Arc::new(workspace))
+    .with_project_completion_opportunity(opportunity_switch);
     let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
     instance.handle().start().await?;
     Ok(instance)
@@ -452,7 +471,7 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
         ),
     ]));
     let journal_path = root.join(".gate").join("operations.log");
-    let instance_a = spawn_instance(root, &journal_path, phase_one_model).await?;
+    let instance_a = spawn_instance(root, &journal_path, phase_one_model, false).await?;
     let handle_a = instance_a.handle();
     let mut events_a = handle_a.subscribe();
     handle_a
@@ -533,7 +552,7 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
             json!({"summary": "bounded exponential retry policy implemented and documented"}),
         ),
     ]));
-    let instance_b = spawn_instance(root, &journal_path, phase_two_model)
+    let instance_b = spawn_instance(root, &journal_path, phase_two_model, false)
         .await
         .map_err(|e| anyhow!("phase-b spawn: {e}"))?;
     instance_b
@@ -607,6 +626,205 @@ async fn drive_two_phases(root: &Path) -> anyhow::Result<GateReport> {
 
     report.hidden_violations = hidden_check_violations(root);
     Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// CompletionOpportunity deterministic off/on replay (Roadmap item 8 freeze)
+// ---------------------------------------------------------------------------
+
+/// What one arm of the replay observed, body-free.
+#[derive(Debug, Default)]
+struct OpportunityArmObservation {
+    turn_completed: bool,
+    task_completed: bool,
+    /// Every opportunity event regardless of disposition.
+    opportunity_events_total: u64,
+    offered_keys: Vec<String>,
+    completed_keys: Vec<String>,
+    /// Surface decisions that preferred `task.complete`, as positions in
+    /// the ordered marker stream below.
+    surfaced_positions: Vec<usize>,
+    /// Positional markers for order-sensitive assertions.
+    markers: Vec<&'static str>,
+}
+
+/// Summary of the off/on pair.
+#[derive(Debug, Default)]
+pub struct OpportunityReplayReport {
+    pub on_offered_once: bool,
+    pub on_surfaced_after_offer: bool,
+    pub on_called_after_offer: bool,
+    pub on_completed: bool,
+    pub on_completed_key_matches_offer: bool,
+    pub off_opportunity_events_zero: bool,
+    pub off_never_surfaced: bool,
+}
+
+impl OpportunityReplayReport {
+    pub fn passed(&self) -> bool {
+        self.on_offered_once
+            && self.on_surfaced_after_offer
+            && self.on_called_after_offer
+            && self.on_completed
+            && self.on_completed_key_matches_offer
+            && self.off_opportunity_events_zero
+            && self.off_never_surfaced
+    }
+}
+
+/// Freeze the already-satisfied-task replay the item-8 promotion gate will
+/// reuse: a scripted task performs one durable mutation followed by one
+/// trusted verification pass under an unchanged basis. With the candidate
+/// enabled that is exactly once-per-basis eligibility — one offer, the
+/// leased surface decision closes the task without any explicit load — and
+/// with it disabled the identical script must produce zero opportunity
+/// observations and never surface `task.complete` from derived readiness.
+pub async fn run_opportunity_replay() -> anyhow::Result<OpportunityReplayReport> {
+    let mut report = OpportunityReplayReport::default();
+
+    let scripted_prefix = |id: &str| -> Vec<ToolCall> {
+        vec![
+            ScriptGateModel::call(
+                "fs.write",
+                &format!("{id}-write"),
+                json!({"path": "src/config.rs", "content": PHASE_ONE_CONFIG}),
+            ),
+            ScriptGateModel::call(
+                "verify.run",
+                &format!("{id}-verify"),
+                json!({"recipe_id": "gate"}),
+            ),
+        ]
+    };
+
+    // ---- ON arm: after the pass lands, the next decision closes the task
+    // through the lease alone (no capability.manage load of task.complete).
+    let mut on_calls = scripted_prefix("on");
+    on_calls.push(ScriptGateModel::call(
+        "task.complete",
+        "on-complete",
+        json!({"summary": "retry policy implemented and verified"}),
+    ));
+    let on_dir = tempfile::tempdir()?;
+    seed_workspace(on_dir.path())?;
+    let on = drive_opportunity_arm(on_dir.path(), true, on_calls).await?;
+
+    // ---- OFF arm: identical work and finish, switch disabled.
+    let off_dir = tempfile::tempdir()?;
+    seed_workspace(off_dir.path())?;
+    let off = drive_opportunity_arm(off_dir.path(), false, scripted_prefix("off")).await?;
+
+    report.on_offered_once = on.offered_keys.len() == 1;
+    report.on_completed = on.task_completed;
+    report.on_completed_key_matches_offer =
+        on.completed_keys.len() == 1 && on.completed_keys == on.offered_keys;
+    // Order is positional: the offer must land before the leased surface
+    // decision and before the model's call.
+    let offer_index = on.markers.iter().position(|marker| *marker == "offered");
+    let called_index = on.markers.iter().position(|marker| *marker == "called");
+    report.on_surfaced_after_offer = offer_index
+        .is_some_and(|offer| on.surfaced_positions.iter().any(|surface| *surface > offer));
+    report.on_called_after_offer =
+        matches!((offer_index, called_index), (Some(o), Some(c)) if o < c);
+    report.off_opportunity_events_zero = off.opportunity_events_total == 0;
+    report.off_never_surfaced = off.surfaced_positions.is_empty();
+    Ok(report)
+}
+
+async fn drive_opportunity_arm(
+    root: &Path,
+    opportunity_switch: bool,
+    calls: Vec<ToolCall>,
+) -> anyhow::Result<OpportunityArmObservation> {
+    let journal = root.join(".gate").join(format!(
+        "{}-operations.log",
+        if opportunity_switch { "on" } else { "off" }
+    ));
+    let instance = spawn_instance(
+        root,
+        &journal,
+        Arc::new(ScriptGateModel::new(calls)),
+        opportunity_switch,
+    )
+    .await?;
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle
+        .set_focus(DIRECTIVE.to_string())
+        .await
+        .map_err(|e| anyhow!("set_focus: {e}"))?;
+    handle
+        .user_message(DIRECTIVE.to_string())
+        .await
+        .map_err(|e| anyhow!("user_message: {e}"))?;
+
+    let mut obs = OpportunityArmObservation::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    // `TaskCompleted`/`Completed` publish after `TurnCompleted` (the
+    // deferred CTX-10 commit runs behind the turn-end barrier), so the
+    // drain keeps going through a short quiet window instead of stopping
+    // at the first turn-completed event.
+    const QUIET_POLLS: u32 = 15;
+    let mut quiet_polls: u32 = 0;
+    while tokio::time::Instant::now() < deadline {
+        let mut got_any = false;
+        while let Ok(envelope) = events.try_recv() {
+            match envelope.event {
+                RuntimeEvent::ToolSurfacePlanned { report } => {
+                    if report
+                        .selected
+                        .iter()
+                        .any(|row| row.tool_name == "task.complete")
+                    {
+                        obs.surfaced_positions.push(obs.markers.len());
+                    }
+                }
+                RuntimeEvent::CompletionOpportunity {
+                    disposition, key, ..
+                } => {
+                    obs.opportunity_events_total += 1;
+                    match disposition {
+                        CompletionOpportunityDisposition::Offered => {
+                            obs.offered_keys.push(key);
+                            obs.markers.push("offered");
+                        }
+                        CompletionOpportunityDisposition::Called => {
+                            obs.markers.push("called");
+                        }
+                        CompletionOpportunityDisposition::Completed => {
+                            obs.completed_keys.push(key);
+                            obs.markers.push("completed_key");
+                        }
+                        _ => {}
+                    }
+                }
+                RuntimeEvent::TaskCompleted { .. } => {
+                    obs.task_completed = true;
+                    obs.markers.push("completed");
+                }
+                RuntimeEvent::TurnCompleted => obs.turn_completed = true,
+                _ => {}
+            }
+            got_any = true;
+        }
+        if obs.turn_completed && !got_any {
+            quiet_polls += 1;
+            if quiet_polls >= QUIET_POLLS {
+                break;
+            }
+        } else if got_any {
+            quiet_polls = 0;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    anyhow::ensure!(
+        obs.turn_completed,
+        "opportunity arm (switch={opportunity_switch}) did not finish: {:?}",
+        obs
+    );
+    let shutdown = instance.shutdown().await;
+    shutdown?;
+    Ok(obs)
 }
 
 const PHASE_ONE_CONFIG: &str = r#"//! Retry configuration.
@@ -724,6 +942,29 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("README.md")).unwrap(),
             "operator content",
+        );
+    }
+
+    /// The item-8 freeze input: the already-satisfied replay must offer
+    /// exactly once per basis and close through the lease alone when the
+    /// candidate is enabled, and stay fully silent when it is not.
+    #[tokio::test]
+    async fn opportunity_replay_passes_off_and_on() {
+        let report = run_opportunity_replay()
+            .await
+            .expect("opportunity replay completes");
+        assert!(
+            report.passed(),
+            "on_offered_once={} on_surfaced_after_offer={} on_called_after_offer={} \
+             on_completed={} on_completed_key_matches_offer={} \
+             off_opportunity_events_zero={} off_never_surfaced={}",
+            report.on_offered_once,
+            report.on_surfaced_after_offer,
+            report.on_called_after_offer,
+            report.on_completed,
+            report.on_completed_key_matches_offer,
+            report.off_opportunity_events_zero,
+            report.off_never_surfaced,
         );
     }
 }

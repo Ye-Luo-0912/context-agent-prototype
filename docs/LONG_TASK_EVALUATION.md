@@ -518,7 +518,13 @@ for exactly one decision, arms one bounded prompt statement through
 not_ready/offered/called/ignored/refused/completed. All eight mandatory
 negatives are deterministic-green at the derivation level, and actor-level
 tests prove the switch is silent by default and never leases an initial task.
-The item-8 off/on paired live promotion gate has not run.
+The already-satisfied-task replay the promotion gate requires is frozen as a
+deterministic off/on pair (`agent-eval --long-task-gate` also runs it): one
+durable mutation plus one real registered-recipe `verify.run` pass under an
+unchanged basis yields exactly one offer, and the leased decision closes the
+task through `task.complete` alone; with the candidate disabled the identical
+script emits zero opportunity events and never surfaces the tool. The item-8
+off/on paired live promotion gate itself has not run.
 
 ### Slice D — one complete durable checkpoint boundary
 
