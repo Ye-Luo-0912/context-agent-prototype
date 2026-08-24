@@ -172,6 +172,8 @@ type EventStream = tokio::sync::broadcast::Receiver<RuntimeEventEnvelope>;
 struct PhaseState {
     model_rounds: u32,
     cancelled_for_cap: bool,
+    /// Set when the resume trigger asked the operator-style cancel.
+    cancel_requested: bool,
     mutation_tool: Option<&'static str>,
     durable_after_mutation: bool,
     resume_committed: u64,
@@ -184,6 +186,8 @@ enum StepOutcome {
     Continue,
     TaskCompleted,
     TurnCompleted,
+    /// The turn stopped because this loop requested the cancel.
+    ExpectedCancel,
     Fail(String),
 }
 
@@ -254,11 +258,15 @@ fn step_event(
         }
         RuntimeEvent::TurnCancelled { .. } => {
             collector.push(envelope);
-            StepOutcome::Fail(if state.cancelled_for_cap {
-                format!("live model-round cap ({LIVE_MAX_MODEL_ROUNDS}) exceeded")
+            if state.cancel_requested {
+                StepOutcome::ExpectedCancel
+            } else if state.cancelled_for_cap {
+                StepOutcome::Fail(format!(
+                    "live model-round cap ({LIVE_MAX_MODEL_ROUNDS}) exceeded"
+                ))
             } else {
-                "turn cancelled".into()
-            })
+                StepOutcome::Fail("turn cancelled".into())
+            }
         }
         RuntimeEvent::TurnCommitFailed { ref message, .. } => {
             let reason = format!("turn commit failed: {message}");
@@ -268,7 +276,13 @@ fn step_event(
         RuntimeEvent::Error { ref message } => {
             let reason = format!("runtime error: {message}");
             collector.push(envelope);
-            StepOutcome::Fail(reason)
+            // Settling an operator cancel can surface cleanup errors that
+            // do not doom the stop; only fail on them outside that window.
+            if state.cancel_requested {
+                StepOutcome::Continue
+            } else {
+                StepOutcome::Fail(reason)
+            }
         }
         RuntimeEvent::RecoveryRequired => {
             collector.push(envelope);
@@ -302,8 +316,11 @@ async fn next_envelope(
 }
 
 /// Wait until the first durably settled workspace mutation has its durable
-/// checkpoint. The task finishing before the interruption is a harness
-/// failure: there would be nothing left to continue.
+/// checkpoint, then stop the run the way an operator would: cancel the
+/// in-flight turn, wait for the cancellation to settle, and return while
+/// the runtime is idle so the checkpoint can be captured. The task
+/// finishing before the interruption is a harness failure: there would be
+/// nothing left to continue.
 async fn wait_resume_trigger(
     receiver: &mut EventStream,
     collector: &mut Collector,
@@ -314,17 +331,52 @@ async fn wait_resume_trigger(
         let envelope = next_envelope(receiver, collector).await?;
         match step_event(envelope, collector, state) {
             StepOutcome::Continue => {}
+            StepOutcome::ExpectedCancel => {
+                // The turn settled from our cancel; pending tool cleanup may
+                // still drain for a short window. Wait for true idleness.
+                settle_after_cancel(receiver, collector, state).await;
+                return Ok(());
+            }
             StepOutcome::TaskCompleted => {
                 return Err("task completed before the resume interruption could fire".into());
             }
             StepOutcome::TurnCompleted => {
+                if state.durable_after_mutation {
+                    // Natural turn boundary after the trigger: equally idle
+                    // and equally resumable.
+                    return Ok(());
+                }
                 return Err("turn finished before any durably settled workspace mutation".into());
             }
             StepOutcome::Fail(reason) => return Err(reason),
         }
         state.enforce_cap(handle);
-        if state.durable_after_mutation {
-            return Ok(());
+        if state.durable_after_mutation && !state.cancel_requested {
+            state.cancel_requested = true;
+            let _ = handle.cancel_turn().await;
+        }
+    }
+}
+
+/// After an operator-style cancel, give the actor a bounded window to
+/// finish explicit tool cleanup before the checkpoint capture: drain
+/// events until a few quiet seconds pass.
+async fn settle_after_cancel(
+    receiver: &mut EventStream,
+    collector: &mut Collector,
+    state: &mut PhaseState,
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let step = Duration::from_millis(500);
+    let mut quiet = Duration::ZERO;
+    while quiet < Duration::from_secs(4) && Instant::now() < deadline {
+        match tokio::time::timeout(step, receiver.recv()).await {
+            Err(_) => quiet += step,
+            Ok(Err(_)) => return,
+            Ok(Ok(envelope)) => {
+                let _ = step_event(envelope, collector, state);
+                quiet = Duration::ZERO;
+            }
         }
     }
 }
@@ -344,6 +396,9 @@ async fn run_to_completion(
             StepOutcome::Continue => {}
             StepOutcome::TaskCompleted => return Ok(()),
             StepOutcome::TurnCompleted => break,
+            StepOutcome::ExpectedCancel => {
+                return Err("unexpected operator-style cancel during a live run".into());
+            }
             StepOutcome::Fail(reason) => return Err(reason),
         }
         state.enforce_cap(handle);
@@ -354,6 +409,9 @@ async fn run_to_completion(
             Ok(Err(_)) => return Ok(()),
             Ok(Ok(envelope)) => match step_event(envelope, collector, state) {
                 StepOutcome::TaskCompleted => return Ok(()),
+                StepOutcome::ExpectedCancel => {
+                    return Err("unexpected operator-style cancel during a live run".into());
+                }
                 StepOutcome::Fail(reason) => return Err(reason),
                 _ => {}
             },
@@ -833,10 +891,10 @@ fn collect_files(
                 anyhow::bail!("file {} exceeds the size cap", prefix.join(&name).display());
             }
             let bytes = std::fs::read(&path)?;
-            out.insert(
-                prefix.join(&name).to_string_lossy().into_owned(),
-                sha256_hex(&bytes),
-            );
+            // Normalize to forward slashes so the policy and seed lookups
+            // are identical across host path separators.
+            let relative = prefix.join(&name).to_string_lossy().replace('\\', "/");
+            out.insert(relative, sha256_hex(&bytes));
         }
     }
     Ok(())
