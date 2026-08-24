@@ -376,7 +376,7 @@ async fn compose_cell(
         ),
     );
     let composed = agent_compose::compose(agent_compose::ComposeConfig {
-        workspace,
+        workspace: workspace.clone(),
         context_engine: engine,
         model,
         approval: Arc::new(AllowAllGate),
