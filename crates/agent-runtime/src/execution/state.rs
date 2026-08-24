@@ -172,6 +172,11 @@ pub struct ExecutionState {
     /// become schema roots only while verification is due.
     #[serde(default)]
     pub verification_sources: Vec<VerificationSourceLease>,
+    /// LONG-TASK advisory (default off upstream): the last actually offered
+    /// completion-opportunity key. Body-free and bounded, so unchanged reads
+    /// and progress-only anchor edits cannot re-arm the same hint.
+    #[serde(default)]
+    pub last_offered_opportunity: Option<String>,
 }
 
 /// 一条已证明存在的执行 blocker（CONV-03 lineage 模型）。
@@ -511,6 +516,20 @@ impl ExecutionState {
 
     pub(super) fn refresh_validity(&mut self) {
         self.verification.state = self.validity();
+    }
+
+    /// Record the last actually offered completion-opportunity key. The
+    /// key is body-free and hard-bounded; recording an offer never touches
+    /// verification state.
+    pub fn record_opportunity_offer(&mut self, key: String) {
+        let mut key = key;
+        if key.chars().count() > crate::opportunity::MAX_OPPORTUNITY_KEY_CHARS {
+            key = key
+                .chars()
+                .take(crate::opportunity::MAX_OPPORTUNITY_KEY_CHARS)
+                .collect();
+        }
+        self.last_offered_opportunity = Some(key);
     }
 
     /// Conservative user-turn signal that this instruction is asking to
@@ -855,6 +874,7 @@ impl ExecutionState {
             unresolved_blockers: self.obligation_warnings(),
             stall_warning: self.stall_warning(),
             frontier_warning: self.frontier_warning(),
+            completion_opportunity: None,
         }
     }
 

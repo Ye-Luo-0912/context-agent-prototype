@@ -15,22 +15,22 @@ use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
     AgentError, AgentResult, AnchorPatchKind, ArgumentDigest, ArtifactLocator, AuthorityLease,
     AuthorityRecoveryStatus, CAPABILITY_MANAGE, CONTEXT_CONSUMPTION_ACK_ITEM_CAP, CONTEXT_MANAGE,
-    CancellationToken, CompletionProposal, ContextConsumptionAck, ContextHints, ContextIngress,
-    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention,
-    DISCOVERY_IDENTICAL_QUERY_BUDGET, DISCOVERY_MAX_QUERIES_PER_TURN, DiscoveryBudgetExhausted,
-    DiscoveryTurnBudget, Effect, EffectDurability, EffectId, EffectReceipt, FocusState,
-    FsRereadClass, InputAuthority, InputKind, InputLifecycle, InputSource,
-    MAX_COMPLETION_ARTIFACTS, MAX_MODEL_TOOL_CALLS_PER_ROUND, MaterializedContext,
-    ModelCompletionValidity, ModelInput, ModelRequest, OperationId, OperationOutcome,
-    OperationQueryResult, OperationResult, OperationState, OperationTerminal, ResourceFreshness,
-    ResourceKey, ResourceVersionOracle, RestoreRevision, RunId, RuntimeDirective, RuntimeEvent,
-    RuntimeInputEnvelope, RuntimeInputId, ScopeId, ScopeKind, StatePatchProposal, TaskAnchorView,
-    TaskId, TaskProgressProposal, TaskProgressView, ToolCall, ToolLeaseBoundary,
-    ToolOperationIdentity, ToolOutcome, ToolOutput, ToolResultDisposition, ToolSpec,
-    ToolSurfaceBlock, ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceRequirement,
-    ToolSurfaceSnapshot, TurnCancelAck, TurnCancellationReason, TurnFrame, TurnFrameStep, TurnId,
-    USER_INPUT_ARTIFACT_OWNER, USER_INPUT_PREVIEW_CHARS, USER_INPUT_QUEUE_CAP,
-    apply_runtime_diagnosis, bounded_preview, context_maintenance_events,
+    CancellationToken, CompletionOpportunityDisposition, CompletionProposal, ContextConsumptionAck,
+    ContextHints, ContextIngress, ContextMaintenanceReport, ContextMaintenanceTrigger,
+    ContextQuery, ContextRetention, DISCOVERY_IDENTICAL_QUERY_BUDGET,
+    DISCOVERY_MAX_QUERIES_PER_TURN, DiscoveryBudgetExhausted, DiscoveryTurnBudget, Effect,
+    EffectDurability, EffectId, EffectReceipt, FocusState, FsRereadClass, InputAuthority,
+    InputKind, InputLifecycle, InputSource, MAX_COMPLETION_ARTIFACTS,
+    MAX_MODEL_TOOL_CALLS_PER_ROUND, MaterializedContext, ModelCompletionValidity, ModelInput,
+    ModelRequest, OperationId, OperationOutcome, OperationQueryResult, OperationResult,
+    OperationState, OperationTerminal, ResourceFreshness, ResourceKey, ResourceVersionOracle,
+    RestoreRevision, RunId, RuntimeDirective, RuntimeEvent, RuntimeInputEnvelope, RuntimeInputId,
+    ScopeId, ScopeKind, StatePatchProposal, TaskAnchorView, TaskId, TaskProgressProposal,
+    TaskProgressView, ToolCall, ToolLeaseBoundary, ToolOperationIdentity, ToolOutcome, ToolOutput,
+    ToolResultDisposition, ToolSpec, ToolSurfaceBlock, ToolSurfaceBlockReason, ToolSurfaceDemand,
+    ToolSurfaceRequirement, ToolSurfaceSnapshot, TurnCancelAck, TurnCancellationReason, TurnFrame,
+    TurnFrameStep, TurnId, USER_INPUT_ARTIFACT_OWNER, USER_INPUT_PREVIEW_CHARS,
+    USER_INPUT_QUEUE_CAP, apply_runtime_diagnosis, bounded_preview, context_maintenance_events,
     discovery_search_from_call, path_exactly_in_directive,
 };
 use agent_core::{
@@ -243,6 +243,12 @@ struct ActiveTurn {
     /// turn commits — through the CTX-10 transaction, so completion never
     /// races an in-flight operation.
     pending_completion: Option<CompletionProposal>,
+    /// LONG-TASK advisory (Slice C): opportunity key whose one-decision
+    /// lease is outstanding — `task.complete` is preferred on this
+    /// decision's surface and the prompt carries the bounded statement.
+    /// Dies with the turn on cancel/fail (retraction); cleared after one
+    /// decision regardless of outcome.
+    opportunity_lease: Option<String>,
     /// 本轮 Applied 对话。Consumed / Archived / InterruptCommitted 复用同一条。
     applied_input: Option<RuntimeInputEnvelope>,
     /// 已经为这条 applied input 发过 Consumed。
@@ -635,6 +641,7 @@ mod edit_attempt_tests {
             protocol_bodies: crate::execution::body_cache::ProtocolBodyCache::default(),
             round_snapshot: None,
             pending_completion: None,
+            opportunity_lease: None,
             applied_input: None,
             input_consumed: false,
             structurally_empty_retries: 0,

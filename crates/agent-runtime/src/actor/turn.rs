@@ -152,6 +152,7 @@ impl RuntimeActor {
             protocol_bodies: crate::execution::body_cache::ProtocolBodyCache::default(),
             round_snapshot: None,
             pending_completion: None,
+            opportunity_lease: None,
             applied_input: Some(applied),
             input_consumed: false,
             structurally_empty_retries: 0,
@@ -417,6 +418,28 @@ impl RuntimeActor {
                         .core
                         .emit_warning(format!("completion proposal refused: {error}"))
                         .await;
+                } else if self.services.project_completion_opportunity()
+                    && let Some(task_id) = self.state.tasks.active()
+                {
+                    // LONG-TASK advisory: the model answered an offered (or
+                    // explicitly directed) closure surface; account the
+                    // call before the commit.
+                    let key = self
+                        .state
+                        .turn
+                        .as_ref()
+                        .and_then(|turn| turn.opportunity_lease.clone())
+                        .unwrap_or_default();
+                    let _ = self
+                        .core
+                        .emit_event(RuntimeEvent::CompletionOpportunity {
+                            disposition: CompletionOpportunityDisposition::Called,
+                            task_id,
+                            key,
+                            anchor_revision: self.current_anchor_revision_value(),
+                            reason: "task.complete proposal accepted for commit".into(),
+                        })
+                        .await;
                 }
             }
             RuntimeDirective::UpdateTaskProgress(proposal) => {
@@ -649,6 +672,148 @@ impl RuntimeActor {
         self.completion_gate().err().map(|error| error.to_string())
     }
 
+    /// LONG-TASK Slice C: one advisory completion-opportunity consult at a
+    /// settled tool-batch safe point. Emits one bounded, body-free event
+    /// per consult; an eligible key whose decision has not consumed it
+    /// leases `task.complete` onto the next decision's surface and arms
+    /// the bounded prompt statement. One unchanged key is offered at most
+    /// once per basis (the last offered key persists in `ExecutionState`);
+    /// a relevant mutation moves the world revision, so a later current
+    /// verification derives a fresh key. Cancel/failure retract silently:
+    /// the lease dies with the turn frame.
+    pub(super) async fn settle_completion_opportunity(&mut self) {
+        if !self.services.project_completion_opportunity() {
+            return;
+        }
+        let Some(task_id) = self.state.tasks.active() else {
+            return;
+        };
+        let pending = self
+            .state
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.pending_completion.is_some());
+
+        // Spend an outstanding lease whose decision ended without calling.
+        // A pending proposal was already accounted as Called on acceptance.
+        let spent = if pending {
+            None
+        } else {
+            self.state
+                .turn
+                .as_mut()
+                .and_then(|turn| turn.opportunity_lease.take())
+        };
+        if let Some(key) = spent {
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::CompletionOpportunity {
+                    disposition: CompletionOpportunityDisposition::Ignored,
+                    task_id,
+                    key,
+                    anchor_revision: self.current_anchor_revision_value(),
+                    reason: "leased decision ended without calling".into(),
+                })
+                .await;
+        }
+
+        let Some(turn) = self.state.turn.as_ref() else {
+            return;
+        };
+        if turn.pending_completion.is_some() {
+            // Called/Refused own this settle; derivation would only repeat
+            // the pending-proposal blocker behind their own events.
+            return;
+        }
+        let anchor = &self
+            .state
+            .tasks
+            .get(task_id)
+            .expect("active id resolves")
+            .anchor;
+        let decision = crate::opportunity::derive_completion_opportunity(
+            task_id,
+            anchor,
+            &turn.execution,
+            false,
+            self.state.recovery_required,
+            self.state.pending_tool_cleanup.is_some(),
+        );
+        let anchor_revision = turn.execution.anchor_revision;
+        match decision.ready {
+            Some(key) => {
+                let already_offered = turn.execution.last_offered_opportunity.as_deref()
+                    == Some(key.key.as_str())
+                    || turn.opportunity_lease.as_deref() == Some(key.key.as_str());
+                if already_offered {
+                    return;
+                }
+                let key_text = key.key.clone();
+                let turn = self.state.turn.as_mut().expect("turn checked above");
+                turn.execution.record_opportunity_offer(key_text.clone());
+                turn.opportunity_lease = Some(key_text.clone());
+                let _ = self
+                    .core
+                    .emit_event(RuntimeEvent::CompletionOpportunity {
+                        disposition: CompletionOpportunityDisposition::Offered,
+                        task_id,
+                        key: key_text,
+                        anchor_revision,
+                        reason: "eligible".into(),
+                    })
+                    .await;
+            }
+            None => {
+                let _ = self
+                    .core
+                    .emit_event(RuntimeEvent::CompletionOpportunity {
+                        disposition: CompletionOpportunityDisposition::NotReady,
+                        task_id,
+                        key: String::new(),
+                        anchor_revision,
+                        reason: decision.reason,
+                    })
+                    .await;
+            }
+        }
+    }
+
+    fn current_anchor_revision_value(&self) -> u64 {
+        self.state
+            .tasks
+            .active()
+            .and_then(|task_id| self.state.tasks.get(task_id))
+            .map(|task| task.anchor.revision)
+            .unwrap_or_default()
+    }
+
+    /// Account a gate-refused proposal against the opportunity lifecycle
+    /// and spend any outstanding lease: the decision returns to the model.
+    pub(super) async fn refuse_completion_opportunity(&mut self, reason: String) {
+        if !self.services.project_completion_opportunity() {
+            return;
+        }
+        let Some(task_id) = self.state.tasks.active() else {
+            return;
+        };
+        let key = self
+            .state
+            .turn
+            .as_mut()
+            .and_then(|turn| turn.opportunity_lease.take())
+            .unwrap_or_default();
+        let _ = self
+            .core
+            .emit_event(RuntimeEvent::CompletionOpportunity {
+                disposition: CompletionOpportunityDisposition::Refused,
+                task_id,
+                key,
+                anchor_revision: self.current_anchor_revision_value(),
+                reason,
+            })
+            .await;
+    }
+
     pub(super) async fn commit_completion(
         &mut self,
         summary: String,
@@ -808,6 +973,27 @@ impl RuntimeActor {
                 report,
             )
             .await;
+        // LONG-TASK advisory: account closure against the opportunity
+        // lifecycle. The key repeats the last offered key when the offer's
+        // basis survived to the commit; empty rows mean an explicit path.
+        if self.services.project_completion_opportunity() {
+            let key = self
+                .state
+                .tasks
+                .get(task_id)
+                .and_then(|task| task.resume.last_offered_opportunity.clone())
+                .unwrap_or_default();
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::CompletionOpportunity {
+                    disposition: CompletionOpportunityDisposition::Completed,
+                    task_id,
+                    key,
+                    anchor_revision,
+                    reason: "typed completion record committed".into(),
+                })
+                .await;
+        }
         if transition.is_ok() {
             self.compact_after_completion().await;
             self.run_storage_gc_at_boundary().await;
@@ -833,6 +1019,26 @@ impl RuntimeActor {
         // background write retries at the next turn end even when the
         // closing round had no tool batch.
         self.safe_point_resume_commit().await;
+        // LONG-TASK advisory: the turn's final decision ended without a
+        // completion proposal, so an outstanding lease is spent as ignored.
+        // A pending proposal skips this — Called/Refused own the outcome.
+        if self.state.turn.as_ref().is_some_and(|turn| {
+            turn.opportunity_lease.is_some() && turn.pending_completion.is_none()
+        }) && let Some(task_id) = self.state.tasks.active()
+            && let Some(turn) = self.state.turn.as_mut()
+        {
+            let key = turn.opportunity_lease.take().unwrap_or_default();
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::CompletionOpportunity {
+                    disposition: CompletionOpportunityDisposition::Ignored,
+                    task_id,
+                    key,
+                    anchor_revision: turn.execution.anchor_revision,
+                    reason: "final decision ended without calling".into(),
+                })
+                .await;
+        }
         // Turn-end barrier: a resume checkpoint still in flight must land
         // (and publish its outcome) before the durable TurnCompleted
         // event, so the JSONL order proves resume-before-completion. A

@@ -619,6 +619,7 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
         &progress.unresolved_blockers,
         progress.stall_warning.as_deref(),
         progress.frontier_warning.as_deref(),
+        progress.completion_opportunity.as_deref(),
     );
     while rendered.chars().count() > agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS {
         if !failed.is_empty() {
@@ -642,6 +643,7 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
             &progress.unresolved_blockers,
             progress.stall_warning.as_deref(),
             progress.frontier_warning.as_deref(),
+            progress.completion_opportunity.as_deref(),
         );
     }
     if rendered.chars().count() > agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS {
@@ -665,6 +667,7 @@ fn format_task_progress(
     blockers: &[String],
     stall_warning: Option<&str>,
     frontier_warning: Option<&str>,
+    completion_opportunity: Option<&str>,
 ) -> String {
     let mut out =
         format!("TASK PROGRESS anchor_rev={anchor_revision} world_rev={workspace_revision}\n");
@@ -677,6 +680,11 @@ fn format_task_progress(
     // 收敛 advisory 同样不参与裁剪：它是重复行为的最后提醒。
     if let Some(warning) = frontier_warning {
         out.push_str(warning);
+        out.push('\n');
+    }
+    // 机会投影（Slice C，默认关）：只在租赁存活的那一次决策可见。
+    if let Some(opportunity) = completion_opportunity {
+        out.push_str(opportunity);
         out.push('\n');
     }
     // 逐义务 blocker（CONV-03，≤2 行有界）：无关推进清不掉它们，

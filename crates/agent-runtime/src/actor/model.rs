@@ -160,6 +160,18 @@ impl RuntimeActor {
                 reason: "current user directive explicitly requests task closure".into(),
             });
         }
+        // LONG-TASK advisory (Slice C, default off): while a derived
+        // completion-opportunity lease is outstanding, this ONE decision
+        // sees `task.complete` preferred on its surface. The model still
+        // chooses; the lease dies with the decision.
+        if self
+            .state
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.opportunity_lease.is_some())
+        {
+            requirements.push(crate::opportunity::opportunity_surface_requirement());
+        }
         // Verification is source-affine once a trusted verifier has
         // produced a reusable result for this exact task anchor. Keep that
         // concrete schema available first; the semantic-role fallback below
@@ -1092,7 +1104,7 @@ impl RuntimeActor {
         if !turn_frame.user_message.is_empty() {
             focus.current_query = turn_frame.user_message.clone();
         }
-        let progress = if self.services.project_task_progress() {
+        let mut progress = if self.services.project_task_progress() {
             if let Some(snapshot) = self.round_snapshot() {
                 Some(snapshot.progress.clone())
             } else if let Some(turn) = self.state.turn.as_ref() {
@@ -1103,6 +1115,17 @@ impl RuntimeActor {
         } else {
             None
         };
+        // LONG-TASK advisory (Slice C, default off): project the bounded
+        // closure statement only while the one-decision lease is live.
+        if let Some(progress) = progress.as_mut().filter(|_| {
+            self.state
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.opportunity_lease.is_some())
+        }) {
+            progress.completion_opportunity =
+                Some(crate::opportunity::OPPORTUNITY_PROMPT_LINE.to_string());
+        }
         (
             Some(focus),
             Some(crate::task::task_anchor_view(&task.anchor)),

@@ -348,6 +348,25 @@ impl AppState {
             RuntimeEvent::CheckpointWriteFailed { reason } => {
                 self.push_system(format!("checkpoint write failed: {reason}"));
             }
+            RuntimeEvent::CompletionOpportunity {
+                disposition,
+                task_id,
+                key,
+                reason,
+                ..
+            } => {
+                // Advisory lifecycle row: surface only the state changes a
+                // user would act on, not every not_ready consult.
+                if !matches!(
+                    disposition,
+                    agent_contracts::CompletionOpportunityDisposition::NotReady
+                ) {
+                    self.push_system(format!(
+                        "completion opportunity {:?} for task {task_id} (key {key}): {reason}",
+                        disposition
+                    ));
+                }
+            }
             RuntimeEvent::TaskContinuationStarted { task_id, .. } => {
                 self.push_system(format!("task {task_id} continuation started"));
             }

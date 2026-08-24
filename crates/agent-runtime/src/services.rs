@@ -43,6 +43,10 @@ pub struct RuntimeServices {
     artifact_workspace: Option<Arc<Workspace>>,
     /// Ablation: when false, PromptAssembler omits TaskProgress. Default true.
     project_task_progress: bool,
+    /// LONG-TASK Slice C: when false (the default), the runtime never
+    /// derives completion-opportunity facts, never leases `task.complete`
+    /// from derived readiness and emits no opportunity events.
+    project_completion_opportunity: bool,
     /// Read-only handle onto the host capability registry, injected at
     /// spawn so the actor's safe-point checkpoints capture the full plane
     /// set. The actor snapshots it; it never mutates through this handle.
@@ -124,6 +128,7 @@ impl RuntimeServices {
             tools,
             artifact_workspace: None,
             project_task_progress: true,
+            project_completion_opportunity: false,
             capability_registry: None,
         }
     }
@@ -157,6 +162,7 @@ impl RuntimeServices {
             tools,
             artifact_workspace: None,
             project_task_progress: true,
+            project_completion_opportunity: false,
             capability_registry: None,
         })
     }
@@ -222,6 +228,18 @@ impl RuntimeServices {
 
     pub(crate) fn project_task_progress(&self) -> bool {
         self.project_task_progress
+    }
+
+    /// Opt the runtime into deriving advisory completion-opportunity facts.
+    /// Default off; promotion requires the ROADMAP item-8 off/on paired
+    /// live gate before this may ship enabled.
+    pub fn with_project_completion_opportunity(mut self, project: bool) -> Self {
+        self.project_completion_opportunity = project;
+        self
+    }
+
+    pub(crate) fn project_completion_opportunity(&self) -> bool {
+        self.project_completion_opportunity
     }
 
     pub(crate) fn artifact_workspace(&self) -> Option<&Workspace> {

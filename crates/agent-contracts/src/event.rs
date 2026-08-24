@@ -94,6 +94,28 @@ pub enum VerificationPassEventKind {
     Reused,
 }
 
+/// Lifecycle of one derived completion-opportunity observation. The
+/// opportunity is advisory: it never commits a task by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionOpportunityDisposition {
+    /// The derivation ran and the task is not closure-ready; `reason`
+    /// names the blocking class.
+    #[default]
+    NotReady,
+    /// The opportunity became eligible and Runtime leased `task.complete`
+    /// onto the next decision surface.
+    Offered,
+    /// The model called `task.complete` while (or after) an offer was live.
+    Called,
+    /// The leased decision ended without calling; the lease is spent.
+    Ignored,
+    /// The proposal was refused by the acceptance gate.
+    Refused,
+    /// A typed CompletionRecord was committed for the task.
+    Completed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEvent {
@@ -395,6 +417,20 @@ pub enum RuntimeEvent {
         anchor_revision: u64,
         #[serde(default)]
         changed_fields: Vec<String>,
+        #[serde(default)]
+        reason: String,
+    },
+    /// One body-free completion-opportunity observation (advisory, derived;
+    /// never completion authority). `key` is the stable opportunity identity
+    /// (empty for `not_ready`), `reason` carries the typed blocker class or
+    /// the lease outcome. Emitted only while the host switch is enabled.
+    CompletionOpportunity {
+        disposition: CompletionOpportunityDisposition,
+        task_id: TaskId,
+        #[serde(default)]
+        key: String,
+        #[serde(default)]
+        anchor_revision: u64,
         #[serde(default)]
         reason: String,
     },

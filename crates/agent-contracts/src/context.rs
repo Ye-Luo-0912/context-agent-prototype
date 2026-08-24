@@ -1139,6 +1139,11 @@ pub struct TaskProgressView {
     /// 不阻断执行。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontier_warning: Option<String>,
+    /// LONG-TASK advisory: one bounded statement that the whole task may
+    /// now be closed, projected only while a derived completion-opportunity
+    /// lease is outstanding for this decision. Never an execution block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_opportunity: Option<String>,
 }
 
 /// Hard cap on the assembled TASK PROGRESS prompt block. List-length caps

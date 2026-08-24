@@ -1273,6 +1273,9 @@ impl RuntimeActor {
                 // bounded resume and schedules one atomic write before the
                 // next model decision.
                 self.safe_point_resume_commit().await;
+                // Advisory consult on the freshly observed batch (default
+                // off): spends a spent lease, may offer a fresh one.
+                self.settle_completion_opportunity().await;
                 if let Some(summary) = self.terminal_completion_summary() {
                     self.finalize_terminal_completion(summary).await;
                 } else if let Some(reason) = self.completion_gate_refusal() {
@@ -1286,6 +1289,7 @@ impl RuntimeActor {
                             .emit_warning(format!("completion gate refused: {reason}"))
                             .await;
                         self.state.completion_refusal_surfaced_for = turn_id;
+                        self.refuse_completion_opportunity(reason).await;
                     }
                     self.advance_turn(op_tx).await;
                 } else {

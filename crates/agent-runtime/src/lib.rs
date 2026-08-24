@@ -16,6 +16,7 @@ pub use execution::{
 pub mod host;
 mod instance;
 pub mod modules;
+mod opportunity;
 mod output;
 mod platform;
 mod plugin;

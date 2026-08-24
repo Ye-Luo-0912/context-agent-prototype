@@ -6,6 +6,7 @@ mod completion;
 mod effects;
 mod focus;
 mod harness;
+mod opportunity;
 mod policy;
 mod safepoint;
 mod scopes;
