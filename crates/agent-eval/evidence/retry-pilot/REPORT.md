@@ -53,19 +53,29 @@ the PinAI instability STATUS warns about.
 
 ## Model-behavior finding (not tuned, recorded)
 
-Across five completed runs, the model **reliably implemented the policy,
-added passing coverage and updated the README**, then ended its final
-message with a report instead of closing the task through intent-gated
-`task.complete` (which requires discovering and leasing it through
-`capability.manage`). One cell out of five did close:
-`normal/r1-attempt2` reached TaskCompleted with the hidden cargo oracle
-passing (28 rounds) — its cell verdict is FAIL only because the
-allowed-diff rule compared backslash paths against forward-slash seed
-keys, a harness bug fixed afterwards ("…and fix diff paths").
+In all four canonical cells the model finished implementation, verification
+and documentation work and then ended its final message with a report
+instead of closing the task through intent-gated `task.complete`. The
+discoverability gap is narrower than "no closure calls": none of the four
+canonical cells even loaded `task.manage` or `task.complete` through
+`capability.manage` — every catalog-control call fetched operational tools
+(`shell.exec`, `process.run`, `edit.replace`). Because the evaluator of this
+run returned on the lifecycle error before the post-run checks, the canonical
+cells carry no independent behavioral verdict; their assistants' self-reports
+of passing tests are recorded but unverified. This run's evaluator skipped
+the oracle in that situation; LT-RUN-04 Slice A replaces that behavior with
+independent per-dimension scoring.
+
+One retained earlier attempt (`normal/r1-attempt2`, second run) shows the
+full path is reachable without any harness change: the model discovered
+`task.complete` through the catalog (escape-hatch role), loaded it, closed
+the task and passed the post-run cargo check (6 tests plus doc-tests); its
+cell verdict is FAIL only because of the since-fixed Windows diff-path bug.
 
 No prompt or gate was changed to improve closure rates; whether closure
-guidance belongs in the product prompt is a decision point for the
-runtime owners, recorded here and in docs/STATUS.md.
+guidance belongs in the product prompt is a decision point for the runtime
+owners, now framed as the default-off `CompletionOpportunity` candidate in
+LT-RUN-04.
 
 ## Verdict rules used
 

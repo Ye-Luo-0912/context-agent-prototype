@@ -234,20 +234,37 @@ in parallel, but it does not reorder or close either gate.
     the `retry_policy_dev` deterministic layer-1 gate also landed
     2026-08-25 (scripted normal/resume stop/restore/continue over the real
     production tool surface, including the catalog-cold lease path through
-    `capability.manage`). What remains of the pilot is live: first C
-    normal/resume harness cells, then same-model A/C normal/resume pairs.
-    The first C cells ran 2026-08-25 and validated the live
-    stop/restore/continue harness; all failed on intent-gated closure
-    variance (evidence `crates/agent-eval/evidence/retry-pilot/`), so the
-    pilot stays open with closure guidance recorded as a product/prompt
-    decision point.
+    `capability.manage`).
 
-    Then run the frozen one-directive `retry_policy_dev` diagnostic described
-    in [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md): first C normal vs
-    resumed harness cells, then same-model A/C normal/resume pairs. Model
-    comparison holds the retained C Runtime/tool surface fixed and varies only
-    the model. Correct hidden outcome, task identity/constraint retention,
-    exact-once effects and current verification precede round/call/token
-    comparisons. These are development cells, not the frozen M15 acceptance
-    set, and they do not reorder M12 then M13.
+    The first four C live cells ran 2026-08-25. They exercised the operator
+    stop/restore/continue path, but all ended without `TaskCompleted`; their
+    event streams contain no direct `task.manage` or `task.complete` calls,
+    and none of the four canonical cells even loaded either tool through
+    `capability.manage`. Because the evaluator
+    currently returns on lifecycle-closure failure before the post-run
+    diff/cargo checks, the canonical cells do not yet prove behavioral
+    success or cold process recovery. An earlier retained attempt did call
+    `task.complete` and pass the cargo check, then failed only on the fixed
+    Windows diff-path defect. Treat the immediate gap as closure affordance
+    plus proof separation, not as evidence for a Task DAG.
+
+    Next execute `LT-RUN-04` in
+    [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md): preserve behavioral,
+    diff, closure, continuation and provider outcomes independently and add a
+    harness-owned oracle outside the agent-editable workspace; preserve the
+    whole-anchor CAS while giving verification basis its own revision meaning;
+    derive a body-free key and offer one positive-evidence-gated
+    `CompletionOpportunity` per unchanged basis behind a default-off candidate
+    switch; and make the actor safe-point artifact a complete, checksummed,
+    revision-acknowledged checkpoint that a fresh Context engine can load.
+    Failed durability must block continuation. On the final common substrate,
+    apply item 8 before promotion: freeze the already-satisfied replay and run
+    retained-C CompletionOpportunity off/on normal/resume pairs with at least
+    two repeats per mode. Behavior/outcome cannot regress, closure must improve,
+    median rounds/calls must fall and no p95/max-turn tail may appear. Only the
+    promoted frozen setting enters same-model A/C, followed by diagnosis and
+    migration tasks. Criterion origin/authority precedes Completion Proof
+    Ledger shadow work; a model-visible TaskGraph remains evidence-gated. These
+    are development cells, not M15 acceptance, and they do not reorder M12 then
+    M13.
 11. V2 Self-Iteration last.

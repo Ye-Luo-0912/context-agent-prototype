@@ -156,6 +156,17 @@ pair passed 4/4 in both arms and restored C to 53 rounds / 51 calls / max-turn
 7 versus A's 54 / 44 / 13, with no C failed outputs. This is one positive
 dirty-tree pair; keep the item open for an independent repeat.
 
+The first one-directive `retry_policy_dev` pilot exposed the opposite edge:
+all four canonical cells ended without `TaskCompleted` and made no direct
+`task.complete` call. Do not undo the continuity fix by making that tool
+permanent. `LT-RUN-04` instead tests a body-free, once-per-verification-basis
+`CompletionOpportunity` after positive terminal evidence, while retaining the
+existing completion gate and explicit model call. It remains default-off until
+an already-satisfied deterministic replay and at least two C off/on paired
+normal/resume repeats pass the Roadmap item-8 success, median round/call and
+tail gates. Closure discoverability and multi-turn non-premature closure must
+both pass before this item closes.
+
 ### TOOL-PROC-01 — explicit ProgramResolver for process.run (fixed 2026-08-23)
 
 Reproduction on Windows confirmed a tool-side semantic defect, not model
@@ -446,35 +457,57 @@ be sized against real demand. Residency loosening stays rejected on
 current evidence; the tiny current-turn LRU gets built only if this
 motive shows up in live runs.
 
-### LONGTASK-01 — bounded autonomous progress update is not model-routable (open)
+### EXEC-REV-01 — anchor CAS and verification basis are coupled inconsistently (open)
 
-`TaskAnchor` already stores bounded interpretation, acceptance, plan and open
-loops, and `ExecutionState` already stores checked files, verification,
-failures and obligations. Host callers can patch the anchor, but one
-autonomous long user directive has no model-visible, Runtime-owned path to
-persist a revised next action/open loops before interruption. Reuse the
-proposed catalog-cold/task-required `task.manage` with
-`base_anchor_revision` CAS. The initial slice may update only bounded
-autonomous progress fields plus one `next_action`; it cannot rewrite user
-constraints, store file/tool bodies, or create a second ResumePoint.
+`ExecutionState` already carries `VerificationObligation.spec_revision`, but
+verification pass/fail records currently copy the whole `anchor_revision`, and
+every accepted anchor replacement calls `mark_spec_changed`. An out-of-turn
+plan-only patch therefore marks otherwise Current verification stale. The
+active `task.manage` path can then overwrite that task-resume state from the
+turn execution after observing its own result at the new anchor revision, yet
+exact-PASS reuse still rejects the older fact because its anchor revision no
+longer matches. The same progress-only semantic change therefore has
+path-dependent completion-freshness and reuse behavior. The code behavior is
+confirmed; its contribution to live round/call cost has not yet been measured.
 
-### LONGTASK-02 — full checkpoint exists, mid-turn continuation does not (open)
+Retain `anchor_revision` as the whole-record compare-and-swap fence, but give
+verification basis an independent revision meaning. Progress-only changes
+advance CAS without invalidating verification; goal, constraint and
+authoritative-criterion changes advance both. Treat `current_interpretation`
+through an explicit host policy. ActiveTurn, task resume, completion and exact
+reuse must share one currentness predicate; cover both revisions through
+checkpoint/restore.
 
-`RuntimeInstance::checkpoint/restore` validates task/context/capability/Core
-authority planes, but checkpoint capture is externally requested and the
-active turn's final ExecutionState is installed on `TaskRecord.resume` only
-after `TurnCompleted`. A process stop during a one-directive development tool
-loop therefore has no claimed bounded continuation boundary.
+### LONGTASK-03 — safe-point artifact is not a complete cold-restorable checkpoint (open)
 
-Add an actor-owned safe point only after a whole tool batch settles and no
-operation/effect is in flight. Meaningful durable changes accrue coalesced
-checkpoint debt; explicit pause/suspend/completion/shutdown waits for atomic
-checkpoint acknowledgement. Restore then uses a Runtime-owned
-`continue_active_task` from the same task id/directive/anchor/resume state,
-without replaying transcript or minting new user authority. Event ordering,
-checkpoint failure/retry, cancellation, exact-once effects and stale
-verification need deterministic coverage before a live run. Contract and
-pilot: [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+The actor safe-point snapshot writes an empty capability list and persists that
+actor-owned value directly; only an external `RuntimeInstance::checkpoint()`
+merges the host registry. `CheckpointStore` has a write-plus-rename path but no
+matching artifact load API, whole-artifact checksum, file sync or parent-
+directory sync. The file is atomically visible but has no power-loss durability
+claim. The live pilot has capability-aware mode disabled, so this is a
+production recovery-contract defect, not the cause of its missing closure.
+
+Make one actor/host ownership handshake produce a complete checkpoint at the
+safe point, persist and load/validate it with explicit platform durability
+semantics, and acknowledge the exact durable resume revision. Prove artifact
+restore with a fresh Runtime and Context engine, without phase-one in-memory
+state. Contract and tests:
+[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+
+### LONGTASK-04 — checkpoint failure does not fail-closed continuation (open)
+
+`await_pending_checkpoint` records failure and returns no error. The
+continuation path waits for it, does not test the failed outcome, and then
+starts the next turn. `CheckpointDurable` also lacks the revision that its
+contract says it acknowledges. A failed safe-point write can therefore leave
+debt visible while continuation still emits `TaskContinuationStarted`.
+
+Track `resume_state_revision`, `required_durable_revision` and
+`durable_revision`. Capture, write, checksum, rename or acknowledgement
+failure must make `continue_active_task` return an error before any model
+request or continuation event. Retry of the same required revision releases
+the fence only after its durable acknowledgement.
 
 ### CONV-01 / CONV-02 / PROTO-EVID-01 — closed 2026-08-23
 
@@ -754,17 +787,48 @@ Frozen `context-bench.v1` SPEC / pack digest stay frozen. Wave-1 live
 retune GC from that live or from an `add_test` cell. Do not treat
 `Likely optimization target` as a modification order.
 
-### EVAL-03 — one-directive development task + interrupted twin (planned)
+### EVAL-03 — pilot conflates closure with behavioral acceptance (open)
 
-The retained 15-directive longflow is a Context/control diagnostic, not an
-autonomous development-task benchmark. After LONGTASK-01/02 deterministic
-gates, freeze `retry_policy_dev`: one network-free Rust task with behavioral,
-API, build, README and allowed-diff hidden checks. Run uninterrupted and
-safe-point stop/restore twins from the same seed/directive. First compare
-normal/resume on C, then same-model A/C; compare models only with Runtime C and
-the tool surface fixed. Correctness, task/constraint survival, exact-once
-effects and current verification gate efficiency. The pilot is not M15
-acceptance. Design: [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+The `retry_policy_dev` deterministic gate is green and the first four C live
+cells ran. All four canonical cells lack `TaskCompleted`, but the evaluator
+returns the lifecycle error before executing its post-run diff/cargo checks.
+Thus their reports cannot distinguish a behaviorally correct workspace with
+missing closure from an incorrect implementation. Additional provider-dead
+attempts must stay outside the canonical four-cell behavior aggregate.
+
+Record behavioral oracle, allowed diff, task closure, continuation and
+provider/runtime health independently; keep the final PASS conjunctive. If the
+workspace is inspectable, missing closure or a late provider failure must not
+suppress read-only acceptance checks. Then use the final evaluator in the
+default-off CompletionOpportunity C off/on promotion gate; only a promoted,
+frozen setting may enter same-model A/C. The pilot is development evidence,
+not M15 acceptance. Design and exit gate:
+[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+
+### EVAL-05 — resume twin does not prove a cold artifact restore (open)
+
+Both phases receive the same `ContextEngine` object. After the durable event,
+the harness separately captures an in-memory full checkpoint and passes that
+value directly to phase two instead of loading the artifact named by the
+event. `SimpleContextEngine::restore` replaces its state, so this does not
+prove an in-memory leak; it proves only that cold-engine/cold-artifact recovery
+has not been tested.
+
+Phase two must allocate a fresh Context engine and host, retain only the
+artifact locator/digest/revision across the boundary, load that artifact, and
+prove the same task/directive/authority identity with no duplicated effect.
+
+### EVAL-06 — live cargo acceptance runs agent-editable tests (open)
+
+The frozen seed contains no harness-owned tests. The post-run `cargo test`
+therefore executes tests the evaluated agent may add inside its editable
+workspace; the other hidden predicates are implementation-marker diagnostics.
+That cargo result is a useful self-check, not an independent behavioral oracle.
+
+Add a network-free harness-owned external test crate or equivalent isolated
+oracle for retry bounds, transient/permanent behavior, saturation/overflow and
+public API compatibility. Multiple correct implementations must pass without
+a golden patch; keep the workspace self-check as a separately named outcome.
 
 ## Closed archive (index only)
 
@@ -780,6 +844,7 @@ Full text: git history of this file.
 | TOOL-ENV-01, TOOL-EDIT-01, TOOL-VIEW-01, TOOL-ERROR-01 | Tool-quality preflight 2026-08-17 |
 | MOD-AUTH-01 | `edit.patch files[]` multi-file authority widening → `EffectIntent::WorkspaceWriteSet` + all-paths `grant_matches` (2026-08-21; see PLATFORM_SECURITY.md) |
 | MOD-AUTH-02 | Prepared effects report canonical `ActualWorkspaceWrite` (real path + real staged bytes); Core commit rejects `ActualExceedsApproved` outside the approved set (2026-08-21) |
+| LONGTASK-01/02 | Catalog-cold progress CAS, actor safe-point resume install, coalesced checkpointing and same-task continuation landed deterministically (2026-08-24/25); residuals are LONGTASK-03/04 and EXEC-REV-01 |
 | Sandbox floor | `UntrustedGenerated.required` now includes `fs_read_confined` + `cpu_quota` (still fail-closed on native until provable); `process_spawn_controlled` → `process_count_quota` with a wire-compat serde alias (2026-08-21) |
 | Foreground ack | `ContextConsumptionAck.foreground_item_ids` + engine counter: foreground bodies the model saw are observable (weak signal; no residency / admission change) (2026-08-21) |
 | TOOL-02 | `search.grep` `path` accepts a file target (file-or-directory), removing a class of `path_not_found` tool failures (2026-08-21) |

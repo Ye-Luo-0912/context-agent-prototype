@@ -13,6 +13,7 @@ and sandbox contracts live elsewhere. Experiment facts live in
 | [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md) | ResourceFact / freshness / verification / snapshot |
 | [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md) | EffectIntent / HostLifecycle / sandbox attestation |
 | [`ROADMAP.md`](ROADMAP.md) | Milestone gates and ordered route |
+| [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md) | Long-task Runtime gaps and development diagnostic |
 | [`AUDIT_TODO.md`](AUDIT_TODO.md) | Confirmed defect queue |
 
 ## Now
@@ -318,24 +319,26 @@ and sandbox contracts live elsewhere. Experiment facts live in
   and single-render prompt projection. Conformance surface tables were
   aligned with intent-gated completion (`task.complete`/`task.manage`
   are catalog-cold; the unload path tests a genuinely optional tool).
-  No live claim yet: safe-point resume commit, completion gates, and the
-  one-directive pilot remain open per [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+  The later safe-point, completion and first live-pilot results are summarized
+  below; this slice alone made no live claim.
 - The second long-task Runtime slice landed (deterministic only): fully
   settled batches accrue bounded checkpoint debt (anchor change, durable
   workspace mutation, verification change); debt installs the bounded
   resume into the existing task record and schedules exactly one atomic
   write under the workspace state directory. `TaskResumeCommitted`
   precedes `CheckpointDurable`, which lands before `TurnCompleted`; a
-  failed write re-arms the debt as `CheckpointWriteFailed` and nothing
-  claims resumability from it. Completion waits for in-flight writes.
+  failed write re-arms the debt as `CheckpointWriteFailed`. Completion waits
+  for in-flight writes. Continuation also waits for settlement but currently
+  does not reject a failed-write outcome; that residual is `LONGTASK-04`.
   `continue_active_task` starts a fresh turn from the stored current
   directive and resume state with a `task_continuation` input kind — no
   new user instruction, no re-ingest, `TaskContinuationStarted` is
   event-visible. Read-only rounds accrue nothing. Deterministic
   coverage: ordering, no-debt read-only rounds, store atomicity and
-  fail-closed locations, and continuation identity. LT-RUN-03
-  (completion/recovery gates) and the `retry_policy_dev` pilot remain
-  open per [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+  fail-closed locations, and continuation identity. LT-RUN-03 and the first
+  `retry_policy_dev` pilot have since run; their remaining proof gaps are
+  summarized below and in
+  [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
 - The third long-task Runtime slice landed (deterministic only): the
   completion acceptance gate re-runs at every edge — no recovery fence,
   no unsettled cancelled operation, zero open failure obligations,
@@ -347,9 +350,9 @@ and sandbox contracts live elsewhere. Experiment facts live in
   `TaskCompleted`, provable from JSONL; a failed final write surfaces as
   a warning that never un-completes the task nor claims resumability.
   Deterministic coverage: open-loop refusal with later resolution and
-  full ordering proof. All three LT-RUN slices are green; the frozen
-  `retry_policy_dev` normal/resume pilot is the next step per
-  [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+  full ordering proof. All three deterministic LT-RUN slices are green; the
+  first live `retry_policy_dev` normal/resume cells later ran as summarized
+  below.
 - The frozen `retry_policy_dev` fixture landed with its deterministic
   layer-1 gate green (2026-08-25, `agent-eval --long-task-gate` plus a
   cargo test running the same gate). One scripted normal/resume pair
@@ -366,27 +369,41 @@ and sandbox contracts live elsewhere. Experiment facts live in
   checkpoints >= 2, continuation and completion events present,
   byte-exact final workspace, empty hidden-check violations, and
   positional ordering `TurnCompleted` -> final durable ->
-  `TaskCompleted`. Landing the gate exposed a real settlement-order
+  `TaskCompleted`. This is a scripted deterministic result, not proof that the
+  persisted safe-point artifact can cold-load all Runtime planes. Landing the
+  gate exposed a real settlement-order
   defect and fixed it: an accepted `task.manage` advances the authority
   epoch during its own operation commit, so recording the accepted value
   completion afterwards saw a stale epoch and raised a false recovery
   fence that refused later mutations; accepted values now terminalize
-  before directive application. Live C/A cells (evaluation layers 2+)
-  remain open behind the provider-stability caution.
+  before directive application. The first live C cells (evaluation layer 2)
+  are summarized next; layers 3+ remain open behind the provider-stability
+  caution.
 - The `retry_policy_dev` live pilot executed its first C-engine cells
   (2026-08-25, evidence under
   [`evidence/retry-pilot/REPORT.md`](../crates/agent-eval/evidence/retry-pilot/REPORT.md)):
-  the harness itself is validated end to end — semantic interruption on
-  the first durably settled mutation, operator-style turn cancel,
-  checkpoint capture, restore through the durable authority lineage and
-  `continue_active_task` continuation all work against a real provider.
-  All four canonical cells FAIL on one reproducible model-behavior
-  finding: the model implements the policy with passing coverage but
-  ends with a report instead of intent-gated task closure; one cell did
-  close with a passing cargo oracle and failed only on a since-fixed
-  harness path bug. Two further attempts died in PinAI transport errors.
-  No acceptance claim; closure guidance is recorded as a product/prompt
-  decision point and nothing was retuned.
+  the harness exercised semantic interruption on the first durably settled
+  mutation, operator-style turn cancel, externally captured checkpoint
+  restore through the durable authority lineage and
+  `continue_active_task`. This is narrower than cold recovery: phase two
+  reuses the same `ContextEngine` object and does not load the actor's
+  safe-point artifact from disk. All four canonical cells end with a report
+  but no `TaskCompleted`; their event streams contain zero direct
+  `task.manage` and zero direct `task.complete` calls, and none of the four
+  canonical cells even loaded either tool through `capability.manage` —
+  their catalog-control calls fetched shell/process/edit tools instead.
+  The evaluator returns on that lifecycle error
+  before the post-run cargo check, so the canonical cells do not support the
+  earlier “passing coverage” characterization. One retained earlier attempt
+  did call `task.complete`, passed the post-run cargo check and failed only on
+  the since-fixed Windows diff-path bug. Two additional attempts are retained
+  separately as PinAI transport failures. No acceptance claim and nothing was
+  retuned. The bounded next task is `LT-RUN-04`: split outcome truth, add a
+  harness-owned oracle outside the editable workspace, decouple verification
+  basis from progress CAS, offer a positive-evidence-gated one-decision closure
+  affordance as a default-off candidate, and make safe-point durability
+  independently cold-loadable; see
+  [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
 - **Execution Convergence V1 mechanism landed** (2026-08-23, all 22
   items checked — the checklist is now the historical record
   [`EXECUTION_CONVERGENCE_V1.md`](EXECUTION_CONVERGENCE_V1.md)):
@@ -582,45 +599,47 @@ deleted. A multi-file effect remains sequential with honest partial recovery.
 This V1-candidate gate runs in parallel with — and does not replace or close —
 the M12 → M13 mainline.
 
-**P1 — long-task Runtime closure before broader agent evaluation.** The r8-r10
-stable-core/edit sequence is sufficient to stop tuning the 15-directive
-longflow: its median C-A gap is +1 model round / +4 tool calls, all arm-runs
-passed hidden checks, and C retained the large Context advantage. Keep the
-surface and Context policy fixed.
+**P1 — trustworthy long-task closure and cold continuation before broader
+agent evaluation.** The r8-r10 stable-core/edit sequence remains frozen: C's
+median gap was +1 model round / +4 tool calls while retaining the large Context
+advantage. Keep Context, GC and the production tool surface fixed.
 
-The current Runtime already owns the required bounded state planes:
-`TaskAnchor` (goal/constraints/acceptance/plan/open loops),
-`TaskRecord.resume: ExecutionState` (checked revisions, verification, failed
-commands and obligations), Context, TurnFrame and artifacts. Full checkpoint
-capture/restore is landed, but it is externally requested, and final resume
-installation still waits for `TurnCompleted`. There is no truthful mid-turn
-crash-continuation claim yet for one autonomous long directive.
+`LT-RUN-01..03` and the deterministic `retry_policy_dev` gate are green. The
+first four live C cells also ran, but all lack lifecycle closure and the current
+evaluator skips post-run acceptance after that failure. Their resume twins prove
+operator stop plus restore of an externally captured full checkpoint, not an
+independent disk cold start: the Context engine is reused, the actor safe-point
+artifact omits the host capability plane, and the artifact store has no load
+path, checksum or fsync durability claim.
 
-Next slices are `LT-RUN-01..03`: a task-required/catalog-cold `task.manage`
-progress CAS for bounded autonomous plan/open-loop/next-action state;
-actor-owned continuation safe points after completely settled tool batches;
-coalesced atomic checkpoints plus `continue_active_task`; and completion gates
-that require current verification and no unknown effect state. Reuse the
-existing TaskAnchor/ExecutionState and do not store raw transcript history.
-Detailed flow, first fixture and eval layering:
-[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
-
-The first live workload will be one complete, network-free Rust development
-request (`retry_policy_dev`), not 15 user-authored substeps. Its uninterrupted
-and process-stop/restore twins share the exact seed/directive and use hidden
-build/API/behavior/diff checks. Deterministic safe-point/restart tests must
-land first. Agent/runtime A/C comparison pins the model; later model comparison
-pins retained C. This pilot is development evidence, not M15 acceptance.
+The next bounded phase is `LT-RUN-04` in
+[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md): (1) preserve behavioral,
+diff, closure, continuation and provider truth independently through a
+harness-owned external oracle; (2) retain whole-anchor CAS while giving
+verification basis an independent revision meaning; (3) derive a
+once-per-basis `CompletionOpportunity` only from current positive terminal
+evidence, default-off until its item-8 candidate gate passes;
+and (4) produce and cold-load one complete, checksummed,
+revision-acknowledged safe-point artifact, with failed durability blocking
+continuation. On that final substrate, run retained-C CompletionOpportunity
+off/on normal/resume pairs with at least two repeats per mode; require
+behavior/outcome non-regression, improved closure, lower median rounds/calls
+and no new tail before promotion. Only the promoted frozen setting enters
+same-model A/C. After that add diagnosis and multi-file migration tasks.
+Criterion origin/authority must land before Completion Proof Ledger shadow
+evidence; a model-visible TaskGraph remains evidence-gated. The pilot remains
+development evidence, not M15 acceptance, and it does not reorder M12 then
+M13.
 
 ## Next milestone
 
 Engineering mainline is **M12, then M13**, then a V1 candidate, then
 formal M15. V2 Self-Iteration stays blocked.
 
-In parallel, finish the deterministic `LT-RUN-01..03` Runtime slices and only
-then run the one-task long-development pilot. Do not spend another live pair
-on the old longflow unless a regression specifically reopens its retained
-r8-r10 decision.
+In parallel, complete `LT-RUN-04`, then pass the retained-C default-off
+CompletionOpportunity paired gate before same-model A/C. Do not spend another
+live pair on the old 15-directive longflow unless a regression specifically
+reopens its retained r8-r10 decision.
 
 Context evaluation: `context-mech.v2` 12-cell evidence exists; do not
 expand to 27 or 300×3. Live `recall_after_fix` is refused.
