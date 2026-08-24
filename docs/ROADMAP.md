@@ -236,6 +236,11 @@ in parallel, but it does not reorder or close either gate.
     production tool surface, including the catalog-cold lease path through
     `capability.manage`). What remains of the pilot is live: first C
     normal/resume harness cells, then same-model A/C normal/resume pairs.
+    The first C cells ran 2026-08-25 and validated the live
+    stop/restore/continue harness; all failed on intent-gated closure
+    variance (evidence `crates/agent-eval/evidence/retry-pilot/`), so the
+    pilot stays open with closure guidance recorded as a product/prompt
+    decision point.
 
     Then run the frozen one-directive `retry_policy_dev` diagnostic described
     in [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md): first C normal vs

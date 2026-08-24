@@ -247,6 +247,11 @@ Do not vary model, Runtime and tool surface in one comparison.
 2. **C live development pilot:** `normal` and `resume`, two repeats each,
    using one pinned model/provider. These four cells validate the harness;
    they are not acceptance.
+   Status: first execution 2026-08-25 (evidence
+   `crates/agent-eval/evidence/retry-pilot/REPORT.md`). Harness validated
+   end to end including live stop/restore/continue; all cells FAIL on
+   intent-gated closure variance plus one provider outage window — no
+   acceptance claim, nothing retuned.
 3. **Agent/runtime comparison:** same pinned model, A/C context engines,
    normal/resume, two repeats (eight paired cells). This isolates Runtime and
    Context behavior.

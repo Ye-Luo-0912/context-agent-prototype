@@ -373,6 +373,20 @@ and sandbox contracts live elsewhere. Experiment facts live in
   fence that refused later mutations; accepted values now terminalize
   before directive application. Live C/A cells (evaluation layers 2+)
   remain open behind the provider-stability caution.
+- The `retry_policy_dev` live pilot executed its first C-engine cells
+  (2026-08-25, evidence under
+  [`evidence/retry-pilot/REPORT.md`](../crates/agent-eval/evidence/retry-pilot/REPORT.md)):
+  the harness itself is validated end to end — semantic interruption on
+  the first durably settled mutation, operator-style turn cancel,
+  checkpoint capture, restore through the durable authority lineage and
+  `continue_active_task` continuation all work against a real provider.
+  All four canonical cells FAIL on one reproducible model-behavior
+  finding: the model implements the policy with passing coverage but
+  ends with a report instead of intent-gated task closure; one cell did
+  close with a passing cargo oracle and failed only on a since-fixed
+  harness path bug. Two further attempts died in PinAI transport errors.
+  No acceptance claim; closure guidance is recorded as a product/prompt
+  decision point and nothing was retuned.
 - **Execution Convergence V1 mechanism landed** (2026-08-23, all 22
   items checked — the checklist is now the historical record
   [`EXECUTION_CONVERGENCE_V1.md`](EXECUTION_CONVERGENCE_V1.md)):
