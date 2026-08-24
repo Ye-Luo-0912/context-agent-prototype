@@ -158,6 +158,18 @@ The implementation must add explicit events for progress update, safe-point
 resume commit, durable checkpoint acknowledgement/failure and continuation
 start. Eval must be able to prove their order from JSONL.
 
+Status: landed deterministically 2026-08-25. Accrued debt reasons are task
+anchor change, durable workspace mutation and verification change; they
+coalesce into one resume install plus one atomic write under the workspace
+state directory (`CheckpointStore`). `TaskResumeCommitted` precedes
+`CheckpointDurable`, which lands before `TurnCompleted`; a failed write
+re-arms the debt and emits `CheckpointWriteFailed` instead of claiming
+resumability. Completion and continuation wait for in-flight writes.
+`continue_active_task` restarts the stored directive with a
+`task_continuation` input kind — no new dialogue identity, no re-ingest,
+and a `TaskContinuationStarted` event. Deterministic coverage: ordering,
+read-only no-debt, store atomicity, and continuation identity.
+
 ### LT-RUN-03 — completion and recovery gate
 
 Keep the landed final-answer/task-closure split. A claimed successful

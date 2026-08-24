@@ -1,4 +1,5 @@
 use super::*;
+use crate::checkpoint::{RUNTIME_CHECKPOINT_VERSION, RunMetadata, TaskManagerSnapshot};
 use agent_contracts::{
     ArgumentDigest, AuthorityRecoveryStatus, ContextDiagnostics, ContextEngine, ContextIngress,
     ContextItemSummary, ContextMaintenanceReport, EffectId, MaterializedContext, ModelCapabilities,

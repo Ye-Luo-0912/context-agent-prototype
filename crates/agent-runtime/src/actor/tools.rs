@@ -1029,6 +1029,9 @@ impl RuntimeActor {
                             ..
                         }) => {
                             self.refresh_runtime_fact_markers();
+                            self.accrue_checkpoint_debt(
+                                crate::checkpoint::CheckpointDebtReason::DurableWorkspaceMutation,
+                            );
                             output
                         }
                         EffectCommitDisposition::Receipt(EffectReceipt::NotApplied { error }) => {
@@ -1177,6 +1180,11 @@ impl RuntimeActor {
                     )
                 {
                     self.refresh_runtime_fact_markers();
+                    if output.tool_name == "verify.run" {
+                        self.accrue_checkpoint_debt(
+                            crate::checkpoint::CheckpointDebtReason::VerificationChanged,
+                        );
+                    }
                 }
                 // Successful semantic observations heat related context
                 // before the next model round. Failed execution results
@@ -1254,6 +1262,11 @@ impl RuntimeActor {
                     ))
                     .await;
                 }
+                // LONG-TASK SAFE POINT: the batch is terminally settled and
+                // nothing is in flight; accrued debt now installs the
+                // bounded resume and schedules one atomic write before the
+                // next model decision.
+                self.safe_point_resume_commit().await;
                 if let Some(summary) = self.terminal_completion_summary() {
                     self.finalize_terminal_completion(summary).await;
                 } else {

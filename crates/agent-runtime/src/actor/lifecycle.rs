@@ -460,7 +460,7 @@ impl RuntimeActor {
             return;
         };
         if let Err(error) = self
-            .begin_applied_turn(queued.content, queued.input, op_tx)
+            .begin_applied_turn(queued.content, queued.input, op_tx, false)
             .await
         {
             let _ = self

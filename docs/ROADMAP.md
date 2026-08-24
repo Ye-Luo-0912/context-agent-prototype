@@ -219,9 +219,13 @@ in parallel, but it does not reorder or close either gate.
     Safe points require a completely settled tool batch and no in-flight
     operation; checkpoint debt is driven by durable state changes, not a fixed
     round count. Deterministic crash/cancel/stale-verification tests must pass
-    before any live claim. Slice (a) landed deterministically 2026-08-24
-    (catalog-cold `task.manage` anchor CAS with authoritative model-visible
-    outcomes and typed refusal events); (b) and (c) remain open.
+    before any live claim. Slices (a) and (b) landed deterministically
+    (2026-08-24 / 2026-08-25): catalog-cold `task.manage` anchor CAS with
+    authoritative model-visible outcomes; coalesced checkpoint debt, atomic
+    state-directory writes with durable/failure events in provable order,
+    completion barriers that wait for in-flight writes, and
+    `continue_active_task` continuation without minting a new directive
+    identity. Slice (c) remains open.
 
     Then run the frozen one-directive `retry_policy_dev` diagnostic described
     in [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md): first C normal vs

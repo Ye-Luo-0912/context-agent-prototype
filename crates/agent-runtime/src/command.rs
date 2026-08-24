@@ -82,6 +82,12 @@ pub enum RuntimeCommand {
     Checkpoint {
         reply: Reply<AgentResult<RuntimeCheckpoint>>,
     },
+    /// Continue the active task's current directive in a fresh turn after
+    /// a stop/restore. No new user instruction is minted and the stored
+    /// directive identity does not change.
+    ContinueActiveTask {
+        reply: Reply<AgentResult<()>>,
+    },
     /// Prepare a full restore: transactionally install context + task
     /// authority, then leave the actor fenced until the host has applied
     /// the capability plane and sends `FinalizeRestore`.
@@ -265,6 +271,13 @@ impl RuntimeHandle {
     /// checkpoint by an external caller.
     pub(crate) async fn checkpoint(&self) -> AgentResult<RuntimeCheckpoint> {
         self.call(|reply| RuntimeCommand::Checkpoint { reply })
+            .await
+    }
+
+    /// Continue the active task's stored current directive in a fresh
+    /// turn. Public: stop/restore twins are a host-driven flow.
+    pub async fn continue_active_task(&self) -> AgentResult<()> {
+        self.call(|reply| RuntimeCommand::ContinueActiveTask { reply })
             .await
     }
 

@@ -330,6 +330,25 @@ impl AppState {
                     self.push_system(format!("task {task_id} progress refused: {reason}"));
                 }
             }
+            RuntimeEvent::TaskResumeCommitted {
+                task_id,
+                anchor_revision,
+                debt,
+            } => {
+                self.push_system(format!(
+                    "task {task_id} resume installed at r{anchor_revision}: {}",
+                    debt.join(", ")
+                ));
+            }
+            RuntimeEvent::CheckpointDurable { bytes, artifact } => {
+                self.push_system(format!("checkpoint durable: {artifact} ({bytes}B)"));
+            }
+            RuntimeEvent::CheckpointWriteFailed { reason } => {
+                self.push_system(format!("checkpoint write failed: {reason}"));
+            }
+            RuntimeEvent::TaskContinuationStarted { task_id, .. } => {
+                self.push_system(format!("task {task_id} continuation started"));
+            }
             RuntimeEvent::Pinned { content } => {
                 self.push_system(format!("pinned: {content}"));
             }

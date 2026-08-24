@@ -320,6 +320,22 @@ and sandbox contracts live elsewhere. Experiment facts live in
   are catalog-cold; the unload path tests a genuinely optional tool).
   No live claim yet: safe-point resume commit, completion gates, and the
   one-directive pilot remain open per [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+- The second long-task Runtime slice landed (deterministic only): fully
+  settled batches accrue bounded checkpoint debt (anchor change, durable
+  workspace mutation, verification change); debt installs the bounded
+  resume into the existing task record and schedules exactly one atomic
+  write under the workspace state directory. `TaskResumeCommitted`
+  precedes `CheckpointDurable`, which lands before `TurnCompleted`; a
+  failed write re-arms the debt as `CheckpointWriteFailed` and nothing
+  claims resumability from it. Completion waits for in-flight writes.
+  `continue_active_task` starts a fresh turn from the stored current
+  directive and resume state with a `task_continuation` input kind — no
+  new user instruction, no re-ingest, `TaskContinuationStarted` is
+  event-visible. Read-only rounds accrue nothing. Deterministic
+  coverage: ordering, no-debt read-only rounds, store atomicity and
+  fail-closed locations, and continuation identity. LT-RUN-03
+  (completion/recovery gates) and the `retry_policy_dev` pilot remain
+  open per [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
 - **Execution Convergence V1 mechanism landed** (2026-08-23, all 22
   items checked — the checklist is now the historical record
   [`EXECUTION_CONVERGENCE_V1.md`](EXECUTION_CONVERGENCE_V1.md)):

@@ -7,6 +7,7 @@ mod effects;
 mod focus;
 mod harness;
 mod policy;
+mod safepoint;
 mod scopes;
 mod stream;
 mod task_progress;

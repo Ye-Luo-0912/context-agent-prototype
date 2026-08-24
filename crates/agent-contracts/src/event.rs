@@ -398,6 +398,43 @@ pub enum RuntimeEvent {
         #[serde(default)]
         reason: String,
     },
+    /// A fully settled batch carried checkpoint debt, so the runtime
+    /// installed the bounded `ExecutionState` into the task resume and
+    /// scheduled one atomic checkpoint write. `debt` names the coalesced
+    /// reasons (anchor change, durable workspace mutation, verification
+    /// change); read-only exploration never produces this event.
+    TaskResumeCommitted {
+        task_id: TaskId,
+        #[serde(default)]
+        anchor_revision: u64,
+        #[serde(default)]
+        debt: Vec<String>,
+    },
+    /// The scheduled background checkpoint write landed durably. Only after
+    /// this event may the run be described as safely resumable up to the
+    /// write's revision.
+    CheckpointDurable {
+        #[serde(default)]
+        bytes: u64,
+        /// Bounded file name of the atomic checkpoint artifact.
+        #[serde(default)]
+        artifact: String,
+    },
+    /// The background checkpoint write failed. Accrued debt stays visible
+    /// and retryable at the next safe point; nothing may claim safe
+    /// resumability from a run whose last write ended here.
+    CheckpointWriteFailed {
+        #[serde(default)]
+        reason: String,
+    },
+    /// `continue_active_task` started a fresh active turn from the same
+    /// task id, current directive, anchor and resume state. No new user
+    /// instruction was minted and no directive identity changed.
+    TaskContinuationStarted {
+        task_id: TaskId,
+        #[serde(default)]
+        anchor_revision: u64,
+    },
     /// The turn fully committed its model result and every mandatory context
     /// write behind the durable event barrier. This is the only successful
     /// turn-commit marker used by crash recovery.

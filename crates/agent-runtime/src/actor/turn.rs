@@ -48,7 +48,7 @@ impl RuntimeActor {
             persist.0,
             persist.1,
         );
-        let _ = reply.send(self.begin_applied_turn(content, input, op_tx).await);
+        let _ = reply.send(self.begin_applied_turn(content, input, op_tx, false).await);
     }
 
     pub(super) async fn begin_applied_turn(
@@ -56,6 +56,7 @@ impl RuntimeActor {
         content: String,
         mut input: RuntimeInputEnvelope,
         op_tx: &mpsc::Sender<OperationCompletion>,
+        continuation: bool,
     ) -> AgentResult<()> {
         // Fence the new turn before an implicit focus or user-message write
         // becomes visible. If a later step fails, the unused epoch is safe;
@@ -94,7 +95,9 @@ impl RuntimeActor {
         }
 
         let turn_id = TurnId::new();
-        if input.body_ref.is_none() {
+        // A continuation re-runs the stored directive: no new input body
+        // is persisted and the directive is not re-ingested as dialogue.
+        if !continuation && input.body_ref.is_none() {
             let (body_ref, digest) = self.persist_user_input_body(&content).await?;
             input.body_ref = body_ref;
             input.digest = digest;
@@ -103,11 +106,13 @@ impl RuntimeActor {
         input.task_id = self.state.task_id;
         input.lifecycle = InputLifecycle::Applied;
         // ingest 成功后再发 Applied 事件，避免日志里有 Accepted 而上下文没有正文。
-        self.services
-            .context_ingest(ContextIngress::UserMessage {
-                content: content.clone(),
-            })
-            .await?;
+        if !continuation {
+            self.services
+                .context_ingest(ContextIngress::UserMessage {
+                    content: content.clone(),
+                })
+                .await?;
+        }
         let applied = input.with_lifecycle(InputLifecycle::Applied);
         self.emit_user_input(applied.clone()).await?;
         let report = self
@@ -152,8 +157,67 @@ impl RuntimeActor {
             structurally_empty_retries: 0,
             pending_scope_closes: VecDeque::new(),
         });
+        if continuation && let Some(task_id) = self.state.task_id {
+            let anchor_revision = self
+                .state
+                .tasks
+                .get(task_id)
+                .map(|task| task.anchor.revision)
+                .unwrap_or_default();
+            self.core
+                .emit_event(RuntimeEvent::TaskContinuationStarted {
+                    task_id,
+                    anchor_revision,
+                })
+                .await?;
+        }
         self.advance_turn(op_tx).await;
         Ok(())
+    }
+
+    /// Start a fresh active turn for the active task from its stored
+    /// current directive and resume state: continuing one long user
+    /// directive after a stop/restore, not a new instruction. No new
+    /// dialogue identity is minted and the directive is not re-ingested.
+    pub(super) async fn continue_active_task_turn(
+        &mut self,
+        op_tx: &mpsc::Sender<OperationCompletion>,
+    ) -> AgentResult<()> {
+        if self.state.recovery_required {
+            return Err(AgentError::RecoveryRequired(
+                "runtime recovery is required before normal mutation may continue".into(),
+            ));
+        }
+        if self.state.pending_tool_cleanup.is_some() {
+            return Err(AgentError::InvalidRequest(
+                "agent is finishing explicit cleanup for a cancelled tool operation".into(),
+            ));
+        }
+        if self.state.turn.is_some() {
+            return Err(AgentError::InvalidRequest(
+                "a turn is already running; continuation requires an idle runtime".into(),
+            ));
+        }
+        let Some(task_id) = self.state.tasks.active() else {
+            return Err(AgentError::InvalidRequest(
+                "no active task to continue".into(),
+            ));
+        };
+        let directive = self
+            .state
+            .tasks
+            .get(task_id)
+            .map(|task| task.turn_intent.trim().to_string())
+            .unwrap_or_default();
+        if directive.is_empty() {
+            return Err(AgentError::InvalidRequest(
+                "the active task has no recorded current directive to continue".into(),
+            ));
+        }
+        // Continuation starts from acknowledged durable state.
+        self.await_pending_checkpoint().await;
+        let input = RuntimeInputEnvelope::task_continuation(task_id, directive.clone());
+        self.begin_applied_turn(directive, input, op_tx, true).await
     }
 
     /// Spawn the next operation the turn state says should run: a pending
@@ -512,6 +576,7 @@ impl RuntimeActor {
             })
             .await;
         self.state.tasks.commit(txn);
+        self.accrue_checkpoint_debt(crate::checkpoint::CheckpointDebtReason::TaskAnchorChanged);
         output.summary = format!(
             "task progress recorded at anchor revision {revision}: {}",
             changed_fields.join(", ")
@@ -695,6 +760,10 @@ impl RuntimeActor {
     /// journals `TurnCommitFailed` (naming the phase) plus
     /// `RecoveryRequired` instead of pretending the turn completed.
     pub(super) async fn finalize_turn(&mut self, content: String) {
+        // Turn-end barrier: a resume checkpoint still in flight must land
+        // (and publish its outcome) before the durable TurnCompleted
+        // event, so the JSONL order proves resume-before-completion.
+        self.await_pending_checkpoint().await;
         let assistant_evidence_identity = self
             .state
             .task_id
@@ -925,6 +994,9 @@ impl RuntimeActor {
     /// (suspended/completed meanwhile) drops the proposal with a warning —
     /// it never fails the already-committed turn.
     pub(super) async fn process_pending_completion(&mut self, proposal: CompletionProposal) {
+        // Completion waits for its in-flight resume write; a failed one
+        // surfaces as CheckpointWriteFailed and never claims resumability.
+        self.await_pending_checkpoint().await;
         if self.state.tasks.active().is_none() {
             let _ = self
                 .core

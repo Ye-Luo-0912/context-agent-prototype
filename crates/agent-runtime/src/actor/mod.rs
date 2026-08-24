@@ -44,9 +44,7 @@ use crate::budget::{
     DEFAULT_OUTPUT_RESERVE, MAX_TOOL_SURFACE_TOKENS, ModelBudget, approx_layer_tokens,
     engine_pack_window, provider_send_window,
 };
-use crate::checkpoint::{
-    RUNTIME_CHECKPOINT_VERSION, RunMetadata, RuntimeCheckpoint, TaskManagerSnapshot,
-};
+use crate::checkpoint::RuntimeCheckpoint;
 use crate::command::{Reply, RuntimeCommand, RuntimeHandle};
 use crate::execution::{ExecutionState, RoundExecutionSnapshot, RuntimeExecutionAttribution};
 use crate::output::bound_tool_output;
@@ -65,6 +63,7 @@ mod model;
 mod restore;
 #[cfg(test)]
 mod restore_tests;
+mod safepoint;
 mod tools;
 mod turn;
 
@@ -1024,6 +1023,12 @@ struct ActorState {
     discovery_budget: DiscoveryTurnBudget,
     /// 周转中最多一条待处理对话（CTX-EVENT-02）。进程内有效，不进 checkpoint。
     pending_user_input: Option<QueuedUserDialogue>,
+    /// Coalesced reasons the next settled batch owes a durable resume
+    /// checkpoint. Read-only exploration leaves this empty.
+    checkpoint_debt: Vec<crate::checkpoint::CheckpointDebtReason>,
+    /// In-flight background checkpoint write; its outcome is published
+    /// lazily at the next safe point or eagerly at a barrier wait.
+    checkpoint_write: Option<tokio::task::JoinHandle<AgentResult<(u64, String)>>>,
 }
 
 /// 已入账但尚未开转的对话。`input` 是 Queued 信封，`content` 是 ingest 全文。

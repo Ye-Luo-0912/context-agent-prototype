@@ -241,14 +241,14 @@ impl RuntimeActor {
                 patch,
                 reply,
             } => {
-                let result =
-                    match self.ensure_idle() {
-                        Err(error) => Err(error),
-                        Ok(()) => match self.state.tasks.prepare_patch_anchor(
-                            task_id,
-                            base_revision,
-                            &patch,
-                        ) {
+                let result = match self.ensure_idle() {
+                    Err(error) => Err(error),
+                    Ok(()) => {
+                        match self
+                            .state
+                            .tasks
+                            .prepare_patch_anchor(task_id, base_revision, &patch)
+                        {
                             Err(error) => Err(error),
                             Ok((txn, revision, changed_fields, kind)) => {
                                 if changed_fields.is_empty() {
@@ -283,6 +283,9 @@ impl RuntimeActor {
                                                     Err(error) => Err(error),
                                                     Ok(()) => {
                                                         self.state.tasks.commit(txn);
+                                                        self.accrue_checkpoint_debt(
+                                                            crate::checkpoint::CheckpointDebtReason::TaskAnchorChanged,
+                                                        );
                                                         Ok(revision)
                                                     }
                                                 }
@@ -291,8 +294,9 @@ impl RuntimeActor {
                                     }
                                 }
                             }
-                        },
-                    };
+                        }
+                    }
+                };
                 let _ = reply.send(result);
             }
             RuntimeCommand::Pin { content, reply } => {
@@ -329,27 +333,14 @@ impl RuntimeActor {
             }
             RuntimeCommand::Checkpoint { reply } => {
                 let result = match self.ensure_idle() {
-                    Ok(()) => match self.core.checkpoint().await {
-                        Ok(context) => self.core.authority_checkpoint_marker().map(|authority| {
-                            RuntimeCheckpoint {
-                                version: RUNTIME_CHECKPOINT_VERSION,
-                                run_metadata: RunMetadata {
-                                    run_id: self.core.run_id(),
-                                    created_at_ms: now_ms(),
-                                },
-                                tasks: TaskManagerSnapshot::from_manager(&self.state.tasks),
-                                current_task_id: self.state.task_id,
-                                focus_revision: self.state.focus_revision,
-                                last_surface_revision: self.state.last_surface_revision,
-                                context,
-                                // The actor does not own the host: the capability
-                                // surface is merged in by RuntimeInstance.
-                                capabilities: Vec::new(),
-                                authority,
-                            }
-                        }),
-                        Err(error) => Err(error),
-                    },
+                    Ok(()) => self.capture_checkpoint().await,
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            RuntimeCommand::ContinueActiveTask { reply } => {
+                let result = match self.ensure_idle() {
+                    Ok(()) => self.continue_active_task_turn(op_tx).await,
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);

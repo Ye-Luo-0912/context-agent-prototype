@@ -51,6 +51,9 @@ pub enum InputKind {
     CancelOperation,
     Command,
     PatchProposal,
+    /// 续跑同一任务：指令身份不变，不铸造新用户对话，也不重新 ingest。
+    /// 只出现在崩溃/中断后的 `continue_active_task` 路径。
+    TaskContinuation,
 }
 
 /// `Received -> Interpreted -> Applied/Queued/Rejected -> Consumed -> Archived`。
@@ -153,6 +156,28 @@ impl RuntimeInputEnvelope {
             lifecycle: InputLifecycle::Applied,
             body_ref,
             digest,
+            bytes,
+            proposal: StatePatchProposal::None,
+        }
+    }
+
+    /// 任务续跑路径：携带的是同一任务已存在的当前指令，不铸造新用户
+    /// 输入身份；`appears_in_user_transcript` 为 false。
+    pub fn task_continuation(task_id: TaskId, directive: impl Into<String>) -> Self {
+        let body = directive.into();
+        let bytes = body.len() as u64;
+        Self {
+            preview: bounded_preview(&body, USER_INPUT_PREVIEW_CHARS),
+            input_id: None,
+            task_id: Some(task_id),
+            turn_id: None,
+            causal_parent: None,
+            source: InputSource::User,
+            authority: InputAuthority::UserSteering,
+            kind: InputKind::TaskContinuation,
+            lifecycle: InputLifecycle::Applied,
+            body_ref: None,
+            digest: None,
             bytes,
             proposal: StatePatchProposal::None,
         }

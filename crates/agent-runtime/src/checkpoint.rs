@@ -39,6 +39,67 @@ use crate::task::{
     validate_anchor, validate_tool_requirement_set,
 };
 
+/// Bounded reasons why a fully settled batch owes a durable resume
+/// checkpoint. Reasons coalesce into one candidate snapshot; read-only
+/// exploration accrues nothing and never forces a synchronous write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointDebtReason {
+    TaskAnchorChanged,
+    DurableWorkspaceMutation,
+    VerificationChanged,
+}
+
+impl CheckpointDebtReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::TaskAnchorChanged => "task_anchor_changed",
+            Self::DurableWorkspaceMutation => "durable_workspace_mutation",
+            Self::VerificationChanged => "verification_changed",
+        }
+    }
+}
+
+/// Actor-owned atomic checkpoint artifact store under the workspace state
+/// directory. A write lands as a unique temp file renamed onto its final
+/// name inside the same directory, so a reader never observes a partial
+/// checkpoint.
+pub struct CheckpointStore {
+    dir: std::path::PathBuf,
+}
+
+impl CheckpointStore {
+    pub fn new(dir: impl Into<std::path::PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+
+    /// Write one checkpoint payload atomically and return its artifact
+    /// file name. Unique names keep every successful write addressable;
+    /// retention/cleanup stays a host concern.
+    pub async fn write_atomic(&self, bytes: &[u8]) -> AgentResult<String> {
+        tokio::fs::create_dir_all(&self.dir)
+            .await
+            .map_err(|error| {
+                AgentError::InvalidRequest(format!("checkpoint dir unavailable: {error}"))
+            })?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_millis())
+            .unwrap_or_default();
+        let artifact = format!("checkpoint-{now}-{}.json", RunId::new());
+        let temp = self.dir.join(format!(".{artifact}.tmp"));
+        let final_path = self.dir.join(&artifact);
+        tokio::fs::write(&temp, bytes).await.map_err(|error| {
+            AgentError::InvalidRequest(format!("checkpoint write failed: {error}"))
+        })?;
+        tokio::fs::rename(&temp, &final_path)
+            .await
+            .map_err(|error| {
+                AgentError::InvalidRequest(format!("checkpoint rename failed: {error}"))
+            })?;
+        Ok(artifact)
+    }
+}
+
 /// Bump when the checkpoint shape changes; restore rejects mismatches.
 pub const RUNTIME_CHECKPOINT_VERSION: u32 = 4;
 
