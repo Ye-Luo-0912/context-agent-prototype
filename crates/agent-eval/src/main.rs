@@ -22,6 +22,7 @@ mod envfile;
 mod fixture_driver;
 mod harvest;
 mod hygiene;
+mod long_live;
 mod long_task;
 mod longflow;
 mod metrics;
@@ -97,6 +98,17 @@ fn usage() -> ! {
          write/edit and context.manage. Live cells always write a versioned\n\
          evidence bundle (default target/eval-evidence/<unix-secs>). This\n\
          is the live paired smoke, not the 300×3 gate.\n\
+         \n\
+         usage: agent-eval [--repeats N] --long-task-live [normal|resume]\n\
+         \n\
+         retry_policy_dev live pilot (layer 2): the C engine runs the frozen\n\
+         one-directive fixture with a real model. Resume cells interrupt on\n\
+         the semantic trigger (first durably settled mutation + its durable\n\
+         checkpoint), then stop/restore/continue the same directive.\n\
+         Acceptance: TaskCompleted + hidden cargo tests pass + allowed diff.\n\
+         Writes evidence under crates/agent-eval/evidence/retry-pilot/.\n\
+         \n\
+         usage: agent-eval --long-task-gate\n\
          \n\
          usage: agent-eval --show-evidence <cell-dir|pair-dir>\n\
          \n\
@@ -558,6 +570,16 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
+            "--long-task-live" => {
+                let mode_filter = args.next().filter(|value| !value.starts_with('-'));
+                let repeats = if repeats_set {
+                    repeats
+                } else {
+                    long_live::DEFAULT_REPEATS
+                };
+                run_long_task_live(mode_filter, repeats, evidence_dir, allow_dirty).await?;
+                return Ok(());
+            }
             "--all" => engines = vec!["append", "rolling", "dynamic"],
             "--engine" => {
                 let Some(value) = args.next() else {
@@ -951,6 +973,50 @@ async fn run_longflow_live(
             print!("{}", fixture_driver::render_live_comparison(&runs));
             let pair_dir = pair.repeat_path();
             print!("{}", bundle::render_evidence(&pair_dir)?);
+        }
+    }
+    Ok(())
+}
+
+/// retry_policy_dev live pilot (LONG_TASK_EVALUATION.md layer 2): the C
+/// engine on the frozen one-directive fixture, normal/resume with repeats.
+async fn run_long_task_live(
+    mode_filter: Option<String>,
+    repeats: u32,
+    evidence_dir: Option<std::path::PathBuf>,
+    allow_dirty: bool,
+) -> anyhow::Result<()> {
+    bundle::require_clean_tree(allow_dirty)?;
+    let modes = long_live::PilotMode::parse(mode_filter.as_deref())?;
+    anyhow::ensure!((1..=8).contains(&repeats), "repeats must be 1..=8");
+    let model = driver::build_live_coding_model()?;
+    let evidence_root = evidence_dir
+        .unwrap_or_else(|| std::path::PathBuf::from("crates/agent-eval/evidence/retry-pilot"));
+    std::fs::create_dir_all(&evidence_root)?;
+    eprintln!("evidence dir: {}", evidence_root.display());
+    for repeat in 1..=repeats {
+        for mode in &modes {
+            eprintln!(
+                "== retry_policy_dev {} live (C) repeat {repeat}/{repeats} ==",
+                mode.id()
+            );
+            let dir = tempfile::tempdir()?;
+            let pair = bundle::PairSink::claim(
+                evidence_root.clone(),
+                format!("retry_policy_dev-{}", mode.id()),
+                repeat,
+                repeats,
+                true,
+            );
+            let outcome = long_live::run_cell(*mode, &pair, model.clone(), dir.path()).await?;
+            println!("{}", outcome.render_line());
+            for violation in &outcome.diff_violations {
+                println!("diff: {violation}");
+            }
+            for violation in &outcome.marker_violations {
+                println!("marker: {violation}");
+            }
+            println!("{}", bundle::render_evidence(&pair.repeat_path())?);
         }
     }
     Ok(())

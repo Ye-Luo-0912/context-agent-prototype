@@ -202,14 +202,23 @@ const HIDDEN_CHECKS: &[HiddenCheck] = &[
 /// Run every hidden check against the workspace; returns violations.
 pub fn hidden_check_violations(root: &Path) -> Vec<String> {
     let mut violations = Vec::new();
-    for check in HIDDEN_CHECKS {
-        let path = root.join(check.path);
-        let body = std::fs::read_to_string(&path).unwrap_or_default();
-        if !(check.accept)(&body) {
-            violations.push(format!("{}: {}", check.path, check.name));
+    for (path, name, passed) in hidden_check_results(root) {
+        if !passed {
+            violations.push(format!("{path}: {name}"));
         }
     }
     violations
+}
+
+/// Per-check pass/fail against the workspace, for evidence assertions.
+pub fn hidden_check_results(root: &Path) -> Vec<(&'static str, &'static str, bool)> {
+    HIDDEN_CHECKS
+        .iter()
+        .map(|check| {
+            let body = std::fs::read_to_string(root.join(check.path)).unwrap_or_default();
+            (check.path, check.name, (check.accept)(&body))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -675,7 +684,8 @@ Small job runner with a pluggable retry policy.
 - waits are injected through [`Sleeper`], so tests never really wait
 "#;
 
-const FINAL_FILES: &[(&str, &str)] = &[
+/// Byte-exact accepted final contents for the mutated seed files.
+pub const FINAL_FILES: &[(&str, &str)] = &[
     ("src/config.rs", PHASE_ONE_CONFIG),
     ("src/lib.rs", PHASE_TWO_LIB),
     ("src/error.rs", PHASE_TWO_ERROR),
