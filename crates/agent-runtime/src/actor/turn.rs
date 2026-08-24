@@ -214,8 +214,10 @@ impl RuntimeActor {
                 "the active task has no recorded current directive to continue".into(),
             ));
         }
-        // Continuation starts from acknowledged durable state.
-        self.await_pending_checkpoint().await;
+        // Continuation starts from acknowledged durable state: the
+        // durability gate fails the command when the required watermark
+        // never landed, instead of starting a turn on an unfenced gap.
+        self.continuation_durability_gate().await?;
         let input = RuntimeInputEnvelope::task_continuation(task_id, directive.clone());
         self.begin_applied_turn(directive, input, op_tx, true).await
     }
@@ -827,10 +829,16 @@ impl RuntimeActor {
     /// journals `TurnCommitFailed` (naming the phase) plus
     /// `RecoveryRequired` instead of pretending the turn completed.
     pub(super) async fn finalize_turn(&mut self, content: String) {
+        // Segment boundary: flush any accrued debt here too, so a failed
+        // background write retries at the next turn end even when the
+        // closing round had no tool batch.
+        self.safe_point_resume_commit().await;
         // Turn-end barrier: a resume checkpoint still in flight must land
         // (and publish its outcome) before the durable TurnCompleted
-        // event, so the JSONL order proves resume-before-completion.
-        self.await_pending_checkpoint().await;
+        // event, so the JSONL order proves resume-before-completion. A
+        // failure is already published as CheckpointWriteFailed; the turn
+        // still completes and nothing claims resumability from it.
+        let _ = self.await_pending_checkpoint().await;
         let assistant_evidence_identity = self
             .state
             .task_id
@@ -1063,7 +1071,7 @@ impl RuntimeActor {
     pub(super) async fn process_pending_completion(&mut self, proposal: CompletionProposal) {
         // Completion waits for its in-flight resume write; a failed one
         // surfaces as CheckpointWriteFailed and never claims resumability.
-        self.await_pending_checkpoint().await;
+        let _ = self.await_pending_checkpoint().await;
         if self.state.tasks.active().is_none() {
             let _ = self
                 .core

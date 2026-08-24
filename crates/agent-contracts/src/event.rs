@@ -412,13 +412,21 @@ pub enum RuntimeEvent {
     },
     /// The scheduled background checkpoint write landed durably. Only after
     /// this event may the run be described as safely resumable up to the
-    /// write's revision.
+    /// write's revision. `revision` is the task-anchor revision the
+    /// artifact was captured at; `checksum` pins the artifact contents.
     CheckpointDurable {
         #[serde(default)]
         bytes: u64,
         /// Bounded file name of the atomic checkpoint artifact.
         #[serde(default)]
         artifact: String,
+        /// Anchor revision this artifact acknowledges. Zero only for
+        /// legacy rows written before revisions existed.
+        #[serde(default)]
+        revision: u64,
+        /// Bounded sha256 hex of the stored envelope, when recorded.
+        #[serde(default)]
+        checksum: String,
     },
     /// The background checkpoint write failed. Accrued debt stays visible
     /// and retryable at the next safe point; nothing may claim safe

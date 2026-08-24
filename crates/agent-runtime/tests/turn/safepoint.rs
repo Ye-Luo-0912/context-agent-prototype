@@ -334,12 +334,15 @@ async fn checkpoint_store_writes_atomically_and_fails_closed_on_a_bad_dir() {
     let store = agent_runtime::CheckpointStore::new(dir.path().join("state").join("checkpoints"));
     let first = store.write_atomic(b"{}").await.unwrap();
     let second = store.write_atomic(b"{}").await.unwrap();
-    assert_ne!(first, second, "every successful write is addressable");
+    assert_ne!(
+        first.artifact, second.artifact,
+        "every successful write is addressable"
+    );
     assert!(
         dir.path()
             .join("state")
             .join("checkpoints")
-            .join(&first)
+            .join(&first.artifact)
             .exists()
     );
 
@@ -585,5 +588,191 @@ async fn open_loops_return_completion_to_the_model_until_resolved() {
         "the task must be closed after the gate passes: {:?}",
         closed.status
     );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn durable_ack_carries_revision_artifact_and_verifiable_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let instance = instance_with(
+        dir.path(),
+        "task.manage",
+        json!({"base_anchor_revision": 0, "next_action": "record progress"}),
+    )
+    .await;
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    let task_id = {
+        handle
+            .set_focus("implement bounded retry".into())
+            .await
+            .unwrap();
+        handle.list_tasks().await.unwrap()[0].id
+    };
+    handle
+        .patch_task_anchor(
+            task_id,
+            0,
+            agent_runtime::AnchorPatch {
+                next_action: Some("record progress".into()),
+                ..agent_runtime::AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    handle.user_message("keep going".into()).await.unwrap();
+
+    // Collect until the turn ends, keeping full envelopes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut durable = None;
+    let mut resume_revisions = Vec::new();
+    loop {
+        let envelope = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("turn finishes inside the deadline")
+            .expect("event stream stays open");
+        match envelope.event {
+            RuntimeEvent::TaskResumeCommitted {
+                anchor_revision, ..
+            } => {
+                resume_revisions.push(anchor_revision);
+            }
+            RuntimeEvent::CheckpointDurable {
+                bytes,
+                artifact,
+                revision,
+                checksum,
+            } => {
+                durable = Some((bytes, artifact, revision, checksum));
+            }
+            RuntimeEvent::TurnCompleted => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        resume_revisions,
+        vec![1],
+        "the anchor patch drives the debt"
+    );
+    let (_bytes, artifact, revision, checksum) = durable.expect("the write must be acknowledged");
+    assert_eq!(revision, 1, "the ack names the revision it captured");
+    assert!(!artifact.is_empty());
+    assert_eq!(checksum.len(), 64, "the ack pins a sha256 digest");
+
+    // The acknowledged artifact loads back, checksum-verified, and its
+    // payload deserializes into the current checkpoint shape.
+    let store =
+        agent_runtime::CheckpointStore::new(dir.path().join(".focus-agent").join("checkpoints"));
+    let payload = store.load_verified(&artifact).await.unwrap();
+    let checkpoint: agent_runtime::RuntimeCheckpoint = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(
+        checkpoint.version,
+        agent_runtime::RUNTIME_CHECKPOINT_VERSION
+    );
+    let payload_text = String::from_utf8_lossy(&payload);
+    assert!(
+        payload_text.contains("record progress"),
+        "the artifact carries the installed resume knowledge"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_checkpoint_write_fences_continuation_until_a_retry_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    // Block the store with a regular file before the runtime writes.
+    let checkpoints_dir = dir.path().join(".focus-agent");
+    std::fs::create_dir_all(&checkpoints_dir).unwrap();
+    std::fs::write(checkpoints_dir.join("checkpoints"), b"not a directory").unwrap();
+
+    let instance = instance_with(
+        dir.path(),
+        "task.manage",
+        json!({"base_anchor_revision": 0, "next_action": "record progress"}),
+    )
+    .await;
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    let task_id = {
+        handle
+            .set_focus("implement bounded retry".into())
+            .await
+            .unwrap();
+        handle.list_tasks().await.unwrap()[0].id
+    };
+    handle
+        .patch_task_anchor(
+            task_id,
+            0,
+            agent_runtime::AnchorPatch {
+                next_action: Some("record progress".into()),
+                ..agent_runtime::AnchorPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+    handle.user_message("keep going".into()).await.unwrap();
+
+    // The safe-point write fails; nothing claims resumability.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_failed = false;
+    loop {
+        let envelope = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("turn finishes inside the deadline")
+            .expect("event stream stays open");
+        match envelope.event {
+            RuntimeEvent::CheckpointWriteFailed { reason } => {
+                saw_failed = true;
+                assert!(
+                    reason.contains("rename failed")
+                        || reason.contains("write failed")
+                        || reason.contains("dir unavailable"),
+                    "the failure names its cause: {reason}"
+                );
+            }
+            RuntimeEvent::TurnCompleted => break,
+            _ => {}
+        }
+    }
+    assert!(saw_failed, "the blocked store must surface a write failure");
+
+    // Continuation is fenced while the durability watermark is unmet.
+    let refusal = handle
+        .continue_active_task()
+        .await
+        .expect_err("continuation must fail closed on a failed write");
+    assert!(
+        refusal.to_string().contains("never landed durably"),
+        "the fence names the missing durability: {refusal}"
+    );
+
+    // Repairing the store and retrying at the next settled batch releases
+    // the fence: a new turn settles, the write lands, continuation passes.
+    std::fs::remove_file(checkpoints_dir.join("checkpoints")).unwrap();
+    let mut repaired_events = handle.subscribe();
+    handle.user_message("one more round".into()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut durable_seen = false;
+    loop {
+        let envelope = tokio::time::timeout_at(deadline, repaired_events.recv())
+            .await
+            .expect("retry turn finishes inside the deadline")
+            .expect("event stream stays open");
+        match envelope.event {
+            RuntimeEvent::CheckpointDurable { revision, .. } => {
+                durable_seen = true;
+                assert_eq!(revision, 1, "the retry acknowledges the required revision");
+            }
+            RuntimeEvent::TurnCompleted => break,
+            _ => {}
+        }
+    }
+    assert!(durable_seen, "the retried write must be acknowledged");
+
+    handle
+        .continue_active_task()
+        .await
+        .expect("a landed watermark releases the continuation fence");
     instance.shutdown().await.unwrap();
 }

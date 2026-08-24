@@ -59,10 +59,29 @@ impl CheckpointDebtReason {
     }
 }
 
+/// Acknowledgement record of one durably written safe-point artifact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredCheckpoint {
+    /// File name inside the store directory.
+    pub artifact: String,
+    /// Total stored byte length (envelope incl. payload).
+    pub bytes: u64,
+    /// Sha256 hex over the raw checkpoint payload bytes.
+    pub checksum: String,
+}
+
+const CHECKPOINT_ENVELOPE_FORMAT: &str = "runtime-checkpoint-envelope-v1";
+
 /// Actor-owned atomic checkpoint artifact store under the workspace state
 /// directory. A write lands as a unique temp file renamed onto its final
 /// name inside the same directory, so a reader never observes a partial
-/// checkpoint.
+/// checkpoint. The stored form is one header line (format + payload
+/// checksum + length) followed by the raw checkpoint payload bytes; load
+/// verifies both before returning anything, so corruption or truncation is
+/// refused instead of silently restored. File data crosses an OS sync
+/// barrier before the rename; parent-directory sync is attempted on a
+/// best-effort basis because Windows does not expose it portably — that
+/// platform limitation stays explicit rather than claimed away.
 pub struct CheckpointStore {
     dir: std::path::PathBuf,
 }
@@ -73,9 +92,9 @@ impl CheckpointStore {
     }
 
     /// Write one checkpoint payload atomically and return its artifact
-    /// file name. Unique names keep every successful write addressable;
-    /// retention/cleanup stays a host concern.
-    pub async fn write_atomic(&self, bytes: &[u8]) -> AgentResult<String> {
+    /// acknowledgement. Unique names keep every successful write
+    /// addressable; retention/cleanup stays a host concern.
+    pub async fn write_atomic(&self, payload: &[u8]) -> AgentResult<StoredCheckpoint> {
         tokio::fs::create_dir_all(&self.dir)
             .await
             .map_err(|error| {
@@ -86,9 +105,19 @@ impl CheckpointStore {
             .map(|since| since.as_millis())
             .unwrap_or_default();
         let artifact = format!("checkpoint-{now}-{}.json", RunId::new());
+        let checksum = sha256_hex(payload);
+        let mut stored: Vec<u8> = Vec::with_capacity(payload.len() + 160);
+        let header = serde_json::json!({
+            "format": CHECKPOINT_ENVELOPE_FORMAT,
+            "checksum": checksum,
+            "payload_bytes": payload.len(),
+        });
+        stored.extend_from_slice(header.to_string().as_bytes());
+        stored.push(b'\n');
+        stored.extend_from_slice(payload);
         let temp = self.dir.join(format!(".{artifact}.tmp"));
         let final_path = self.dir.join(&artifact);
-        tokio::fs::write(&temp, bytes).await.map_err(|error| {
+        write_and_sync(&temp, &stored).await.map_err(|error| {
             AgentError::InvalidRequest(format!("checkpoint write failed: {error}"))
         })?;
         tokio::fs::rename(&temp, &final_path)
@@ -96,8 +125,106 @@ impl CheckpointStore {
             .map_err(|error| {
                 AgentError::InvalidRequest(format!("checkpoint rename failed: {error}"))
             })?;
-        Ok(artifact)
+        sync_directory_best_effort(&self.dir).await;
+        Ok(StoredCheckpoint {
+            artifact,
+            bytes: stored.len() as u64,
+            checksum,
+        })
     }
+
+    /// Load and verify one acknowledged artifact by name. Refuses unknown
+    /// files, truncated payloads, checksum mismatches and wrong envelopes
+    /// before any bytes reach the caller.
+    pub async fn load_verified(&self, artifact: &str) -> AgentResult<Vec<u8>> {
+        // The name comes from an ack/event, never from model output; still,
+        // refuse anything path-like outright.
+        if artifact.is_empty()
+            || !artifact
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(AgentError::InvalidRequest(
+                "invalid checkpoint artifact name".into(),
+            ));
+        }
+        let path = self.dir.join(artifact);
+        let stored = tokio::fs::read(&path).await.map_err(|error| {
+            AgentError::InvalidRequest(format!(
+                "checkpoint artifact {artifact} unreadable: {error}"
+            ))
+        })?;
+        let split = stored
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or_else(|| {
+                AgentError::InvalidRequest(format!("checkpoint artifact {artifact} has no header"))
+            })?;
+        let header: serde_json::Value =
+            serde_json::from_slice(&stored[..split]).map_err(|error| {
+                AgentError::InvalidRequest(format!(
+                    "checkpoint artifact {artifact} header malformed: {error}"
+                ))
+            })?;
+        if header["format"] != CHECKPOINT_ENVELOPE_FORMAT {
+            return Err(AgentError::InvalidRequest(format!(
+                "checkpoint artifact {artifact} is not a {} envelope",
+                CHECKPOINT_ENVELOPE_FORMAT
+            )));
+        }
+        let expected_checksum = header["checksum"].as_str().ok_or_else(|| {
+            AgentError::InvalidRequest(format!(
+                "checkpoint artifact {artifact} header has no checksum"
+            ))
+        })?;
+        let payload_bytes = header["payload_bytes"].as_u64().ok_or_else(|| {
+            AgentError::InvalidRequest(format!(
+                "checkpoint artifact {artifact} header has no payload length"
+            ))
+        })? as usize;
+        let payload = &stored[split + 1..];
+        if payload.len() != payload_bytes {
+            return Err(AgentError::InvalidRequest(format!(
+                "checkpoint artifact {artifact} is truncated: {} of {payload_bytes} bytes",
+                payload.len()
+            )));
+        }
+        if sha256_hex(payload) != expected_checksum {
+            return Err(AgentError::InvalidRequest(format!(
+                "checkpoint artifact {artifact} fails its checksum"
+            )));
+        }
+        Ok(payload.to_vec())
+    }
+}
+
+async fn write_and_sync(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut file = tokio::fs::File::create(path).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await?;
+    Ok(())
+}
+
+/// Best-effort directory-entry durability. Platforms without portable
+/// directory fsync (Windows) simply skip it; the limitation is part of the
+/// contract, not hidden behind a fake success.
+async fn sync_directory_best_effort(dir: &std::path::Path) {
+    if let Ok(file) = tokio::fs::File::open(dir).await {
+        let _ = file.sync_all().await;
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    // agent-runtime depends on agent-contracts only for hashing-free
+    // types; pull the digest through the workspace-shared sha2 crate.
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 /// Bump when the checkpoint shape changes; restore rejects mismatches.

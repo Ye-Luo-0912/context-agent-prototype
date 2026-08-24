@@ -43,6 +43,14 @@ impl RuntimeInstance {
     /// is derived from the services inside this seam — a composition root
     /// never constructs the authority facade itself.
     pub fn spawn(host: ModuleHost, services: RuntimeServices) -> Self {
+        // Safe-point checkpoints must capture the full plane set: hand the
+        // actor a read-only registry handle unless the composition root
+        // already wired one. The host stays the registration authority;
+        // this is a mechanical snapshot source, not a second orchestrator.
+        let mut services = services;
+        if services.capability_snapshot_for_spawn().is_none() {
+            services.set_capability_registry(host.capability_registry());
+        }
         let services = Arc::new(services);
         let (handle, task) = crate::actor::spawn_runtime(services);
         Self {

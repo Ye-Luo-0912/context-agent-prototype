@@ -1028,10 +1028,20 @@ struct ActorState {
     checkpoint_debt: Vec<crate::checkpoint::CheckpointDebtReason>,
     /// In-flight background checkpoint write; its outcome is published
     /// lazily at the next safe point or eagerly at a barrier wait.
-    checkpoint_write: Option<tokio::task::JoinHandle<AgentResult<(u64, String)>>>,
+    /// Yields the anchor revision captured and the stored acknowledgement.
+    checkpoint_write:
+        Option<tokio::task::JoinHandle<AgentResult<(u64, crate::checkpoint::StoredCheckpoint)>>>,
     /// Last background write ended in `CheckpointWriteFailed` and has not
     /// been followed by a durable one yet.
     checkpoint_write_failed: bool,
+    /// Durability watermarks for one process segment: the revision whose
+    /// resume knowledge is installed, the revision continuation requires
+    /// to be durable, and the latest durably acknowledged revision.
+    /// Process-local by design — a restored runtime inherits durability
+    /// through the loaded checkpoint itself.
+    resume_state_revision: Option<u64>,
+    required_durable_revision: Option<u64>,
+    durable_revision: Option<u64>,
     /// Turn id whose completion-gate refusal was already surfaced, so one
     /// unresolved proposal warns once instead of every round.
     completion_refusal_surfaced_for: Option<TurnId>,

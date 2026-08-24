@@ -43,6 +43,35 @@ pub struct RuntimeServices {
     artifact_workspace: Option<Arc<Workspace>>,
     /// Ablation: when false, PromptAssembler omits TaskProgress. Default true.
     project_task_progress: bool,
+    /// Read-only handle onto the host capability registry, injected at
+    /// spawn so the actor's safe-point checkpoints capture the full plane
+    /// set. The actor snapshots it; it never mutates through this handle.
+    capability_registry: Option<Arc<crate::capability::CapabilityRegistry>>,
+}
+
+impl RuntimeServices {
+    /// The live host capability surface for checkpoint captures, when a
+    /// registry was injected at spawn.
+    pub(crate) fn capability_snapshot(&self) -> Vec<crate::checkpoint::CapabilitySnapshot> {
+        self.capability_registry
+            .as_ref()
+            .map(|registry| registry.snapshot())
+            .unwrap_or_default()
+    }
+
+    /// Spawn-time injection probe and setter (crate-private).
+    pub(crate) fn capability_snapshot_for_spawn(
+        &self,
+    ) -> Option<&Arc<crate::capability::CapabilityRegistry>> {
+        self.capability_registry.as_ref()
+    }
+
+    pub(crate) fn set_capability_registry(
+        &mut self,
+        registry: Arc<crate::capability::CapabilityRegistry>,
+    ) {
+        self.capability_registry = Some(registry);
+    }
 }
 
 /// Trusted, construction-time recovery dependencies for Core authority.
@@ -95,6 +124,7 @@ impl RuntimeServices {
             tools,
             artifact_workspace: None,
             project_task_progress: true,
+            capability_registry: None,
         }
     }
 
@@ -127,6 +157,7 @@ impl RuntimeServices {
             tools,
             artifact_workspace: None,
             project_task_progress: true,
+            capability_registry: None,
         })
     }
 

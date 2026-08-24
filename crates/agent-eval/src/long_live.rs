@@ -8,11 +8,12 @@
 //! from the shared durable authority lineage and continues the SAME
 //! directive through `continue_active_task`.
 //!
-//! Acceptance is behavioral: the model must close the task through
-//! `task.complete`, hidden cargo tests on the finished fixture must pass
-//! with at least one test executed, and the workspace diff must stay
-//! inside the allowed paths. The layer-1 marker predicates ride along as
-//! diagnostics only — multiple correct implementations are accepted.
+//! Acceptance is behavioral, harness-owned and independent of anything the
+//! evaluated agent may add: a frozen oracle test exercising only the seed's
+//! public API is injected into the finished workspace after the run and
+//! executed in isolation. Outcome dimensions (behavior, diff, closure,
+//! continuation, provider health) are recorded separately; the final
+//! verdict stays conjunctive.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,140 @@ use crate::workload::{HiddenAssertionResult, HiddenCommandResult, HiddenFileBody
 pub const PILOT_SCHEMA: &str = "retry-pilot-cell-v1";
 /// LONG_TASK_EVALUATION layer 2: normal and resume, two repeats each.
 pub const DEFAULT_REPEATS: u32 = 2;
+
+/// Harness-owned behavioral oracle. Injected into the finished workspace
+/// after the run (so the evaluated agent never sees it) and executed as an
+/// isolated integration target. It pins only the frozen public API and the
+/// directive's stated semantics — never a concrete growth formula or patch
+/// shape, so multiple correct implementations pass.
+const ORACLE_TEST_NAME: &str = "retry_policy_oracle";
+const ORACLE_TEST_SOURCE: &str = r#"//! Harness-owned behavioral oracle; copied in by the evaluation harness
+//! after the run. Not authored by the evaluated agent.
+
+use jobrunner::{FakeSleeper, RetryConfig, RetryError, Sleeper};
+
+fn config(max_attempts: u32, base_delay_ms: u64, max_delay_ms: u64) -> RetryConfig {
+    RetryConfig {
+        max_attempts,
+        base_delay_ms,
+        max_delay_ms,
+    }
+}
+
+#[test]
+fn first_try_success_never_waits() {
+    let mut sleeper = FakeSleeper::default();
+    let mut calls = 0u32;
+    let result = jobrunner::run_job(&config(3, 25, 100), &mut sleeper, || {
+        calls += 1;
+        Ok(())
+    });
+    assert!(result.is_ok());
+    assert_eq!(calls, 1);
+    assert!(sleeper.sleeps.is_empty());
+}
+
+#[test]
+fn transient_errors_are_retried_until_success() {
+    let mut sleeper = FakeSleeper::default();
+    let mut calls = 0u32;
+    let result = jobrunner::run_job(&config(5, 10, 500), &mut sleeper, || {
+        calls += 1;
+        if calls < 4 {
+            Err(RetryError::Transient("blip".into()))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(result.is_ok(), "transient faults must be retried to success");
+    assert_eq!(calls, 4);
+    assert_eq!(sleeper.sleeps.len(), 3, "one wait per retry");
+}
+
+#[test]
+fn permanent_errors_return_without_waiting() {
+    let mut sleeper = FakeSleeper::default();
+    let mut calls = 0u32;
+    let result = jobrunner::run_job(&config(9, 10, 500), &mut sleeper, || {
+        calls += 1;
+        Err(RetryError::Permanent("bad input".into()))
+    });
+    assert!(matches!(result, Err(RetryError::Permanent(_))));
+    assert_eq!(calls, 1);
+    assert!(sleeper.sleeps.is_empty());
+}
+
+#[test]
+fn max_attempts_includes_the_first_call() {
+    let mut sleeper = FakeSleeper::default();
+    let mut calls = 0u32;
+    let result = jobrunner::run_job(&config(1, 10, 100), &mut sleeper, || {
+        calls += 1;
+        Err(RetryError::Transient("blip".into()))
+    });
+    assert!(result.is_err());
+    assert_eq!(calls, 1, "one attempt means no retry");
+    assert!(sleeper.sleeps.is_empty());
+
+    let mut calls = 0u32;
+    let mut sleeper = FakeSleeper::default();
+    let _ = jobrunner::run_job(&config(4, 10, 100), &mut sleeper, || {
+        calls += 1;
+        Err(RetryError::Transient("blip".into()))
+    });
+    assert_eq!(calls, 4, "the budget caps total attempts including the first");
+    assert_eq!(sleeper.sleeps.len(), 3);
+}
+
+#[test]
+fn delays_grow_monotonic_and_saturate_at_max_delay_ms() {
+    let mut sleeper = FakeSleeper::default();
+    let mut calls = 0u32;
+    let _ = jobrunner::run_job(&config(6, 50, 400), &mut sleeper, || {
+        calls += 1;
+        Err(RetryError::Transient("blip".into()))
+    });
+    assert_eq!(calls, 6);
+    let sleeps = &sleeper.sleeps;
+    assert_eq!(sleeps.len(), 5);
+    for delay in sleeps {
+        assert!(*delay >= 1, "a nonzero base delay must produce a wait");
+        assert!(*delay <= 400, "delays saturate at max_delay_ms");
+    }
+    for pair in sleeps.windows(2) {
+        assert!(pair[0] <= pair[1], "exponential growth must not shrink");
+    }
+}
+
+#[test]
+fn huge_base_delays_saturate_instead_of_overflowing() {
+    let mut sleeper = FakeSleeper::default();
+    let mut calls = 0u32;
+    let _ = jobrunner::run_job(&config(4, u64::MAX, 250), &mut sleeper, || {
+        calls += 1;
+        Err(RetryError::Transient("blip".into()))
+    });
+    assert_eq!(calls, 4);
+    assert_eq!(sleeper.sleeps.len(), 3);
+    for delay in &sleeper.sleeps {
+        assert_eq!(
+            *delay, 250,
+            "a base above the cap must saturate at max_delay_ms"
+        );
+    }
+}
+
+#[test]
+fn public_api_accepts_a_dyn_sleeper() {
+    let mut sleeper = FakeSleeper::default();
+    let dyn_sleeper: &mut dyn Sleeper = &mut sleeper;
+    let result =
+        jobrunner::run_job(&config(2, 5, 50), dyn_sleeper, || {
+            Err(RetryError::Transient("once".into()))
+        });
+    assert!(result.is_err());
+}
+"#;
 
 const LIVE_IDLE: Duration = Duration::from_secs(300);
 /// Live cells share one round cap across engines; never raise it for C.
@@ -89,13 +224,29 @@ impl ApprovalGate for AllowAllGate {
     }
 }
 
-/// One finished live cell, before evidence serialization.
+/// One finished live cell, before evidence serialization. Outcome
+/// dimensions are recorded independently: a lifecycle-closure failure must
+/// not erase whether the workspace was behaviorally correct, and the final
+/// verdict stays conjunctive.
 pub struct CellOutcome {
     pub mode: PilotMode,
     pub passed: bool,
+    /// Runtime/lifecycle failure reason, if any. Never suppresses the
+    /// read-only acceptance dimensions below.
     pub error: Option<String>,
     pub wall_ms: u64,
-    pub task_completed: bool,
+    /// pass | fail | not_run(reason)
+    pub behavior: String,
+    /// pass | fail
+    pub diff: String,
+    /// completed | active | failed
+    pub closure: String,
+    /// n/a | restored | failed
+    pub continuation: String,
+    /// healthy | transport_failed
+    pub provider_health: String,
+    /// Agent-authored `cargo test` self-check: pass | fail | not_run
+    pub self_check: String,
     pub resume_committed: u64,
     pub checkpoint_durable: u64,
     pub model_rounds_phase_one: u32,
@@ -104,7 +255,6 @@ pub struct CellOutcome {
     pub resume_trigger: Option<&'static str>,
     pub diff_violations: Vec<String>,
     pub marker_violations: Vec<String>,
-    pub cargo_passed: bool,
 }
 
 impl CellOutcome {
@@ -114,7 +264,16 @@ impl CellOutcome {
             passed: false,
             error: Some(reason),
             wall_ms,
-            task_completed: false,
+            behavior: "not_run".into(),
+            diff: "fail".into(),
+            closure: "failed".into(),
+            continuation: if mode == PilotMode::Resume {
+                "failed".into()
+            } else {
+                "n/a".into()
+            },
+            provider_health: "healthy".into(),
+            self_check: "not_run".into(),
             resume_committed: 0,
             checkpoint_durable: 0,
             model_rounds_phase_one: 0,
@@ -122,7 +281,6 @@ impl CellOutcome {
             resume_trigger: None,
             diff_violations: Vec::new(),
             marker_violations: Vec::new(),
-            cargo_passed: false,
         }
     }
 
@@ -134,15 +292,18 @@ impl CellOutcome {
             .map(|tool| format!(" trigger={tool}"))
             .unwrap_or_default();
         format!(
-            "retry_policy_dev {:<6} repeat-cell {} rounds={}+{} resumes={} durables={} task_completed={} cargo={}{}{}",
+            "retry_policy_dev {:<6} {} behavior={} diff={} closure={} continuation={} provider={} rounds={}+{} resumes={} durables={}{}{}",
             self.mode.id(),
             status,
+            self.behavior,
+            self.diff,
+            self.closure,
+            self.continuation,
+            self.provider_health,
             self.model_rounds_phase_one,
             self.model_rounds_phase_two,
             self.resume_committed,
             self.checkpoint_durable,
-            self.task_completed,
-            self.cargo_passed,
             trigger,
             self.error
                 .as_ref()
@@ -176,6 +337,8 @@ struct PhaseState {
     cancel_requested: bool,
     mutation_tool: Option<&'static str>,
     durable_after_mutation: bool,
+    /// Artifact name of the latest acknowledged durable checkpoint.
+    last_durable_artifact: Option<String>,
     resume_committed: u64,
     checkpoint_durable: u64,
     turn_completed: bool,
@@ -235,9 +398,12 @@ fn step_event(
             collector.push(envelope);
             StepOutcome::Continue
         }
-        RuntimeEvent::CheckpointDurable { .. } => {
+        RuntimeEvent::CheckpointDurable { ref artifact, .. } => {
             state.checkpoint_durable = state.checkpoint_durable.saturating_add(1);
             state.durable_after_mutation |= state.mutation_tool.is_some();
+            if !artifact.is_empty() {
+                state.last_durable_artifact = Some(artifact.clone());
+            }
             collector.push(envelope);
             StepOutcome::Continue
         }
@@ -468,6 +634,23 @@ fn c_engine(model: Arc<dyn ModelTransport>) -> Arc<dyn ContextEngine> {
     Arc::new(engine.with_compactor(Arc::new(agent_compose::ModelBackedCompactor::new(model))))
 }
 
+/// Cold boundary: read the acknowledged safe-point artifact from the
+/// workspace store, verify its envelope checksum, and deserialize it. No
+/// phase-one in-memory state crosses with it.
+async fn load_checkpoint_artifact(
+    root: &Path,
+    artifact: &str,
+) -> anyhow::Result<agent_runtime::RuntimeCheckpoint> {
+    let workspace = agent_workspace::Workspace::open(root).await?;
+    let store =
+        agent_runtime::checkpoint::CheckpointStore::new(workspace.state_dir().join("checkpoints"));
+    let payload = store
+        .load_verified(artifact)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    Ok(serde_json::from_slice(&payload)?)
+}
+
 /// Run one live cell end to end and score it against the finished
 /// workspace. Never panics on provider/runtime failures: failures become
 /// `CellOutcome::error` so evidence records stay honest.
@@ -496,11 +679,13 @@ pub async fn run_cell(
     let mut rounds_one = 0u32;
     let mut rounds_two = 0u32;
     let mut task_completed = false;
-    let engine = c_engine(model.clone());
+    let mut phase_two_restored = false;
 
-    // ---- Phase one: drive the directive from the clean seed.
-    let mut checkpoint: Option<agent_runtime::RuntimeCheckpoint> = None;
-    match compose_cell(root, model.clone(), engine.clone()).await {
+    // ---- Phase one: drive the directive from the clean seed. The engine
+    // instance is per-phase; the resume twin must not inherit any
+    // phase-one in-memory state through a shared object.
+    let mut checkpoint_artifact: Option<String> = None;
+    match compose_cell(root, model.clone(), c_engine(model.clone())).await {
         Err(e) => error = Some(format!("phase-one compose failed: {e:#}")),
         Ok(composed) => {
             let handle = composed.handle().clone();
@@ -538,9 +723,17 @@ pub async fn run_cell(
                         error = Some("normal run ended without TaskCompleted".into());
                     }
                     if mode == PilotMode::Resume {
-                        match composed.checkpoint().await {
-                            Ok(captured) => checkpoint = Some(captured),
-                            Err(e) => error = Some(format!("checkpoint capture failed: {e}")),
+                        // Retain only the artifact locator across the
+                        // boundary: phase two loads and verifies the exact
+                        // acknowledged safe-point artifact from disk.
+                        match state.last_durable_artifact.clone() {
+                            Some(artifact) => checkpoint_artifact = Some(artifact),
+                            None => {
+                                error = Some(
+                                    "trigger fired without an acknowledged checkpoint artifact"
+                                        .into(),
+                                );
+                            }
                         }
                     }
                 }
@@ -557,91 +750,150 @@ pub async fn run_cell(
         }
     }
 
-    // ---- Phase two (resume only): restore and continue the SAME directive.
+    // ---- Phase two (resume only): cold-load the acknowledged artifact
+    // into a fresh runtime and continue the SAME directive.
     if mode == PilotMode::Resume && error.is_none() {
-        match checkpoint {
-            None => error = Some("resume mode reached phase two without a checkpoint".into()),
-            Some(checkpoint) => match compose_cell(root, model.clone(), engine).await {
-                Err(e) => error = Some(format!("phase-two compose failed: {e:#}")),
-                Ok(composed) => {
-                    let handle = composed.handle().clone();
-                    let mut events = composed.subscribe();
-                    let mut state = PhaseState::default();
-                    let drive = async {
-                        composed
-                            .instance
-                            .restore(checkpoint)
-                            .await
-                            .map_err(|e| format!("restore failed: {e}"))?;
-                        handle
-                            .continue_active_task()
-                            .await
-                            .map_err(|e| format!("continue_active_task failed: {e}"))?;
-                        run_to_completion(&mut events, &mut collector, &mut state, &handle).await
-                    }
-                    .await;
-                    match drive {
-                        Ok(()) => {
-                            rounds_two = state.model_rounds;
-                            resume_committed += state.resume_committed;
-                            checkpoint_durable += state.checkpoint_durable;
-                            task_completed |= state.task_completed;
-                            if !task_completed {
-                                error = Some("continuation ended without TaskCompleted".into());
+        let loaded = match &checkpoint_artifact {
+            None => Err(anyhow::anyhow!(
+                "resume mode reached phase two without a checkpoint"
+            )),
+            Some(artifact) => load_checkpoint_artifact(root, artifact).await,
+        };
+        match loaded {
+            Err(e) => error = Some(format!("checkpoint artifact load failed: {e:#}")),
+            Ok(checkpoint) => {
+                match compose_cell(root, model.clone(), c_engine(model.clone())).await {
+                    Err(e) => error = Some(format!("phase-two compose failed: {e:#}")),
+                    Ok(composed) => {
+                        let handle = composed.handle().clone();
+                        let mut events = composed.subscribe();
+                        let mut state = PhaseState::default();
+                        let drive: Result<(), String> = async {
+                            composed
+                                .instance
+                                .restore(checkpoint)
+                                .await
+                                .map_err(|e| format!("restore failed: {e}"))?;
+                            handle
+                                .continue_active_task()
+                                .await
+                                .map_err(|e| format!("continue_active_task failed: {e}"))?;
+                            run_to_completion(&mut events, &mut collector, &mut state, &handle)
+                                .await
+                        }
+                        .await;
+                        match drive {
+                            Ok(()) => {
+                                phase_two_restored = true;
+                                rounds_two = state.model_rounds;
+                                resume_committed += state.resume_committed;
+                                checkpoint_durable += state.checkpoint_durable;
+                                task_completed |= state.task_completed;
+                                if !task_completed {
+                                    error = Some("continuation ended without TaskCompleted".into());
+                                }
+                            }
+                            Err(reason) => {
+                                error = Some(format!("phase two failed: {reason}"));
                             }
                         }
-                        Err(reason) => {
-                            error = Some(format!("phase two failed: {reason}"));
+                        if let Err(e) = composed.shutdown().await
+                            && error.is_none()
+                        {
+                            error = Some(format!("phase-two shutdown failed: {e}"));
+                        }
+                        while let Ok(envelope) = events.try_recv() {
+                            collector.push(envelope);
                         }
                     }
-                    if let Err(e) = composed.shutdown().await
-                        && error.is_none()
-                    {
-                        error = Some(format!("phase-two shutdown failed: {e}"));
-                    }
-                    while let Ok(envelope) = events.try_recv() {
-                        collector.push(envelope);
-                    }
                 }
-            },
+            }
         }
     }
 
     let wall_ms = started.elapsed().as_millis() as u64;
-    if let Some(reason) = error.as_ref() {
-        let mut outcome = CellOutcome::failed(mode, wall_ms, reason.clone());
-        outcome.task_completed = task_completed;
-        outcome.resume_committed = resume_committed;
-        outcome.checkpoint_durable = checkpoint_durable;
-        outcome.model_rounds_phase_one = rounds_one;
-        outcome.model_rounds_phase_two = rounds_two;
-        write_evidence(pair, root, &collector, &outcome, None);
-        return Ok(outcome);
-    }
 
-    // ---- Behavioral acceptance. The diff scan runs before the cargo test
-    // so build artifacts can never enter the verdict.
+    // ---- Outcome dimensions, recorded independently. Read-only
+    // acceptance always runs while the workspace is inspectable — a
+    // missing closure or a late provider failure must not erase whether
+    // the implementation was behaviorally correct. The diff scan runs
+    // before the oracle injection so build artifacts and the harness's
+    // own oracle file can never enter the allowed-diff verdict.
+    let provider_failed = error
+        .as_deref()
+        .is_some_and(|reason| reason.contains("transport error"));
+    let closure = if task_completed {
+        "completed"
+    } else if error.is_some() {
+        "failed"
+    } else {
+        "active"
+    };
+    let continuation = match mode {
+        PilotMode::Normal => "n/a",
+        PilotMode::Resume if phase_two_restored => "restored",
+        _ => "failed",
+    }
+    .to_string();
+
     let diff_violations = match diff_violations(root) {
         Ok(violations) => violations,
-        Err(e) => {
-            let reason = format!("diff scan failed: {e:#}");
-            let mut outcome = CellOutcome::failed(mode, wall_ms, reason);
-            outcome.task_completed = true;
-            write_evidence(pair, root, &collector, &outcome, None);
-            return Ok(outcome);
+        Err(e) => vec![format!("diff scan failed: {e:#}")],
+    };
+    let diff_clean = diff_violations.is_empty();
+    let marker_violations = long_task::hidden_check_violations(root);
+
+    // Harness-owned behavioral oracle: inject after the diff scan, then
+    // run as an isolated integration target.
+    let oracle_record = match std::fs::write(
+        root.join("tests").join(format!("{ORACLE_TEST_NAME}.rs")),
+        ORACLE_TEST_SOURCE,
+    ) {
+        Err(e) => HiddenCommandResult {
+            argv: cargo_argv(),
+            expect_exit: 0,
+            exit: None,
+            timed_out: false,
+            stdout: String::new(),
+            stderr: format!("oracle injection failed: {e}"),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            passed: false,
+        },
+        Ok(()) => {
+            let mut record = run_cargo_test(root, &["--test", ORACLE_TEST_NAME]).await;
+            record.argv = cargo_argv();
+            record
         }
     };
-    let marker_violations = long_task::hidden_check_violations(root);
-    let cargo = run_cargo_test(root).await;
-    let cargo_passed = cargo.passed;
-    let passed = task_completed && cargo_passed && diff_violations.is_empty();
+    // Agent-authored self-check over the whole workspace, reported but
+    // never gating: the evaluated agent owns these tests.
+    let self_check_record = run_cargo_test(root, &["--quiet"]).await;
+    let behavior = if oracle_record.passed { "pass" } else { "fail" }.to_string();
+    let self_check = if self_check_record.passed {
+        "pass"
+    } else if error.is_some() && !workspace_has_tests(root) {
+        "not_run"
+    } else {
+        "fail"
+    };
 
+    let passed = task_completed && behavior == "pass" && diff_clean;
     let outcome = CellOutcome {
         mode,
         passed,
-        error: None,
+        error,
         wall_ms,
-        task_completed,
+        behavior,
+        diff: if diff_clean { "pass" } else { "fail" }.into(),
+        closure: closure.into(),
+        continuation,
+        provider_health: if provider_failed {
+            "transport_failed".into()
+        } else {
+            "healthy".into()
+        },
+        self_check: self_check.into(),
         resume_committed,
         checkpoint_durable,
         model_rounds_phase_one: rounds_one,
@@ -649,22 +901,49 @@ pub async fn run_cell(
         resume_trigger: trigger_tool,
         diff_violations,
         marker_violations,
-        cargo_passed,
     };
-    write_evidence(pair, root, &collector, &outcome, Some(&cargo));
+    write_evidence(
+        pair,
+        root,
+        &collector,
+        &outcome,
+        Some(&oracle_record),
+        Some(&self_check_record),
+    );
     Ok(outcome)
 }
 
+/// Whether the agent left any test of its own behind (decides whether a
+/// failed workspace self-check is `fail` or `not_run`).
+fn workspace_has_tests(root: &Path) -> bool {
+    if list_tests_dir(root).is_empty() {
+        return false;
+    }
+    let source_files = [
+        "src/lib.rs",
+        "src/error.rs",
+        "src/config.rs",
+        "src/sleeper.rs",
+    ];
+    source_files.iter().any(|file| {
+        std::fs::read_to_string(root.join(file))
+            .map(|body| body.contains("#[cfg(test)]") || body.contains("#[test]"))
+            .unwrap_or(false)
+    })
+}
+
 /// Serialize the cell into the claimed pair directory using the shared
-/// evidence conventions (manifest + events.jsonl + hidden report).
+/// evidence conventions (manifest + events.jsonl + hidden report) plus
+/// this pilot's per-dimension record.
 fn write_evidence(
     pair: &PairSink,
     root: &Path,
     collector: &Collector,
     outcome: &CellOutcome,
-    cargo: Option<&HiddenCommandResult>,
+    oracle: Option<&HiddenCommandResult>,
+    self_check: Option<&HiddenCommandResult>,
 ) {
-    let report = build_hidden_report(outcome, root, cargo);
+    let report = build_hidden_report(outcome, root, oracle, self_check);
     let metrics = crate::metrics::aggregate_metrics(&collector.events);
     let cell_dir = pair.cell_dir("dynamic");
     if let Err(e) = crate::bundle::write_cell_parts(
@@ -686,12 +965,32 @@ fn write_evidence(
     ) {
         eprintln!("warning: retry-pilot evidence write failed: {e}");
     }
+    let dimensions = serde_json::json!({
+        "schema": PILOT_SCHEMA,
+        "mode": outcome.mode.id(),
+        "behavioral_oracle": outcome.behavior,
+        "allowed_diff": outcome.diff,
+        "task_closure": outcome.closure,
+        "continuation": outcome.continuation,
+        "provider_runtime": outcome.provider_health,
+        "workspace_self_check": outcome.self_check,
+        "final_passed": outcome.passed,
+        "runtime_error": outcome.error,
+    });
+    let dimensions_path = pair.cell_dir("dynamic").join("dimensions.json");
+    if let Err(e) = std::fs::write(
+        &dimensions_path,
+        serde_json::to_vec_pretty(&dimensions).unwrap_or_default(),
+    ) {
+        eprintln!("warning: retry-pilot dimensions write failed: {e}");
+    }
 }
 
 fn build_hidden_report(
     outcome: &CellOutcome,
     root: &Path,
-    cargo: Option<&HiddenCommandResult>,
+    oracle: Option<&HiddenCommandResult>,
+    self_check: Option<&HiddenCommandResult>,
 ) -> HiddenReport {
     let checks = long_task::hidden_check_results(root);
     let assertions: Vec<HiddenAssertionResult> = checks
@@ -716,22 +1015,30 @@ fn build_hidden_report(
         .iter()
         .map(|relative| file_body(root, relative))
         .collect();
-    // A cell that errored before acceptance records the oracle as skipped
-    // instead of implying an unexecuted check passed or failed.
-    let commands = match cargo {
-        Some(result) => vec![result.clone()],
-        None => vec![HiddenCommandResult {
+    // Both cargo invocations are recorded; the gating oracle first, then
+    // the agent-authored workspace self-check.
+    let mut commands: Vec<HiddenCommandResult> = Vec::new();
+    match oracle {
+        Some(result) => commands.push(result.clone()),
+        None => commands.push(HiddenCommandResult {
             argv: cargo_argv(),
             expect_exit: 0,
             exit: None,
             timed_out: false,
             stdout: String::new(),
-            stderr: "oracle skipped: the cell errored before acceptance".into(),
+            stderr: "oracle not run".into(),
             stdout_truncated: false,
             stderr_truncated: false,
             passed: false,
-        }],
-    };
+        }),
+    }
+    if let Some(result) = self_check {
+        let mut record = result.clone();
+        record
+            .stderr
+            .push_str("\n(self-check over agent-authored tests; informational)");
+        commands.push(record);
+    }
     HiddenReport {
         schema: PILOT_SCHEMA.to_string(),
         kind: "retry_pilot_oracle".into(),
@@ -752,20 +1059,24 @@ fn cargo_argv() -> Vec<String> {
         .collect()
 }
 
-/// Hidden cargo-test oracle: compile and run whatever coverage the model
-/// added. Passing requires a zero exit, zero failures and at least one
-/// executed test (a fixture with no added tests must not pass).
-async fn run_cargo_test(root: &Path) -> HiddenCommandResult {
+/// Hidden cargo-test runner over the finished workspace. `args` selects
+/// the target set: the harness-owned oracle runs as an isolated
+/// integration test, the agent-authored self-check runs everything.
+async fn run_cargo_test(root: &Path, args: &[&str]) -> HiddenCommandResult {
     use std::process::Stdio;
 
     let mut command = tokio::process::Command::new("cargo");
     command
-        .args(["test", "--quiet"])
+        .arg("test")
+        .args(args)
         .current_dir(root)
         .env("CARGO_TERM_COLOR", "never")
         .stdin(Stdio::null());
     let mut record = HiddenCommandResult {
-        argv: cargo_argv(),
+        argv: std::iter::once("cargo".to_string())
+            .chain(std::iter::once("test".to_string()))
+            .chain(args.iter().map(|arg| (*arg).to_string()))
+            .collect(),
         expect_exit: 0,
         exit: None,
         timed_out: false,
@@ -1034,5 +1345,35 @@ mod tests {
     fn spec_digest_is_stable_across_calls() {
         assert_eq!(spec_sha256(), spec_sha256());
         assert_eq!(spec_sha256().len(), 64);
+    }
+
+    /// The harness-owned oracle must accept the reference solution and
+    /// reject the untouched seed, offline and in isolation.
+    #[tokio::test]
+    async fn oracle_accepts_reference_solution_and_rejects_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        long_task::seed_workspace(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        let oracle_path = dir
+            .path()
+            .join("tests")
+            .join(format!("{ORACLE_TEST_NAME}.rs"));
+        std::fs::write(&oracle_path, ORACLE_TEST_SOURCE).unwrap();
+
+        let seed_result = run_cargo_test(dir.path(), &["--test", ORACLE_TEST_NAME]).await;
+        assert!(
+            !seed_result.passed,
+            "the seed has no retry policy; the oracle must fail on it"
+        );
+
+        for (relative, contents) in long_task::FINAL_FILES {
+            std::fs::write(dir.path().join(relative), contents).unwrap();
+        }
+        let result = run_cargo_test(dir.path(), &["--test", ORACLE_TEST_NAME]).await;
+        assert!(
+            result.passed,
+            "reference solution must pass the oracle\nstdout:\n{}\nstderr:\n{}",
+            result.stdout, result.stderr
+        );
     }
 }

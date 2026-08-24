@@ -80,6 +80,12 @@ impl RuntimeActor {
         // visible. Consuming one epoch when context restore later fails is
         // safe; installing restored state before a failed fence is not.
         let restore_id = self.bump_generation()?;
+        // Durability watermarks are process-local: the loaded checkpoint
+        // is itself this segment's durability proof, so pre-restore
+        // bookkeeping must not fence continuation after a restore.
+        self.state.resume_state_revision = None;
+        self.state.required_durable_revision = None;
+        self.state.durable_revision = None;
         self.core
             .restore(context, current_task_id)
             .await

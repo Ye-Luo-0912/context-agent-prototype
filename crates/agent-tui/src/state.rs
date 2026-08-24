@@ -340,7 +340,9 @@ impl AppState {
                     debt.join(", ")
                 ));
             }
-            RuntimeEvent::CheckpointDurable { bytes, artifact } => {
+            RuntimeEvent::CheckpointDurable {
+                bytes, artifact, ..
+            } => {
                 self.push_system(format!("checkpoint durable: {artifact} ({bytes}B)"));
             }
             RuntimeEvent::CheckpointWriteFailed { reason } => {
