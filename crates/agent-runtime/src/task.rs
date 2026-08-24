@@ -471,9 +471,13 @@ enum TaskPlan {
         replacement: TaskToolRequirementSet,
     },
     /// Atomically replace one task's whole anchor (bounded, versioned).
+    /// `authority_changed` marks a boundary-class change (goal/constraints):
+    /// only those invalidate dependent verification. A progress-only CAS
+    /// advances the record revision without staling a Current verifier.
     ReplaceAnchor {
         target: TaskId,
         replacement: TaskAnchor,
+        authority_changed: bool,
     },
 }
 
@@ -746,6 +750,7 @@ impl TaskManager {
 
         normalize_anchor(&mut anchor)?;
         let changed_fields = anchor_changed_fields(&task.anchor, &anchor);
+        let authority_changed = changed_fields.iter().any(|field| is_authority_field(field));
         let revision = if changed_fields.is_empty() {
             base_revision
         } else {
@@ -759,6 +764,7 @@ impl TaskManager {
                 plan: TaskPlan::ReplaceAnchor {
                     target: task_id,
                     replacement: anchor,
+                    authority_changed,
                 },
             },
             revision,
@@ -800,6 +806,11 @@ impl TaskManager {
         let mut replacement = patch.apply_to(&task.anchor);
         normalize_anchor(&mut replacement)?;
         let changed_fields = anchor_changed_fields(&task.anchor, &replacement);
+        // A patch that moves only runtime-evolvable fields advances the
+        // record CAS without touching the verification basis; a boundary
+        // patch (goal/constraints) invalidates dependent verification.
+        let authority_changed = kind == AnchorPatchKind::Boundary
+            || changed_fields.iter().any(|field| is_authority_field(field));
         let revision = if changed_fields.is_empty() {
             base_revision
         } else {
@@ -813,6 +824,7 @@ impl TaskManager {
                 plan: TaskPlan::ReplaceAnchor {
                     target: task_id,
                     replacement,
+                    authority_changed,
                 },
             },
             revision,
@@ -884,9 +896,13 @@ impl TaskManager {
             TaskPlan::ReplaceAnchor {
                 target,
                 replacement,
+                authority_changed,
             } => {
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == target) {
-                    if task.anchor.revision != replacement.revision {
+                    if task.anchor.revision != replacement.revision && authority_changed {
+                        // Only a boundary change (goal/constraints) makes a
+                        // Current verifier stale. Progress-only CAS keeps
+                        // the verification basis untouched.
                         task.resume.mark_spec_changed();
                     }
                     task.resume.anchor_revision = replacement.revision;
@@ -1023,6 +1039,14 @@ pub(crate) fn normalize_anchor(anchor: &mut TaskAnchor) -> AgentResult<()> {
         }
     }
     Ok(())
+}
+
+/// Authority fields of the anchor: moving any of them is a boundary-class
+/// change that invalidates dependent verification. Everything else
+/// (interpretation, plan, open loops, next action, refs) advances only the
+/// record CAS.
+fn is_authority_field(field: &str) -> bool {
+    matches!(field, "original_goal" | "constraints")
 }
 
 /// The capped list of anchor field names whose content differs from `old`,
@@ -1455,6 +1479,159 @@ mod tests {
                 .to_string()
                 .contains("immutable"),
             "a completed task's anchor must be immutable"
+        );
+    }
+
+    #[test]
+    fn progress_only_cas_keeps_current_verification_and_boundary_change_stales_it() {
+        use crate::execution::{VerificationCause, VerificationState};
+
+        let mut tasks = TaskManager::new();
+        let id = create(&mut tasks, "goal");
+
+        // A passing verification command makes the resume verifier Current.
+        let test = agent_contracts::ToolOutput {
+            call_id: "c".into(),
+            tool_name: "shell.exec".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: "exit 0".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({"command": "cargo test", "verification": true}),
+        };
+        tasks.observe_tool(&test, 1);
+        assert_eq!(
+            tasks.get(id).unwrap().resume.verification.state,
+            VerificationState::Current,
+            "the fixture itself must produce a Current verifier"
+        );
+
+        // A progress-only patch advances the record CAS but leaves the
+        // verification basis untouched.
+        let (txn, revision, _, kind) = tasks
+            .prepare_patch_anchor(
+                id,
+                0,
+                &AnchorPatch {
+                    next_action: Some("record progress".into()),
+                    ..AnchorPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(kind, AnchorPatchKind::Autonomous);
+        tasks.commit(txn);
+        let task = tasks.get(id).unwrap();
+        assert_eq!(task.anchor.revision, 1);
+        assert_eq!(revision, 1);
+        assert_eq!(
+            task.resume.verification.state,
+            VerificationState::Current,
+            "progress-only CAS must not stale a Current verifier"
+        );
+        assert_eq!(
+            task.resume.verification.cause,
+            VerificationCause::None,
+            "no stale cause may be recorded for a progress-only CAS"
+        );
+        assert_eq!(
+            task.resume.anchor_revision, 1,
+            "the CAS fence must still advance so a stale write is refused"
+        );
+        // The stale base revision is still rejected after the progress bump.
+        let stale_write = tasks.prepare_patch_anchor(
+            id,
+            0,
+            &AnchorPatch {
+                open_loops: Some(vec!["x".into()]),
+                ..AnchorPatch::default()
+            },
+        );
+        assert!(
+            stale_write.is_err(),
+            "CAS fence must survive the decoupling"
+        );
+
+        // A boundary patch (goal change) does invalidate the verifier.
+        let (txn, _, _, kind) = tasks
+            .prepare_patch_anchor(
+                id,
+                1,
+                &AnchorPatch {
+                    original_goal: Some("changed goal".into()),
+                    ..AnchorPatch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(kind, AnchorPatchKind::Boundary);
+        tasks.commit(txn);
+        let task = tasks.get(id).unwrap();
+        assert_eq!(task.anchor.revision, 2);
+        assert_eq!(
+            task.resume.verification.state,
+            VerificationState::Stale,
+            "a goal change must stale the dependent verification"
+        );
+        assert_eq!(
+            task.resume.verification.cause,
+            VerificationCause::SpecChanged
+        );
+    }
+
+    #[test]
+    fn whole_anchor_replace_matches_authority_semantics_of_patches() {
+        use crate::execution::VerificationState;
+
+        let mut tasks = TaskManager::new();
+        let id = create(&mut tasks, "task A");
+        let test = agent_contracts::ToolOutput {
+            call_id: "c".into(),
+            tool_name: "shell.exec".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: "exit 0".into(),
+            artifact_ref: None,
+            metadata: serde_json::json!({"command": "cargo test", "verification": true}),
+        };
+        tasks.observe_tool(&test, 1);
+        assert_eq!(
+            tasks.get(id).unwrap().resume.verification.state,
+            VerificationState::Current
+        );
+
+        // Replace with an anchor whose authority fields are identical:
+        // only runtime fields move, so verification stays Current.
+        let mut evolved = evolved_anchor();
+        evolved.original_goal = "task A".into();
+        evolved.constraints.clear();
+        let (txn, revision, changed) = tasks
+            .prepare_replace_anchor(id, 0, evolved)
+            .expect("initial CAS is valid");
+        assert!(
+            !changed
+                .iter()
+                .any(|field| field == "original_goal" || field == "constraints"),
+            "fixture must not touch authority fields, got {changed:?}"
+        );
+        tasks.commit(txn);
+        let task = tasks.get(id).unwrap();
+        assert_eq!(task.anchor.revision, revision);
+        assert_eq!(
+            task.resume.verification.state,
+            VerificationState::Current,
+            "authority-preserving replace must keep the verifier Current"
+        );
+
+        // Replacing across a goal change stales it.
+        let mut moved = tasks.get(id).unwrap().anchor.clone();
+        moved.original_goal = "task B".into();
+        let (txn, _, _) = tasks
+            .prepare_replace_anchor(id, revision, moved)
+            .expect("revision matches");
+        tasks.commit(txn);
+        assert_eq!(
+            tasks.get(id).unwrap().resume.verification.state,
+            VerificationState::Stale,
+            "an authority-moving replace must stale the verifier"
         );
     }
 
