@@ -329,7 +329,8 @@ and sandbox contracts live elsewhere. Experiment facts live in
   precedes `CheckpointDurable`, which lands before `TurnCompleted`; a
   failed write re-arms the debt as `CheckpointWriteFailed`. Completion waits
   for in-flight writes. Continuation also waits for settlement but currently
-  does not reject a failed-write outcome; that residual is `LONGTASK-04`.
+  does not reject a failed-write outcome; that residual is `LONGTASK-04`
+  (since resolved by the LT-RUN-04 Slice D watermarks).
   `continue_active_task` starts a fresh turn from the stored current
   directive and resume state with a `task_continuation` input kind — no
   new user instruction, no re-ingest, `TaskContinuationStarted` is
@@ -404,6 +405,31 @@ and sandbox contracts live elsewhere. Experiment facts live in
   affordance as a default-off candidate, and make safe-point durability
   independently cold-loadable; see
   [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+- All four deterministic `LT-RUN-04` slices landed (2026-08-25). Slice A:
+  outcome dimensions are recorded independently, read-only acceptance always
+  runs on an inspectable workspace, a harness-owned frozen-API oracle executes
+  outside the agent-editable workspace after the diff scan, and resume twins
+  build a fresh Context engine per phase while crossing the boundary with only
+  the checksum-verified artifact locator. Slice B: a progress-only anchor CAS
+  advances the record revision and its resume fence without staling a Current
+  verifier; only goal/constraint movement marks dependent verification stale,
+  implemented as authority gating on the single record revision rather than a
+  second counter. Slice C: the advisory `CompletionOpportunity` candidate
+  landed behind a default-off host switch — pure eligibility mirrors the
+  acceptance gate plus positive durable-work and exact-tuple trusted-pass
+  evidence, the body-free key is offered once per basis and persisted bounded
+  in `ExecutionState`, the lease prefers `task.complete` for exactly one
+  decision with one bounded prompt statement, typed events distinguish
+  not_ready/offered/called/ignored/refused/completed, and all eight mandatory
+  negatives plus switch-default silence are deterministic-green. Slice D:
+  safe-point checkpoints capture every visible plane including the host
+  capability registry under the generation handshake, write as sha256 +
+  fsync'd atomic-rename envelopes with a corruption-refusing load path, and
+  continuation is gated by monotonic watermarks that fail closed until a
+  retried write lands. None of this is a live claim: no cell has passed the
+  full conjunction, and the CompletionOpportunity promotion gate (Roadmap
+  item 8 off/on paired repeats) has not run — the candidate stays off until
+  it does.
 - **Execution Convergence V1 mechanism landed** (2026-08-23, all 22
   items checked — the checklist is now the historical record
   [`EXECUTION_CONVERGENCE_V1.md`](EXECUTION_CONVERGENCE_V1.md)):
@@ -610,7 +636,9 @@ evaluator skips post-run acceptance after that failure. Their resume twins prove
 operator stop plus restore of an externally captured full checkpoint, not an
 independent disk cold start: the Context engine is reused, the actor safe-point
 artifact omits the host capability plane, and the artifact store has no load
-path, checksum or fsync durability claim.
+path, checksum or fsync durability claim. The runtime has since landed all of
+those properties (LT-RUN-04 Slice D), but the retained cells predate it, so
+they still do not demonstrate cold start.
 
 The next bounded phase is `LT-RUN-04` in
 [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md): (1) preserve behavioral,
@@ -630,6 +658,12 @@ Criterion origin/authority must land before Completion Proof Ledger shadow
 evidence; a model-visible TaskGraph remains evidence-gated. The pilot remains
 development evidence, not M15 acceptance, and it does not reorder M12 then
 M13.
+
+All four `LT-RUN-04` slices are landed deterministically as of 2026-08-25
+(see Now); the live half of this phase remains open: canonical closure cells
+under the split-dimension evaluator, and the item-8 off/on paired
+CompletionOpportunity promotion gate on the final substrate before any
+same-model A/C comparison.
 
 ## Next milestone
 

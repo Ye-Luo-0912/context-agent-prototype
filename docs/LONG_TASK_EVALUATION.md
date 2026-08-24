@@ -382,6 +382,15 @@ For resume cells, phase two must construct a fresh Context implementation and
 load the persisted checkpoint artifact. Reusing the phase-one engine object is
 not a cold-resume result.
 
+Status: landed 2026-08-25. The evaluator records the six outcome dimensions
+independently and read-only acceptance always runs while the workspace is
+inspectable; a harness-owned frozen-public-API oracle is injected after the
+run and executed in isolation from the agent-editable workspace, and the
+agent's own cargo run stays a separate non-gating self-check. Resume twins
+build a fresh Context engine per phase and cross the boundary holding only
+the acknowledged artifact locator, which is checksum-verified on load.
+No live cell has yet passed the full conjunction.
+
 ### Slice B — separate CAS revision from verification basis
 
 Retain the current monotonic anchor revision as the compare-and-swap revision
@@ -422,6 +431,17 @@ Acceptance for this slice:
 - checkpoint/restore preserves both revisions and their binding;
 - ActiveTurn, task resume, exact reuse and completion agree on currentness;
 - completion records remain bound to the authoritative task basis.
+
+Status: landed deterministically 2026-08-25, as authority-gated staleness on
+the existing single record revision rather than a second counter: the whole
+anchor CAS still advances one monotonic revision and the resume fence always
+follows it, but only boundary-class movement (goal/constraints) marks a
+Current verifier stale with cause `SpecChanged`; progress-only CAS keeps the
+verifier Current while stale-base writes stay refused. The behavioral
+acceptance bullets above are covered by deterministic TaskManager tests in
+both the patch and whole-anchor paths. A dedicated verification-basis counter
+stays open and is not needed by any current caller; if criterion-level gates
+arrive they must first define criterion origin/authority as stated above.
 
 ### Slice C — conservative `CompletionOpportunity` candidate
 
@@ -486,6 +506,20 @@ offers per opportunity key. If the gate fails, the candidate remains off and
 cannot be smuggled into an A/C comparison; only a promoted, frozen setting may
 be held constant across later Context engines.
 
+Status: landed behind a default-off host switch
+(`RuntimeServices::with_project_completion_opportunity`) on 2026-08-25, not
+promoted. Eligibility is a pure derivation mirroring the acceptance gate plus
+the two positive-evidence conditions (task-relevant durable mutation with
+`MutationResult` provenance; a trusted verification pass current on the exact
+identity tuple). The body-free key is once-per-basis and only the last offered
+key persists in bounded `ExecutionState`; the lease prefers `task.complete`
+for exactly one decision, arms one bounded prompt statement through
+`TaskProgressView`, and retracts on cancel/failure. Typed events distinguish
+not_ready/offered/called/ignored/refused/completed. All eight mandatory
+negatives are deterministic-green at the derivation level, and actor-level
+tests prove the switch is silent by default and never leases an initial task.
+The item-8 off/on paired live promotion gate has not run.
+
 ### Slice D — one complete durable checkpoint boundary
 
 The current actor safe-point artifact contains the actor-owned checkpoint
@@ -540,6 +574,17 @@ engine. Phase two constructs new instances, checksum-validates and loads that
 exact artifact, and only then calls `continue_active_task`. An in-memory
 `RuntimeCheckpoint` may not cross the boundary. Instrument instance identity in
 the deterministic harness so this fact is provable rather than inferred.
+
+Status: landed deterministically 2026-08-25. Safe-point persistence runs
+through one full-plane coordinator that captures the host capability plane at
+spawn-injected registry handles, and `CheckpointStore` writes a header +
+payload envelope with sha256 and an OS sync barrier before the atomic rename,
+with a verified load path refusing truncation or corruption. Continuation is
+gated by monotonic watermarks (`resume_state_revision`,
+`required_durable_revision`, `durable_revision`) and fails closed with a typed
+fence until a retried write lands; turn-end settlement flushes accrued debt so
+a failed write retries even without a tool batch. `CheckpointDurable` carries
+the acknowledged revision and checksum.
 
 ### Slice E — evidence gate for proof and planning research
 
