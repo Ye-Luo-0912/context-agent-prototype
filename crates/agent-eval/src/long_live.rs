@@ -383,7 +383,10 @@ async fn compose_cell(
         base_tools: tools,
         capability_aware: false,
         journal: None,
-        artifact_store: None,
+        // Durable checkpoints need the workspace as their store: without it
+        // every scheduled write fails with "no checkpoint store configured"
+        // and nothing is resumable.
+        artifact_store: Some(Arc::new(workspace.clone())),
         output_broker: None,
         max_tool_rounds: Some(LIVE_MAX_MODEL_ROUNDS as usize),
         project_task_progress: true,

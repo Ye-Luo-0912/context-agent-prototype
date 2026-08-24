@@ -1016,7 +1016,12 @@ async fn run_long_task_live(
             for violation in &outcome.marker_violations {
                 println!("marker: {violation}");
             }
-            println!("{}", bundle::render_evidence(&pair.repeat_path())?);
+            // Best effort: a fresh evidence file can transiently fail to
+            // open on Windows (defender/indexer); never lose the run over it.
+            match bundle::render_evidence(&pair.repeat_path()) {
+                Ok(rendered) => println!("{rendered}"),
+                Err(e) => eprintln!("warning: evidence render failed: {e}"),
+            }
         }
     }
     Ok(())
