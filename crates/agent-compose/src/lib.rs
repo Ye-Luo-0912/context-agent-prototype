@@ -30,7 +30,7 @@ use agent_workspace::Workspace;
 use context_baselines::{AppendOnlyEngine, RollingConfig, RollingSummaryEngine};
 use context_contextcore::{ContextServiceConfig, ServiceEngine, connect_engine};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
-use provider_openai::{OpenAiConfig, OpenAiProvider, RetryingTransport};
+use provider_openai::{OpenAiConfig, OpenAiProtocol, OpenAiProvider, RetryingTransport};
 use tokio::sync::broadcast;
 
 mod compactor;
@@ -131,6 +131,7 @@ pub async fn build_context_engine(
 /// - `OPENAI_BASE_URL` (default `https://api.openai.com/v1`) — point at
 ///   DeepSeek (`https://api.deepseek.com/v1`), Qwen, Moonshot, GLM, ...
 /// - `OPENAI_MODEL` (default `gpt-4o-mini`)
+/// - `OPENAI_API_PROTOCOL` (`auto` by default; also `responses` or `chat`)
 /// - `OPENAI_CONTEXT_WINDOW` (default 128000 declared send window)
 pub fn model_from_env() -> Arc<dyn ModelTransport> {
     let Ok(api_key) = std::env::var("OPENAI_API_KEY") else {
@@ -143,11 +144,16 @@ pub fn model_from_env() -> Arc<dyn ModelTransport> {
     let base_url = std::env::var("OPENAI_BASE_URL")
         .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
     let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let protocol = std::env::var("OPENAI_API_PROTOCOL")
+        .ok()
+        .and_then(|value| OpenAiProtocol::parse(&value).ok())
+        .unwrap_or_default();
     let context_window = env_declared_context_window();
     let provider = OpenAiProvider::new(OpenAiConfig {
         api_key,
         base_url,
         model,
+        protocol,
         max_output_tokens: 4096,
         timeout: std::time::Duration::from_secs(120),
         send_stream_options: true,

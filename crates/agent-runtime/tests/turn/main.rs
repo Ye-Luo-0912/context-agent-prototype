@@ -9,3 +9,4 @@ mod harness;
 mod policy;
 mod scopes;
 mod stream;
+mod task_progress;

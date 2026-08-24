@@ -16,8 +16,9 @@ use std::sync::{Arc, RwLock};
 
 use agent_contracts::{
     AgentError, AgentResult, ResourceDescriptor, ToolCatalogEntry, ToolDispatcher,
-    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec,
-    ToolSurfaceSnapshot, reject_staged_effect_for_process_tool, search_tool_catalog_filtered,
+    ToolExecutionAttribution, ToolExecutionPurpose, ToolExecutionRequest, ToolLeaseReconcileReport,
+    ToolOutcome, ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec, ToolSurfaceSnapshot,
+    VerificationReuse, reject_staged_effect_for_process_tool, search_tool_catalog_filtered,
 };
 use agent_workspace::Workspace;
 use serde::Deserialize;
@@ -27,8 +28,9 @@ use crate::tools::{
     ArtifactReadTool, CodeDiagnosticsTool, CodeSymbolsTool, ContextManageTool, EditPatchTool,
     EditReplaceTool, FsListTool, FsReadTool, FsWriteTool, GitDiffTool, GitStatusTool,
     ProcessRunTool, ProcessSession, ProcessSessionTool, SearchGrepTool, ShellExecTool,
-    TaskCompleteTool, Tool,
+    TaskCompleteTool, TaskManageTool, Tool, VerificationRunTool,
 };
+use crate::{VERIFY_RUN_TOOL_NAME, VerificationRecipes};
 
 /// Control tools are now defined by the unified catalog contract.
 pub use agent_contracts::{CAPABILITY_MANAGE, ToolLifecycle};
@@ -53,12 +55,12 @@ pub struct ToolLifecycleConfig {
 
 impl Default for ToolLifecycleConfig {
     fn default() -> Self {
-        // Production always-loaded surface. Git / shell / `fs.write` /
-        // `edit.replace` / `context.manage` stay in the catalog and load
-        // through `capability.manage` (or runtime NeedEvidence).
-        // `edit.patch` is the single canonical mutation primitive: one
-        // extra discovery round costs more than keeping its compact schema
-        // on the core coding surface. Scripted eval fixtures,
+        // Production always-loaded coding surface. Compact, universal file
+        // creation and read-only Git review join read/search/edit.patch:
+        // repeated catalog-control rounds cost far more than their combined
+        // ~190-token schemas. Shell/process, `edit.replace`,
+        // `context.manage` and plugin tools remain catalog-loaded on demand.
+        // Scripted eval fixtures,
         // `--compare-arm`, and context-bench/mech ops still pin write/edit
         // and `context.manage`; live coding compare reuses this default.
         Self {
@@ -71,12 +73,15 @@ impl Default for ToolLifecycleConfig {
                 // read side of that contract, so it must always be on the
                 // surface.
                 "artifact.read".into(),
-                // Canonical revision-aware mutation. Not fs.write /
-                // edit.replace / git / shell / process.
+                // Canonical revision-aware mutation. Not edit.replace /
+                // shell / process.
                 "edit.patch".into(),
-                // Completion is a task-level control: the model can always
-                // propose a structured outcome.
-                "task.complete".into(),
+                // Compact universal coding primitives. Surface visibility
+                // grants no write/effect authority; normal host policy and
+                // approval still gate execution.
+                "fs.write".into(),
+                "git.status".into(),
+                "git.diff".into(),
                 // Catalog control plane: search/inspect/load/unload. The
                 // merged retrieval tool (`context.manage`) is catalog-only
                 // until EXTERNAL CONTEXT / NeedEvidence (item 24).
@@ -98,6 +103,10 @@ struct ToolEntry {
     tool: Arc<dyn Tool>,
     state: ToolLifecycle,
     last_used_tick: u64,
+    /// An explicit host/operator load is a live source until unload. Runtime
+    /// lease loads leave this false and are released by decision-boundary
+    /// reconciliation when their typed roots disappear.
+    persistent_load: bool,
 }
 
 pub struct BuiltinToolDispatcher {
@@ -110,20 +119,42 @@ pub struct BuiltinToolDispatcher {
     /// Bumped on every lifecycle change (load/unload/gc transitions), so a
     /// `ToolSurfaceSnapshot` is auditably identifiable.
     generation: AtomicU64,
+    /// Immutable host recipe table. The matching host-effect policy is
+    /// derived from this same value by the composition root.
+    verification_recipes: Arc<VerificationRecipes>,
 }
 
 impl BuiltinToolDispatcher {
+    fn stays_loaded(&self, name: &str) -> bool {
+        name == VERIFY_RUN_TOOL_NAME || self.config.always_loaded.iter().any(|core| core == name)
+    }
+
     pub fn new(workspace: Workspace) -> Self {
-        Self::with_config(workspace, ToolLifecycleConfig::default())
+        let recipes = VerificationRecipes::discover(&workspace);
+        Self::with_config_and_verification_recipes(
+            workspace,
+            ToolLifecycleConfig::default(),
+            recipes,
+        )
     }
 
     pub fn with_config(workspace: Workspace, config: ToolLifecycleConfig) -> Self {
+        let recipes = VerificationRecipes::discover(&workspace);
+        Self::with_config_and_verification_recipes(workspace, config, recipes)
+    }
+
+    pub fn with_config_and_verification_recipes(
+        workspace: Workspace,
+        config: ToolLifecycleConfig,
+        verification_recipes: VerificationRecipes,
+    ) -> Self {
+        let verification_recipes = Arc::new(verification_recipes);
         // One session registry per dispatcher, shared by every
         // `process.session` tool instance.
         let sessions: std::sync::Arc<
             tokio::sync::Mutex<std::collections::HashMap<String, ProcessSession>>,
         > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let tools: Vec<Arc<dyn Tool>> = vec![
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(FsListTool::new(workspace.clone())),
             Arc::new(FsReadTool::new(workspace.clone())),
             Arc::new(ArtifactReadTool::new(workspace.clone())),
@@ -143,12 +174,23 @@ impl BuiltinToolDispatcher {
             Arc::new(CodeDiagnosticsTool::new(workspace.clone())),
             Arc::new(ContextManageTool::new()),
             Arc::new(TaskCompleteTool::new()),
+            // Catalog-cold autonomous progress surface for explicit
+            // long-task runs; ordinary turns discover it through the
+            // catalog instead of paying its schema every round.
+            Arc::new(TaskManageTool::new()),
         ];
+        if let Some(tool) =
+            VerificationRunTool::new(workspace.clone(), verification_recipes.clone())
+        {
+            tools.push(Arc::new(tool));
+        }
         let catalog = tools
             .into_iter()
             .map(|tool| {
                 let spec = tool.spec();
-                let state = if config.always_loaded.contains(&spec.name) {
+                let state = if config.always_loaded.contains(&spec.name)
+                    || spec.name == VERIFY_RUN_TOOL_NAME
+                {
                     ToolLifecycle::Loaded
                 } else {
                     ToolLifecycle::Available
@@ -162,6 +204,7 @@ impl BuiltinToolDispatcher {
                         tool,
                         state,
                         last_used_tick: 0,
+                        persistent_load: false,
                     },
                 )
             })
@@ -172,12 +215,32 @@ impl BuiltinToolDispatcher {
             workspace,
             tick: AtomicU64::new(0),
             generation: AtomicU64::new(0),
+            verification_recipes,
         }
     }
 
-    /// Load a catalog tool into the active set (or re-load a warm/unloaded
-    /// one) so its schema appears on the next model request.
+    pub fn verification_recipes(&self) -> VerificationRecipes {
+        self.verification_recipes.as_ref().clone()
+    }
+
+    /// Host/operator load. The schema remains resident until explicit unload;
+    /// this is a surface source only and never grants execution authority.
     pub fn load(&self, name: &str) -> AgentResult<()> {
+        let tick = self.stamp_now();
+        let mut catalog = self.catalog.write().expect("tool catalog poisoned");
+        let entry = catalog.get_mut(name).ok_or_else(|| {
+            AgentError::Tool(format!("unknown tool: {name} (see capability.search)"))
+        })?;
+        entry.state = ToolLifecycle::Loaded;
+        entry.last_used_tick = tick;
+        entry.persistent_load = true;
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Runtime lease load. An existing persistent source is preserved, but a
+    /// new runtime load is eligible for source reconciliation.
+    fn load_for_lease(&self, name: &str) -> AgentResult<()> {
         let tick = self.stamp_now();
         let mut catalog = self.catalog.write().expect("tool catalog poisoned");
         let entry = catalog.get_mut(name).ok_or_else(|| {
@@ -192,7 +255,7 @@ impl BuiltinToolDispatcher {
     /// Unload a tool from the model surface. Core tools in `always_loaded`
     /// cannot be unloaded.
     pub fn unload(&self, name: &str) -> AgentResult<()> {
-        if self.config.always_loaded.iter().any(|core| core == name) {
+        if self.stays_loaded(name) {
             return Err(AgentError::InvalidRequest(format!(
                 "core tool '{name}' cannot be unloaded"
             )));
@@ -202,6 +265,7 @@ impl BuiltinToolDispatcher {
             AgentError::Tool(format!("unknown tool: {name} (see capability.search)"))
         })?;
         entry.state = ToolLifecycle::Unloaded;
+        entry.persistent_load = false;
         self.generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -269,6 +333,47 @@ impl BuiltinToolDispatcher {
             .sum()
     }
 
+    /// Project runtime-owned leases onto the builtin surface. This is a
+    /// decision-boundary transition, not idle GC: no clock advances and no
+    /// threshold participates. Unrooted optional schemas become Warm while
+    /// remaining discoverable and exactly reloadable.
+    pub fn reconcile_leases(&self, roots: &[String]) -> ToolLeaseReconcileReport {
+        let mut catalog = self.catalog.write().expect("tool catalog poisoned");
+        let mut candidates: Vec<String> = catalog
+            .iter()
+            .filter(|(name, entry)| {
+                entry.state == ToolLifecycle::Loaded && !self.stays_loaded(name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        candidates.sort();
+
+        let mut report = ToolLeaseReconcileReport::default();
+        let mut changed = false;
+        for name in candidates {
+            let persistent = catalog
+                .get(&name)
+                .is_some_and(|entry| entry.persistent_load);
+            if persistent {
+                report.record_retained_persistent();
+                continue;
+            }
+            if roots.iter().any(|root| root == &name) {
+                report.record_retained();
+                continue;
+            }
+            if let Some(entry) = catalog.get_mut(&name) {
+                entry.state = ToolLifecycle::Warm;
+                changed = true;
+                report.record_released(&name);
+            }
+        }
+        if changed {
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
+        report
+    }
+
     /// Age transitions at an explicit runtime safe point: idle tools cool
     /// Loaded -> Warm and then Warm -> Unloaded, so the model surface
     /// tracks recent use. Core tools (`always_loaded`) never age out, and
@@ -304,7 +409,8 @@ impl BuiltinToolDispatcher {
             let mut aging: Vec<(&String, &mut ToolEntry, usize)> = catalog
                 .iter_mut()
                 .filter_map(|(name, entry)| {
-                    if self.config.always_loaded.iter().any(|core| core == name)
+                    if self.stays_loaded(name)
+                        || entry.persistent_load
                         || roots.iter().any(|root| root == name)
                         || entry.state != ToolLifecycle::Loaded
                     {
@@ -326,7 +432,8 @@ impl BuiltinToolDispatcher {
             }
         }
         for (name, entry) in catalog.iter_mut() {
-            if self.config.always_loaded.iter().any(|core| core == name)
+            if self.stays_loaded(name)
+                || entry.persistent_load
                 || roots.iter().any(|root| root == name)
             {
                 continue;
@@ -349,13 +456,13 @@ impl BuiltinToolDispatcher {
         vec![
             ToolSpec {
                 name: CAPABILITY_MANAGE.into(),
-                description: "Catalog ops: search, inspect, load, unload. Search by query and/or role=mutate|verify|read_resource|search|inspect_diff|escape_hatch. Load by exact name from the TOOL CATALOG index.".into(),
+                description: "Tool-catalog ops: search, inspect, load, unload. Search by query and/or role=mutate|verify|read_resource|search|inspect_diff|escape_hatch. Load only an exact tool name from the TOOL CATALOG index; a verify.run recipe_id is an argument value, not a loadable tool.".into(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["op"],
                     "properties": {
                         "op": {"type": "string", "enum": ["search", "inspect", "load", "unload"]},
-                        "name": {"type": "string", "description": "Exact tool name for inspect/load/unload"},
+                        "name": {"type": "string", "description": "Exact tool name for inspect/load/unload; never a verify.run recipe_id"},
                         "query": {"type": "string", "description": "search: token match over name/description/owner/state/risk"},
                         "role": {
                             "type": "string",
@@ -431,6 +538,10 @@ impl ToolDispatcher for BuiltinToolDispatcher {
         Self::gc(self, roots);
     }
 
+    fn reconcile_leases(&self, roots: &[String]) -> ToolLeaseReconcileReport {
+        Self::reconcile_leases(self, roots)
+    }
+
     fn loaded_surface_bytes(&self) -> usize {
         Self::loaded_surface_bytes(self)
     }
@@ -452,7 +563,7 @@ impl ToolDispatcher for BuiltinToolDispatcher {
             .read()
             .expect("tool catalog poisoned")
             .contains_key(name)
-            && !self.config.always_loaded.iter().any(|core| core == name)
+            && !self.stays_loaded(name)
     }
 
     fn catalog(&self) -> Vec<ToolCatalogEntry> {
@@ -463,6 +574,10 @@ impl ToolDispatcher for BuiltinToolDispatcher {
         self.load(name)
     }
 
+    fn load_tool_for_lease(&self, name: &str) -> AgentResult<()> {
+        self.load_for_lease(name)
+    }
+
     fn unload_tool(&self, name: &str) -> AgentResult<()> {
         self.unload(name)
     }
@@ -470,6 +585,10 @@ impl ToolDispatcher for BuiltinToolDispatcher {
     fn inspect_tool(&self, name: &str) -> Option<ToolSpec> {
         let catalog = self.catalog.read().expect("tool catalog poisoned");
         catalog.get(name).map(|entry| entry.tool.spec())
+    }
+
+    fn execution_attribution(&self, call: &agent_contracts::ToolCall) -> ToolExecutionAttribution {
+        self.builtin_execution_attribution(call)
     }
 
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -521,6 +640,106 @@ impl ToolDispatcher for BuiltinToolDispatcher {
                 output
             }
         }
+    }
+}
+
+/// Trusted builtin call-purpose mapping. Only workspace resource identities
+/// are copied; arbitrary command strings, queries and content never enter the
+/// attribution channel. Generic shell/process remain opaque even when their
+/// command happens to run tests; only a host recipe may become Verify.
+impl BuiltinToolDispatcher {
+    fn builtin_execution_attribution(
+        &self,
+        call: &agent_contracts::ToolCall,
+    ) -> ToolExecutionAttribution {
+        if call.name == VERIFY_RUN_TOOL_NAME {
+            let Some(recipe_id) = call
+                .arguments
+                .get("recipe_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+            else {
+                return ToolExecutionAttribution::default();
+            };
+            let Some(recipe) = self.verification_recipes.get(recipe_id) else {
+                return ToolExecutionAttribution::default();
+            };
+            let attribution = ToolExecutionAttribution::bounded(
+                ToolExecutionPurpose::Verify,
+                recipe.cwd.clone().or_else(|| Some(".".into())),
+                recipe.reuse,
+            );
+            if recipe.reuse != VerificationReuse::ExactCurrentWorld {
+                return attribution;
+            }
+            let cwd = recipe
+                .cwd
+                .as_deref()
+                .map(|relative| self.workspace.root().join(relative))
+                .unwrap_or_else(|| self.workspace.root().to_path_buf());
+            let env = recipe
+                .env
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let executable_identity =
+                crate::tools::verification_executable_identity(&recipe.argv[0], &cwd, &env);
+            let Some(identity_material) = self.verification_recipes.identity_material(
+                recipe,
+                &self.workspace.runtime_facts(),
+                self.workspace.root(),
+                &executable_identity,
+            ) else {
+                // Exact equivalence could not be captured completely (for
+                // example an oversized inherited environment). Keep typed
+                // verification, but execute every request.
+                return ToolExecutionAttribution::bounded(
+                    ToolExecutionPurpose::Verify,
+                    recipe.cwd.clone().or_else(|| Some(".".into())),
+                    VerificationReuse::TaskScoped,
+                );
+            };
+            return attribution.with_verification_identity_material(&identity_material);
+        }
+        let purpose = match call.name.as_str() {
+            "fs.read" => ToolExecutionPurpose::Observe,
+            "fs.list" | "search.grep" | "code.symbols" | "code.diagnostics" => {
+                ToolExecutionPurpose::Search
+            }
+            "fs.write" | "edit.replace" | "edit.patch" => ToolExecutionPurpose::Mutate,
+            "shell.exec" | "process.run" | "process.session" => ToolExecutionPurpose::Opaque,
+            CAPABILITY_MANAGE | "context.manage" | "task.complete" => ToolExecutionPurpose::Control,
+            "git.status" | "git.diff" | "artifact.read" => ToolExecutionPurpose::Observe,
+            _ => ToolExecutionPurpose::Unattributed,
+        };
+        let mut targets = Vec::new();
+        if matches!(
+            call.name.as_str(),
+            "fs.read"
+                | "fs.list"
+                | "search.grep"
+                | "fs.write"
+                | "edit.replace"
+                | "git.diff"
+                | "code.symbols"
+                | "code.diagnostics"
+        ) && let Some(path) = call.arguments.get("path").and_then(|value| value.as_str())
+        {
+            targets.push(path.to_string());
+        }
+        if call.name == "edit.patch"
+            && let Some(files) = call
+                .arguments
+                .get("files")
+                .and_then(|value| value.as_array())
+        {
+            targets.extend(files.iter().filter_map(|file| {
+                file.get("path")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            }));
+        }
+        ToolExecutionAttribution::bounded(purpose, targets, VerificationReuse::None)
     }
 }
 
@@ -619,7 +838,7 @@ impl BuiltinToolDispatcher {
         request: ToolExecutionRequest,
         name: String,
     ) -> AgentResult<ToolOutput> {
-        self.load(&name)?;
+        self.load_for_lease(&name)?;
         Ok(ToolOutput {
             call_id: request.call.id,
             tool_name: CAPABILITY_MANAGE.into(),
@@ -627,7 +846,7 @@ impl BuiltinToolDispatcher {
             summary: format!("tool loaded: {name}"),
             model_content: format!("tool loaded: {name} — its schema is now offered to the model"),
             artifact_ref: None,
-            metadata: json!({"tool": name}),
+            metadata: json!({"op": "load", "tool": name}),
         })
     }
 
@@ -644,7 +863,7 @@ impl BuiltinToolDispatcher {
             summary: format!("tool unloaded: {name}"),
             model_content: format!("tool unloaded: {name}"),
             artifact_ref: None,
-            metadata: json!({"tool": name}),
+            metadata: json!({"op": "unload", "tool": name}),
         })
     }
 
@@ -805,6 +1024,10 @@ mod tests {
         );
         assert!(names.contains(&"capability.manage".to_string()));
         assert!(
+            !names.contains(&"task.complete".to_string()),
+            "task lifecycle closure is intent-gated, not an ordinary turn tool: {names:?}"
+        );
+        assert!(
             !names.contains(&"context.gc_hint".to_string()),
             "the meta-tools must be merged into context.manage: {names:?}"
         );
@@ -812,13 +1035,103 @@ mod tests {
             !names.contains(&"capability.search".to_string()),
             "the catalog control tools must be merged into capability.manage: {names:?}"
         );
-        assert!(
-            !names.contains(&"git.status".to_string()),
-            "git tools must not be loaded by default: {names:?}"
+        assert!(names.contains(&"git.status".to_string()));
+        assert!(names.contains(&"git.diff".to_string()));
+        assert!(names.contains(&"fs.write".to_string()));
+    }
+
+    #[tokio::test]
+    async fn discovered_verifier_is_visible_and_host_attributed_before_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn value() -> u8 { 1 }\n").unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let dispatcher = BuiltinToolDispatcher::new(workspace);
+        assert!(surface(&dispatcher).contains(&VERIFY_RUN_TOOL_NAME.to_string()));
+
+        let call = ToolCall {
+            id: "verify-1".into(),
+            name: VERIFY_RUN_TOOL_NAME.into(),
+            arguments: json!({"recipe_id": "rust.compile-tests:src/lib.rs"}),
+        };
+        let attribution = dispatcher.execution_attribution(&call);
+        assert_eq!(attribution.purpose, ToolExecutionPurpose::Verify);
+        assert_eq!(
+            attribution.verification_reuse,
+            VerificationReuse::ExactCurrentWorld
         );
-        assert!(
-            !names.contains(&"fs.write".to_string()),
-            "write tools must be loaded on demand: {names:?}"
+        assert!(attribution.exact_verification_identity().is_some());
+        assert_eq!(
+            attribution,
+            dispatcher.execution_attribution(&call),
+            "stable host/executable world must produce one exact identity"
+        );
+        std::fs::write(dir.path().join("src/lib.rs"), "fn value() -> u8 { 2 }\n").unwrap();
+        assert_ne!(
+            attribution.verification_identity,
+            dispatcher
+                .execution_attribution(&call)
+                .verification_identity,
+            "an exact recipe input changed outside Runtime must invalidate PASS"
+        );
+
+        let opaque = dispatcher.execution_attribution(&ToolCall {
+            id: "opaque".into(),
+            name: "process.run".into(),
+            arguments: json!({"argv": ["rustc", "--test", "src/lib.rs"]}),
+        });
+        assert_eq!(opaque.purpose, ToolExecutionPurpose::Opaque);
+        assert_eq!(opaque.verification_reuse, VerificationReuse::None);
+    }
+
+    #[tokio::test]
+    async fn general_project_test_recipe_is_typed_but_not_exactly_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let dispatcher = BuiltinToolDispatcher::new(workspace);
+        let attribution = dispatcher.execution_attribution(&ToolCall {
+            id: "verify-cargo".into(),
+            name: VERIFY_RUN_TOOL_NAME.into(),
+            arguments: json!({"recipe_id": "rust.workspace"}),
+        });
+        assert_eq!(attribution.purpose, ToolExecutionPurpose::Verify);
+        assert_eq!(
+            attribution.verification_reuse,
+            VerificationReuse::TaskScoped
+        );
+        assert!(attribution.exact_verification_identity().is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_verification_identity_changes_with_host_recipe_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let build = |revision: &str| {
+            let recipe = crate::VerificationRecipe::new(
+                "project.check",
+                "Check project",
+                revision,
+                vec!["rustc".into(), "--version".into()],
+            )
+            .unwrap()
+            .with_exact_current_world_reuse();
+            BuiltinToolDispatcher::with_config_and_verification_recipes(
+                workspace.clone(),
+                ToolLifecycleConfig::default(),
+                VerificationRecipes::new(vec![recipe]).unwrap(),
+            )
+        };
+        let call = ToolCall {
+            id: "verify".into(),
+            name: VERIFY_RUN_TOOL_NAME.into(),
+            arguments: json!({"recipe_id": "project.check"}),
+        };
+        let first = build("v1").execution_attribution(&call);
+        let second = build("v2").execution_attribution(&call);
+        assert_ne!(
+            first.verification_identity, second.verification_identity,
+            "a host recipe change must invalidate prior exact PASS"
         );
     }
 
@@ -867,6 +1180,20 @@ mod tests {
             query.contains("path") && query.contains("entity"),
             "query key stays `query` and names the indexed fields: {query}"
         );
+        assert_eq!(
+            spec.input_schema["properties"]["kind"]["enum"]
+                .as_array()
+                .map(Vec::len),
+            Some(10),
+            "kind must expose its exact bounded vocabulary"
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["scope"]["enum"]
+                .as_array()
+                .map(Vec::len),
+            Some(5),
+            "scope must expose its exact bounded vocabulary"
+        );
         let ops = spec.input_schema["properties"]["op"]["enum"]
             .as_array()
             .expect("op enum");
@@ -882,6 +1209,35 @@ mod tests {
             spec.description.contains("context://run/"),
             "schema names the catalog uri the mutation ops consume: {}",
             spec.description
+        );
+    }
+
+    #[tokio::test]
+    async fn model_surface_uses_one_artifact_paging_primitive() {
+        let dispatcher = dispatcher().await;
+        for name in ["fs.list", "search.grep", "code.symbols"] {
+            let spec = dispatcher.inspect_tool(name).expect("builtin tool spec");
+            assert!(
+                spec.input_schema["properties"].get("cursor").is_none(),
+                "{name} must not invite the model to invent an opaque cursor"
+            );
+            assert!(
+                spec.description.contains("artifact.read"),
+                "{name} must route overflow through the shared artifact reader"
+            );
+        }
+        let artifact = dispatcher
+            .inspect_tool("artifact.read")
+            .expect("artifact.read spec");
+        assert!(
+            artifact.input_schema["properties"]
+                .get("reference")
+                .is_some()
+        );
+        assert!(
+            artifact.input_schema["properties"]
+                .get("start_line")
+                .is_some()
         );
     }
 
@@ -1012,6 +1368,52 @@ mod tests {
             agent_contracts::EngineQuery::FetchExternal { .. }
         ));
 
+        // Union-shaped tool arguments are dispatched by `op`: malformed
+        // placeholders for fields that fetch does not consume cannot poison
+        // an otherwise valid fetch.
+        let outcome = dispatcher
+            .execute(request(
+                "context.manage",
+                json!({
+                    "op": "fetch",
+                    "item_id": item_id,
+                    "kind": "",
+                    "scope": "",
+                    "task_id": "",
+                    "fact": "",
+                    "label": ""
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            query(outcome),
+            agent_contracts::EngineQuery::FetchExternal { .. }
+        ));
+
+        // The schema advertises canonical names, while the executor also
+        // accepts their stable lowercase wire spellings.
+        let outcome = dispatcher
+            .execute(request(
+                "context.manage",
+                json!({
+                    "op": "search",
+                    "query": "AuthService",
+                    "kind": "constraint",
+                    "scope": "task"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            query(outcome),
+            agent_contracts::EngineQuery::SearchExternal {
+                kind: Some(agent_contracts::ContextKind::Constraint),
+                scope: Some(agent_contracts::ContextScope::Task),
+                ..
+            }
+        ));
+
         let outcome = dispatcher
             .execute(request(
                 "context.manage",
@@ -1039,6 +1441,22 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("missing 'query'"), "{error}");
         let error = dispatcher
+            .execute(request(
+                "context.manage",
+                json!({"op": "search", "query": "AuthService", "kind": "Task"}),
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid 'kind'"), "{error}");
+        let error = dispatcher
+            .execute(request(
+                "context.manage",
+                json!({"op": "fetch", "item_id": "", "kind": "Constraint"}),
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing 'item_id'"), "{error}");
+        let error = dispatcher
             .execute(request("context.manage", json!({"op": "gc_hint"})))
             .await
             .unwrap_err();
@@ -1059,17 +1477,24 @@ mod tests {
     #[tokio::test]
     async fn load_and_unload_change_the_model_surface() {
         let dispatcher = dispatcher().await;
-        assert!(!surface(&dispatcher).contains(&"git.status".to_string()));
+        assert!(!surface(&dispatcher).contains(&"edit.replace".to_string()));
+        assert!(!surface(&dispatcher).contains(&"task.complete".to_string()));
 
-        dispatcher.load("git.status").unwrap();
-        assert!(surface(&dispatcher).contains(&"git.status".to_string()));
+        dispatcher.load("edit.replace").unwrap();
+        assert!(surface(&dispatcher).contains(&"edit.replace".to_string()));
 
-        dispatcher.unload("git.status").unwrap();
-        assert!(!surface(&dispatcher).contains(&"git.status".to_string()));
+        dispatcher.load("task.complete").unwrap();
+        assert!(surface(&dispatcher).contains(&"task.complete".to_string()));
+
+        dispatcher.unload("edit.replace").unwrap();
+        assert!(!surface(&dispatcher).contains(&"edit.replace".to_string()));
+        dispatcher.unload("task.complete").unwrap();
+        assert!(!surface(&dispatcher).contains(&"task.complete".to_string()));
 
         // Core tools cannot be unloaded.
         let core = dispatcher.unload("fs.read");
         assert!(core.is_err(), "core tools must stay loaded");
+        assert!(dispatcher.unload("git.status").is_err());
     }
 
     #[tokio::test]
@@ -1082,7 +1507,9 @@ mod tests {
         );
         assert!(!dispatcher.may_omit_from_round(CAPABILITY_MANAGE));
         assert!(!dispatcher.may_omit_from_round("unknown.tool"));
-        assert!(dispatcher.may_omit_from_round("git.status"));
+        assert!(!dispatcher.may_omit_from_round("git.status"));
+        assert!(dispatcher.may_omit_from_round("edit.replace"));
+        assert!(dispatcher.may_omit_from_round("task.complete"));
     }
 
     #[tokio::test]
@@ -1093,15 +1520,18 @@ mod tests {
         let writer_finished = finished.clone();
         let writer = std::thread::spawn(move || {
             for _ in 0..2_000 {
-                writer_dispatcher.load("git.status").unwrap();
-                writer_dispatcher.unload("git.status").unwrap();
+                writer_dispatcher.load("edit.replace").unwrap();
+                writer_dispatcher.unload("edit.replace").unwrap();
             }
             writer_finished.store(true, Ordering::Release);
         });
 
         while !finished.load(Ordering::Acquire) {
             let snapshot = dispatcher.surface();
-            let loaded = snapshot.specs.iter().any(|spec| spec.name == "git.status");
+            let loaded = snapshot
+                .specs
+                .iter()
+                .any(|spec| spec.name == "edit.replace");
             assert_eq!(
                 loaded,
                 snapshot.generation % 2 == 1,
@@ -1130,7 +1560,7 @@ mod tests {
                 surface_low_watermark_bytes: 0,
             },
         );
-        dispatcher.load("fs.write").unwrap();
+        dispatcher.load_for_lease("fs.write").unwrap();
         assert!(surface(&dispatcher).contains(&"fs.write".to_string()));
         // specs() is pure: reading the surface must not age the lifecycle.
         for _ in 0..3 {
@@ -1164,13 +1594,98 @@ mod tests {
                 surface_low_watermark_bytes: 500_000,
             },
         );
-        dispatcher.load("fs.write").unwrap();
+        dispatcher.load_for_lease("fs.write").unwrap();
         for _ in 0..10 {
             dispatcher.gc(&[]);
         }
         assert!(
             surface(&dispatcher).contains(&"fs.write".to_string()),
             "低于高水位不得冷却可选工具：保留成本低于一次重载轮"
+        );
+    }
+
+    #[tokio::test]
+    async fn decision_lease_reconcile_cools_only_unrooted_optionals() {
+        let (workspace, _dir) = open_workspace().await;
+        let dispatcher = BuiltinToolDispatcher::with_config(
+            workspace,
+            ToolLifecycleConfig {
+                always_loaded: vec!["fs.read".into()],
+                idle_to_warm_ticks: 100,
+                warm_to_unload_ticks: 200,
+                // Prove that lease reconciliation is independent of byte
+                // pressure and the idle clock.
+                surface_soft_high_bytes: 1_000_000,
+                surface_low_watermark_bytes: 500_000,
+            },
+        );
+        dispatcher.load_for_lease("fs.write").unwrap();
+        dispatcher.load_for_lease("git.status").unwrap();
+
+        let report = dispatcher.reconcile_leases(&["fs.write".to_string()]);
+        assert_eq!(report.examined_loaded_optional, 2);
+        assert_eq!(report.retained_by_root, 1);
+        assert_eq!(report.released_to_warm, 1);
+        assert_eq!(report.released_tools, vec!["git.status"]);
+        let rows = dispatcher.catalog();
+        let state = |name: &str| {
+            rows.iter()
+                .find(|row| row.name == name)
+                .map(|row| row.state)
+                .unwrap()
+        };
+        assert_eq!(state("fs.read"), ToolLifecycle::Loaded);
+        assert_eq!(state("fs.write"), ToolLifecycle::Loaded);
+        assert_eq!(state("git.status"), ToolLifecycle::Warm);
+
+        dispatcher.load_for_lease("git.status").unwrap();
+        assert!(
+            dispatcher
+                .specs()
+                .iter()
+                .any(|spec| spec.name == "git.status"),
+            "a released lease must remain exactly reloadable"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_load_source_survives_reconcile_and_pressure_until_unload() {
+        let (workspace, _dir) = open_workspace().await;
+        let dispatcher = BuiltinToolDispatcher::with_config(
+            workspace,
+            ToolLifecycleConfig {
+                always_loaded: vec!["fs.read".into()],
+                idle_to_warm_ticks: 1,
+                warm_to_unload_ticks: 2,
+                surface_soft_high_bytes: 0,
+                surface_low_watermark_bytes: 0,
+            },
+        );
+        ToolDispatcher::load_tool(&dispatcher, "git.status").unwrap();
+        dispatcher.load_for_lease("fs.write").unwrap();
+
+        let report = dispatcher.reconcile_leases(&[]);
+        assert_eq!(report.examined_loaded_optional, 2);
+        assert_eq!(report.retained_by_persistent_source, 1);
+        assert_eq!(report.released_to_warm, 1);
+        for _ in 0..4 {
+            dispatcher.gc(&[]);
+        }
+        let rows = dispatcher.catalog();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.name == "git.status")
+                .map(|row| row.state),
+            Some(ToolLifecycle::Loaded)
+        );
+        ToolDispatcher::unload_tool(&dispatcher, "git.status").unwrap();
+        assert_eq!(
+            dispatcher
+                .catalog()
+                .iter()
+                .find(|row| row.name == "git.status")
+                .map(|row| row.state),
+            Some(ToolLifecycle::Unloaded)
         );
     }
 
@@ -1214,8 +1729,8 @@ mod tests {
                 surface_low_watermark_bytes: watermark,
             },
         );
-        dispatcher.load("fs.write").unwrap();
-        dispatcher.load("git.status").unwrap();
+        dispatcher.load_for_lease("fs.write").unwrap();
+        dispatcher.load_for_lease("git.status").unwrap();
         for _ in 0..4 {
             dispatcher.gc(&[]);
         }
@@ -1250,8 +1765,8 @@ mod tests {
                 surface_low_watermark_bytes: 0,
             },
         );
-        dispatcher.load("fs.write").unwrap();
-        dispatcher.load("git.status").unwrap();
+        dispatcher.load_for_lease("fs.write").unwrap();
+        dispatcher.load_for_lease("git.status").unwrap();
         assert!(surface(&dispatcher).contains(&"git.status".to_string()));
 
         // The active task requires fs.write but not git.status. Idle GC
@@ -1306,13 +1821,20 @@ mod tests {
         let load = dispatcher
             .execute(request(
                 CAPABILITY_MANAGE,
-                json!({"op": "load", "name": "git.status"}),
+                json!({"op": "load", "name": "edit.replace"}),
             ))
             .await
             .unwrap();
         let load = value(load);
         assert!(load.ok);
-        assert!(surface(&dispatcher).contains(&"git.status".to_string()));
+        assert!(surface(&dispatcher).contains(&"edit.replace".to_string()));
+        let report = dispatcher.reconcile_leases(&[]);
+        assert_eq!(report.retained_by_persistent_source, 0);
+        assert_eq!(report.released_to_warm, 1);
+        assert!(
+            !surface(&dispatcher).contains(&"edit.replace".to_string()),
+            "model capability.manage load must remain a transient runtime lease"
+        );
 
         // Unknown ops are rejected.
         let bad = dispatcher
@@ -1706,5 +2228,29 @@ mod tests {
                 .contains("must not receive a Core-issued effect context"),
             "a ReadOnly git spawn must not be laundered through a process identity: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn builtin_attribution_copies_only_trusted_resource_identities() {
+        let dispatcher = dispatcher().await;
+        let read = ToolCall {
+            id: "read-1".into(),
+            name: "fs.read".into(),
+            arguments: json!({"path": r"src\lib.rs", "offset": 10, "needle": "secret"}),
+        };
+        let attribution = dispatcher.execution_attribution(&read);
+        assert_eq!(attribution.purpose, ToolExecutionPurpose::Observe);
+        assert_eq!(attribution.targets, vec!["src/lib.rs"]);
+        assert_eq!(attribution.verification_reuse, VerificationReuse::None);
+
+        let shell = ToolCall {
+            id: "shell-1".into(),
+            name: "shell.exec".into(),
+            arguments: json!({"command": "cargo test"}),
+        };
+        let shell_attribution = dispatcher.execution_attribution(&shell);
+        assert_eq!(shell_attribution.purpose, ToolExecutionPurpose::Opaque);
+        assert!(shell_attribution.targets.is_empty());
+        assert!(!shell_attribution.reusable_verification());
     }
 }

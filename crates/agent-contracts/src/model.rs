@@ -195,6 +195,36 @@ impl TurnFrame {
     /// in-flight last group. The full frame stays untouched for audit
     /// and turn-end persistence; only the wire projection shrinks.
     pub fn checkpoint_tail(&self, keep: usize) -> (TurnFrame, usize) {
+        let Some((retain_from, compacted)) = self.checkpoint_boundary(keep) else {
+            return (self.clone(), 0);
+        };
+        let mut tail = TurnFrame::new(self.user_message.clone());
+        tail.steps = self.steps[retain_from..].to_vec();
+        (tail, compacted)
+    }
+
+    /// Model-facing checkpoint projection: the same retained protocol tail
+    /// plus a tiny receipt index for persistable results that fell out of
+    /// the tail. Receipts contain no tool body and do not claim currentness;
+    /// they only prevent the generic count note from erasing which checks
+    /// already completed.
+    pub fn checkpoint(&self, keep: usize) -> (TurnFrame, TurnCheckpoint) {
+        let Some((retain_from, compacted_exchanges)) = self.checkpoint_boundary(keep) else {
+            return (self.clone(), TurnCheckpoint::default());
+        };
+        let mut tail = TurnFrame::new(self.user_message.clone());
+        tail.steps = self.steps[retain_from..].to_vec();
+        let receipts = checkpoint_receipts(&self.steps[..retain_from]);
+        (
+            tail,
+            TurnCheckpoint {
+                compacted_exchanges,
+                receipts,
+            },
+        )
+    }
+
+    fn checkpoint_boundary(&self, keep: usize) -> Option<(usize, usize)> {
         let group_starts: Vec<usize> = self
             .steps
             .iter()
@@ -204,21 +234,26 @@ impl TurnFrame {
             .collect();
         let total = group_starts.len();
         if total <= keep {
-            return (self.clone(), 0);
+            return None;
         }
-        let retain_from = group_starts[total - keep];
-        let mut tail = TurnFrame::new(self.user_message.clone());
-        tail.steps = self.steps[retain_from..].to_vec();
-        (tail, total - keep)
+        let retain_from = if keep == 0 {
+            self.steps.len()
+        } else {
+            group_starts[total - keep]
+        };
+        Some((retain_from, total - keep))
     }
 
     /// The wire view for one model request: the retained tail plus the
     /// bounded checkpoint note when older exchanges were compacted.
     pub fn checkpointed_messages(&self, keep: usize) -> Vec<ModelMessage> {
-        let (tail, compacted) = self.checkpoint_tail(keep);
+        let (tail, checkpoint) = self.checkpoint(keep);
         let mut messages = tail.messages();
-        if compacted > 0 {
-            messages.insert(1, ModelMessage::user(turn_checkpoint_note(compacted)));
+        if checkpoint.compacted_exchanges > 0 {
+            messages.insert(
+                1,
+                ModelMessage::user(turn_checkpoint_note_with_receipts(&checkpoint)),
+            );
         }
         messages
     }
@@ -251,16 +286,108 @@ impl TurnFrame {
 /// TASK PROGRESS, artifacts, and the run journal.
 pub const TURN_FRAME_KEEP_EXCHANGES: usize = 6;
 
+/// Maximum persistable outcome receipts retained in one checkpoint note.
+/// This is an index, not a transcript: tool bodies and arguments stay out.
+pub const MAX_TURN_CHECKPOINT_RECEIPTS: usize = 6;
+/// Hard cap for one rendered receipt, including tool name and status.
+pub const MAX_TURN_CHECKPOINT_RECEIPT_CHARS: usize = 96;
+const MAX_TURN_CHECKPOINT_TOOL_NAME_CHARS: usize = 48;
+
 /// PROTO-EVID-01：单轮最多回注的协议正文行数。与运行时当轮缓存的
 /// 容量一致；回注内容只进 user-role 焦点层，不进 Context / 不持久。
 pub const MAX_PROTOCOL_BODY_ROWS: usize = 4;
 
-/// The bounded deterministic checkpoint note injected into the wire
-/// view when older exchanges are compacted away.
+/// The original count-only checkpoint note. Kept as a stable public helper
+/// for callers that do not carry a [`TurnCheckpoint`] receipt index.
 pub fn turn_checkpoint_note(compacted_exchanges: usize) -> String {
-    format!(
-        "TURN CHECKPOINT: {compacted_exchanges} earlier tool exchange(s) were compacted from this protocol view. Their reliable facts are reflected in TASK PROGRESS and workspace state; the full audit trail remains in the run journal. Do not assume the compacted exchanges are still pending."
-    )
+    turn_checkpoint_note_with_receipts(&TurnCheckpoint {
+        compacted_exchanges,
+        receipts: Vec::new(),
+    })
+}
+
+/// The bounded deterministic checkpoint note injected into the wire view
+/// when older exchanges are compacted away. Rendering re-bounds every row
+/// so older or externally deserialized checkpoints cannot inflate a prompt.
+pub fn turn_checkpoint_note_with_receipts(checkpoint: &TurnCheckpoint) -> String {
+    let mut note = format!(
+        "TURN CHECKPOINT: {} earlier tool exchange(s) were compacted from this protocol view. Their reliable current facts are reflected in TASK PROGRESS; the full audit trail remains in the run journal. Do not assume the compacted exchanges are still pending.",
+        checkpoint.compacted_exchanges
+    );
+    if !checkpoint.receipts.is_empty() {
+        note.push_str("\nRECENT COMPACTED RECEIPTS (outcomes only; not bodies or currentness):");
+        for receipt in checkpoint
+            .receipts
+            .iter()
+            .take(MAX_TURN_CHECKPOINT_RECEIPTS)
+        {
+            note.push_str("\n- ");
+            note.push_str(&bound_checkpoint_receipt(receipt));
+        }
+    }
+    note
+}
+
+fn checkpoint_receipts(compacted_steps: &[TurnFrameStep]) -> Vec<String> {
+    let mut newest_first = Vec::new();
+    for step in compacted_steps.iter().rev() {
+        let TurnFrameStep::ToolResult {
+            output,
+            disposition: ToolResultDisposition::PersistObservation,
+            ..
+        } = step
+        else {
+            continue;
+        };
+        let status = if output.ok { "ok" } else { "failed" };
+        let tool_name = output
+            .tool_name
+            .chars()
+            .take(MAX_TURN_CHECKPOINT_TOOL_NAME_CHARS)
+            .collect::<String>();
+        let raw = format!("{tool_name} {status}: {}", output.summary);
+        let receipt = bound_checkpoint_receipt(&raw);
+        if !newest_first.contains(&receipt) {
+            newest_first.push(receipt);
+            if newest_first.len() >= MAX_TURN_CHECKPOINT_RECEIPTS {
+                break;
+            }
+        }
+    }
+    newest_first.reverse();
+    newest_first
+}
+
+fn bound_checkpoint_receipt(receipt: &str) -> String {
+    let mut bounded = String::with_capacity(MAX_TURN_CHECKPOINT_RECEIPT_CHARS);
+    let mut chars = 0;
+    let mut pending_space = false;
+    let mut truncated = false;
+    for ch in receipt.chars() {
+        if ch.is_whitespace() {
+            pending_space = chars > 0;
+            continue;
+        }
+        let needed = usize::from(pending_space) + 1;
+        if chars + needed > MAX_TURN_CHECKPOINT_RECEIPT_CHARS {
+            truncated = true;
+            break;
+        }
+        if pending_space {
+            bounded.push(' ');
+            chars += 1;
+            pending_space = false;
+        }
+        bounded.push(ch);
+        chars += 1;
+    }
+    if truncated {
+        if chars == MAX_TURN_CHECKPOINT_RECEIPT_CHARS {
+            bounded.pop();
+        }
+        bounded.push('…');
+    }
+    bounded
 }
 
 /// The five-layer model input assembled by the runtime for one model request:
@@ -293,9 +420,31 @@ pub struct ModelInput {
 /// How many completed exchanges a model input's turn frame compacted
 /// away. `Default` is meaningful: an absent checkpoint is the
 /// nothing-compacted case for pre-checkpoint traces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TurnCheckpoint {
     pub compacted_exchanges: usize,
+    /// Latest persistable outcomes from the compacted prefix. Each row is
+    /// bounded and contains no raw tool body or arguments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipts: Vec<String>,
+}
+
+/// Schema-free checkpoint accounting carried by `ModelStarted`. The event
+/// records only counts; receipt text remains in the ephemeral model input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TurnCheckpointStats {
+    pub compacted_exchanges: u64,
+    pub receipt_count: u64,
+}
+
+impl From<&TurnCheckpoint> for TurnCheckpointStats {
+    fn from(checkpoint: &TurnCheckpoint) -> Self {
+        Self {
+            compacted_exchanges: checkpoint.compacted_exchanges as u64,
+            receipt_count: checkpoint.receipts.len().min(MAX_TURN_CHECKPOINT_RECEIPTS) as u64,
+        }
+    }
 }
 
 impl ModelInput {
@@ -303,12 +452,12 @@ impl ModelInput {
     /// checkpoint note when older exchanges were compacted.
     pub fn turn_frame_wire_messages(&self) -> Vec<ModelMessage> {
         let mut messages = self.turn_frame.messages();
-        if let Some(checkpoint) = self.turn_checkpoint
+        if let Some(checkpoint) = self.turn_checkpoint.as_ref()
             && checkpoint.compacted_exchanges > 0
         {
             messages.insert(
                 1,
-                ModelMessage::user(turn_checkpoint_note(checkpoint.compacted_exchanges)),
+                ModelMessage::user(turn_checkpoint_note_with_receipts(checkpoint)),
             );
         }
         messages
@@ -464,6 +613,11 @@ pub struct ModelOutput {
     #[serde(default)]
     pub usage: ModelUsage,
 }
+
+/// Hard safety bound for one provider-produced parallel tool batch. This
+/// limits the actor queue, TurnFrame and result-delivery root set; it is not a
+/// convergence target and never tells the model how many calls it should use.
+pub const MAX_MODEL_TOOL_CALLS_PER_ROUND: usize = 32;
 
 impl ModelOutput {
     pub fn completion_validity(&self) -> ModelCompletionValidity {
@@ -653,6 +807,89 @@ mod tests {
         let (same, compacted) = framed_turn(6).checkpoint_tail(6);
         assert_eq!(compacted, 0);
         assert_eq!(same.steps.len(), 12);
+
+        // `keep = 0` is a valid fully compacted wire projection.
+        let (empty, compacted) = framed_turn(2).checkpoint_tail(0);
+        assert_eq!(compacted, 2);
+        assert!(empty.steps.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_receipts_are_bounded_and_exclude_transient_or_raw_data() {
+        let mut turn = TurnFrame::new("finish the task");
+        for index in 0..9 {
+            let call_id = format!("call-{index}");
+            let tool_name = format!("tool.check_{index}");
+            turn.push_tool_calls(vec![ToolCall {
+                id: call_id.clone(),
+                name: tool_name.clone(),
+                arguments: json!({"secret_argument": format!("path-secret-{index}")}),
+            }]);
+            let disposition = if index == 2 {
+                ToolResultDisposition::TransientNoPersist
+            } else {
+                ToolResultDisposition::PersistObservation
+            };
+            turn.push_tool_result_with(
+                ToolOutput {
+                    call_id,
+                    tool_name,
+                    ok: index != 6,
+                    summary: if index == 7 {
+                        format!("checked {index} {}", "x".repeat(200))
+                    } else {
+                        format!("checked\nitem {index}")
+                    },
+                    model_content: format!("raw-body-secret-{index}"),
+                    artifact_ref: None,
+                    metadata: json!({}),
+                },
+                None,
+                disposition,
+            );
+        }
+
+        let (tail, checkpoint) = turn.checkpoint(1);
+        assert_eq!(checkpoint.compacted_exchanges, 8);
+        assert_eq!(tail.steps.len(), 2);
+        assert_eq!(checkpoint.receipts.len(), MAX_TURN_CHECKPOINT_RECEIPTS);
+        assert!(checkpoint.receipts[0].starts_with("tool.check_1 ok:"));
+        assert!(checkpoint.receipts[5].starts_with("tool.check_7 ok:"));
+        assert!(
+            checkpoint
+                .receipts
+                .iter()
+                .any(|receipt| receipt.starts_with("tool.check_6 failed:"))
+        );
+        assert!(
+            checkpoint
+                .receipts
+                .iter()
+                .all(|receipt| receipt.chars().count() <= MAX_TURN_CHECKPOINT_RECEIPT_CHARS)
+        );
+
+        let note = turn_checkpoint_note_with_receipts(&checkpoint);
+        assert!(!note.contains("tool.check_2"), "transient reads stay out");
+        assert!(!note.contains("raw-body-secret"), "tool bodies stay out");
+        assert!(!note.contains("path-secret"), "tool arguments stay out");
+        assert!(!note.contains("\nitem"), "receipt rows are single-line");
+    }
+
+    #[test]
+    fn checkpoint_note_rebounds_deserialized_receipts() {
+        let checkpoint = TurnCheckpoint {
+            compacted_exchanges: 99,
+            receipts: (0..10)
+                .map(|index| format!("row {index}\n{}", "x".repeat(200)))
+                .collect(),
+        };
+        let note = turn_checkpoint_note_with_receipts(&checkpoint);
+        let rows: Vec<&str> = note.lines().filter(|line| line.starts_with("- ")).collect();
+        assert_eq!(rows.len(), MAX_TURN_CHECKPOINT_RECEIPTS);
+        assert!(rows.iter().all(|row| {
+            row.trim_start_matches("- ").chars().count() <= MAX_TURN_CHECKPOINT_RECEIPT_CHARS
+        }));
+        assert_eq!(turn_checkpoint_note(3).lines().count(), 1);
     }
 
     #[test]
@@ -709,6 +946,7 @@ mod tests {
             tool_schemas: Vec::new(),
             turn_checkpoint: Some(TurnCheckpoint {
                 compacted_exchanges: compacted,
+                receipts: Vec::new(),
             }),
         };
         let messages = input.turn_frame_wire_messages();
@@ -741,6 +979,12 @@ mod tests {
         assert_eq!(parsed.role, ModelRole::User);
         assert!(parsed.tool_calls.is_empty());
         assert!(parsed.tool_call_id.is_none());
+
+        // Checkpoints written before receipt indexes existed remain valid.
+        let checkpoint: TurnCheckpoint =
+            serde_json::from_str(r#"{"compacted_exchanges":3}"#).unwrap();
+        assert_eq!(checkpoint.compacted_exchanges, 3);
+        assert!(checkpoint.receipts.is_empty());
     }
 
     #[test]

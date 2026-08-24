@@ -10,7 +10,7 @@
 
 use agent_contracts::{
     CAPABILITY_MANAGE, CONTEXT_MANAGE, ContextItemId, FS_READ_MOTIVE_KEY, FrontierDelta,
-    FsReadMotive, RuntimeEvent, RuntimeEventEnvelope,
+    FsReadMotive, MutationFootprint, RuntimeEvent, RuntimeEventEnvelope, ToolSurfaceOrigin,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -67,12 +67,70 @@ pub struct RunMetrics {
     pub frontier_advances: u64,
     /// 同版本重复已知证据的调用数。
     pub redundant_evidence_calls: u64,
+    /// Unknown/失效后以相同参数和结果恢复 currentness、但没有增加新
+    /// 语义证据的调用数。
+    pub reconfirmed_evidence_calls: u64,
     /// 无前沿推进动作的连击峰值（advisory 阈值为 5）。
     pub frontier_no_advance_peak: u64,
     /// 因 world revision 推进而失效的前沿证据条数。
     pub evidence_invalidations: u64,
-    /// PROTO-EVID-02b：当轮正文缓存账目（事件增量求和）。hit/eligible
-    /// 给出可独立验证的命中率；invalidated/oversize 解释缓存为何丢。
+    /// CONV-OBS-02：任务结果前沿的影子账本。现有 Evidence
+    /// Frontier 回答“是否获得了新的 current 证据”；这一组指标
+    /// 只回答“任务结果是否前进”，不参与实时决策。
+    /// 前进事件是成功的 Known 变更结果、显式 typed verification
+    /// 结果或已提交的 `TaskCompleted`。同一工具结果可以同时是变更和
+    /// verification，但 `outcome_frontier_advances` 只计一次。
+    pub outcome_frontier_advances: u64,
+    pub outcome_mutation_results: u64,
+    pub outcome_verification_results: u64,
+    pub outcome_task_completions: u64,
+    /// 既不是结果前进，也没有 Unknown 变更失效的工具结果。
+    pub evidence_only_results: u64,
+    /// 可能改写 workspace 但缺少资源触达集的结果。与 typed
+    /// verification 正交：必要验证也可能是 Unknown，此时两者都计。
+    pub unknown_invalidation_results: u64,
+    /// 单个 user directive 内，连续多少个工具结果没有推进任务结果。
+    pub max_results_without_outcome_advance: u64,
+    /// TOOL-SURFACE-OBS-01：来自有界 `ToolSurfacePlanReport.selected`
+    /// 的 optional catalog 暴露/使用账本。这些字段名明确指向
+    /// reported rows；如果 report 截断，不会冒充完整 surface。
+    pub catalog_optional_surface_rounds: u64,
+    pub catalog_optional_reported_rows: u64,
+    pub catalog_optional_reported_schema_tokens: u64,
+    pub catalog_optional_requested_calls: u64,
+    pub catalog_optional_unused_reported_rows: u64,
+    pub catalog_optional_rounds_without_request: u64,
+    pub surface_report_truncated_rounds: u64,
+    /// FLOW-LEASE-01: exact body-free lifecycle totals from
+    /// `ToolLeasesReconciled`. The released-name sample may truncate, but
+    /// these counters do not.
+    pub tool_lease_reconcile_events: u64,
+    pub tool_lease_directive_boundaries: u64,
+    pub tool_lease_decision_boundaries: u64,
+    pub tool_lease_examined_optional: u64,
+    pub tool_lease_retained_by_root: u64,
+    pub tool_lease_retained_by_persistent_source: u64,
+    pub tool_lease_released_to_warm: u64,
+    pub tool_lease_report_names_truncated: u64,
+    /// FLOW-ACTION-01: body-free actor batch accounting. Unlike
+    /// `ExecutionFrontier`, these totals include transient results and
+    /// no-dispatch refusals.
+    pub action_batches_settled: u64,
+    pub action_requested: u64,
+    pub action_terminal: u64,
+    pub action_spawned: u64,
+    pub action_refused: u64,
+    pub action_reused: u64,
+    pub action_persist_observation: u64,
+    pub action_transient_no_persist: u64,
+    pub action_access_event_only: u64,
+    pub action_outcome_advances: u64,
+    pub action_no_outcome_results: u64,
+    pub action_missing_terminal: u64,
+    pub action_unexpected_terminal: u64,
+    /// PROTO-EVID-02b：当轮正文恢复账目（事件增量求和）。hit/eligible
+    /// 给出真实 checkpoint demand 的恢复率；invalidated/oversize 解释
+    /// 缓存为何丢。
     pub protocol_cache_eligible: u64,
     pub protocol_cache_hit: u64,
     pub protocol_cache_miss: u64,
@@ -87,6 +145,18 @@ pub struct RunMetrics {
     pub obligation_attempted: u64,
     pub obligation_precondition_changes: u64,
     pub obligation_resolved: u64,
+    /// Trusted speculative-path fact lifecycle. `reused` is the number of
+    /// filesystem/search dispatches avoided after a live workspace check;
+    /// it is intentionally separate from failed tool outputs.
+    pub negative_fact_recorded: u64,
+    pub negative_fact_reused: u64,
+    pub negative_fact_invalidated: u64,
+    pub negative_fact_promoted: u64,
+    pub negative_fact_resolved: u64,
+    /// Exact verification PASS receipts and no-dispatch reuses. These stay
+    /// separate from model-requested verification results and tool starts.
+    pub verification_pass_recorded: u64,
+    pub verification_pass_reused: u64,
     /// 同血统第 2 次及以后的失败调用数——真正可避免的浪费
     /// （第一次失败是诚实拒绝，不是优化目标）。
     pub avoidable_failure_calls: u64,
@@ -258,6 +328,13 @@ pub struct RunMetrics {
     pub prompt_tool_schema_tokens: u64,
     /// Sum of `PromptLayerCosts.tool_catalog_index_tokens` across rounds.
     pub prompt_tool_catalog_index_tokens: u64,
+    /// Model rounds whose bounded TurnFrame projection compacted at least
+    /// one complete tool exchange.
+    pub turn_checkpoint_rounds: u64,
+    /// Sum of complete exchanges omitted from model-facing TurnFrames.
+    pub turn_checkpoint_compacted_exchanges: u64,
+    /// Sum of bounded, body-free outcome receipts rendered with checkpoints.
+    pub turn_checkpoint_receipts: u64,
     /// Repeated `fs.read` of the same path (workspace reread, not an id partition).
     pub recovery_workspace_reread: u64,
     /// Forgotten ids that were never recovered.
@@ -295,6 +372,14 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
     let mut obligation_lineage_totals: HashMap<String, u32> = HashMap::new();
     let mut turn_round_buckets: Vec<u64> = Vec::new();
     let mut current_turn_rounds: u64 = 0;
+    // CONV-OBS-02 只是 eval 影子时钟：它不修改 Runtime 的
+    // Evidence Frontier，也不抑制任何工具。
+    let mut results_without_outcome_advance: u64 = 0;
+    // TOOL-SURFACE-OBS-01 逐轮连接 surface provenance 与后续调用。
+    // ToolStarted 是正常路径；Runtime 预调度拒绝只有 ToolFinished，
+    // 因此用有界在途 id 集合避免重复计数。
+    let mut catalog_optional_round: Option<CatalogOptionalRound> = None;
+    let mut open_optional_calls: HashSet<String> = HashSet::new();
 
     for envelope in events {
         match &envelope.event {
@@ -305,10 +390,19 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     turn_round_buckets.push(current_turn_rounds);
                     current_turn_rounds = 0;
                 }
+                results_without_outcome_advance = 0;
                 metrics.turns += 1;
             }
             RuntimeEvent::ToolStarted { call } => {
                 metrics.tool_calls += 1;
+                note_catalog_optional_request(
+                    &mut metrics,
+                    catalog_optional_round.as_mut(),
+                    &mut open_optional_calls,
+                    &call.id,
+                    &call.name,
+                    true,
+                );
                 if is_edit_tool(&call.name) {
                     metrics.edit_started_calls += 1;
                     first_edit_timestamp_ms.get_or_insert(envelope.timestamp_ms);
@@ -367,6 +461,46 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 }
             }
             RuntimeEvent::ToolFinished { output } => {
+                note_catalog_optional_request(
+                    &mut metrics,
+                    catalog_optional_round.as_mut(),
+                    &mut open_optional_calls,
+                    &output.call_id,
+                    &output.tool_name,
+                    false,
+                );
+                let footprint = output.mutation_footprint();
+                let mutation_result = output.ok
+                    && matches!(&footprint, MutationFootprint::Known(touches) if !touches.is_empty());
+                let verification_result = output.is_verification();
+                let unknown_invalidation = matches!(footprint, MutationFootprint::Unknown);
+                if mutation_result {
+                    metrics.outcome_mutation_results =
+                        metrics.outcome_mutation_results.saturating_add(1);
+                }
+                if verification_result {
+                    metrics.outcome_verification_results =
+                        metrics.outcome_verification_results.saturating_add(1);
+                }
+                if unknown_invalidation {
+                    metrics.unknown_invalidation_results =
+                        metrics.unknown_invalidation_results.saturating_add(1);
+                }
+                if mutation_result || verification_result {
+                    metrics.outcome_frontier_advances =
+                        metrics.outcome_frontier_advances.saturating_add(1);
+                    results_without_outcome_advance = 0;
+                } else {
+                    results_without_outcome_advance =
+                        results_without_outcome_advance.saturating_add(1);
+                    metrics.max_results_without_outcome_advance = metrics
+                        .max_results_without_outcome_advance
+                        .max(results_without_outcome_advance);
+                    if !unknown_invalidation {
+                        metrics.evidence_only_results =
+                            metrics.evidence_only_results.saturating_add(1);
+                    }
+                }
                 if !output.ok {
                     metrics.failed_tool_outputs += 1;
                 }
@@ -553,10 +687,57 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 if *delta == FrontierDelta::RedundantEvidence {
                     metrics.redundant_evidence_calls += 1;
                 }
+                if *delta == FrontierDelta::EvidenceReconfirmed {
+                    metrics.reconfirmed_evidence_calls += 1;
+                }
                 metrics.frontier_no_advance_peak = metrics
                     .frontier_no_advance_peak
                     .max(u64::from(*actions_since_frontier_advance));
                 metrics.evidence_invalidations += *invalidated;
+            }
+            RuntimeEvent::ExecutionBatchSettled {
+                requested,
+                terminal,
+                spawned,
+                refused,
+                reused,
+                persist_observation,
+                transient_no_persist,
+                access_event_only,
+                outcome_advances,
+                no_outcome_results,
+                missing_terminal,
+                unexpected_terminal,
+                ..
+            } => {
+                metrics.action_batches_settled = metrics.action_batches_settled.saturating_add(1);
+                metrics.action_requested =
+                    metrics.action_requested.saturating_add(*requested as u64);
+                metrics.action_terminal = metrics.action_terminal.saturating_add(*terminal as u64);
+                metrics.action_spawned = metrics.action_spawned.saturating_add(*spawned as u64);
+                metrics.action_refused = metrics.action_refused.saturating_add(*refused as u64);
+                metrics.action_reused = metrics.action_reused.saturating_add(*reused as u64);
+                metrics.action_persist_observation = metrics
+                    .action_persist_observation
+                    .saturating_add(*persist_observation as u64);
+                metrics.action_transient_no_persist = metrics
+                    .action_transient_no_persist
+                    .saturating_add(*transient_no_persist as u64);
+                metrics.action_access_event_only = metrics
+                    .action_access_event_only
+                    .saturating_add(*access_event_only as u64);
+                metrics.action_outcome_advances = metrics
+                    .action_outcome_advances
+                    .saturating_add(*outcome_advances as u64);
+                metrics.action_no_outcome_results = metrics
+                    .action_no_outcome_results
+                    .saturating_add(*no_outcome_results as u64);
+                metrics.action_missing_terminal = metrics
+                    .action_missing_terminal
+                    .saturating_add(*missing_terminal as u64);
+                metrics.action_unexpected_terminal = metrics
+                    .action_unexpected_terminal
+                    .saturating_add(*unexpected_terminal as u64);
             }
             RuntimeEvent::ProtocolBodyCacheStats {
                 eligible,
@@ -614,6 +795,31 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 *lineage_total = (*lineage_total).max(*total_attempts);
                 let _ = epoch;
             }
+            RuntimeEvent::ExecutionNegativeFact { kind, .. } => match kind {
+                agent_contracts::NegativeFactEventKind::Recorded => {
+                    metrics.negative_fact_recorded += 1;
+                }
+                agent_contracts::NegativeFactEventKind::Reused => {
+                    metrics.negative_fact_reused += 1;
+                }
+                agent_contracts::NegativeFactEventKind::Invalidated => {
+                    metrics.negative_fact_invalidated += 1;
+                }
+                agent_contracts::NegativeFactEventKind::Promoted => {
+                    metrics.negative_fact_promoted += 1;
+                }
+                agent_contracts::NegativeFactEventKind::Resolved => {
+                    metrics.negative_fact_resolved += 1;
+                }
+            },
+            RuntimeEvent::ExecutionVerificationPass { kind, .. } => match kind {
+                agent_contracts::VerificationPassEventKind::Recorded => {
+                    metrics.verification_pass_recorded += 1;
+                }
+                agent_contracts::VerificationPassEventKind::Reused => {
+                    metrics.verification_pass_reused += 1;
+                }
+            },
             RuntimeEvent::ContextMaintained { report, .. } => {
                 metrics.lifecycle_transitions += report.transitions.len() as u64;
                 snapshot_access(&mut metrics, &report.diagnostics);
@@ -671,11 +877,52 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 snapshot_access(&mut metrics, &report.diagnostics);
             }
             RuntimeEvent::ToolSurfacePlanned { report } => {
+                finish_catalog_optional_round(&mut metrics, &mut catalog_optional_round);
                 metrics.rounds += 1;
                 current_turn_rounds = current_turn_rounds.saturating_add(1);
                 metrics.schema_tokens_total += report.selected_schema_tokens as u64;
+                if report.selected_total > report.selected.len() {
+                    metrics.surface_report_truncated_rounds =
+                        metrics.surface_report_truncated_rounds.saturating_add(1);
+                }
+                catalog_optional_round = Some(CatalogOptionalRound::from_report(report));
             }
-            RuntimeEvent::ModelStarted { prompt_layers, .. } => {
+            RuntimeEvent::ToolLeasesReconciled {
+                boundary, report, ..
+            } => {
+                metrics.tool_lease_reconcile_events =
+                    metrics.tool_lease_reconcile_events.saturating_add(1);
+                match boundary {
+                    agent_contracts::ToolLeaseBoundary::DirectiveStart => {
+                        metrics.tool_lease_directive_boundaries =
+                            metrics.tool_lease_directive_boundaries.saturating_add(1);
+                    }
+                    agent_contracts::ToolLeaseBoundary::ModelDecision => {
+                        metrics.tool_lease_decision_boundaries =
+                            metrics.tool_lease_decision_boundaries.saturating_add(1);
+                    }
+                }
+                metrics.tool_lease_examined_optional = metrics
+                    .tool_lease_examined_optional
+                    .saturating_add(report.examined_loaded_optional as u64);
+                metrics.tool_lease_retained_by_root = metrics
+                    .tool_lease_retained_by_root
+                    .saturating_add(report.retained_by_root as u64);
+                metrics.tool_lease_retained_by_persistent_source = metrics
+                    .tool_lease_retained_by_persistent_source
+                    .saturating_add(report.retained_by_persistent_source as u64);
+                metrics.tool_lease_released_to_warm = metrics
+                    .tool_lease_released_to_warm
+                    .saturating_add(report.released_to_warm as u64);
+                metrics.tool_lease_report_names_truncated = metrics
+                    .tool_lease_report_names_truncated
+                    .saturating_add(report.released_tools_truncated as u64);
+            }
+            RuntimeEvent::ModelStarted {
+                prompt_layers,
+                turn_checkpoint,
+                ..
+            } => {
                 metrics.prompt_system_tokens = metrics
                     .prompt_system_tokens
                     .saturating_add(prompt_layers.system_tokens);
@@ -703,6 +950,16 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 metrics.prompt_tool_catalog_index_tokens = metrics
                     .prompt_tool_catalog_index_tokens
                     .saturating_add(prompt_layers.tool_catalog_index_tokens);
+                if turn_checkpoint.compacted_exchanges > 0 {
+                    metrics.turn_checkpoint_rounds =
+                        metrics.turn_checkpoint_rounds.saturating_add(1);
+                }
+                metrics.turn_checkpoint_compacted_exchanges = metrics
+                    .turn_checkpoint_compacted_exchanges
+                    .saturating_add(turn_checkpoint.compacted_exchanges);
+                metrics.turn_checkpoint_receipts = metrics
+                    .turn_checkpoint_receipts
+                    .saturating_add(turn_checkpoint.receipt_count);
             }
             RuntimeEvent::ModelUsed {
                 input_tokens,
@@ -765,9 +1022,20 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                     .max(diagnostics.resident_bytes as u64);
                 snapshot_access(&mut metrics, diagnostics);
             }
+            RuntimeEvent::TaskCompleted { .. } => {
+                metrics.outcome_task_completions =
+                    metrics.outcome_task_completions.saturating_add(1);
+                metrics.outcome_frontier_advances =
+                    metrics.outcome_frontier_advances.saturating_add(1);
+                results_without_outcome_advance = 0;
+            }
+            RuntimeEvent::TurnCompleted => {
+                finish_catalog_optional_round(&mut metrics, &mut catalog_optional_round);
+            }
             _ => {}
         }
     }
+    finish_catalog_optional_round(&mut metrics, &mut catalog_optional_round);
     if !materialize_ms_samples.is_empty() {
         materialize_ms_samples.sort_unstable();
         metrics.materialize_ms_p50 = percentile(&materialize_ms_samples, 50);
@@ -843,6 +1111,98 @@ struct OpenManageCall {
 struct OpenEditCall {
     started_ms: u64,
     paths: Vec<String>,
+}
+
+/// One model round's bounded, event-visible optional surface rows. The report
+/// caps the row count, so this structure stays bounded independently of trace
+/// length. `selected_total > selected.len()` is reported separately.
+#[derive(Default)]
+struct CatalogOptionalRound {
+    schema_tokens_by_name: HashMap<String, u64>,
+    requested_names: HashSet<String>,
+}
+
+impl CatalogOptionalRound {
+    fn from_report(report: &agent_contracts::ToolSurfacePlanReport) -> Self {
+        let schema_tokens_by_name = report
+            .selected
+            .iter()
+            .filter(|row| row.origin == ToolSurfaceOrigin::CatalogLoadedOptional)
+            .map(|row| (row.tool_name.clone(), row.approx_tokens as u64))
+            .collect();
+        Self {
+            schema_tokens_by_name,
+            requested_names: HashSet::new(),
+        }
+    }
+}
+
+fn note_catalog_optional_request(
+    metrics: &mut RunMetrics,
+    round: Option<&mut CatalogOptionalRound>,
+    open_calls: &mut HashSet<String>,
+    call_id: &str,
+    tool_name: &str,
+    started: bool,
+) {
+    let Some(round) = round else {
+        if !started {
+            open_calls.remove(call_id);
+        }
+        return;
+    };
+    if !round.schema_tokens_by_name.contains_key(tool_name) {
+        if !started {
+            open_calls.remove(call_id);
+        }
+        return;
+    }
+    round.requested_names.insert(tool_name.to_string());
+    if started {
+        if open_calls.insert(call_id.to_string()) {
+            metrics.catalog_optional_requested_calls =
+                metrics.catalog_optional_requested_calls.saturating_add(1);
+        }
+    } else if !open_calls.remove(call_id) {
+        // Runtime may refuse a model-requested call before dispatch, which
+        // deliberately emits ToolFinished without ToolStarted. It still
+        // proves the exposed schema influenced the trajectory.
+        metrics.catalog_optional_requested_calls =
+            metrics.catalog_optional_requested_calls.saturating_add(1);
+    }
+}
+
+fn finish_catalog_optional_round(
+    metrics: &mut RunMetrics,
+    round: &mut Option<CatalogOptionalRound>,
+) {
+    let Some(round) = round.take() else {
+        return;
+    };
+    if round.schema_tokens_by_name.is_empty() {
+        return;
+    }
+    metrics.catalog_optional_surface_rounds =
+        metrics.catalog_optional_surface_rounds.saturating_add(1);
+    metrics.catalog_optional_reported_rows = metrics
+        .catalog_optional_reported_rows
+        .saturating_add(round.schema_tokens_by_name.len() as u64);
+    metrics.catalog_optional_reported_schema_tokens = metrics
+        .catalog_optional_reported_schema_tokens
+        .saturating_add(round.schema_tokens_by_name.values().copied().sum::<u64>());
+    let unused = round
+        .schema_tokens_by_name
+        .keys()
+        .filter(|name| !round.requested_names.contains(*name))
+        .count() as u64;
+    metrics.catalog_optional_unused_reported_rows = metrics
+        .catalog_optional_unused_reported_rows
+        .saturating_add(unused);
+    if round.requested_names.is_empty() {
+        metrics.catalog_optional_rounds_without_request = metrics
+            .catalog_optional_rounds_without_request
+            .saturating_add(1);
+    }
 }
 
 fn is_edit_tool(name: &str) -> bool {
@@ -1034,8 +1394,13 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          reactivation_utility: events={} unique={} selected={} consumed={} tokens(reactivated/selected/consumed)={}/{}/{}\n\
          reactivation_kind: tool_obs selected/consumed={}/{} file_obs selected/consumed={}/{}\n\
          prompt_layers: system={} facts={} anchor={} progress={} focus={} history={} turn={} tools={} catalog={}\n\
+         turn_checkpoint: rounds={} compacted_exchanges={} receipts={}\n\
          compaction: in={} out={}\n\
          behavior: tool_calls={} failed_outputs={} spills={} output_chars={} repeated_fs_reads={}\n\
+         outcome_frontier: advances={} mutation_results={} verification_results={} completions={} evidence_only={} unknown_invalidations={} max_results_without_advance={}\n\
+         optional_surface(reported): rounds={} rows={} schema_tokens={} requested_calls={} unused_rows={} rounds_without_request={} truncated_rounds={}\n\
+         tool_leases: events={} directive={} decisions={} examined={} retained(runtime/persistent)={}/{} released_to_warm={} sample_truncated={}\n\
+         action_batches: settled={} requested={} terminal={} dispatch(spawned/refused/reused)={}/{}/{} disposition(persist/transient/access)={}/{}/{} outcome/no_outcome={}/{} accounting_gap(missing/unexpected)={}/{}\n\
          edits: attempts={} started={} raw_ok={} committed_change={} failed={} first_raw_ok={}/{} first_committed_change={}/{} unfinished={} latency_p50={}ms latency_p95={}ms to_trace_end={}ms\n\
          edit_io: fs_read_bytes={} success_bytes_before={} success_bytes_after={} confirm_reads={} fallback(shell_proxy/fs_write)={}/{} settlement(not_applied/recovery/unknown)={}/{}/{}\n\
          reread: previously_selected={} selected_descriptor={} external_descriptor={} resident_unselected={} warm={} stored={} first_read={}\n\
@@ -1043,6 +1408,8 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
          selected_attr: kind={:?} reason={:?} source={:?} reactivated={} resident={}\n\
          tool_failures: {:?}\n\
          obligations: opened={} attempted={} precond_changed={} resolved={} avoidable={} max_epoch_attempts={} max_lineage_total={}\n\
+         negative_facts: recorded={} reused={} invalidated={} promoted={} resolved={}\n\
+         verification_passes: recorded={} reused={}\n\
          turn_tail: max_rounds={} p95_rounds={}\n",
         metrics.model_input_tokens,
         metrics.model_output_tokens,
@@ -1114,6 +1481,9 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.prompt_turn_frame_tokens,
         metrics.prompt_tool_schema_tokens,
         metrics.prompt_tool_catalog_index_tokens,
+        metrics.turn_checkpoint_rounds,
+        metrics.turn_checkpoint_compacted_exchanges,
+        metrics.turn_checkpoint_receipts,
         metrics.compaction_input_tokens,
         metrics.compaction_output_tokens,
         metrics.tool_calls,
@@ -1121,6 +1491,41 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.artifact_spills,
         metrics.output_chars_total,
         metrics.repeated_fs_reads,
+        metrics.outcome_frontier_advances,
+        metrics.outcome_mutation_results,
+        metrics.outcome_verification_results,
+        metrics.outcome_task_completions,
+        metrics.evidence_only_results,
+        metrics.unknown_invalidation_results,
+        metrics.max_results_without_outcome_advance,
+        metrics.catalog_optional_surface_rounds,
+        metrics.catalog_optional_reported_rows,
+        metrics.catalog_optional_reported_schema_tokens,
+        metrics.catalog_optional_requested_calls,
+        metrics.catalog_optional_unused_reported_rows,
+        metrics.catalog_optional_rounds_without_request,
+        metrics.surface_report_truncated_rounds,
+        metrics.tool_lease_reconcile_events,
+        metrics.tool_lease_directive_boundaries,
+        metrics.tool_lease_decision_boundaries,
+        metrics.tool_lease_examined_optional,
+        metrics.tool_lease_retained_by_root,
+        metrics.tool_lease_retained_by_persistent_source,
+        metrics.tool_lease_released_to_warm,
+        metrics.tool_lease_report_names_truncated,
+        metrics.action_batches_settled,
+        metrics.action_requested,
+        metrics.action_terminal,
+        metrics.action_spawned,
+        metrics.action_refused,
+        metrics.action_reused,
+        metrics.action_persist_observation,
+        metrics.action_transient_no_persist,
+        metrics.action_access_event_only,
+        metrics.action_outcome_advances,
+        metrics.action_no_outcome_results,
+        metrics.action_missing_terminal,
+        metrics.action_unexpected_terminal,
         metrics.edit_attempts,
         metrics.edit_started_calls,
         metrics.edit_successes,
@@ -1172,6 +1577,13 @@ pub fn render_metrics(metrics: &RunMetrics) -> String {
         metrics.avoidable_failure_calls,
         metrics.max_obligation_attempts_per_epoch,
         metrics.max_total_attempts_per_lineage,
+        metrics.negative_fact_recorded,
+        metrics.negative_fact_reused,
+        metrics.negative_fact_invalidated,
+        metrics.negative_fact_promoted,
+        metrics.negative_fact_resolved,
+        metrics.verification_pass_recorded,
+        metrics.verification_pass_reused,
         metrics.max_turn_rounds,
         metrics.p95_turn_rounds,
     )
@@ -1184,9 +1596,9 @@ mod tests {
         AttentionState, CompactionReason, ContextDiagnostics, ContextGcReport, ContextItemId,
         ContextKind, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextScope,
         ContextSelection, ContextStateTransition, InputLifecycle, OperationId, PromptLayerCosts,
-        RunId, RuntimeInputEnvelope, ScoreBreakdown, TaskId, ToolOutput, ToolSurfaceDemand,
-        ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceSelection,
-        ToolSurfaceSourceRevisions, TurnId,
+        RunId, RuntimeInputEnvelope, ScoreBreakdown, TaskId, ToolLeaseBoundary,
+        ToolLeaseReconcileReport, ToolOutput, ToolSurfaceDemand, ToolSurfacePlanReport,
+        ToolSurfacePlanStatus, ToolSurfaceSelection, ToolSurfaceSourceRevisions, TurnId,
     };
     use serde_json::json;
 
@@ -1372,6 +1784,10 @@ mod tests {
                 generation: 1,
                 surface_revision: 1,
                 model_round: 1,
+                turn_checkpoint: agent_contracts::TurnCheckpointStats {
+                    compacted_exchanges: 4,
+                    receipt_count: 3,
+                },
                 prompt_layers: PromptLayerCosts {
                     system_tokens: 80,
                     runtime_facts_tokens: 20,
@@ -1498,6 +1914,9 @@ mod tests {
         assert!(!metrics.provider_tokens_lower_bound);
         assert_eq!(metrics.prompt_task_progress_tokens, 40);
         assert_eq!(metrics.prompt_historical_context_tokens, 800);
+        assert_eq!(metrics.turn_checkpoint_rounds, 1);
+        assert_eq!(metrics.turn_checkpoint_compacted_exchanges, 4);
+        assert_eq!(metrics.turn_checkpoint_receipts, 3);
         assert_eq!(metrics.prompt_tool_catalog_index_tokens, 40);
         assert_eq!(metrics.reactivation_events, 0);
         assert_eq!(metrics.unique_reactivated, 0);
@@ -1543,6 +1962,326 @@ mod tests {
         assert!(rendered.contains("progress=40"));
         assert!(rendered.contains("history=800"));
         assert!(rendered.contains("tool_obs selected/consumed=6/4"));
+    }
+
+    #[test]
+    fn separates_task_outcome_progress_from_evidence_and_optional_surface_exposure() {
+        let run = RunId::new();
+        let turn_id = TurnId::new();
+        let task_id = TaskId::new();
+        let surface = |model_round: usize, surface_revision: u64| {
+            RuntimeEvent::ToolSurfacePlanned {
+                report: ToolSurfacePlanReport {
+                    turn_id,
+                    model_round,
+                    surface_revision,
+                    source_revisions: ToolSurfaceSourceRevisions::default(),
+                    status: ToolSurfacePlanStatus::Ready,
+                    selected: vec![
+                        ToolSurfaceSelection {
+                            tool_name: "fs.read".into(),
+                            demand: ToolSurfaceDemand::MustSurface,
+                            origin: ToolSurfaceOrigin::DispatcherRequired,
+                            approx_tokens: 120,
+                        },
+                        ToolSurfaceSelection {
+                            tool_name: "git.status".into(),
+                            demand: ToolSurfaceDemand::KeepReady,
+                            origin: ToolSurfaceOrigin::CatalogLoadedOptional,
+                            approx_tokens: 80,
+                        },
+                        ToolSurfaceSelection {
+                            tool_name: "shell.exec".into(),
+                            demand: ToolSurfaceDemand::KeepReady,
+                            origin: ToolSurfaceOrigin::CatalogLoadedOptional,
+                            approx_tokens: 100,
+                        },
+                    ],
+                    // Exercise the honest-reporting flag: metrics below only
+                    // claim the three bounded rows that are actually visible.
+                    selected_total: 4,
+                    omitted: Vec::new(),
+                    omitted_total: 0,
+                    blocked: Vec::new(),
+                    blocked_total: 0,
+                    selected_schema_tokens: 300,
+                    mandatory_schema_tokens: 120,
+                    estimated_input_tokens: 1_000,
+                    input_budget_tokens: 24_000,
+                },
+            }
+        };
+        let call = |id: &str, name: &str| RuntimeEvent::ToolStarted {
+            call: agent_contracts::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: json!({}),
+            },
+        };
+        let output = |id: &str, name: &str, metadata| RuntimeEvent::ToolFinished {
+            output: ToolOutput {
+                call_id: id.into(),
+                tool_name: name.into(),
+                ok: true,
+                summary: "ok".into(),
+                model_content: String::new(),
+                artifact_ref: None,
+                metadata,
+            },
+        };
+
+        let events = vec![
+            envelope(run, 1, RuntimeEvent::user_message_accepted("fix it")),
+            envelope(run, 2, surface(1, 1)),
+            envelope(run, 3, call("read", "fs.read")),
+            envelope(
+                run,
+                4,
+                output(
+                    "read",
+                    "fs.read",
+                    json!({"path": "src/lib.rs", "revision": "r1"}),
+                ),
+            ),
+            envelope(run, 5, call("status", "git.status")),
+            envelope(run, 6, output("status", "git.status", json!({}))),
+            envelope(run, 7, surface(2, 2)),
+            envelope(run, 8, call("edit", "edit.patch")),
+            envelope(
+                run,
+                9,
+                output(
+                    "edit",
+                    "edit.patch",
+                    json!({
+                        "path": "src/lib.rs",
+                        "revision": "r2",
+                        "changed": true,
+                        "mutates_workspace": true
+                    }),
+                ),
+            ),
+            // A pathless generic process is an Unknown invalidation, not a
+            // task-outcome advance.
+            envelope(
+                run,
+                10,
+                output(
+                    "process-refused-after-dispatch",
+                    "process.run",
+                    json!({"mutates_workspace": true}),
+                ),
+            ),
+            // Verification intent is host-stamped and advances the shadow
+            // outcome frontier even though mutation remains orthogonal.
+            envelope(
+                run,
+                11,
+                output(
+                    "verify",
+                    "process.run",
+                    json!({"verification": true, "mutates_workspace": true}),
+                ),
+            ),
+            envelope(
+                run,
+                12,
+                RuntimeEvent::TaskCompleted {
+                    task_id,
+                    anchor_revision: 3,
+                    summary: "done".into(),
+                },
+            ),
+            envelope(run, 13, RuntimeEvent::TurnCompleted),
+        ];
+
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.outcome_frontier_advances, 3);
+        assert_eq!(metrics.outcome_mutation_results, 1);
+        assert_eq!(metrics.outcome_verification_results, 1);
+        assert_eq!(metrics.outcome_task_completions, 1);
+        assert_eq!(metrics.evidence_only_results, 2);
+        assert_eq!(metrics.unknown_invalidation_results, 2);
+        assert_eq!(metrics.max_results_without_outcome_advance, 2);
+        assert_eq!(metrics.catalog_optional_surface_rounds, 2);
+        assert_eq!(metrics.catalog_optional_reported_rows, 4);
+        assert_eq!(metrics.catalog_optional_reported_schema_tokens, 360);
+        assert_eq!(metrics.catalog_optional_requested_calls, 1);
+        assert_eq!(metrics.catalog_optional_unused_reported_rows, 3);
+        assert_eq!(metrics.catalog_optional_rounds_without_request, 1);
+        assert_eq!(metrics.surface_report_truncated_rounds, 2);
+        let rendered = render_metrics(&metrics);
+        assert!(rendered.contains("outcome_frontier: advances=3"));
+        assert!(rendered.contains("optional_surface(reported): rounds=2"));
+    }
+
+    #[test]
+    fn lease_reconciliation_aggregates_exact_totals_not_name_samples() {
+        let run = RunId::new();
+        let turn_id = TurnId::new();
+        let events = vec![
+            envelope(
+                run,
+                1,
+                RuntimeEvent::ToolLeasesReconciled {
+                    turn_id,
+                    model_round: 1,
+                    boundary: ToolLeaseBoundary::DirectiveStart,
+                    report: ToolLeaseReconcileReport {
+                        examined_loaded_optional: 19,
+                        retained_by_root: 3,
+                        retained_by_persistent_source: 0,
+                        released_to_warm: 16,
+                        released_tools: vec!["sample.one".into()],
+                        released_tools_truncated: 15,
+                    },
+                },
+            ),
+            envelope(
+                run,
+                2,
+                RuntimeEvent::ToolLeasesReconciled {
+                    turn_id,
+                    model_round: 2,
+                    boundary: ToolLeaseBoundary::ModelDecision,
+                    report: ToolLeaseReconcileReport {
+                        examined_loaded_optional: 4,
+                        retained_by_root: 1,
+                        retained_by_persistent_source: 1,
+                        released_to_warm: 2,
+                        released_tools: vec!["sample.two".into()],
+                        released_tools_truncated: 1,
+                    },
+                },
+            ),
+        ];
+
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.tool_lease_reconcile_events, 2);
+        assert_eq!(metrics.tool_lease_directive_boundaries, 1);
+        assert_eq!(metrics.tool_lease_decision_boundaries, 1);
+        assert_eq!(metrics.tool_lease_examined_optional, 23);
+        assert_eq!(metrics.tool_lease_retained_by_root, 4);
+        assert_eq!(metrics.tool_lease_retained_by_persistent_source, 1);
+        assert_eq!(metrics.tool_lease_released_to_warm, 18);
+        assert_eq!(metrics.tool_lease_report_names_truncated, 16);
+        assert!(render_metrics(&metrics).contains("tool_leases: events=2"));
+    }
+
+    #[test]
+    fn action_batch_metrics_include_transient_and_refused_terminals() {
+        let run = RunId::new();
+        let events = vec![envelope(
+            run,
+            1,
+            RuntimeEvent::ExecutionBatchSettled {
+                turn_id: TurnId::new(),
+                model_round: 4,
+                requested: 3,
+                terminal: 3,
+                spawned: 1,
+                refused: 1,
+                reused: 1,
+                persist_observation: 1,
+                transient_no_persist: 2,
+                access_event_only: 0,
+                succeeded: 2,
+                failed: 1,
+                known_mutation_results: 0,
+                typed_verification_results: 0,
+                unknown_invalidations: 1,
+                completion_proposals: 0,
+                outcome_advances: 0,
+                no_outcome_results: 3,
+                missing_terminal: 0,
+                unexpected_terminal: 0,
+            },
+        )];
+
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.action_batches_settled, 1);
+        assert_eq!(metrics.action_requested, 3);
+        assert_eq!(metrics.action_terminal, 3);
+        assert_eq!(metrics.action_spawned, 1);
+        assert_eq!(metrics.action_refused, 1);
+        assert_eq!(metrics.action_reused, 1);
+        assert_eq!(metrics.action_persist_observation, 1);
+        assert_eq!(metrics.action_transient_no_persist, 2);
+        assert_eq!(metrics.action_no_outcome_results, 3);
+        assert_eq!(metrics.action_missing_terminal, 0);
+        assert_eq!(metrics.action_unexpected_terminal, 0);
+        assert!(render_metrics(&metrics).contains("action_batches: settled=1"));
+    }
+
+    #[test]
+    fn negative_fact_lifecycle_is_counted_separately_from_tool_calls() {
+        let run = RunId::new();
+        let kinds = [
+            agent_contracts::NegativeFactEventKind::Recorded,
+            agent_contracts::NegativeFactEventKind::Reused,
+            agent_contracts::NegativeFactEventKind::Invalidated,
+            agent_contracts::NegativeFactEventKind::Promoted,
+            agent_contracts::NegativeFactEventKind::Resolved,
+        ];
+        let events: Vec<_> = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                envelope(
+                    run,
+                    index as u64 + 1,
+                    RuntimeEvent::ExecutionNegativeFact {
+                        kind,
+                        tool_name: "fs.read".into(),
+                        target: "src/guess.rs".into(),
+                        failure: agent_contracts::ToolFailureClass::PathNotFound,
+                        workspace_revision: 0,
+                    },
+                )
+            })
+            .collect();
+
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.negative_fact_recorded, 1);
+        assert_eq!(metrics.negative_fact_reused, 1);
+        assert_eq!(metrics.negative_fact_invalidated, 1);
+        assert_eq!(metrics.negative_fact_promoted, 1);
+        assert_eq!(metrics.negative_fact_resolved, 1);
+        assert_eq!(metrics.tool_calls, 0);
+        assert!(render_metrics(&metrics).contains("negative_facts: recorded=1 reused=1"));
+    }
+
+    #[test]
+    fn exact_verification_pass_reuse_is_counted_without_inventing_a_tool_start() {
+        let run = RunId::new();
+        let events = [
+            agent_contracts::VerificationPassEventKind::Recorded,
+            agent_contracts::VerificationPassEventKind::Reused,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            envelope(
+                run,
+                index as u64 + 1,
+                RuntimeEvent::ExecutionVerificationPass {
+                    kind,
+                    tool_name: "test.verify".into(),
+                    argument_digest: "arg".into(),
+                    verification_identity: "recipe:v1|env:test".into(),
+                    anchor_revision: 2,
+                    directive_revision: 3,
+                    workspace_revision: 4,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(metrics.verification_pass_recorded, 1);
+        assert_eq!(metrics.verification_pass_reused, 1);
+        assert_eq!(metrics.tool_calls, 0);
+        assert!(render_metrics(&metrics).contains("verification_passes: recorded=1 reused=1"));
     }
 
     #[test]

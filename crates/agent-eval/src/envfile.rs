@@ -9,6 +9,7 @@ const ALLOWED: &[&str] = &[
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_MODEL",
+    "OPENAI_API_PROTOCOL",
     "OPENAI_CONTEXT_WINDOW",
 ];
 
@@ -67,13 +68,14 @@ pub fn parse_context_window(raw: Option<&str>) -> anyhow::Result<usize> {
 pub fn status_line(path: &Path) -> String {
     let model = get("OPENAI_MODEL").unwrap_or_else(|| "(unset)".into());
     let base = get("OPENAI_BASE_URL").unwrap_or_else(|| "(unset)".into());
+    let protocol = get("OPENAI_API_PROTOCOL").unwrap_or_else(|| "auto".into());
     let key = if get("OPENAI_API_KEY").is_some() {
         "present"
     } else {
         "missing"
     };
     format!(
-        "eval env: {} model={model} base={base} key={key}",
+        "eval env: {} model={model} base={base} protocol={protocol} key={key}",
         path.display()
     )
 }
@@ -94,7 +96,7 @@ pub fn parse_eval_env(text: &str) -> anyhow::Result<BTreeMap<String, String>> {
         let key = key.trim();
         if !ALLOWED.contains(&key) {
             anyhow::bail!(
-                "line {}: refusing to load {key} (only OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL / OPENAI_CONTEXT_WINDOW)",
+                "line {}: refusing to load {key} (only OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL / OPENAI_API_PROTOCOL / OPENAI_CONTEXT_WINDOW)",
                 index + 1
             );
         }
@@ -152,6 +154,7 @@ mod tests {
              export OPENAI_MODEL=\"gpt-5.6-luna\"\n\
              OPENAI_BASE_URL=https://api.pinaic.com/v1\n\
              OPENAI_API_KEY='sk-test'\n\
+             OPENAI_API_PROTOCOL=responses\n\
              OPENAI_CONTEXT_WINDOW=128000\n",
         )
         .unwrap();
@@ -166,6 +169,10 @@ mod tests {
         assert_eq!(
             map.get("OPENAI_API_KEY").map(String::as_str),
             Some("sk-test")
+        );
+        assert_eq!(
+            map.get("OPENAI_API_PROTOCOL").map(String::as_str),
+            Some("responses")
         );
         assert_eq!(
             map.get("OPENAI_CONTEXT_WINDOW").map(String::as_str),

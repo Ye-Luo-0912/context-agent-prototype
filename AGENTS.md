@@ -12,6 +12,7 @@ changing architecture.
 | [`docs/EXECUTION_COHERENCE.md`](docs/EXECUTION_COHERENCE.md) | Execution Coherence V1 |
 | [`docs/PLATFORM_SECURITY.md`](docs/PLATFORM_SECURITY.md) | EffectIntent / sandbox attestation |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Milestone gates and ordered route |
+| [`docs/LONG_TASK_EVALUATION.md`](docs/LONG_TASK_EVALUATION.md) | Long-task Runtime gaps and one-directive development diagnostic |
 | [`docs/AUDIT_TODO.md`](docs/AUDIT_TODO.md) | Confirmed defect queue |
 | `crates/agent-eval/evidence/*/REPORT.md` | Experiment facts |
 

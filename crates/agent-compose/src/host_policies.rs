@@ -26,12 +26,43 @@ impl HostToolPolicyRegistry {
     /// 仅内置表——所有组合共用的 fail-closed 起点。未准入的插件工具
     /// 没有条目。
     pub fn with_builtins() -> Self {
-        Self {
-            builtins: tool_runtime::BUILTIN_TOOL_POLICIES.clone(),
+        Self::with_builtin_extensions(Vec::new())
+            .expect("the static builtin host policy table must be valid")
+    }
+
+    /// Install trusted first-party extensions derived by the composition
+    /// root. Unlike plugin admission these entries become immutable builtin
+    /// authority and cannot later be shadowed. `verify.run` uses this path so
+    /// dispatcher and Core receive the same recipe table.
+    pub fn with_builtin_extensions(extensions: Vec<HostToolPolicy>) -> Result<Self, String> {
+        let mut builtins = tool_runtime::BUILTIN_TOOL_POLICIES.clone();
+        for extension in extensions {
+            if extension.tool_name.trim().is_empty() {
+                return Err("builtin extension tool name must not be empty".into());
+            }
+            if builtins
+                .iter()
+                .any(|policy| policy.tool_name == extension.tool_name)
+            {
+                return Err(format!(
+                    "duplicate builtin host policy '{}'",
+                    extension.tool_name
+                ));
+            }
+            builtins.push(extension);
+        }
+        Ok(Self {
+            builtins,
             admitted: Vec::new(),
             snapshot: RwLock::new(None),
             revision: AtomicU64::new(1),
-        }
+        })
+    }
+
+    pub fn with_builtins_and_verification(
+        recipes: &tool_runtime::VerificationRecipes,
+    ) -> Result<Self, String> {
+        Self::with_builtin_extensions(recipes.host_policy().into_iter().collect())
     }
 
     /// 安装一条运维审核过的插件绑定。撞内置名或重复准入一律失败：
@@ -146,6 +177,34 @@ mod tests {
                 HostEffectBinding::ReadOnly
             ),
             "a failed admission must leave the builtin binding in place"
+        );
+    }
+
+    #[test]
+    fn verification_extension_is_builtin_and_resolves_recipe_argv() {
+        let recipe = tool_runtime::VerificationRecipe::new(
+            "project.check",
+            "Check the project",
+            "v1",
+            vec!["cargo".into(), "check".into()],
+        )
+        .unwrap();
+        let recipes = tool_runtime::VerificationRecipes::new(vec![recipe]).unwrap();
+        let mut registry =
+            HostToolPolicyRegistry::with_builtins_and_verification(&recipes).unwrap();
+        let policy = registry.policy_for("verify.run").unwrap();
+        assert_eq!(
+            policy.intent_from(&json!({"recipe_id": "project.check"})),
+            agent_contracts::exec_argv_intent(&["cargo".into(), "check".into()])
+        );
+        assert!(
+            registry
+                .admit(HostToolPolicy {
+                    tool_name: "verify.run".into(),
+                    binding: HostEffectBinding::ReadOnly,
+                })
+                .is_err(),
+            "trusted recipe authority cannot be shadowed by plugin admission"
         );
     }
 

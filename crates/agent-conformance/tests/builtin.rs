@@ -233,7 +233,9 @@ async fn control_tools_execute_and_stay_within_the_envelope() {
             "search" => json!({"op": "search", "query": "fs"}),
             "inspect" => json!({"op": "inspect", "name": "fs.read"}),
             "load" => json!({"op": "load", "name": "git.status"}),
-            "unload" => json!({"op": "unload", "name": "git.status"}),
+            // A stable-core member cannot be unloaded, so exercise the
+            // unload path on a genuinely catalog-optional tool instead.
+            "unload" => json!({"op": "unload", "name": "edit.replace"}),
             _ => unreachable!(),
         };
         let outcome = dispatcher

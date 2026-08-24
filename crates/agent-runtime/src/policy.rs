@@ -210,6 +210,7 @@ mod tests {
         TaskAnchor {
             revision: 7,
             original_goal: "goal".into(),
+            next_action: String::new(),
             current_interpretation: "goal".into(),
             constraints: Vec::new(),
             acceptance_criteria: if acceptance {

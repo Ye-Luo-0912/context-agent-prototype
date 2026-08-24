@@ -23,12 +23,22 @@ pub struct WireChunk {
     pub choices: Vec<WireChoice>,
     #[serde(default)]
     pub usage: Option<WireUsage>,
+    #[serde(default)]
+    pub error: Option<WireError>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct WireChoice {
     #[serde(default)]
     pub delta: WireDelta,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WireError {
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -76,6 +86,7 @@ pub struct StreamAccumulator {
     content: String,
     tool_calls: Vec<AccToolCall>,
     pub usage: Option<ModelUsage>,
+    terminal_error: Option<String>,
 }
 
 impl StreamAccumulator {
@@ -83,6 +94,15 @@ impl StreamAccumulator {
     /// should be forwarded to the sink (text deltas and tool-call deltas).
     pub fn apply(&mut self, chunk: &WireChunk) -> Vec<ModelChunk> {
         let mut events = Vec::new();
+
+        if let Some(error) = &chunk.error {
+            self.terminal_error = Some(
+                error
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "provider stream error".to_string()),
+            );
+        }
 
         if let Some(usage) = &chunk.usage {
             self.usage = Some(ModelUsage {
@@ -93,6 +113,9 @@ impl StreamAccumulator {
         }
 
         for choice in &chunk.choices {
+            if choice.finish_reason.as_deref() == Some("network_error") {
+                self.terminal_error = Some("provider reported finish_reason=network_error".into());
+            }
             if let Some(content) = &choice.delta.content
                 && !content.is_empty()
             {
@@ -143,6 +166,10 @@ impl StreamAccumulator {
         }
 
         events
+    }
+
+    pub fn take_terminal_error(&mut self) -> Option<String> {
+        self.terminal_error.take()
     }
 
     /// Finalize into (content, tool_calls). Malformed tool-call argument JSON
@@ -265,5 +292,19 @@ mod tests {
         let (_, calls) = acc.finalize();
         assert_eq!(calls[0].name, "fs.read");
         assert_eq!(calls[0].arguments, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn provider_network_error_is_not_an_empty_success() {
+        let mut acc = StreamAccumulator::default();
+        let chunk: WireChunk = serde_json::from_str(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"network_error"}]}"#,
+        )
+        .unwrap();
+        assert!(acc.apply(&chunk).is_empty());
+        assert_eq!(
+            acc.take_terminal_error().as_deref(),
+            Some("provider reported finish_reason=network_error")
+        );
     }
 }

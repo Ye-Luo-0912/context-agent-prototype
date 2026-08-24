@@ -1,0 +1,26 @@
+{
+  "analysis_schema": "agent-eval.longflow.v1",
+  "arm_order": [
+    "dynamic",
+    "append"
+  ],
+  "cells": [
+    {
+      "dir": "dynamic",
+      "engine": "dynamic"
+    },
+    {
+      "dir": "append",
+      "engine": "append"
+    }
+  ],
+  "fixture_id": "late_constraint_long",
+  "live": true,
+  "mechanism": "late_constraint",
+  "repeat": 2,
+  "repeats": 2,
+  "schema": "agent-eval.pair.v1",
+  "spec_sha256": "effb470ba0fde93f288ed0ac714dffb4adadf6275c3d3022b516717395464080",
+  "task_id": "late_constraint_long",
+  "tool_surface": "production"
+}

@@ -4,8 +4,8 @@ Neither M12 nor M13 is closed. This file is the authority/sandbox contract.
 Layering and crate graph live in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 Current freeze / P0 live in [`STATUS.md`](STATUS.md).
 
-Generic `shell.exec` / `process.run` / `process.session` stay a
-non-transactional exception: Core identity before spawn, kill-then-reap
+Generic `shell.exec` / `process.run` / `process.session`, plus the bounded
+host-recipe `verify.run`, stay a non-transactional exception: Core identity before spawn, kill-then-reap
 on cancel, no rollback of child mutations. Do not invent `MOD-18` from
 residual syscalls, multiplexing, or Named Pipe/UDS. WASI is a V2
 untrusted-plane candidate, not a v0 slice.
@@ -27,6 +27,20 @@ in `tool-runtime` (`BuiltinToolPolicies`); trusted composition owns
 plugin bindings and never lets them shadow a builtin. The same registry
 reaches the kernel lease path, the approval gate, and the capability
 dispatcher — approval and lease minting cannot drift.
+
+`HostEffectBinding::ExecRecipe` is the trusted indirection for
+`verify.run { recipe_id }`: the model-visible call contains no argv, and the
+composition root installs the exact bounded `id -> argv` table as an immutable
+builtin extension. The dispatcher executes from that same recipe set. Unknown
+ids resolve to empty `ExecArgv`; a plugin cannot shadow `verify.run` or add an
+argv through `ToolSpec`/call metadata. The resolved spawn is still checked as
+Actual ExecArgv ⊆ Approved ExecArgv before the child starts.
+
+Exact PASS reuse is narrower than spawn authority. A source-read-only recipe
+must supply a complete bounded host identity; Runtime recomputes it after the
+process and records exact provenance only when pre/post identities match.
+Incomplete workspace/environment capture, links or external-input directives
+retain typed verification but cannot authorize a later no-dispatch PASS.
 
 ## EffectIntent (M12 first cut)
 

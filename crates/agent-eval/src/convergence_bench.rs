@@ -1,4 +1,4 @@
-//! Convergence Bench（评审第 29 条）：三个确定性 scripted-model 场景，
+//! Convergence Bench（评审第 29 条）：四个确定性 scripted-model 场景，
 //! 在真实 runtime + 真实工具表面上验证 Execution Convergence 语义。
 //! 不依赖 live provider，可在 CI 里反复运行：
 //!
@@ -7,7 +7,9 @@
 //! - `operational_evidence`：同版本重复观察入前沿并计 RedundantEvidence
 //!   （CONV-01）；
 //! - `protocol_body`：正文被 turn checkpoint 截掉后由当轮缓存回注
-//!   （PROTO-EVID-01）。
+//!   （PROTO-EVID-01）；
+//! - `verification_reuse`：生产 `verify.run` 的同一 exact PASS 第二次
+//!   请求不再启动进程，但仍结算完整工具结果。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -109,6 +111,7 @@ async fn run_session(
 ) -> anyhow::Result<Vec<RuntimeEventEnvelope>> {
     let approval: Arc<dyn ApprovalGate> = Arc::new(AllowAllGate);
     let workspace = agent_workspace::Workspace::open(workspace_root).await?;
+    let verification_recipes = tool_runtime::VerificationRecipes::discover(&workspace);
     // 收敛基准需要显式运行 process.run；默认表面不含它。
     let lifecycle = tool_runtime::ToolLifecycleConfig {
         always_loaded: vec![
@@ -119,7 +122,11 @@ async fn run_session(
         ..Default::default()
     };
     let tools: Arc<dyn agent_contracts::ToolDispatcher> = Arc::new(
-        tool_runtime::BuiltinToolDispatcher::with_config(workspace.clone(), lifecycle),
+        tool_runtime::BuiltinToolDispatcher::with_config_and_verification_recipes(
+            workspace.clone(),
+            lifecycle,
+            verification_recipes.clone(),
+        ),
     );
     let context_engine: Arc<dyn ContextEngine> =
         Arc::new(SimpleContextEngine::new(SimpleContextConfig::default()));
@@ -136,7 +143,10 @@ async fn run_session(
         max_tool_rounds: Some(32),
         project_task_progress: true,
         host_policies: Some(Arc::new(
-            agent_compose::HostToolPolicyRegistry::with_builtins(),
+            agent_compose::HostToolPolicyRegistry::with_builtins_and_verification(
+                &verification_recipes,
+            )
+            .map_err(anyhow::Error::msg)?,
         )),
     })
     .await?;
@@ -334,12 +344,79 @@ pub async fn scenario_protocol_body() -> anyhow::Result<ConvergenceBenchReport> 
     ))
 }
 
-/// 运行全部三个确定性场景；任一失败即整体失败。
+/// 场景四：真实 builtin dispatcher + Core authority + `rustc` recipe。
+/// 第一次成功记录 PASS；同 directive/current world 的第二次调用复用
+/// 结果，不能再产生 ToolStarted/子进程。
+pub async fn scenario_verification_reuse() -> anyhow::Result<ConvergenceBenchReport> {
+    let dir = seed_workspace(&[("src/main.rs", "fn main() {}\n")]).await?;
+    let arguments = || {
+        serde_json::json!({
+            "recipe_id": "rust.compile-tests:src/main.rs"
+        })
+    };
+    let model = Arc::new(ScriptedModel::new(
+        vec![
+            tool_call("v1", "verify.run", arguments()),
+            tool_call("v2", "verify.run", arguments()),
+        ],
+        "verification reuse done",
+    ));
+    let events = run_session(dir.path(), model, &["compile the exact test target twice"]).await?;
+    let started = count_started(&events, "verify.run");
+    let finished = events
+        .iter()
+        .filter(|envelope| {
+            matches!(
+                &envelope.event,
+                agent_contracts::RuntimeEvent::ToolFinished { output }
+                    if output.tool_name == "verify.run" && output.ok
+            )
+        })
+        .count();
+    let metrics = aggregate_metrics(&events);
+    let trace = events
+        .iter()
+        .filter_map(|envelope| match &envelope.event {
+            agent_contracts::RuntimeEvent::ToolStarted { call } if call.name == "verify.run" => {
+                Some(format!("started:{}", call.id))
+            }
+            agent_contracts::RuntimeEvent::ToolFinished { output }
+                if output.tool_name == "verify.run" =>
+            {
+                Some(format!(
+                    "finished:{}:{}:{}",
+                    output.call_id, output.ok, output.summary
+                ))
+            }
+            agent_contracts::RuntimeEvent::ExecutionVerificationPass { kind, .. } => {
+                Some(format!("pass:{kind:?}"))
+            }
+            agent_contracts::RuntimeEvent::Error { message } => Some(format!("error:{message}")),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let passed = started == 1
+        && finished == 2
+        && metrics.verification_pass_recorded == 1
+        && metrics.verification_pass_reused == 1;
+    Ok(ConvergenceBenchReport::new(
+        "verification_reuse",
+        passed,
+        format!(
+            "verify.run started={started}, finished={finished}, pass_recorded={}, pass_reused={}, trace=[{trace}]",
+            metrics.verification_pass_recorded, metrics.verification_pass_reused,
+        ),
+    ))
+}
+
+/// 运行全部四个确定性场景；任一失败即整体失败。
 pub async fn run_convergence_bench() -> anyhow::Result<Vec<ConvergenceBenchReport>> {
     let reports = vec![
         scenario_retry_domain().await?,
         scenario_operational_evidence().await?,
         scenario_protocol_body().await?,
+        scenario_verification_reuse().await?,
     ];
     Ok(reports)
 }
@@ -350,7 +427,7 @@ mod tests {
 
     /// Convergence Bench 自身作为测试运行（评审第 29 条的验收门）。
     #[tokio::test]
-    async fn all_three_scenarios_pass() {
+    async fn all_four_scenarios_pass() {
         let reports = run_convergence_bench().await.expect("bench runs");
         for report in &reports {
             assert!(

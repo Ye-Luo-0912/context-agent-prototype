@@ -333,6 +333,14 @@ later close of the parent still sees the item.
 
 This preserves the result while removing the completed task's detailed working set from active attention.
 
+The model-side `task.complete` follows the same transition, but task closure
+is not synonymous with ending a model turn. Its schema is leased only from
+explicit closure intent, a task-owned requirement, or deliberate catalog
+load. Once proposed, Runtime waits for every sibling tool result; a clean
+batch with a still-valid completion gate terminalizes directly at the durable
+turn safe point, while a failed sibling or invalidated verification returns to
+the model for recovery.
+
 Automatic summary generation should be added at the runtime/task-boundary layer, not buried inside the context store.
 
 ## 8b. Scope tree (V1-M2)
@@ -908,14 +916,16 @@ Execution Coherence V1 (freeze candidate) is specified in
 [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md). This file keeps the
 Context packing rules that follow from **IdentityKnown ≠ BodyVisible**.
 
-Selected historical `fs.read` bodies
-and stamped-path identity logs whose path is already Checked are omitted
-from SELECTED WORKING CONTEXT (the item header keeps `path@revision`);
-the current TurnFrame still carries live tool bodies. Errors keep their
-body. This does not enable descriptor-only ToolObservation reactivation.
-Materialize packing prices a Checked ToolObservation / FileObservation
-item as a descriptor via `ContextHints.checked_files` so omitted bodies
-do not consume the working-set budget. Before GC the
+Selected historical `fs.read` bodies are omitted from SELECTED WORKING
+CONTEXT only when another low-authority layer of the same request already
+carries the exact `path@revision` body. Runtime passes those bounded exact
+identities through `ContextHints.visible_body_identities`; TaskProgress
+`checked_files` remains identity/currentness only. Stamped shell/process
+logs are distinct evidence and are never replaced by a file body. Errors
+keep their body. This does not enable descriptor-only ToolObservation
+reactivation. Materialize packing prices only exact covered file-body items
+as descriptors, so packing and final rendering share the same body-presence
+predicate. Before GC the
 runtime pushes the same rows as `ContextAction::CheckedFiles` so a
 covered file body is not hot-reactivated.
 
@@ -925,7 +935,8 @@ When CURRENT DIRECTIVE *exactly* names an ExecutionState-known path
 latest matching file body into `MaterializedContext.foreground` for this
 request only: Warm stays Warm, Stored is not Admitted, consumption ack
 does not stamp those ids. Assembler renders `CURRENT FOREGROUND EVIDENCE`
-before SELECTED WORKING CONTEXT; Checked omit does not apply there.
+before SELECTED WORKING CONTEXT. Foreground is itself exact body presence,
+not a TaskProgress identity.
 The engine packs foreground first, then subtracts **actual** body tokens
 from `budget_tokens` before historical packing. Runtime must not
 worst-case-reserve `MAX_FOREGROUND_TOKENS` (~2048); that constant is the
@@ -944,18 +955,27 @@ counters are segment-local (zeroed on restore); run-global unique/event
 counts come from `ContextGc` events. Context V1 still does not enable
 P3/P4 by default. Do not add further Context heuristics. Production
 `ToolLifecycleConfig::default()` always-loads `fs.list` / `fs.read` /
-`search.grep` / `artifact.read` / `edit.patch` / `task.complete` /
-`capability.manage`; git / shell / write / `edit.replace` / `context.manage` are catalog-only. Eval
-fixtures and scripted `--compare-arm` that pin `fs.write` / `edit.replace`
-and `context.manage` are not a product-surface isomorph. Live coding
+`fs.write` / `search.grep` / `artifact.read` / `edit.patch` / `git.status` /
+`git.diff` / `capability.manage`; when
+bounded host recipes exist, the compact
+`verify.run { recipe_id }` schema is also required and cannot be silently
+omitted. Shell / `edit.replace` / `context.manage` and plugin tools are
+catalog-only. Eval fixtures and scripted `--compare-arm` that additionally
+pin `edit.replace` and `context.manage` are not a product-surface isomorph. Live coding
 compare now reuses production
 `ToolLifecycleConfig::default()`. Runtime PreferSurfaces `context.manage`
 when Warm/Cold/Stored catalog entries or TaskAnchor `evidence_refs`
 exist (NeedEvidence / EXTERNAL CONTEXT); otherwise it stays catalog-only
-and loads through `capability.manage`. The
-remaining product gap is a structured Verify capability
-(`verify.project` / `verify.tests` after M12/M13), not a
-`verify.run(command)` rename of `shell.exec`. Main engineering
+and loads through `capability.manage`. `task.complete` is likewise
+catalog-only during ordinary turns: Runtime leases it for explicit task-close
+intent or a task-owned requirement, and deliberate model discovery remains
+available. A normal final response closes only the turn, preserving the
+multi-turn task scope and its bounded TaskProgress. The
+landed Verify slice is a host-recipe selector, not a
+`verify.run(command)` rename of `shell.exec`; general project runners stay
+TaskScoped/Unknown-safe and exact reuse is limited to host-asserted
+source-read-only recipes. Sandboxed broader project verification and
+equivalence/obligation provenance remain after M12/M13. Main engineering
 returns to M12/M13.
 
 Producing a `RuntimeDirective` requires the `runtime:context-control`

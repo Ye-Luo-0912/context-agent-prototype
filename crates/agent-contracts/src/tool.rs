@@ -356,6 +356,130 @@ pub enum ToolSemanticRole {
     EscapeHatch,
 }
 
+/// Runtime-facing purpose of one tool call, assigned by the trusted
+/// dispatcher before execution. This is deliberately separate from
+/// [`ToolSpec::roles`]: catalog roles are model/discovery metadata, while
+/// execution attribution may authorize reuse of a world fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExecutionPurpose {
+    /// No trusted purpose was assigned. This is the fail-closed default for
+    /// third-party dispatchers and dynamic capability tools.
+    #[default]
+    Unattributed,
+    Observe,
+    Search,
+    Mutate,
+    Verify,
+    Control,
+    /// Generic process/shell execution. Opaque execution never becomes a
+    /// reusable verification merely because producer metadata says so.
+    Opaque,
+}
+
+/// Whether a host-attributed verifier may be remembered for the current task
+/// and whether one of its successful results may be reused. Runtime still
+/// binds both modes to the task anchor; exact PASS reuse additionally requires
+/// the same user directive, workspace revision, arguments and host-supplied
+/// verification identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationReuse {
+    #[default]
+    None,
+    /// Remember the verifier source, but always execute a requested call.
+    TaskScoped,
+    /// A successful result is deterministic for the complete identity named
+    /// by [`ToolExecutionAttribution::verification_identity`]. Hosts must
+    /// change that identity whenever the verification recipe, policy,
+    /// execution profile or relevant environment changes.
+    ExactCurrentWorld,
+}
+
+/// Pre-dispatch, host-trusted execution attribution. It contains only
+/// bounded identities, never arguments, output bodies or producer metadata.
+/// Runtime combines these targets with current task authority; the dispatcher
+/// does not decide whether a target is relevant to a task.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ToolExecutionAttribution {
+    pub purpose: ToolExecutionPurpose,
+    #[serde(default)]
+    pub targets: Vec<String>,
+    #[serde(default)]
+    pub verification_reuse: VerificationReuse,
+    /// SHA-256 identity of host-owned verification recipe material plus every
+    /// environment/policy input not already present in the call arguments.
+    /// Runtime never needs the raw material. Empty is fail-closed and disables
+    /// exact PASS reuse.
+    #[serde(default)]
+    pub verification_identity: String,
+}
+
+impl ToolExecutionAttribution {
+    /// Build a canonical bounded attribution. Target order is deterministic,
+    /// slash-normalized and de-duplicated so it can safely cross Runtime
+    /// boundaries without copying arbitrary call arguments.
+    pub fn bounded(
+        purpose: ToolExecutionPurpose,
+        targets: impl IntoIterator<Item = String>,
+        verification_reuse: VerificationReuse,
+    ) -> Self {
+        let mut targets: Vec<String> = targets
+            .into_iter()
+            .map(|target| crate::normalize_resource_path(&target))
+            .filter(|target| !target.is_empty())
+            .collect();
+        targets.sort();
+        targets.dedup();
+        targets.truncate(crate::MAX_RESOURCE_TOUCHES);
+        Self {
+            purpose,
+            targets,
+            verification_reuse: if purpose == ToolExecutionPurpose::Verify {
+                verification_reuse
+            } else {
+                VerificationReuse::None
+            },
+            verification_identity: String::new(),
+        }
+    }
+
+    /// Attach the complete host-side equivalence identity for an exact
+    /// verifier. The identity is ignored for all other attribution modes.
+    pub fn with_verification_identity_material(mut self, identity_material: &str) -> Self {
+        if self.purpose == ToolExecutionPurpose::Verify
+            && self.verification_reuse == VerificationReuse::ExactCurrentWorld
+            && !identity_material.trim().is_empty()
+        {
+            self.verification_identity =
+                crate::ContentDigest::sha256_bytes(identity_material.trim().as_bytes()).to_string();
+        }
+        self
+    }
+
+    pub fn reusable_verification(&self) -> bool {
+        self.purpose == ToolExecutionPurpose::Verify
+            && matches!(
+                self.verification_reuse,
+                VerificationReuse::TaskScoped | VerificationReuse::ExactCurrentWorld
+            )
+    }
+
+    /// Exact PASS reuse is deliberately opt-in and fails closed for direct,
+    /// unbounded struct construction or a missing host equivalence identity.
+    pub fn exact_verification_identity(&self) -> Option<&str> {
+        (self.purpose == ToolExecutionPurpose::Verify
+            && self.verification_reuse == VerificationReuse::ExactCurrentWorld
+            && !self.verification_identity.is_empty()
+            && self
+                .verification_identity
+                .parse::<crate::ContentDigest>()
+                .is_ok())
+        .then_some(self.verification_identity.as_str())
+    }
+}
+
 impl ToolSemanticRole {
     pub fn as_arg(self) -> &'static str {
         match self {
@@ -408,6 +532,7 @@ impl ToolSemanticRole {
             "fs.list" | "search.grep" | "context.search" | "context.manage" | "code.symbols"
             | CAPABILITY_MANAGE | CAPABILITY_SEARCH => Some(Self::Search),
             "git.diff" | "git.status" | "git.log" | "code.diagnostics" => Some(Self::InspectDiff),
+            "verify.run" => Some(Self::Verify),
             "fs.write" | "edit.replace" | "edit.patch" => Some(Self::Mutate),
             "shell.exec" | "process.run" | "process.session" => Some(Self::EscapeHatch),
             _ => None,
@@ -727,7 +852,7 @@ impl ToolOutput {
         if matches!(class, ToolFailureClass::PathNotFound)
             && matches!(
                 self.tool_name.as_str(),
-                "process.run" | "shell.exec" | "process.session"
+                "process.run" | "shell.exec" | "process.session" | "verify.run"
             )
         {
             return ToolFailureDomain::ExecutableResolution;
@@ -1261,7 +1386,10 @@ impl OperationEffectContext {
 /// rolled back. They must return [`ToolOutcome::Value`], never a prepared
 /// effect.
 pub fn is_non_transactional_process_tool(name: &str) -> bool {
-    matches!(name, "shell.exec" | "process.run" | "process.session")
+    matches!(
+        name,
+        "shell.exec" | "process.run" | "process.session" | "verify.run"
+    )
 }
 
 /// Process tools already mutate inside the child. Staging a prepared effect
@@ -1286,7 +1414,7 @@ pub struct ToolExecutionRequest {
     pub call: ToolCall,
     /// Stable identity for a side-effecting operation, issued and persisted
     /// by Core before dispatch. Read-only calls carry `None`.
-    /// `shell.exec` / `process.run` / `process.session` must carry `Some`
+    /// `shell.exec` / `process.run` / `process.session` / `verify.run` must carry `Some`
     /// ([`is_non_transactional_process_tool`]); a missing identity fails
     /// closed before spawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1764,6 +1892,27 @@ pub enum RuntimeDirective {
     /// Executed at the turn's safe point (after the turn commits), so the
     /// completion never races an in-flight operation.
     CompleteTask(CompletionProposal),
+    /// 模型通过 `task.manage` 提交的有界进度提案。在操作提交点同步执行：
+    /// CAS 结果写回模型可见输出，过期修订当场可重试。结构上不携带
+    /// goal/constraints 字段，用户权威边界不可能被此指令触碰。
+    UpdateTaskProgress(TaskProgressProposal),
+}
+
+/// 一次有界任务进度提案。只允许更新自治字段（当前理解、计划进度、
+/// 开放回路、单一 next_action），全部为短文本与身份引用，永不携带文件
+/// 正文、原始工具输出或转录摘录。`base_anchor_revision` 是对
+/// `TaskAnchor.revision` 的 compare-and-swap 基准。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskProgressProposal {
+    pub base_anchor_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_interpretation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_progress: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_loops: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
 }
 
 /// Permission a capability's manifest must declare to attach context
@@ -1781,7 +1930,7 @@ pub const RUNTIME_CONTEXT_CONTROL: &str = "runtime:context-control";
 pub enum ToolOutcome {
     /// The execution produced only an output; there is nothing to commit.
     /// Non-transactional process tools (`shell.exec` / `process.run` /
-    /// `process.session`) must use this arm: the child may already have
+    /// `process.session` / `verify.run`) must use this arm: the child may already have
     /// mutated the world.
     Value(ToolOutput),
     /// The computation finished and a side effect is staged. `output` is
@@ -2096,6 +2245,84 @@ impl ToolLifecycle {
     }
 }
 
+/// Maximum number of released tool names copied into one lease-reconciliation
+/// event. The counters remain exact when the sample is truncated. This is a
+/// wire/observability bound, never a policy limit on how many tools may be
+/// rooted or reconciled.
+pub const MAX_TOOL_LEASE_REPORT_NAMES: usize = 16;
+
+/// Schema-lifecycle work performed at one runtime decision boundary.
+///
+/// A dispatcher examines only optional tools that are currently on the model
+/// surface. Exact runtime roots and explicit host-persistent loads keep their
+/// schemas loaded; every other optional schema moves to `Warm` (off-surface
+/// but immediately reloadable). Core/always-loaded tools and active calls are
+/// not candidates. The report is body-free and bounded so the runtime can
+/// explain the transition without copying schemas or tool output into the
+/// event stream.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolLeaseReconcileReport {
+    pub examined_loaded_optional: usize,
+    pub retained_by_root: usize,
+    #[serde(default)]
+    pub retained_by_persistent_source: usize,
+    pub released_to_warm: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub released_tools: Vec<String>,
+    #[serde(default)]
+    pub released_tools_truncated: usize,
+}
+
+impl ToolLeaseReconcileReport {
+    pub fn record_retained(&mut self) {
+        self.examined_loaded_optional = self.examined_loaded_optional.saturating_add(1);
+        self.retained_by_root = self.retained_by_root.saturating_add(1);
+    }
+
+    pub fn record_retained_persistent(&mut self) {
+        self.examined_loaded_optional = self.examined_loaded_optional.saturating_add(1);
+        self.retained_by_persistent_source = self.retained_by_persistent_source.saturating_add(1);
+    }
+
+    pub fn record_released(&mut self, tool_name: &str) {
+        self.examined_loaded_optional = self.examined_loaded_optional.saturating_add(1);
+        self.released_to_warm = self.released_to_warm.saturating_add(1);
+        if self.released_tools.len() < MAX_TOOL_LEASE_REPORT_NAMES {
+            self.released_tools.push(crate::discovery::truncate_chars(
+                tool_name,
+                MAX_TOOL_REQUIREMENT_NAME_CHARS,
+            ));
+        } else {
+            self.released_tools_truncated = self.released_tools_truncated.saturating_add(1);
+        }
+    }
+
+    /// Merge independent catalog partitions into one deterministic report.
+    /// Names are sorted after merging; exact totals do not depend on the
+    /// bounded sample.
+    pub fn merge(&mut self, other: Self) {
+        self.examined_loaded_optional = self
+            .examined_loaded_optional
+            .saturating_add(other.examined_loaded_optional);
+        self.retained_by_root = self.retained_by_root.saturating_add(other.retained_by_root);
+        self.retained_by_persistent_source = self
+            .retained_by_persistent_source
+            .saturating_add(other.retained_by_persistent_source);
+        self.released_to_warm = self.released_to_warm.saturating_add(other.released_to_warm);
+        self.released_tools_truncated = self
+            .released_tools_truncated
+            .saturating_add(other.released_tools_truncated);
+        self.released_tools.extend(other.released_tools);
+        self.released_tools.sort();
+        if self.released_tools.len() > MAX_TOOL_LEASE_REPORT_NAMES {
+            self.released_tools_truncated = self
+                .released_tools_truncated
+                .saturating_add(self.released_tools.len() - MAX_TOOL_LEASE_REPORT_NAMES);
+            self.released_tools.truncate(MAX_TOOL_LEASE_REPORT_NAMES);
+        }
+    }
+}
+
 /// One row of the unified tool catalog (the discovery surface shared by
 /// `capability.search` / `capability.inspect`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2204,6 +2431,16 @@ pub trait ToolDispatcher: Send + Sync {
     /// silent idle path. The default ignores roots.
     fn gc(&self, _roots: &[String]) {}
 
+    /// Reconcile model-surface leases at a runtime-owned decision boundary.
+    /// Unlike `gc`, this does not advance an idle clock and has no numeric
+    /// expiry: an optional schema stays visible exactly while a typed source
+    /// roots it. Released schemas become `Warm`, so the catalog remains
+    /// discoverable and model autonomy is preserved. Dispatchers without a
+    /// mutable catalog keep the compatibility no-op.
+    fn reconcile_leases(&self, _roots: &[String]) -> ToolLeaseReconcileReport {
+        ToolLeaseReconcileReport::default()
+    }
+
     /// 当前已加载 schema 的字节总量（表面压力度量）。默认 0：无生命
     /// 周期状态的 dispatcher 无压力。统一表面驻留规划用它把 builtin
     /// 与 capability 两侧放进同一个压力预算。
@@ -2219,12 +2456,22 @@ pub trait ToolDispatcher: Send + Sync {
         Vec::new()
     }
 
-    /// Unified `capability.load`: put a tool (or the capability owning it)
-    /// on the model surface. Default: unsupported.
+    /// Host/operator load: put a tool on the model surface until an explicit
+    /// unload. Implementations with source-aware leases treat this as a
+    /// persistent source; it is still only schema residency and grants no
+    /// execution authority. Default: unsupported.
     fn load_tool(&self, name: &str) -> AgentResult<()> {
         Err(AgentError::InvalidRequest(format!(
             "this tool provider does not support loading '{name}'"
         )))
+    }
+
+    /// Runtime lease load: make a tool visible while runtime-owned typed
+    /// roots (task requirement, active call, result delivery) need it. The
+    /// next lease reconciliation may cool it when all such roots disappear.
+    /// Providers without source tracking fall back to the legacy load path.
+    fn load_tool_for_lease(&self, name: &str) -> AgentResult<()> {
+        self.load_tool(name)
     }
 
     /// Unified `capability.unload`: remove a tool from the model surface.
@@ -2237,6 +2484,14 @@ pub trait ToolDispatcher: Send + Sync {
     /// Unified `capability.inspect`: the full spec of one tool, if known.
     fn inspect_tool(&self, _name: &str) -> Option<ToolSpec> {
         None
+    }
+
+    /// Assign a trusted purpose and bounded resource targets before a call is
+    /// dispatched. The fail-closed default carries no attribution. In
+    /// particular, Runtime must never derive reusable verification from a
+    /// producer's `ToolOutput.metadata` or from an arbitrary shell command.
+    fn execution_attribution(&self, _call: &ToolCall) -> ToolExecutionAttribution {
+        ToolExecutionAttribution::default()
     }
 
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome>;
@@ -2714,6 +2969,46 @@ mod tests {
     }
 
     #[test]
+    fn execution_attribution_is_bounded_and_verification_fails_closed() {
+        let targets = (0..(crate::MAX_RESOURCE_TOUCHES + 4))
+            .map(|index| format!(r"src\part-{index}.rs"))
+            .chain(["src/part-0.rs".to_string()]);
+        let observe = ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Observe,
+            targets,
+            VerificationReuse::TaskScoped,
+        );
+        assert_eq!(observe.targets.len(), crate::MAX_RESOURCE_TOUCHES);
+        assert!(observe.targets.iter().all(|path| !path.contains('\\')));
+        assert_eq!(observe.verification_reuse, VerificationReuse::None);
+        assert!(!observe.reusable_verification());
+
+        let verify = ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Verify,
+            Vec::<String>::new(),
+            VerificationReuse::TaskScoped,
+        );
+        assert!(verify.reusable_verification());
+        assert!(verify.exact_verification_identity().is_none());
+
+        let exact_without_identity = ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Verify,
+            Vec::<String>::new(),
+            VerificationReuse::ExactCurrentWorld,
+        );
+        assert!(exact_without_identity.reusable_verification());
+        assert!(
+            exact_without_identity
+                .exact_verification_identity()
+                .is_none()
+        );
+
+        let exact = exact_without_identity.with_verification_identity_material("host-policy:v3");
+        let expected = crate::ContentDigest::sha256_bytes(b"host-policy:v3").to_string();
+        assert_eq!(exact.exact_verification_identity(), Some(expected.as_str()));
+    }
+
+    #[test]
     fn shell_is_an_escape_hatch_not_a_verifier() {
         assert_eq!(
             ToolSemanticRole::from_tool_name("shell.exec"),
@@ -3005,6 +3300,7 @@ mod tests {
         assert!(is_non_transactional_process_tool("shell.exec"));
         assert!(is_non_transactional_process_tool("process.run"));
         assert!(is_non_transactional_process_tool("process.session"));
+        assert!(is_non_transactional_process_tool("verify.run"));
         assert!(!is_non_transactional_process_tool("fs.write"));
         assert!(!is_non_transactional_process_tool("git.status"));
         assert!(!is_non_transactional_process_tool("capability.manage"));
@@ -3015,6 +3311,10 @@ mod tests {
         let cases = [
             ("shell.exec", serde_json::json!({"command": "echo hi"})),
             ("process.run", serde_json::json!({"argv": ["echo", "hi"]})),
+            (
+                "verify.run",
+                serde_json::json!({"recipe_id": "project.test"}),
+            ),
             (
                 "process.session",
                 serde_json::json!({"action": "start", "argv": ["sleep", "1"]}),
@@ -3482,5 +3782,37 @@ mod tests {
                     && error.contains("simulated rollback failure")
         ));
         assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lease_report_keeps_exact_totals_with_a_bounded_sorted_sample() {
+        let mut left = ToolLeaseReconcileReport::default();
+        for index in (0..MAX_TOOL_LEASE_REPORT_NAMES + 3).rev() {
+            left.record_released(&format!("tool.{index:02}"));
+        }
+        let mut right = ToolLeaseReconcileReport::default();
+        right.record_retained();
+        right.record_retained_persistent();
+        right.record_released("aaa.first");
+        left.merge(right);
+
+        assert_eq!(
+            left.examined_loaded_optional,
+            MAX_TOOL_LEASE_REPORT_NAMES + 6
+        );
+        assert_eq!(left.retained_by_root, 1);
+        assert_eq!(left.retained_by_persistent_source, 1);
+        assert_eq!(left.released_to_warm, MAX_TOOL_LEASE_REPORT_NAMES + 4);
+        assert_eq!(left.released_tools.len(), MAX_TOOL_LEASE_REPORT_NAMES);
+        assert_eq!(
+            left.released_tools_truncated,
+            left.released_to_warm - left.released_tools.len()
+        );
+        assert!(
+            left.released_tools
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1])
+        );
+        assert_eq!(left.released_tools[0], "aaa.first");
     }
 }

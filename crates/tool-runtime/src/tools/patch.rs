@@ -120,11 +120,27 @@ struct FilePatch {
     hunks: Vec<Hunk>,
 }
 
+#[derive(Deserialize, Clone, Copy, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum HunkOp {
+    #[default]
+    Replace,
+    InsertBefore,
+    InsertAfter,
+}
+
 #[derive(Deserialize, Clone)]
 struct Hunk {
+    /// Parser compatibility defaults legacy `old`/`new` calls to replace.
+    /// The model-visible schema requires an explicit operation so additions
+    /// do not have to masquerade as destructive replacements.
+    #[serde(default)]
+    op: HunkOp,
     old: String,
     new: String,
-    /// 1-based occurrence to replace when `old` appears more than once.
+    /// Parser-only compatibility with the earlier model surface. New model
+    /// calls must use a unique exact anchor instead of a positional count:
+    /// ordinal matches are brittle after preceding hunks move repeated text.
     #[serde(default)]
     occurrence: Option<usize>,
 }
@@ -192,10 +208,11 @@ struct ResolvedPatch {
 
 impl EditPatchTool {
     /// Apply one exact-match hunk to the working text. The hunk's `old`
-    /// must match exactly once (or a valid `occurrence` is given),
-    /// mirroring `edit.replace`'s explicitness.
+    /// must match exactly once on the current model surface. Parser-only
+    /// compatibility still accepts a valid legacy `occurrence`.
     fn apply_hunk(
         original: &mut String,
+        op: HunkOp,
         old: &str,
         new: &str,
         occurrence: Option<usize>,
@@ -206,18 +223,19 @@ impl EditPatchTool {
         let matched_eol_adapted = &original[found.start..found.end] != old;
         let replacement = adapt_edit_replacement(original, found, new, line_ending);
         let replacement_eol_adapted = replacement.as_ref() != new;
-        let projected = projected_replacement_len(
-            original.len(),
-            found.end - found.start,
-            replacement.len(),
-            1,
-        )
-        .filter(|size| *size <= MAX_FILE_BYTES)
-        .ok_or(ApplyHunkError::ResultTooLarge)?;
+        let (start, end) = match op {
+            HunkOp::Replace => (found.start, found.end),
+            HunkOp::InsertBefore => (found.start, found.start),
+            HunkOp::InsertAfter => (found.end, found.end),
+        };
+        let projected =
+            projected_replacement_len(original.len(), end - start, replacement.len(), 1)
+                .filter(|size| *size <= MAX_FILE_BYTES)
+                .ok_or(ApplyHunkError::ResultTooLarge)?;
         if projected > original.capacity() {
             original.reserve(projected - original.len());
         }
-        original.replace_range(found.start..found.end, replacement.as_ref());
+        original.replace_range(start..end, replacement.as_ref());
         Ok((found.count, matched_eol_adapted || replacement_eol_adapted))
     }
 }
@@ -232,7 +250,7 @@ impl Tool for EditPatchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit.patch".into(),
-            description: "Patch files[] exactly; each item: path, latest fs.read base_revision, hunks; max 64 hunks total.".into(),
+            description: "Exact revision-checked replace/insert hunks across files[]; max 16 files; max 64 hunks total.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["files"],
@@ -256,12 +274,12 @@ impl Tool for EditPatchTool {
                                     "maxItems": 64,
                                     "items": {
                                         "type": "object",
-                                        "required": ["old", "new"],
+                                        "required": ["op", "old", "new"],
                                         "additionalProperties": false,
                                         "properties": {
-                                            "old": {"type": "string", "minLength": 1, "description": "Exact text to replace (must match exactly once unless occurrence is given; only LF/CRLF encoding is token-equivalent)"},
-                                            "new": {"type": "string"},
-                                            "occurrence": {"type": "integer", "minimum": 1, "description": "1-based occurrence to replace"}
+                                            "op": {"type": "string", "enum": ["replace", "insert_before", "insert_after"], "description": "replace removes the anchor; insert_before/insert_after preserve it. Use insert operations for additions."},
+                                            "old": {"type": "string", "minLength": 1, "description": "Unique exact anchor; include enough unchanged context to disambiguate repeated text (only LF/CRLF encoding is token-equivalent)"},
+                                            "new": {"type": "string", "description": "Replacement or inserted text; include every intended separator/newline explicitly"}
                                         }
                                     }
                                 }
@@ -394,6 +412,7 @@ impl Tool for EditPatchTool {
                 line_endings_normalized |= old.as_ref() != hunk.old || new.as_ref() != hunk.new;
                 match Self::apply_hunk(
                     &mut updated,
+                    hunk.op,
                     old.as_ref(),
                     new.as_ref(),
                     hunk.occurrence,
@@ -411,7 +430,7 @@ impl Tool for EditPatchTool {
                                 ToolFailureClass::AmbiguousMatch,
                                 count,
                                 format!(
-                                    "ambiguous_match: hunk `old` appears {count} times; pass occurrence or use a unique exact anchor"
+                                    "ambiguous_match: hunk `old` appears {count} times; include enough unchanged context to make the exact anchor unique"
                                 ),
                             ),
                             ExactMatchError::NoMatch { count } => (
@@ -550,7 +569,7 @@ impl Tool for EditPatchTool {
         let echo = bound_chars_with_marker(
             &echo_blocks.join("\n"),
             EDIT_ECHO_MAX_CHARS,
-            "\n… (additional edit echoes omitted at global cap; use fs.read for full bodies)",
+            "\n… (middle edit echoes omitted at global cap; use fs.read for full bodies)\n",
         );
         // Keep every new revision outside the optional echo budget. The list
         // is in the same order as the submitted `files[]`; with at most 16
@@ -712,7 +731,52 @@ mod tests {
         let file = &schema["properties"]["files"]["items"]["properties"];
         assert_eq!(file["path"]["maxLength"], 512);
         assert_eq!(file["base_revision"]["pattern"], "^[0-9a-f]{64}$");
-        assert_eq!(file["hunks"]["items"]["properties"]["old"]["minLength"], 1);
+        let hunk = &file["hunks"]["items"];
+        assert_eq!(hunk["required"], json!(["op", "old", "new"]));
+        assert_eq!(
+            hunk["properties"]["op"]["enum"],
+            json!(["replace", "insert_before", "insert_after"])
+        );
+        assert_eq!(hunk["properties"]["old"]["minLength"], 1);
+        assert!(
+            hunk["properties"].get("occurrence").is_none(),
+            "ordinal selection is parser-only compatibility, not model surface"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_occurrence_remains_parser_compatible_but_off_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let file = dir.path().join("f.txt");
+        tfs::write(&file, "same\nsame\n").await.unwrap();
+        let revision = read_revision(&workspace, "f.txt").await;
+        let tool = EditPatchTool::new(workspace);
+
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "legacy",
+                json!({
+                    "files": [{
+                        "path": "f.txt",
+                        "base_revision": revision,
+                        "hunks": [{"old": "same", "new": "changed", "occurrence": 2}]
+                    }]
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::PreparedEffect { effect, .. } = outcome else {
+            panic!("legacy occurrence must remain executable through the parser");
+        };
+        assert!(matches!(
+            effect.commit().await,
+            EffectReceipt::Applied { .. }
+        ));
+        assert_eq!(tfs::read_to_string(file).await.unwrap(), "same\nchanged\n");
     }
 
     #[tokio::test]
@@ -815,6 +879,101 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("fn a() {}")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_insert_hunks_preserve_their_unique_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let file = dir.path().join("lib.rs");
+        tfs::write(&file, "fn first() {}\nfn last() {}\n")
+            .await
+            .unwrap();
+        let revision = read_revision(&workspace, "lib.rs").await;
+        let tool = EditPatchTool::new(workspace);
+
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "insert",
+                json!({
+                    "files": [{
+                        "path": "lib.rs",
+                        "base_revision": revision,
+                        "hunks": [
+                            {
+                                "op": "insert_after",
+                                "old": "fn first() {}",
+                                "new": "\nfn second() {}"
+                            },
+                            {
+                                "op": "insert_before",
+                                "old": "fn last() {}",
+                                "new": "fn penultimate() {}\n"
+                            }
+                        ]
+                    }]
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::PreparedEffect { effect, .. } = outcome else {
+            panic!("explicit insert hunks must prepare a committed effect");
+        };
+        assert!(matches!(
+            effect.commit().await,
+            EffectReceipt::Applied { .. }
+        ));
+        assert_eq!(
+            tfs::read_to_string(file).await.unwrap(),
+            "fn first() {}\nfn second() {}\nfn penultimate() {}\nfn last() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_insert_adapts_newlines_without_removing_a_crlf_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let file = dir.path().join("lib.rs");
+        tfs::write(&file, "fn first() {}\r\nfn last() {}\r\n")
+            .await
+            .unwrap();
+        let revision = read_revision(&workspace, "lib.rs").await;
+        let tool = EditPatchTool::new(workspace);
+
+        let outcome = tool
+            .execute(
+                RunId::new(),
+                "insert-crlf",
+                json!({
+                    "files": [{
+                        "path": "lib.rs",
+                        "base_revision": revision,
+                        "hunks": [{
+                            "op": "insert_after",
+                            "old": "fn first() {}",
+                            "new": "\nfn middle() {}"
+                        }]
+                    }]
+                }),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::PreparedEffect { effect, .. } = outcome else {
+            panic!("CRLF insert must prepare a committed effect");
+        };
+        assert!(matches!(
+            effect.commit().await,
+            EffectReceipt::Applied { .. }
+        ));
+        assert_eq!(
+            tfs::read(file).await.unwrap(),
+            b"fn first() {}\r\nfn middle() {}\r\nfn last() {}\r\n"
         );
     }
 
@@ -1419,8 +1578,12 @@ mod tests {
         tfs::write(dir.path().join("a.txt"), "a\n").await.unwrap();
         tfs::write(dir.path().join("b.txt"), "b\n").await.unwrap();
         let tool = EditPatchTool::new(workspace);
-        let long_a = format!("{}\n", "A".repeat(2_000));
-        let long_b = format!("{}\n", "B".repeat(2_000));
+        let long_a = (0..40)
+            .map(|index| format!("A-{index:02} padding padding padding\n"))
+            .collect::<String>();
+        let long_b = (0..40)
+            .map(|index| format!("B-{index:02} padding padding padding\n"))
+            .collect::<String>();
 
         let outcome = tool
             .execute(
@@ -1450,6 +1613,18 @@ mod tests {
             echo.chars().count() <= EDIT_ECHO_MAX_CHARS,
             "all file echoes share one hard cap: {}",
             echo.chars().count()
+        );
+        assert!(
+            echo.contains("A-00"),
+            "the first file head stays visible: {echo}"
+        );
+        assert!(
+            echo.contains("B-39"),
+            "the final file tail stays visible: {echo}"
+        );
+        assert!(
+            echo.contains("middle edit echoes omitted"),
+            "global truncation must identify the omitted middle: {echo}"
         );
         effect.rollback("test cleanup").await.unwrap();
     }

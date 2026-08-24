@@ -1,0 +1,85 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "late_constraint_long",
+  "expected_edit": "add v2 Hello and Heartbeat while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 3,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Heartbeat"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "RELEASE.md",
+      "pred": "contains",
+      "needles": [
+        "v2"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "RELEASE.md",
+      "exists": true,
+      "sha256": "8387a8f01a8eece25acc7723e05993620af39e1afbf82953ab1753661ccc3afa",
+      "bytes": 313,
+      "truncated": false,
+      "body": "Version 2 will expand the protocol beyond the current ping message with additional message types, clearer decoding and encoding rules, and stronger validation while preserving compatibility with existing ping round trips.\n\nShipped in v2: the `Hello(String)` message with the explicit `v:2|hello:<value>` envelope."
+    },
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "89ed9e88157297f07d08bf3abc5dffab64124613b9afca6a546f9ba13ff74826",
+      "bytes": 1258,
+      "truncated": false,
+      "body": "pub enum Msg {\r\n    Ping,\r\n    Hello(String),\r\n    Heartbeat(u32),\r\n}\r\n\r\npub fn decode(bytes: &str) -> Result<Msg, String> {\r\n    if let Some(hello) = bytes.strip_prefix(\"v:2|hello:\") {\r\n        return Ok(Msg::Hello(hello.into()));\r\n    }\r\n    if let Some(sequence) = bytes.strip_prefix(\"v:2|heartbeat:\") {\r\n        return sequence\r\n            .parse::<u32>()\r\n            .map(Msg::Heartbeat)\r\n            .map_err(|_| \"invalid heartbeat\".into());\r\n    }\r\n    if bytes.contains(\"ping\") {\r\n        return Ok(Msg::Ping);\r\n    }\r\n    Err(\"unknown\".into())\r\n}\r\n\r\npub fn encode(msg: &Msg) -> String {\r\n    match msg {\r\n        Msg::Ping => \"ping\".into(),\r\n        Msg::Hello(value) => format!(\"v:2|hello:{value}\"),\r\n        Msg::Heartbeat(sequence) => format!(\"v:2|heartbeat:{sequence}\"),\r\n    }\r\n}\r\n\r\npub fn ping_roundtrip() -> Result<Msg, String> {\r\n    decode(&encode(&Msg::Ping))\r\n}\r\n\r\n#[cfg(test)]\r\nmod tests {\r\n    use super::{decode, encode, Msg};\r\n\r\n    #[test]\r\n    fn decodes_ping_frame_successfully() {\r\n        assert!(matches!(decode(\"ping\"), Ok(Msg::Ping)));\r\n    }\r\n\r\n    #[test]\r\n    fn heartbeat_roundtrips() {\r\n        let message = Msg::Heartbeat(42);\r\n        assert!(matches!(decode(&encode(&message)), Ok(Msg::Heartbeat(42))));\r\n    }\r\n}\r\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\longflow\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpvEpUYm\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

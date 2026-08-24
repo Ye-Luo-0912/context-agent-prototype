@@ -1,0 +1,85 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "late_constraint_long",
+  "expected_edit": "add v2 Hello and Heartbeat while keeping unversioned ping",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Heartbeat"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 3,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "RELEASE.md",
+      "pred": "contains",
+      "needles": [
+        "v2"
+      ],
+      "count": 2,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "RELEASE.md",
+      "exists": true,
+      "sha256": "bf0975f08d0d568559d80f88bf883f8c4867702e721c68755e2d72d152933f38",
+      "bytes": 553,
+      "truncated": false,
+      "body": "# Release Notes\n\n## v2 (planned)\n\nThe planned v2 work extends the minimal `Msg::Ping` wire protocol in `src/protocol.rs` with structured, self-describing messages: each frame will gain a version prefix and carry `seq`, an optional payload, and a TTL/timestamp so receivers can correlate pings with replies, echo realistic payloads, and discard stale messages. This requires replacing the current substring-based `decode` with exact delimited parsing (e.g., `ping|seq=42|len=0|ttl=...`) and keeping the existing single-message behavior as a v1 fallback.\n"
+    },
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "3fa87414d6576b6a20100bc433caaf914725459d79d1a8ce62d6b93a52a0b011",
+      "bytes": 378,
+      "truncated": false,
+      "body": "pub enum Msg {\r\n    Ping,\r\n}\r\n\r\npub fn decode(bytes: &str) -> Result<Msg, String> {\r\n    if bytes.contains(\"ping\") {\r\n        return Ok(Msg::Ping);\r\n    }\r\n    Err(\"unknown\".into())\r\n}\r\n\r\npub fn encode(msg: &Msg) -> String {\r\n    match msg {\r\n        Msg::Ping => \"ping\".into(),\r\n    }\r\n}\r\n\r\npub fn roundtrip_ping() -> Result<Msg, String> {\r\n    decode(&encode(&Msg::Ping))\r\n}\r\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\longflow\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmp4upv4R\\append"
+      ],
+      "expect_exit": 0,
+      "exit": 1,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "wire_v1 failed",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

@@ -29,8 +29,8 @@ const MAX_EXPANSION_ITEMS: usize = 8;
 /// edge keep the full working-set budget.
 const EXPANSION_RESERVE_TOKENS: usize = 1024;
 /// Assembler frame around a raw-evidence identity header (`[ToolObservation |
-/// ... | path=...]`). Charged when TASK PROGRESS already names the path so
-/// packing does not reserve the omitted body (file text or identity-log stdout).
+/// ... | path=...]`). Charged only when another layer of the same request
+/// already carries this exact file body.
 const FILE_BODY_DESCRIPTOR_FRAME_TOKENS: usize = 48;
 
 /// One dependency-expansion candidate for the bounded top-K heap: ordered
@@ -207,7 +207,7 @@ pub(crate) fn materialize(
         }
         let breakdown =
             score_item_with_breakdown(item, engine_focus.as_ref(), &state.hot_entities, turn);
-        let tokens = packed_item_tokens(item, &query.hints.checked_files);
+        let tokens = packed_item_tokens(item, &query.hints.visible_body_identities);
         candidates.push((index, breakdown, tokens));
     }
 
@@ -275,7 +275,7 @@ pub(crate) fn materialize(
                 item,
                 breakdown,
                 latest_file_bodies.contains(&item.id),
-                &query.hints.checked_files,
+                &query.hints.visible_body_identities,
             ),
             breakdown.clone(),
         ));
@@ -338,7 +338,7 @@ pub(crate) fn materialize(
                 item,
                 &breakdown,
                 latest_file_bodies.contains(&item.id),
-                &query.hints.checked_files,
+                &query.hints.visible_body_identities,
             ),
             breakdown,
         ));
@@ -400,7 +400,7 @@ pub(crate) fn materialize(
                 if archived_below_cutoff(dep, &breakdown, config, &latest_file_bodies) {
                     continue;
                 }
-                let tokens = packed_item_tokens(dep, &query.hints.checked_files);
+                let tokens = packed_item_tokens(dep, &query.hints.visible_body_identities);
                 expanded.push(ExpandedCandidate {
                     index: dep_index,
                     score: breakdown.total,
@@ -466,7 +466,7 @@ pub(crate) fn materialize(
         if path.is_empty() {
             continue;
         }
-        if prices_as_file_body_descriptor(item, &query.hints.checked_files) {
+        if prices_as_file_body_descriptor(item, &query.hints.visible_body_identities) {
             state.selected_descriptor_paths.insert(path);
         } else {
             state.selected_body_paths.insert(path);
@@ -476,11 +476,12 @@ pub(crate) fn materialize(
         .iter()
         .map(|index| {
             let item = &state.items[*index];
-            let content = if prices_as_file_body_descriptor(item, &query.hints.checked_files) {
-                file_body_descriptor_content(item)
-            } else {
-                item.content.clone()
-            };
+            let content =
+                if prices_as_file_body_descriptor(item, &query.hints.visible_body_identities) {
+                    file_body_descriptor_content(item)
+                } else {
+                    item.content.clone()
+                };
             MaterializedItem {
                 item_id: item.id,
                 kind: item.kind,
@@ -762,7 +763,7 @@ fn selection_reason(
     item: &ContextItem,
     breakdown: &ScoreBreakdown,
     latest_file_body: bool,
-    checked_files: &[String],
+    visible_body_identities: &[String],
 ) -> String {
     let mut reason = if item.retention == ContextRetention::Pinned {
         "explicitly pinned".to_string()
@@ -795,27 +796,27 @@ fn selection_reason(
             breakdown.entity_affinity,
         )
     };
-    if prices_as_file_body_descriptor(item, checked_files) {
-        reason.push_str("; body omitted, path already checked");
+    if prices_as_file_body_descriptor(item, visible_body_identities) {
+        reason.push_str("; body omitted, exact body already visible");
     }
     reason
 }
 
-fn prices_as_file_body_descriptor(item: &ContextItem, checked_files: &[String]) -> bool {
-    if item.kind == agent_contracts::ContextKind::Error || checked_files.is_empty() {
-        return false;
-    }
-    if !matches!(
-        item.kind,
-        agent_contracts::ContextKind::ToolObservation
-            | agent_contracts::ContextKind::FileObservation
-    ) {
+fn prices_as_file_body_descriptor(item: &ContextItem, visible_body_identities: &[String]) -> bool {
+    if item.kind == agent_contracts::ContextKind::Error
+        || visible_body_identities.is_empty()
+        || !is_file_body_observation(item)
+    {
         return false;
     }
     let Some(path) = observation_file_path(item) else {
         return false;
     };
-    agent_contracts::checked_files_cover_path(checked_files, path)
+    agent_contracts::visible_body_identities_cover(
+        visible_body_identities,
+        path,
+        item.file_revision.as_deref(),
+    )
 }
 
 fn file_body_descriptor_content(item: &ContextItem) -> String {
@@ -831,8 +832,8 @@ fn file_body_descriptor_content(item: &ContextItem) -> String {
     }
 }
 
-fn packed_item_tokens(item: &ContextItem, checked_files: &[String]) -> usize {
-    if prices_as_file_body_descriptor(item, checked_files) {
+fn packed_item_tokens(item: &ContextItem, visible_body_identities: &[String]) -> usize {
+    if prices_as_file_body_descriptor(item, visible_body_identities) {
         approx_tokens(&file_body_descriptor_content(item))
             .saturating_add(FILE_BODY_DESCRIPTOR_FRAME_TOKENS)
     } else {

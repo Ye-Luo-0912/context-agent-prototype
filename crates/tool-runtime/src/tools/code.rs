@@ -351,7 +351,7 @@ struct SymbolsArgs {
     query: String,
     #[serde(default = "default_symbols_limit")]
     limit: usize,
-    /// Opaque paging token from a previous `code.symbols` result.
+    /// Parser-only compatibility. Model-visible paging uses artifact.read.
     #[serde(default)]
     cursor: Option<String>,
 }
@@ -365,14 +365,13 @@ impl Tool for CodeSymbolsTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "code.symbols".into(),
-            description: "Language-aware symbol-definition scan over workspace source files (pure local lexical scan; no language server, no index). Returns `file:line:col  kind name` rows for definitions like fn/struct/class/def/func; comments and ignored dirs are skipped; C-like function detection is a heuristic.".into(),
+            description: "Language-aware symbol-definition scan over workspace source files (pure local lexical scan; no language server, no index). Returns `file:line:col  kind name` rows for definitions like fn/struct/class/def/func; comments and ignored dirs are skipped; C-like function detection is a heuristic. Overflow returns an artifact_ref; read further lines with artifact.read.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Optional workspace-relative directory"},
                     "query": {"type": "string", "description": "Optional case-sensitive substring filter on the symbol name"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
-                    "cursor": {"type": "string", "description": "Opaque token from a previous code.symbols result; serves the next page from that call's snapshot"}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000}
                 }
             }),
             risk: ToolRisk::ReadOnly,
@@ -473,8 +472,9 @@ impl Tool for CodeSymbolsTool {
             .as_ref()
             .map(|r| {
                 format!(
-                    "\n... {} more symbols; full list: {r}",
-                    symbols.len() - model_rows.len()
+                    "\n... {} more symbols; full-list artifact: {r}. Continue with artifact.read reference={r} start_line={}",
+                    symbols.len() - model_rows.len(),
+                    model_rows.len() + 1,
                 )
             })
             .unwrap_or_default();
@@ -505,6 +505,7 @@ impl Tool for CodeSymbolsTool {
                 "files_scanned": scanned_files,
                 "returned": model_rows.len(),
                 "has_more": has_more,
+                "next_start_line": has_more.then_some(model_rows.len() + 1),
                 "cursor": cursor,
             }),
         }))

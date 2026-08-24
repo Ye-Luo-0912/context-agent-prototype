@@ -22,9 +22,9 @@
 //!    to hide uncertainty.
 //! 2. Obligation exists ≠ Due now. Do not wipe a real obligation just to
 //!    avoid surfacing Verify.
-//! 3. Resource identity known ≠ body available in prompt. Descriptor-only
-//!    selected items, Checked omit, and Foreground Evidence exist because
-//!    of this gap.
+//! 3. Resource identity known ≠ body available in prompt. Historical body
+//!    omission requires exact same-request body presence; TaskProgress
+//!    identity alone never qualifies.
 //!
 //! 4. One model round = one [`RoundExecutionSnapshot`]. Prompt, hints,
 //!    and tool-surface policy all read that snapshot. Do not clone
@@ -61,8 +61,9 @@ pub use needs::{
 pub use snapshot::RoundExecutionSnapshot;
 pub use snapshot::VerificationProjection;
 pub use state::{
-    ExecutionState, FrontierObservation, ResourceFact, ResourceProvenance, VerificationCause,
-    VerificationCoverage, VerificationState,
+    ExecutionState, FrontierObservation, NegativeExecutionFact, NegativeFactTransition,
+    ResourceFact, ResourceProvenance, RuntimeExecutionAttribution, VerificationCause,
+    VerificationCoverage, VerificationFact, VerificationSourceLease, VerificationState,
 };
 
 /// Checkpoint/wire name for [`ExecutionState`]. The `TaskRecord` field is

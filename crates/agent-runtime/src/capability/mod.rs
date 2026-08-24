@@ -20,10 +20,10 @@ use agent_contracts::{
     CAPABILITY_SEARCH_MAX_LIMIT, Capability, CapabilityActivation, CapabilityInvocationContext,
     CapabilityLifecycle, CapabilityManifest, CapabilityOutcome, CapabilityStatus,
     CapabilityTransport, Effect, HostToolPolicies, RUNTIME_CONTEXT_CONTROL, ResourceDescriptor,
-    ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolOutput,
-    ToolSemanticRole, ToolSpec, ToolSurfaceSnapshot, WORKSPACE_READ, WORKSPACE_WRITE,
-    WorkspaceHandle, compact_tool_purpose, sanitize_untrusted_producer_output,
-    search_tool_catalog_filtered, unbound_effect_intent,
+    ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLeaseReconcileReport,
+    ToolLifecycle, ToolOutcome, ToolOutput, ToolSemanticRole, ToolSpec, ToolSurfaceSnapshot,
+    WORKSPACE_READ, WORKSPACE_WRITE, WorkspaceHandle, compact_tool_purpose,
+    sanitize_untrusted_producer_output, search_tool_catalog_filtered, unbound_effect_intent,
 };
 use agent_core::{CapabilityAdmission, CapabilityState, CapabilityStateAuthority};
 use agent_workspace::{ArtifactStoreHandle, ConfinedWorkspaceHandle, RemoteEffectAck, Workspace};
@@ -124,6 +124,10 @@ struct Entry {
 struct CapabilityToolState {
     lifecycle: ToolLifecycle,
     last_used_tick: u64,
+    /// Live composition/operator residency source. Runtime lease loads leave
+    /// this false and are released when their task/call/result roots vanish.
+    /// This flag never grants invoke authority.
+    persistent_load: bool,
 }
 
 /// Fail-closed meet for activation restored from an older authority
@@ -497,14 +501,23 @@ impl CapabilityRegistry {
         })
     }
 
-    /// Unified `capability.load`: put exactly one tool of the owning
-    /// capability on the model surface. Sibling tools of the same
-    /// capability stay off until they are loaded individually — a single
-    /// tool load never surfaces the whole capability. Unknown tool names
-    /// are rejected like the builtin catalog does, and a
-    /// disabled/quarantined capability cannot load — activation is the
-    /// gate in front of the surface.
+    /// Host/operator persistent load: put exactly one tool of the owning
+    /// capability on the model surface until explicit unload. Sibling tools
+    /// stay off, and activation remains the authority gate. Model control and
+    /// Runtime-derived demand must use `load_tool_for_lease` below so they do
+    /// not mint a hidden persistent source.
     pub fn load_tool(&self, tool_name: &str) -> AgentResult<()> {
+        self.load_tool_with_source(tool_name, true)
+    }
+
+    /// Runtime-owned lease load. Kept separate from the public host load so
+    /// a model `capability.manage load` does not become an accidental
+    /// task-global pin.
+    fn load_tool_for_lease(&self, tool_name: &str) -> AgentResult<()> {
+        self.load_tool_with_source(tool_name, false)
+    }
+
+    fn load_tool_with_source(&self, tool_name: &str, persistent: bool) -> AgentResult<()> {
         let owner = self
             .owner_of(tool_name)
             .ok_or_else(|| AgentError::Tool(format!("unknown tool: {tool_name}")))?;
@@ -529,13 +542,18 @@ impl CapabilityRegistry {
             )));
         }
         let tick = self.stamp_now();
-        entry.tool_states.insert(
-            tool_name.to_string(),
-            CapabilityToolState {
+        let state = entry
+            .tool_states
+            .entry(tool_name.to_string())
+            .or_insert(CapabilityToolState {
                 lifecycle: ToolLifecycle::Loaded,
                 last_used_tick: tick,
-            },
-        );
+                persistent_load: persistent,
+            });
+        state.lifecycle = ToolLifecycle::Loaded;
+        state.last_used_tick = tick;
+        // A runtime lease reload must never weaken an existing host source.
+        state.persistent_load |= persistent;
         // A load puts tools on the surface: bump the generation.
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.catalog_version.fetch_add(1, Ordering::Relaxed);
@@ -718,6 +736,58 @@ impl CapabilityRegistry {
         self.gc_with_pressure(roots, 0)
     }
 
+    /// Reconcile runtime-owned schema leases without advancing the idle
+    /// clock. Loaded, unrooted capability tools move to Warm: their process,
+    /// catalog row and exact reload path remain intact, but their schema no
+    /// longer consumes the next model request.
+    pub fn reconcile_leases(&self, roots: &[String]) -> ToolLeaseReconcileReport {
+        let _surface = self
+            .surface_gate
+            .write()
+            .expect("capability registry poisoned");
+        let mut inner = self.inner.write().expect("capability registry poisoned");
+        let mut candidates: Vec<(String, String)> = inner
+            .iter()
+            .flat_map(|(owner, entry)| {
+                entry.tool_states.iter().filter_map(move |(name, state)| {
+                    (state.lifecycle == ToolLifecycle::Loaded)
+                        .then_some((owner.clone(), name.clone()))
+                })
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+        let mut report = ToolLeaseReconcileReport::default();
+        let mut changed = false;
+        for (owner, name) in candidates {
+            let persistent = inner
+                .get(&owner)
+                .and_then(|entry| entry.tool_states.get(&name))
+                .is_some_and(|state| state.persistent_load);
+            if persistent {
+                report.record_retained_persistent();
+                continue;
+            }
+            if roots.iter().any(|root| root == &name) {
+                report.record_retained();
+                continue;
+            }
+            if let Some(state) = inner
+                .get_mut(&owner)
+                .and_then(|entry| entry.tool_states.get_mut(&name))
+            {
+                state.lifecycle = ToolLifecycle::Warm;
+                changed = true;
+                report.record_released(&name);
+            }
+        }
+        if changed {
+            self.generation.fetch_add(1, Ordering::Relaxed);
+            self.catalog_version.fetch_add(1, Ordering::Relaxed);
+        }
+        report
+    }
+
     /// 统一表面驻留预算下的安全点（评审第 20 条）：Loaded→Warm 冷却
     /// 只由合并压力驱动（本侧 + builtin 侧字节数共用同一组水位，超
     /// 高位才按最久未用冷却到低水位），替代 capability 侧原纯 TTL；
@@ -747,6 +817,7 @@ impl CapabilityRegistry {
                         .collect();
                     for (name, state) in &entry.tool_states {
                         if roots.iter().any(|root| root == name)
+                            || state.persistent_load
                             || state.lifecycle != ToolLifecycle::Loaded
                         {
                             continue;
@@ -777,6 +848,9 @@ impl CapabilityRegistry {
             for entry in inner.values_mut() {
                 for (name, state) in entry.tool_states.iter_mut() {
                     if roots.iter().any(|root| root == name) {
+                        continue;
+                    }
+                    if state.persistent_load {
                         continue;
                     }
                     let idle = tick.saturating_sub(state.last_used_tick);
@@ -900,6 +974,15 @@ impl CapabilityRegistry {
                 continue;
             };
             let activation = restore_activation_meet(live_state.activation, entry.activation);
+            // The checkpoint carries only mechanical residency. Live host
+            // sources are re-established by the composition root before
+            // restore and merged here; restored-only rows remain releasable.
+            let persistent_tools: HashSet<String> = current
+                .tool_states
+                .iter()
+                .filter(|(_, state)| state.persistent_load)
+                .map(|(name, _)| name.clone())
+                .collect();
             if activation.usable() && !entry.loaded_tools.is_empty() {
                 // Per-tool format: only the named tools go on the surface,
                 // and only those the capability actually declares in this
@@ -919,6 +1002,7 @@ impl CapabilityRegistry {
                             CapabilityToolState {
                                 lifecycle: ToolLifecycle::Loaded,
                                 last_used_tick: 0,
+                                persistent_load: persistent_tools.contains(name),
                             },
                         )
                     })
@@ -935,12 +1019,30 @@ impl CapabilityRegistry {
                             CapabilityToolState {
                                 lifecycle: ToolLifecycle::Loaded,
                                 last_used_tick: 0,
+                                persistent_load: persistent_tools.contains(&spec.name),
                             },
                         )
                     })
                     .collect();
             } else {
                 current.tool_states.clear();
+            }
+            if activation.usable() {
+                // A current-run host source outranks stale mechanical
+                // residency. Union it back even when an older checkpoint did
+                // not list the tool; only tools still declared now qualify.
+                for name in persistent_tools {
+                    if current.tool_specs.iter().any(|spec| spec.name == name) {
+                        current
+                            .tool_states
+                            .entry(name)
+                            .or_insert(CapabilityToolState {
+                                lifecycle: ToolLifecycle::Loaded,
+                                last_used_tick: 0,
+                                persistent_load: true,
+                            });
+                    }
+                }
             }
             restored_states.push((
                 entry.id.clone(),
@@ -1324,6 +1426,14 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
         self.base.gc(roots);
     }
 
+    fn reconcile_leases(&self, roots: &[String]) -> ToolLeaseReconcileReport {
+        // Both partitions make their transition at the same actor safe
+        // point. Merge exact counters and a bounded deterministic sample.
+        let mut report = self.capabilities.reconcile_leases(roots);
+        report.merge(self.base.reconcile_leases(roots));
+        report
+    }
+
     fn loaded_surface_bytes(&self) -> usize {
         self.base
             .loaded_surface_bytes()
@@ -1341,6 +1451,13 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
         self.base.load_tool(name)
     }
 
+    fn load_tool_for_lease(&self, name: &str) -> AgentResult<()> {
+        if self.capabilities.owner_of(name).is_some() {
+            return self.capabilities.load_tool_for_lease(name);
+        }
+        self.base.load_tool_for_lease(name)
+    }
+
     fn unload_tool(&self, name: &str) -> AgentResult<()> {
         if self.capabilities.owner_of(name).is_some() {
             return self.capabilities.unload_tool(name);
@@ -1352,6 +1469,21 @@ impl ToolDispatcher for CapabilityAwareDispatcher {
         self.capabilities
             .tool_spec(name)
             .or_else(|| self.base.inspect_tool(name))
+    }
+
+    fn execution_attribution(
+        &self,
+        call: &agent_contracts::ToolCall,
+    ) -> agent_contracts::ToolExecutionAttribution {
+        if self.capabilities.owner_of(&call.name).is_some() {
+            // Capability-declared roles and output metadata are discovery /
+            // model payload, not Runtime fact authority. A future operator
+            // policy may explicitly attribute an admitted capability; until
+            // then dynamic calls fail closed as unattributed.
+            agent_contracts::ToolExecutionAttribution::default()
+        } else {
+            self.base.execution_attribution(call)
+        }
     }
 
     async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
@@ -1856,7 +1988,7 @@ impl CapabilityAwareDispatcher {
             .find(|entry| entry.name == name)
             .is_some_and(|entry| entry.state.in_surface());
         if !already {
-            self.load_tool(&name)?;
+            self.load_tool_for_lease(&name)?;
         }
         let trailer = self.loaded_surface_trailer();
         let (summary, model_content) = if already {
@@ -1877,7 +2009,7 @@ impl CapabilityAwareDispatcher {
             summary,
             model_content,
             artifact_ref: None,
-            metadata: json!({"tool": name, "already_loaded": already}),
+            metadata: json!({"op": "load", "tool": name, "already_loaded": already}),
         })
     }
 
@@ -1894,7 +2026,7 @@ impl CapabilityAwareDispatcher {
             summary: format!("tool unloaded: {name}"),
             model_content: format!("tool unloaded: {name}"),
             artifact_ref: None,
-            metadata: json!({"tool": name}),
+            metadata: json!({"op": "unload", "tool": name}),
         })
     }
 

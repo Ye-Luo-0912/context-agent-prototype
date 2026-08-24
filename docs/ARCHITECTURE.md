@@ -484,13 +484,21 @@ The P1 contract adds:
   `Upstream request failed`) with exponential backoff. A genuine 400
   (illegal tool name, context overflow) is not retryable.
 
-`provider-openai` speaks the OpenAI Chat Completions SSE protocol, which
-DeepSeek, Qwen, Moonshot/Kimi, GLM, and most vendors also implement: point
-`OpenAiConfig::base_url` at any of them. All vendor wire parsing stays in that
-crate. Function names on the wire are mapped to `^[a-zA-Z0-9_-]+$` (`.` and
-`:` become `_`); inbound `tool_calls` are mapped back to Core ids. Two Core
-ids that collapse to the same wire name fail closed before the HTTP call.
-Kernel tool ids are unchanged.
+`provider-openai` speaks both Responses and Chat Completions SSE. Protocol is
+an explicit adapter setting (`responses`, `chat`, or `auto`); `auto` probes
+`<base_url>/responses` once and caches Chat fallback only for an explicit
+unsupported-endpoint result. It never changes `base_url` or fails over between
+providers. Thus PinAI is contacted directly at its own `/v1/responses` base,
+while a localhost OpenCode relay remains a separate provider route. Responses
+input is rebuilt from the Runtime-owned model frame (`message`,
+`function_call`, `function_call_output`) with `store=false`; no provider
+conversation becomes Context authority. Chat `finish_reason=network_error`
+and Responses terminal error events remain retryable transport failures rather
+than structurally empty successful turns. All vendor wire parsing stays in the
+provider crate. Function names on either wire are mapped to
+`^[a-zA-Z0-9_-]+$` (`.` and `:` become `_`); inbound calls are mapped back to
+Core ids. Two Core ids that collapse to the same wire name fail closed before
+the HTTP call. Kernel tool ids are unchanged.
 
 ### ToolDispatcher
 
@@ -512,9 +520,24 @@ capabilities under one catalog:
 
 - `catalog()` — every known tool (builtin + capability) with lifecycle state
   and owner, for `capability.search` / `capability.inspect`;
-- `load_tool(name)` / `unload_tool(name)` — move exactly one tool on/off the
-  model surface; loading one capability tool never surfaces its siblings;
+- `load_tool(name)` / `unload_tool(name)` — host/operator persistent source:
+  move exactly one tool on/off the model surface until explicit unload;
+  loading one capability tool never surfaces its siblings and never grants
+  execution authority;
+- `load_tool_for_lease(name)` — Runtime/model lease load. Typed task, active
+  call and result-delivery roots keep it visible. A trusted model-explicit load
+  also creates a turn-local pending-use root until exact use, unload, or
+  directive end, allowing adjacent loads to coexist without a round TTL. A
+  source-free optional moves to Warm at the next safe decision boundary.
+  Providers without source tracking retain the compatibility fallback to
+  `load_tool`;
 - `inspect_tool(name)` — one tool's full spec;
+- `execution_attribution(call)` — fail-closed, bounded pre-dispatch semantics:
+  trusted purpose, canonical resource identities and whether a registered
+  Verify operation may be reused within one task anchor. It is not part of
+  `ToolSpec`, grants no authority, and cannot be supplied by producer output
+  metadata. Dynamic capabilities default to Unattributed; shell/process are
+  Opaque;
 - `ToolLifecycle::{Available, Loaded, Active, Warm, Unloaded}` is the one
   lifecycle shared by both planes: registered-but-not-loaded capability
   tools are `Available` and do not grow the prompt, the builtin catalog
@@ -543,6 +566,34 @@ candidate set:
   executing tool as `MustSurface`. Derivation is deterministic,
   de-duplicated, catalog-filtered and bounded, and the explicit task-owned
   set stays the authority;
+- an anchor-bound trusted verification-source row may PreferSurface the exact
+  verifier that previously produced current evidence. If that schema is not
+  available, typed role derivation remains the fallback; source affinity does
+  not itself authorize execution or prove equivalence;
+- an exact verifier may separately opt into `ExactCurrentWorld` only with a
+  SHA-256 host identity digest covering recipe, execution-profile, policy and
+  relevant environment revisions. Raw environment material never crosses the
+  attribution boundary. Runtime reuses a PASS only when task-owned
+  execution state, anchor revision, user-directive revision, workspace
+  revision, exact tool, canonical argument digest and that host identity all
+  match and verification validity remains Current. The receipt is provenance
+  on the existing bounded verification fact, never Context/transcript state;
+  a new directive or any uncertain identity executes normally. Generic shell,
+  process and dynamic capability metadata cannot opt in;
+- the production builtin verifier is `verify.run { recipe_id }`, never an
+  arbitrary command wrapper. `VerificationRecipes` is bounded, immutable and
+  shared by construction: it derives the dispatcher's concrete argv/cwd/env
+  and the composition root's `ExecRecipe` host policy. Unknown ids collapse to
+  empty authority. The tool is added to the required round surface only when a
+  recipe exists, so empty/non-project workspaces pay no schema cost. General
+  project test runners remain `TaskScoped`; only a host-asserted
+  source-read-only recipe may use exact reuse. Exact capture hashes recipe
+  revision, platform, executable, inherited environment and either a declared
+  complete input set or a complete bounded workspace snapshot. Runtime samples
+  the trusted identity before and after execution and records an exact PASS only
+  when they match. Links/escapes, external-input directives, special files,
+  races or incomplete/oversized capture keep the result TaskScoped and execute
+  later requests normally;
 - after the tool-GC safe point, the runtime refreshes required lifecycle flags
   and `RoundSurfacePlan` projects the complete loaded candidate set. Mandatory
   schemas are retained, preferred schemas degrade deterministically under
@@ -554,8 +605,10 @@ candidate set:
   after a Ready plan and successful final packing.
 
 Capability lifecycle is per tool: loading one tool of a capability never
-surfaces its siblings, while process start/stop stays owner-level, and
-checkpoint restore migrates legacy whole-capability flags to per-tool lists.
+surfaces its siblings, while process start/stop stays owner-level. Checkpoint
+restore migrates legacy whole-capability flags to per-tool lists but treats
+them as mechanical residency, not proof of a persistent source; live
+composition-time host sources are unioned back after restore.
 Every selected/omitted round row carries per-row provenance
 (`TaskRequirement` / `DispatcherRequired` / `CatalogLoadedOptional` /
 `Unknown` for legacy rows), so task-authored Prefer is distinguishable from
@@ -851,13 +904,19 @@ resolves `body_ref` when given a workspace (`--workspace`).
 ```text
 User input
    │
+   ├─ create/activate long-lived Task; replace current TurnIntent
+   ├─ seed ActiveTurn.execution from TaskRecord.resume
    ├─ persist exact body (user-input artifact, if workspace wired)
    ├─ ContextEngine.ingest(UserMessage)   ── full body
    ├─ emit UserMessageAccepted            ── bounded preview + envelope
    ├─ maintain(UserInput)
    │
    v
-maintain(BeforeModel)
+BeforeModel safe point
+   ├─ close settled tool scopes / reconcile pending tool leases
+   ├─ revalidate bounded pending path identities
+   ├─ derive one RoundExecutionSnapshot + TaskProgressView
+   └─ maintain(BeforeModel)
    │
    v
 ContextEngine.materialize(ContextQuery)   ── the Context Frame (long-term working set)
@@ -874,9 +933,13 @@ ModelTransport.complete_stream()
    │                                     │
    └─ tool calls                         │
        │                                 │
+       ├─ trusted pre-dispatch attribution / authority lease
        ├─ approval                       │
-       ├─ ToolDispatcher.execute         │
+       ├─ ToolDispatcher.execute or prepare effect
+       ├─ generation fence + commit / rollback
        ├─ artifact raw output            │
+       ├─ settle the complete requested batch
+       ├─ update ActiveTurn.execution / obligations / frontier
        ├─ bounded ToolOutput ──▶ Turn Frame (execution stack, runtime-owned)
        └─ not ingested during the turn   │
              │                           │
@@ -886,13 +949,24 @@ Final answer
    ├─ persist turn: ingest(ToolObservation) x N + maintain(AfterTool)
    ├─ ingest(AssistantMessage)
    ├─ maintain(AfterModel)
-   └─ TurnCompleted
+   ├─ GC / input Consumed+Archived
+   ├─ durable TurnCompleted barrier
+   ├─ install ActiveTurn.execution as TaskRecord.resume
+   └─ optional explicit task.complete safe-point transaction
 ```
 
 The tool result loop is the runtime's execution stack, not long-term memory:
 results ride in the `TurnFrame` and never touch the context engine until the
 turn ends, when they are persisted as observations and observed by one
 `maintain(AfterTool)` pass.
+
+This is the landed ordinary-turn loop. Full `RuntimeCheckpoint` capture and
+restore are landed, but automatic checkpoint scheduling and autonomous
+continuation from a safe point *inside* one long user directive are not. The
+planned extension reuses `TaskAnchor + TaskRecord.resume` and never serializes
+the raw transcript; see
+[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md) and the continuation
+boundary in [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md).
 
 ### The model budget: the engine only sees its slice
 
@@ -1004,12 +1078,27 @@ system prompt or the tool schemas.
 The turn's own protocol history is a working set too, not an append-only
 log: the wire view keeps only the last `TURN_FRAME_KEEP_EXCHANGES`
 completed tool exchanges and replaces older whole call+result groups with
-one bounded deterministic `TURN CHECKPOINT` note (no LLM summary). The
-runtime's full `TurnFrame` is never mutated — audit, events, and
-turn-end persistence still see every step; only the model-facing wire
-projection is bounded. Details and the progress/stall machinery that
-motivate it are in
+one bounded deterministic `TURN CHECKPOINT` note (no LLM summary). For
+long turns the note also carries a receipt index of at most six distinct
+persistable outcomes, each at most 96 characters: tool name, `ok`/`failed`,
+and the tool-owned short summary. Arguments, raw/model content, artifacts,
+and transient context-retrieval results are excluded. The receipt is a
+low-authority record that an outcome happened, not evidence that it remains
+current; typed TaskProgress/Execution Frontier freshness still decides that.
+The runtime's full `TurnFrame` is never mutated — audit, events, and turn-end
+persistence still see every step; only the model-facing wire projection is
+bounded. `ModelStarted.turn_checkpoint` records only compacted/receipt counts
+for evaluation, never receipt text. This changes no ContextEngine selection,
+GC, residency, reactivation, or budget rule. Details and the progress/stall
+machinery that motivate it are in
 [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md).
+
+When a selected `fs.read`/file-observation body has an exact
+`path@revision` match in the current TaskProgress Fresh set, its low-authority
+context header co-locates `workspace_identity=current`. This is a currentness
+fact, not an instruction and not permission to omit the only body. It avoids
+requiring the model to join distant prompt layers while preserving the rule
+that TaskProgress identity alone never replaces file content.
 
 #### Runtime Facts layer (`TOOL-ENV-01`)
 
@@ -1057,12 +1146,19 @@ window also carries a bounded `C/L/N` physical-EOL token map. Its displayed
 body remains a numbered logical view capped at 400 lines. The full UTF-8 read
 and revision lookup share the 4 MiB mutation ceiling and use a `MAX + 1`
 bounded growth probe, so every admitted canonical edit target can first yield
-a revision without creating an unbounded ingest path. `edit.patch` is the single canonical
-mutation visible to the model: root `files[]`, with required `path`, a
-`base_revision` copied from `fs.read`, and nonempty `hunks` per entry (at most 16 files
-and 64 hunks total). The runtime still parses the old top-level single-file
-shortcut for compatibility, but does not advertise it; a top-level revision
-cannot be silently spread across multiple files. `edit.replace` remains
+a revision without creating an unbounded ingest path. `edit.patch` is the
+single canonical mutation visible to the model: root `files[]`, with required
+`path`, a `base_revision` copied from `fs.read`, and nonempty `hunks` per entry
+(at most 16 files and 64 hunks total). Each model-visible hunk declares
+`op = replace | insert_before | insert_after` plus a unique exact `old` anchor
+with enough unchanged context. Insert operations preserve the anchor and
+insert the explicit `new` bytes beside it; they do not infer separators or
+newlines. Omitted `op` defaults to replace only in the compatibility parser,
+and ordinal `occurrence` remains parser-only because repeated-text positions
+are brittle after earlier hunks. The bounded success echo preserves both the beginning and end of a
+large changed span and marks the omitted middle. The runtime still parses the
+old top-level single-file shortcut for compatibility, but does not advertise
+it; a top-level revision cannot be silently spread across multiple files. `edit.replace` remains
 catalog-only and also accepts a revision. Refusals distinguish
 `stale_revision`, `no_exact_match` and `ambiguous_match` and return the
 current revision plus at most three candidate regions.
@@ -1071,8 +1167,9 @@ Production `edit.patch` validates that `base_revision` equals the transaction
 snapshot SHA-256; it does not retain a per-run read ledger proving that the
 string came from the latest `fs.read`. The v3 Tool Surface gate verifies that
 provenance from the trace as evaluation evidence. The compatibility parser
-also still accepts the legacy top-level form and a missing revision; this is a
-wire-compatibility boundary, not a second model-visible schema.
+also still accepts the legacy top-level form, a missing revision and an
+omitted operation; this is a wire-compatibility boundary, not a second
+model-visible schema.
 
 The matching contract is **newline-token exact**, never fuzzy. LF and CRLF
 are the only two physical encodings admitted for one logical newline token;
@@ -1207,7 +1304,19 @@ and artifact policy:
 | `edit.patch` | write | result + revisions + one globally bounded changed-region echo | change journal |
 | `edit.replace` | write | result + revision + bounded changed-region echo | change journal |
 | `git.status` / `git.diff` | read | ≤ 12 K chars tail | artifact when truncated |
-| `shell.exec` / `process.run` / `process.session` | process | bounded ring tail / session page | artifact (incremental append) |
+| `shell.exec` / `process.run` / `process.session` | process | bounded ring tail / session page | artifact for non-empty capture (incremental append) |
+
+Model-visible spill continuation is centralized on `artifact.read`.
+`process.run` and host-owned `verify.run` do not publish an `artifact_ref` for
+a zero-byte stdout/stderr capture; the terminal result says that no output was
+produced. Any non-empty or truncated capture retains the sealed artifact and
+the same bounded continuation path.
+`fs.list`, `search.grep`, and `code.symbols` expose only their bounded
+first-page inputs; an overflow result carries the run-owned `artifact_ref` and
+next line. Their older snapshot-cursor arguments remain parser-only
+compatibility for trusted callers. This prevents a model from inventing an
+opaque capability merely because every ordinary first-page schema advertises
+one, while preserving bounded immutable-artifact paging.
 
 `search.grep` skips `.git`, `.focus-agent`, `target`, `node_modules`, `vendor`,
 `dist`, `build`, `.idea`, `.vscode` and caps files scanned (5000) and bytes per
@@ -1821,13 +1930,31 @@ single-purpose meta-tools:
   `unload`, provided identically by the builtin dispatcher and the
   capability-aware dispatcher (which filters out the builtin copy).
 
-The default always-loaded model surface is `fs.list`, `fs.read`,
-`search.grep`, `artifact.read`, `edit.patch`, `task.complete`,
-`capability.manage`. `edit.patch` is the single canonical mutation
-primitive; `fs.write`, `edit.replace`, git, shell, and process stay
-catalog-only. `context.manage` is catalog-only until an evidence fact-gap
-(Warm/Cold/Stored catalog, TaskAnchor `evidence_refs`, or open loops);
-the model can also load it through `capability.manage`. Catalog search
+`task.complete` asks the model only for the bounded semantic summary. The
+Runtime already owns current assistant-output and verification evidence and
+attaches those handles to `CompletionRecord` at the safe point. The older
+model-supplied artifact list remains parser-only compatibility; asking the
+model to echo opaque runtime capabilities created avoidable invalid proposals
+without adding authority or evidence. Ending a model turn is implicit and does
+not close the durable task. `task.complete` is therefore catalog-cold during
+ordinary work: Runtime leases it for explicit task-closure intent or an
+explicit task requirement, while the model can still deliberately discover
+and load it through `capability.manage`. Once accepted, it terminates directly
+after the whole sibling batch settles successfully and current verification
+still passes. A failed sibling or invalidated completion gate returns the
+results to the model instead of hiding them behind task closure.
+
+The default always-loaded model surface is `fs.list`, `fs.read`, `fs.write`,
+`search.grep`, `artifact.read`, `edit.patch`, `git.status`, `git.diff`, and
+`capability.manage`. `edit.patch` is the single canonical revision-aware
+mutation primitive for existing text; compact universal file creation and
+read-only Git review remain visible because measured catalog-control rounds
+cost more than their small schemas. Surface visibility grants no effect
+authority. `edit.replace`, shell, process and plugin tools stay catalog-only.
+`context.manage` is catalog-only until a typed evidence need
+(Warm/Cold/Stored catalog, TaskAnchor `evidence_refs`, or open loops), while
+`task.complete` is catalog-only until explicit closure intent or a task-owned
+requirement; the model can also load either through `capability.manage`. Catalog search
 accepts `role=mutate|verify|read_resource|search|inspect_diff|escape_hatch`
 so the model does not have to guess keywords. The merge is evidence-backed,
 not assumed: `merged_control_surface_costs_

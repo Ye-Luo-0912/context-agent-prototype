@@ -21,6 +21,16 @@ pub struct HostToolPolicy {
     pub binding: HostEffectBinding,
 }
 
+/// One host-owned process recipe used by an [`HostEffectBinding::ExecRecipe`]
+/// policy. The model selects only `id`; the executable argv never comes from
+/// model arguments. Concrete recipe descriptions, cwd and environment stay
+/// in the tool implementation and do not become authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostExecRecipe {
+    pub id: String,
+    pub argv: Vec<String>,
+}
+
 /// How the host interprets this tool's arguments. Not carried on
 /// [`crate::ToolSpec`]: a generated plugin cannot bind itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +42,13 @@ pub enum HostEffectBinding {
     },
     ExecArgv {
         argv_arg: String,
+    },
+    /// Resolve a bounded host-registered recipe id to its exact argv. An
+    /// unknown/empty id resolves to an empty intent and therefore cannot
+    /// acquire process authority.
+    ExecRecipe {
+        recipe_arg: String,
+        recipes: Vec<HostExecRecipe>,
     },
     ShellExec {
         command_arg: String,
@@ -152,6 +169,18 @@ impl HostToolPolicy {
             } => workspace_write_intent(arguments, path_arg, content_args),
             HostEffectBinding::ExecArgv { argv_arg } => {
                 exec_argv_intent(&string_list(arguments, argv_arg))
+            }
+            HostEffectBinding::ExecRecipe {
+                recipe_arg,
+                recipes,
+            } => {
+                let recipe_id = string_arg(arguments, recipe_arg);
+                let argv = recipes
+                    .iter()
+                    .find(|recipe| recipe.id == recipe_id)
+                    .map(|recipe| recipe.argv.as_slice())
+                    .unwrap_or_default();
+                exec_argv_intent(argv)
             }
             HostEffectBinding::ShellExec {
                 command_arg,
@@ -343,6 +372,31 @@ mod tests {
             "-rf".into(),
             ".".into()
         ])));
+    }
+
+    #[test]
+    fn exec_recipe_resolves_only_the_host_registered_argv() {
+        let policy = HostToolPolicy {
+            tool_name: "verify.run".into(),
+            binding: HostEffectBinding::ExecRecipe {
+                recipe_arg: "recipe_id".into(),
+                recipes: vec![HostExecRecipe {
+                    id: "rust.workspace".into(),
+                    argv: vec!["cargo".into(), "test".into(), "--workspace".into()],
+                }],
+            },
+        };
+        assert_eq!(
+            policy.intent_from(&json!({
+                "recipe_id": "rust.workspace",
+                "argv": ["different", "model", "argv"]
+            })),
+            exec_argv_intent(&["cargo".into(), "test".into(), "--workspace".into()])
+        );
+        assert_eq!(
+            policy.intent_from(&json!({"recipe_id": "unknown"})),
+            exec_argv_intent(&[])
+        );
     }
 
     #[test]

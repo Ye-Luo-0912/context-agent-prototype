@@ -11,6 +11,8 @@ mod session;
 mod shell;
 mod stream;
 mod task;
+mod task_manage;
+mod verify;
 mod view;
 
 pub(crate) use artifact::ArtifactReadTool;
@@ -20,12 +22,14 @@ pub(crate) use edit::EditReplaceTool;
 pub(crate) use fs::{FsListTool, FsReadTool, FsWriteTool};
 pub(crate) use git::{GitDiffTool, GitStatusTool};
 pub(crate) use patch::EditPatchTool;
-pub(crate) use process::ProcessRunTool;
+pub(crate) use process::{ProcessRunTool, verification_executable_identity};
 pub(crate) use search::SearchGrepTool;
 pub(crate) use session::{ProcessSession, ProcessSessionTool};
 pub(crate) use shell::ShellExecTool;
 pub use shell::{ShellDialect, ShellKind};
 pub(crate) use task::TaskCompleteTool;
+pub(crate) use task_manage::TaskManageTool;
+pub(crate) use verify::VerificationRunTool;
 pub(crate) use view::{
     hidden_path_output, is_hidden_name, is_not_found_error, missing_path_output,
     ordinary_view_blocked,
@@ -687,8 +691,11 @@ const EDIT_ECHO_CONTEXT_LINES: usize = 3;
 pub(crate) const EDIT_ECHO_MAX_CHARS: usize = 1200;
 
 /// Keep a model-facing fragment inside a hard character budget, including
-/// the truncation marker itself. This is shared by single- and multi-file
-/// edit receipts so adding files can never multiply an advertised cap.
+/// the truncation marker itself. Preserve both ends: edit receipts commonly
+/// span several distant hunks, and a prefix-only bound can hide the final
+/// changed hunk or a missing file terminator while still claiming to echo the
+/// changed region. This is shared by single- and multi-file edit receipts so
+/// adding files can never multiply an advertised cap.
 pub(crate) fn bound_chars_with_marker(text: &str, max_chars: usize, marker: &str) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -700,8 +707,14 @@ pub(crate) fn bound_chars_with_marker(text: &str, max_chars: usize, marker: &str
     if marker_len >= max_chars {
         return marker.chars().take(max_chars).collect();
     }
-    let mut bounded: String = text.chars().take(max_chars - marker_len).collect();
+    let retained = max_chars - marker_len;
+    let head_chars = retained.div_ceil(2);
+    let tail_chars = retained - head_chars;
+    let mut bounded: String = text.chars().take(head_chars).collect();
     bounded.push_str(marker);
+    let mut tail: Vec<char> = text.chars().rev().take(tail_chars).collect();
+    tail.reverse();
+    bounded.extend(tail);
     bounded
 }
 
@@ -752,22 +765,64 @@ pub(crate) fn edit_echo(original: &str, updated: &str, max_chars: usize) -> Stri
     };
     let window_start = first_line.saturating_sub(EDIT_ECHO_CONTEXT_LINES);
     let take = last_line + 1 + EDIT_ECHO_CONTEXT_LINES - window_start;
-    let mut out = String::new();
+    let marker = "… (middle of echo omitted at cap; fs.read the path for the full body)\n";
+    let marker_len = marker.chars().count();
+    if max_chars == 0 {
+        return String::new();
+    }
+    if marker_len >= max_chars {
+        return marker.chars().take(max_chars).collect();
+    }
+    let retained = max_chars - marker_len;
+    let head_limit = retained.div_ceil(2);
+    let tail_limit = retained - head_limit;
+    let mut full = String::new();
+    let mut full_chars = 0usize;
+    let mut head = String::new();
+    let mut head_chars = 0usize;
+    let mut tail = std::collections::VecDeque::with_capacity(tail_limit);
+    let mut truncated = false;
     for (index, line) in updated.lines().enumerate().skip(window_start).take(take) {
         let number = index + 1;
         let clipped: String = line.chars().take(120).collect();
         let rendered = format!("{number:>6} | {clipped}\n");
-        if out.chars().count() + rendered.chars().count() > max_chars {
-            out.push_str(&rendered);
-            return bound_chars_with_marker(
-                &out,
-                max_chars,
-                "… (echo truncated at cap; fs.read the path for the full body)\n",
-            );
+        let rendered_chars = rendered.chars().count();
+        if !truncated && full_chars.saturating_add(rendered_chars) <= max_chars {
+            full.push_str(&rendered);
+            full_chars += rendered_chars;
+            continue;
         }
-        out.push_str(&rendered);
+        if !truncated {
+            truncated = true;
+            for ch in full.chars().chain(rendered.chars()) {
+                if head_chars < head_limit {
+                    head.push(ch);
+                    head_chars += 1;
+                } else if tail_limit > 0 {
+                    if tail.len() == tail_limit {
+                        tail.pop_front();
+                    }
+                    tail.push_back(ch);
+                }
+            }
+            full.clear();
+            continue;
+        }
+        if tail_limit > 0 {
+            for ch in rendered.chars() {
+                if tail.len() == tail_limit {
+                    tail.pop_front();
+                }
+                tail.push_back(ch);
+            }
+        }
     }
-    out
+    if !truncated {
+        return full;
+    }
+    head.push_str(marker);
+    head.extend(tail);
+    head
 }
 
 pub(crate) fn classify_process_outcome(
@@ -879,12 +934,19 @@ pub(crate) const MAX_SNAPSHOT_BYTES: u64 = 2 * 1024 * 1024;
 pub(crate) fn parse_cursor(cursor: &str) -> AgentResult<(&str, usize)> {
     let (reference, offset) = cursor.rsplit_once('#').ok_or_else(|| {
         AgentError::InvalidRequest(format!(
-            "malformed cursor (expected <artifact_ref>#<offset>): {cursor:?}"
+            "malformed cursor (expected <artifact_ref>#<offset>): {cursor:?}; omit cursor for the first page and otherwise copy metadata.cursor verbatim"
         ))
     })?;
-    let offset: usize = offset
-        .parse()
-        .map_err(|_| AgentError::InvalidRequest(format!("malformed cursor offset: {cursor:?}")))?;
+    let offset: usize = offset.parse().map_err(|_| {
+        AgentError::InvalidRequest(format!(
+            "malformed cursor offset: {cursor:?}; copy metadata.cursor verbatim"
+        ))
+    })?;
+    agent_contracts::ArtifactLocator::parse(reference).map_err(|error| {
+        AgentError::InvalidRequest(format!(
+            "invalid cursor artifact identity: {error}; omit cursor for the first page and otherwise copy metadata.cursor verbatim"
+        ))
+    })?;
     Ok((reference, offset))
 }
 
@@ -1271,6 +1333,18 @@ mod echo_tests {
             echo.chars().count() <= 200,
             "the hard cap must hold: {} chars",
             echo.chars().count()
+        );
+        assert!(
+            echo.contains("line 0"),
+            "the first changed lines stay visible: {echo}"
+        );
+        assert!(
+            echo.contains("line 59"),
+            "the last changed lines stay visible: {echo}"
+        );
+        assert!(
+            echo.contains("middle of echo omitted"),
+            "the marker must describe middle omission: {echo}"
         );
     }
 

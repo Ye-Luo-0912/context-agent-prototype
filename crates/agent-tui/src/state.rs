@@ -306,6 +306,30 @@ impl AppState {
                     changed_fields.join(", ")
                 ));
             }
+            RuntimeEvent::TaskProgressUpdated {
+                task_id,
+                accepted,
+                anchor_revision,
+                changed_fields,
+                reason,
+            } => {
+                // task.manage 的确定性结果：拒绝时状态未变，reason 说明
+                // 类别（如过期基准修订），便于从事件流核对 CAS 结果。
+                if accepted {
+                    if changed_fields.is_empty() {
+                        self.push_system(format!(
+                            "task {task_id} progress already current at r{anchor_revision}"
+                        ));
+                    } else {
+                        self.push_system(format!(
+                            "task {task_id} progress recorded at r{anchor_revision}: {}",
+                            changed_fields.join(", ")
+                        ));
+                    }
+                } else {
+                    self.push_system(format!("task {task_id} progress refused: {reason}"));
+                }
+            }
             RuntimeEvent::Pinned { content } => {
                 self.push_system(format!("pinned: {content}"));
             }
@@ -413,6 +437,16 @@ impl AppState {
                 }
                 self.push_system(message);
             }
+            RuntimeEvent::ToolLeasesReconciled {
+                boundary, report, ..
+            } => {
+                if report.released_to_warm > 0 {
+                    self.push_system(format!(
+                        "tool leases reconciled at {boundary:?}: {} optional schema(s) left the surface, {} retained by a live root",
+                        report.released_to_warm, report.retained_by_root
+                    ));
+                }
+            }
             RuntimeEvent::ModelStarted {
                 turn_id,
                 operation_id,
@@ -496,12 +530,25 @@ impl AppState {
                 // 收敛账目不进消息面板：advisory 已由 TASK PROGRESS 渲染，
                 // 这里只是保持 match 穷尽。
             }
+            RuntimeEvent::ExecutionBatchSettled { .. } => {
+                // Body-free action accounting belongs to eval/audit, not the
+                // conversational panel.
+            }
             RuntimeEvent::ProtocolBodyCacheStats { .. } => {
                 // 正文缓存账目同理：指标归 eval 聚合，UI 不重复渲染。
             }
             RuntimeEvent::ExecutionObligation { .. } => {
                 // 义务账目同理：typed 计数归 eval 聚合，advisory 已由
                 // TASK PROGRESS 渲染。
+            }
+            RuntimeEvent::ExecutionNegativeFact { .. } => {
+                // Speculative absence lifecycle is an audit/eval signal. Its
+                // truthful no-dispatch result is already visible as the
+                // corresponding ToolFinished row.
+            }
+            RuntimeEvent::ExecutionVerificationPass { .. } => {
+                // Exact PASS lifecycle is audit/eval data. A reused result is
+                // already visible through its truthful ToolFinished row.
             }
             RuntimeEvent::Diagnostics { diagnostics } => {
                 self.context = diagnostics.clone();
@@ -687,6 +734,7 @@ mod tests {
             generation: 3,
             surface_revision: 8,
             model_round: 2,
+            turn_checkpoint: Default::default(),
             prompt_layers: Default::default(),
         }));
 
@@ -736,6 +784,7 @@ mod tests {
             generation: 4,
             surface_revision: 1,
             model_round: 1,
+            turn_checkpoint: Default::default(),
             prompt_layers: Default::default(),
         }));
 
@@ -821,6 +870,7 @@ mod tests {
             generation: 5,
             surface_revision: 3,
             model_round: 1,
+            turn_checkpoint: Default::default(),
             prompt_layers: Default::default(),
         }));
 

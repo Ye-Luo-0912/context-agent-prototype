@@ -1,6 +1,7 @@
 mod host_policies;
 mod registry;
 pub mod tools;
+mod verification;
 
 pub use agent_contracts::{
     CAPABILITY_INSPECT, CAPABILITY_LOAD, CAPABILITY_SEARCH, CAPABILITY_UNLOAD, ToolCatalogEntry,
@@ -9,3 +10,6 @@ pub use agent_contracts::{
 pub use host_policies::{BUILTIN_TOOL_POLICIES, BuiltinToolPolicies};
 pub use registry::{BuiltinToolDispatcher, ToolLifecycleConfig};
 pub use tools::{ShellDialect, ShellKind};
+pub use verification::{
+    MAX_VERIFICATION_RECIPES, VERIFY_RUN_TOOL_NAME, VerificationRecipe, VerificationRecipes,
+};

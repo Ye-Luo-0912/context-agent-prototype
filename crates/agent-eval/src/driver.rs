@@ -18,7 +18,7 @@ use agent_runtime::{
 use anyhow::Context as _;
 use context_baselines::{AppendOnlyEngine, RollingConfig, RollingSummaryEngine};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
-use provider_openai::{OpenAiConfig, OpenAiProvider, RetryingTransport};
+use provider_openai::{OpenAiConfig, OpenAiProtocol, OpenAiProvider, RetryingTransport};
 use tokio::sync::broadcast;
 
 /// Per-engine measurement of one eval run.
@@ -102,11 +102,18 @@ fn build_model_with_timeout(timeout: Duration) -> anyhow::Result<Arc<dyn ModelTr
     let base_url = crate::envfile::get("OPENAI_BASE_URL")
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
     let model = crate::envfile::get("OPENAI_MODEL").unwrap_or_else(|| "gpt-4o-mini".to_string());
+    let protocol = crate::envfile::get("OPENAI_API_PROTOCOL")
+        .as_deref()
+        .map(OpenAiProtocol::parse)
+        .transpose()
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or_default();
     let context_window = crate::envfile::context_window()?;
     let provider = OpenAiProvider::new(OpenAiConfig {
         api_key,
         base_url,
         model,
+        protocol,
         max_output_tokens: 4096,
         timeout,
         send_stream_options: true,

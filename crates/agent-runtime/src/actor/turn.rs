@@ -135,6 +135,9 @@ impl RuntimeActor {
             turn_frame: TurnFrame::new(content),
             model_round: 0,
             pending_tools: VecDeque::new(),
+            pending_loaded_tools: Vec::new(),
+            result_delivery_tools: Vec::new(),
+            action_batch: None,
             tool_surface: None,
             turn_state: TurnState::Running,
             op: None,
@@ -182,10 +185,77 @@ impl RuntimeActor {
         }
     }
 
+    /// Return the accepted completion summary only at the terminal edge of
+    /// a fully successful tool batch. A failed sibling or a verification
+    /// invalidation deliberately routes through another model decision so
+    /// the model can inspect and recover instead of having its earlier
+    /// proposal blindly committed.
+    pub(super) fn terminal_completion_summary(&self) -> Option<String> {
+        let turn = self.state.turn.as_ref()?;
+        let batch = turn.action_batch.as_ref()?;
+        if batch.terminal != batch.requested
+            || batch.failed != 0
+            || completion_from_execution(&turn.execution).is_err()
+        {
+            return None;
+        }
+        turn.pending_completion
+            .as_ref()
+            .map(|proposal| proposal.summary.clone())
+    }
+
+    /// Finish a model-selected `task.complete` without manufacturing a
+    /// confirmation round. The action ledger is durable before the normal
+    /// turn/completion transaction begins.
+    pub(super) fn finalize_terminal_completion(
+        &mut self,
+        summary: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        // Return a boxed future at the function boundary. `finalize_turn`
+        // contains the entire durability transaction; keeping its concrete
+        // future out of the hot operation-completion state machine avoids a
+        // multi-megabyte polling stack on Windows.
+        Box::pin(async move {
+            if let Err(error) = self.settle_action_batch().await {
+                self.require_effect_recovery(format!(
+                    "action-batch audit failed before terminal completion: {error}"
+                ))
+                .await;
+                self.settle_aborted_turn().await;
+                return;
+            }
+            // The ordinary next-model path closes every result scope before
+            // consuming the batch. One-shot completion has no next model,
+            // so perform the same bounded close here; otherwise a later
+            // completion-transaction failure could drop the turn while its
+            // already-landed tool scope remained open.
+            if let Err(error) = self.close_tool_frames().await {
+                let _ = self
+                    .core
+                    .emit_event(RuntimeEvent::Error {
+                        message: crate::output::bound_error_message(error.to_string()),
+                    })
+                    .await;
+            }
+            self.finalize_turn(summary).await;
+        })
+    }
+
     pub(super) async fn spawn_next_model_or_end(
         &mut self,
         op_tx: &mpsc::Sender<OperationCompletion>,
     ) {
+        // A model request consumes only a fully terminalized tool batch.
+        // Settle the body-free ledger first; the round-budget refusal path
+        // must report the batch too rather than dropping its accounting.
+        if let Err(error) = self.settle_action_batch().await {
+            self.require_effect_recovery(format!(
+                "action-batch audit failed before the next model decision: {error}"
+            ))
+            .await;
+            self.settle_aborted_turn().await;
+            return;
+        }
         let over_budget = self.state.turn.as_ref().is_some_and(|turn| {
             turn.op.is_none() && turn.model_round >= self.services.max_tool_rounds()
         });
@@ -280,6 +350,19 @@ impl RuntimeActor {
                         .await;
                 }
             }
+            RuntimeDirective::UpdateTaskProgress(proposal) => {
+                // Safety net only: the operation-commit path applies
+                // progress proposals itself so the CAS outcome reaches the
+                // model. A proposal here would be applied without that
+                // feedback loop, so refuse instead of half-applying.
+                let _ = self
+                    .core
+                    .emit_warning(
+                        "task.manage proposal refused: no model-visible result to attach".into(),
+                    )
+                    .await;
+                drop(proposal);
+            }
         }
     }
 
@@ -310,6 +393,133 @@ impl RuntimeActor {
         };
         turn.pending_completion = Some(proposal);
         Ok(())
+    }
+
+    /// Apply a `task.manage` progress proposal through the trusted anchor
+    /// compare-and-swap. The authoritative outcome replaces the tool's
+    /// optimistic submission text: success reports the resulting revision,
+    /// a refusal reports the typed reason and leaves task state untouched,
+    /// so a stale revision is correctable and retryable in the next round.
+    /// The proposal structurally carries only autonomous fields; goal and
+    /// constraint changes stay on the boundary/approval path.
+    pub(super) async fn apply_task_progress_proposal(
+        &mut self,
+        output: &mut ToolOutput,
+        proposal: TaskProgressProposal,
+    ) {
+        let Some(task_id) = self.state.tasks.active() else {
+            output.ok = false;
+            output.summary = "task.manage refused: no active task".into();
+            output.metadata = serde_json::json!({ "refused": "no_active_task" });
+            return;
+        };
+        let patch = AnchorPatch {
+            current_interpretation: proposal.current_interpretation.clone(),
+            plan_progress: proposal.plan_progress.clone(),
+            open_loops: proposal.open_loops.clone(),
+            next_action: proposal.next_action.clone(),
+            ..AnchorPatch::default()
+        };
+        let prepared =
+            self.state
+                .tasks
+                .prepare_patch_anchor(task_id, proposal.base_anchor_revision, &patch);
+        let (txn, revision, changed_fields, kind) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // A stale base revision (or an immutable completed task)
+                // changes nothing: the typed reason carries the current
+                // revision so the model can re-read and retry.
+                output.ok = false;
+                output.summary = bounded_preview(
+                    &format!("task.manage refused: {error}"),
+                    agent_contracts::MAX_TOOL_SUMMARY_CHARS,
+                );
+                output.metadata = serde_json::json!({ "refused": "anchor_cas" });
+                let _ = self
+                    .core
+                    .emit_event(RuntimeEvent::TaskProgressUpdated {
+                        task_id,
+                        accepted: false,
+                        anchor_revision: 0,
+                        changed_fields: Vec::new(),
+                        reason: bounded_preview(
+                            &error.to_string(),
+                            agent_contracts::MAX_TASK_ANCHOR_ITEM_CHARS,
+                        ),
+                    })
+                    .await;
+                return;
+            }
+        };
+        if changed_fields.is_empty() {
+            // Idempotent no-op: nothing moved, so no generation bump and
+            // no anchor event — but the model still learns the live
+            // revision for its next CAS base.
+            self.state.tasks.commit(txn);
+            output.summary = format!("task progress already current at anchor revision {revision}");
+            output.metadata = serde_json::json!({ "anchor_revision": revision, "changed": 0 });
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::TaskProgressUpdated {
+                    task_id,
+                    accepted: true,
+                    anchor_revision: revision,
+                    changed_fields: Vec::new(),
+                    reason: "idempotent".into(),
+                })
+                .await;
+            return;
+        }
+        if let Err(error) = self.bump_generation() {
+            output.ok = false;
+            output.summary = format!("task.manage refused: {error}");
+            output.metadata = serde_json::json!({ "refused": "generation" });
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::Error {
+                    message: error.to_string(),
+                })
+                .await;
+            return;
+        }
+        debug_assert!(matches!(kind, AnchorPatchKind::Autonomous));
+        if let Err(error) = self
+            .core
+            .emit_event(RuntimeEvent::TaskAnchorChanged {
+                task_id,
+                revision,
+                changed_fields: changed_fields.clone(),
+                patch_kind: kind,
+            })
+            .await
+        {
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::Error {
+                    message: error.to_string(),
+                })
+                .await;
+        }
+        let _ = self
+            .core
+            .emit_event(RuntimeEvent::TaskProgressUpdated {
+                task_id,
+                accepted: true,
+                anchor_revision: revision,
+                changed_fields: changed_fields.clone(),
+                reason: String::new(),
+            })
+            .await;
+        self.state.tasks.commit(txn);
+        output.summary = format!(
+            "task progress recorded at anchor revision {revision}: {}",
+            changed_fields.join(", ")
+        );
+        output.metadata = serde_json::json!({
+            "anchor_revision": revision,
+            "changed": changed_fields,
+        });
     }
 
     /// Commit the active task's typed CompletionRecord — the CTX-10
@@ -881,6 +1091,12 @@ impl RuntimeActor {
         {
             self.state.recovery_required = true;
             let _ = self.core.emit_event(RuntimeEvent::RecoveryRequired).await;
+            if let Err(audit_error) = self.settle_action_batch().await {
+                self.require_effect_recovery(format!(
+                    "action-batch audit failed after cancellation admission failed: {audit_error}"
+                ))
+                .await;
+            }
             self.state.turn = None;
             return Err(AgentError::RecoveryRequired(format!(
                 "Core could not install the cancelled operation terminal: {error}"
@@ -898,9 +1114,24 @@ impl RuntimeActor {
                 })
                 .await;
             let _ = self.core.emit_event(RuntimeEvent::RecoveryRequired).await;
+            if let Err(audit_error) = self.settle_action_batch().await {
+                self.require_effect_recovery(format!(
+                    "action-batch audit failed after cancellation cleanup failed: {audit_error}"
+                ))
+                .await;
+            }
             self.state.turn = None;
             return Err(error);
         }
+        let action_audit_error = if let Err(error) = self.settle_action_batch().await {
+            let message = crate::output::bound_error_message(format!(
+                "action-batch audit failed during cancellation: {error}"
+            ));
+            self.require_effect_recovery(message.clone()).await;
+            Some(message)
+        } else {
+            None
+        };
         let mut turn = self
             .state
             .turn
@@ -929,6 +1160,9 @@ impl RuntimeActor {
             reason,
         )
         .await;
+        if let Some(error) = action_audit_error {
+            return Err(AgentError::RecoveryRequired(error));
+        }
         Ok(TurnCancelAck::Cancelled {
             turn_id: turn.turn_id,
             task_id: self.state.task_id,
@@ -978,9 +1212,24 @@ impl RuntimeActor {
                 })
                 .await;
             let _ = self.core.emit_event(RuntimeEvent::RecoveryRequired).await;
+            if let Err(audit_error) = self.settle_action_batch().await {
+                self.require_effect_recovery(format!(
+                    "action-batch audit failed after cancellation cleanup failed: {audit_error}"
+                ))
+                .await;
+            }
             self.state.turn = None;
             return Err(error);
         }
+        let action_audit_error = if let Err(error) = self.settle_action_batch().await {
+            let message = crate::output::bound_error_message(format!(
+                "action-batch audit failed during cancellation: {error}"
+            ));
+            self.require_effect_recovery(message.clone()).await;
+            Some(message)
+        } else {
+            None
+        };
         let mut turn = self
             .state
             .turn
@@ -1009,6 +1258,9 @@ impl RuntimeActor {
             reason,
         )
         .await;
+        if let Some(error) = action_audit_error {
+            return Err(AgentError::RecoveryRequired(error));
+        }
         Ok(TurnCancelAck::Cancelled {
             turn_id: turn.turn_id,
             task_id: self.state.task_id,

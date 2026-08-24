@@ -140,6 +140,17 @@ impl PromptAssembler {
             .into_iter()
             .map(ToolSpec::compact_for_model_surface)
             .collect();
+        // Compute the protocol working-set projection before rendering
+        // historical context. Exact file bodies carried by the retained
+        // turn tail or restored checkpoint spill are the only reason a
+        // selected historical fs.read body may collapse to a descriptor.
+        let (turn_frame, turn_checkpoint) =
+            turn.checkpoint(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
+        let compacted_exchanges = turn_checkpoint.compacted_exchanges;
+        let checkpoint_body_demand = checkpoint_body_demand(turn, &turn_frame, task_progress);
+        let restored =
+            rehydrated_protocol_bodies(turn, &turn_frame, task_progress, protocol_bodies);
+        let visible_body_identities = visible_body_identities_from_parts(&turn_frame, &restored);
         // Observations (retrieved history, external refs) are rendered as
         // low-authority `user` messages, never as `system`: policy and
         // instructions stay in the system layer, so content retrieved from
@@ -149,12 +160,11 @@ impl PromptAssembler {
         if !history.foreground.is_empty() {
             // Passive transient rehydration: file bodies the current
             // directive exactly named. Not GC reactivation — Warm stays
-            // Warm and Stored is not Admitted. Checked omit does not
-            // apply here; identity-only SELECTED WORKING CONTEXT is not
-            // enough to append.
+            // Warm and Stored is not Admitted. Foreground is itself a body,
+            // never an identity-only descriptor.
             let mut foreground = String::from("CURRENT FOREGROUND EVIDENCE");
             for item in &history.foreground {
-                foreground.push_str(&render_selected_item(item, None));
+                foreground.push_str(&render_selected_item(item, &[], task_progress));
             }
             context_frame.push(ModelMessage::user(foreground));
         }
@@ -174,7 +184,11 @@ impl PromptAssembler {
                 ));
             }
             for item in &history.items {
-                working.push_str(&render_selected_item(item, task_progress));
+                working.push_str(&render_selected_item(
+                    item,
+                    &visible_body_identities,
+                    task_progress,
+                ));
             }
             context_frame.push(ModelMessage::user(working));
         }
@@ -214,16 +228,8 @@ impl PromptAssembler {
             system_policy.push(ModelMessage::system(index));
         }
 
-        // Deterministic turn checkpointing: the model-facing protocol
-        // view keeps only the last TURN_FRAME_KEEP_EXCHANGES exchanges;
-        // older ones collapse to a bounded note. The runtime's full
-        // frame (audit, turn-end persistence) is never mutated here.
-        let (turn_frame, compacted_exchanges) =
-            turn.checkpoint_tail(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
-        let restored =
-            rehydrated_protocol_bodies(turn, &turn_frame, task_progress, protocol_bodies);
         let body_stats = ProtocolBodyAssemblyStats {
-            eligible: protocol_bodies.len() as u64,
+            eligible: checkpoint_body_demand.len() as u64,
             restored: restored.len() as u64,
             restored_body_tokens: restored
                 .iter()
@@ -251,11 +257,7 @@ impl PromptAssembler {
                 context_frame,
                 turn_frame,
                 tool_schemas: tools,
-                turn_checkpoint: (compacted_exchanges > 0).then_some(
-                    agent_contracts::TurnCheckpoint {
-                        compacted_exchanges,
-                    },
-                ),
+                turn_checkpoint: (compacted_exchanges > 0).then_some(turn_checkpoint),
             },
             body_stats,
         )
@@ -265,7 +267,9 @@ impl PromptAssembler {
 /// PROTO-EVID-02b：一次模型输入组装的正文缓存账目（增量，不是累计）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProtocolBodyAssemblyStats {
-    /// 提交给回注挑选的候选行数（当轮缓存非空行）。
+    /// Exact fresh fs.read bodies actually removed by this checkpoint and
+    /// therefore requiring restoration. Cache rows still carried in the
+    /// retained tail are not demand and do not inflate misses.
     pub eligible: u64,
     /// 实际回注的行数。
     pub restored: u64,
@@ -283,46 +287,168 @@ fn rehydrated_protocol_bodies(
     progress: Option<&TaskProgressView>,
     protocol_bodies: &[(String, String)],
 ) -> Vec<(String, String)> {
-    if protocol_bodies.is_empty() {
+    let demand = checkpoint_body_demand(full_turn, retained, progress);
+    if demand.is_empty() {
         return Vec::new();
     }
-    let carried_identities = |frame: &TurnFrame| -> HashSet<String> {
-        frame
-            .steps
-            .iter()
-            .filter_map(|step| {
-                let TurnFrameStep::ToolResult { output, .. } = step else {
-                    return None;
-                };
-                if !output.ok || output.model_content.is_empty() {
-                    return None;
-                }
-                let touch = output.resource_touches().into_iter().next()?;
-                Some(format!(
-                    "{}@{}",
-                    touch.path,
-                    touch.revision.clone().unwrap_or_default()
-                ))
-            })
-            .collect()
-    };
-    let full = carried_identities(full_turn);
-    let retained_set = carried_identities(retained);
+    // The full ActiveTurn frame is the bounded audit backing for this open
+    // turn. Select exactly the bodies the checkpoint just spilled; do not
+    // depend on a latest-read LRU that tends to retain rows still in the
+    // tail and evict the older row that now needs restoration.
+    let spilled_rows = demanded_file_read_body_rows(full_turn, &demand);
+    demand
+        .into_iter()
+        .filter_map(|identity| {
+            protocol_bodies
+                .iter()
+                .find(|(cached, body)| cached == &identity && !body.is_empty())
+                .cloned()
+                .or_else(|| {
+                    spilled_rows
+                        .iter()
+                        .find(|(spilled, _)| spilled == &identity)
+                        .cloned()
+                })
+        })
+        .take(agent_contracts::MAX_PROTOCOL_BODY_ROWS)
+        .collect()
+}
+
+fn checkpoint_body_demand(
+    full_turn: &TurnFrame,
+    retained: &TurnFrame,
+    progress: Option<&TaskProgressView>,
+) -> Vec<String> {
+    let retained_set: HashSet<String> = file_read_body_identities(retained).into_iter().collect();
     let fresh_facts: Option<HashSet<String>> =
         progress.map(|progress| progress.checked_files.iter().cloned().collect());
-    protocol_bodies
-        .iter()
-        .filter(|(identity, body)| {
-            !body.is_empty()
-                && full.contains(identity)
-                && !retained_set.contains(identity)
+    file_read_body_identities(full_turn)
+        .into_iter()
+        .filter(|identity| {
+            !retained_set.contains(identity)
                 && fresh_facts
                     .as_ref()
                     .is_some_and(|facts| facts.contains(identity))
         })
         .take(agent_contracts::MAX_PROTOCOL_BODY_ROWS)
-        .cloned()
         .collect()
+}
+
+/// Exact file-body identities already present in the model-facing request.
+/// This is also the materializer's body-coverage input, so packing and final
+/// rendering use the same IdentityKnown != BodyVisible predicate.
+pub(crate) fn visible_body_identities_for_request(
+    full_turn: &TurnFrame,
+    progress: Option<&TaskProgressView>,
+    protocol_bodies: &[(String, String)],
+) -> Vec<String> {
+    let (retained, _) = full_turn.checkpoint_tail(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
+    let restored = rehydrated_protocol_bodies(full_turn, &retained, progress, protocol_bodies);
+    visible_body_identities_from_parts(&retained, &restored)
+}
+
+/// Exact fs.read identities that the next checkpoint projection will drop,
+/// independent of freshness. Runtime uses this bounded demand set to spend
+/// its existing revalidation quota on bodies that can actually prevent a
+/// model-driven reread.
+pub(crate) fn checkpoint_spilled_body_identities(full_turn: &TurnFrame) -> Vec<String> {
+    let (retained, _) = full_turn.checkpoint_tail(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
+    let retained_set: HashSet<String> = file_read_body_identities(&retained).into_iter().collect();
+    file_read_body_identities(full_turn)
+        .into_iter()
+        .filter(|identity| !retained_set.contains(identity))
+        .take(agent_contracts::MAX_PROTOCOL_BODY_ROWS)
+        .collect()
+}
+
+fn visible_body_identities_from_parts(
+    retained: &TurnFrame,
+    restored: &[(String, String)],
+) -> Vec<String> {
+    let mut identities = file_read_body_identities(retained);
+    for (identity, _) in restored {
+        if identities.len() >= agent_contracts::MAX_VISIBLE_BODY_HINTS {
+            break;
+        }
+        if !identities.contains(identity) {
+            identities.push(identity.clone());
+        }
+    }
+    identities
+}
+
+fn file_read_body_identities(frame: &TurnFrame) -> Vec<String> {
+    let mut identities = Vec::new();
+    for step in &frame.steps {
+        let TurnFrameStep::ToolResult { output, .. } = step else {
+            continue;
+        };
+        if output.tool_name != "fs.read" || !output.ok || output.model_content.is_empty() {
+            continue;
+        }
+        let Some(touch) = output.resource_touches().into_iter().next() else {
+            continue;
+        };
+        let Some(identity) = touch
+            .revision
+            .as_deref()
+            .and_then(|revision| agent_contracts::file_body_identity(&touch.path, revision))
+        else {
+            continue;
+        };
+        if !identities.contains(&identity) {
+            identities.push(identity);
+            if identities.len() >= agent_contracts::MAX_VISIBLE_BODY_HINTS {
+                break;
+            }
+        }
+    }
+    identities
+}
+
+fn demanded_file_read_body_rows(
+    frame: &TurnFrame,
+    demanded_identities: &[String],
+) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    for step in &frame.steps {
+        let TurnFrameStep::ToolResult { output, .. } = step else {
+            continue;
+        };
+        if output.tool_name != "fs.read"
+            || !output.ok
+            || output.model_content.is_empty()
+            || output.model_content.len() > crate::execution::body_cache::MAX_PROTOCOL_BODY_BYTES
+        {
+            continue;
+        }
+        let Some(touch) = output.resource_touches().into_iter().next() else {
+            continue;
+        };
+        let Some(identity) = touch
+            .revision
+            .as_deref()
+            .and_then(|revision| agent_contracts::file_body_identity(&touch.path, revision))
+        else {
+            continue;
+        };
+        if !demanded_identities.contains(&identity) {
+            continue;
+        }
+        if let Some(existing) = rows.iter_mut().find(|(existing, _)| existing == &identity) {
+            *existing = (identity, output.model_content.clone());
+        } else {
+            rows.push((identity, output.model_content.clone()));
+        }
+        if rows.len()
+            >= demanded_identities
+                .len()
+                .min(agent_contracts::MAX_PROTOCOL_BODY_ROWS)
+        {
+            break;
+        }
+    }
+    rows
 }
 
 /// Token cost of the runtime-owned Focus frame (TaskAnchor + TaskProgress +
@@ -462,6 +588,9 @@ fn render_task_anchor(task: &TaskAnchorView) -> String {
     append_list(&mut persistent, "Acceptance:", &task.acceptance_criteria);
     append_list(&mut persistent, "Progress:", &task.plan_progress);
     append_list(&mut persistent, "Open loops:", &task.open_loops);
+    if !task.next_action.is_empty() {
+        persistent.push_str(&format!("Next action: {}\n", task.next_action));
+    }
     while persistent.ends_with('\n') {
         persistent.pop();
     }
@@ -576,17 +705,47 @@ fn append_list(out: &mut String, label: &str, items: &[String]) {
     }
 }
 
-fn render_selected_item(item: &MaterializedItem, progress: Option<&TaskProgressView>) -> String {
+fn render_selected_item(
+    item: &MaterializedItem,
+    visible_body_identities: &[String],
+    progress: Option<&TaskProgressView>,
+) -> String {
     let path = render_selected_path(item);
-    let body = if omit_selected_file_body(item, progress) {
+    let current = if selected_item_is_current(item, progress) {
+        " | workspace_identity=current"
+    } else {
+        ""
+    };
+    let body = if omit_selected_file_body(item, visible_body_identities) {
         String::new()
     } else {
         item.content.clone()
     };
     format!(
-        "\n[{:?} | {:?} | id={}{path} | attention={:?} | semantic={:?}]\n{body}\n",
+        "\n[{:?} | {:?} | id={}{path}{current} | attention={:?} | semantic={:?}]\n{body}\n",
         item.kind, item.scope, item.item_id, item.attention, item.semantic
     )
+}
+
+fn selected_item_is_current(item: &MaterializedItem, progress: Option<&TaskProgressView>) -> bool {
+    if item.kind != ContextKind::FileObservation && item.source.as_deref() != Some("tool:fs.read") {
+        return false;
+    }
+    let (Some(path), Some(revision), Some(progress)) = (
+        item.file_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+        item.file_revision
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+        progress,
+    ) else {
+        return false;
+    };
+    let identity = format!("{path}@{revision}");
+    progress.checked_files.iter().any(|row| row == &identity)
 }
 
 fn render_selected_path(item: &MaterializedItem) -> String {
@@ -609,18 +768,17 @@ fn render_selected_path(item: &MaterializedItem) -> String {
     }
 }
 
-/// Historical ToolObservation / FileObservation bodies stay out of the
-/// prompt when TASK PROGRESS already names the path. That covers `fs.read`
-/// file bodies and stamped-path identity logs (`shell.exec`, writes). Live
-/// TurnFrame tool results are unchanged. Errors keep their body. No
-/// retrieval tutorial — identity is the header + Checked.
-fn omit_selected_file_body(item: &MaterializedItem, progress: Option<&TaskProgressView>) -> bool {
+/// A selected historical file body is redundant only when another layer of
+/// this exact request already carries the same `path@revision` body. A
+/// TaskProgress identity alone is deliberately insufficient, and arbitrary
+/// path-stamped tool logs are not file bodies.
+fn omit_selected_file_body(item: &MaterializedItem, visible_body_identities: &[String]) -> bool {
     if item.kind == ContextKind::Error {
         return false;
     }
-    let Some(progress) = progress else {
+    if item.kind != ContextKind::FileObservation && item.source.as_deref() != Some("tool:fs.read") {
         return false;
-    };
+    }
     let Some(path) = item
         .file_path
         .as_deref()
@@ -629,12 +787,10 @@ fn omit_selected_file_body(item: &MaterializedItem, progress: Option<&TaskProgre
     else {
         return false;
     };
-    if !progress.covers_path(path) {
-        return false;
-    }
-    matches!(
-        item.kind,
-        ContextKind::FileObservation | ContextKind::ToolObservation
+    agent_contracts::visible_body_identities_cover(
+        visible_body_identities,
+        path,
+        item.file_revision.as_deref(),
     )
 }
 
@@ -859,7 +1015,7 @@ mod tests {
             .expect("foreground section");
         assert!(
             foreground.contains("fn secret_body"),
-            "Checked omit must not strip foreground bodies: {foreground}"
+            "foreground bodies must remain visible: {foreground}"
         );
         let selected = user_texts
             .iter()
@@ -872,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_covered_fs_read_omits_historical_body() {
+    fn progress_identity_alone_keeps_the_only_historical_body() {
         let assembler = PromptAssembler::new("policy");
         let mut file = item("     1 | fn secret_body() {}");
         file.kind = ContextKind::ToolObservation;
@@ -901,8 +1057,13 @@ mod tests {
             .expect("working set");
         assert!(working.content.contains("path=src/auth.rs@abc123"));
         assert!(
-            !working.content.contains("fn secret_body"),
-            "covered file body must not be dumped: {}",
+            working.content.contains("workspace_identity=current"),
+            "the body and its exact fresh identity must be co-located: {}",
+            working.content
+        );
+        assert!(
+            working.content.contains("fn secret_body"),
+            "identity-only progress must not erase the only body: {}",
             working.content
         );
         assert!(
@@ -929,10 +1090,67 @@ mod tests {
             "without TASK PROGRESS the historical body stays: {}",
             dumped.content
         );
+        assert!(
+            !dumped.content.contains("workspace_identity=current"),
+            "currentness must come from exact TaskProgress authority: {}",
+            dumped.content
+        );
     }
 
     #[test]
-    fn progress_covered_stamped_shell_omits_stdout() {
+    fn retained_exact_fs_read_body_deduplicates_historical_copy() {
+        let assembler = PromptAssembler::new("policy");
+        let mut file = item("     1 | fn secret_body() {}");
+        file.kind = ContextKind::ToolObservation;
+        file.source = Some("tool:fs.read".into());
+        file.file_path = Some("src/auth.rs".into());
+        file.file_revision = Some("abc123".into());
+        let history = materialized_with(vec![file], ContextMapView::default());
+        let progress = TaskProgressView {
+            checked_files: vec!["src/auth.rs@abc123".into()],
+            ..Default::default()
+        };
+        let mut turn = TurnFrame::new("continue");
+        turn.push_tool_result(
+            agent_contracts::ToolOutput {
+                call_id: "read-1".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "     1 | fn secret_body() {}".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({
+                    "path": "src/auth.rs",
+                    "revision": "abc123"
+                }),
+            },
+            None,
+        );
+        let assembled =
+            assembler.assemble(None, None, Some(&progress), &history, &turn, Vec::new());
+        let working = assembled
+            .context_frame
+            .iter()
+            .find(|message| message.content.contains("SELECTED WORKING CONTEXT"))
+            .expect("working set");
+        assert!(working.content.contains("path=src/auth.rs@abc123"));
+        assert!(
+            !working.content.contains("fn secret_body"),
+            "the retained tool result already carries the exact body: {}",
+            working.content
+        );
+        assert!(
+            assembled
+                .turn_frame
+                .messages()
+                .iter()
+                .any(|message| message.content.contains("fn secret_body")),
+            "deduplication must leave one model-visible copy"
+        );
+    }
+
+    #[test]
+    fn progress_identity_does_not_erase_stamped_shell_evidence() {
         let assembler = PromptAssembler::new("policy");
         let mut shell = item("tests passed in src/auth.rs\nfull cargo output");
         shell.kind = ContextKind::ToolObservation;
@@ -959,8 +1177,8 @@ mod tests {
             .expect("working set");
         assert!(working.content.contains("path=src/auth.rs@abc123"));
         assert!(
-            !working.content.contains("full cargo output"),
-            "covered identity log must not dump stdout: {}",
+            working.content.contains("full cargo output"),
+            "a file body elsewhere cannot replace shell evidence: {}",
             working.content
         );
 
@@ -1098,6 +1316,7 @@ mod tests {
             acceptance_criteria: vec!["tests pass".into()],
             plan_progress: vec!["extract helpers".into()],
             open_loops: vec!["verify callers".into()],
+            next_action: "wire the second caller".into(),
         };
         let mut history = materialized_with(Vec::new(), ContextMapView::default());
         history.focus = Some(FocusState::for_task(
@@ -1126,6 +1345,10 @@ mod tests {
         assert!(focus.contains("Interpretation: split the module"));
         assert!(focus.contains("- do not change public API"));
         assert!(focus.contains("- verify callers"));
+        assert!(
+            focus.matches("Next action: wire the second caller").count() == 1,
+            "the proposal renders exactly once: {focus}"
+        );
         assert!(focus.contains("CURRENT DIRECTIVE"));
         assert!(focus.contains("Append HDMI to scratch.md"));
         assert!(focus.contains("CURRENT FOCUS"));
@@ -1284,8 +1507,10 @@ mod tests {
         );
         let checkpoint = assembled
             .turn_checkpoint
+            .as_ref()
             .expect("9 exchanges over the keep threshold must compact");
         assert_eq!(checkpoint.compacted_exchanges, 3);
+        assert_eq!(checkpoint.receipts, ["fs.read ok: read"]);
         assert_eq!(
             assembled.turn_frame.steps.len(),
             12,
@@ -1315,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_body_cache_rehydrates_only_lost_fresh_identities() {
+    fn checkpoint_spill_rehydrates_only_lost_fresh_identities() {
         use agent_contracts::ContextMapView;
         let assembler = PromptAssembler::new("policy");
         let mut turn = TurnFrame::new("inspect auth");
@@ -1390,9 +1615,31 @@ mod tests {
                 || message.content.contains("fn secret_body()")
         }));
 
-        // 身份不一致（文件已换版或事实非 Fresh）：不回注。
+        // The checkpoint selector can recover the exact spilled fs.read
+        // body from the bounded full ActiveTurn even when the latest-read
+        // LRU no longer contains that older row.
+        let lru_missed = assembler.assemble_with_catalog(
+            None,
+            None,
+            Some(&progress),
+            &history,
+            &turn,
+            Vec::new(),
+            &[],
+            &[],
+        );
+        assert!(
+            lru_missed
+                .context_frame
+                .iter()
+                .any(|message| message.content.contains("fn secret_body()")),
+            "checkpoint demand, not latest-read recency, selects restoration"
+        );
+
+        // A stale cache row cannot override the exact body in the trusted
+        // open-turn frame.
         let stale = vec![("src/auth.rs@old".to_string(), "stale body".to_string())];
-        let not_restored = assembler.assemble_with_catalog(
+        let stale_cache_ignored = assembler.assemble_with_catalog(
             None,
             None,
             Some(&progress),
@@ -1403,11 +1650,42 @@ mod tests {
             &stale,
         );
         assert!(
+            stale_cache_ignored
+                .context_frame
+                .iter()
+                .any(|message| message.content.contains("fn secret_body()")),
+            "the exact spilled body should still restore"
+        );
+        assert!(
+            !stale_cache_ignored
+                .context_frame
+                .iter()
+                .any(|message| message.content.contains("stale body")),
+            "a stale cached identity must never be rehydrated"
+        );
+
+        // If TASK PROGRESS no longer proves the exact identity Fresh, even
+        // the full turn's bytes stay out of the model request.
+        let stale_progress = TaskProgressView {
+            checked_files: vec!["src/auth.rs@new".into()],
+            ..Default::default()
+        };
+        let not_restored = assembler.assemble_with_catalog(
+            None,
+            None,
+            Some(&stale_progress),
+            &history,
+            &turn,
+            Vec::new(),
+            &[],
+            &bodies,
+        );
+        assert!(
             !not_restored
                 .context_frame
                 .iter()
                 .any(|message| message.content.contains("RESTORED TURN BODIES")),
-            "a stale identity must never be rehydrated"
+            "a stale progress identity must never authorize restoration"
         );
 
         // 正文仍在保留尾（未截断）：不重复回注。

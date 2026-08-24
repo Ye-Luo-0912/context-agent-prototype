@@ -11,8 +11,8 @@
 use std::{collections::HashMap, process::Stdio};
 
 use agent_contracts::{
-    AgentError, AgentResult, CancellationToken, RunId, ToolOutcome, ToolOutput, ToolRisk,
-    ToolSemanticRole, ToolSpec, attach_failure_class,
+    AgentError, AgentResult, CancellationToken, HostToolPolicy, OperationEffectContext, RunId,
+    ToolOutcome, ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec, attach_failure_class,
 };
 use agent_process::kill_process_tree;
 use agent_workspace::Workspace;
@@ -246,6 +246,46 @@ fn resolve_program(
     }
 }
 
+/// Bounded host-side executable identity used by exact verification reuse.
+/// It intentionally excludes general cwd contents (build output would change
+/// those during a successful verifier) and includes only resolver version,
+/// effective PATH, resolved executable path/metadata and explicit env.
+pub(crate) fn verification_executable_identity(
+    argv0: &str,
+    cwd: &std::path::Path,
+    env_overrides: &HashMap<String, String>,
+) -> String {
+    let mut source = Vec::new();
+    source.extend_from_slice(RESOLVER_RULES_VERSION);
+    source.extend_from_slice(b"\0PATH=");
+    source.extend_from_slice(std::env::var("PATH").unwrap_or_default().as_bytes());
+    source.push(0);
+    source.extend_from_slice(&canonical_env_bytes(env_overrides));
+    source.push(0);
+    match resolve_program(argv0, cwd, env_overrides) {
+        Ok(resolution) => {
+            source.extend_from_slice(resolution.executable.to_string_lossy().as_bytes());
+            if let Ok(metadata) = std::fs::metadata(&resolution.executable) {
+                source.extend_from_slice(&metadata.len().to_le_bytes());
+                if let Ok(modified) = metadata.modified()
+                    && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
+                {
+                    source.extend_from_slice(&duration.as_secs().to_le_bytes());
+                    source.extend_from_slice(&duration.subsec_nanos().to_le_bytes());
+                }
+            }
+        }
+        Err(failure) => {
+            source.extend_from_slice(b"unresolved\0");
+            for candidate in failure.candidates_tried {
+                source.extend_from_slice(candidate.as_bytes());
+                source.push(0);
+            }
+        }
+    }
+    content_digest(&source)
+}
+
 pub struct ProcessRunTool {
     workspace: Workspace,
 }
@@ -257,17 +297,31 @@ impl ProcessRunTool {
 }
 
 #[derive(Deserialize)]
-struct ProcessArgs {
-    argv: Vec<String>,
+pub(crate) struct ProcessArgs {
+    pub(crate) argv: Vec<String>,
     /// Workspace-relative working directory for the process (defaults to
     /// the workspace root).
     #[serde(default)]
-    cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
     /// Explicit environment overrides layered on the inherited environment.
     #[serde(default)]
-    env: HashMap<String, String>,
+    pub(crate) env: HashMap<String, String>,
     #[serde(default = "default_timeout_ms")]
-    timeout_ms: u64,
+    pub(crate) timeout_ms: u64,
+}
+
+/// One fully resolved process request. Keeping the authority inputs beside the
+/// actual argv makes the common runner reusable without growing an unrelated
+/// positional-argument list as trusted process tools are added.
+pub(crate) struct ProcessInvocation<'a> {
+    pub(crate) tool_name: &'a str,
+    pub(crate) run_id: RunId,
+    pub(crate) call_id: &'a str,
+    pub(crate) authority_arguments: &'a Value,
+    pub(crate) authority_policy: &'a HostToolPolicy,
+    pub(crate) args: ProcessArgs,
+    pub(crate) effect_context: Option<OperationEffectContext>,
+    pub(crate) cancel: CancellationToken,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -312,14 +366,47 @@ impl Tool for ProcessRunTool {
     ) -> AgentResult<ToolOutcome> {
         let args: ProcessArgs = serde_json::from_value(arguments.clone())
             .map_err(|e| AgentError::InvalidRequest(format!("process.run args: {e}")))?;
+        let policy = crate::BUILTIN_TOOL_POLICIES
+            .iter()
+            .find(|policy| policy.tool_name == "process.run")
+            .expect("process.run builtin policy must exist");
+        self.execute_invocation(ProcessInvocation {
+            tool_name: "process.run",
+            run_id,
+            call_id,
+            authority_arguments: &arguments,
+            authority_policy: policy,
+            args,
+            effect_context,
+            cancel,
+        })
+        .await
+    }
+}
+
+impl ProcessRunTool {
+    pub(crate) async fn execute_invocation(
+        &self,
+        invocation: ProcessInvocation<'_>,
+    ) -> AgentResult<ToolOutcome> {
+        let ProcessInvocation {
+            tool_name,
+            run_id,
+            call_id,
+            authority_arguments,
+            authority_policy,
+            args,
+            effect_context,
+            cancel,
+        } = invocation;
         if args.argv.is_empty() {
-            return Err(AgentError::InvalidRequest(
-                "process.run requires a non-empty argv".into(),
-            ));
+            return Err(AgentError::InvalidRequest(format!(
+                "{tool_name} resolved to an empty argv"
+            )));
         }
         if args.argv.len() > MAX_ARGV {
             return Err(AgentError::InvalidRequest(format!(
-                "process.run argv is limited to {MAX_ARGV} arguments"
+                "{tool_name} argv is limited to {MAX_ARGV} arguments"
             )));
         }
         if args
@@ -328,12 +415,12 @@ impl Tool for ProcessRunTool {
             .any(|arg| arg.chars().count() > MAX_ARG_CHARS)
         {
             return Err(AgentError::InvalidRequest(format!(
-                "process.run argv arguments are limited to {MAX_ARG_CHARS} chars"
+                "{tool_name} argv arguments are limited to {MAX_ARG_CHARS} chars"
             )));
         }
         if args.env.len() > MAX_ENV_KEYS {
             return Err(AgentError::InvalidRequest(format!(
-                "process.run env is limited to {MAX_ENV_KEYS} keys"
+                "{tool_name} env is limited to {MAX_ENV_KEYS} keys"
             )));
         }
         if args
@@ -342,7 +429,7 @@ impl Tool for ProcessRunTool {
             .any(|value| value.chars().count() > MAX_ENV_VALUE_CHARS)
         {
             return Err(AgentError::InvalidRequest(format!(
-                "process.run env values are limited to {MAX_ENV_VALUE_CHARS} chars"
+                "{tool_name} env values are limited to {MAX_ENV_VALUE_CHARS} chars"
             )));
         }
         let timeout_ms = args.timeout_ms.clamp(100, MAX_TIMEOUT_MS);
@@ -355,12 +442,16 @@ impl Tool for ProcessRunTool {
             None => self.workspace.root().to_path_buf(),
         };
 
-        super::require_process_effect_context(&effect_context, "process.run")?;
-        super::require_covered_process_spawn(
-            "process.run",
-            &arguments,
-            &agent_contracts::exec_argv_intent(&args.argv),
-        )?;
+        super::require_process_effect_context(&effect_context, tool_name)?;
+        let actual_intent = agent_contracts::exec_argv_intent(&args.argv);
+        if !authority_policy
+            .intent_from(authority_arguments)
+            .covers(&actual_intent)
+        {
+            return Err(AgentError::InvalidRequest(
+                "actual process command is not covered by the approved effect intent; the child was not started".into(),
+            ));
+        }
 
         // TOOL-PROC-01：preflight 显式解析。失败在这里以类型化输出返回
         // （附尝试过的候选与完整身份指纹），不再把隐式语义留给 spawn。
@@ -374,9 +465,9 @@ impl Tool for ProcessRunTool {
                 let (scope_key, fingerprint) = resolution_identity(&cwd, &args.env);
                 return Ok(ToolOutcome::Value(agent_contracts::tool_failure_output(
                     call_id,
-                    "process.run",
+                    tool_name,
                     agent_contracts::ToolFailureClass::PathNotFound,
-                    format!("process.run refused: program_not_found ({})", args.argv[0]),
+                    format!("{tool_name} refused: program_not_found ({})", args.argv[0]),
                     format!(
                         "program `{}` was not found.\ncwd `{}` contains: {}\ntried: {}\ncompile or install it first, or run a binary that exists in the listing.",
                         args.argv[0],
@@ -430,9 +521,9 @@ impl Tool for ProcessRunTool {
                 let entries = bounded_cwd_listing(&cwd);
                 return Ok(ToolOutcome::Value(agent_contracts::tool_failure_output(
                     call_id,
-                    "process.run",
+                    tool_name,
                     agent_contracts::ToolFailureClass::PathNotFound,
-                    format!("process.run refused: program_not_found ({})", args.argv[0]),
+                    format!("{tool_name} refused: program_not_found ({})", args.argv[0]),
                     format!(
                         "program `{}` disappeared before spawn.\ncwd `{}` contains: {}",
                         args.argv[0],
@@ -459,7 +550,7 @@ impl Tool for ProcessRunTool {
             &self.workspace,
             &effect_context,
             &child,
-            "process.run",
+            tool_name,
         ) {
             Ok(pid) => pid,
             Err(error) => {
@@ -549,13 +640,17 @@ impl Tool for ProcessRunTool {
             pid,
             exited.as_ref().and_then(|status| status.code()),
         )?;
-        let artifact_ref = self.workspace.seal_buffered_artifact(artifact).await?;
-
         let model_content = capture.model_tail();
         let total_lines = capture.total_lines();
         let total_bytes = capture.total_bytes();
         let artifact_bytes = capture.artifact_bytes();
         let artifact_truncated = capture.artifact_truncated();
+        let sealed_artifact_ref = self.workspace.seal_buffered_artifact(artifact).await?;
+        // An empty sealed capture is not useful evidence. Publishing its
+        // locator invites a follow-up artifact.read that can only return zero
+        // lines. Keep the capture/seal path uniform for durability and expose
+        // a locator only when there are bytes to retrieve.
+        let artifact_ref = (artifact_bytes > 0).then_some(sealed_artifact_ref);
 
         let exit_code = exited.as_ref().and_then(|status| status.code());
         let ok = outcome == "completed" && exited.as_ref().is_some_and(|s| s.success());
@@ -571,12 +666,12 @@ impl Tool for ProcessRunTool {
             .unwrap_or(&cwd)
             .to_string_lossy()
             .replace('\\', "/");
-        let artifact_note = if artifact_truncated {
-            format!(
-                "Artifact capture truncated at {MAX_ARTIFACT_BYTES} bytes; remaining output was drained but not stored. Captured prefix: {artifact_ref}"
-            )
-        } else {
-            format!("Full output: {artifact_ref}")
+        let artifact_note = match (artifact_truncated, artifact_ref.as_deref()) {
+            (true, Some(reference)) => Some(format!(
+                "Artifact capture truncated at {MAX_ARTIFACT_BYTES} bytes; remaining output was drained but not stored. Captured prefix: {reference}"
+            )),
+            (false, Some(reference)) => Some(format!("Full output: {reference}")),
+            (_, None) => None,
         };
         let truncation_summary = if artifact_truncated {
             ", artifact truncated"
@@ -612,17 +707,22 @@ impl Tool for ProcessRunTool {
             attach_failure_class(&mut metadata, class);
         }
 
+        let model_content = match (model_content.is_empty(), artifact_note) {
+            (true, None) => "process produced no stdout/stderr".to_string(),
+            (_, Some(note)) => format!("{model_content}\n\n{note}"),
+            (false, None) => model_content,
+        };
         Ok(ToolOutcome::Value(ToolOutput {
             call_id: call_id.into(),
-            tool_name: "process.run".into(),
+            tool_name: tool_name.into(),
             ok,
             summary: format!(
                 "process {outcome} (exit={exit_text}, {total_lines} lines, ~{} KB output, ~{} KB captured{truncation_summary})",
                 total_bytes / 1024,
                 artifact_bytes / 1024,
             ),
-            model_content: format!("{model_content}\n\n{artifact_note}"),
-            artifact_ref: Some(artifact_ref),
+            model_content,
+            artifact_ref,
             metadata,
         }))
     }
@@ -670,6 +770,24 @@ mod tests {
         #[cfg(not(windows))]
         {
             vec!["echo".into(), text.into()]
+        }
+    }
+
+    /// A successful argv with no stdout/stderr on either supported platform.
+    fn quiet_success_argv() -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec![
+                "cmd".into(),
+                "/D".into(),
+                "/S".into(),
+                "/C".into(),
+                "exit /b 0".into(),
+            ]
+        }
+        #[cfg(not(windows))]
+        {
+            vec!["sh".into(), "-c".into(), ":".into()]
         }
     }
 
@@ -819,6 +937,36 @@ mod tests {
             output.model_content
         );
         assert_eq!(output.metadata["cwd"], ".");
+    }
+
+    #[tokio::test]
+    async fn empty_process_capture_does_not_publish_an_unreadable_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let tool = ProcessRunTool::new(workspace);
+        let run_id = RunId::new();
+        let arguments = json!({"argv": quiet_success_argv()});
+        let context = ctx(run_id, &arguments);
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                arguments,
+                Some(context),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        assert!(output.ok, "quiet command failed: {}", output.summary);
+        assert_eq!(output.metadata["output_bytes"], 0);
+        assert_eq!(output.metadata["artifact_bytes"], 0);
+        assert!(output.artifact_ref.is_none());
+        assert_eq!(
+            output.model_content, "process produced no stdout/stderr",
+            "zero-byte success must be terminal without inviting artifact.read"
+        );
     }
 
     fn write_marker_argv() -> Vec<String> {

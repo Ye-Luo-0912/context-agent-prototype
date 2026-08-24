@@ -72,33 +72,59 @@ impl RuntimeActor {
         self.capture_round_snapshot(&current_input, has_external_context);
         let snapshot = self.round_snapshot().cloned();
 
-        // Tool lifecycle safe point. The active task's tool-demand set is
-        // the GC root set: a tool the task requires is never aged out by
-        // idle GC, so task demand cannot silently evaporate from the
-        // surface. Task demand is declarative only: reload can restore
-        // catalog/schema readiness, but cannot enable a disabled
-        // capability, grant a permission or bypass approval/effect policy.
+        // Build roots before either lifecycle mechanism mutates the surface.
+        // They come from exact task requirements, typed execution needs,
+        // pending explicit loads and the preceding model batch whose results
+        // this request will consume. No free-text action plan or fixed lease
+        // duration participates.
+        let lease_catalog = self.services.tool_specs();
+        let task_roots = self.tool_lease_roots(&lease_catalog, &[], true, true);
+
+        // Tool lifecycle GC remains the bounded pressure/idle backstop. The
+        // same source roots protect required, pending-load and result-delivery
+        // tools; task demand can restore schema readiness but never grants
+        // authority.
+        // It runs before lease reconciliation so a newly released schema
+        // finishes this decision boundary at Warm rather than immediately
+        // crossing the older Warm->Unloaded idle threshold.
+        self.services.tool_gc(&task_roots);
+
+        // A newly applied directive is a hard semantic boundary for
+        // ephemeral model-load/result-delivery leases. Reconcile once here
+        // so an aborted old turn or restored loaded snapshot cannot leak
+        // optional schemas into the new directive. Typed/task roots survive;
+        // everything else makes a Loaded->Warm transition and remains
+        // exactly reloadable.
+        if model_round == 1 {
+            let report = self.services.tool_reconcile_leases(&task_roots);
+            if report.examined_loaded_optional > 0
+                && let Err(error) = self
+                    .core
+                    .emit_event(RuntimeEvent::ToolLeasesReconciled {
+                        turn_id,
+                        model_round,
+                        boundary: ToolLeaseBoundary::DirectiveStart,
+                        report,
+                    })
+                    .await
+            {
+                // The surface transition already landed. Without its journal
+                // record the next model request would observe an unaudited
+                // catalog state, so fence instead of continuing.
+                self.fail_round_preparation("tool_leases_reconciled_event", error)
+                    .await;
+                return;
+            }
+        }
+
         let active_task = self
             .state
             .task_id
             .and_then(|task_id| self.state.tasks.get(task_id));
-        let mut task_roots: Vec<String> = active_task
-            .map(|task| {
-                task.tool_requirements
-                    .entries
-                    .iter()
-                    .map(|requirement| requirement.tool_name.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
         let need_evidence = snapshot
             .as_ref()
             .map(|snap| snap.needs.evidence_needed || snap.needs.open_loop_needs_evidence)
             .unwrap_or(has_external_context);
-        if need_evidence {
-            task_roots.push(CONTEXT_MANAGE.to_string());
-        }
-        self.services.tool_gc(&task_roots);
         let verification_due = self
             .round_verification()
             .map(|projection| projection.due)
@@ -106,6 +132,8 @@ impl RuntimeActor {
         let turn_intent = active_task
             .map(|task| task.turn_intent.as_str())
             .filter(|intent| !intent.is_empty());
+        let completion_requested =
+            turn_intent.is_some_and(crate::execution::ExecutionState::turn_requests_complete);
         let has_failures = snapshot
             .as_ref()
             .map(|snap| snap.needs.unresolved_failure)
@@ -118,6 +146,43 @@ impl RuntimeActor {
                 )
             })
             .unwrap_or((None, Vec::new()));
+        // Ending a model turn is implicit; closing the durable task is a
+        // separate lifecycle transition. Keep `task.complete` catalog-cold
+        // during ordinary work so a model cannot accidentally erase task
+        // affinity after every successful substep. Explicit user intent or
+        // a task-owned requirement loads it through the same bounded lease
+        // path as every other optional capability. The model can also find
+        // and load it deliberately through `capability.manage`.
+        if completion_requested {
+            requirements.push(ToolSurfaceRequirement {
+                tool_name: "task.complete".into(),
+                demand: ToolSurfaceDemand::PreferSurface,
+                reason: "current user directive explicitly requests task closure".into(),
+            });
+        }
+        // Verification is source-affine once a trusted verifier has
+        // produced a reusable result for this exact task anchor. Keep that
+        // concrete schema available first; the semantic-role fallback below
+        // is used only when the source is absent from the current catalog.
+        let verification_source_tools = if verification_due {
+            active_task
+                .and_then(|task| {
+                    self.state.turn.as_ref().map(|turn| {
+                        turn.execution
+                            .verification_source_tools(task.anchor.revision)
+                    })
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        requirements.extend(verification_source_tools.iter().map(|tool_name| {
+            ToolSurfaceRequirement {
+                tool_name: tool_name.clone(),
+                demand: ToolSurfaceDemand::PreferSurface,
+                reason: "trusted verifier source for current task anchor".into(),
+            }
+        }));
 
         // Reload only requirements that GC actually moved off-surface. The
         // final snapshot below is authoritative, so a refused load is
@@ -137,13 +202,13 @@ impl RuntimeActor {
         );
         for requirement in &requirements {
             if !visible_names.contains(&requirement.tool_name) {
-                let _ = self.services.tool_load(&requirement.tool_name);
+                let _ = self.services.tool_load_for_lease(&requirement.tool_name);
             }
         }
         // Item 24: `context.manage` is catalog-only until NeedEvidence.
         // Load it before the candidate snapshot so policy can PreferSurface it.
         if need_evidence && !visible_names.contains(CONTEXT_MANAGE) {
-            let _ = self.services.tool_load(CONTEXT_MANAGE);
+            let _ = self.services.tool_load_for_lease(CONTEXT_MANAGE);
         }
 
         // Dispatcher snapshot is the complete currently-loaded candidate
@@ -155,6 +220,9 @@ impl RuntimeActor {
             .iter()
             .map(|spec| spec.name.clone())
             .collect();
+        let exact_verifier_available = verification_source_tools
+            .iter()
+            .any(|tool_name| candidate_names.contains(tool_name));
 
         // Derive typed tool roots from execution need → catalog roles
         // (not hard-coded tool names), then merge them into the explicit
@@ -170,7 +238,7 @@ impl RuntimeActor {
                 focus_goal: active_task.map(|task| task.goal.as_str()),
                 active_tool,
                 catalog: &candidates.specs,
-                verification_due,
+                verification_due: verification_due && !exact_verifier_available,
                 turn_intent,
                 has_failures,
                 has_external_context,
@@ -347,6 +415,12 @@ impl RuntimeActor {
             .map(|task| crate::task::anchor_root_claims(&task.anchor))
             .unwrap_or_default();
         let foreground_resources = self.foreground_resource_hints(&turn_frame, &current_input);
+        let protocol_bodies = self.eligible_protocol_bodies();
+        let visible_body_identities = crate::prompt::visible_body_identities_for_request(
+            &turn_frame,
+            progress_view.as_ref(),
+            &protocol_bodies,
+        );
         let context_budget = model_budget.context_frame_budget;
         let materialized = match self
             .services
@@ -361,6 +435,7 @@ impl RuntimeActor {
                         .as_ref()
                         .map(|view| view.checked_files.clone())
                         .unwrap_or_default(),
+                    visible_body_identities,
                     foreground_resources,
                 },
             })
@@ -479,8 +554,9 @@ impl RuntimeActor {
         }
 
         let estimated_input_tokens = assembled_total(&input);
-        // PROTO-EVID-02b：正文缓存账目出账（增量）。候选行数取最终一次
-        // 组装；失效/超限计数是自上一条账目以来的累计，drain 后归零。
+        // PROTO-EVID-02b：正文恢复账目出账（增量）。eligible 是最终
+        // 组装的真实 checkpoint demand；失效/超限计数是自上一条账目
+        // 以来的累计，drain 后归零。
         // 只记账不设障：事件失败不影响本轮准备。
         if let Some(turn) = self.state.turn.as_mut() {
             let deltas = turn.protocol_bodies.drain_deltas();
@@ -631,6 +707,11 @@ impl RuntimeActor {
                 generation,
                 surface_revision,
                 model_round,
+                turn_checkpoint: input
+                    .turn_checkpoint
+                    .as_ref()
+                    .map(agent_contracts::TurnCheckpointStats::from)
+                    .unwrap_or_default(),
                 prompt_layers: crate::prompt::prompt_layer_costs_with_catalog(
                     &self.assembler,
                     runtime_focus.as_ref(),
@@ -711,6 +792,8 @@ impl RuntimeActor {
                     lease: None,
                     effect_id: None,
                     argument_digest: None,
+                    attribution: None,
+                    verification_call: None,
                     tool_identity: None,
                     value_completion_pending: false,
                     recovery_required: None,
@@ -735,21 +818,7 @@ impl RuntimeActor {
         // 条目只有在事实表里同 path@digest 重新 Fresh（BeforeModel 重
         // 验证通过）时才恢复资格；是否回注由组装器再核对 checkpoint
         // 截断 + Fresh 事实一致。
-        let protocol_bodies = self
-            .state
-            .turn
-            .as_ref()
-            .map(|turn| {
-                let fresh_identities: Vec<(String, String)> = turn
-                    .execution
-                    .checked_files
-                    .iter()
-                    .filter(|fact| fact.freshness == agent_contracts::ResourceFreshness::Fresh)
-                    .map(|fact| (fact.path.clone(), fact.digest.clone()))
-                    .collect();
-                turn.protocol_bodies.eligible_rows(&fresh_identities)
-            })
-            .unwrap_or_default();
+        let protocol_bodies = self.eligible_protocol_bodies();
         self.assembler.assemble_with_catalog_stats(
             focus,
             task,
@@ -762,15 +831,192 @@ impl RuntimeActor {
         )
     }
 
+    fn eligible_protocol_bodies(&self) -> Vec<(String, String)> {
+        self.state
+            .turn
+            .as_ref()
+            .map(|turn| {
+                let fresh_identities: Vec<(String, String)> = turn
+                    .execution
+                    .checked_files
+                    .iter()
+                    .filter(|fact| fact.freshness == agent_contracts::ResourceFreshness::Fresh)
+                    .map(|fact| (fact.path.clone(), fact.digest.clone()))
+                    .collect();
+                turn.protocol_bodies.eligible_rows(&fresh_identities)
+            })
+            .unwrap_or_default()
+    }
+
+    /// Exact schema roots for one safe point. This is a projection of
+    /// existing authority/facts plus explicit model calls; it never chooses
+    /// an action, command or argument for the model.
+    pub(super) fn tool_lease_roots(
+        &self,
+        catalog: &[ToolSpec],
+        decision_calls: &[ToolCall],
+        include_turn_leases: bool,
+        include_active_tool: bool,
+    ) -> Vec<String> {
+        let active_task = self
+            .state
+            .task_id
+            .and_then(|task_id| self.state.tasks.get(task_id));
+        let snapshot = self.round_snapshot();
+        let mut roots: Vec<String> = active_task
+            .map(|task| {
+                task.tool_requirements
+                    .entries
+                    .iter()
+                    .map(|requirement| requirement.tool_name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let verification_due = snapshot
+            .map(|round| round.verification.due)
+            .unwrap_or(false);
+        let verification_source_tools: Vec<String> = if verification_due {
+            active_task
+                .and_then(|task| {
+                    self.state.turn.as_ref().map(|turn| {
+                        turn.execution
+                            .verification_source_tools(task.anchor.revision)
+                    })
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|tool_name| catalog.iter().any(|spec| spec.name == *tool_name))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        roots.extend(verification_source_tools.iter().cloned());
+
+        let derived = crate::policy::derive_task_roots(crate::policy::TaskRootInput {
+            anchor: active_task.map(|task| &task.anchor),
+            focus_goal: active_task.map(|task| task.goal.as_str()),
+            active_tool: include_active_tool
+                .then_some(self.state.active_tool.as_deref())
+                .flatten(),
+            catalog,
+            verification_due: verification_due && verification_source_tools.is_empty(),
+            turn_intent: active_task
+                .map(|task| task.turn_intent.as_str())
+                .filter(|intent| !intent.is_empty()),
+            has_failures: snapshot
+                .map(|round| round.needs.unresolved_failure)
+                .unwrap_or(false),
+            has_external_context: snapshot
+                .map(|round| round.needs.evidence_needed)
+                .unwrap_or(false),
+        });
+        roots.extend(derived.into_iter().map(|requirement| requirement.tool_name));
+
+        if snapshot.is_some_and(|round| {
+            round.needs.evidence_needed || round.needs.open_loop_needs_evidence
+        }) {
+            roots.push(CONTEXT_MANAGE.to_string());
+        }
+        if include_turn_leases && let Some(turn) = self.state.turn.as_ref() {
+            roots.extend(turn.pending_loaded_tools.iter().cloned());
+            roots.extend(turn.result_delivery_tools.iter().cloned());
+        }
+        roots.extend(decision_calls.iter().map(|call| call.name.clone()));
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    /// Settle optional schema leases after one successful model decision.
+    /// The decision consumes the previous result-delivery lease. A pending
+    /// explicit load is consumed only when that exact tool is called, so
+    /// sequential loads form a task-local cohort instead of evicting each
+    /// other at adjacent decisions. An empty decision ends the turn and
+    /// releases every unused pending load. Reconciliation happens before
+    /// dispatch, while the actor is at a surface-safe boundary.
+    pub(super) async fn reconcile_model_decision_leases(
+        &mut self,
+        calls: &[ToolCall],
+    ) -> AgentResult<()> {
+        let Some((turn_id, model_round, catalog)) = self.state.turn.as_ref().map(|turn| {
+            (
+                turn.turn_id,
+                turn.model_round,
+                turn.tool_surface
+                    .as_ref()
+                    .map(|surface| surface.specs.clone())
+                    .unwrap_or_default(),
+            )
+        }) else {
+            return Ok(());
+        };
+        let pending_loaded_tools = self
+            .state
+            .turn
+            .as_ref()
+            .map(|turn| {
+                if calls.is_empty() {
+                    Vec::new()
+                } else {
+                    turn.pending_loaded_tools
+                        .iter()
+                        .filter(|name| {
+                            !calls.iter().any(|call| call.name.as_str() == name.as_str())
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                }
+            })
+            .unwrap_or_default();
+        let mut roots = self.tool_lease_roots(&catalog, calls, false, false);
+        roots.extend(pending_loaded_tools.iter().cloned());
+        roots.sort();
+        roots.dedup();
+        let report = self.services.tool_reconcile_leases(&roots);
+        if report.examined_loaded_optional > 0 {
+            self.core
+                .emit_event(RuntimeEvent::ToolLeasesReconciled {
+                    turn_id,
+                    model_round,
+                    boundary: ToolLeaseBoundary::ModelDecision,
+                    report,
+                })
+                .await?;
+        }
+
+        let mut delivery: Vec<String> = calls.iter().map(|call| call.name.clone()).collect();
+        delivery.sort();
+        delivery.dedup();
+        if let Some(turn) = self.state.turn.as_mut() {
+            turn.pending_loaded_tools = pending_loaded_tools;
+            turn.result_delivery_tools = delivery;
+        }
+        // The model decision just consumed the prior active tool's result.
+        // New calls establish their own active identity when dispatched.
+        self.state.active_tool = None;
+        Ok(())
+    }
+
     async fn revalidate_stored_resource_facts(&mut self, current_query: &str) {
         let Some(oracle) = self.services.artifact_workspace() else {
             return;
         };
+        let priority_body_identities = self
+            .state
+            .turn
+            .as_ref()
+            .map(|turn| crate::prompt::checkpoint_spilled_body_identities(&turn.turn_frame))
+            .unwrap_or_default();
         let Some(turn) = self.state.turn.as_mut() else {
             return;
         };
         turn.execution
-            .revalidate(oracle as &dyn ResourceVersionOracle, current_query)
+            .revalidate_with_priority(
+                oracle as &dyn ResourceVersionOracle,
+                current_query,
+                &priority_body_identities,
+            )
             .await;
     }
 

@@ -30,6 +30,9 @@ impl TaskCompleteTool {
 #[derive(Deserialize)]
 struct CompleteArgs {
     summary: String,
+    /// Parser-only compatibility for trusted callers. Runtime already owns
+    /// the current assistant-output and verification evidence handles; the
+    /// model must not be asked to echo or invent those capabilities.
     #[serde(default)]
     artifacts: Vec<String>,
 }
@@ -39,13 +42,12 @@ impl Tool for TaskCompleteTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "task.complete".into(),
-            description: "Propose task completion (summary + optional artifact:// refs).".into(),
+            description: "Close the entire active multi-turn task with a bounded summary. Do not use this merely to finish one turn or substep; an ordinary final response ends the turn without discarding task continuity. Runtime attaches current assistant-output and verification evidence itself.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["summary"],
                 "properties": {
-                    "summary": {"type": "string", "description": "Completion summary (bounded)"},
-                    "artifacts": {"type": "array", "items": {"type": "string"}, "description": "Optional artifact:// refs produced by the completion (bounded)"}
+                    "summary": {"type": "string", "description": "Completion summary (bounded)"}
                 }
             }),
             risk: ToolRisk::ReadOnly,
@@ -149,6 +151,12 @@ mod tests {
     #[tokio::test]
     async fn packages_a_bounded_completion_proposal() {
         let tool = TaskCompleteTool::new();
+        assert!(
+            tool.spec().input_schema["properties"]
+                .get("artifacts")
+                .is_none(),
+            "runtime evidence handles are parser-only, not model echo fields"
+        );
         let run_id = RunId::new();
         let evidence = ArtifactLocator::sealed(run_id, "grep", ContentDigest::sha256_bytes(b"out"))
             .unwrap()

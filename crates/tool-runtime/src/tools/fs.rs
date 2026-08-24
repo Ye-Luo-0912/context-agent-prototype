@@ -43,6 +43,9 @@ struct ListArgs {
     /// instead of a fresh directory scan, so paging stays consistent even
     /// if the directory changes between pages.
     #[serde(default)]
+    /// Parser-only compatibility for non-model callers. Model-visible
+    /// continuation is centralized on `artifact.read` so an opaque token is
+    /// never guessed merely because every first-page call advertises it.
     cursor: Option<String>,
 }
 
@@ -55,13 +58,12 @@ impl Tool for FsListTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "fs.list".into(),
-            description: "List workspace files (hides .focus-agent and .git).".into(),
+            description: "List workspace files (hides .focus-agent and .git). Overflow returns an artifact_ref; read further lines with artifact.read.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Workspace-relative path"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000},
-                    "cursor": {"type": "string", "description": "Opaque token from a previous fs.list result; serves the next page from that call's snapshot"}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000}
                 }
             }),
             risk: ToolRisk::ReadOnly,
@@ -164,8 +166,9 @@ impl Tool for FsListTool {
             .as_ref()
             .map(|r| {
                 format!(
-                    "\n... {} more entries; full listing: {r}",
-                    entries.len() - visible.len()
+                    "\n... {} more entries; full listing artifact: {r}. Continue with artifact.read reference={r} start_line={}",
+                    entries.len() - visible.len(),
+                    visible.len() + 1,
                 )
             })
             .unwrap_or_default();
@@ -198,6 +201,7 @@ impl Tool for FsListTool {
                 "entry_count": entries.len(),
                 "returned": visible.len(),
                 "has_more": has_more,
+                "next_start_line": has_more.then_some(visible.len() + 1),
                 "cursor": cursor,
             }),
         }))

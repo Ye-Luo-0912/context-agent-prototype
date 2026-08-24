@@ -1,0 +1,63 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "batch_two_file",
+  "expected_edit": "one edit.patch files[] composite covering both revision-checked files",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/library.cfg",
+      "pred": "sha256",
+      "needles": [
+        "8cba9a19a1c76c3b41252849472d900ce1a7b03cc6dadf2b0b945dec7ba8c5ff"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/client.cfg",
+      "pred": "sha256",
+      "needles": [
+        "990a5ef473ef9fbd2fd40288de375d0160f5246b219278566280b4175915c956"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/library.cfg",
+      "exists": true,
+      "sha256": "70d88ea9e75ce05146165734d67a8b2e55f0dc00ec70a2a7af78221272a496b3",
+      "bytes": 19,
+      "truncated": false,
+      "body": "api=v1\nmode=stable\n"
+    },
+    {
+      "path": "src/client.cfg",
+      "exists": true,
+      "sha256": "6a76c69f6df6ae8f115a1f2295fb7027fc15b3cb6a4d97bd3ea0f144fd319afc",
+      "bytes": 18,
+      "truncated": false,
+      "body": "uses=v1\nflag=keep\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "tool-edit.no-unexpected-files"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

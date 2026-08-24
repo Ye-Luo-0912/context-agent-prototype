@@ -1,0 +1,104 @@
+{
+  "allow_dirty": true,
+  "edit_patch_model_spec": {
+    "description": "Patch files[] exactly; each item: path, latest fs.read base_revision, hunks; max 64 hunks total.",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "files": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "base_revision": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "hunks": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "new": {
+                      "type": "string"
+                    },
+                    "occurrence": {
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "old": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "old",
+                    "new"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 64,
+                "minItems": 1,
+                "type": "array"
+              },
+              "path": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "base_revision",
+              "hunks"
+            ],
+            "type": "object"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "files"
+      ],
+      "type": "object"
+    },
+    "name": "edit.patch",
+    "risk": "WorkspaceWrite",
+    "roles": [
+      "mutate"
+    ]
+  },
+  "edit_patch_model_spec_sha256": "03f67eee2ac0f71f762e0d27f5ef64cad2df6bc0b01887ee30b6a1ebed91db10",
+  "expected_cells": [
+    "crlf_multi_hunk/r1/production",
+    "mixed_eol/r1/production",
+    "stale_revision_recovery/r1/production",
+    "batch_two_file/r1/production"
+  ],
+  "gate_implementation_sha256": "957ece6e2058c232da69d63680f9a1991dc90d66717da1ad5c30a672e777747b",
+  "gate_schema": "agent-eval.tool-surface-edit.v3",
+  "model_identity": {
+    "base_url": "http://127.0.0.1:8787/v1",
+    "model": "ox-alpha-free"
+  },
+  "pack_digest": "e5c871282743a079c1e7b85be11859b05cd86e49a7cb8aa44587ae2a6b586611",
+  "pack_schema": "agent-eval.tool-edit.v2",
+  "repeats": 1,
+  "schema": "agent-eval.tool-edit-run-plan.v2",
+  "scope": "full_pack",
+  "source_tree_digest": "99bc2974f88156adaa6fc4d26c31d84e4cfcd10b2e278cc2ef308d9f3f37f275",
+  "spec_sha256": "19d7a492afb7e4b45ae5b3d01bfcaacad4df8b060e6b00510eca3efdab525c0a",
+  "status": "planned",
+  "task_ids": [
+    "crlf_multi_hunk",
+    "mixed_eol",
+    "stale_revision_recovery",
+    "batch_two_file"
+  ],
+  "task_sha256s": {
+    "batch_two_file": "d44b0ec6efe28143f88e2a6b57798fc9758f4e102d11c7858a6cfe24ad4418a0",
+    "crlf_multi_hunk": "935aacdcb8a71d7e775a8b701787c1811df14f7595aa8b4236945b2f11b39221",
+    "mixed_eol": "e6c6c3864330fb36a6bd151ace532aae7da81fe70b948fe6183d7cc5260875c1",
+    "stale_revision_recovery": "a1aa1cb7d173955a87890c2554d757c8356ed78dd68c4966f50179c56eb12d9d"
+  }
+}

@@ -1010,9 +1010,11 @@ async fn fs_read_of_a_descriptorized_body_is_selected_descriptor() {
         })
         .await
         .unwrap();
+    let mut first_read = fs_read("1", "src/a.rs");
+    first_read.metadata["revision"] = serde_json::json!("rev");
     engine
         .ingest(ContextIngress::ToolObservation {
-            output: fs_read("1", "src/a.rs"),
+            output: first_read,
             scope_id: None,
         })
         .await
@@ -1023,6 +1025,7 @@ async fn fs_read_of_a_descriptorized_body_is_selected_descriptor() {
             budget_tokens: 10_000,
             hints: ContextHints {
                 checked_files: vec!["src/a.rs@rev".into()],
+                visible_body_identities: vec!["src/a.rs@rev".into()],
                 ..ContextHints::default()
             },
         })
@@ -1197,7 +1200,7 @@ async fn recent_file_bodies_cap_and_one_round_lease() {
 }
 
 #[tokio::test]
-async fn checked_file_body_is_priced_as_a_descriptor() {
+async fn only_visible_exact_file_body_is_priced_as_a_descriptor() {
     let engine = SimpleContextEngine::new(SimpleContextConfig {
         dependency_expansion: false,
         ..SimpleContextConfig::default()
@@ -1254,7 +1257,7 @@ async fn checked_file_body_is_priced_as_a_descriptor() {
         "the small constraint must still fit"
     );
 
-    let with = engine
+    let checked_only = engine
         .materialize(ContextQuery {
             current_input: "continue".into(),
             budget_tokens: 200,
@@ -1265,24 +1268,46 @@ async fn checked_file_body_is_priced_as_a_descriptor() {
         })
         .await
         .unwrap();
-    let selected = with
+    assert!(
+        !checked_only
+            .items
+            .iter()
+            .any(|item| item.item_id == body_id),
+        "identity-only progress must still price the real body"
+    );
+
+    let with_visible_body = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 200,
+            hints: ContextHints {
+                checked_files: vec!["src/big.rs@aaa".into()],
+                visible_body_identities: vec!["src/big.rs@aaa".into()],
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let selected = with_visible_body
         .items
         .iter()
         .find(|item| item.item_id == body_id)
         .expect("descriptor-priced file body must fit");
     assert_eq!(selected.content, "src/big.rs@aaa");
     assert!(
-        with.items
+        with_visible_body
+            .items
             .iter()
             .any(|item| item.kind == ContextKind::Constraint),
         "descriptor pricing must leave room for the constraint"
     );
     assert!(
-        with.selected
+        with_visible_body
+            .selected
             .iter()
-            .any(|sel| sel.item_id == body_id && sel.reason.contains("path already checked")),
+            .any(|sel| sel.item_id == body_id && sel.reason.contains("exact body already visible")),
         "reason must say the body was omitted: {:?}",
-        with.selected
+        with_visible_body.selected
     );
     let state = engine.state.lock().await;
     let heap = state
@@ -1294,7 +1319,7 @@ async fn checked_file_body_is_priced_as_a_descriptor() {
 }
 
 #[tokio::test]
-async fn checked_stamped_shell_is_priced_as_a_descriptor() {
+async fn visible_file_body_does_not_replace_stamped_shell_output() {
     let engine = SimpleContextEngine::new(SimpleContextConfig {
         dependency_expansion: false,
         ..SimpleContextConfig::default()
@@ -1343,28 +1368,24 @@ async fn checked_stamped_shell_is_priced_as_a_descriptor() {
         !without.items.iter().any(|item| item.item_id == log_id),
         "full identity-log stdout must not fit a 200-token budget"
     );
-    let with = engine
+    let with_visible_file_body = engine
         .materialize(ContextQuery {
             current_input: "continue".into(),
             budget_tokens: 200,
             hints: ContextHints {
                 checked_files: vec!["src/big.rs@aaa".into()],
+                visible_body_identities: vec!["src/big.rs@aaa".into()],
                 ..Default::default()
             },
         })
         .await
         .unwrap();
-    let selected = with
-        .items
-        .iter()
-        .find(|item| item.item_id == log_id)
-        .expect("descriptor-priced identity log must fit");
-    assert_eq!(selected.content, "src/big.rs@aaa");
     assert!(
-        with.items
+        !with_visible_file_body
+            .items
             .iter()
-            .any(|item| item.kind == ContextKind::Constraint),
-        "descriptor pricing must leave room for the constraint"
+            .any(|item| item.item_id == log_id),
+        "an fs.read body cannot stand in for distinct shell output"
     );
     let state = engine.state.lock().await;
     let heap = state

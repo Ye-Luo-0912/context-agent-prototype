@@ -1213,6 +1213,7 @@ mod tests {
                 generation: 1,
                 surface_revision: 1,
                 model_round: seq as usize,
+                turn_checkpoint: agent_contracts::TurnCheckpointStats::default(),
                 prompt_layers: PromptLayerCosts::default(),
             },
         )

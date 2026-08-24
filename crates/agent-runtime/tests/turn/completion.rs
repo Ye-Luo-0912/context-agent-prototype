@@ -119,13 +119,14 @@ impl ToolDispatcher for CompletionToolDispatcher {
 async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    let model = Arc::new(CompletionProposalModel {
+        summary: "the task is done",
+        rounds: AtomicUsize::new(0),
+    });
     let services = RuntimeServices::new(
         CoreAuthorityConfig::default(),
         Arc::new(TestContextEngine),
-        Arc::new(CompletionProposalModel {
-            summary: "the task is done",
-            rounds: AtomicUsize::new(0),
-        }),
+        model.clone(),
         Arc::new(CompletionToolDispatcher {
             workspace: Some((*workspace).clone()),
         }),
@@ -192,6 +193,143 @@ async fn task_complete_proposal_commits_the_typed_record_at_turn_end() {
     assert!(
         record.final_output_digest.is_some(),
         "the final output digest must be retained"
+    );
+    assert_eq!(
+        model.rounds.load(Ordering::SeqCst),
+        1,
+        "accepted task.complete is already the terminal model decision"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+/// A completion proposal followed by a failed sibling action must not skip
+/// the model's recovery decision. This guards the conservative half of the
+/// one-shot rule: only an entirely successful batch terminalizes directly.
+#[derive(Debug)]
+struct CompletionWithFailedSiblingModel {
+    rounds: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for CompletionWithFailedSiblingModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        if round == 0 {
+            Ok(ModelOutput {
+                content: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "complete".into(),
+                        name: "task.complete".into(),
+                        arguments: json!({"summary": "completion still stands", "artifacts": []}),
+                    },
+                    ToolCall {
+                        id: "fail".into(),
+                        name: "always.fail".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                usage: Default::default(),
+            })
+        } else {
+            Ok(ModelOutput {
+                content: "handled the failed sibling".into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            })
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CompletionWithFailureDispatcher;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for CompletionWithFailureDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        let mut specs = CompletionToolDispatcher { workspace: None }.specs();
+        specs.push(ToolSpec {
+            name: "always.fail".into(),
+            description: "deterministic test failure".into(),
+            input_schema: json!({"type": "object", "additionalProperties": false}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        });
+        specs
+    }
+
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        if request.call.name == "task.complete" {
+            return CompletionToolDispatcher { workspace: None }
+                .execute(request)
+                .await;
+        }
+        Ok(ToolOutcome::Value(ToolOutput {
+            call_id: request.call.id,
+            tool_name: request.call.name,
+            ok: false,
+            summary: "expected failure".into(),
+            model_content: "expected failure".into(),
+            artifact_ref: None,
+            metadata: json!({}),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn task_complete_waits_for_model_when_a_sibling_action_failed() {
+    let model = Arc::new(CompletionWithFailedSiblingModel {
+        rounds: AtomicUsize::new(0),
+    });
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model.clone(),
+        Arc::new(CompletionWithFailureDispatcher),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .user_message("finish carefully".into())
+        .await
+        .unwrap();
+
+    let mut failed_batch_seen = false;
+    let mut assistant_content = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+        {
+            match envelope.event {
+                RuntimeEvent::ExecutionBatchSettled { failed, .. } => {
+                    failed_batch_seen |= failed == 1;
+                }
+                RuntimeEvent::AssistantMessage { content } => assistant_content = Some(content),
+                RuntimeEvent::TaskCompleted { .. } => break,
+                _ => {}
+            }
+        }
+    }
+
+    assert!(failed_batch_seen, "the failed sibling must be audited");
+    assert_eq!(
+        assistant_content.as_deref(),
+        Some("handled the failed sibling")
+    );
+    assert_eq!(
+        model.rounds.load(Ordering::SeqCst),
+        2,
+        "the failed batch must be returned to the model"
     );
     instance.shutdown().await.unwrap();
 }
@@ -321,10 +459,9 @@ fn collect_owner_files(dir: &std::path::Path, owner: &str) -> Vec<std::path::Pat
         .collect()
 }
 
-/// Round 0 proposes `task.complete`; round 1 answers with one very long
-/// plain-text response — so the raw-evidence artifact of the *final*
-/// response is written, and the CompletionRecord must attach its ref even
-/// though the model declared no artifacts.
+/// Proposes `task.complete` with a bounded but non-trivial summary. The
+/// summary itself is the terminal assistant response, so Runtime must write
+/// that exact body as raw evidence without another model call.
 #[derive(Debug)]
 struct CompletingLongModel {
     rounds: AtomicUsize,
@@ -344,29 +481,26 @@ impl ModelTransport for CompletingLongModel {
                 tool_calls: vec![ToolCall {
                     id: "call-1".into(),
                     name: "task.complete".into(),
-                    arguments: json!({"summary": "the task is done", "artifacts": []}),
+                    arguments: json!({
+                        "summary": "x".repeat(self.content_len),
+                        "artifacts": []
+                    }),
                 }],
                 usage: Default::default(),
             })
         } else {
-            Ok(ModelOutput {
-                content: "x".repeat(self.content_len),
-                tool_calls: Vec::new(),
-                usage: Default::default(),
-            })
+            panic!("accepted task.complete must not request a confirmation round")
         }
     }
 }
 
-/// The CompletionRecord carries the raw-evidence artifact of the final
-/// assistant response, independent of the model's self-declared artifact
-/// list — the raw output stays reachable after the bounded ContextItem
-/// truncated it.
+/// The CompletionRecord carries the raw-evidence artifact of the terminal
+/// completion summary, independent of the model's self-declared artifacts.
 #[tokio::test]
 async fn completion_record_attaches_the_raw_final_response_artifact() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
-    let content_len = 40_000;
+    let content_len = agent_contracts::MAX_COMPLETION_SUMMARY_CHARS;
     let services = RuntimeServices::new(
         CoreAuthorityConfig::default(),
         Arc::new(TestContextEngine),

@@ -938,11 +938,20 @@ pub struct ContextHints {
     #[serde(default)]
     pub task: Option<TaskAnchorView>,
     /// Checked `path` / `path@revision` rows from the runtime TaskProgress
-    /// projection. Engines may price historical file-body items as
-    /// descriptors when a row covers the path. They must not copy this
-    /// onto `MaterializedContext` for prompt rendering.
+    /// projection. This is identity/currentness only: it never proves that
+    /// the model-facing request already carries the corresponding body.
+    /// Engines must not copy this onto `MaterializedContext` for prompt
+    /// rendering.
     #[serde(default)]
     pub checked_files: Vec<String>,
+    /// Exact `path@revision` identities whose file bodies are already
+    /// carried by another low-authority layer of this same model request
+    /// (the retained turn tail or checkpoint-body restoration). An engine
+    /// may price only those historical file bodies as descriptors. This is
+    /// deliberately separate from `checked_files`: IdentityKnown is not
+    /// BodyVisible.
+    #[serde(default)]
+    pub visible_body_identities: Vec<String>,
     /// Current-directive exact-mention ∩ ExecutionState known paths.
     /// Engines may transiently project those file bodies for this request
     /// without changing residency (no Warm→Resident, no Stored Admit).
@@ -968,6 +977,12 @@ pub const MAX_ANCHOR_ROOT_CLAIMS: usize = 64;
 /// from the front (oldest) so the engine never sees an unbounded set.
 pub const MAX_CHECKED_FILE_HINTS: usize = 32;
 
+/// Hard cap on exact body-presence hints for one materialization. The
+/// runtime currently contributes at most the retained turn exchanges plus
+/// the bounded checkpoint spill, but implementations must not rely on a
+/// caller respecting that smaller product limit.
+pub const MAX_VISIBLE_BODY_HINTS: usize = 16;
+
 /// Max file bodies in one CURRENT FOREGROUND EVIDENCE projection.
 pub const MAX_FOREGROUND_RESOURCES: usize = 2;
 
@@ -988,6 +1003,10 @@ pub struct TaskAnchorView {
     pub acceptance_criteria: Vec<String>,
     pub plan_progress: Vec<String>,
     pub open_loops: Vec<String>,
+    /// `task.manage` 提交的单一可替换下一步指引。它是提示，
+    /// 不是 planner：模型仍自主决定下一次调用。
+    #[serde(default)]
+    pub next_action: String,
 }
 
 impl TaskAnchorView {
@@ -998,6 +1017,7 @@ impl TaskAnchorView {
             && self.acceptance_criteria.is_empty()
             && self.plan_progress.is_empty()
             && self.open_loops.is_empty()
+            && self.next_action.is_empty()
     }
 }
 
@@ -1013,6 +1033,9 @@ pub enum FrontierDelta {
     WorldInvalidatedUnknown,
     /// 世界未变而知识改进：新事实、新验证行或新前沿证据。
     EvidenceAdvanced,
+    /// 失效后的同一语义证据重新被证明为当前。它修复 currentness，
+    /// 但没有增加新知识，因此不清除收敛债务。
+    EvidenceReconfirmed,
     /// 一条未满足义务解除（失败清除等）且无新证据。
     ObligationResolved,
     /// 同 world revision 下重复了已知证据或结果。
@@ -1037,6 +1060,7 @@ impl FrontierDelta {
             Self::ObservedWorldChange => "world",
             Self::WorldInvalidatedUnknown => "unknown",
             Self::EvidenceAdvanced => "evidence",
+            Self::EvidenceReconfirmed => "reconfirmed",
             Self::ObligationResolved => "obligation",
             Self::RedundantEvidence => "redundant",
             Self::NoProgress => "none",
@@ -1065,10 +1089,24 @@ pub struct ExecutionEvidence {
     pub observed_world_revision: u64,
     pub validity: EvidenceValidity,
     pub argument_digest: String,
+    /// Digest of the bounded semantic result (or sealed artifact bytes).
+    /// Kept separate from the human-readable summary so revalidation can
+    /// distinguish currentness repair from genuinely new evidence.
+    #[serde(default)]
+    pub outcome_digest: String,
+    /// Whether this row is currently valid. Invalidated rows remain in the
+    /// same bounded table as dormant semantic fingerprints; prompt
+    /// projection still requires this flag plus the validity binding.
+    #[serde(default = "default_execution_evidence_current")]
+    pub current: bool,
     #[serde(default)]
     pub turn: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_ref: Option<String>,
+}
+
+fn default_execution_evidence_current() -> bool {
+    true
 }
 
 /// Bounded prompt projection of an `ExecutionState`. Operational cache only:
@@ -1136,6 +1174,34 @@ pub fn checked_files_cover_path(checked_files: &[String], path: &str) -> bool {
         let row = crate::normalize_resource_path(row);
         row == path || row.starts_with(&prefix)
     })
+}
+
+/// Canonical exact identity for a model-visible file body. Empty paths or
+/// revisions cannot prove body equivalence and therefore return `None`.
+pub fn file_body_identity(path: &str, revision: &str) -> Option<String> {
+    let path = crate::normalize_resource_path(path);
+    let revision = revision.trim();
+    if path.is_empty() || revision.is_empty() {
+        return None;
+    }
+    Some(format!("{path}@{revision}"))
+}
+
+/// Whether the current request already carries the exact body identity.
+/// Matching is exact after slash normalization; path-only rows and another
+/// revision never cover a body.
+pub fn visible_body_identities_cover(
+    visible_body_identities: &[String],
+    path: &str,
+    revision: Option<&str>,
+) -> bool {
+    let Some(identity) = revision.and_then(|revision| file_body_identity(path, revision)) else {
+        return false;
+    };
+    visible_body_identities
+        .iter()
+        .take(MAX_VISIBLE_BODY_HINTS)
+        .any(|row| crate::normalize_resource_path(row) == identity)
 }
 
 /// Why a record is a root. Independent of `AnchorRootStrength` (how strongly
@@ -2573,6 +2639,31 @@ mod tests {
         assert!(!path_exactly_in_directive(
             "file.rs.bak is stale",
             "file.rs"
+        ));
+    }
+
+    #[test]
+    fn visible_body_identity_requires_the_exact_revision() {
+        let visible = vec![r"src\auth.rs@abc".to_string()];
+        assert!(visible_body_identities_cover(
+            &visible,
+            "src/auth.rs",
+            Some("abc")
+        ));
+        assert!(!visible_body_identities_cover(
+            &visible,
+            "src/auth.rs",
+            Some("def")
+        ));
+        assert!(!visible_body_identities_cover(
+            &["src/auth.rs".into()],
+            "src/auth.rs",
+            Some("abc")
+        ));
+        assert!(!visible_body_identities_cover(
+            &visible,
+            "src/auth.rs",
+            None
         ));
     }
 }

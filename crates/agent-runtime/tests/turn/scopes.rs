@@ -7,12 +7,13 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentError, AgentResult, AttentionState, ContextAction, ContextDiagnostics, ContextEngine,
-    ContextIngress, ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextQuery, ContextScope, ContextStateTransition, EventJournal,
-    MaterializedContext, ModelCapabilities, ModelOutput, ModelRequest, ModelRole, ModelTransport,
-    RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, ToolCall, ToolDispatcher,
-    ToolExecutionRequest, ToolOutcome, ToolOutput, ToolSemanticRole, ToolSpec,
+    AgentError, AgentResult, AttentionState, CompletionProposal, ContextAction, ContextDiagnostics,
+    ContextEngine, ContextIngress, ContextItemId, ContextItemSummary, ContextKind,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextScope,
+    ContextStateTransition, EventJournal, MaterializedContext, ModelCapabilities, ModelOutput,
+    ModelRequest, ModelRole, ModelTransport, RuntimeDirective, RuntimeEvent, RuntimeEventEnvelope,
+    ScopeId, ScopeKind, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOutcome, ToolOutput,
+    ToolSemanticRole, ToolSpec,
 };
 
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
@@ -311,6 +312,105 @@ impl ContextEngine for ScopeRecordingEngine {
     async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
         Ok(())
     }
+}
+
+#[derive(Debug)]
+struct OneShotCompletionModel;
+
+#[async_trait::async_trait]
+impl ModelTransport for OneShotCompletionModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        Ok(ModelOutput {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "complete".into(),
+                name: "task.complete".into(),
+                arguments: json!({"summary": "done"}),
+            }],
+            usage: Default::default(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct OneShotCompletionDispatcher;
+
+#[async_trait::async_trait]
+impl ToolDispatcher for OneShotCompletionDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "task.complete".into(),
+            description: "complete".into(),
+            input_schema: json!({"type": "object"}),
+            risk: agent_contracts::ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        }]
+    }
+
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        Ok(ToolOutcome::RuntimeDirective {
+            output: ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "completion proposed".into(),
+                model_content: "completion proposed".into(),
+                artifact_ref: None,
+                metadata: json!({}),
+            },
+            directive: RuntimeDirective::CompleteTask(CompletionProposal {
+                summary: "done".into(),
+                artifacts: Vec::new(),
+            }),
+        })
+    }
+}
+
+#[tokio::test]
+async fn one_shot_completion_closes_the_landed_tool_scope_without_a_next_model() {
+    let context = Arc::new(ScopeRecordingEngine::default());
+    let handle = spawn_with(
+        Arc::new(OneShotCompletionModel),
+        context.clone(),
+        Arc::new(OneShotCompletionDispatcher),
+    )
+    .await;
+    let mut events = handle.subscribe();
+    handle
+        .user_message("complete the task".into())
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Ok(Ok(envelope)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            && matches!(envelope.event, RuntimeEvent::TaskCompleted { .. })
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "one-shot completion did not commit"
+        );
+    }
+
+    let tool_scope = context
+        .opens
+        .lock()
+        .await
+        .iter()
+        .find_map(|(kind, id)| (*kind == ScopeKind::Tool).then_some(*id))
+        .expect("task.complete must own a tool scope");
+    assert!(
+        context.closes.lock().await.contains(&tool_scope),
+        "terminal completion must explicitly consume its tool-result scope"
+    );
 }
 
 #[tokio::test]

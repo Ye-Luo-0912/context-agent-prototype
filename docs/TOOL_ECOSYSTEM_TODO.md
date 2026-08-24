@@ -390,11 +390,11 @@ The repository is already partially aligned with this architecture.
 | External effect enforcement | [~] fail-closed containment / M13 residual | Non-empty process `WireEffect`s are rejected before staging until actual intent can be bound to PLAT operation/effect identity and proved within the lease. Empty-effect/value responses remain usable and request-owned output identity is canonicalized. Direct child syscalls are not protocol effects: Linux write confinement, Linux TCP deny (ABI v4+), and Windows Low-IL write confinement are landed, but direct reads, UDP/raw/pathname-Unix sockets and Windows network remain the `CORE-01`/M13 residual. |
 | Extension sandbox | [~] M13 residual | Env scrub, private cwd, bounded stderr, deadlines, whole-process-tree termination, Windows Job quotas (including wrap 512 MiB and NORMAL priority), Unix rlimits (CPU/process/AS/FSIZE/NOFILE/CORE plus Linux NICE/RTPRIO/`no_new_privs`), brokered filesystem reads, deny-by-default brokered network, Linux Landlock write confinement, Linux Landlock TCP deny (ABI v4+), Linux Landlock device-ioctl deny (ABI v5), Linux Landlock signal scope (ABI v6) and Windows Low-IL write confinement are implemented. Direct reads, UDP/raw/pathname-Unix sockets, Windows network confinement and I/O bandwidth limits remain open. TTY detach, `HANDLE_LIST`, and Job UI restrictions stay skipped. |
 | Permission model | [~] bounded baseline | Registration validates the known permission vocabulary, derives minimum risk, and Core stores the accepted grant rather than trusting a live manifest. Standing grants narrow concrete effect intent. The vocabulary remains coarse and the landed PLAT-02 identity/error vocabulary is not yet the recoverable per-operation Platform authority of `PLAT-03/04`. |
-| Output contract | [x] model boundary / protocol caps closed | The trusted output broker caps model-facing fields when wired and the actor keeps a last-line guard; process streams use bounded fragments and an 8 MiB per-invocation/session artifact cap while draining overflow. Process responses take `call_id`/`tool_name` from the trusted request. `PLAT-00` caps every outbound/control/decoded frame and constrains large broker values (256 KiB bounded reads with truncation metadata). Artifact refs are capped identity locators (`artifact://v1/<run>/<owner>/<digest>`); live captures use an explicit draft until seal. Parse-time decoded JSON DOM budgets are landed. Remaining `PLAT-04` work is landed (JCS, legacy negotiation, shared fault matrix). Adapter envelope migration remains `PLAT-07`. |
+| Output contract | [x] model boundary / protocol caps closed | The trusted output broker caps model-facing fields when wired and the actor keeps a last-line guard; process streams use bounded fragments and an 8 MiB per-invocation/session artifact cap while draining overflow. Zero-byte captures return an explicit no-output terminal message without publishing an empty artifact ref; non-empty/truncated captures retain sealed artifacts. Process responses take `call_id`/`tool_name` from the trusted request. `PLAT-00` caps every outbound/control/decoded frame and constrains large broker values (256 KiB bounded reads with truncation metadata). Artifact refs are capped identity locators (`artifact://v1/<run>/<owner>/<digest>`); live captures use an explicit draft until seal. Parse-time decoded JSON DOM budgets are landed. Remaining `PLAT-04` work is landed (JCS, legacy negotiation, shared fault matrix). Adapter envelope migration remains `PLAT-07`. |
 | File/navigation tools | [x] `TOOL-VIEW-01` | Ordinary `fs.list` / `fs.read` / `search.grep` / code tools hide `.focus-agent` and raw `.git`. Sealed evidence stays on `artifact.read`; VCS on `git.*`. Missing paths return a bounded parent hint. Glob/multi-read, binary/media metadata, and read-tool cancellation remain optional later gaps. |
-| Edit reliability | [x] `TOOL-EDIT-01` | `edit.replace` accepts optional `base_revision` from `fs.read`; refusals are typed `stale_revision` / `no_exact_match` / `ambiguous_match` with at most three candidate regions. Matching stays exact; `edit.patch` remains the multi-hunk path. |
+| Edit reliability | [x] `TOOL-EDIT-01` | `edit.replace` accepts optional `base_revision` from `fs.read`; refusals are typed `stale_revision` / `no_exact_match` / `ambiguous_match` with at most three candidate regions. Matching stays exact; `edit.patch` remains the multi-hunk path, requires explicit `replace` / `insert_before` / `insert_after` intent on the model surface, preserves insertion anchors, exposes only unique exact anchors, keeps omitted op/ordinal selection parser-only, and preserves both ends of a bounded success echo. |
 | Tool failure feedback | [x] `TOOL-ERROR-01` | Trusted `metadata._runtime` (`failure_class` + recovery hint) and a model-visible `runtime_failure:` header. No blind retry or cost exclusion. Failed execution results stay TurnFrame-only. |
-| Process tools | [x] dialect disclosed / M13 residual | `shell.exec` binds one disclosed dialect for the run (Windows prefers `pwsh`, then Windows PowerShell 5.1, then `cmd.exe`; Unix POSIX `sh`). `process.run` is the no-shell argv path; `process.session` is start/poll/stop. Raw shell remains a non-transactional fallback. OS isolation residual is M12/M13, not this row. |
+| Process tools | [x] dialect disclosed / M13 residual | `shell.exec` binds one disclosed dialect for the run (Windows prefers `pwsh`, then Windows PowerShell 5.1, then `cmd.exe`; Unix POSIX `sh`). `process.run` is the no-shell argv path; `process.session` is start/poll/stop. Host-owned `verify.run` recipe ids are schema values, not tool-catalog names and never require `capability.manage` load. Raw shell remains a non-transactional fallback. OS isolation residual is M12/M13, not this row. |
 | Runtime facts | [x] `TOOL-ENV-01` | `runtime_facts/v1` sits after System Policy (≤1 KiB, ≤16 confined markers). Normalized OS product/release, architecture, workspace-relative contract. Facts never enter ContextEngine, transcript, or GC. |
 | VCS tools | [~] minimal | `git.status` and `git.diff` are confined, bounded, and read-only. `log/show/blame` and structured change review are absent; commit/push must remain higher-risk effects. |
 | Runtime control | [x] bounded baseline | `context.manage`, `capability.manage`, typed TaskAnchor patches, `task.complete`, and `artifact.read` exist. Federated resource discovery and managed-child controls are the next experimental surfaces. |
@@ -469,27 +469,35 @@ Runtime decides what task step happens next and what fits inside that limit.
 The names below describe roles. Do not rename the current tools until the
 contract and A/B results justify migration.
 
-### Tier 0: always-available runtime controls
+### Tier 0: Runtime-owned controls (visibility is demand-driven)
 
 These are trusted runtime operations, not ecosystem capabilities:
 
-- `context.manage`: lifecycle hint/tag/lease/collect and deliberate recall;
-- `capability.manage`: bounded search/inspect/load/unload of optional tools;
-- `task.manage` (proposed): inspect/propose TaskAnchor, plan, open-loop, and
-  acceptance-state updates; runtime events remain the authority;
-- `task.complete` (proposed): submit a structured completion proposal with
-  output/evidence/artifact/open-loop references; runtime verification and
-  durable commit create the CompletionRecord;
-- `artifact.fetch` (proposed): bounded range/excerpt access to an artifact by
-  stable reference without copying it into a new observation.
+- `context.manage` (landed, catalog-cold until typed evidence demand):
+  deliberate catalog recall and bounded context directives;
+- `capability.manage` (landed, always visible): bounded
+  search/inspect/load/unload of optional tools;
+- `task.manage` (proposed next long-task slice): CAS-propose bounded
+  TaskAnchor plan/open-loop/next-action updates; runtime events remain the
+  authority and user constraints stay on the boundary/approval path;
+- `task.complete` (landed, catalog-cold until closure intent/requirement):
+  submit a bounded completion summary; Runtime attaches owned
+  output/verification refs and durable commit creates the CompletionRecord;
+- `artifact.read` (landed, always visible): bounded range/excerpt access to an
+  artifact by stable reference without copying the full body into a new
+  observation.
 - `runtime.search` (proposed experiment): federated read-only discovery across
   provider-owned Context/Tool descriptors before widening to other resource
   kinds; resolving a result never implies admission, loading, or invocation;
 - `agent.manage` (future, evidence-gated): bounded discovery, assignment,
   wait/status/cancel, and handoff collection for Runtime-owned child workers.
 
-TaskAnchor must also update automatically from trusted runtime events. These
-controls must not turn long tasks into a sequence of user confirmations.
+ExecutionState already updates automatically from trusted runtime events.
+TaskAnchor semantic progress remains explicit: the proposed `task.manage`
+call updates only bounded autonomous fields at semantic safe points. These
+controls must not turn long tasks into a fixed plan or a sequence of user
+confirmations. See
+[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
 
 `task.manage` and `task.complete` are Runtime-owned directives, not ordinary
 capabilities. An external plugin cannot acquire task-authority merely by
@@ -1553,8 +1561,9 @@ together with TaskAnchor and continuous context GC.
 - [x] **TOOLS-05** Add patch-set/file-revision semantics; evaluate against `edit.replace`
   before deprecating anything. `edit.patch` lands the file-revision
   semantics: `fs.read` reports the content revision (SHA-256 hex), hunks
-  are exact-match and occurrence-aware like `edit.replace` (nothing is
-  deprecated), an optional `base_revision` refuses an edit based on stale
+  are exact-match and require unique model-visible anchors; legacy ordinal
+  occurrence remains parser-only compatibility. Nothing is deprecated, and
+  an optional `base_revision` refuses an edit based on stale
   content, and multiple files commit as one composite effect with
   journal-backed rollback evidence. `edit.replace` remains the simpler
   single-hunk tool; no deprecation.
@@ -1580,6 +1589,11 @@ together with TaskAnchor and continuous context GC.
   cause duplicates or gaps. Cursors past the snapshot end and malformed
   cursors are clean errors, and `artifact.read` can still page through any
   spill directly.
+  Follow-up live evidence on 2026-08-24 showed that publishing those optional
+  opaque cursors on every model call induced fabricated artifact identities.
+  The model-visible surface is now consolidated on `artifact.read`; per-tool
+  cursor parsing remains only for compatibility with trusted non-model
+  callers.
 - [x] **TOOLS-08P** Validate the TaskToolRequirements/round-surface first
   slice: bounded TaskRecord CAS, Must/Prefer/KeepReady packing and degradation,
   lifecycle refresh, bounded decision events, one final snapshot, runtime

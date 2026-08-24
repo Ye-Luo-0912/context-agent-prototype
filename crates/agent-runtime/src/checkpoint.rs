@@ -112,9 +112,10 @@ pub struct TaskRecordSnapshot {
     pub turn_intent: String,
 }
 
-/// One dynamic capability's surface state: its activation and which of its
-/// tools are on the model surface. Restoring re-applies the flags so a
-/// restarted run offers exactly the tools the checkpoint left loaded.
+/// One dynamic capability's activation plus bounded mechanical tool
+/// readiness/residency. The checkpoint intentionally does not carry a live
+/// host-persistent source: current composition must re-establish that intent,
+/// while restored-only rows remain eligible for lease reconciliation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilitySnapshot {
     pub id: String,
@@ -125,8 +126,9 @@ pub struct CapabilitySnapshot {
     /// list is the authoritative form.
     #[serde(default)]
     pub loaded: bool,
-    /// Per-tool surface state (authoritative since the per-tool lifecycle).
-    /// Empty means no tool of this capability is on the surface.
+    /// Per-tool readiness state (authoritative since the per-tool lifecycle).
+    /// It includes Loaded and Warm rows so reload remains cheap; empty means
+    /// no retained readiness for this capability.
     #[serde(default)]
     pub loaded_tools: Vec<String>,
 }
@@ -414,6 +416,44 @@ mod tests {
         assert_eq!(requirements.entries[0].tool_name, "fs.read");
         assert_eq!(requirements.entries[1].tool_name, "search.grep");
         assert!(decoded.authority.is_none());
+    }
+
+    #[test]
+    fn v4_round_trip_preserves_a_progress_proposal_exactly() {
+        let mut tasks = task_manager_with_requirements();
+        let task_id = tasks.active().unwrap();
+        let base = tasks.get(task_id).unwrap().anchor.revision;
+        let (txn, _revision, changed_fields, kind) = tasks
+            .prepare_patch_anchor(
+                task_id,
+                base,
+                &crate::task::AnchorPatch {
+                    current_interpretation: Some(
+                        "retry policy spans config, errors and execution".into(),
+                    ),
+                    plan_progress: Some(vec!["read the runner".into()]),
+                    open_loops: Some(vec!["prove saturation at the delay cap".into()]),
+                    next_action: Some("add the fake-sleeper unit test".into()),
+                    ..crate::task::AnchorPatch::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(kind, agent_contracts::AnchorPatchKind::Autonomous));
+        assert!(changed_fields.contains(&"next_action".to_string()));
+        tasks.commit(txn);
+
+        let encoded = serde_json::to_vec(&checkpoint(&tasks)).unwrap();
+        let decoded: RuntimeCheckpoint = serde_json::from_slice(&encoded).unwrap();
+        decoded.validate().unwrap();
+        // The proposal survives restore exactly, next_action included.
+        assert_eq!(
+            decoded.tasks.tasks[0].anchor,
+            tasks.get(task_id).unwrap().anchor
+        );
+        assert_eq!(
+            decoded.tasks.tasks[0].anchor.next_action,
+            "add the fake-sleeper unit test"
+        );
     }
 
     #[test]

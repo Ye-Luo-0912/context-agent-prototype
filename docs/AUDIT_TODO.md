@@ -81,6 +81,81 @@ wire compatible).
 
 ## Open P1 — Tool Surface reliability
 
+### TOOL-CONTRACT-01 — optional-union and cursor semantics (deterministic fix landed 2026-08-24; live gate open)
+
+The PinAI/Luna long-flow trace attributed 25/29 Dynamic failed outputs to
+malformed pagination capabilities. A trial that silently mapped empty/zero
+cursors to page one removed those failures but increased C from 75 rounds / 85
+calls to 137 / 171 and created a 47-round turn; paired A timed out. A second
+trial kept strict execution and published a cursor regex; the model then
+fabricated matching-looking artifact identities, all 25 file/search calls
+failed, C used 107/112 rounds/calls, and A timed out at turn 6. Neither trial
+is accepted.
+
+The retained surface uses `artifact.read` as the sole model-visible spill
+continuation. `fs.list`, `search.grep`, and `code.symbols` return bounded first
+pages plus a run-owned artifact ref and next line; their snapshot cursors stay
+parser-only compatibility and execution remains fail-closed. This removes
+three optional opaque-capability fields without adding a tool or prompt state.
+
+The negative run also exposed `context.manage` parsing every property of its
+union before `op` dispatch: unused empty UUID/enum fields invalidated valid
+fetch/search requests. It now parses only fields consumed by the selected op,
+publishes bounded kind/scope enums, and remains strict for required/relevant
+values. `tool-runtime` unit tests and clippy are green. This is deterministic
+tool-contract correctness, not a live convergence claim. The open gate is at
+least two paired repeats with unchanged hidden success, lower median rounds and
+calls, and no new p95/max-turn tail. Evidence:
+`crates/agent-eval/evidence/longflow-pinai-luna-responses-2026-08-24/REPORT.md`
+and `longflow-pinai-luna-cursor-normalized-2026-08-24/REPORT.md`.
+The strict-schema follow-up is
+`longflow-pinai-luna-tool-contract-2026-08-24/REPORT.md`.
+
+The same trace showed `task.complete` at 16 calls / 5 failures from invalid
+model-supplied artifact claims. Runtime already merges its trusted current
+assistant artifact and current verification refs into `CompletionRecord`.
+The model schema now requests only the bounded summary; the artifact list is
+parser-only compatibility and remains strictly validated when a trusted caller
+uses it. A follow-up 4/4 pair reduced failures to 2/1 but left C at 77 rounds /
+84 calls versus A's 49/36, so this deterministic defect is fixed while the
+live round/call acceptance remains open.
+
+### TOOL-CONTINUITY-01 — turn completion must not erase multi-turn task affinity (candidate; live success gate open 2026-08-24)
+
+The one-shot completion trace isolated a lifecycle feedback loop rather than a
+Context-size problem. Dynamic C called and committed `task.complete` on 9/15
+turns versus A's 3/15. Each commit closed the task scope; the next user
+directive started with a new task id and empty task-scoped `TaskProgress`, then
+repeated capability discovery, list/read/search, and another completion.
+
+The candidate separates implicit final-answer/turn completion from durable
+task closure. `task.complete` is catalog-cold by default, leased for explicit
+task-closure intent or an explicit Task requirement, and still discoverable
+through `capability.manage`. An accepted clean completion terminates without a
+confirmation model round; failed siblings and invalid verification gates keep
+the recovery round. This changes no Context/GC threshold or retrieval score.
+
+Deterministic tool/runtime tests are green. A short live edit passed in 3
+rounds / 2 calls / 0 failures. Two independent long-flow pairs reduced C to
+49/44 and 57/52 rounds/calls (A 50/45 and 47/38) while median C input, selected
+tokens, and resident bytes remained below A. Do not close this item yet: C
+hidden success was 3/4 then 4/4 versus A 4/4 twice. The failed assertion was a
+successful `RELEASE.md` edit that used `Version 2` instead of the requested
+literal `v2`; it was not an edit/runtime failure, but success-neutrality is an
+outcome gate, not a causal excuse. A later complete pair passed 4/4 in both
+arms but regressed C to 82 rounds / 76 calls with one 30-round edit-repair
+turn, versus A's 47 / 36. Task completions remained zero, so task continuity
+fixed the identified lifecycle loop but is not sufficient for convergence.
+Require broader clean paired repeats with no success or max-turn regression.
+Evidence:
+`longflow-pinai-luna-task-continuity-2026-08-24/REPORT.md` and
+`longflow-pinai-luna-task-continuity-r2-2026-08-24/REPORT.md` and
+`longflow-post-continuity-r3-2026-08-24/REPORT.md` and
+`longflow-post-edit-anchor-r4-2026-08-24/REPORT.md`. The first post-hardening
+pair passed 4/4 in both arms and restored C to 53 rounds / 51 calls / max-turn
+7 versus A's 54 / 44 / 13, with no C failed outputs. This is one positive
+dirty-tree pair; keep the item open for an independent repeat.
+
 ### TOOL-PROC-01 — explicit ProgramResolver for process.run (fixed 2026-08-23)
 
 Reproduction on Windows confirmed a tool-side semantic defect, not model
@@ -129,6 +204,82 @@ sees only canonical revision-required `files[]`; the legacy single-file shape
 is parser-only compatibility and cannot ambiguously bind one revision to many
 files. A successful patch reports every new revision in submitted-file order
 outside the optional echo cap.
+
+The complete post-continuity r3 trace added a general recovery defect: a large
+successful multi-hunk edit echo was prefix-only and hid the final changed file
+tail, while model-visible ordinal `occurrence` allowed repeated low-uniqueness
+`}` repairs to land on earlier braces. `edit.patch` now exposes only unique
+exact anchors with enough unchanged context; ordinal input remains parser-only
+wire compatibility. Both the per-file changed-span echo and the global
+multi-file bound preserve head and tail with an explicit middle-omission
+marker. `tool-runtime` 154/154 and `agent-eval` 129/129 are green. A short
+post-change live smoke passed in 4 rounds / 3 calls / 0 failures with the first
+patch committed and no confirm read or fallback. This proves model/schema
+compatibility, not accepted long-flow performance; a new paired live repeat is
+still required.
+
+That paired repeat is now directional green: C 53 rounds / 51 calls / max-turn
+7 versus A 54 / 44 / 13, both hidden 4/4, and no C failures or ordinal fields.
+Three residual C calls read zero-byte successful verification artifacts. The
+shared process output now withholds `artifact_ref` only when captured bytes are
+zero and returns an explicit no-output terminal message; non-empty/truncated
+captures are unchanged. The run predates that last correction, so no synthetic
+call reduction is claimed. Require an independent post-output-change repeat.
+
+That repeat validated the zero-output routing but exposed the next execution
+coherence defect. Both arms passed hidden 4/4 and C made zero `artifact.read`
+calls, yet C used 47 rounds / 44 calls versus A's 43 / 32. Evidence-only
+results were 29 versus 16. In the largest amplified turn C already had an
+exact current target body, but globally novel list/Git/catalog observations
+each appeared to advance the global Evidence Frontier. Task-target relevance
+now qualifies read-only frontier advancement once a directive has an exact
+Fresh root: unrelated new facts stay stored and model-visible when selected,
+but do not reset convergence debt. Directives without an exact root preserve
+broad exploration and all warnings remain advisory. Selected exact file
+bodies co-locate `workspace_identity=current`; tool schemas distinguish
+`verify.run` recipe values from `capability.manage` tool names. The r5 trace
+predates this correction, so require a new paired measurement. See
+[`longflow-post-empty-artifact-r5-2026-08-24/REPORT.md`](../crates/agent-eval/evidence/longflow-post-empty-artifact-r5-2026-08-24/REPORT.md).
+
+The r6 measurement is a counterexample. Hidden success remained 4/4 in both
+arms and C retained its Context advantage, but used 57 rounds / 56 calls /
+max-turn 15 versus A's 49 / 38 / 7. The task-frontier advisory fired without
+preventing a 15-round already-satisfied turn. Exact surface events show
+decision-bound load churn: `git.diff` disappeared when the next decision
+loaded `git.status`, forcing catalog reloads instead of allowing a cooperating
+tool set. Runtime now keeps explicit model loads pending until exact use,
+unload, or directive end, independently of one-decision called-tool result
+delivery. This has deterministic cohort coverage and no Context/GC change, but
+postdates r6 and is not live-accepted. See
+[`longflow-task-relevant-frontier-r6-2026-08-24/REPORT.md`](../crates/agent-eval/evidence/longflow-task-relevant-frontier-r6-2026-08-24/REPORT.md).
+
+The r7 pair confirmed source lifetime but not convergence: the Git reload loop
+disappeared and max-turn returned to 8, yet C used 62 rounds / 59 calls versus
+A's 46 / 35. Eight of ten C catalog operations addressed `fs.write`,
+`edit.replace`, `git.status` or `git.diff`. The isolated follow-up candidate
+always surfaces only the compact universal subset `fs.write` + Git status/diff
+(about 190 additional schema tokens; core about 947/4,096); `edit.replace` and
+all non-core capability classes remain dynamic. See
+[`longflow-pending-tool-cohort-r7-2026-08-24/REPORT.md`](../crates/agent-eval/evidence/longflow-pending-tool-cohort-r7-2026-08-24/REPORT.md).
+
+Three stable-core repeats support retaining that product boundary: r8 C/A was
+46/46 rounds and 41/37 calls; r9 was 49/47 and 46/38, with hidden 4/4 in every
+arm and one `capability.manage` call per arm. C retained 22–37% lower model
+input and 61–65% lower historical Context. r9 still had a 9-round editor tail:
+two sequential replacement hunks targeted the same ping-test anchor, so the
+first consumed the second's match. `edit.patch` now makes operation intent
+explicit (`replace` / `insert_before` / `insert_after`); insertions preserve
+their unique anchor and omitted op remains parser-only replace compatibility.
+The unchanged r10 live repeat passed hidden 4/4 in both arms at C/A 48/47
+rounds and 41/39 calls, with identical three failed outputs and max-turn 8.
+Explicit insertions were used successfully and the r9 Hello conflict did not
+recur. C's remaining two patch refusals were safe ambiguous/no-exact locator
+failures; neither was a filesystem settlement failure. Across r8-r10 the
+median gap is +1 round / +4 calls. Retain the stable core and explicit
+operations; do not admit positional or fuzzy matching from this one sample.
+See [`r8`](../crates/agent-eval/evidence/longflow-stable-core-surface-r8-2026-08-24/REPORT.md)
+and [`r9`](../crates/agent-eval/evidence/longflow-stable-core-surface-r9-2026-08-24/REPORT.md),
+then [`r10`](../crates/agent-eval/evidence/longflow-explicit-edit-ops-r10-2026-08-24/REPORT.md).
 
 Canonical batch path keys are acquired in sorted order before any edit
 snapshot; one pinned bounded read feeds transformation, SHA-256, recovery hash
@@ -207,8 +358,10 @@ Confirmed residuals:
 - mixed-EOL matching materializes one bounded canonical view per hunk; keep
   the simpler implementation until profiling shows it is a hot path, then a
   streaming token matcher may replace it without changing semantics;
-- `fs.write` remains a catalog-only blind whole-file upsert for scripted-arm
-  compatibility; a future compatible schema needs explicit create vs
+- `fs.write` remains a blind whole-file upsert, now in the compact production
+  core surface because create/replace is a universal coding operation and its
+  78-token schema costs less than repeated catalog-control rounds. Execution
+  is still effect/approval gated. A future compatible schema needs explicit create vs
   revision-checked replace rather than making it a second primary editor;
 - the r4 live diagnostic did not exercise external-process races, process
   crash, disk-full/journal failures, or partial multi-file recovery, and does
@@ -292,6 +445,36 @@ out of descriptor-only/needs-revalidation so a protocol body cache would
 be sized against real demand. Residency loosening stays rejected on
 current evidence; the tiny current-turn LRU gets built only if this
 motive shows up in live runs.
+
+### LONGTASK-01 — bounded autonomous progress update is not model-routable (open)
+
+`TaskAnchor` already stores bounded interpretation, acceptance, plan and open
+loops, and `ExecutionState` already stores checked files, verification,
+failures and obligations. Host callers can patch the anchor, but one
+autonomous long user directive has no model-visible, Runtime-owned path to
+persist a revised next action/open loops before interruption. Reuse the
+proposed catalog-cold/task-required `task.manage` with
+`base_anchor_revision` CAS. The initial slice may update only bounded
+autonomous progress fields plus one `next_action`; it cannot rewrite user
+constraints, store file/tool bodies, or create a second ResumePoint.
+
+### LONGTASK-02 — full checkpoint exists, mid-turn continuation does not (open)
+
+`RuntimeInstance::checkpoint/restore` validates task/context/capability/Core
+authority planes, but checkpoint capture is externally requested and the
+active turn's final ExecutionState is installed on `TaskRecord.resume` only
+after `TurnCompleted`. A process stop during a one-directive development tool
+loop therefore has no claimed bounded continuation boundary.
+
+Add an actor-owned safe point only after a whole tool batch settles and no
+operation/effect is in flight. Meaningful durable changes accrue coalesced
+checkpoint debt; explicit pause/suspend/completion/shutdown waits for atomic
+checkpoint acknowledgement. Restore then uses a Runtime-owned
+`continue_active_task` from the same task id/directive/anchor/resume state,
+without replaying transcript or minting new user authority. Event ordering,
+checkpoint failure/retry, cancellation, exact-once effects and stale
+verification need deterministic coverage before a live run. Contract and
+pilot: [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
 
 ### CONV-01 / CONV-02 / PROTO-EVID-01 — closed 2026-08-23
 
@@ -397,6 +580,112 @@ so optimization targets long turns, not task-round means. Deferred
 honestly: a `warning_surfaced` kind needs the render path to report
 surfacing; do not fake it from attempt counts.
 
+### CONV-04 — execution attribution + capability leases (partial; attribution/negative-fact slices landed 2026-08-24)
+
+The retained long-flow event streams prove that the current convergence
+scalar is the wrong decision signal for optional exploration. C/A produced
+the same eight successful Known mutation outcomes, but C produced 48 versus
+21 evidence-only results, 9 versus 0 Unknown invalidations, and an 18 versus
+3 maximum result streak without an outcome advance. Its catalog-loaded
+optional surface exposed 134 reported rows (118 unused in their round) and
+received 18 requests; A exposed 28 (26 unused) and received two. All selected
+reports were untruncated. The 36-call C-A difference is exactly the additional
+27 evidence-only plus 9 Unknown results in this diagnostic.
+
+Landed measurement foundation: `agent-eval::RunMetrics` aggregates the
+body-free `outcome_frontier_*` partition and bounded
+`catalog_optional_*` exposure/request join from existing events, renders them
+under `--metrics`, and includes them in new bundle summaries. It counts
+`TransientNoPersist` results, but does not persist their bodies or change
+Runtime behavior. Source-bound facts and the causal trace are in
+`crates/agent-eval/evidence/longflow-task-provenance-2026-08-24/REPORT.md`.
+
+Landed first behavior slice (not yet a live performance claim): Runtime uses
+source-driven schema leases rather than a round TTL. Exact tools called by one
+model decision remain rooted through execution and the next successful
+decision; reuse renews the result-delivery source, non-use releases it. A
+trusted catalog-load receipt establishes a separate pending-use source until
+the exact tool is called, explicitly unloaded, or the directive ends. Adjacent
+loads therefore form a small turn-local cohort instead of evicting each other;
+using one consumes only that member. New directives clear leftover ephemeral
+leases, while explicit task requirements and typed verification/evidence roots
+survive. Host/operator loads are a distinct persistent source until explicit
+unload; Runtime/model load paths never become task-global pins, and restore
+unions current composition sources with checkpoint residency without
+promoting restored-only rows. `ExecutionBatchSettled` accounts
+transient/refused/reused actions without persisting their bodies. Oversized
+batches execute no member and terminalize every request as a no-dispatch
+refusal. Builtin, dynamic capability and actor tests cover release, renewal,
+reload, task-root retention, restore and source separation. Lease/batch event
+append failures fence the actor before another model decision. The model tool
+batch has a 32-call hard memory/queue bound; it is not a convergence constant.
+
+Landed second behavior slice (still not a live performance claim):
+`ToolDispatcher::execution_attribution` supplies bounded pre-dispatch purpose,
+canonical resource targets and explicit verification-reuse policy. Runtime
+joins targets with current task roots; dynamic capabilities fail closed,
+shell/process remain Opaque, and output metadata cannot mint reusable
+verification. Unrooted trusted path misses enter an eight-row,
+workspace-revision-bound negative-fact table rather than the Obligation
+Ledger. Equivalent reuse requires a live Workspace absence check plus a
+successful `ExecutionNegativeFact::Reused` audit append; external appearance
+or any admitted workspace mutation invalidates the fact. Current task roots
+promote the next miss back to an obligation. Exact trusted verifier sources
+are checkpointed under the task-anchor revision and PreferSurfaced when
+verification is due, with semantic-role fallback if unavailable.
+`negative_fact_*` eval counters, state/builtin/capability tests and an actor
+test (two terminal read results, one real dispatch) cover the landed boundary.
+
+Landed third behavior slice (still not a live performance claim):
+`VerificationReuse::ExactCurrentWorld` requires a trusted SHA-256 host identity
+digest for recipe/execution-profile/policy/environment inputs; raw environment
+material is not stored. A successful
+verification fact records exact tool, Runtime argument digest, task anchor,
+user-directive revision and workspace revision. Runtime skips a later call
+only if the whole tuple remains current and the `ExecutionVerificationPass`
+reuse event appends; otherwise it dispatches. The no-dispatch result is
+truthful (`executed=false`), remains a terminal action, and is split into
+`verification_pass_recorded/reused` eval counters. New user directives and
+any admitted workspace revision change force a real rerun. The state unit test
+covers argument, environment, directive and workspace invalidation; the actor
+test receives two terminal verification results from one dispatch.
+
+Landed production entry point: bounded `verify.run { recipe_id }` recipes are
+the only builtin process calls that can receive Verify attribution. Model argv
+cannot shadow the host recipe; Core and the dispatcher are wired from one
+recipe set. General project runners are `TaskScoped` and conservatively retain
+Unknown mutation semantics. The first exact recipe is the generic
+  manifest-free Rust test-target compile into `.focus-agent`; it binds a
+  complete bounded workspace file snapshot, recipe revision, platform,
+  resolved compiler and bounded complete environment. This covers transitive
+  sibling modules; links/escapes, external-input directives, special files,
+  overflow and pre/post identity drift downgrade to real execution. The real
+runtime/tool deterministic bench now proves two requests settle from one
+spawn (`Recorded=1`, `Reused=1`). Generic shell/process behavior is unchanged.
+
+Open implementation must remain execution-only and staged:
+
+- extend the landed exact-current completed-PASS identity with broader bounded
+  coverage/obligation provenance, identical in-flight joining, and explicit
+  host-declared equivalence classes; do not infer equivalence from commands;
+- extend the landed exact result-delivery/task/verification roots with trusted
+  obligation-scoped provenance source tools;
+- complete the table-driven crash/restart matrix. Normal, transient,
+  recovery-refused, duplicate, oversized-batch, scope-open, admission and
+  publication abort paths now settle or expose a missing terminal through the
+  actor-local ledger; abrupt process loss still needs replay evidence;
+- independently make accepted completion one-shot and terminal-safe; the
+  retained baseline has zero completion calls, so this cannot be presented as
+  the cause of its 49/65 versus 38/29 gap.
+
+Do not lower the 18 KiB watermark globally, choose a call cutoff from this one
+trace, parse arbitrary command strings to infer read-only/verification, or add
+another generic "finish sooner" prompt. Before default behavior changes,
+require deterministic exact/equivalent verifier reuse, stale settlement,
+transient action, negative fact, cross-turn lease, discovery/reload and
+already-satisfied-task tests, followed by at least two paired live repeats
+with hidden success unchanged and no new p95/max-turn tail.
+
 ### PROTO-EVID-03 — Unknown suspends body reuse instead of deleting it (fixed 2026-08-23)
 
 First live `ProtocolBodyCacheStats` accounting showed eligibility of
@@ -436,7 +725,13 @@ gate also fired; that cache landed 2026-08-23 (see PROTO-EVID-02).
 **Status: Freeze Candidate** (MOD-OBS-01 / MOD-PROG-01 / turn
 checkpointing landed 2026-08-21; the clean post-outage longflow pass
 2026-08-23 held — Warm=Stored rereads stayed 0 and capability churn
-stayed gone). Do not reimplement `ResumePoint`.
+stayed gone). Do not reimplement `ResumePoint`. A model-visible
+`TaskProgress.task_changes` projection was tested and reverted 2026-08-24:
+although one attribution turn shortened, its refined run amplified C to 127
+rounds / 174 calls. Do not reintroduce it without the replay and paired-live
+gate in `ROADMAP.md`. A generic current-workspace-authority standing prompt
+also failed that gate in two repeats (C 64/79 and 72/76) and was reverted; do
+not replace structured evidence with a "stop earlier" instruction.
 Contract: [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md).
 
 ## Open P2 — evaluation
@@ -458,6 +753,18 @@ Frozen `context-bench.v1` SPEC / pack digest stay frozen. Wave-1 live
 (`historical_context=0`), not Context. Do not collect 300×3. Do not
 retune GC from that live or from an `add_test` cell. Do not treat
 `Likely optimization target` as a modification order.
+
+### EVAL-03 — one-directive development task + interrupted twin (planned)
+
+The retained 15-directive longflow is a Context/control diagnostic, not an
+autonomous development-task benchmark. After LONGTASK-01/02 deterministic
+gates, freeze `retry_policy_dev`: one network-free Rust task with behavioral,
+API, build, README and allowed-diff hidden checks. Run uninterrupted and
+safe-point stop/restore twins from the same seed/directive. First compare
+normal/resume on C, then same-model A/C; compare models only with Runtime C and
+the tool surface fixed. Correctness, task/constraint survival, exact-once
+effects and current verification gate efficiency. The pilot is not M15
+acceptance. Design: [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
 
 ## Closed archive (index only)
 

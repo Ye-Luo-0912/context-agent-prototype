@@ -3,9 +3,11 @@
 use std::path::Path;
 
 use agent_contracts::{
-    EvidenceValidity, ExecutionEvidence, FrontierDelta, MAX_FOREGROUND_RESOURCES,
-    MAX_TASK_ANCHOR_ITEM_CHARS, ResourceFreshness, ResourceKey, TaskProgressView, ToolFailureClass,
-    ToolFailureDomain, ToolOutput, path_exactly_in_directive,
+    ArtifactLocator, ContentDigest, EvidenceValidity, ExecutionEvidence, FrontierDelta,
+    MAX_FOREGROUND_RESOURCES, MAX_TASK_ANCHOR_ITEM_CHARS, NegativeFactEventKind, ResourceFreshness,
+    ResourceKey, TaskProgressView, ToolExecutionAttribution, ToolExecutionPurpose,
+    ToolFailureClass, ToolFailureDomain, ToolOutput, VerificationPassEventKind,
+    path_exactly_in_directive,
 };
 #[cfg(test)]
 use agent_contracts::{ToolResultDisposition, TurnFrame, TurnFrameStep};
@@ -31,6 +33,11 @@ const EVIDENCE_TEXT_CHARS: usize = 80;
 /// 义务账本上限（最旧淘汰）与单义务目标数上限。
 pub(super) const MAX_OBLIGATIONS: usize = 8;
 const MAX_OBLIGATION_TARGETS: usize = 8;
+/// Speculative negative path observations and trusted verifier sources are
+/// operational identities, never transcript history. Both tables are small
+/// and checkpoint-validated.
+pub(super) const MAX_NEGATIVE_FACTS: usize = 8;
+pub(super) const MAX_VERIFICATION_SOURCES: usize = 4;
 
 /// 一轮工具观察的确定性前沿分类结果，随 `ExecutionFrontier` 事件上报。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +48,10 @@ pub struct FrontierObservation {
     pub invalidated: u64,
     /// CONV-OBS-01：本次观察产生的义务账目事件（有界）。
     pub obligation_events: Vec<agent_contracts::ExecutionObligationEvent>,
+    /// Bounded lifecycle transitions for speculative negative facts.
+    pub negative_fact_events: Vec<NegativeFactTransition>,
+    /// Body-free lifecycle transitions for exact verification PASS receipts.
+    pub verification_pass_events: Vec<VerificationPassTransition>,
 }
 
 /// [`ExecutionState::record_observation_evidence`] 的三值结果。
@@ -48,10 +59,33 @@ pub struct FrontierObservation {
 pub(super) enum ObservationEvidence {
     /// 新证据或证据内容变化。
     Advanced,
+    /// A dormant row became current again with the same arguments and
+    /// semantic outcome. Currentness improved; knowledge did not.
+    Reconfirmed,
     /// 同 key 同 validity 同结果的重复观察。
     Repeated,
     /// 该输出不产生前沿证据（无可键化路径且非命令成功）。
     None,
+}
+
+/// Semantic effect of stamping one resource identity. Returning from
+/// NeedsRevalidation to the same digest repairs currentness but is not a new
+/// world fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResourceObservation {
+    None,
+    Reconfirmed,
+    Advanced,
+}
+
+impl ResourceObservation {
+    pub(super) fn merge(&mut self, other: Self) {
+        if matches!(other, Self::Advanced)
+            || matches!(other, Self::Reconfirmed) && matches!(self, Self::None)
+        {
+            *self = other;
+        }
+    }
 }
 
 /// Consecutive no-progress counter for one operation signature
@@ -91,6 +125,17 @@ pub struct FailureCluster {
 #[serde(rename_all = "snake_case")]
 pub struct ExecutionState {
     pub anchor_revision: u64,
+    /// Monotonic user-directive clock. Exact PASS reuse is deliberately
+    /// limited to one directive so an explicit later request to rerun a
+    /// verifier is never silently served by an older result.
+    #[serde(default)]
+    pub directive_revision: u64,
+    /// Whether the current directive already has an exact task-rooted
+    /// resource identity. Once true, unrelated catalog/workspace discoveries
+    /// remain available as evidence but no longer reset the task-convergence
+    /// frontier merely because their evidence key is novel.
+    #[serde(default)]
+    pub directive_has_rooted_evidence: bool,
     /// Monotonic world clock. Bumped on any may-mutate observation.
     /// Verification facts bind to this value and do not auto-promote.
     #[serde(default)]
@@ -118,6 +163,15 @@ pub struct ExecutionState {
     /// 仅前置变化或同类成功解除。
     #[serde(default)]
     pub obligations: Vec<ExecutionObligation>,
+    /// Trusted path misses that were speculative rather than rooted in task
+    /// authority. They are bound to `workspace_revision`, retain no body,
+    /// and may be reused only after a live Workspace absence check.
+    #[serde(default)]
+    pub negative_facts: Vec<NegativeExecutionFact>,
+    /// Exact host-attributed verifier identities for this task anchor. They
+    /// become schema roots only while verification is due.
+    #[serde(default)]
+    pub verification_sources: Vec<VerificationSourceLease>,
 }
 
 /// 一条已证明存在的执行 blocker（CONV-03 lineage 模型）。
@@ -276,6 +330,16 @@ pub struct VerificationFact {
     pub anchor_revision: u64,
     #[serde(default)]
     pub workspace_revision: u64,
+    /// Exact verifier provenance is populated only from trusted pre-dispatch
+    /// attribution. Empty fields keep legacy/non-exact evidence fail-closed.
+    #[serde(default)]
+    pub source_tool_name: String,
+    #[serde(default)]
+    pub argument_digest: String,
+    #[serde(default)]
+    pub verification_identity: String,
+    #[serde(default)]
+    pub directive_revision: u64,
     /// Artifact locator of the verification output, when the tool retained one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_ref: Option<String>,
@@ -291,6 +355,74 @@ pub struct FailedCommandFact {
     pub turn: u64,
 }
 
+/// One speculative, revision-bound negative path observation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NegativeExecutionFact {
+    pub tool_name: String,
+    pub target: String,
+    pub argument_digest: String,
+    pub failure: ToolFailureClass,
+    pub workspace_revision: u64,
+    pub turn: u64,
+}
+
+/// Provenance lease for a verifier explicitly attributed by the trusted host
+/// before dispatch. Workspace changes do not erase the source (they are why a
+/// rerun becomes due); an anchor revision change does.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct VerificationSourceLease {
+    pub tool_name: String,
+    pub argument_digest: String,
+    pub anchor_revision: u64,
+}
+
+/// Runtime combines host attribution with current task authority. The host
+/// names what a call does; only Runtime can say which targets are task-rooted.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeExecutionAttribution {
+    pub host: ToolExecutionAttribution,
+    pub rooted_targets: Vec<String>,
+}
+
+impl RuntimeExecutionAttribution {
+    pub fn target_is_rooted(&self, target: &str) -> bool {
+        let target = agent_contracts::normalize_resource_path(target);
+        self.rooted_targets.iter().any(|rooted| rooted == &target)
+    }
+
+    pub fn reusable_verification(&self) -> bool {
+        self.host.reusable_verification()
+    }
+
+    pub fn exact_verification_identity(&self) -> Option<&str> {
+        self.host.exact_verification_identity()
+    }
+}
+
+/// Body-free transition emitted through [`FrontierObservation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NegativeFactTransition {
+    pub kind: NegativeFactEventKind,
+    pub tool_name: String,
+    pub target: String,
+    pub failure: ToolFailureClass,
+    pub workspace_revision: u64,
+}
+
+/// Body-free transition for an exact verification PASS receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationPassTransition {
+    pub kind: VerificationPassEventKind,
+    pub tool_name: String,
+    pub argument_digest: String,
+    pub verification_identity: String,
+    pub anchor_revision: u64,
+    pub directive_revision: u64,
+    pub workspace_revision: u64,
+}
+
 pub(super) struct OperationIdentity {
     pub tool_name: String,
     pub target: String,
@@ -300,7 +432,13 @@ impl ExecutionState {
     /// New user directive: TurnIntent is replaced by the caller. Verification
     /// obligation is not wiped here — whether Verify is due this round is
     /// [`Self::verification_due_now`].
-    pub fn on_user_turn(&mut self) {}
+    pub fn on_user_turn(&mut self, message: &str) {
+        self.directive_revision = self.directive_revision.saturating_add(1);
+        self.directive_has_rooted_evidence = self.checked_files.iter().any(|row| {
+            row.freshness == ResourceFreshness::Fresh
+                && path_exactly_in_directive(message, &row.path)
+        });
+    }
 
     /// Persistent obligation: something still needs a verification, even if
     /// this round should not Prefer-verify. Derived from
@@ -382,7 +520,7 @@ impl ExecutionState {
             || lower.contains("check that tests")
     }
 
-    fn turn_requests_complete(message: &str) -> bool {
+    pub(crate) fn turn_requests_complete(message: &str) -> bool {
         let lower = message.to_ascii_lowercase();
         lower.contains("task.complete")
             || lower.contains("complete the task")
@@ -471,6 +609,133 @@ impl ExecutionState {
         self.checked_files.iter().find(|row| row.path == path)
     }
 
+    /// Whether existing Runtime facts already make this path a task
+    /// precondition. Textual directive/anchor relevance is combined by the
+    /// actor; this method owns only structured execution state.
+    pub fn path_is_execution_rooted(&self, path: &str) -> bool {
+        let path = agent_contracts::normalize_resource_path(path);
+        if path.is_empty() {
+            return false;
+        }
+        if self.checked_files.iter().any(|fact| fact.path == path) {
+            return true;
+        }
+        if matches!(
+            &self.verification.coverage,
+            VerificationCoverage::Resources(paths) if paths.iter().any(|covered| covered == &path)
+        ) {
+            return true;
+        }
+        self.obligations.iter().any(|row| {
+            row.scope_key == path
+                || row
+                    .precondition
+                    .split_once('@')
+                    .map(|(candidate, _)| candidate == path)
+                    .unwrap_or(row.precondition == path)
+        })
+    }
+
+    /// Exact verifier schemas remembered for the current task anchor. The
+    /// caller decides whether verification is due; current verification does
+    /// not keep schemas resident merely because a source exists.
+    pub fn verification_source_tools(&self, anchor_revision: u64) -> Vec<String> {
+        let mut tools: Vec<String> = self
+            .verification_sources
+            .iter()
+            .filter(|source| source.anchor_revision == anchor_revision)
+            .map(|source| source.tool_name.clone())
+            .collect();
+        tools.sort();
+        tools.dedup();
+        tools
+    }
+
+    /// Return a PASS only when the complete equivalence tuple is current:
+    /// trusted tool+recipe, exact arguments, task anchor, user directive and
+    /// admitted workspace world. There is no TTL or approximate match; any
+    /// uncertainty falls through to normal dispatch.
+    pub fn current_exact_verification_pass(
+        &self,
+        tool_name: &str,
+        argument_digest: &str,
+        anchor_revision: u64,
+        attribution: &RuntimeExecutionAttribution,
+    ) -> Option<VerificationFact> {
+        let verification_identity = attribution.exact_verification_identity()?;
+        if self.anchor_revision != anchor_revision || self.validity() != VerificationState::Current
+        {
+            return None;
+        }
+        self.verifications
+            .iter()
+            .rev()
+            .find(|fact| {
+                fact.ok
+                    && fact.anchor_revision == anchor_revision
+                    && fact.directive_revision == self.directive_revision
+                    && fact.workspace_revision == self.workspace_revision
+                    && fact.source_tool_name == tool_name
+                    && fact.argument_digest == argument_digest
+                    && fact.verification_identity == verification_identity
+            })
+            .cloned()
+    }
+
+    /// Find a current speculative miss equivalent to this attributed call.
+    /// Target identity, not arbitrary arguments, defines equivalence: line
+    /// windows and search needles cannot make an absent path appear. The
+    /// actor still performs a live Workspace absence check before reuse.
+    pub fn current_negative_fact(
+        &self,
+        tool_name: &str,
+        attribution: &RuntimeExecutionAttribution,
+    ) -> Option<NegativeExecutionFact> {
+        if !matches!(
+            attribution.host.purpose,
+            ToolExecutionPurpose::Observe | ToolExecutionPurpose::Search
+        ) {
+            return None;
+        }
+        attribution.host.targets.iter().find_map(|target| {
+            if attribution.target_is_rooted(target) {
+                return None;
+            }
+            self.negative_facts
+                .iter()
+                .find(|fact| {
+                    fact.tool_name == tool_name
+                        && fact.target == *target
+                        && fact.failure == ToolFailureClass::PathNotFound
+                        && fact.workspace_revision == self.workspace_revision
+                })
+                .cloned()
+        })
+    }
+
+    /// Remove one negative fact after a live recheck disproves it. The
+    /// transition is returned so the actor can journal the decision before
+    /// dispatching the formerly-missing path.
+    pub fn invalidate_negative_fact(
+        &mut self,
+        tool_name: &str,
+        target: &str,
+    ) -> Option<NegativeFactTransition> {
+        let target = agent_contracts::normalize_resource_path(target);
+        let index = self
+            .negative_facts
+            .iter()
+            .position(|fact| fact.tool_name == tool_name && fact.target == target)?;
+        let fact = self.negative_facts.remove(index);
+        Some(NegativeFactTransition {
+            kind: NegativeFactEventKind::Invalidated,
+            tool_name: fact.tool_name,
+            target: fact.target,
+            failure: fact.failure,
+            workspace_revision: self.workspace_revision,
+        })
+    }
+
     /// Current directive exact-mentions ∩ known (non-Missing) resource
     /// paths. Recency first, capped. Runtime fills `ContextHints`; the
     /// engine must not re-parse TurnIntent.
@@ -547,6 +812,16 @@ impl ExecutionState {
             failed_commands: self
                 .failed_commands
                 .iter()
+                // A current speculative miss has a more precise projection
+                // below. Do not spend prompt budget on both the generic
+                // failure row and its revision-bound known-absence identity.
+                .filter(|failure| {
+                    !self.negative_facts.iter().any(|negative| {
+                        negative.workspace_revision == self.workspace_revision
+                            && negative.tool_name == failure.tool_name
+                            && negative.target == failure.target
+                    })
+                })
                 .map(|row| {
                     if row.target.is_empty() {
                         format!("{}:{}", row.tool_name, row.summary)
@@ -554,6 +829,20 @@ impl ExecutionState {
                         format!("{} {}:{}", row.tool_name, row.target, row.summary)
                     }
                 })
+                .chain(
+                    self.negative_facts
+                        .iter()
+                        .filter(|row| row.workspace_revision == self.workspace_revision)
+                        .map(|row| {
+                            format!(
+                                "known_absent {} {}:{} @ world={}",
+                                row.tool_name,
+                                row.target,
+                                row.failure.as_str(),
+                                row.workspace_revision
+                            )
+                        }),
+                )
                 .collect(),
             operational_evidence: self.evidence_rows(),
             unresolved_blockers: self.obligation_warnings(),
@@ -683,11 +972,13 @@ impl ExecutionState {
                 };
             }
         }
-        // 逐签名停滞只在重复行为（NoProgress / RedundantEvidence）下
-        // 累计；无失败的未知失效只记债务，不冒充停滞。
+        // 逐签名停滞只在重复行为（NoProgress / redundant/reconfirmed
+        // evidence）下累计；无失败的未知失效只记债务，不冒充停滞。
         if !matches!(
             delta,
-            FrontierDelta::NoProgress | FrontierDelta::RedundantEvidence
+            FrontierDelta::NoProgress
+                | FrontierDelta::RedundantEvidence
+                | FrontierDelta::EvidenceReconfirmed
         ) {
             return;
         }
@@ -717,12 +1008,12 @@ impl ExecutionState {
         }
     }
 
-    /// world revision 推进后使版本绑定的证据过期。返回失效条数——
-    /// 这是"证据因世界变化而死亡"的可解释计数，不是知识损失：事实表
-    /// 与事件流仍在。
+    /// World movement marks version-bound evidence non-current. Rows stay in
+    /// the same bounded table as semantic fingerprints so an identical
+    /// observation can repair currentness without laundering itself into
+    /// new evidence. Prompt projection still hides every non-current row.
     pub(super) fn invalidate_stale_evidence(&mut self) -> u64 {
-        let before = self.evidence.len();
-        // EXEC-EVID-01a：清理与投影共用同一个 currentness 谓词；
+        // EXEC-EVID-01a：失效与投影共用同一个 currentness 谓词；
         // 先物化事实表快照，避免借用冲突。
         let revision = self.workspace_revision;
         let last_turn = self.last_turn;
@@ -732,14 +1023,20 @@ impl ExecutionState {
             .filter(|fact| fact.freshness == ResourceFreshness::Fresh)
             .map(|fact| (fact.path.as_str(), fact.digest.as_str()))
             .collect();
-        self.evidence.retain(|row| match &row.validity {
-            EvidenceValidity::WorkspaceRevision(at) => *at == revision,
-            EvidenceValidity::Resource { path, digest } => fresh
-                .get(path.as_str())
-                .is_some_and(|current| *current == digest),
-            EvidenceValidity::Turn => row.turn != 0 && row.turn == last_turn,
-        });
-        let invalidated = (before - self.evidence.len()) as u64;
+        let mut invalidated = 0u64;
+        for row in &mut self.evidence {
+            let binding_current = match &row.validity {
+                EvidenceValidity::WorkspaceRevision(at) => *at == revision,
+                EvidenceValidity::Resource { path, digest } => fresh
+                    .get(path.as_str())
+                    .is_some_and(|current| *current == digest),
+                EvidenceValidity::Turn => row.turn != 0 && row.turn == last_turn,
+            };
+            if row.current && !binding_current {
+                row.current = false;
+                invalidated = invalidated.saturating_add(1);
+            }
+        }
         if invalidated > 0 {
             self.convergence.evidence_revision = self
                 .convergence
@@ -753,6 +1050,9 @@ impl ExecutionState {
     /// WorkspaceRevision 绑定当前世界版本；Resource 要求事实表存在
     /// 同 path@digest 的 Fresh 行；Turn 要求仍是当轮。
     pub(super) fn evidence_is_current(&self, row: &ExecutionEvidence) -> bool {
+        if !row.current {
+            return false;
+        }
         match &row.validity {
             EvidenceValidity::WorkspaceRevision(at) => *at == self.workspace_revision,
             EvidenceValidity::Resource { path, digest } => {
@@ -764,6 +1064,141 @@ impl ExecutionState {
         }
     }
 
+    /// Any admitted workspace mutation invalidates absence claims. This is
+    /// intentionally conservative: a write to a parent or a generated file
+    /// can make a previously speculative path exist. Rows are tiny and
+    /// bounded, so invalidation is exact and event-visible.
+    pub(super) fn invalidate_negative_facts_for_world_change(
+        &mut self,
+    ) -> Vec<NegativeFactTransition> {
+        self.negative_facts
+            .drain(..)
+            .map(|fact| NegativeFactTransition {
+                kind: NegativeFactEventKind::Invalidated,
+                tool_name: fact.tool_name,
+                target: fact.target,
+                failure: fact.failure,
+                workspace_revision: self.workspace_revision,
+            })
+            .collect()
+    }
+
+    /// Apply one trusted path observation to the negative-fact table.
+    /// Returns whether this miss is speculative and therefore must *not* open
+    /// a task obligation, plus body-free lifecycle transitions.
+    pub(super) fn observe_negative_fact(
+        &mut self,
+        output: &ToolOutput,
+        argument_digest: &str,
+        turn: u64,
+        attribution: Option<&RuntimeExecutionAttribution>,
+    ) -> (bool, Vec<NegativeFactTransition>) {
+        let Some(attribution) = attribution else {
+            return (false, Vec::new());
+        };
+        if !matches!(
+            attribution.host.purpose,
+            ToolExecutionPurpose::Observe | ToolExecutionPurpose::Search
+        ) {
+            return (false, Vec::new());
+        }
+        let Some(target) = output
+            .file_path()
+            .map(agent_contracts::normalize_resource_path)
+            .filter(|target| attribution.host.targets.iter().any(|known| known == target))
+        else {
+            return (false, Vec::new());
+        };
+        let mut transitions = Vec::new();
+        if output.ok {
+            if let Some(index) = self
+                .negative_facts
+                .iter()
+                .position(|fact| fact.tool_name == output.tool_name && fact.target == target)
+            {
+                let fact = self.negative_facts.remove(index);
+                transitions.push(NegativeFactTransition {
+                    kind: NegativeFactEventKind::Resolved,
+                    tool_name: fact.tool_name,
+                    target: fact.target,
+                    failure: fact.failure,
+                    workspace_revision: self.workspace_revision,
+                });
+            }
+            return (false, transitions);
+        }
+        if output.failure_class() != Some(ToolFailureClass::PathNotFound) {
+            return (false, transitions);
+        }
+        if attribution.target_is_rooted(&target) {
+            if let Some(index) = self
+                .negative_facts
+                .iter()
+                .position(|fact| fact.tool_name == output.tool_name && fact.target == target)
+            {
+                let fact = self.negative_facts.remove(index);
+                transitions.push(NegativeFactTransition {
+                    kind: NegativeFactEventKind::Promoted,
+                    tool_name: fact.tool_name,
+                    target: fact.target,
+                    failure: fact.failure,
+                    workspace_revision: self.workspace_revision,
+                });
+            }
+            return (false, transitions);
+        }
+
+        let argument_digest = bound_item(argument_digest);
+        if let Some(existing) = self
+            .negative_facts
+            .iter_mut()
+            .find(|fact| fact.tool_name == output.tool_name && fact.target == target)
+        {
+            existing.argument_digest = argument_digest;
+            existing.workspace_revision = self.workspace_revision;
+            existing.turn = turn;
+            return (true, transitions);
+        }
+        self.negative_facts.push(NegativeExecutionFact {
+            tool_name: bound_item(&output.tool_name),
+            target: target.clone(),
+            argument_digest,
+            failure: ToolFailureClass::PathNotFound,
+            workspace_revision: self.workspace_revision,
+            turn,
+        });
+        transitions.push(NegativeFactTransition {
+            kind: NegativeFactEventKind::Recorded,
+            tool_name: bound_item(&output.tool_name),
+            target,
+            failure: ToolFailureClass::PathNotFound,
+            workspace_revision: self.workspace_revision,
+        });
+        (true, transitions)
+    }
+
+    /// Remember an exact trusted verifier for this task anchor. Producer
+    /// metadata cannot reach this path; only pre-dispatch attribution can.
+    pub(super) fn record_verification_source(
+        &mut self,
+        tool_name: &str,
+        argument_digest: &str,
+        attribution: Option<&RuntimeExecutionAttribution>,
+    ) {
+        if !attribution.is_some_and(RuntimeExecutionAttribution::reusable_verification) {
+            return;
+        }
+        let tool_name = bound_item(tool_name);
+        let argument_digest = bound_item(argument_digest);
+        self.verification_sources
+            .retain(|source| source.tool_name != tool_name);
+        self.verification_sources.push(VerificationSourceLease {
+            tool_name,
+            argument_digest,
+            anchor_revision: self.anchor_revision,
+        });
+    }
+
     /// CONV-03 lineage：由 typed 失效事实登记/累计义务。同 scope 的
     /// 行是同一个 blocker 的同一血统——同指纹累计 epoch 内尝试，异
     /// 指纹推进 epoch（PreconditionChanged ≠ Resolved）；不同 scope
@@ -772,9 +1207,10 @@ impl ExecutionState {
         &mut self,
         output: &ToolOutput,
         identity: &OperationIdentity,
+        speculative_negative: bool,
         events: &mut Vec<agent_contracts::ExecutionObligationEvent>,
     ) {
-        if output.ok {
+        if output.ok || speculative_negative {
             return;
         }
         // 注意走 output 的域判定而非裸 class 映射：外壳工具的
@@ -1053,7 +1489,10 @@ impl ExecutionState {
             .collect()
     }
 
-    /// 成功观察入前沿（评审第 9/15 条）。键化规则：
+    /// Store successful observations in the bounded evidence table. A novel
+    /// row advances the task frontier only when the current directive has no
+    /// exact root yet or trusted Runtime attribution binds the observation to
+    /// one; storage and task progress are deliberately separate. Key rules:
     /// - `git.status` / `git.diff` / `git.log`：key=工具名，
     ///   validity=`WorkspaceRevision(当前)`；
     /// - 其他带 path 的成功读：key=`工具:path`，
@@ -1061,7 +1500,8 @@ impl ExecutionState {
     /// - 成功命令运行（未知足迹）：key=`工具:参数摘要`，
     ///   validity=`WorkspaceRevision(当前)`。
     ///
-    /// 同 key 同 validity 同结果同参数即重复；否则插入为新证据。
+    /// 同 key 同结果 digest 同参数：current 时是重复，dormant 时只是
+    /// reconfirmation；只有语义结果或 coverage/参数改变才是新证据。
     pub(super) fn record_observation_evidence(
         &mut self,
         output: &ToolOutput,
@@ -1097,6 +1537,7 @@ impl ExecutionState {
             return ObservationEvidence::None;
         };
         let outcome = bound_evidence_text(output.summary.trim());
+        let outcome_digest = observation_outcome_digest(output);
         // Runtime 传入的真 ArgumentDigest（OperationCompletion 计算）；
         // 空串时退化为参数摘要，保持旧轨迹可用。
         let argument_digest = if argument_digest.is_empty() {
@@ -1105,20 +1546,27 @@ impl ExecutionState {
             bound_evidence_text(argument_digest)
         };
         if let Some(existing) = self.evidence.iter_mut().find(|row| row.key == key) {
-            let identical = existing.validity == validity
-                && existing.outcome == outcome
+            let same_semantic = !existing.outcome_digest.is_empty()
+                && existing.outcome_digest == outcome_digest
                 && existing.argument_digest == argument_digest;
-            if identical {
+            if same_semantic && existing.current && existing.validity == validity {
                 return ObservationEvidence::Repeated;
             }
+            let reconfirmed = same_semantic && !existing.current;
             existing.outcome = outcome;
+            existing.outcome_digest = outcome_digest;
             existing.observed_world_revision = self.workspace_revision;
             existing.validity = validity;
             existing.argument_digest = argument_digest;
+            existing.current = true;
             existing.turn = turn;
             existing.evidence_ref = output.artifact_ref.clone();
             self.bump_evidence_revision();
-            return ObservationEvidence::Advanced;
+            return if reconfirmed {
+                ObservationEvidence::Reconfirmed
+            } else {
+                ObservationEvidence::Advanced
+            };
         }
         self.evidence.insert(
             0,
@@ -1128,6 +1576,8 @@ impl ExecutionState {
                 observed_world_revision: self.workspace_revision,
                 validity,
                 argument_digest,
+                outcome_digest,
+                current: true,
                 turn,
                 evidence_ref: output.artifact_ref.clone(),
             },
@@ -1151,16 +1601,15 @@ impl ExecutionState {
         }
     }
 
-    /// Upsert one resource fact. Returns whether the observation changed
-    /// anything (new row, new digest, or freshness improvement) — the
-    /// deterministic progress vector consumes that signal.
+    /// Upsert one resource fact while keeping semantic change orthogonal to
+    /// currentness repair.
     pub(super) fn upsert_file(
         &mut self,
         path: &str,
         digest: String,
         turn: u64,
         provenance: ResourceProvenance,
-    ) -> bool {
+    ) -> ResourceObservation {
         let path = bound_item(path);
         let digest = bound_item(&digest);
         let digest_changed = self.checked_files.iter().any(|row| {
@@ -1170,14 +1619,20 @@ impl ExecutionState {
             self.mark_source_changed(&path);
         }
         if let Some(existing) = self.checked_files.iter_mut().find(|row| row.path == path) {
-            let changed = digest_changed
-                || existing.digest != digest
-                || existing.freshness != ResourceFreshness::Fresh;
+            let semantic_changed = digest_changed || existing.digest != digest;
+            let currentness_repaired =
+                !semantic_changed && existing.freshness != ResourceFreshness::Fresh;
             existing.digest = digest;
             existing.turn = turn;
             existing.freshness = ResourceFreshness::Fresh;
             existing.provenance = provenance;
-            return changed;
+            return if semantic_changed {
+                ResourceObservation::Advanced
+            } else if currentness_repaired {
+                ResourceObservation::Reconfirmed
+            } else {
+                ResourceObservation::None
+            };
         }
         self.checked_files.push(ResourceFact {
             path,
@@ -1186,7 +1641,7 @@ impl ExecutionState {
             turn,
             provenance,
         });
-        true
+        ResourceObservation::Advanced
     }
 
     pub(super) fn push_failure(
@@ -1207,19 +1662,46 @@ impl ExecutionState {
 
     pub(super) fn push_verification(
         &mut self,
-        summary: String,
-        ok: bool,
+        output: &ToolOutput,
+        argument_digest: &str,
+        attribution: Option<&RuntimeExecutionAttribution>,
         turn: u64,
-        evidence_ref: Option<String>,
-    ) {
+    ) -> Option<VerificationPassTransition> {
+        let verification_identity = attribution
+            .and_then(RuntimeExecutionAttribution::exact_verification_identity)
+            .map(bound_item)
+            .unwrap_or_default();
+        let source_tool_name = if verification_identity.is_empty() {
+            String::new()
+        } else {
+            bound_item(&output.tool_name)
+        };
+        let argument_digest = if verification_identity.is_empty() {
+            String::new()
+        } else {
+            bound_item(argument_digest)
+        };
         self.verifications.push(VerificationFact {
-            summary: bound_item(&summary),
-            ok,
+            summary: bound_item(&output.summary),
+            ok: output.ok,
             turn,
             anchor_revision: self.anchor_revision,
             workspace_revision: self.workspace_revision,
-            evidence_ref: evidence_ref.map(|value| bound_item(&value)),
+            source_tool_name: source_tool_name.clone(),
+            argument_digest: argument_digest.clone(),
+            verification_identity: verification_identity.clone(),
+            directive_revision: self.directive_revision,
+            evidence_ref: output.artifact_ref.as_ref().map(|value| bound_item(value)),
         });
+        (output.ok && !verification_identity.is_empty()).then_some(VerificationPassTransition {
+            kind: VerificationPassEventKind::Recorded,
+            tool_name: source_tool_name,
+            argument_digest,
+            verification_identity,
+            anchor_revision: self.anchor_revision,
+            directive_revision: self.directive_revision,
+            workspace_revision: self.workspace_revision,
+        })
     }
 
     pub(super) fn cap(&mut self) {
@@ -1234,6 +1716,14 @@ impl ExecutionState {
         if self.failed_commands.len() > MAX_RESUME_FAILURES {
             let drop = self.failed_commands.len() - MAX_RESUME_FAILURES;
             self.failed_commands.drain(0..drop);
+        }
+        if self.negative_facts.len() > MAX_NEGATIVE_FACTS {
+            let drop = self.negative_facts.len() - MAX_NEGATIVE_FACTS;
+            self.negative_facts.drain(0..drop);
+        }
+        if self.verification_sources.len() > MAX_VERIFICATION_SOURCES {
+            let drop = self.verification_sources.len() - MAX_VERIFICATION_SOURCES;
+            self.verification_sources.drain(0..drop);
         }
     }
 
@@ -1261,6 +1751,8 @@ pub(crate) fn validate_execution_state(state: &ExecutionState) -> Result<(), Str
     if state.checked_files.len() > MAX_RESUME_FILES
         || state.verifications.len() > MAX_RESUME_FAILURES
         || state.failed_commands.len() > MAX_RESUME_FAILURES
+        || state.negative_facts.len() > MAX_NEGATIVE_FACTS
+        || state.verification_sources.len() > MAX_VERIFICATION_SOURCES
     {
         return Err("resume list exceeds its cap".into());
     }
@@ -1277,8 +1769,42 @@ pub(crate) fn validate_execution_state(state: &ExecutionState) -> Result<(), Str
         if row.key.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
             || row.outcome.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
             || row.argument_digest.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || row.outcome_digest.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
         {
             return Err("evidence row exceeds its text bound".into());
+        }
+    }
+    for row in &state.verifications {
+        if row.summary.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || row.source_tool_name.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || row.argument_digest.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || row.verification_identity.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || !row.verification_identity.is_empty()
+                && row
+                    .verification_identity
+                    .parse::<agent_contracts::ContentDigest>()
+                    .is_err()
+            || row
+                .evidence_ref
+                .as_ref()
+                .is_some_and(|value| value.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS)
+        {
+            return Err("verification fact exceeds its text bound".into());
+        }
+    }
+    for row in &state.negative_facts {
+        if row.tool_name.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || row.target.chars().count() > agent_contracts::MAX_RESOURCE_PATH_CHARS
+            || row.argument_digest.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+        {
+            return Err("negative fact exceeds its text bound".into());
+        }
+    }
+    for row in &state.verification_sources {
+        if row.tool_name.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || row.argument_digest.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+        {
+            return Err("verification source exceeds its text bound".into());
         }
     }
     Ok(())
@@ -1299,12 +1825,32 @@ pub(super) fn path_mentioned_in_query(query: &str, path: &str) -> bool {
 }
 
 pub(super) fn is_command_tool(name: &str) -> bool {
-    name == "shell.exec" || name == "process.run" || name.starts_with("git.")
+    name == "shell.exec"
+        || name == "process.run"
+        || name == "verify.run"
+        || name.starts_with("git.")
 }
 
 /// 证据文本的收紧界：outcome / 参数摘要不需要事实表级别的长度。
 fn bound_evidence_text(text: &str) -> String {
     text.chars().take(EVIDENCE_TEXT_CHARS).collect()
+}
+
+fn observation_outcome_digest(output: &ToolOutput) -> String {
+    if let Some(digest) = output
+        .artifact_ref
+        .as_deref()
+        .and_then(|reference| ArtifactLocator::parse_sealed(reference).ok())
+        .and_then(|locator| locator.digest())
+    {
+        return digest.to_string();
+    }
+    let bytes = if output.model_content.is_empty() {
+        output.summary.as_bytes()
+    } else {
+        output.model_content.as_bytes()
+    };
+    ContentDigest::sha256_bytes(bytes).to_string()
 }
 
 pub(super) fn bound_item(text: &str) -> String {

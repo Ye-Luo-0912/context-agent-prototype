@@ -11,12 +11,38 @@ use agent_contracts::{
 
 use super::ResourceProvenance;
 use super::state::{
-    ExecutionState, MAX_REVALIDATE_PER_ROUND, ObservationEvidence, VerificationCause,
-    VerificationCoverage, bound_item, is_command_tool, operation_identity, path_mentioned_in_query,
-    same_operation,
+    ExecutionState, MAX_REVALIDATE_PER_ROUND, ObservationEvidence, ResourceObservation,
+    RuntimeExecutionAttribution, VerificationCause, VerificationCoverage, bound_item,
+    is_command_tool, operation_identity, path_mentioned_in_query, same_operation,
 };
 
 impl ExecutionState {
+    /// Account a no-dispatch exact PASS reuse without duplicating the
+    /// underlying verification fact. The prior fact remains the sole result
+    /// authority; this action is redundant evidence at the current frontier.
+    pub fn observe_reused_verification(
+        &mut self,
+        output: &ToolOutput,
+        anchor_revision: u64,
+        turn: u64,
+    ) -> super::state::FrontierObservation {
+        self.anchor_revision = anchor_revision;
+        self.last_turn = turn;
+        let identity = operation_identity(output);
+        let delta = FrontierDelta::RedundantEvidence;
+        self.update_convergence(&identity, None, delta);
+        self.refresh_validity();
+        super::state::FrontierObservation {
+            delta,
+            actions_since_frontier_advance: self.convergence.actions_since_frontier_advance,
+            evidence_revision: self.convergence.evidence_revision,
+            invalidated: 0,
+            obligation_events: Vec::new(),
+            negative_fact_events: Vec::new(),
+            verification_pass_events: Vec::new(),
+        }
+    }
+
     /// 无 Runtime 参数摘要时的便捷入口（测试/旧路径）：证据身份退化为
     /// 参数摘要。生产主路径走 [`Self::observe_tool_with_digest`]。
     pub fn observe_tool(
@@ -38,24 +64,71 @@ impl ExecutionState {
         turn: u64,
         argument_digest: &str,
     ) -> super::state::FrontierObservation {
+        // Compatibility path for deterministic state tests and old callers.
+        // Production uses `observe_tool_attributed`; only the trusted
+        // pre-dispatch channel may mint a reusable verifier there.
+        self.observe_tool_inner(
+            output,
+            anchor_revision,
+            turn,
+            argument_digest,
+            None,
+            output.is_verification(),
+        )
+    }
+
+    /// Production observation path. Verification authority comes only from
+    /// trusted pre-dispatch attribution; producer metadata cannot
+    /// retroactively turn shell/process or a dynamic capability into a
+    /// reusable verifier.
+    pub fn observe_tool_attributed(
+        &mut self,
+        output: &ToolOutput,
+        anchor_revision: u64,
+        turn: u64,
+        argument_digest: &str,
+        attribution: &RuntimeExecutionAttribution,
+    ) -> super::state::FrontierObservation {
+        let is_verification = attribution.reusable_verification();
+        self.observe_tool_inner(
+            output,
+            anchor_revision,
+            turn,
+            argument_digest,
+            Some(attribution),
+            is_verification,
+        )
+    }
+
+    fn observe_tool_inner(
+        &mut self,
+        output: &ToolOutput,
+        anchor_revision: u64,
+        turn: u64,
+        argument_digest: &str,
+        attribution: Option<&RuntimeExecutionAttribution>,
+        is_verification: bool,
+    ) -> super::state::FrontierObservation {
         self.anchor_revision = anchor_revision;
         self.last_turn = turn;
         // MOD-PROG-01 progress probe: capture the before-state so one
         // deterministic classification can answer "did this round move
         // the world or our knowledge of it?"
-        let before_files = self.checked_files.len();
         let before_failures = self.failed_commands.len();
         let before_verifications = self.verifications.len();
         let before_last_evidence = self
             .verifications
             .last()
             .map(|row| (row.ok, row.summary.clone()));
-        let mut observation_changed = false;
+        let mut resource_observation = ResourceObservation::None;
+        let mut negative_fact_events = Vec::new();
+        let mut verification_pass_events = Vec::new();
         let footprint = output.mutation_footprint();
         match &footprint {
             MutationFootprint::None => {}
             MutationFootprint::Known(_) | MutationFootprint::Unknown => {
                 self.workspace_revision = self.workspace_revision.saturating_add(1);
+                negative_fact_events.extend(self.invalidate_negative_facts_for_world_change());
             }
         }
         // Unknown mutation：无法知道改了什么，旧事实先全部降级为待复核；
@@ -71,7 +144,7 @@ impl ExecutionState {
             let touches = output.resource_touches();
             // Provenance is diagnostic only: which kind of trusted
             // observation last stamped this fact.
-            let provenance = if output.is_verification() {
+            let provenance = if is_verification {
                 ResourceProvenance::Verification
             } else if output.may_mutate_workspace() {
                 ResourceProvenance::MutationResult
@@ -79,22 +152,21 @@ impl ExecutionState {
                 ResourceProvenance::Read
             };
             for touch in &touches {
-                observation_changed |= self.upsert_file(
+                resource_observation.merge(self.upsert_file(
                     &touch.path,
                     touch.revision.clone().unwrap_or_default(),
                     turn,
                     provenance,
-                );
+                ));
             }
             self.failed_commands
                 .retain(|row| !same_operation(row, &identity));
-            if output.is_verification() {
-                self.push_verification(
-                    output.summary.clone(),
-                    true,
-                    turn,
-                    output.artifact_ref.clone(),
-                );
+            if is_verification {
+                if let Some(event) =
+                    self.push_verification(output, argument_digest, attribution, turn)
+                {
+                    verification_pass_events.push(event);
+                }
                 self.verification.spec_revision = self.anchor_revision;
                 self.verification.cause = VerificationCause::None;
                 self.verification.source_changed = false;
@@ -122,12 +194,12 @@ impl ExecutionState {
                         .clone()
                         .filter(|revision| !revision.is_empty())
                     {
-                        observation_changed |= self.upsert_file(
+                        resource_observation.merge(self.upsert_file(
                             &touch.path,
                             revision,
                             turn,
                             ResourceProvenance::MutationRefusal,
-                        );
+                        ));
                     }
                 }
             }
@@ -141,13 +213,8 @@ impl ExecutionState {
                 self.push_failure(&identity, output.summary.clone(), turn);
             }
         }
-        if output.is_verification() && !output.ok {
-            self.push_verification(
-                output.summary.clone(),
-                false,
-                turn,
-                output.artifact_ref.clone(),
-            );
+        if is_verification && !output.ok {
+            let _ = self.push_verification(output, argument_digest, attribution, turn);
             self.verification.cause = VerificationCause::FailureRepair;
             self.verification.spec_revision = self.anchor_revision;
             self.verification.failed_open = true;
@@ -155,6 +222,10 @@ impl ExecutionState {
         if matches!(footprint, MutationFootprint::Unknown) && had_prior_verification_evidence {
             self.verification.unknown_pending = true;
         }
+        self.record_verification_source(&output.tool_name, argument_digest, attribution);
+        let (speculative_negative, negative_transitions) =
+            self.observe_negative_fact(output, argument_digest, turn, attribution);
+        negative_fact_events.extend(negative_transitions);
         // EXEC-EVID-01a：本轮可信事实已落表后再统一裁决证据现势性——
         // edit 的新 digest 必须当场杀死绑定旧 digest 的证据行，而不是
         // 等到下一轮。失效条数随事件上报。
@@ -163,7 +234,12 @@ impl ExecutionState {
         // 登记新失败；账目事件随 FrontierObservation 出账（CONV-OBS-01）。
         let mut obligation_events = Vec::new();
         self.resolve_obligations(output, &mut obligation_events);
-        self.record_obligation(output, &identity, &mut obligation_events);
+        self.record_obligation(
+            output,
+            &identity,
+            speculative_negative,
+            &mut obligation_events,
+        );
         self.cap();
         self.refresh_validity();
         // Deterministic frontier classification (CONV-01): a verification
@@ -171,7 +247,8 @@ impl ExecutionState {
         // Known is provable world change, Unknown is only invalidation,
         // and read-only rounds split into evidence gain vs redundant
         // repeat vs obligation resolution vs nothing.
-        let facts_gained = observation_changed || self.checked_files.len() > before_files;
+        let facts_gained = resource_observation == ResourceObservation::Advanced;
+        let facts_reconfirmed = resource_observation == ResourceObservation::Reconfirmed;
         let evidence_gained = self.verifications.len() > before_verifications
             && self
                 .verifications
@@ -179,15 +256,28 @@ impl ExecutionState {
                 .map(|row| (row.ok, row.summary.clone()))
                 != before_last_evidence;
         let failure_resolved = self.failed_commands.len() < before_failures;
-        let obs_evidence =
-            if output.ok && !output.is_verification() && !output.may_mutate_workspace() {
-                // 评审第 17 条：证据身份用 Runtime 的真 ArgumentDigest，
-                // 不在 ToolOutput 上反推；缺省时退化为参数摘要。
-                self.record_observation_evidence(output, turn, argument_digest)
-            } else {
-                ObservationEvidence::None
-            };
-        let delta = if output.is_verification() && output.ok {
+        let obs_evidence = if output.ok && !is_verification && !output.may_mutate_workspace() {
+            // 评审第 17 条：证据身份用 Runtime 的真 ArgumentDigest，
+            // 不在 ToolOutput 上反推；缺省时退化为参数摘要。
+            self.record_observation_evidence(output, turn, argument_digest)
+        } else {
+            ObservationEvidence::None
+        };
+        let rooted_observation = output.ok
+            && attribution.is_some_and(|attribution| !attribution.rooted_targets.is_empty());
+        let read_only_evidence_gained =
+            facts_gained || evidence_gained || obs_evidence == ObservationEvidence::Advanced;
+        // A targeted directive must not appear to converge forever by
+        // discovering unrelated, globally novel evidence. Keep every fact in
+        // the bounded evidence tables, but advance the task frontier only for
+        // rooted evidence once an exact current target is known. Directives
+        // without a known target retain broad exploration semantics.
+        let evidence_advances_task = read_only_evidence_gained
+            && (!self.directive_has_rooted_evidence || rooted_observation);
+        if rooted_observation {
+            self.directive_has_rooted_evidence = true;
+        }
+        let delta = if is_verification && output.ok {
             if evidence_gained {
                 FrontierDelta::EvidenceAdvanced
             } else {
@@ -202,13 +292,14 @@ impl ExecutionState {
                     FrontierDelta::WorldInvalidatedUnknown
                 }
                 MutationFootprint::None => {
-                    if facts_gained
-                        || evidence_gained
-                        || obs_evidence == ObservationEvidence::Advanced
-                    {
+                    if evidence_advances_task {
                         FrontierDelta::EvidenceAdvanced
                     } else if failure_resolved {
                         FrontierDelta::ObligationResolved
+                    } else if facts_reconfirmed
+                        || matches!(obs_evidence, ObservationEvidence::Reconfirmed)
+                    {
+                        FrontierDelta::EvidenceReconfirmed
                     } else if matches!(obs_evidence, ObservationEvidence::Repeated) {
                         FrontierDelta::RedundantEvidence
                     } else {
@@ -224,6 +315,8 @@ impl ExecutionState {
             evidence_revision: self.convergence.evidence_revision,
             invalidated,
             obligation_events,
+            negative_fact_events,
+            verification_pass_events,
         }
     }
 
@@ -237,6 +330,18 @@ impl ExecutionState {
     /// [`VerificationCoverage::Unspecified`] cannot: untracked files may
     /// have changed, so a new Verify is required.
     pub async fn revalidate(&mut self, oracle: &dyn ResourceVersionOracle, query: &str) {
+        self.revalidate_with_priority(oracle, query, &[]).await;
+    }
+
+    /// Same bounded hash-only revalidation, with exact body identities that
+    /// the protocol checkpoint is about to spill ranked first. Verification
+    /// coverage and current directive mentions follow; the cap remains 8.
+    pub async fn revalidate_with_priority(
+        &mut self,
+        oracle: &dyn ResourceVersionOracle,
+        query: &str,
+        priority_body_identities: &[String],
+    ) {
         let mut pending: Vec<usize> = self
             .checked_files
             .iter()
@@ -246,7 +351,22 @@ impl ExecutionState {
             .collect();
         pending.sort_by_key(|&index| {
             let fact = &self.checked_files[index];
+            let body_rank = agent_contracts::file_body_identity(&fact.path, &fact.digest)
+                .and_then(|identity| {
+                    priority_body_identities
+                        .iter()
+                        .take(agent_contracts::MAX_VISIBLE_BODY_HINTS)
+                        .position(|candidate| candidate == &identity)
+                })
+                .unwrap_or(usize::MAX);
+            let verification_covered = matches!(
+                &self.verification.coverage,
+                VerificationCoverage::Resources(paths)
+                    if paths.iter().any(|path| path == &fact.path)
+            );
             (
+                body_rank,
+                std::cmp::Reverse(verification_covered),
                 std::cmp::Reverse(path_mentioned_in_query(query, &fact.path)),
                 std::cmp::Reverse(fact.turn),
                 index,

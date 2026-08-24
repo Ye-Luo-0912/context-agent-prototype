@@ -1,0 +1,85 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "late_constraint_long",
+  "expected_edit": "add v2 Hello and Heartbeat while keeping unversioned ping",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 0,
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Heartbeat"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 8,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "RELEASE.md",
+      "pred": "contains",
+      "needles": [
+        "v2"
+      ],
+      "count": 4,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "RELEASE.md",
+      "exists": true,
+      "sha256": "ac1b615ee195bbe4b5a32bd1e0cb9d7ab4c0a678d7dd8cf733a53b4330f3d83f",
+      "bytes": 684,
+      "truncated": false,
+      "body": "# Release Notes\n\n## Shipped\n\n- v2 Hello: shipped.\n\n## Planned v2 Work\n\nThe planned v2 work focuses on expanding the wire protocol beyond its current single-message surface: the `Msg` enum will grow from just `Ping` to include response and error variants (such as `Pong` and `Error`), while `decode` will be tightened from its permissive substring match to strict, exact-token parsing with proper error reporting so that malformed input fails cleanly instead of being partially accepted. Alongside this, encode/decode round-trip properties will be locked in with tests, and explicit protocol versioning will be introduced so v1 and v2 peers can negotiate compatibility during rollout.\n"
+    },
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "a6b01e28d47683c1df9903d6768e6b4e3b4deaad416ea7d80ab221fa52a592fc",
+      "bytes": 1177,
+      "truncated": false,
+      "body": "pub enum Msg {\r\n    Ping,\r\n    Heartbeat(u32),\r\n}\r\n\r\npub fn decode(bytes: &str) -> Result<Msg, String> {\r\n    if bytes.contains(\"ping\") {\r\n        return Ok(Msg::Ping);\r\n    }\r\n    if let Some(rest) = bytes.strip_prefix(\"heartbeat:\") {\r\n        if let Ok(seq) = rest.parse::<u32>() {\r\n            return Ok(Msg::Heartbeat(seq));\r\n        }\r\n    }\r\n    Err(\"unknown\".into())\r\n}\r\n\r\npub fn encode(msg: &Msg) -> String {\r\n    match msg {\r\n        Msg::Ping => \"ping\".into(),\r\n        Msg::Heartbeat(seq) => format!(\"heartbeat:{seq}\"),\r\n    }\r\n}\r\n\r\npub fn roundtrip_ping() -> Result<(), String> {\r\n    let encoded = encode(&Msg::Ping);\r\n    if matches!(decode(&encoded), Ok(Msg::Ping)) {\r\n        Ok(())\r\n    } else {\r\n        Err(format!(\"ping roundtrip failed on {:?}\", encoded))\r\n    }\r\n}\r\n\r\n#[cfg(test)]\r\nmod tests {\r\n    use super::*;\r\n\r\n    #[test]\r\n    fn ping_roundtrips() {\r\n        assert_eq!(roundtrip_ping(), Ok(()));\r\n    }\r\n\r\n    #[test]\r\n    fn decodes_ping_frame() {\r\n        assert_eq!(decode(\"ping\"), Ok(Msg::Ping));\r\n    }\r\n\r\n    #[test]\r\n    fn heartbeat_roundtrips() {\r\n        assert_eq!(decode(&encode(&Msg::Heartbeat(7))), Ok(Msg::Heartbeat(7)));\r\n    }\r\n}\r\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\longflow\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmp4upv4R\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 1,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "wire_v1 failed",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

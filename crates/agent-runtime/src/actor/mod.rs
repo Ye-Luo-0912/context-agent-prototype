@@ -20,17 +20,18 @@ use agent_contracts::{
     DISCOVERY_IDENTICAL_QUERY_BUDGET, DISCOVERY_MAX_QUERIES_PER_TURN, DiscoveryBudgetExhausted,
     DiscoveryTurnBudget, Effect, EffectDurability, EffectId, EffectReceipt, FocusState,
     FsRereadClass, InputAuthority, InputKind, InputLifecycle, InputSource,
-    MAX_COMPLETION_ARTIFACTS, MaterializedContext, ModelCompletionValidity, ModelInput,
-    ModelRequest, OperationId, OperationOutcome, OperationQueryResult, OperationResult,
-    OperationState, OperationTerminal, ResourceFreshness, ResourceKey, ResourceVersionOracle,
-    RestoreRevision, RunId, RuntimeDirective, RuntimeEvent, RuntimeInputEnvelope, RuntimeInputId,
-    ScopeId, ScopeKind, StatePatchProposal, TaskAnchorView, TaskId, TaskProgressView, ToolCall,
+    MAX_COMPLETION_ARTIFACTS, MAX_MODEL_TOOL_CALLS_PER_ROUND, MaterializedContext,
+    ModelCompletionValidity, ModelInput, ModelRequest, OperationId, OperationOutcome,
+    OperationQueryResult, OperationResult, OperationState, OperationTerminal, ResourceFreshness,
+    ResourceKey, ResourceVersionOracle, RestoreRevision, RunId, RuntimeDirective, RuntimeEvent,
+    RuntimeInputEnvelope, RuntimeInputId, ScopeId, ScopeKind, StatePatchProposal, TaskAnchorView,
+    TaskId, TaskProgressProposal, TaskProgressView, ToolCall, ToolLeaseBoundary,
     ToolOperationIdentity, ToolOutcome, ToolOutput, ToolResultDisposition, ToolSpec,
-    ToolSurfaceBlock, ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceSnapshot,
-    TurnCancelAck, TurnCancellationReason, TurnFrame, TurnFrameStep, TurnId,
+    ToolSurfaceBlock, ToolSurfaceBlockReason, ToolSurfaceDemand, ToolSurfaceRequirement,
+    ToolSurfaceSnapshot, TurnCancelAck, TurnCancellationReason, TurnFrame, TurnFrameStep, TurnId,
     USER_INPUT_ARTIFACT_OWNER, USER_INPUT_PREVIEW_CHARS, USER_INPUT_QUEUE_CAP,
     apply_runtime_diagnosis, bounded_preview, context_maintenance_events,
-    discovery_search_from_call,
+    discovery_search_from_call, path_exactly_in_directive,
 };
 use agent_core::{
     ApprovalVerdict, CorePort, EffectCommitDisposition, EffectCommitRejection, EffectCommitRequest,
@@ -47,7 +48,7 @@ use crate::checkpoint::{
     RUNTIME_CHECKPOINT_VERSION, RunMetadata, RuntimeCheckpoint, TaskManagerSnapshot,
 };
 use crate::command::{Reply, RuntimeCommand, RuntimeHandle};
-use crate::execution::{ExecutionState, RoundExecutionSnapshot};
+use crate::execution::{ExecutionState, RoundExecutionSnapshot, RuntimeExecutionAttribution};
 use crate::output::bound_tool_output;
 use crate::prompt::PromptAssembler;
 use crate::services::RuntimeServices;
@@ -196,6 +197,23 @@ struct ActiveTurn {
     turn_frame: TurnFrame,
     model_round: usize,
     pending_tools: VecDeque<ToolCall>,
+    /// Optional tools explicitly loaded by the model but not yet called in
+    /// this directive. Unlike a time-to-live lease, this set advances on a
+    /// semantic event: using the exact tool consumes its pending-load root.
+    /// Sibling loads therefore remain available while the model assembles a
+    /// small task-specific tool cohort. The set is unique, turn-scoped and
+    /// never checkpointed or copied into Context.
+    pending_loaded_tools: Vec<String>,
+    /// Exact tools selected by the last successful model decision. Their
+    /// schemas stay rooted while the calls run and until the following model
+    /// decision consumes their results. The following decision either renews
+    /// the lease by calling the tool again or releases it. Bounded by the
+    /// model tool-call batch contract; never checkpointed across directives.
+    result_delivery_tools: Vec<String>,
+    /// Current model-requested action batch. It is bounded by
+    /// `MAX_MODEL_TOOL_CALLS_PER_ROUND`, contains counters only, and never
+    /// enters Context, prompt history or a checkpoint.
+    action_batch: Option<TurnActionBatch>,
     /// The tool surface of the current model round, captured once after the
     /// tool lifecycle GC. `None` only before the first round starts.
     tool_surface: Option<ToolSurfaceSnapshot>,
@@ -238,6 +256,140 @@ struct ActiveTurn {
     /// whole turn frame every round (O(R²) with repeated no-op closes
     /// inflating `event_seq`).
     pending_scope_closes: VecDeque<agent_contracts::ScopeId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ActionDispatch {
+    Spawned,
+    Refused,
+    Reused,
+}
+
+/// Actor-local, body-free accounting for one model tool-call batch.
+#[derive(Debug, Clone)]
+struct TurnActionBatch {
+    model_round: usize,
+    requested: usize,
+    terminal: usize,
+    spawned: usize,
+    refused: usize,
+    reused: usize,
+    persist_observation: usize,
+    transient_no_persist: usize,
+    access_event_only: usize,
+    succeeded: usize,
+    failed: usize,
+    known_mutation_results: usize,
+    typed_verification_results: usize,
+    unknown_invalidations: usize,
+    completion_proposals: usize,
+    outcome_advances: usize,
+    no_outcome_results: usize,
+}
+
+impl TurnActionBatch {
+    fn new(model_round: usize, requested: usize) -> Self {
+        Self {
+            model_round,
+            requested,
+            terminal: 0,
+            spawned: 0,
+            refused: 0,
+            reused: 0,
+            persist_observation: 0,
+            transient_no_persist: 0,
+            access_event_only: 0,
+            succeeded: 0,
+            failed: 0,
+            known_mutation_results: 0,
+            typed_verification_results: 0,
+            unknown_invalidations: 0,
+            completion_proposals: 0,
+            outcome_advances: 0,
+            no_outcome_results: 0,
+        }
+    }
+
+    /// A provider batch rejected as one bounded protocol unit before any
+    /// individual call is admitted. Each requested call receives the same
+    /// terminal no-dispatch refusal so `requested == terminal` still holds;
+    /// no call body, arguments or synthetic ToolOutput is retained.
+    fn refused_before_dispatch(model_round: usize, requested: usize) -> Self {
+        let mut batch = Self::new(model_round, requested);
+        batch.terminal = requested;
+        batch.refused = requested;
+        batch.transient_no_persist = requested;
+        batch.failed = requested;
+        batch.no_outcome_results = requested;
+        batch
+    }
+
+    fn record(
+        &mut self,
+        output: &ToolOutput,
+        disposition: ToolResultDisposition,
+        mut dispatch: ActionDispatch,
+        trusted_verification: Option<bool>,
+    ) {
+        self.terminal = self.terminal.saturating_add(1);
+        if matches!(dispatch, ActionDispatch::Spawned)
+            && output
+                .metadata
+                .get("executed")
+                .and_then(|value| value.as_bool())
+                == Some(false)
+        {
+            dispatch = ActionDispatch::Refused;
+        }
+        match dispatch {
+            ActionDispatch::Spawned => self.spawned = self.spawned.saturating_add(1),
+            ActionDispatch::Refused => self.refused = self.refused.saturating_add(1),
+            ActionDispatch::Reused => self.reused = self.reused.saturating_add(1),
+        }
+        match disposition {
+            ToolResultDisposition::PersistObservation => {
+                self.persist_observation = self.persist_observation.saturating_add(1)
+            }
+            ToolResultDisposition::TransientNoPersist => {
+                self.transient_no_persist = self.transient_no_persist.saturating_add(1)
+            }
+            ToolResultDisposition::AccessEventOnly => {
+                self.access_event_only = self.access_event_only.saturating_add(1)
+            }
+        }
+        if output.ok {
+            self.succeeded = self.succeeded.saturating_add(1);
+        } else {
+            self.failed = self.failed.saturating_add(1);
+        }
+
+        let footprint = output.mutation_footprint();
+        let known_mutation = output.ok
+            && matches!(
+                &footprint,
+                agent_contracts::MutationFootprint::Known(touches) if !touches.is_empty()
+            );
+        let verification = trusted_verification.unwrap_or_else(|| output.is_verification());
+        let unknown = matches!(footprint, agent_contracts::MutationFootprint::Unknown);
+        let completion = output.ok && output.tool_name == "task.complete";
+        self.known_mutation_results = self
+            .known_mutation_results
+            .saturating_add(usize::from(known_mutation));
+        self.typed_verification_results = self
+            .typed_verification_results
+            .saturating_add(usize::from(verification));
+        self.unknown_invalidations = self
+            .unknown_invalidations
+            .saturating_add(usize::from(unknown));
+        self.completion_proposals = self
+            .completion_proposals
+            .saturating_add(usize::from(completion));
+        if known_mutation || verification {
+            self.outcome_advances = self.outcome_advances.saturating_add(1);
+        } else {
+            self.no_outcome_results = self.no_outcome_results.saturating_add(1);
+        }
+    }
 }
 
 /// Raw assistant evidence is ephemeral runtime state, not task authority.
@@ -472,6 +624,9 @@ mod edit_attempt_tests {
             turn_frame: TurnFrame::new("edit the file"),
             model_round: 1,
             pending_tools: VecDeque::new(),
+            pending_loaded_tools: Vec::new(),
+            result_delivery_tools: Vec::new(),
+            action_batch: None,
             tool_surface: None,
             turn_state: TurnState::Running,
             op: None,
@@ -768,6 +923,14 @@ pub(crate) struct OperationCompletion {
     effect_id: Option<EffectId>,
     /// Digest Core admitted for this tool operation.
     argument_digest: Option<ArgumentDigest>,
+    /// Host purpose plus Runtime task relevance captured before dispatch.
+    /// Output metadata cannot modify this after the operation runs.
+    attribution: Option<RuntimeExecutionAttribution>,
+    /// Original call retained only for exact verification. Runtime recomputes
+    /// host identity after execution and records a reusable PASS only when the
+    /// pre/post identities match; external changes during a verifier cannot
+    /// manufacture a receipt for a mixed world.
+    verification_call: Option<ToolCall>,
     /// Exact Core operation identity for tool cancellation/late-result
     /// terminalization. Model operations do not enter this registry.
     tool_identity: Option<ToolOperationIdentity>,

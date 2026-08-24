@@ -25,7 +25,7 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use state::AppState;
-use tool_runtime::BuiltinToolDispatcher;
+use tool_runtime::{BuiltinToolDispatcher, VerificationRecipes};
 
 /// UI-side handles for interactive approval: the broker carries requests from
 /// the kernel to the UI, the gate carries the user's decision back, and the
@@ -72,7 +72,11 @@ async fn main() -> anyhow::Result<()> {
     }
     // 授权映射是组合根的决定：一份内置注册表同时交给审批门、能力
     // 分发器与内核租约路径。
-    let host_policies = Arc::new(HostToolPolicyRegistry::with_builtins());
+    let verification_recipes = VerificationRecipes::discover(&workspace);
+    let host_policies = Arc::new(
+        HostToolPolicyRegistry::with_builtins_and_verification(&verification_recipes)
+            .map_err(anyhow::Error::msg)?,
+    );
     let (approval, interactive) = if read_only {
         (
             Arc::new(PolicyApprovalGate::read_only()) as Arc<dyn agent_contracts::ApprovalGate>,
@@ -104,7 +108,11 @@ async fn main() -> anyhow::Result<()> {
     // actor is spawned but not started yet — subscribe first so
     // `RunStarted` is observable.
     let checkpoint_dir = workspace.state_dir().join("checkpoints");
-    let base_tools = Arc::new(BuiltinToolDispatcher::new(workspace.clone()));
+    let base_tools = Arc::new(BuiltinToolDispatcher::with_config_and_verification_recipes(
+        workspace.clone(),
+        Default::default(),
+        verification_recipes,
+    ));
     let artifact_store = Arc::new(workspace.clone());
     let output_broker = Arc::new(WorkspaceOutputBroker::new(workspace.clone().into()));
     let composed = compose(ComposeConfig {

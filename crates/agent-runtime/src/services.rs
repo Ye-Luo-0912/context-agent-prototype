@@ -15,8 +15,9 @@ use agent_contracts::{
     ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
     ContextStateTransition, EffectReconciler, EventJournal, FocusState, FsRereadClass,
     MaterializedContext, ModelCapabilities, ModelEventSink, ModelOutput, ModelRequest,
-    ModelTransport, ScopeId, ScopeKind, StorageGcReport, TaskId, ToolCatalogEntry, ToolDispatcher,
-    ToolSpec, ToolSurfaceSnapshot,
+    ModelTransport, ScopeId, ScopeKind, StorageGcReport, TaskId, ToolCall, ToolCatalogEntry,
+    ToolDispatcher, ToolExecutionAttribution, ToolLeaseReconcileReport, ToolSpec,
+    ToolSurfaceSnapshot,
 };
 use agent_core::{CoreAuthorityConfig, CorePort, build_core_port, try_build_core_port};
 use agent_workspace::Workspace;
@@ -423,12 +424,23 @@ impl RuntimeServices {
         self.tools.gc(roots);
     }
 
+    /// Project runtime-owned leases onto the mutable schema surface at an
+    /// actor safe point. This is separate from idle/pressure GC: it advances
+    /// no clock and releases only optional schemas without a current source.
+    pub(crate) fn tool_reconcile_leases(&self, roots: &[String]) -> ToolLeaseReconcileReport {
+        self.tools.reconcile_leases(roots)
+    }
+
     pub(crate) fn tool_catalog(&self) -> Vec<ToolCatalogEntry> {
         self.tools.catalog()
     }
 
-    pub(crate) fn tool_load(&self, name: &str) -> AgentResult<()> {
-        self.tools.load_tool(name)
+    pub(crate) fn tool_execution_attribution(&self, call: &ToolCall) -> ToolExecutionAttribution {
+        self.tools.execution_attribution(call)
+    }
+
+    pub(crate) fn tool_load_for_lease(&self, name: &str) -> AgentResult<()> {
+        self.tools.load_tool_for_lease(name)
     }
 }
 

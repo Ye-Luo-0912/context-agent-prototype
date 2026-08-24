@@ -1,10 +1,11 @@
 {
-  "generated": "2026-08-22",
+  "generated": "2026-08-24",
   "purpose": "TOOLS-01 machine-readable matrix: inventory of the current tool schemas, limits, context dispositions, effects and platform behavior as of this commit. The code remains authoritative; this file is the ACI specification input for TOOLS-02/03/04.",
   "surface": {
-    "core": ["fs.list", "fs.read", "artifact.read", "search.grep", "edit.patch", "task.complete"],
+    "core": ["fs.list", "fs.read", "fs.write", "artifact.read", "search.grep", "edit.patch", "git.status", "git.diff"],
     "control": ["capability.manage"],
-    "catalog_optional": ["fs.write", "edit.replace", "git.status", "git.diff", "shell.exec", "process.run", "process.session", "code.symbols", "code.diagnostics", "context.manage"]
+    "conditional_required": ["verify.run when the host discovers at least one bounded recipe"],
+    "catalog_optional": ["edit.replace", "shell.exec", "process.run", "process.session", "code.symbols", "code.diagnostics", "context.manage", "task.complete", "task.manage"]
   },
   "global_limits": {
     "MAX_TOOL_MODEL_CONTENT_CHARS": 16000,
@@ -100,7 +101,7 @@
     },
     "fs.write": {
       "risk": "WorkspaceWrite",
-      "surface_class": "catalog_optional",
+      "surface_class": "core",
       "schema": {
         "path": {"type": "string", "required": true},
         "content": {"type": "string", "required": true}
@@ -114,15 +115,15 @@
       "risk": "WorkspaceWrite",
       "surface_class": "core",
       "schema": {
-        "files": {"type": "array", "required": true, "note": "the only model-visible form: [{path, base_revision, hunks:[{old, new, occurrence?}]}]; every base_revision is required lower-hex SHA-256 copied from fs.read; max 16 files and 64 total hunks per call"}
+        "files": {"type": "array", "required": true, "note": "the only model-visible form: [{path, base_revision, hunks:[{op, old, new}]}], where op is replace, insert_before, or insert_after; old must be a unique exact anchor with enough unchanged context; inserts preserve old and new carries every intended separator/newline; every base_revision is required lower-hex SHA-256 copied from fs.read; max 16 files and 64 total hunks per call"}
       },
-      "parser_compatibility": "legacy top-level path/base_revision/hunks and omitted revisions remain input-only compatibility for older callers; they are not advertised to the model",
+      "parser_compatibility": "legacy top-level path/base_revision/hunks, omitted revisions, omitted op (defaults to replace), and ordinal occurrence remain input-only compatibility for older callers; they are not advertised to the model",
       "limits": {
         "max_file_bytes": 4194304,
         "max_files": 16,
         "max_hunks": 64,
         "success_echo_chars": 1200,
-        "note": "canonical target keys are deduplicated and locked in sorted order before any read; one pinned bounded snapshot per file feeds transform, revision, recovery hash and bounded backup, and the shared lease group is held through composite settlement; base_revision refuses stale input; matching is newline-token exact (LF equals CRLF only, lone CR and every non-EOL byte remain literal), with mixed matches mapped back to exact raw spans and new EOLs reconstructed from the matched region; ordinary occurrence scanning is constant-memory and mixed replace-all uses monotonic mapping without collecting offsets; projected output and the workspace boundary both enforce max_file_bytes; the commit-time re-check detects external drift already visible but hash-to-rename is not atomic CAS against writers outside the shared Workspace; each file commit is atomic, while a multi-file composite commits sequentially and is not a cross-file transaction; a later staging failure rolls back prepared siblings, and a later commit conflict/failure reports any partial application as recovery-required; the combined multi-file success echo, including its marker, has one hard cap"
+        "note": "canonical target keys are deduplicated and locked in sorted order before any read; one pinned bounded snapshot per file feeds transform, revision, recovery hash and bounded backup, and the shared lease group is held through composite settlement; base_revision refuses stale input; matching is newline-token exact (LF equals CRLF only, lone CR and every non-EOL byte remain literal), with mixed matches mapped back to exact raw spans and new EOLs reconstructed from the matched region; parser-only ordinary occurrence scanning is constant-memory; projected output and the workspace boundary both enforce max_file_bytes; the commit-time re-check detects external drift already visible but hash-to-rename is not atomic CAS against writers outside the shared Workspace; each file commit is atomic, while a multi-file composite commits sequentially and is not a cross-file transaction; a later staging failure rolls back prepared siblings, and a later commit conflict/failure reports any partial application as recovery-required; the combined multi-file success echo, including its marker, has one hard cap and preserves both ends when the middle is omitted"
       },
       "effects": ["write:workspace", "journal:changes.jsonl", "journal:authority/workspace-effects.jsonl"],
       "context_disposition": "PersistObservation",
@@ -150,7 +151,7 @@
     },
     "git.status": {
       "risk": "ReadOnly",
-      "surface_class": "catalog_optional",
+      "surface_class": "core",
       "schema": {},
       "limits": {
         "model_output_chars": 12000,
@@ -163,7 +164,7 @@
     },
     "git.diff": {
       "risk": "ReadOnly",
-      "surface_class": "catalog_optional",
+      "surface_class": "core",
       "schema": {
         "path": {"type": "string"},
         "staged": {"type": "boolean"}
@@ -215,7 +216,7 @@
         "max_env_value_chars": 16384,
         "model_output_chars": 12000,
         "buffer_lines": 200,
-        "note": "full log streams to an artifact; bounded ring-buffer tail reaches the model; timeout/cancel kill the whole process tree"
+        "note": "non-empty or truncated logs stream to a sealed artifact and a bounded ring-buffer tail reaches the model; a zero-byte stdout/stderr capture returns an explicit terminal no-output result without artifact_ref; timeout/cancel kill the whole process tree"
       },
       "effects": ["process:exec"],
       "context_disposition": "PersistObservation",
@@ -297,16 +298,15 @@
     },
     "task.complete": {
       "risk": "ReadOnly",
-      "surface_class": "core",
+      "surface_class": "catalog_optional",
       "schema": {
-        "summary": {"type": "string", "required": true, "note": "bounded completion summary"},
-        "artifacts": {"type": "array", "items": {"type": "string"}, "note": "optional artifact:// refs produced by the completion"}
+        "summary": {"type": "string", "required": true, "note": "the only model-visible field; bounded completion summary"}
       },
       "limits": {
         "max_completion_summary_chars": 2000,
         "max_completion_artifacts": 32,
         "max_completion_ref_chars": 256,
-        "note": "the tool performs no side effect itself: it attaches a typed RuntimeDirective::CompleteTask that the runtime validates (same caps as a persisted CompletionRecord) and commits at the turn's safe point — after the turn commits, never mid-operation — through the CTX-10 transaction used by /done; a completed task owns exactly one CompletionRecord with the proposal's summary and artifact refs"
+        "note": "the tool performs no side effect itself: it attaches a typed RuntimeDirective::CompleteTask that the runtime validates and commits at the durable turn safe point; current assistant and verification refs are attached by Runtime, while the older model-supplied artifacts field is parser-only compatibility; the tool is surfaced only for explicit closure intent, a task requirement, or deliberate catalog load"
       },
       "effects": ["task:complete"],
       "context_disposition": "PersistObservation",

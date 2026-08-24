@@ -102,6 +102,11 @@ pub struct TaskAnchor {
     /// Open loops the task is still working: unresolved questions,
     /// pending verifications, follow-ups.
     pub open_loops: Vec<String>,
+    /// The single replaceable next-action guidance proposed through
+    /// `task.manage`. Replaceable guidance, not a planner: the model still
+    /// decides every call and may revise it after new evidence.
+    #[serde(default)]
+    pub next_action: String,
     /// Typed root claims that must stay resident (or recallable) while this
     /// task is active.
     pub working_refs: Vec<ContextRootClaim>,
@@ -130,6 +135,8 @@ pub struct AnchorPatch {
     pub plan_progress: Option<Vec<String>>,
     /// `TaskAnchor.open_loops` — autonomous.
     pub open_loops: Option<Vec<String>>,
+    /// `TaskAnchor.next_action` — autonomous.
+    pub next_action: Option<String>,
     /// `TaskAnchor.working_refs` — autonomous.
     pub working_refs: Option<Vec<ContextRootClaim>>,
     /// `TaskAnchor.evidence_refs` — autonomous.
@@ -170,6 +177,9 @@ impl AnchorPatch {
         }
         if let Some(value) = &self.open_loops {
             next.open_loops = value.clone();
+        }
+        if let Some(value) = &self.next_action {
+            next.next_action = value.clone();
         }
         if let Some(value) = &self.working_refs {
             next.working_refs = value.clone();
@@ -275,6 +285,7 @@ pub fn task_anchor_view(anchor: &TaskAnchor) -> agent_contracts::TaskAnchorView 
         acceptance_criteria: anchor.acceptance_criteria.clone(),
         plan_progress: anchor.plan_progress.clone(),
         open_loops: anchor.open_loops.clone(),
+        next_action: anchor.next_action.clone(),
     }
 }
 
@@ -509,7 +520,7 @@ impl TaskManager {
             return;
         }
         task.turn_intent = intent;
-        task.resume.on_user_turn();
+        task.resume.on_user_turn(text);
     }
 
     /// Record a trusted tool fact on the active task's execution state.
@@ -995,6 +1006,7 @@ pub(crate) fn normalize_anchor(anchor: &mut TaskAnchor) -> AgentResult<()> {
     ] {
         check_bounded_list(field, list)?;
     }
+    check_bounded_text("anchor next_action", &anchor.next_action)?;
     for (field, claims) in [
         ("working_refs", &anchor.working_refs),
         ("evidence_refs", &anchor.evidence_refs),
@@ -1049,6 +1061,11 @@ pub(crate) fn anchor_changed_fields(old: &TaskAnchor, new: &TaskAnchor) -> Vec<S
         &mut changed,
     );
     consider("open_loops", old.open_loops != new.open_loops, &mut changed);
+    consider(
+        "next_action",
+        old.next_action != new.next_action,
+        &mut changed,
+    );
     consider(
         "working_refs",
         old.working_refs != new.working_refs,
@@ -1309,6 +1326,7 @@ mod tests {
             acceptance_criteria: vec!["crit".into()],
             plan_progress: vec!["done".into()],
             open_loops: vec!["loop".into()],
+            next_action: "next step".into(),
             working_refs: vec![claim(
                 RootClaimRole::ActiveDecision,
                 RootClaimStrength::ResidentRequired,
@@ -1595,6 +1613,7 @@ mod tests {
             acceptance_criteria: vec!["tests pass".into(), "api unchanged".into()],
             plan_progress: vec!["read the module".into()],
             open_loops: vec!["verify edge cases".into()],
+            next_action: "patch the second caller".into(),
             working_refs: vec![ContextRootClaim {
                 item_ref: "item:auth".into(),
                 role: RootClaimRole::ActiveDecision,
@@ -1629,6 +1648,7 @@ mod tests {
                 "acceptance_criteria",
                 "plan_progress",
                 "open_loops",
+                "next_action",
                 "working_refs"
             ]
         );

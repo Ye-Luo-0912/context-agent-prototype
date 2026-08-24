@@ -400,6 +400,12 @@ impl RuntimeActor {
     /// input must not dangle at Applied forever. The committed interruption
     /// is the input's terminal audit record, then the turn frame is dropped.
     pub(super) async fn settle_aborted_turn(&mut self) {
+        if let Err(error) = self.settle_action_batch().await {
+            self.require_effect_recovery(format!(
+                "action-batch audit failed while aborting the turn: {error}"
+            ))
+            .await;
+        }
         if let Some(turn) = self.state.turn.take()
             && !turn.input_consumed
             && let Some(applied) = turn.applied_input

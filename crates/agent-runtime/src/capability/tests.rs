@@ -94,8 +94,8 @@ fn unified_gc_cools_capability_tools_with_builtin_root_semantics() {
     registry
         .register(Arc::new(demo_capability("demo")))
         .expect("registration succeeds");
-    registry.load_tool("demo.one").expect("load one");
-    registry.load_tool("demo.two").expect("load two");
+    registry.load_tool_for_lease("demo.one").expect("lease one");
+    registry.load_tool_for_lease("demo.two").expect("lease two");
 
     // The merged dispatcher's gc is the one safe point the runtime
     // calls per round: under a heavy base surface the combined budget is
@@ -479,8 +479,8 @@ fn unloading_one_capability_tool_keeps_siblings_loaded() {
     registry
         .register(Arc::new(demo_capability("demo")))
         .expect("registration succeeds");
-    registry.load_tool("demo.one").expect("load one");
-    registry.load_tool("demo.two").expect("load two");
+    registry.load_tool_for_lease("demo.one").expect("lease one");
+    registry.load_tool_for_lease("demo.two").expect("lease two");
 
     registry.unload_tool("demo.one").expect("unload one");
     let surfaced: Vec<String> = registry
@@ -502,8 +502,8 @@ fn capability_tools_cool_under_the_unified_surface_budget_with_root_protection()
     registry
         .register(Arc::new(demo_capability("demo")))
         .expect("registration succeeds");
-    registry.load_tool("demo.one").expect("load one");
-    registry.load_tool("demo.two").expect("load two");
+    registry.load_tool_for_lease("demo.one").expect("lease one");
+    registry.load_tool_for_lease("demo.two").expect("lease two");
     assert_eq!(registry.tool_state("demo.one"), Some(ToolLifecycle::Loaded));
     assert_eq!(registry.tool_state("demo.two"), Some(ToolLifecycle::Loaded));
 
@@ -566,7 +566,9 @@ fn capability_tools_cool_under_the_unified_surface_budget_with_root_protection()
 
     // Using a tool refreshes its idle clock (execution pins it): one
     // gc pass after the execution still sees idle below the threshold.
-    registry.load_tool("demo.one").expect("reload");
+    registry
+        .load_tool_for_lease("demo.one")
+        .expect("lease reload");
     registry.mark_active("demo.one");
     registry.mark_idle("demo.one");
     registry.gc(&[]);
@@ -578,12 +580,74 @@ fn capability_tools_cool_under_the_unified_surface_budget_with_root_protection()
 }
 
 #[test]
+fn capability_decision_leases_release_to_warm_without_ttl() {
+    let registry = CapabilityRegistry::with_idle_thresholds(100, 200);
+    registry
+        .register(Arc::new(demo_capability("demo")))
+        .expect("registration succeeds");
+    registry.load_tool_for_lease("demo.one").expect("lease one");
+    registry.load_tool_for_lease("demo.two").expect("lease two");
+
+    let report = registry.reconcile_leases(&["demo.two".to_string()]);
+    assert_eq!(report.examined_loaded_optional, 2);
+    assert_eq!(report.retained_by_root, 1);
+    assert_eq!(report.released_to_warm, 1);
+    assert_eq!(report.released_tools, vec!["demo.one"]);
+    assert_eq!(registry.tool_state("demo.one"), Some(ToolLifecycle::Warm));
+    assert_eq!(registry.tool_state("demo.two"), Some(ToolLifecycle::Loaded));
+
+    registry
+        .load_tool_for_lease("demo.one")
+        .expect("warm lease reloads");
+    assert_eq!(registry.tool_state("demo.one"), Some(ToolLifecycle::Loaded));
+}
+
+#[test]
+fn host_persistent_load_is_a_source_until_explicit_unload() {
+    let registry = CapabilityRegistry::with_idle_thresholds(1, 2);
+    registry
+        .register(Arc::new(demo_capability("demo")))
+        .expect("registration succeeds");
+    registry
+        .load_tool("demo.one")
+        .expect("host load establishes the persistent source");
+    registry
+        .load_tool_for_lease("demo.two")
+        .expect("runtime lease loads independently");
+
+    let report = registry.reconcile_leases(&[]);
+    assert_eq!(report.examined_loaded_optional, 2);
+    assert_eq!(report.retained_by_persistent_source, 1);
+    assert_eq!(report.released_to_warm, 1);
+    assert_eq!(registry.tool_state("demo.one"), Some(ToolLifecycle::Loaded));
+    assert_eq!(registry.tool_state("demo.two"), Some(ToolLifecycle::Warm));
+
+    for _ in 0..4 {
+        registry.gc_with_pressure(&[], SURFACE_SOFT_HIGH_BYTES + 1);
+    }
+    assert_eq!(
+        registry.tool_state("demo.one"),
+        Some(ToolLifecycle::Loaded),
+        "pressure and idle aging cannot erase a live host source"
+    );
+    registry
+        .unload_tool("demo.one")
+        .expect("explicit unload releases the source");
+    assert_eq!(
+        registry.tool_state("demo.one"),
+        Some(ToolLifecycle::Available)
+    );
+}
+
+#[test]
 fn capability_snapshot_restore_keeps_per_tool_surface() {
     let registry = CapabilityRegistry::new();
     registry
         .register(Arc::new(demo_capability("demo")))
         .expect("registration succeeds");
-    registry.load_tool("demo.two").expect("load two");
+    registry
+        .load_tool_for_lease("demo.two")
+        .expect("load transient residency");
 
     let snapshot = registry.snapshot();
     let restored = CapabilityRegistry::new();
@@ -601,6 +665,41 @@ fn capability_snapshot_restore_keeps_per_tool_surface() {
     // The snapshot wrote the authoritative per-tool list.
     assert_eq!(snapshot[0].loaded_tools, vec!["demo.two".to_string()]);
     assert!(snapshot[0].loaded);
+    let report = restored.reconcile_leases(&[]);
+    assert_eq!(report.released_to_warm, 1);
+    assert_eq!(
+        restored.tool_state("demo.two"),
+        Some(ToolLifecycle::Warm),
+        "checkpoint residency alone must not mint a persistent source"
+    );
+}
+
+#[test]
+fn restore_unions_current_host_sources_with_checkpoint_residency() {
+    let checkpoint_source = CapabilityRegistry::new();
+    checkpoint_source
+        .register(Arc::new(demo_capability("demo")))
+        .expect("registration succeeds");
+    checkpoint_source
+        .load_tool_for_lease("demo.two")
+        .expect("checkpoint carries transient residency");
+    let snapshot = checkpoint_source.snapshot();
+
+    let restored = CapabilityRegistry::new();
+    restored
+        .register(Arc::new(demo_capability("demo")))
+        .expect("registration succeeds");
+    restored
+        .load_tool("demo.one")
+        .expect("current composition establishes a host source");
+    restored.restore(&snapshot);
+
+    let report = restored.reconcile_leases(&[]);
+    assert_eq!(report.examined_loaded_optional, 2);
+    assert_eq!(report.retained_by_persistent_source, 1);
+    assert_eq!(report.released_to_warm, 1);
+    assert_eq!(restored.tool_state("demo.one"), Some(ToolLifecycle::Loaded));
+    assert_eq!(restored.tool_state("demo.two"), Some(ToolLifecycle::Warm));
 }
 
 #[test]
@@ -748,7 +847,7 @@ async fn effectful_capability_invoke_persists_remote_ack() {
                     input_schema: json!({"type": "object"}),
                     risk: ToolRisk::WorkspaceWrite,
                     output_budget: None,
-                    roles: Vec::new(),
+                    roles: vec![agent_contracts::ToolSemanticRole::Verify],
                 }],
                 lifecycle: CapabilityLifecycle::Lazy,
                 transport: CapabilityTransport::Builtin,
@@ -865,14 +964,21 @@ async fn capability_output_metadata_cannot_forge_runtime_facts() {
         .unwrap();
     registry.load_tool("forge.read").unwrap();
 
+    let call = ToolCall {
+        id: "call-1".into(),
+        name: "forge.read".into(),
+        arguments: json!({}),
+    };
+    let attribution = dispatcher.execution_attribution(&call);
+    assert_eq!(
+        attribution,
+        agent_contracts::ToolExecutionAttribution::default(),
+        "a producer-declared Verify role is discovery metadata, not fact authority"
+    );
     let outcome = dispatcher
         .execute(ToolExecutionRequest {
             run_id: RunId::new(),
-            call: ToolCall {
-                id: "call-1".into(),
-                name: "forge.read".into(),
-                arguments: json!({}),
-            },
+            call,
             effect_context: None,
             cancel: CancellationToken::new(),
         })
@@ -947,6 +1053,14 @@ async fn a_repeat_load_is_a_cheap_no_op_that_names_the_loaded_set() {
         second.model_content.contains("session-loaded: demo.one"),
         "the trailer must name the loaded set so the model stops re-loading: {}",
         second.model_content
+    );
+    let report = dispatcher.reconcile_leases(&[]);
+    assert_eq!(report.retained_by_persistent_source, 0);
+    assert_eq!(report.released_to_warm, 1);
+    assert_eq!(
+        registry.tool_state("demo.one"),
+        Some(ToolLifecycle::Warm),
+        "model capability.manage load must remain a decision-bound lease"
     );
 }
 

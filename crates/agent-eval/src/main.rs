@@ -1621,6 +1621,7 @@ mod tool_edit_main_tests {
             repeat: 1,
             repeats: 3,
             live: true,
+            tool_surface: Some("production".into()),
             fixture_sha256: "fixture-sha".into(),
             git_head: None,
             git_dirty: None,

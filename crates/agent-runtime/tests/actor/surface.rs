@@ -1,14 +1,134 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use agent_contracts::{
-    ContextEngine, ContextKind, RuntimeEvent, RuntimeEventEnvelope, ToolSurfaceBlockReason,
-    ToolSurfaceDemand, ToolSurfaceOmissionReason, ToolSurfacePlanStatus, ToolSurfaceRequirement,
+    AgentError, AgentResult, ContextEngine, ContextKind, RuntimeEvent, RuntimeEventEnvelope,
+    ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLeaseBoundary, ToolLifecycle,
+    ToolOutcome, ToolRisk, ToolSpec, ToolSurfaceBlockReason, ToolSurfaceDemand,
+    ToolSurfaceOmissionReason, ToolSurfacePlanStatus, ToolSurfaceRequirement,
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{RuntimeServices, approx_layer_tokens, spawn_runtime};
 
 use crate::harness::*;
+
+#[derive(Debug, Default)]
+struct IntentGatedCompletionDispatcher {
+    loaded: AtomicBool,
+}
+
+impl IntentGatedCompletionDispatcher {
+    fn spec() -> ToolSpec {
+        ToolSpec {
+            name: "task.complete".into(),
+            description: "close the active task".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["summary"],
+                "properties": {"summary": {"type": "string"}}
+            }),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolDispatcher for IntentGatedCompletionDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.loaded
+            .load(Ordering::SeqCst)
+            .then(Self::spec)
+            .into_iter()
+            .collect()
+    }
+
+    fn may_omit_from_round(&self, name: &str) -> bool {
+        name == "task.complete"
+    }
+
+    fn catalog(&self) -> Vec<ToolCatalogEntry> {
+        vec![ToolCatalogEntry {
+            name: "task.complete".into(),
+            state: if self.loaded.load(Ordering::SeqCst) {
+                ToolLifecycle::Loaded
+            } else {
+                ToolLifecycle::Available
+            },
+            owner: "builtin".into(),
+            description: "close the active task".into(),
+            risk: ToolRisk::ReadOnly,
+            roles: Vec::new(),
+        }]
+    }
+
+    fn load_tool(&self, name: &str) -> AgentResult<()> {
+        if name != "task.complete" {
+            return Err(AgentError::InvalidRequest(format!("unknown tool: {name}")));
+        }
+        self.loaded.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn inspect_tool(&self, name: &str) -> Option<ToolSpec> {
+        (name == "task.complete").then(Self::spec)
+    }
+
+    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        Err(AgentError::InvalidRequest(
+            "the recording model never calls tools".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn task_completion_surface_is_gated_by_explicit_turn_intent() {
+    let model = Arc::new(RecordingModel::default());
+    let tools = Arc::new(IntentGatedCompletionDispatcher::default());
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model.clone(),
+        tools,
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+
+    handle
+        .user_message("continue implementing the current task".into())
+        .await
+        .unwrap();
+    wait_for_turn_completed(&mut events).await;
+    handle.user_message("mark this done".into()).await.unwrap();
+    wait_for_turn_completed(&mut events).await;
+
+    {
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .all(|spec| spec.name != "task.complete"),
+            "ordinary turn completion must preserve task continuity"
+        );
+        assert!(
+            requests[1]
+                .tools
+                .iter()
+                .any(|spec| spec.name == "task.complete"),
+            "explicit task-closure intent must lease the typed completion tool"
+        );
+    }
+    handle.stop().await.unwrap();
+}
 
 #[tokio::test]
 async fn final_guard_trims_to_the_input_budget_not_the_window() {
@@ -189,6 +309,627 @@ async fn final_guard_omits_optional_schema_without_unloading_it() {
             .any(|row| row.tool_name == "optional.large")
     );
 
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn directive_boundary_releases_unrooted_optional_schema_before_model_start() {
+    let model = Arc::new(VariableWindowModel::new(16_000));
+    let tools = Arc::new(RoundLocalToolDispatcher::lease_reconciling());
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model.clone(),
+        tools.clone(),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle.user_message("new directive".into()).await.unwrap();
+
+    let seen = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut seen = Vec::new();
+        loop {
+            let envelope = events.recv().await.unwrap();
+            let done = matches!(envelope.event, RuntimeEvent::TurnCompleted);
+            seen.push(envelope.event);
+            if done {
+                break seen;
+            }
+        }
+    })
+    .await
+    .expect("turn completes");
+
+    let lease_index = seen
+        .iter()
+        .position(|event| matches!(event, RuntimeEvent::ToolLeasesReconciled { .. }))
+        .expect("lease event");
+    let surface_index = seen
+        .iter()
+        .position(|event| matches!(event, RuntimeEvent::ToolSurfacePlanned { .. }))
+        .expect("surface event");
+    let model_index = seen
+        .iter()
+        .position(|event| matches!(event, RuntimeEvent::ModelStarted { .. }))
+        .expect("model event");
+    assert!(lease_index < surface_index && surface_index < model_index);
+    match &seen[lease_index] {
+        RuntimeEvent::ToolLeasesReconciled {
+            boundary, report, ..
+        } => {
+            assert_eq!(*boundary, ToolLeaseBoundary::DirectiveStart);
+            assert_eq!(report.examined_loaded_optional, 1);
+            assert_eq!(report.released_to_warm, 1);
+            assert_eq!(report.retained_by_root, 0);
+        }
+        _ => unreachable!(),
+    }
+    assert!(!tools.optional_loaded());
+    assert_eq!(tools.unload_calls(), 0, "lease release is Warm, not unload");
+    {
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .all(|spec| spec.name != "optional.large")
+        );
+    }
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_requirement_roots_optional_schema_across_directive_reconcile() {
+    let model = Arc::new(VariableWindowModel::new(16_000));
+    let tools = Arc::new(RoundLocalToolDispatcher::lease_reconciling());
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model.clone(),
+        tools.clone(),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle.set_focus("rooted capability".into()).await.unwrap();
+    let task_id = handle.list_tasks().await.unwrap()[0].id;
+    handle
+        .replace_task_tool_requirements(
+            task_id,
+            0,
+            vec![ToolSurfaceRequirement {
+                tool_name: "optional.large".into(),
+                demand: ToolSurfaceDemand::PreferSurface,
+                reason: "task-scoped capability".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    handle
+        .user_message("use the rooted tool".into())
+        .await
+        .unwrap();
+    wait_for_turn_completed(&mut events).await;
+
+    assert!(tools.optional_loaded());
+    {
+        let requests = model.requests.lock().unwrap();
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .any(|spec| spec.name == "optional.large")
+        );
+    }
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn result_delivery_lease_survives_load_and_call_then_releases_on_non_use() {
+    let model = Arc::new(LeaseFlowModel::default());
+    let tools = Arc::new(RoundLocalToolDispatcher::lease_reconciling());
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model.clone(),
+        tools.clone(),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut turn_events = handle.subscribe();
+    let mut audit_events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .user_message("exercise a leased tool".into())
+        .await
+        .unwrap();
+    wait_for_turn_completed(&mut turn_events).await;
+
+    let (lease_reports, action_batches) = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut reports = Vec::new();
+        let mut batches = Vec::new();
+        loop {
+            let envelope = audit_events.recv().await.unwrap();
+            match envelope.event {
+                RuntimeEvent::ToolLeasesReconciled {
+                    boundary, report, ..
+                } => reports.push((boundary, report)),
+                RuntimeEvent::ExecutionBatchSettled {
+                    requested,
+                    terminal,
+                    spawned,
+                    refused,
+                    reused,
+                    missing_terminal,
+                    unexpected_terminal,
+                    ..
+                } => batches.push((
+                    requested,
+                    terminal,
+                    spawned,
+                    refused,
+                    reused,
+                    missing_terminal,
+                    unexpected_terminal,
+                )),
+                RuntimeEvent::TurnCompleted => break (reports, batches),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("audit stream reaches turn completion");
+
+    assert_eq!(model.requests.lock().unwrap().len(), 3);
+    assert_eq!(tools.load_calls(), 1);
+    assert_eq!(
+        action_batches,
+        vec![(1, 1, 1, 0, 0, 0, 0), (1, 1, 1, 0, 0, 0, 0)],
+        "each model-requested action must receive exactly one terminal disposition"
+    );
+    assert!(
+        lease_reports.iter().any(|(boundary, report)| {
+            *boundary == ToolLeaseBoundary::ModelDecision
+                && report.retained_by_root == 1
+                && report.released_to_warm == 0
+        }),
+        "the call decision must renew the result-delivery lease"
+    );
+    assert!(
+        lease_reports.iter().any(|(boundary, report)| {
+            *boundary == ToolLeaseBoundary::ModelDecision
+                && report.released_to_warm == 1
+                && report.released_tools == vec!["optional.large"]
+        }),
+        "the first successful decision that does not reuse the tool releases it"
+    );
+    assert!(
+        !tools.optional_loaded(),
+        "released target leaves the model surface"
+    );
+    assert_eq!(tools.unload_calls(), 0, "release remains a Warm transition");
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn pending_load_cohort_survives_adjacent_loads_until_each_tool_is_used() {
+    let model = Arc::new(CohortLeaseModel::default());
+    let tools = Arc::new(RoundLocalToolDispatcher::lease_reconciling());
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model.clone(),
+        tools.clone(),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .user_message("assemble and use an optional tool cohort".into())
+        .await
+        .unwrap();
+    wait_for_turn_completed(&mut events).await;
+
+    assert_eq!(model.requests.lock().unwrap().len(), 5);
+    assert_eq!(tools.load_calls(), 2, "each cohort member loads once");
+    assert!(!tools.optional_loaded(), "used A releases at turn end");
+    assert!(!tools.optional_peer_loaded(), "used B releases at turn end");
+    assert_eq!(tools.unload_calls(), 0, "release remains Warm, not unload");
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn oversized_provider_batch_is_refused_without_dispatch_and_fully_accounted() {
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(OversizedToolBatchModel),
+        Arc::new(RoundLocalToolDispatcher::new()),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .user_message("return an oversized action batch".into())
+        .await
+        .unwrap();
+
+    let mut saw_limit_error = false;
+    let mut saw_tool_started = false;
+    let batch = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match events.recv().await.unwrap().event {
+                RuntimeEvent::Error { message } => {
+                    saw_limit_error |= message.contains("hard safety limit");
+                }
+                RuntimeEvent::ToolStarted { .. } => saw_tool_started = true,
+                RuntimeEvent::ExecutionBatchSettled {
+                    requested,
+                    terminal,
+                    spawned,
+                    refused,
+                    transient_no_persist,
+                    failed,
+                    no_outcome_results,
+                    missing_terminal,
+                    unexpected_terminal,
+                    ..
+                } => {
+                    break (
+                        requested,
+                        terminal,
+                        spawned,
+                        refused,
+                        transient_no_persist,
+                        failed,
+                        no_outcome_results,
+                        missing_terminal,
+                        unexpected_terminal,
+                    );
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("oversized batch reaches a terminal ledger event");
+
+    assert!(saw_limit_error);
+    assert!(!saw_tool_started, "no member of an oversized batch may run");
+    assert_eq!(
+        batch,
+        (
+            agent_contracts::MAX_MODEL_TOOL_CALLS_PER_ROUND + 1,
+            agent_contracts::MAX_MODEL_TOOL_CALLS_PER_ROUND + 1,
+            0,
+            agent_contracts::MAX_MODEL_TOOL_CALLS_PER_ROUND + 1,
+            agent_contracts::MAX_MODEL_TOOL_CALLS_PER_ROUND + 1,
+            agent_contracts::MAX_MODEL_TOOL_CALLS_PER_ROUND + 1,
+            agent_contracts::MAX_MODEL_TOOL_CALLS_PER_ROUND + 1,
+            0,
+            0,
+        ),
+        "batch-level refusal must terminalize every requested action exactly once"
+    );
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn speculative_missing_path_is_reused_only_after_live_workspace_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = agent_workspace::Workspace::open(dir.path()).await.unwrap();
+    let tools = Arc::new(MissingReadDispatcher::default());
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(DuplicateMissingReadModel::default()),
+        tools.clone(),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    )
+    .with_artifact_workspace(Arc::new(workspace));
+    let (handle, _task) = spawn_runtime(Arc::new(services));
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .user_message("inspect a possible implementation location".into())
+        .await
+        .unwrap();
+
+    let (started, finished, recorded, reused, batch) =
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut started = 0;
+            let mut finished = 0;
+            let mut recorded = 0;
+            let mut reused = 0;
+            let mut batch = None;
+            loop {
+                match events.recv().await.unwrap().event {
+                    RuntimeEvent::ToolStarted { call } if call.name == "fs.read" => {
+                        started += 1;
+                    }
+                    RuntimeEvent::ToolFinished { output } if output.tool_name == "fs.read" => {
+                        finished += 1;
+                    }
+                    RuntimeEvent::ExecutionNegativeFact { kind, .. } => match kind {
+                        agent_contracts::NegativeFactEventKind::Recorded => recorded += 1,
+                        agent_contracts::NegativeFactEventKind::Reused => reused += 1,
+                        _ => {}
+                    },
+                    RuntimeEvent::ExecutionBatchSettled {
+                        requested,
+                        terminal,
+                        spawned,
+                        reused,
+                        ..
+                    } => batch = Some((requested, terminal, spawned, reused)),
+                    RuntimeEvent::TurnCompleted => {
+                        break (started, finished, recorded, reused, batch);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("duplicate missing-path turn completes");
+
+    assert_eq!(
+        tools.executions.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(started, 1, "only the first call may dispatch");
+    assert_eq!(finished, 2, "both model calls receive terminal results");
+    assert_eq!(recorded, 1);
+    assert_eq!(reused, 1);
+    assert_eq!(batch, Some((2, 2, 1, 1)));
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn exact_current_verification_pass_avoids_only_the_equivalent_dispatch() {
+    let tools = Arc::new(ExactVerifyDispatcher::default());
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(DuplicateExactVerifyModel::default()),
+        tools.clone(),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let (handle, _task) = spawn_runtime(Arc::new(services));
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .user_message("run one deterministic verification recipe".into())
+        .await
+        .unwrap();
+
+    let (started, finished, recorded, reused, reused_output, batch) =
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut started = 0;
+            let mut finished = 0;
+            let mut recorded = 0;
+            let mut reused = 0;
+            let mut reused_output = false;
+            let mut batch = None;
+            loop {
+                match events.recv().await.unwrap().event {
+                    RuntimeEvent::ToolStarted { call } if call.name == "test.verify" => {
+                        started += 1;
+                    }
+                    RuntimeEvent::ToolFinished { output } if output.tool_name == "test.verify" => {
+                        finished += 1;
+                        reused_output |= output
+                            .metadata
+                            .get("verification_pass_reused")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                    }
+                    RuntimeEvent::ExecutionVerificationPass { kind, .. } => match kind {
+                        agent_contracts::VerificationPassEventKind::Recorded => recorded += 1,
+                        agent_contracts::VerificationPassEventKind::Reused => reused += 1,
+                    },
+                    RuntimeEvent::ExecutionBatchSettled {
+                        requested,
+                        terminal,
+                        spawned,
+                        reused,
+                        ..
+                    } => batch = Some((requested, terminal, spawned, reused)),
+                    RuntimeEvent::TurnCompleted => {
+                        break (started, finished, recorded, reused, reused_output, batch);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("duplicate exact-verification turn completes");
+
+    assert_eq!(
+        tools.executions.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(started, 1, "only the first verifier call may dispatch");
+    assert_eq!(finished, 2, "both requested calls receive terminal results");
+    assert_eq!(recorded, 1);
+    assert_eq!(reused, 1);
+    assert!(
+        reused_output,
+        "the skipped call must disclose executed=false reuse"
+    );
+    assert_eq!(batch, Some((2, 2, 1, 1)));
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn exact_verification_identity_drift_executes_again_and_marks_the_result() {
+    let tools = Arc::new(DriftingExactVerifyDispatcher::default());
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(DuplicateExactVerifyModel::default()),
+        tools.clone(),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let (handle, _task) = spawn_runtime(Arc::new(services));
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .user_message("run a verifier while its identity changes".into())
+        .await
+        .unwrap();
+
+    let (started, recorded, reused, drifted, batch) =
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut started = 0;
+            let mut recorded = 0;
+            let mut reused = 0;
+            let mut drifted = 0;
+            let mut batch = None;
+            loop {
+                match events.recv().await.unwrap().event {
+                    RuntimeEvent::ToolStarted { call } if call.name == "test.verify" => {
+                        started += 1;
+                    }
+                    RuntimeEvent::ToolFinished { output } if output.tool_name == "test.verify" => {
+                        drifted += usize::from(
+                            output
+                                .metadata
+                                .get("verification_identity_stable")
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(false),
+                        );
+                    }
+                    RuntimeEvent::ExecutionVerificationPass { kind, .. } => match kind {
+                        agent_contracts::VerificationPassEventKind::Recorded => recorded += 1,
+                        agent_contracts::VerificationPassEventKind::Reused => reused += 1,
+                    },
+                    RuntimeEvent::ExecutionBatchSettled {
+                        requested,
+                        terminal,
+                        spawned,
+                        reused,
+                        ..
+                    } => batch = Some((requested, terminal, spawned, reused)),
+                    RuntimeEvent::TurnCompleted => {
+                        break (started, recorded, reused, drifted, batch);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("identity-drift turn completes");
+
+    assert_eq!(
+        tools.executions.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(started, 2, "identity drift must prevent the second skip");
+    assert_eq!(recorded, 1, "only the stable second PASS is exact");
+    assert_eq!(reused, 0);
+    assert_eq!(drifted, 1, "the downgraded PASS stays event-visible");
+    assert_eq!(batch, Some((2, 2, 2, 0)));
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn lease_transition_audit_failure_fences_before_model_start() {
+    let model = Arc::new(RecordingModel::default());
+    let tools = Arc::new(RoundLocalToolDispatcher::lease_reconciling());
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model.clone(),
+        tools.clone(),
+        Arc::new(PolicyApprovalGate::read_only()),
+        Some(Arc::new(FailToolLeaseEventJournal)),
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .user_message("start a directive".into())
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().event,
+                RuntimeEvent::RecoveryRequired
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("an unaudited lease transition must fence the actor");
+
+    assert!(model.requests.lock().unwrap().is_empty());
+    assert!(
+        !tools.optional_loaded(),
+        "the transition landed, so failure must fence rather than pretend it rolled back"
+    );
+    assert!(
+        handle.user_message("must be fenced".into()).await.is_err(),
+        "a known audit gap requires restore before another directive"
+    );
+    handle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn action_batch_audit_failure_fences_before_following_model_decision() {
+    let model = Arc::new(LeaseFlowModel::default());
+    let tools = Arc::new(RoundLocalToolDispatcher::lease_reconciling());
+    let kernel = Arc::new(RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model.clone(),
+        tools.clone(),
+        Arc::new(PolicyApprovalGate::read_only()),
+        Some(Arc::new(FailActionBatchEventJournal)),
+    ));
+    let (handle, _task) = spawn_runtime(kernel);
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .user_message("load a leased capability".into())
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().event,
+                RuntimeEvent::RecoveryRequired
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("an unaudited action batch must fence the actor");
+
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    assert_eq!(tools.load_calls(), 1, "the first action did execute");
+    assert!(
+        handle.user_message("must be fenced".into()).await.is_err(),
+        "the runtime cannot continue after losing the batch terminal record"
+    );
     handle.stop().await.unwrap();
 }
 

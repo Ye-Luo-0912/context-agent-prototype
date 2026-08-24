@@ -1,13 +1,14 @@
 //! Algorithm tests for ExecutionState (formerly ResumePoint).
 
 use super::state::{
-    MAX_RESUME_FILES, MAX_REVALIDATE_PER_ROUND, VerificationCause, VerificationCoverage,
-    VerificationState,
+    MAX_NEGATIVE_FACTS, MAX_RESUME_FILES, MAX_REVALIDATE_PER_ROUND, MAX_VERIFICATION_SOURCES,
+    VerificationCause, VerificationCoverage, VerificationState,
 };
 use super::*;
 use agent_contracts::{
-    MAX_TASK_ANCHOR_ITEM_CHARS, ResourceFreshness, ResourceVersionOracle, ToolOutput,
-    ToolResultDisposition, TurnFrame,
+    MAX_TASK_ANCHOR_ITEM_CHARS, NegativeFactEventKind, ResourceFreshness, ResourceVersionOracle,
+    ToolExecutionAttribution, ToolExecutionPurpose, ToolOutput, ToolResultDisposition, TurnFrame,
+    VerificationReuse,
 };
 use serde_json::json;
 
@@ -737,7 +738,7 @@ async fn recall_after_fix_note_turn_does_not_inherit_need_verify() {
         "Known edit still unmet after same-hash revalidate"
     );
 
-    resume.on_user_turn();
+    resume.on_user_turn("run the tests");
     assert!(
         resume.has_unmet_obligation(),
         "on_user_turn must not wipe the obligation"
@@ -797,6 +798,49 @@ async fn pending_revalidation_past_the_round_cap_is_not_checked() {
     assert_eq!(fresh, MAX_REVALIDATE_PER_ROUND);
     assert_eq!(pending, 20 - MAX_REVALIDATE_PER_ROUND);
     assert_eq!(resume.view().checked_files.len(), MAX_REVALIDATE_PER_ROUND);
+}
+
+#[tokio::test]
+async fn checkpoint_body_demand_gets_existing_revalidation_quota_first() {
+    let mut resume = ExecutionState::default();
+    for index in 0..20 {
+        let mut row = output("fs.read", true, "read");
+        row.metadata = json!({
+            "path": format!("src/f{index}.rs"),
+            "revision": format!("rev{index}")
+        });
+        resume.observe_tool(&row, 1, index);
+    }
+    let mut process = output("process.run", true, "ran");
+    process.metadata = json!({"argv": "compiler"});
+    resume.observe_tool(&process, 1, 21);
+
+    let mut map = std::collections::HashMap::new();
+    for index in 0..20 {
+        map.insert(format!("src/f{index}.rs"), Some(format!("rev{index}")));
+    }
+    resume
+        .revalidate_with_priority(&MapOracle(map), "", &["src/f0.rs@rev0".into()])
+        .await;
+    assert_eq!(
+        resume
+            .checked_files
+            .iter()
+            .find(|row| row.path == "src/f0.rs")
+            .expect("priority fact")
+            .freshness,
+        ResourceFreshness::Fresh,
+        "a checkpoint-spilled body must not lose to pure recency"
+    );
+    assert_eq!(
+        resume
+            .checked_files
+            .iter()
+            .filter(|row| row.freshness == ResourceFreshness::Fresh)
+            .count(),
+        MAX_REVALIDATE_PER_ROUND,
+        "priority changes order, never expands the bounded quota"
+    );
 }
 
 #[test]
@@ -905,6 +949,43 @@ fn git_status_repeat_at_same_revision_is_redundant_evidence() {
 }
 
 #[test]
+fn targeted_directive_keeps_unrooted_novel_evidence_off_the_task_frontier() {
+    let mut state = ExecutionState::default();
+    state.observe_tool(&read_output("src/auth.rs", "rev-a"), 1, 1);
+    state.on_user_turn("Refactor src/auth.rs without changing behavior");
+    assert!(state.directive_has_rooted_evidence);
+
+    let unrooted = RuntimeExecutionAttribution {
+        host: ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Observe,
+            Vec::<String>::new(),
+            agent_contracts::VerificationReuse::None,
+        ),
+        rooted_targets: Vec::new(),
+    };
+    let observation = state.observe_tool_attributed(&git_status(), 1, 2, "git-status-a", &unrooted);
+    assert_eq!(
+        observation.delta,
+        agent_contracts::FrontierDelta::NoProgress
+    );
+    assert_eq!(observation.actions_since_frontier_advance, 1);
+    assert!(
+        state.evidence.iter().any(|row| row.key == "git.status"),
+        "unrelated evidence remains available even when it is not task progress"
+    );
+
+    state.on_user_turn("Survey the workspace broadly");
+    assert!(!state.directive_has_rooted_evidence);
+    let diff = output("git.diff", true, "new workspace diff");
+    let observation = state.observe_tool_attributed(&diff, 1, 3, "git-diff-a", &unrooted);
+    assert_eq!(
+        observation.delta,
+        agent_contracts::FrontierDelta::EvidenceAdvanced,
+        "open-ended directives retain broad exploration semantics"
+    );
+}
+
+#[test]
 fn redundant_round_does_not_clear_active_failure_cluster() {
     let mut resume = ExecutionState::default();
     // 先建立已知证据，后面的同版本重读才是冗余而非新证据。
@@ -975,7 +1056,9 @@ fn known_edit_advances_world_and_invalidates_revision_bound_evidence() {
         agent_contracts::FrontierDelta::ObservedWorldChange
     );
     assert_eq!(observation.invalidated, 1, "git.status@rev0 expired");
-    assert!(resume.evidence.is_empty());
+    assert_eq!(resume.evidence.len(), 1);
+    assert!(!resume.evidence[0].current, "expired row must not project");
+    assert!(resume.view().operational_evidence.is_empty());
     assert_eq!(observation.actions_since_frontier_advance, 0);
 }
 
@@ -1194,7 +1277,7 @@ fn edit_target_obligation_resolves_only_at_new_digest() {
 }
 
 #[test]
-fn stale_resource_evidence_is_hidden_and_swept() {
+fn stale_resource_evidence_is_hidden_but_keeps_bounded_fingerprint() {
     // 评审第 8 条的原始 bug 场景：edit 之后 Resource 行不得残留 AAA。
     let mut resume = ExecutionState::default();
     resume.observe_tool(&read_output("src/foo.rs", "AAA"), 1, 1);
@@ -1206,11 +1289,40 @@ fn stale_resource_evidence_is_hidden_and_swept() {
         resume.view().operational_evidence.is_empty(),
         "evidence for a changed file must not render"
     );
-    assert!(!resume.evidence.iter().any(|row| row.validity
-        == agent_contracts::EvidenceValidity::Resource {
-            path: "src/foo.rs".into(),
-            digest: "AAA".into(),
-        }));
+    let dormant = resume
+        .evidence
+        .iter()
+        .find(|row| {
+            row.validity
+                == agent_contracts::EvidenceValidity::Resource {
+                    path: "src/foo.rs".into(),
+                    digest: "AAA".into(),
+                }
+        })
+        .expect("bounded semantic fingerprint remains available");
+    assert!(!dormant.current, "stale evidence must never project");
+}
+
+#[test]
+fn identical_read_after_unknown_reconfirms_without_advancing_frontier() {
+    let mut resume = ExecutionState::default();
+    resume.observe_tool(&read_output("src/auth.rs", "r1"), 1, 1);
+    let unknown = resume.observe_tool(
+        &pathless_command("process.run", true, "rustc --test", "compiled"),
+        1,
+        2,
+    );
+    assert_eq!(unknown.invalidated, 1);
+    assert!(!resume.evidence[0].current);
+
+    let reconfirmed = resume.observe_tool(&read_output("src/auth.rs", "r1"), 1, 3);
+    assert_eq!(
+        reconfirmed.delta,
+        agent_contracts::FrontierDelta::EvidenceReconfirmed
+    );
+    assert_eq!(reconfirmed.actions_since_frontier_advance, 2);
+    assert!(resume.evidence[0].current);
+    assert_eq!(resume.evidence.len(), 1);
 }
 
 #[test]
@@ -1224,6 +1336,8 @@ fn restore_rejects_oversized_frontier_fields() {
             observed_world_revision: 1,
             validity: agent_contracts::EvidenceValidity::WorkspaceRevision(1),
             argument_digest: String::new(),
+            outcome_digest: String::new(),
+            current: true,
             turn: 1,
             evidence_ref: None,
         });
@@ -1237,8 +1351,220 @@ fn restore_rejects_oversized_frontier_fields() {
         observed_world_revision: 1,
         validity: agent_contracts::EvidenceValidity::WorkspaceRevision(1),
         argument_digest: String::new(),
+        outcome_digest: String::new(),
+        current: true,
         turn: 1,
         evidence_ref: None,
     });
     assert!(validate_execution_state(&long_key).is_err());
+
+    let mut negative_overflow = ExecutionState::default();
+    for index in 0..=MAX_NEGATIVE_FACTS {
+        negative_overflow
+            .negative_facts
+            .push(NegativeExecutionFact {
+                tool_name: "fs.read".into(),
+                target: format!("src/guess-{index}.rs"),
+                argument_digest: format!("arg-{index}"),
+                failure: agent_contracts::ToolFailureClass::PathNotFound,
+                workspace_revision: 0,
+                turn: 1,
+            });
+    }
+    assert!(validate_execution_state(&negative_overflow).is_err());
+
+    let mut source_overflow = ExecutionState::default();
+    for index in 0..=MAX_VERIFICATION_SOURCES {
+        source_overflow
+            .verification_sources
+            .push(VerificationSourceLease {
+                tool_name: format!("verify.{index}"),
+                argument_digest: format!("arg-{index}"),
+                anchor_revision: 1,
+            });
+    }
+    assert!(validate_execution_state(&source_overflow).is_err());
+}
+
+fn attributed_path(
+    purpose: ToolExecutionPurpose,
+    path: &str,
+    rooted: bool,
+) -> RuntimeExecutionAttribution {
+    RuntimeExecutionAttribution {
+        host: ToolExecutionAttribution::bounded(
+            purpose,
+            [path.to_string()],
+            VerificationReuse::None,
+        ),
+        rooted_targets: rooted.then(|| path.to_string()).into_iter().collect(),
+    }
+}
+
+fn missing_path(path: &str) -> ToolOutput {
+    let mut missing = output("fs.read", false, "path not found");
+    missing.metadata = json!({
+        "path": path,
+        "failure_class": "path_not_found",
+    });
+    missing
+}
+
+#[test]
+fn speculative_path_miss_records_negative_fact_without_task_obligation() {
+    let mut state = ExecutionState::default();
+    let attribution = attributed_path(ToolExecutionPurpose::Observe, "src/guess.rs", false);
+    let observation =
+        state.observe_tool_attributed(&missing_path("src/guess.rs"), 3, 1, "arg-1", &attribution);
+
+    assert!(state.obligations.is_empty());
+    assert_eq!(state.negative_facts.len(), 1);
+    assert_eq!(state.negative_facts[0].target, "src/guess.rs");
+    assert_eq!(state.view().failed_commands.len(), 1);
+    assert!(state.view().failed_commands[0].starts_with("known_absent "));
+    assert_eq!(
+        observation.negative_fact_events[0].kind,
+        NegativeFactEventKind::Recorded
+    );
+    assert!(
+        state
+            .current_negative_fact("fs.read", &attribution)
+            .is_some()
+    );
+}
+
+#[test]
+fn task_rooted_path_miss_stays_an_obligation() {
+    let mut state = ExecutionState::default();
+    let attribution = attributed_path(ToolExecutionPurpose::Observe, "src/required.rs", true);
+    let observation = state.observe_tool_attributed(
+        &missing_path("src/required.rs"),
+        3,
+        1,
+        "arg-1",
+        &attribution,
+    );
+
+    assert!(state.negative_facts.is_empty());
+    assert_eq!(state.obligations.len(), 1);
+    assert!(observation.negative_fact_events.is_empty());
+}
+
+#[test]
+fn workspace_mutation_invalidates_speculative_negative_facts() {
+    let mut state = ExecutionState::default();
+    let attribution = attributed_path(ToolExecutionPurpose::Observe, "src/guess.rs", false);
+    state.observe_tool_attributed(&missing_path("src/guess.rs"), 3, 1, "arg-1", &attribution);
+
+    let mut edit = output("edit.replace", true, "updated workspace");
+    edit.metadata = json!({"path": "src/other.rs", "revision": "r2"});
+    let edit_attribution = attributed_path(ToolExecutionPurpose::Mutate, "src/other.rs", true);
+    let observation = state.observe_tool_attributed(&edit, 3, 2, "arg-2", &edit_attribution);
+
+    assert!(state.negative_facts.is_empty());
+    assert!(
+        observation
+            .negative_fact_events
+            .iter()
+            .any(|event| event.kind == NegativeFactEventKind::Invalidated)
+    );
+}
+
+#[test]
+fn only_trusted_verify_attribution_mints_reusable_verification() {
+    let mut state = ExecutionState::default();
+    let mut verify = output("test.verify", true, "tests passed");
+    verify.metadata = json!({"verification": true});
+    let untrusted = RuntimeExecutionAttribution::default();
+    state.observe_tool_attributed(&verify, 7, 1, "arg-u", &untrusted);
+    assert!(state.verifications.is_empty());
+    assert!(state.verification_source_tools(7).is_empty());
+
+    let trusted = RuntimeExecutionAttribution {
+        host: ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Verify,
+            Vec::<String>::new(),
+            VerificationReuse::TaskScoped,
+        ),
+        rooted_targets: Vec::new(),
+    };
+    state.observe_tool_attributed(&verify, 7, 2, "arg-t", &trusted);
+    assert_eq!(state.verifications.len(), 1);
+    assert_eq!(state.verification_source_tools(7), vec!["test.verify"]);
+    assert!(state.verification_source_tools(8).is_empty());
+}
+
+#[test]
+fn exact_verification_pass_reuse_requires_the_complete_current_identity() {
+    let mut state = ExecutionState::default();
+    state.on_user_turn("verify current state");
+    let verify = output("test.verify", true, "tests passed");
+    let exact = RuntimeExecutionAttribution {
+        host: ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Verify,
+            Vec::<String>::new(),
+            VerificationReuse::ExactCurrentWorld,
+        )
+        .with_verification_identity_material("test-runner:v2|policy:p3|env:win11"),
+        rooted_targets: Vec::new(),
+    };
+
+    let observation = state.observe_tool_attributed(&verify, 7, 1, "arg-a", &exact);
+    assert_eq!(observation.verification_pass_events.len(), 1);
+    assert_eq!(
+        observation.verification_pass_events[0].kind,
+        agent_contracts::VerificationPassEventKind::Recorded
+    );
+    assert!(
+        state
+            .current_exact_verification_pass("test.verify", "arg-a", 7, &exact)
+            .is_some()
+    );
+    let verification_count = state.verifications.len();
+    let reused = state.observe_reused_verification(&verify, 7, 2);
+    assert_eq!(
+        reused.delta,
+        agent_contracts::FrontierDelta::RedundantEvidence
+    );
+    assert_eq!(state.verifications.len(), verification_count);
+    assert!(
+        state
+            .current_exact_verification_pass("test.verify", "arg-b", 7, &exact)
+            .is_none()
+    );
+
+    let changed_environment = RuntimeExecutionAttribution {
+        host: ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Verify,
+            Vec::<String>::new(),
+            VerificationReuse::ExactCurrentWorld,
+        )
+        .with_verification_identity_material("test-runner:v2|policy:p3|env:linux"),
+        rooted_targets: Vec::new(),
+    };
+    assert!(
+        state
+            .current_exact_verification_pass("test.verify", "arg-a", 7, &changed_environment)
+            .is_none()
+    );
+
+    state.on_user_turn("verify current state again");
+    assert!(
+        state
+            .current_exact_verification_pass("test.verify", "arg-a", 7, &exact)
+            .is_none(),
+        "a later user directive must be able to request a real rerun"
+    );
+
+    state.observe_tool_attributed(&verify, 7, 2, "arg-a", &exact);
+    let mut edit = output("edit.replace", true, "updated workspace");
+    edit.metadata = json!({"path": "src/other.rs", "revision": "r2"});
+    let edit_attribution = attributed_path(ToolExecutionPurpose::Mutate, "src/other.rs", true);
+    state.observe_tool_attributed(&edit, 7, 3, "edit-a", &edit_attribution);
+    assert!(
+        state
+            .current_exact_verification_pass("test.verify", "arg-a", 7, &exact)
+            .is_none(),
+        "an admitted workspace revision change must force real verification"
+    );
 }

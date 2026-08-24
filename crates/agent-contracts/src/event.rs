@@ -5,7 +5,8 @@ use crate::{
     AgentResult, CompactionReason, ContextConsumptionAck, ContextDiagnostics, ContextGcReport,
     ContextMaintenanceReport, ContextMaintenanceTrigger, ContextSelection, ContextStateTransition,
     OperationId, OperationSnapshot, RunId, RuntimeInputEnvelope, ScopeId, StorageGcReport, TaskId,
-    ToolCall, ToolOutput, ToolSurfacePlanReport, ToolSurfaceRequirement, TurnId,
+    ToolCall, ToolLeaseReconcileReport, ToolOutput, ToolSurfacePlanReport, ToolSurfaceRequirement,
+    TurnId,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +53,45 @@ pub enum AnchorPatchKind {
     /// Goal / constraints / waiver touched; the patch had to clear the
     /// approval gate before it reached the task table.
     Boundary,
+}
+
+/// Runtime decision boundary that caused optional schema leases to be
+/// reconciled. This is lifecycle provenance, not a timeout or planning hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolLeaseBoundary {
+    /// The first model request for a newly applied user directive. Ephemeral
+    /// leases from an aborted/older directive cannot cross this boundary.
+    DirectiveStart,
+    /// A successful model decision consumed the preceding results. Tools the
+    /// decision calls are rooted until their results reach the next decision.
+    ModelDecision,
+}
+
+/// Lifecycle of one bounded, workspace-version-bound negative execution
+/// fact. These events contain identities only and are sufficient to audit why
+/// a speculative miss was remembered, reused, invalidated or promoted into a
+/// task obligation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NegativeFactEventKind {
+    #[default]
+    Recorded,
+    Reused,
+    Invalidated,
+    Promoted,
+    Resolved,
+}
+
+/// Lifecycle of one exact verification PASS receipt. A recorded receipt is
+/// reusable only while every identity carried by its event remains current;
+/// reuse is a no-dispatch terminal tool result, not a synthetic model turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationPassEventKind {
+    #[default]
+    Recorded,
+    Reused,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +169,16 @@ pub enum RuntimeEvent {
     ToolSurfacePlanned {
         report: ToolSurfacePlanReport,
     },
+    /// One body-free account of optional schema residency reconciled from
+    /// typed roots. Emitted only when a dispatcher had optional loaded rows
+    /// to examine; the report's totals remain exact if its name sample is
+    /// truncated.
+    ToolLeasesReconciled {
+        turn_id: TurnId,
+        model_round: usize,
+        boundary: ToolLeaseBoundary,
+        report: ToolLeaseReconcileReport,
+    },
     /// A model round started. Carries the operation identity so live
     /// consumers (the UI's run-state aggregator) can fence streamed deltas:
     /// a delta whose turn/operation/generation no longer matches the
@@ -143,6 +193,10 @@ pub enum RuntimeEvent {
         model_round: usize,
         #[serde(default)]
         prompt_layers: crate::PromptLayerCosts,
+        /// Bounded TurnFrame projection accounting. Old traces default to
+        /// zero; receipt text never enters the durable event stream.
+        #[serde(default)]
+        turn_checkpoint: crate::TurnCheckpointStats,
     },
     /// Live streamed text delta. Never journaled (the final `AssistantMessage`
     /// carries the complete content); only forwarded to live subscribers.
@@ -170,6 +224,33 @@ pub enum RuntimeEvent {
     ToolFinished {
         output: ToolOutput,
     },
+    /// One model-requested tool batch settled in the actor. This body-free
+    /// accounting is orthogonal to Context persistence: transient catalog /
+    /// context reads and no-dispatch refusals still terminate actions here.
+    /// `missing_terminal` and `unexpected_terminal` are hard integrity
+    /// signals and should remain zero on a normally settled batch.
+    ExecutionBatchSettled {
+        turn_id: TurnId,
+        model_round: usize,
+        requested: usize,
+        terminal: usize,
+        spawned: usize,
+        refused: usize,
+        reused: usize,
+        persist_observation: usize,
+        transient_no_persist: usize,
+        access_event_only: usize,
+        succeeded: usize,
+        failed: usize,
+        known_mutation_results: usize,
+        typed_verification_results: usize,
+        unknown_invalidations: usize,
+        completion_proposals: usize,
+        outcome_advances: usize,
+        no_outcome_results: usize,
+        missing_terminal: usize,
+        unexpected_terminal: usize,
+    },
     /// 证据前沿账目：每个持久化工具观察一条。收敛指标（前沿推进数 /
     /// 冗余证据调用 / 无推进动作连击 / 证据失效数）从这里确定性聚合；
     /// 字段全部有界，不含任何工具正文。
@@ -185,11 +266,12 @@ pub enum RuntimeEvent {
         invalidated: u64,
     },
     /// PROTO-EVID-02b：当轮正文缓存账目，每次模型输入组装出一条增量。
-    /// eligible/hit/miss 为本次组装的候选/回注/未回注行数；
+    /// eligible/hit/miss 为本次组装真实 checkpoint demand / 回注 /
+    /// 未回注行数（仍在 retained tail 的缓存行不计 demand）；
     /// invalidated 为物理丢弃条数（Known mutation / LRU 挤出），
     /// suspended 为 Unknown footprint 挂起（休眠保留）的条数，
     /// oversize 为因超限拒缓存的条数；restored_body_tokens 为本次
-    /// 回注正文的近似 token。缓存命中率由此可从事件流独立验证。
+    /// 回注正文的近似 token。恢复率由此可从事件流独立验证。
     ProtocolBodyCacheStats {
         #[serde(default)]
         eligible: u64,
@@ -225,6 +307,36 @@ pub enum RuntimeEvent {
         attempts_in_epoch: u32,
         #[serde(default)]
         total_attempts: u32,
+    },
+    /// A speculative, trusted path miss changed lifecycle. The event is
+    /// body-free and revision-bound; it is not a transcript message or a
+    /// task obligation by itself.
+    ExecutionNegativeFact {
+        #[serde(default)]
+        kind: NegativeFactEventKind,
+        tool_name: String,
+        target: String,
+        failure: crate::ToolFailureClass,
+        #[serde(default)]
+        workspace_revision: u64,
+    },
+    /// A trusted exact verifier recorded or reused a PASS under the same
+    /// bounded task/directive/world/recipe identity. The event carries no
+    /// verification body or command arguments.
+    ExecutionVerificationPass {
+        #[serde(default)]
+        kind: VerificationPassEventKind,
+        tool_name: String,
+        argument_digest: String,
+        /// SHA-256 digest of the host recipe/profile/policy/environment
+        /// identity material; raw host environment data never enters events.
+        verification_identity: String,
+        #[serde(default)]
+        anchor_revision: u64,
+        #[serde(default)]
+        directive_revision: u64,
+        #[serde(default)]
+        workspace_revision: u64,
     },
     /// A tool frame closed: the runtime published the lifecycle transitions
     /// the close produced (durable outcomes promoted out of the tool frame),
@@ -269,6 +381,22 @@ pub enum RuntimeEvent {
         /// wire/checkpoint rows.
         #[serde(default)]
         patch_kind: AnchorPatchKind,
+    },
+    /// A `task.manage` progress proposal settled. On success this follows
+    /// the matching `TaskAnchorChanged`; on refusal the task state is
+    /// unchanged and `reason` names the refusal class (for example a stale
+    /// base revision), so eval can prove CAS outcomes from JSONL alone.
+    TaskProgressUpdated {
+        task_id: TaskId,
+        accepted: bool,
+        /// Resulting anchor revision on success; unchanged revision on an
+        /// idempotent no-op.
+        #[serde(default)]
+        anchor_revision: u64,
+        #[serde(default)]
+        changed_fields: Vec<String>,
+        #[serde(default)]
+        reason: String,
     },
     /// The turn fully committed its model result and every mandatory context
     /// write behind the durable event barrier. This is the only successful

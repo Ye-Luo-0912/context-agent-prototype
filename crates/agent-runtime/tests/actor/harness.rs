@@ -3,14 +3,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_contracts::{
-    AgentResult, AttentionState, ContextConsumptionAck, ContextDiagnostics, ContextEngine,
-    ContextIngress, ContextItemId, ContextItemSummary, ContextKind, ContextMaintenanceReport,
-    ContextMaintenanceTrigger, ContextQuery, ContextRetention, ContextScope,
-    ContextStateTransition, EventJournal, FocusState, MaterializedContext, MaterializedItem,
-    ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput, ModelRequest, ModelTransport,
-    ModelUsage, RuntimeEvent, RuntimeEventEnvelope, ScopeId, ScopeKind, SemanticState, TaskId,
-    ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLifecycle, ToolOutcome, ToolRisk,
-    ToolSemanticRole, ToolSpec, ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceSnapshot,
+    AgentResult, AttentionState, CAPABILITY_MANAGE, ContextConsumptionAck, ContextDiagnostics,
+    ContextEngine, ContextIngress, ContextItemId, ContextItemSummary, ContextKind,
+    ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery, ContextRetention,
+    ContextScope, ContextStateTransition, EventJournal, FocusState, MAX_MODEL_TOOL_CALLS_PER_ROUND,
+    MaterializedContext, MaterializedItem, ModelCapabilities, ModelChunk, ModelEventSink,
+    ModelOutput, ModelRequest, ModelTransport, ModelUsage, RuntimeEvent, RuntimeEventEnvelope,
+    ScopeId, ScopeKind, SemanticState, TaskId, ToolCall, ToolCatalogEntry, ToolDispatcher,
+    ToolExecutionAttribution, ToolExecutionPurpose, ToolExecutionRequest, ToolLeaseReconcileReport,
+    ToolLifecycle, ToolOutcome, ToolOutput, ToolRisk, ToolSemanticRole, ToolSpec,
+    ToolSurfacePlanReport, ToolSurfacePlanStatus, ToolSurfaceSnapshot, VerificationReuse,
 };
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{RuntimeHandle, RuntimeServices, spawn_runtime};
@@ -269,6 +271,228 @@ impl ToolDispatcher for OneToolDispatcher {
         Err(agent_contracts::AgentError::Tool(
             "no tools configured".into(),
         ))
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct MissingReadDispatcher {
+    pub(crate) executions: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ToolDispatcher for MissingReadDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "fs.read".into(),
+            description: "read a workspace file".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: vec![ToolSemanticRole::ReadResource],
+        }]
+    }
+
+    fn execution_attribution(&self, call: &ToolCall) -> ToolExecutionAttribution {
+        ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Observe,
+            call.arguments
+                .get("path")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned),
+            VerificationReuse::None,
+        )
+    }
+
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        let path = request.call.arguments["path"].as_str().unwrap_or_default();
+        Ok(ToolOutcome::Value(ToolOutput {
+            call_id: request.call.id,
+            tool_name: request.call.name,
+            ok: false,
+            summary: "path not found".into(),
+            model_content: format!("path not found: {path}"),
+            artifact_ref: None,
+            metadata: serde_json::json!({
+                "path": path,
+                "failure_class": "path_not_found"
+            }),
+        }))
+    }
+}
+
+/// First decision requests the same speculative missing path twice; the
+/// second decision finishes after consuming both truthful results.
+#[derive(Debug, Default)]
+pub(crate) struct DuplicateMissingReadModel {
+    step: AtomicUsize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ExactVerifyDispatcher {
+    pub(crate) executions: AtomicUsize,
+}
+
+fn exact_verify_spec() -> ToolSpec {
+    ToolSpec {
+        name: "test.verify".into(),
+        description: "run a deterministic trusted test recipe".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {"suite": {"type": "string"}},
+            "required": ["suite"]
+        }),
+        risk: ToolRisk::ReadOnly,
+        output_budget: None,
+        roles: vec![ToolSemanticRole::Verify],
+    }
+}
+
+fn exact_verify_output(request: ToolExecutionRequest) -> ToolOutcome {
+    ToolOutcome::Value(ToolOutput {
+        call_id: request.call.id,
+        tool_name: request.call.name,
+        ok: true,
+        summary: "deterministic suite passed".into(),
+        model_content: "deterministic suite passed".into(),
+        artifact_ref: None,
+        // Producer metadata is intentionally not authoritative.
+        metadata: serde_json::json!({"suite": "unit"}),
+    })
+}
+
+#[async_trait::async_trait]
+impl ToolDispatcher for ExactVerifyDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![exact_verify_spec()]
+    }
+
+    fn execution_attribution(&self, _call: &ToolCall) -> ToolExecutionAttribution {
+        ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Verify,
+            Vec::<String>::new(),
+            VerificationReuse::ExactCurrentWorld,
+        )
+        .with_verification_identity_material("test.verify:v1|policy:test|env:fixture")
+    }
+
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        Ok(exact_verify_output(request))
+    }
+}
+
+/// First preflight sees v1, while postflight and all later reads see v2.
+/// Runtime must keep the first PASS task-scoped and execute the second call.
+#[derive(Debug, Default)]
+pub(crate) struct DriftingExactVerifyDispatcher {
+    pub(crate) executions: AtomicUsize,
+    identity_reads: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ToolDispatcher for DriftingExactVerifyDispatcher {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![exact_verify_spec()]
+    }
+
+    fn execution_attribution(&self, _call: &ToolCall) -> ToolExecutionAttribution {
+        let read = self.identity_reads.fetch_add(1, Ordering::SeqCst);
+        let identity = if read == 0 {
+            "test.verify:v1|policy:test|env:fixture"
+        } else {
+            "test.verify:v2|policy:test|env:fixture"
+        };
+        ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Verify,
+            Vec::<String>::new(),
+            VerificationReuse::ExactCurrentWorld,
+        )
+        .with_verification_identity_material(identity)
+    }
+
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        Ok(exact_verify_output(request))
+    }
+}
+
+/// Two exact verifier calls in one directive. The first executes; the second
+/// should receive a truthful reused PASS before the final model decision.
+#[derive(Debug, Default)]
+pub(crate) struct DuplicateExactVerifyModel {
+    step: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for DuplicateExactVerifyModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            tool_calls: true,
+            ..ModelCapabilities::default()
+        }
+    }
+
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let step = self.step.fetch_add(1, Ordering::SeqCst);
+        Ok(ModelOutput {
+            content: if step > 0 {
+                "done".to_string()
+            } else {
+                String::new()
+            },
+            tool_calls: if step == 0 {
+                ["verify-1", "verify-2"]
+                    .into_iter()
+                    .map(|id| ToolCall {
+                        id: id.into(),
+                        name: "test.verify".into(),
+                        arguments: serde_json::json!({"suite": "unit"}),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            usage: ModelUsage::default(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for DuplicateMissingReadModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            tool_calls: true,
+            ..ModelCapabilities::default()
+        }
+    }
+
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let step = self.step.fetch_add(1, Ordering::SeqCst);
+        Ok(ModelOutput {
+            content: if step > 0 {
+                "done".to_string()
+            } else {
+                String::new()
+            },
+            tool_calls: if step == 0 {
+                ["missing-1", "missing-2"]
+                    .into_iter()
+                    .map(|id| ToolCall {
+                        id: id.into(),
+                        name: "fs.read".into(),
+                        arguments: serde_json::json!({"path": "src/speculative.rs"}),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            usage: ModelUsage::default(),
+        })
     }
 }
 
@@ -550,6 +774,36 @@ impl EventJournal for FailConsumptionEventJournal {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct FailToolLeaseEventJournal;
+
+#[async_trait::async_trait]
+impl EventJournal for FailToolLeaseEventJournal {
+    async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+        if matches!(envelope.event, RuntimeEvent::ToolLeasesReconciled { .. }) {
+            return Err(agent_contracts::AgentError::Storage(
+                "simulated tool-lease journal failure".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct FailActionBatchEventJournal;
+
+#[async_trait::async_trait]
+impl EventJournal for FailActionBatchEventJournal {
+    async fn append(&self, envelope: &RuntimeEventEnvelope) -> AgentResult<()> {
+        if matches!(envelope.event, RuntimeEvent::ExecutionBatchSettled { .. }) {
+            return Err(agent_contracts::AgentError::Storage(
+                "simulated action-batch journal failure".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The engine rejects the clear-focus transition (`FocusCleared` ingest
 /// fails), so a suspend that depends on it must fail too — and the task
 /// table must not move.
@@ -813,7 +1067,11 @@ impl ModelTransport for VariableWindowModel {
 #[derive(Debug)]
 pub(crate) struct RoundLocalToolDispatcher {
     optional_loaded: AtomicBool,
+    optional_warm: AtomicBool,
+    optional_peer_loaded: AtomicBool,
+    optional_peer_warm: AtomicBool,
     evict_on_gc: AtomicBool,
+    reconcile_on_boundary: AtomicBool,
     optional_schema_chars: usize,
     generation: AtomicU64,
     load_calls: AtomicUsize,
@@ -827,7 +1085,11 @@ impl RoundLocalToolDispatcher {
     pub(crate) fn new() -> Self {
         Self {
             optional_loaded: AtomicBool::new(true),
+            optional_warm: AtomicBool::new(false),
+            optional_peer_loaded: AtomicBool::new(false),
+            optional_peer_warm: AtomicBool::new(false),
             evict_on_gc: AtomicBool::new(false),
+            reconcile_on_boundary: AtomicBool::new(false),
             optional_schema_chars: 10_000,
             generation: AtomicU64::new(17),
             load_calls: AtomicUsize::new(0),
@@ -846,6 +1108,14 @@ impl RoundLocalToolDispatcher {
         dispatcher
     }
 
+    pub(crate) fn lease_reconciling() -> Self {
+        let dispatcher = Self::new();
+        dispatcher
+            .reconcile_on_boundary
+            .store(true, Ordering::SeqCst);
+        dispatcher
+    }
+
     pub(crate) fn schema_overflow() -> Self {
         Self {
             optional_schema_chars: 20_000,
@@ -859,6 +1129,10 @@ impl RoundLocalToolDispatcher {
 
     pub(crate) fn optional_loaded(&self) -> bool {
         self.optional_loaded.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn optional_peer_loaded(&self) -> bool {
+        self.optional_peer_loaded.load(Ordering::SeqCst)
     }
 
     pub(crate) fn unload_calls(&self) -> usize {
@@ -902,6 +1176,29 @@ impl ToolDispatcher for RoundLocalToolDispatcher {
                 roles: Vec::new(),
             });
         }
+        if self.optional_peer_loaded() {
+            specs.push(ToolSpec {
+                name: "optional.peer".into(),
+                description: "second optional schema for cohort lease tests".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+                output_budget: None,
+                roles: Vec::new(),
+            });
+        }
+        if self.reconcile_on_boundary.load(Ordering::SeqCst) {
+            specs.push(ToolSpec {
+                name: CAPABILITY_MANAGE.into(),
+                description: "load an exact test tool".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["op", "name"]
+                }),
+                risk: ToolRisk::ReadOnly,
+                output_budget: None,
+                roles: vec![ToolSemanticRole::Search],
+            });
+        }
         specs
     }
 
@@ -914,7 +1211,7 @@ impl ToolDispatcher for RoundLocalToolDispatcher {
     }
 
     fn may_omit_from_round(&self, name: &str) -> bool {
-        name == "optional.large"
+        matches!(name, "optional.large" | "optional.peer")
     }
 
     fn gc(&self, roots: &[String]) {
@@ -922,12 +1219,40 @@ impl ToolDispatcher for RoundLocalToolDispatcher {
         if self.evict_on_gc.load(Ordering::SeqCst)
             && self.optional_loaded.swap(false, Ordering::SeqCst)
         {
+            self.optional_warm.store(false, Ordering::SeqCst);
             self.generation.fetch_add(1, Ordering::SeqCst);
         }
     }
 
+    fn reconcile_leases(&self, roots: &[String]) -> ToolLeaseReconcileReport {
+        if !self.reconcile_on_boundary.load(Ordering::SeqCst) {
+            return ToolLeaseReconcileReport::default();
+        }
+        let mut report = ToolLeaseReconcileReport::default();
+        for (name, loaded, warm) in [
+            ("optional.large", &self.optional_loaded, &self.optional_warm),
+            (
+                "optional.peer",
+                &self.optional_peer_loaded,
+                &self.optional_peer_warm,
+            ),
+        ] {
+            if !loaded.load(Ordering::SeqCst) {
+                continue;
+            }
+            if roots.iter().any(|root| root == name) {
+                report.record_retained();
+            } else if loaded.swap(false, Ordering::SeqCst) {
+                warm.store(true, Ordering::SeqCst);
+                report.record_released(name);
+                self.generation.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        report
+    }
+
     fn catalog(&self) -> Vec<ToolCatalogEntry> {
-        vec![
+        let mut rows = vec![
             ToolCatalogEntry {
                 name: "core.read".into(),
                 state: ToolLifecycle::Loaded,
@@ -940,6 +1265,8 @@ impl ToolDispatcher for RoundLocalToolDispatcher {
                 name: "optional.large".into(),
                 state: if self.optional_loaded() {
                     ToolLifecycle::Loaded
+                } else if self.optional_warm.load(Ordering::SeqCst) {
+                    ToolLifecycle::Warm
                 } else {
                     ToolLifecycle::Unloaded
                 },
@@ -948,38 +1275,313 @@ impl ToolDispatcher for RoundLocalToolDispatcher {
                 risk: agent_contracts::ToolRisk::ReadOnly,
                 roles: Vec::new(),
             },
-        ]
+            ToolCatalogEntry {
+                name: "optional.peer".into(),
+                state: if self.optional_peer_loaded() {
+                    ToolLifecycle::Loaded
+                } else if self.optional_peer_warm.load(Ordering::SeqCst) {
+                    ToolLifecycle::Warm
+                } else {
+                    ToolLifecycle::Unloaded
+                },
+                owner: "test".into(),
+                description: "second optional schema for cohort lease tests".into(),
+                risk: agent_contracts::ToolRisk::ReadOnly,
+                roles: Vec::new(),
+            },
+        ];
+        if self.reconcile_on_boundary.load(Ordering::SeqCst) {
+            rows.push(ToolCatalogEntry {
+                name: CAPABILITY_MANAGE.into(),
+                state: ToolLifecycle::Loaded,
+                owner: "test".into(),
+                description: "load an exact test tool".into(),
+                risk: agent_contracts::ToolRisk::ReadOnly,
+                roles: vec![ToolSemanticRole::Search],
+            });
+        }
+        rows
     }
 
     fn load_tool(&self, name: &str) -> AgentResult<()> {
-        if name != "optional.large" {
-            return Err(agent_contracts::AgentError::InvalidRequest(format!(
-                "unknown loadable tool '{name}'"
-            )));
-        }
+        let (loaded, warm) = match name {
+            "optional.large" => (&self.optional_loaded, &self.optional_warm),
+            "optional.peer" => (&self.optional_peer_loaded, &self.optional_peer_warm),
+            _ => {
+                return Err(agent_contracts::AgentError::InvalidRequest(format!(
+                    "unknown loadable tool '{name}'"
+                )));
+            }
+        };
         self.load_calls.fetch_add(1, Ordering::SeqCst);
-        if !self.optional_loaded.swap(true, Ordering::SeqCst) {
+        warm.store(false, Ordering::SeqCst);
+        if !loaded.swap(true, Ordering::SeqCst) {
             self.generation.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
     }
 
     fn unload_tool(&self, name: &str) -> AgentResult<()> {
-        if name != "optional.large" {
-            return Err(agent_contracts::AgentError::InvalidRequest(format!(
-                "core tool '{name}' cannot be unloaded"
-            )));
-        }
+        let (loaded, warm) = match name {
+            "optional.large" => (&self.optional_loaded, &self.optional_warm),
+            "optional.peer" => (&self.optional_peer_loaded, &self.optional_peer_warm),
+            _ => {
+                return Err(agent_contracts::AgentError::InvalidRequest(format!(
+                    "core tool '{name}' cannot be unloaded"
+                )));
+            }
+        };
         self.unload_calls.fetch_add(1, Ordering::SeqCst);
-        self.optional_loaded.store(false, Ordering::SeqCst);
+        loaded.store(false, Ordering::SeqCst);
+        warm.store(false, Ordering::SeqCst);
         self.generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
-    async fn execute(&self, _request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
-        Err(agent_contracts::AgentError::Tool(
-            "no tools are executed in this test".into(),
-        ))
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        if !self.reconcile_on_boundary.load(Ordering::SeqCst) {
+            return Err(agent_contracts::AgentError::Tool(
+                "no tools are executed in this test".into(),
+            ));
+        }
+        let call = request.call;
+        let output = match call.name.as_str() {
+            CAPABILITY_MANAGE => {
+                let op = call
+                    .arguments
+                    .get("op")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let name = call
+                    .arguments
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                if op != "load" || !matches!(name, "optional.large" | "optional.peer") {
+                    return Err(agent_contracts::AgentError::InvalidRequest(
+                        "test catalog accepts only its optional cohort tools".into(),
+                    ));
+                }
+                self.load_tool(name)?;
+                ToolOutput {
+                    call_id: call.id,
+                    tool_name: CAPABILITY_MANAGE.into(),
+                    ok: true,
+                    summary: format!("tool loaded: {name}"),
+                    model_content: format!("tool loaded: {name}"),
+                    artifact_ref: None,
+                    metadata: serde_json::json!({
+                        "op": "load",
+                        "tool": name
+                    }),
+                }
+            }
+            "optional.large" | "optional.peer" => ToolOutput {
+                call_id: call.id,
+                tool_name: call.name,
+                ok: true,
+                summary: "optional result".into(),
+                model_content: "optional result".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({}),
+            },
+            _ => {
+                return Err(agent_contracts::AgentError::Tool(format!(
+                    "unknown test tool: {}",
+                    call.name
+                )));
+            }
+        };
+        Ok(ToolOutcome::Value(output))
+    }
+}
+
+/// Three decisions exercising the result-delivery lease exactly:
+/// load target -> call target -> consume its result and finish.
+#[derive(Debug, Default)]
+pub(crate) struct LeaseFlowModel {
+    pub(crate) requests: Mutex<Vec<ModelRequest>>,
+    step: AtomicUsize,
+}
+
+/// Loads two optional tools in adjacent decisions and then uses each one.
+/// A decision-bound lease drops the first schema while loading the second;
+/// the source-driven cohort lease keeps both available until exact use.
+#[derive(Debug, Default)]
+pub(crate) struct CohortLeaseModel {
+    pub(crate) requests: Mutex<Vec<ModelRequest>>,
+    step: AtomicUsize,
+}
+
+/// Returns one more call than the runtime's per-round memory/queue safety
+/// boundary. The actor must reject the batch without dispatching any member
+/// while still emitting a complete body-free action ledger.
+#[derive(Debug, Default)]
+pub(crate) struct OversizedToolBatchModel;
+
+#[async_trait::async_trait]
+impl ModelTransport for OversizedToolBatchModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            tool_calls: true,
+            ..ModelCapabilities::default()
+        }
+    }
+
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        Ok(ModelOutput {
+            content: String::new(),
+            tool_calls: (0..=MAX_MODEL_TOOL_CALLS_PER_ROUND)
+                .map(|index| ToolCall {
+                    id: format!("oversized-{index}"),
+                    name: "core.read".into(),
+                    arguments: serde_json::json!({}),
+                })
+                .collect(),
+            usage: Default::default(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for LeaseFlowModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            streaming: true,
+            tool_calls: true,
+            max_output_tokens: 1_000,
+            context_window: Some(16_000),
+        }
+    }
+
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        unreachable!("streaming model should be driven through complete_stream")
+    }
+
+    async fn complete_stream(
+        &self,
+        request: ModelRequest,
+        sink: &dyn ModelEventSink,
+    ) -> AgentResult<ModelOutput> {
+        let step = self.step.fetch_add(1, Ordering::SeqCst);
+        let surfaced_optional = request
+            .tools
+            .iter()
+            .any(|spec| spec.name == "optional.large");
+        match step {
+            0 => assert!(!surfaced_optional, "directive boundary must release it"),
+            1 | 2 => assert!(
+                surfaced_optional,
+                "load/call result-delivery lease must keep the target visible"
+            ),
+            _ => panic!("unexpected extra model decision {step}"),
+        }
+        self.requests.lock().unwrap().push(request);
+        sink.on_chunk(ModelChunk::Done).await?;
+        let tool_calls = match step {
+            0 => vec![ToolCall {
+                id: "load-optional".into(),
+                name: CAPABILITY_MANAGE.into(),
+                arguments: serde_json::json!({
+                    "op": "load",
+                    "name": "optional.large"
+                }),
+            }],
+            1 => vec![ToolCall {
+                id: "use-optional".into(),
+                name: "optional.large".into(),
+                arguments: serde_json::json!({}),
+            }],
+            2 => Vec::new(),
+            _ => unreachable!(),
+        };
+        Ok(ModelOutput {
+            content: if step == 2 { "done" } else { "" }.into(),
+            tool_calls,
+            usage: ModelUsage::default(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for CohortLeaseModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            streaming: true,
+            tool_calls: true,
+            max_output_tokens: 1_000,
+            context_window: Some(16_000),
+        }
+    }
+
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        unreachable!("streaming model should be driven through complete_stream")
+    }
+
+    async fn complete_stream(
+        &self,
+        request: ModelRequest,
+        sink: &dyn ModelEventSink,
+    ) -> AgentResult<ModelOutput> {
+        let step = self.step.fetch_add(1, Ordering::SeqCst);
+        let has_large = request
+            .tools
+            .iter()
+            .any(|spec| spec.name == "optional.large");
+        let has_peer = request
+            .tools
+            .iter()
+            .any(|spec| spec.name == "optional.peer");
+        match step {
+            0 => assert!(!has_large && !has_peer, "directive starts cohort-free"),
+            1 => assert!(has_large && !has_peer, "first load surfaces only A"),
+            2 | 3 => assert!(
+                has_large && has_peer,
+                "unused sibling loads must coexist (large={has_large}, peer={has_peer})"
+            ),
+            4 => assert!(
+                !has_large && has_peer,
+                "A expires after result delivery; B remains"
+            ),
+            _ => panic!("unexpected extra model decision {step}"),
+        }
+        self.requests.lock().unwrap().push(request);
+        sink.on_chunk(ModelChunk::Done).await?;
+        let tool_calls = match step {
+            0 => vec![ToolCall {
+                id: "load-large".into(),
+                name: CAPABILITY_MANAGE.into(),
+                arguments: serde_json::json!({
+                    "op": "load",
+                    "name": "optional.large"
+                }),
+            }],
+            1 => vec![ToolCall {
+                id: "load-peer".into(),
+                name: CAPABILITY_MANAGE.into(),
+                arguments: serde_json::json!({
+                    "op": "load",
+                    "name": "optional.peer"
+                }),
+            }],
+            2 => vec![ToolCall {
+                id: "use-large".into(),
+                name: "optional.large".into(),
+                arguments: serde_json::json!({}),
+            }],
+            3 => vec![ToolCall {
+                id: "use-peer".into(),
+                name: "optional.peer".into(),
+                arguments: serde_json::json!({}),
+            }],
+            4 => Vec::new(),
+            _ => unreachable!(),
+        };
+        Ok(ModelOutput {
+            content: if step == 4 { "done" } else { "" }.into(),
+            tool_calls,
+            usage: ModelUsage::default(),
+        })
     }
 }
 

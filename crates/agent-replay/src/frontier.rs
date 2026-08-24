@@ -29,6 +29,9 @@ pub struct FrontierRebuild {
     pub advances: u64,
     /// Same-revision repeats of known evidence.
     pub redundant: u64,
+    /// Same semantic evidence that only repaired currentness after an
+    /// invalidation.
+    pub reconfirmed: u64,
     /// Evidence rows invalidated by world-revision advances.
     pub invalidations: u64,
     /// Peak of consecutive non-advance actions (advisory fires at 5).
@@ -55,6 +58,9 @@ pub fn rebuild_frontier(envelopes: &[RuntimeEventEnvelope]) -> FrontierRebuild {
         }
         if observation.delta == FrontierDelta::RedundantEvidence {
             rebuild.redundant += 1;
+        }
+        if observation.delta == FrontierDelta::EvidenceReconfirmed {
+            rebuild.reconfirmed += 1;
         }
         rebuild.invalidations += observation.invalidated;
         rebuild.no_advance_peak = rebuild

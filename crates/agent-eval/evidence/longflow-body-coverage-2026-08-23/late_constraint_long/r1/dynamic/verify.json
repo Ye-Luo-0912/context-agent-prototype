@@ -1,0 +1,85 @@
+{
+  "schema": "agent-eval.verify.v1",
+  "kind": "file_content+command",
+  "fixture_id": "late_constraint_long",
+  "expected_edit": "add v2 Hello and Heartbeat while keeping unversioned ping",
+  "passed": true,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Hello"
+      ],
+      "count": 3,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "Heartbeat"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/protocol.rs",
+      "pred": "contains",
+      "needles": [
+        "ping"
+      ],
+      "count": 5,
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "RELEASE.md",
+      "pred": "contains",
+      "needles": [
+        "v2"
+      ],
+      "count": 1,
+      "passed": true,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "RELEASE.md",
+      "exists": true,
+      "sha256": "c2f9b41cfb04d51dc783ea2cfc293ff7a2e905c27500bc2b54068dd6047c3ec0",
+      "bytes": 378,
+      "truncated": false,
+      "body": "Version 2 will expand the protocol beyond the current ping message with additional message types, clearer encoding and decoding rules, stronger validation, and a more extensible foundation for future clients and capabilities while preserving reliable handling of unknown or malformed input.\r\nVersion 2 Hello is shipped with the explicit v2 envelope and string payload support.\r\n"
+    },
+    {
+      "path": "src/protocol.rs",
+      "exists": true,
+      "sha256": "1810bac9688bb46549ae96769b7389e7373b556c303be85228016c37bac6b8b6",
+      "bytes": 3142,
+      "truncated": false,
+      "body": "pub enum Msg {\r\n    Ping,\r\n    Hello(String),\r\n    Heartbeat(u32),\r\n}\r\n\r\npub fn decode(bytes: &str) -> Result<Msg, String> {\r\n    if bytes.contains(\"ping\") {\r\n        return Ok(Msg::Ping);\r\n    }\r\n\r\n    if let Some(heartbeat) = decode_v2_heartbeat(bytes) {\r\n        return Ok(Msg::Heartbeat(heartbeat));\r\n    }\r\n\r\n    if let Some(hello) = decode_v2_hello(bytes) {\r\n        return Ok(Msg::Hello(hello));\r\n    }\r\n\r\n    Err(\"unknown\".into())\r\n}\r\n\r\npub fn encode(msg: &Msg) -> String {\r\n    match msg {\r\n        Msg::Ping => \"ping\".into(),\r\n        Msg::Hello(name) => format!(r#\"{{\"v\":2,\"hello\":\"{}\"}}\"#, escape_json_string(name)),\r\n        Msg::Heartbeat(sequence) => format!(r#\"{{\"v\":2,\"heartbeat\":{}}}\"#, sequence),\r\n    }\r\n}\r\n\r\nfn escape_json_string(value: &str) -> String {\r\n    let mut escaped = String::new();\r\n    for ch in value.chars() {\r\n        match ch {\r\n            '\"' => escaped.push_str(r#\"\\\"\"#),\r\n            '\\\\' => escaped.push_str(r#\"\\\\\"#),\r\n            '\\n' => escaped.push_str(r#\"\\n\"#),\r\n            '\\r' => escaped.push_str(r#\"\\r\"#),\r\n            '\\t' => escaped.push_str(r#\"\\t\"#),\r\n            ch if ch.is_control() => escaped.push_str(&format!(r#\"\\u{:04x}\"#, ch as u32)),\r\n            ch => escaped.push(ch),\r\n        }\r\n    }\r\n    escaped\r\n}\r\n\r\nfn decode_v2_heartbeat(bytes: &str) -> Option<u32> {\r\n    let prefix = r#\"{\"v\":2,\"heartbeat\":\"#;\r\n    let encoded = bytes.strip_prefix(prefix)?.strip_suffix('}')?;\r\n    encoded.parse().ok()\r\n}\r\n\r\nfn decode_v2_hello(bytes: &str) -> Option<String> {\r\n    let prefix = r#\"{\"v\":2,\"hello\":\"#;\r\n    let encoded = bytes.strip_prefix(prefix)?.strip_suffix('\"')?;\r\n    let mut decoded = String::new();\r\n    let mut chars = encoded.chars();\r\n\r\n    while let Some(ch) = chars.next() {\r\n        if ch != '\\\\' {\r\n            decoded.push(ch);\r\n            continue;\r\n        }\r\n\r\n        match chars.next()? {\r\n            '\"' => decoded.push('\"'),\r\n            '\\\\' => decoded.push('\\\\'),\r\n            '/' => decoded.push('/'),\r\n            'b' => decoded.push('\\u{0008}'),\r\n            'f' => decoded.push('\\u{000c}'),\r\n            'n' => decoded.push('\\n'),\r\n            'r' => decoded.push('\\r'),\r\n            't' => decoded.push('\\t'),\r\n            'u' => {\r\n                let code = chars.by_ref().take(4).collect::<String>();\r\n                if code.len() != 4 || !code.chars().all(|digit| digit.is_ascii_hexdigit()) {\r\n                    return None;\r\n                }\r\n                decoded.push(char::from_u32(u32::from_str_radix(&code, 16).ok()?)?);\r\n            }\r\n            _ => return None,\r\n        }\r\n    }\r\n\r\n    Some(decoded)\r\n}\r\n\r\npub fn ping_roundtrip() -> Result<Msg, String> {\r\n    decode(&encode(&Msg::Ping))\r\n}\r\n\r\n#[cfg(test)]\r\nmod tests {\r\n    use super::{decode, Msg};\r\n\r\n    #[test]\r\n    fn decodes_ping_frame_successfully() {\r\n        assert!(matches!(decode(\"ping\"), Ok(Msg::Ping)));\r\n    }\r\n\r\n    #[test]\r\n    fn roundtrips_heartbeat_sequence() {\r\n        let encoded = super::encode(&Msg::Heartbeat(42));\r\n        assert_eq!(encoded, r#\"{\"v\":2,\"heartbeat\":42}\"#);\r\n        assert!(matches!(decode(&encoded), Ok(Msg::Heartbeat(42))));\r\n    }\r\n}\r\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "python",
+        "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\crates\\agent-eval\\longflow\\checks\\wire_v1.py",
+        "C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmpLigded\\dynamic"
+      ],
+      "expect_exit": 0,
+      "exit": 0,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": true
+    }
+  ]
+}

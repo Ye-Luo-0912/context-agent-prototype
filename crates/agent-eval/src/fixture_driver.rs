@@ -69,6 +69,13 @@ enum EvalToolSurface {
 }
 
 impl EvalToolSurface {
+    fn id(self) -> &'static str {
+        match self {
+            Self::ScriptedPin => "scripted_pin",
+            Self::Production => "production",
+        }
+    }
+
     fn lifecycle_config(self) -> tool_runtime::ToolLifecycleConfig {
         match self {
             Self::Production => tool_runtime::ToolLifecycleConfig::default(),
@@ -426,6 +433,7 @@ pub async fn run_tool_edit_live(
             &root,
             session.lagged,
             session.deltas_omitted,
+            Some(EvalToolSurface::Production.id()),
             &hidden,
         )?;
         let sidecar = serde_json::json!({
@@ -1075,11 +1083,14 @@ async fn run_workspace_session_harness_ops(
 
     let workspace = agent_workspace::Workspace::open(workspace_root).await?;
     let fixture_workspace = workspace.clone();
-    let tools: Arc<dyn ToolDispatcher> =
-        Arc::new(tool_runtime::BuiltinToolDispatcher::with_config(
+    let verification_recipes = tool_runtime::VerificationRecipes::discover(&workspace);
+    let tools: Arc<dyn ToolDispatcher> = Arc::new(
+        tool_runtime::BuiltinToolDispatcher::with_config_and_verification_recipes(
             workspace.clone(),
             tool_surface.lifecycle_config(),
-        ));
+            verification_recipes.clone(),
+        ),
+    );
 
     let composed = agent_compose::compose(agent_compose::ComposeConfig {
         workspace,
@@ -1095,7 +1106,10 @@ async fn run_workspace_session_harness_ops(
         project_task_progress,
         // 与生产组合一致的内置授权映射；缺省也会装同一张表。
         host_policies: Some(Arc::new(
-            agent_compose::HostToolPolicyRegistry::with_builtins(),
+            agent_compose::HostToolPolicyRegistry::with_builtins_and_verification(
+                &verification_recipes,
+            )
+            .map_err(anyhow::Error::msg)?,
         )),
     })
     .await?;
@@ -1369,6 +1383,7 @@ pub async fn compare_bench_live(
             name,
             pair,
             true,
+            EvalToolSurface::ScriptedPin,
         )
         .await?;
         let manager_tokens = manager_token_cost(engine.as_ref()).await?;
@@ -1430,6 +1445,7 @@ pub async fn compare_mech_live(
             name,
             pair,
             true,
+            EvalToolSurface::ScriptedPin,
         )
         .await?;
         let manager_tokens = manager_token_cost(engine.as_ref()).await?;
@@ -1448,16 +1464,17 @@ pub async fn compare_mech_live(
                 "mechanism": task.file.scenario,
                 "spec_sha256": crate::context_mech::spec_sha256(),
                 "task_id": task.id(),
+                "tool_surface": EvalToolSurface::ScriptedPin.id(),
             }),
         )?;
     }
     Ok(runs)
 }
 
-/// Same cells as [`compare_mech_live`], but the A and C engines run
-/// concurrently in independent workspaces. The model calls dominate wall
-/// time, so pairing them roughly halves cell latency without changing
-/// either engine's trajectory. Results are returned in arm order.
+/// Same A/C engine pairing as [`compare_mech_live`], but for the longflow
+/// product diagnostic: engines run concurrently in independent workspaces
+/// on the production-default tool surface. The frozen sequential mechanism
+/// cells remain ScriptedPin. Results are returned in arm order.
 /// `schema` / `spec_sha256` stamp the pair document with the caller's
 /// pack identity so longflow evidence is not mislabeled as mech v2.
 pub async fn compare_mech_live_parallel(
@@ -1500,6 +1517,7 @@ pub async fn compare_mech_live_parallel(
                 name,
                 pair,
                 true,
+                EvalToolSurface::Production,
             )
             .await?;
             let manager_tokens = manager_token_cost(engine.as_ref()).await?;
@@ -1521,6 +1539,7 @@ pub async fn compare_mech_live_parallel(
                 "mechanism": task.file.scenario,
                 "spec_sha256": spec_sha256,
                 "task_id": task.id(),
+                "tool_surface": EvalToolSurface::Production.id(),
             }),
         )?;
     }
@@ -1590,6 +1609,7 @@ pub async fn compare_ablation_live(
             name,
             pair,
             project_task_progress,
+            EvalToolSurface::ScriptedPin,
         )
         .await?;
         let manager_tokens = manager_token_cost(engine.as_ref()).await?;
@@ -1627,6 +1647,7 @@ async fn run_bench_with_engine(
     engine: &'static str,
     pair: Option<&bundle::PairSink>,
     project_task_progress: bool,
+    tool_surface: EvalToolSurface,
 ) -> anyhow::Result<FixtureEval> {
     let session = run_workspace_session_ops(
         workspace_root,
@@ -1635,7 +1656,7 @@ async fn run_bench_with_engine(
         &task.file.ops,
         limits,
         project_task_progress,
-        EvalToolSurface::ScriptedPin,
+        tool_surface,
     )
     .await?;
     let report = context_bench::evaluate_task(pack, task, workspace_root);
@@ -1662,6 +1683,7 @@ async fn run_bench_with_engine(
             workspace_root,
             session.lagged,
             session.deltas_omitted,
+            Some(tool_surface.id()),
             &report,
         )?;
     }
@@ -1709,10 +1731,12 @@ mod tests {
                 "search.grep".to_string(),
                 "artifact.read".to_string(),
                 "edit.patch".to_string(),
-                "task.complete".to_string(),
+                "fs.write".to_string(),
+                "git.status".to_string(),
+                "git.diff".to_string(),
                 agent_contracts::CAPABILITY_MANAGE.to_string(),
             ],
-            "live coding compare matches production; edit.patch is the canonical mutation primitive; context.manage is catalog-only"
+            "live coding compare matches production; compact file-write/Git review primitives are core; context.manage and task.complete are intent-gated/catalog-only"
         );
         assert!(
             !production
@@ -1725,8 +1749,14 @@ mod tests {
             !production
                 .always_loaded
                 .iter()
-                .any(|name| name == "fs.write"),
-            "production must not pin fs.write"
+                .any(|name| name == "task.complete"),
+            "ordinary turn completion must not close task-scoped progress"
+        );
+        assert!(
+            production
+                .always_loaded
+                .iter()
+                .any(|name| name == "fs.write")
         );
         assert!(
             !production

@@ -31,7 +31,8 @@ pub use discovery::*;
 pub use error::*;
 pub use event::*;
 pub use host_policy::{
-    HostEffectBinding, HostPolicySnapshot, HostToolPolicies, HostToolPolicy, unbound_effect_intent,
+    HostEffectBinding, HostExecRecipe, HostPolicySnapshot, HostToolPolicies, HostToolPolicy,
+    unbound_effect_intent,
 };
 pub use ids::*;
 pub use input::*;

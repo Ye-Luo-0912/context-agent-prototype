@@ -1,8 +1,8 @@
 //! OpenAI-compatible streaming model provider.
 //!
-//! Speaks the OpenAI Chat Completions streaming protocol (`data:` SSE events),
-//! which is also implemented by DeepSeek, Qwen/DashScope, Moonshot/Kimi, Zhipu
-//! GLM, and most other vendors. Point `OpenAiConfig::base_url` at any of them.
+//! Speaks both the Responses and Chat Completions SSE protocols. `Auto` probes
+//! Responses once and falls back only when the endpoint explicitly reports it
+//! unsupported; the negotiated result is cached for the life of the provider.
 //!
 //! The provider normalizes vendor wire chunks into `ModelChunk` events and
 //! returns the final assembled `ModelOutput` (content, tool calls, usage). All
@@ -11,13 +11,17 @@
 //! OpenAI 函数名不允许 `.` / `:`。出网时由 `wire_names` 换成 `_`，回包还原成
 //! Core 工具 id，避免 `fs.list` 这类内建名被上游 400。
 
+mod responses;
 mod retry;
 mod sse;
 mod wire_names;
 
 pub use retry::RetryingTransport;
 
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicU8, Ordering},
+    time::Duration,
+};
 
 use agent_contracts::{
     AgentError, AgentResult, ModelCapabilities, ModelChunk, ModelEventSink, ModelOutput,
@@ -30,8 +34,34 @@ use serde_json::{Value, json};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
 
+use crate::responses::ResponsesAccumulator;
 use crate::sse::{StreamAccumulator, WireChunk, parse_sse_data};
 use crate::wire_names::ToolNameCodec;
+
+const PROTOCOL_UNKNOWN: u8 = 0;
+const PROTOCOL_CHAT: u8 = 1;
+const PROTOCOL_RESPONSES: u8 = 2;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpenAiProtocol {
+    ChatCompletions,
+    Responses,
+    #[default]
+    Auto,
+}
+
+impl OpenAiProtocol {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "responses" | "response" => Ok(Self::Responses),
+            "chat" | "chat_completions" | "chat-completions" => Ok(Self::ChatCompletions),
+            other => Err(format!(
+                "unsupported OPENAI_API_PROTOCOL '{other}'; expected auto, responses, or chat"
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct OpenAiConfig {
@@ -40,6 +70,9 @@ pub struct OpenAiConfig {
     pub base_url: String,
     /// e.g. `gpt-4o-mini`, `deepseek-chat`, `qwen-plus`, ...
     pub model: String,
+    /// Wire endpoint selection. `Auto` prefers `/responses` and caches an
+    /// explicit unsupported-endpoint fallback to `/chat/completions`.
+    pub protocol: OpenAiProtocol,
     pub max_output_tokens: usize,
     pub timeout: Duration,
     /// Send `stream_options: { "include_usage": true }`. Some compatible
@@ -91,6 +124,16 @@ fn gateway_wrapped_upstream_failure(body: &str) -> bool {
         .contains("upstream request failed")
 }
 
+fn responses_endpoint_unsupported(code: u16, body: &str) -> bool {
+    if matches!(code, 404 | 405 | 501) {
+        return true;
+    }
+    let body = body.to_ascii_lowercase();
+    body.contains("unsupported_protocol")
+        || body.contains("responses endpoint is not supported")
+        || body.contains("responses api is not supported")
+}
+
 fn truncate_error_body(body: &str) -> String {
     let trimmed = body.trim();
     let total = trimmed.chars().count();
@@ -104,6 +147,7 @@ fn truncate_error_body(body: &str) -> String {
 pub struct OpenAiProvider {
     config: OpenAiConfig,
     client: Client,
+    negotiated_protocol: AtomicU8,
 }
 
 impl OpenAiProvider {
@@ -116,7 +160,11 @@ impl OpenAiProvider {
             .timeout(config.timeout)
             .build()
             .expect("build reqwest client");
-        Self { config, client }
+        Self {
+            config,
+            client,
+            negotiated_protocol: AtomicU8::new(PROTOCOL_UNKNOWN),
+        }
     }
 
     /// Build with an injected HTTP client. The composition root owns
@@ -124,7 +172,11 @@ impl OpenAiProvider {
     /// this to pin a `no_proxy` client so a machine-wide proxy can never
     /// intercept loopback mock servers.
     pub fn with_client(config: OpenAiConfig, client: Client) -> Self {
-        Self { config, client }
+        Self {
+            config,
+            client,
+            negotiated_protocol: AtomicU8::new(PROTOCOL_UNKNOWN),
+        }
     }
 }
 
@@ -149,7 +201,86 @@ impl ModelTransport for OpenAiProvider {
         sink: &dyn ModelEventSink,
     ) -> AgentResult<ModelOutput> {
         let codec = ToolNameCodec::from_request(&request)?;
-        let payload = build_wire_request(&request, &self.config, &codec);
+        let selected = match self.config.protocol {
+            OpenAiProtocol::ChatCompletions => PROTOCOL_CHAT,
+            OpenAiProtocol::Responses => PROTOCOL_RESPONSES,
+            OpenAiProtocol::Auto => self.negotiated_protocol.load(Ordering::Acquire),
+        };
+
+        if selected == PROTOCOL_CHAT {
+            return self
+                .complete_chat_stream(&request, sink, &codec)
+                .await
+                .map_err(|error| error.error);
+        }
+        if selected == PROTOCOL_RESPONSES {
+            return self
+                .complete_responses_stream(&request, sink, &codec)
+                .await
+                .map_err(|error| error.error);
+        }
+
+        match self.complete_responses_stream(&request, sink, &codec).await {
+            Ok(output) => {
+                self.negotiated_protocol
+                    .store(PROTOCOL_RESPONSES, Ordering::Release);
+                Ok(output)
+            }
+            Err(error) if error.endpoint_unsupported => {
+                let output = self
+                    .complete_chat_stream(&request, sink, &codec)
+                    .await
+                    .map_err(|error| error.error)?;
+                self.negotiated_protocol
+                    .store(PROTOCOL_CHAT, Ordering::Release);
+                Ok(output)
+            }
+            Err(error) => Err(error.error),
+        }
+    }
+}
+
+struct ProtocolError {
+    error: AgentError,
+    endpoint_unsupported: bool,
+}
+
+impl ProtocolError {
+    fn transport(retryable: bool, message: String) -> Self {
+        Self {
+            error: AgentError::Transport { retryable, message },
+            endpoint_unsupported: false,
+        }
+    }
+
+    fn unsupported(code: u16, body: &str) -> Self {
+        Self {
+            error: AgentError::Transport {
+                retryable: false,
+                message: format!("HTTP {code}: {}", truncate_error_body(body)),
+            },
+            endpoint_unsupported: true,
+        }
+    }
+}
+
+impl From<AgentError> for ProtocolError {
+    fn from(error: AgentError) -> Self {
+        Self {
+            error,
+            endpoint_unsupported: false,
+        }
+    }
+}
+
+impl OpenAiProvider {
+    async fn complete_chat_stream(
+        &self,
+        request: &ModelRequest,
+        sink: &dyn ModelEventSink,
+        codec: &ToolNameCodec,
+    ) -> Result<ModelOutput, ProtocolError> {
+        let payload = build_chat_wire_request(request, &self.config, codec);
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
@@ -162,19 +293,16 @@ impl ModelTransport for OpenAiProvider {
             .json(&payload)
             .send()
             .await
-            .map_err(|error| AgentError::Transport {
-                retryable: true,
-                message: format!("request failed: {error}"),
-            })?;
+            .map_err(|error| ProtocolError::transport(true, format!("request failed: {error}")))?;
 
         let status = response.status();
         if !status.is_success() {
             let code = status.as_u16();
             let body = response.text().await.unwrap_or_default();
-            return Err(AgentError::Transport {
-                retryable: http_status_retryable(code, &body),
-                message: format!("HTTP {code}: {}", truncate_error_body(&body)),
-            });
+            return Err(ProtocolError::transport(
+                http_status_retryable(code, &body),
+                format!("HTTP {code}: {}", truncate_error_body(&body)),
+            ));
         }
 
         let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
@@ -187,7 +315,7 @@ impl ModelTransport for OpenAiProvider {
         loop {
             tokio::select! {
                 _ = request.cancel.cancelled() => {
-                    return Err(AgentError::Cancelled);
+                    return Err(ProtocolError::from(AgentError::Cancelled));
                 }
                 line = lines.next() => {
                     match line {
@@ -198,12 +326,12 @@ impl ModelTransport for OpenAiProvider {
                             // instead of growing the accumulator forever.
                             total_bytes = total_bytes.saturating_add(line.len() + 1);
                             if total_bytes > max_stream_bytes {
-                                return Err(AgentError::Transport {
-                                    retryable: false,
-                                    message: format!(
+                                return Err(ProtocolError::transport(
+                                    false,
+                                    format!(
                                         "stream exceeded the {max_stream_bytes} byte cap; provider response is not bounded"
                                     ),
-                                });
+                                ));
                             }
                             let Some(payload) = parse_sse_data(&line) else {
                                 continue;
@@ -214,7 +342,7 @@ impl ModelTransport for OpenAiProvider {
                             match serde_json::from_str::<WireChunk>(payload) {
                                 Ok(chunk) => {
                                     for event in accumulator.apply(&chunk) {
-                                        sink.on_chunk(codec.remap_chunk(event)).await?;
+                                        sink.on_chunk(codec.remap_chunk(event)).await.map_err(ProtocolError::from)?;
                                     }
                                 }
                                 Err(error) => {
@@ -223,10 +351,10 @@ impl ModelTransport for OpenAiProvider {
                             }
                         }
                         Some(Err(error)) => {
-                            return Err(AgentError::Transport {
-                                retryable: true,
-                                message: format!("stream error: {error}"),
-                            });
+                            return Err(ProtocolError::transport(
+                                true,
+                                format!("stream error: {error}"),
+                            ));
                         }
                         None => break,
                     }
@@ -234,11 +362,100 @@ impl ModelTransport for OpenAiProvider {
             }
         }
 
+        if let Some(message) = accumulator.take_terminal_error() {
+            return Err(ProtocolError::transport(true, message));
+        }
         let usage = accumulator.usage.clone().unwrap_or_default();
         let (content, tool_calls) = accumulator.finalize();
         let tool_calls = codec.remap_calls(tool_calls);
-        sink.on_chunk(ModelChunk::Done).await?;
+        sink.on_chunk(ModelChunk::Done)
+            .await
+            .map_err(ProtocolError::from)?;
 
+        Ok(ModelOutput {
+            content,
+            tool_calls,
+            usage,
+        })
+    }
+
+    async fn complete_responses_stream(
+        &self,
+        request: &ModelRequest,
+        sink: &dyn ModelEventSink,
+        codec: &ToolNameCodec,
+    ) -> Result<ModelOutput, ProtocolError> {
+        let payload = build_responses_wire_request(request, &self.config, codec);
+        let url = format!("{}/responses", self.config.base_url.trim_end_matches('/'));
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.config.api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|error| ProtocolError::transport(true, format!("request failed: {error}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let code = status.as_u16();
+            let body = response.text().await.unwrap_or_default();
+            if responses_endpoint_unsupported(code, &body) {
+                return Err(ProtocolError::unsupported(code, &body));
+            }
+            return Err(ProtocolError::transport(
+                http_status_retryable(code, &body),
+                format!("HTTP {code}: {}", truncate_error_body(&body)),
+            ));
+        }
+
+        let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
+        let reader = StreamReader::new(byte_stream);
+        let mut lines = FramedRead::new(reader, LinesCodec::new());
+        let max_stream_bytes = self.config.max_stream_bytes;
+        let mut total_bytes = 0usize;
+        let mut accumulator = ResponsesAccumulator::default();
+        loop {
+            tokio::select! {
+                _ = request.cancel.cancelled() => return Err(ProtocolError::from(AgentError::Cancelled)),
+                line = lines.next() => {
+                    match line {
+                        Some(Ok(line)) => {
+                            total_bytes = total_bytes.saturating_add(line.len() + 1);
+                            if total_bytes > max_stream_bytes {
+                                return Err(ProtocolError::transport(
+                                    false,
+                                    format!("stream exceeded the {max_stream_bytes} byte cap; provider response is not bounded"),
+                                ));
+                            }
+                            let Some(payload) = parse_sse_data(&line) else { continue; };
+                            if payload == "[DONE]" { break; }
+                            match serde_json::from_str::<Value>(payload) {
+                                Ok(event) => {
+                                    for chunk in accumulator.apply(&event) {
+                                        sink.on_chunk(codec.remap_chunk(chunk)).await.map_err(ProtocolError::from)?;
+                                    }
+                                }
+                                Err(error) => tracing::debug!(%error, %payload, "skipping unparseable Responses stream event"),
+                            }
+                        }
+                        Some(Err(error)) => {
+                            return Err(ProtocolError::transport(true, format!("stream error: {error}")));
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = accumulator.take_terminal_error() {
+            return Err(ProtocolError::transport(error.retryable, error.message));
+        }
+        let (content, tool_calls, usage) = accumulator.finalize();
+        let tool_calls = codec.remap_calls(tool_calls);
+        sink.on_chunk(ModelChunk::Done)
+            .await
+            .map_err(ProtocolError::from)?;
         Ok(ModelOutput {
             content,
             tool_calls,
@@ -247,7 +464,7 @@ impl ModelTransport for OpenAiProvider {
     }
 }
 
-fn build_wire_request(
+fn build_chat_wire_request(
     request: &ModelRequest,
     config: &OpenAiConfig,
     codec: &ToolNameCodec,
@@ -324,6 +541,72 @@ fn build_wire_request(
     wire
 }
 
+fn build_responses_wire_request(
+    request: &ModelRequest,
+    config: &OpenAiConfig,
+    codec: &ToolNameCodec,
+) -> Value {
+    let mut input = Vec::with_capacity(request.messages.len());
+    for message in &request.messages {
+        match message.role {
+            ModelRole::System | ModelRole::User | ModelRole::Assistant => {
+                if !message.content.is_empty() {
+                    input.push(json!({
+                        "role": role_name(message.role),
+                        "content": message.content,
+                    }));
+                }
+                if message.role == ModelRole::Assistant {
+                    input.extend(message.tool_calls.iter().map(|call| {
+                        json!({
+                            "type": "function_call",
+                            "call_id": call.id,
+                            "name": codec.to_wire(&call.name),
+                            "arguments": call.arguments.to_string(),
+                        })
+                    }));
+                }
+            }
+            ModelRole::Tool => {
+                if let Some(call_id) = &message.tool_call_id {
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": message.content,
+                    }));
+                }
+            }
+        }
+    }
+
+    let tools: Vec<Value> = request
+        .tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "name": codec.to_wire(&tool.name),
+                "description": tool.description,
+                "parameters": tool.input_schema,
+            })
+        })
+        .collect();
+    let mut wire = json!({
+        "model": config.model,
+        "input": input,
+        "tools": tools,
+        "stream": true,
+        "store": false,
+    });
+    if config.send_stream_options {
+        wire["stream_options"] = json!({ "include_obfuscation": false });
+    }
+    if config.send_max_tokens {
+        wire["max_output_tokens"] = json!(config.max_output_tokens);
+    }
+    wire
+}
+
 fn role_name(role: ModelRole) -> &'static str {
     match role {
         ModelRole::System => "system",
@@ -378,6 +661,7 @@ mod tests {
             api_key: "secret".into(),
             base_url: "https://example.com/v1".into(),
             model: "deepseek-chat".into(),
+            protocol: OpenAiProtocol::ChatCompletions,
             max_output_tokens: 2048,
             timeout: Duration::from_secs(30),
             send_stream_options: true,
@@ -386,7 +670,7 @@ mod tests {
             context_window: None,
         };
         let codec = ToolNameCodec::from_request(&request).expect("no name collision");
-        let wire = build_wire_request(&request, &config, &codec);
+        let wire = build_chat_wire_request(&request, &config, &codec);
         assert_eq!(wire["model"], "deepseek-chat");
         assert_eq!(wire["stream"], true);
         assert_eq!(wire["stream_options"]["include_usage"], true);
@@ -414,6 +698,52 @@ mod tests {
     }
 
     #[test]
+    fn builds_stateless_responses_tool_continuation() {
+        let request = ModelRequest {
+            messages: vec![
+                ModelMessage::system("be focused"),
+                ModelMessage::user("list files"),
+                ModelMessage::assistant_tool_calls(vec![agent_contracts::ToolCall {
+                    id: "call-1".into(),
+                    name: "fs.list".into(),
+                    arguments: json!({"path": ""}),
+                }]),
+                ModelMessage::tool_result("call-1", "fs.list", "a, b, c"),
+            ],
+            tools: vec![ToolSpec {
+                name: "fs.list".into(),
+                description: "list files".into(),
+                input_schema: json!({"type": "object"}),
+                risk: agent_contracts::ToolRisk::ReadOnly,
+                output_budget: None,
+                roles: vec![ToolSemanticRole::Search],
+            }],
+            metadata: json!({}),
+            cancel: CancellationToken::new(),
+        };
+        let mut config = dummy_config("https://example.com/v1".into());
+        config.protocol = OpenAiProtocol::Responses;
+        config.send_stream_options = true;
+        config.send_max_tokens = true;
+        let codec = ToolNameCodec::from_request(&request).unwrap();
+        let wire = build_responses_wire_request(&request, &config, &codec);
+
+        assert_eq!(wire["stream"], true);
+        assert_eq!(wire["store"], false);
+        assert_eq!(wire["max_output_tokens"], 64);
+        assert_eq!(wire["stream_options"]["include_obfuscation"], false);
+        assert_eq!(wire["input"][0]["role"], "system");
+        assert_eq!(wire["input"][2]["type"], "function_call");
+        assert_eq!(wire["input"][2]["call_id"], "call-1");
+        assert_eq!(wire["input"][2]["name"], "fs_list");
+        assert_eq!(wire["input"][3]["type"], "function_call_output");
+        assert_eq!(wire["input"][3]["call_id"], "call-1");
+        assert_eq!(wire["tools"][0]["type"], "function");
+        assert_eq!(wire["tools"][0]["name"], "fs_list");
+        assert!(wire["tools"][0].get("function").is_none());
+    }
+
+    #[test]
     fn wire_negotiation_drops_provider_rejected_fields() {
         let request = ModelRequest {
             messages: vec![ModelMessage::user("hi")],
@@ -425,6 +755,7 @@ mod tests {
             api_key: "secret".into(),
             base_url: "https://example.com/v1".into(),
             model: "strict-model".into(),
+            protocol: OpenAiProtocol::ChatCompletions,
             max_output_tokens: 2048,
             timeout: Duration::from_secs(30),
             send_stream_options: false,
@@ -433,7 +764,7 @@ mod tests {
             context_window: None,
         };
         let codec = ToolNameCodec::from_request(&request).expect("no name collision");
-        let wire = build_wire_request(&request, &config, &codec);
+        let wire = build_chat_wire_request(&request, &config, &codec);
         assert!(
             wire.get("stream_options").is_none(),
             "a provider that rejects stream_options must not receive it"
@@ -450,6 +781,7 @@ mod tests {
             api_key: "secret".into(),
             base_url,
             model: "mock".into(),
+            protocol: OpenAiProtocol::ChatCompletions,
             max_output_tokens: 64,
             timeout: Duration::from_secs(5),
             send_stream_options: false,
@@ -538,6 +870,46 @@ mod tests {
         assert_eq!(output.tool_calls[0].name, "fs.list");
     }
 
+    #[tokio::test]
+    async fn responses_endpoint_round_trips_function_calls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let n = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(request.starts_with("POST /v1/responses HTTP/1.1"));
+            assert!(request.contains("\"input\""));
+            assert!(request.contains("\"name\":\"fs_list\""));
+            assert!(!request.contains("\"function\":{\"name\":\"fs_list\""));
+            let sse = concat!(
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"fs_list\",\"arguments\":\"\"}}\n\n",
+                "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_1\",\"delta\":\"{}\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut config = dummy_config(format!("http://{addr}/v1"));
+        config.protocol = OpenAiProtocol::Responses;
+        let provider =
+            OpenAiProvider::with_client(config, Client::builder().no_proxy().build().unwrap());
+        let output = provider.complete(fs_list_request()).await.unwrap();
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].id, "call_1");
+        assert_eq!(output.tool_calls[0].name, "fs.list");
+        assert_eq!(output.tool_calls[0].arguments, json!({}));
+        assert_eq!(output.usage.input_tokens, Some(10));
+        assert_eq!(output.usage.output_tokens, Some(2));
+        server.await.unwrap();
+    }
+
     #[test]
     fn gateway_wrapped_upstream_400_is_retryable_real_400_is_not() {
         let wrapped =
@@ -601,6 +973,7 @@ mod tests {
             api_key: "secret".into(),
             base_url: format!("http://{addr}/v1"),
             model: "mock".into(),
+            protocol: OpenAiProtocol::ChatCompletions,
             max_output_tokens: 2048,
             timeout: Duration::from_secs(10),
             send_stream_options: true,

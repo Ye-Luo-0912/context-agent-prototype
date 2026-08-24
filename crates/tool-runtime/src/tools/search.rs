@@ -49,6 +49,7 @@ struct GrepArgs {
     /// instead of a fresh scan, so paging stays consistent even if files
     /// change between pages.
     #[serde(default)]
+    /// Parser-only compatibility. Model-visible paging uses artifact.read.
     cursor: Option<String>,
 }
 
@@ -103,15 +104,14 @@ impl Tool for SearchGrepTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "search.grep".into(),
-            description: "Regex search workspace files (rg-style, bounded).".into(),
+            description: "Regex search workspace files (rg-style, bounded). Overflow returns an artifact_ref; read further lines with artifact.read.".into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["pattern"],
                 "properties": {
                     "pattern": {"type": "string", "description": "Regular expression"},
                     "path": {"type": "string", "description": "Optional workspace-relative file or directory: a file is searched directly, a directory is searched recursively"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
-                    "cursor": {"type": "string", "description": "Opaque token from a previous search.grep result; serves the next page from that call's snapshot"}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000}
                 }
             }),
             risk: ToolRisk::ReadOnly,
@@ -251,8 +251,9 @@ impl Tool for SearchGrepTool {
             .as_ref()
             .map(|r| {
                 format!(
-                    "\n... {} more hits; full list: {r}",
-                    hits.len() - model_hits.len()
+                    "\n... {} more hits; full-list artifact: {r}. Continue with artifact.read reference={r} start_line={}",
+                    hits.len() - model_hits.len(),
+                    model_hits.len() + 1,
                 )
             })
             .unwrap_or_default();
@@ -262,6 +263,7 @@ impl Tool for SearchGrepTool {
             "files_scanned": scanned_files,
             "returned": model_hits.len(),
             "has_more": has_more,
+            "next_start_line": has_more.then_some(model_hits.len() + 1),
             "cursor": cursor,
         });
         if hits.is_empty() {
