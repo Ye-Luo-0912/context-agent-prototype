@@ -22,6 +22,7 @@ mod envfile;
 mod fixture_driver;
 mod harvest;
 mod hygiene;
+mod long_task;
 mod longflow;
 mod metrics;
 mod mock_model;
@@ -529,6 +530,31 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if !reports.iter().all(|report| report.passed) {
                     anyhow::bail!("convergence bench failed");
+                }
+                return Ok(());
+            }
+            "--long-task-gate" => {
+                let report = long_task::run_deterministic_gate().await?;
+                println!(
+                    "retry_policy_dev deterministic gate: {}",
+                    if report.passed() { "PASS" } else { "FAIL" }
+                );
+                println!(
+                    "resume_committed={} checkpoint_durable={} continuation={} completed={} order_ok={}",
+                    report.resume_committed,
+                    report.checkpoint_durable,
+                    report.continuation_started,
+                    report.task_completed,
+                    report.order_ok
+                );
+                if let Some(duplicate) = &report.duplicated_effect {
+                    println!("duplicated_effect: {duplicate}");
+                }
+                for violation in &report.hidden_violations {
+                    println!("hidden: {violation}");
+                }
+                if !report.passed() {
+                    anyhow::bail!("long-task gate failed");
                 }
                 return Ok(());
             }

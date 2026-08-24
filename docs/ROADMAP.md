@@ -231,7 +231,11 @@ in parallel, but it does not reorder or close either gate.
     gated one-shot proposals return to the model instead of committing, and
     success orders `TurnCompleted` -> final durable checkpoint ack ->
     `TaskCompleted`. The deterministic long-task Runtime slices are green;
-    the frozen `retry_policy_dev` pilot remains the next step.
+    the `retry_policy_dev` deterministic layer-1 gate also landed
+    2026-08-25 (scripted normal/resume stop/restore/continue over the real
+    production tool surface, including the catalog-cold lease path through
+    `capability.manage`). What remains of the pilot is live: first C
+    normal/resume harness cells, then same-model A/C normal/resume pairs.
 
     Then run the frozen one-directive `retry_policy_dev` diagnostic described
     in [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md): first C normal vs

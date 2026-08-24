@@ -233,6 +233,17 @@ Do not vary model, Runtime and tool surface in one comparison.
 1. **Deterministic runtime gate:** scripted decisions cover progress CAS,
    safe-point ordering, checkpoint failure/retry, stop/restore/continue,
    no duplicated effect commit and completion refusal with stale verify.
+   Status: green for `retry_policy_dev` as of 2026-08-25. The scripted
+   normal/resume gate (`agent-eval --long-task-gate`, also run as a cargo
+   test) drives two real runtime instances over the production tool
+   surface — progress CAS at the operation commit, safe-point ordering,
+   stop/restore/continue through the shared durable authority lineage,
+   exactly-once byte-exact effects, hidden-check acceptance and
+   `TurnCompleted` -> final durable -> `TaskCompleted` ordering.
+   Directive tools are leased from their catalog-cold state through
+   `capability.manage`, exactly as a live run must. Checkpoint
+   failure/retry and completion-refusal-with-stale-verify remain covered
+   by the LT-RUN runtime slices; layers 2+ (live cells) are still open.
 2. **C live development pilot:** `normal` and `resume`, two repeats each,
    using one pinned model/provider. These four cells validate the harness;
    they are not acceptance.

@@ -350,6 +350,29 @@ and sandbox contracts live elsewhere. Experiment facts live in
   full ordering proof. All three LT-RUN slices are green; the frozen
   `retry_policy_dev` normal/resume pilot is the next step per
   [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+- The frozen `retry_policy_dev` fixture landed with its deterministic
+  layer-1 gate green (2026-08-25, `agent-eval --long-task-gate` plus a
+  cargo test running the same gate). One scripted normal/resume pair
+  drives two real runtime instances over the production tool surface:
+  phase one reads the fixture, records bounded progress through the
+  anchor CAS and durably mutates `src/config.rs`; the harness stops the
+  runtime, restores a fresh instance across runs through the shared
+  durable authority lineage and continues the SAME directive via
+  `continue_active_task`; phase two implements the retry policy,
+  updates the README/error taxonomy and closes through intent-gated
+  `task.complete`. Directive tools are catalog-cold optionals: the
+  scripted model leases them via `capability.manage`, matching what any
+  live run must do. Acceptance predicates: resume commits > 0, durable
+  checkpoints >= 2, continuation and completion events present,
+  byte-exact final workspace, empty hidden-check violations, and
+  positional ordering `TurnCompleted` -> final durable ->
+  `TaskCompleted`. Landing the gate exposed a real settlement-order
+  defect and fixed it: an accepted `task.manage` advances the authority
+  epoch during its own operation commit, so recording the accepted value
+  completion afterwards saw a stale epoch and raised a false recovery
+  fence that refused later mutations; accepted values now terminalize
+  before directive application. Live C/A cells (evaluation layers 2+)
+  remain open behind the provider-stability caution.
 - **Execution Convergence V1 mechanism landed** (2026-08-23, all 22
   items checked — the checklist is now the historical record
   [`EXECUTION_CONVERGENCE_V1.md`](EXECUTION_CONVERGENCE_V1.md)):

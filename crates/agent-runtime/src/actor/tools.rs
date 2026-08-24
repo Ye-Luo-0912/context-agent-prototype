@@ -1159,6 +1159,25 @@ impl RuntimeActor {
                     &mut output,
                 );
                 self.stamp_fs_read_motive(&mut output).await;
+                // Terminalize the accepted value while the operation's
+                // admission generation is still current: an applied runtime
+                // directive below may advance the authority epoch (an
+                // accepted `task.manage` anchor CAS does), and recording
+                // afterwards would make this very operation stale and
+                // raise a false recovery fence.
+                if completion.value_completion_pending
+                    && let Some(argument_digest) = completion.argument_digest
+                    && let Err(error) = self.core.finish_value_operation(
+                        completion.operation.operation_id,
+                        argument_digest,
+                        completion.operation.generation,
+                    )
+                {
+                    self.require_effect_recovery(format!(
+                        "Core could not record accepted tool value completion: {error}"
+                    ))
+                    .await;
+                }
                 // Execute the tool's runtime directive now, as part of the
                 // operation commit — not at turn end — so a context control
                 // request takes effect before the next model round. A task
@@ -1249,19 +1268,6 @@ impl RuntimeActor {
                     .emit_event(RuntimeEvent::ToolFinished { output })
                     .await;
                 self.report_frontier(frontier).await;
-                if completion.value_completion_pending
-                    && let Some(argument_digest) = completion.argument_digest
-                    && let Err(error) = self.core.finish_value_operation(
-                        completion.operation.operation_id,
-                        argument_digest,
-                        completion.operation.generation,
-                    )
-                {
-                    self.require_effect_recovery(format!(
-                        "Core could not record accepted tool value completion: {error}"
-                    ))
-                    .await;
-                }
                 // LONG-TASK SAFE POINT: the batch is terminally settled and
                 // nothing is in flight; accrued debt now installs the
                 // bounded resume and schedules one atomic write before the
