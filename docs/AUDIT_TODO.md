@@ -77,7 +77,11 @@ binding's epoch at mint; commit consults Core's own operation record for
 the tool name and refuses with a typed rejection when the binding was
 revoked or replaced since — a missing record fences too, while builtin and
 never-admitted tools carry no epoch and are never fenced. CORE-11 is
-closed; M12 remains open only for the coordinator transport.
+closed. The out-of-process coordinator transport also landed 2026-08-26
+(`broker_host` durable ledger + `ProcessEffectBroker`, execution stays at
+the requester; see `PLATFORM_SECURITY.md`). No further M12 slices are
+queued in this file; the gate stays open as a milestone-review decision,
+not a defect here.
 
 ### CORE-12 — M13 attestation depth (attestation landed 2026-08-25)
 

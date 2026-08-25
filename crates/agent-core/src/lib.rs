@@ -14,7 +14,10 @@ pub use approval::{
     TaskApprovalGate,
 };
 pub use authority::ApprovalVerdict;
-pub use broker::JournaledEffectBroker;
+pub use broker::{
+    CoordinatorReply, CoordinatorRequest, JournaledEffectBroker, ProcessEffectBroker,
+    ReservationJournal, ReservedRecord, serve_broker_lines,
+};
 pub use capability_admission::{
     AdmissionContext, CapabilityAdmission, MAX_TOOL_DESCRIPTION_CHARS, MAX_TOOL_NAME_CHARS,
     MAX_TOOL_SCHEMA_BYTES, MAX_TOOLS_PER_CAPABILITY,
@@ -30,8 +33,8 @@ pub use plugin_admission::{
 };
 pub use plugin_state::PluginStateAuthority;
 pub use port::{
-    AdmittedToolPermit, CorePort, CoreToolExecution, EffectBroker, EffectCommitDisposition,
-    EffectCommitRejection, EffectCommitRequest, EffectRollbackRequest, LocalEffectBroker,
-    OperationCancelDisposition, PublishedToolPermit, ToolOperationAdmission, build_core_port,
-    try_build_core_port,
+    AdmittedToolPermit, CorePort, CoreToolExecution, EffectAck, EffectBroker,
+    EffectCommitDisposition, EffectCommitRejection, EffectCommitRequest, EffectReservation,
+    EffectRollbackRequest, LocalEffectBroker, OperationCancelDisposition, PublishedToolPermit,
+    ReservedEffect, ToolOperationAdmission, build_core_port, try_build_core_port,
 };

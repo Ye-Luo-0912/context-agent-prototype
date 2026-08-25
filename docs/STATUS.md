@@ -555,11 +555,18 @@ by design, and two concerns stay separate: the policy snapshot identity
 prevents *reinterpretation* of approved operations, while the explicit
 binding revocation epoch is the only mechanism that may fence live
 leases — one revision field must not carry both meanings.
-Remaining for M12 closure: the out-of-process coordinator transport
-implementing reserve/dispatch/ack over a wire protocol; its required
-durability and reconciliation contract already exists as the in-process
-`JournaledEffectBroker` reference (journal-before-act phases, startup
-reconciliation consultation).
+Remaining for M12 closure: nothing structural is left on the
+reserve/dispatch/ack path. The out-of-process coordinator transport
+landed 2026-08-26 as a process-separated durable ledger: `broker_host`
+opens the same `ReservationJournal` and serves bounded line-delimited
+requests over stdin/stdout, `ProcessEffectBroker` journals each phase
+across the pipe and applies effect bodies locally at the requester
+(they are not remotable in v0), so crash-window semantics match the
+in-process `JournaledEffectBroker` reference exactly — between a
+dispatched record and its ack record recovery can only be Ambiguous.
+Broker-owned cross-process execution and HTTP/gRPC coordinator shells
+stay future work until a consumer actually needs remotable effects;
+do not build them speculatively.
 Do not build a second registry. Attestation is actual enforced
 capabilities; generic process tools stay non-transactional.
 UntrustedGenerated stays fail-closed on native. Multi-file

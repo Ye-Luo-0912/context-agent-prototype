@@ -31,19 +31,21 @@ const MAX_RESERVATIONS: usize = 65_536;
 const MAX_RESERVATION_ID_CHARS: usize = 256;
 
 /// 一条预留的耐久形状：经纪分配的 id + 租约的权威形状（可能没有
-/// 意图）。从不携带参数体或效果内部状态。
+/// 意图）。从不携带参数体或效果内部状态。这也是协调器线协议里的
+/// 预约载荷。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ReservedRecord {
-    reservation_id: String,
-    run_id: RunId,
-    operation_id: OperationId,
-    argument_digest: ArgumentDigest,
-    generation: u64,
-    intent: Option<agent_contracts::EffectIntent>,
+pub struct ReservedRecord {
+    pub reservation_id: String,
+    pub run_id: RunId,
+    pub operation_id: OperationId,
+    pub argument_digest: ArgumentDigest,
+    pub generation: u64,
+    pub intent: Option<agent_contracts::EffectIntent>,
 }
 
 impl ReservedRecord {
-    fn from_reservation(reservation_id: String, reservation: &EffectReservation) -> Self {
+    /// 从 Core 的预留请求构造；`reservation_id` 由经纪分配。
+    pub fn from_reservation(reservation_id: String, reservation: &EffectReservation) -> Self {
         Self {
             reservation_id,
             run_id: reservation.run_id,
@@ -121,13 +123,15 @@ struct JournalState {
 }
 
 /// 预留日志：追加式、每帧校验和、序号连续、fold 校验、撕裂尾修复。
-pub(crate) struct ReservationJournal {
+/// 这是协调器契约的持久面：进程内包装与进程外宿主共用同一份。
+pub struct ReservationJournal {
     path: std::path::PathBuf,
     state: Mutex<JournalState>,
 }
 
 impl ReservationJournal {
-    pub(crate) fn open(path: &Path) -> AgentResult<Self> {
+    /// 打开（或创建）给定路径的预留日志并持有排他锁。
+    pub fn open(path: &Path) -> AgentResult<Self> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -164,23 +168,49 @@ impl ReservationJournal {
         })
     }
 
-    fn record_reserved(&self, effect_id: EffectId, record: ReservedRecord) -> AgentResult<()> {
+    /// 记录一次派发意图。fold 拒绝（未预约/重复派发/已应答）即报错。
+    pub fn record_dispatched(&self, effect_id: EffectId) -> AgentResult<()> {
+        self.append(ReservationTransition::Dispatched { effect_id })
+    }
+
+    /// 记录一次持久应答；`applied` 决定崩溃分类落在 Applied 还是
+    /// NotApplied。
+    pub fn record_acked(&self, effect_id: EffectId, applied: bool) -> AgentResult<()> {
+        self.append(ReservationTransition::Acknowledged { effect_id, applied })
+    }
+
+    /// 由经纪分配的预留 id 反查效果身份；应答路径需要它定位日志条目。
+    pub fn effect_id_for(&self, reservation_id: &str) -> AgentResult<Option<EffectId>> {
+        let state = self.state.lock().expect("broker journal poisoned");
+        if let Some(error) = &state.failed {
+            return Err(AgentError::Storage(error.clone()));
+        }
+        Ok(state
+            .recovery
+            .by_reservation_id(reservation_id)
+            .map(|entry| entry.effect_id))
+    }
+
+    /// 当前日志序号：协调器用它为预约分配单调 id（peek-then-append
+    /// 在单飞行会话内不会交错）。
+    pub fn last_seq(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("broker journal poisoned")
+            .recovery
+            .last_seq
+    }
+
+    /// 落一条预约。id 已由调用方分配；fold 拒绝重复效果。
+    pub fn record_reserved(&self, effect_id: EffectId, record: ReservedRecord) -> AgentResult<()> {
         self.append(ReservationTransition::Reserved {
             effect_id,
             record: Box::new(record),
         })
     }
 
-    fn record_dispatched(&self, effect_id: EffectId) -> AgentResult<()> {
-        self.append(ReservationTransition::Dispatched { effect_id })
-    }
-
-    fn record_acked(&self, effect_id: EffectId, applied: bool) -> AgentResult<()> {
-        self.append(ReservationTransition::Acknowledged { effect_id, applied })
-    }
-
     /// 按效果身份分类持久预留。None = 本日志从未管理过该效果。
-    pub(crate) fn reconcile(
+    pub fn reconcile(
         &self,
         context: &OperationEffectContext,
     ) -> AgentResult<Option<EffectReconciliation>> {
@@ -547,6 +577,354 @@ impl EffectBroker for JournaledEffectBroker {
         context: &OperationEffectContext,
     ) -> AgentResult<Option<EffectReconciliation>> {
         self.journal.reconcile(context)
+    }
+}
+
+/// 协调器线协议：单行 JSON 请求/应答；超限行视为协议违规并终止
+/// 会话。serde 的内部标签表示法本身容忍多余字段，所以这里的把关
+/// 是行界、已知操作集合与 fold 校验，而不是字段白名单。
+pub const MAX_COORDINATOR_LINE_BYTES: usize = 64 * 1024;
+
+/// 协调器收到的请求。客户端编码、宿主解码，两侧各持一半 derive。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum CoordinatorRequest {
+    Reserve {
+        effect_id: EffectId,
+        record: Box<ReservedRecord>,
+    },
+    Dispatched {
+        effect_id: EffectId,
+        reservation_id: String,
+    },
+    Acknowledged {
+        reservation_id: String,
+        applied: bool,
+    },
+    Reconcile {
+        context: OperationEffectContext,
+    },
+    Shutdown,
+}
+
+/// 协调器返回的应答。宿主编码、客户端解码；`ok=false` 时 `error`
+/// 携带有界原因。
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CoordinatorReply {
+    pub ok: bool,
+    pub reservation_id: Option<String>,
+    pub reconciliation: Option<Option<EffectReconciliation>>,
+    pub error: Option<String>,
+}
+
+impl CoordinatorReply {
+    fn ok(reservation_id: Option<String>) -> Self {
+        Self {
+            ok: true,
+            reservation_id,
+            reconciliation: None,
+            error: None,
+        }
+    }
+
+    fn error(error: impl std::string::ToString) -> Self {
+        Self {
+            ok: false,
+            reservation_id: None,
+            reconciliation: None,
+            error: Some(error.to_string()),
+        }
+    }
+}
+
+fn handle_coordinator_request(
+    journal: &ReservationJournal,
+    request: CoordinatorRequest,
+) -> CoordinatorReply {
+    match request {
+        CoordinatorRequest::Reserve {
+            effect_id,
+            mut record,
+        } => {
+            // 服务端就是经纪：预留 id 在这里按日志序号单调分配，
+            // 单飞行会话内 peek-then-append 不会交错。应答必须带回
+            // 这个 id，客户端后续派发/应答都要引用它。
+            if record.reservation_id.is_empty() {
+                record.reservation_id = format!("coord/{}/{}", journal.last_seq() + 1, effect_id);
+            }
+            let assigned = record.reservation_id.clone();
+            match journal.record_reserved(effect_id, *record) {
+                Ok(()) => CoordinatorReply::ok(Some(assigned)),
+                Err(error) => CoordinatorReply::error(error),
+            }
+        }
+        CoordinatorRequest::Dispatched {
+            effect_id,
+            reservation_id,
+        } => match journal.record_dispatched(effect_id) {
+            Ok(()) => CoordinatorReply::ok(Some(reservation_id)),
+            Err(error) => CoordinatorReply::error(error),
+        },
+        CoordinatorRequest::Acknowledged {
+            reservation_id,
+            applied,
+        } => match journal.effect_id_for(&reservation_id) {
+            Ok(Some(effect_id)) => match journal.record_acked(effect_id, applied) {
+                Ok(()) => CoordinatorReply::ok(Some(reservation_id)),
+                Err(error) => CoordinatorReply::error(error),
+            },
+            Ok(None) => CoordinatorReply::error(format!(
+                "acknowledgement references unknown broker reservation {reservation_id}"
+            )),
+            Err(error) => CoordinatorReply::error(error),
+        },
+        CoordinatorRequest::Reconcile { context } => match journal.reconcile(&context) {
+            Ok(reconciliation) => CoordinatorReply {
+                ok: true,
+                reservation_id: None,
+                reconciliation: Some(reconciliation),
+                error: None,
+            },
+            Err(error) => CoordinatorReply::error(error),
+        },
+        CoordinatorRequest::Shutdown => CoordinatorReply::ok(None),
+    }
+}
+
+/// 以行分隔帧驱动一次协调器会话：EOF 或 `shutdown` 正常返回，协议
+/// 违规报错。输入输出泛化，进程内即可确定性测试。
+pub fn serve_broker_lines<R: std::io::BufRead, W: std::io::Write>(
+    input: &mut R,
+    output: &mut W,
+    journal: &ReservationJournal,
+) -> AgentResult<()> {
+    loop {
+        let mut line = String::new();
+        let read = input
+            .read_line(&mut line)
+            .map_err(|error| AgentError::Storage(format!("read coordinator request: {error}")))?;
+        if read == 0 {
+            return Ok(());
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.len() > MAX_COORDINATOR_LINE_BYTES {
+            return Err(AgentError::InvalidRequest(
+                "coordinator request exceeds its line bound".into(),
+            ));
+        }
+        let reply = match serde_json::from_str::<CoordinatorRequest>(&line) {
+            Ok(CoordinatorRequest::Shutdown) => return Ok(()),
+            Ok(request) => handle_coordinator_request(journal, request),
+            Err(error) => {
+                CoordinatorReply::error(format!("malformed coordinator request: {error}"))
+            }
+        };
+        let mut encoded = serde_json::to_vec(&reply).map_err(|error| {
+            AgentError::Storage(format!("serialize coordinator reply: {error}"))
+        })?;
+        encoded.push(b'\n');
+        output
+            .write_all(&encoded)
+            .and_then(|_| output.flush())
+            .map_err(|error| AgentError::Storage(format!("write coordinator reply: {error}")))?;
+    }
+}
+
+/// 进程外协调器客户端：把本地执行包进持久三相。预约与应答跨进程
+/// 落到协调器日志；派发意图先落账、效果体在请求方本地应用——崩溃
+/// 窗口与进程内版本一致，只能是 Ambiguous。连接单飞行；丢弃时先
+/// 尽力发送 shutdown，宿主见 EOF 也会自行退出。
+pub struct ProcessEffectBroker {
+    connection: Mutex<Option<CoordinatorConnection>>,
+}
+
+struct CoordinatorConnection {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl ProcessEffectBroker {
+    /// 启动协调器宿主子进程，`journal_path` 作为它的唯一参数。
+    pub fn connect(program: &Path, journal_path: &Path) -> AgentResult<Self> {
+        let mut child = std::process::Command::new(program)
+            .arg(journal_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| {
+                AgentError::Storage(format!(
+                    "spawn effect coordinator {}: {error}",
+                    program.display()
+                ))
+            })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AgentError::Storage("coordinator stdin unavailable".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AgentError::Storage("coordinator stdout unavailable".into()))?;
+        Ok(Self {
+            connection: Mutex::new(Some(CoordinatorConnection {
+                child,
+                stdin,
+                stdout: std::io::BufReader::new(stdout),
+            })),
+        })
+    }
+
+    fn rpc(
+        connection: &mut CoordinatorConnection,
+        request: CoordinatorRequest,
+    ) -> AgentResult<CoordinatorReply> {
+        use std::io::Write as _;
+        let encoded = serde_json::to_vec(&request).map_err(|error| {
+            AgentError::Storage(format!("serialize coordinator request: {error}"))
+        })?;
+        connection
+            .stdin
+            .write_all(&encoded)
+            .and_then(|_| connection.stdin.write_all(b"\n"))
+            .and_then(|_| connection.stdin.flush())
+            .map_err(|error| AgentError::Storage(format!("write coordinator request: {error}")))?;
+        let mut line = String::new();
+        let read = connection
+            .stdout
+            .read_line(&mut line)
+            .map_err(|error| AgentError::Storage(format!("read coordinator reply: {error}")))?;
+        if read == 0 {
+            return Err(AgentError::Storage(
+                "effect coordinator exited before replying".into(),
+            ));
+        }
+        if line.len() > MAX_COORDINATOR_LINE_BYTES {
+            return Err(AgentError::InvalidRequest(
+                "coordinator reply exceeds its line bound".into(),
+            ));
+        }
+        serde_json::from_str(&line)
+            .map_err(|error| AgentError::Storage(format!("malformed coordinator reply: {error}")))
+    }
+
+    fn require_ok(reply: CoordinatorReply) -> AgentResult<CoordinatorReply> {
+        if reply.ok {
+            Ok(reply)
+        } else {
+            Err(AgentError::Storage(
+                reply.error.unwrap_or_else(|| "coordinator refused".into()),
+            ))
+        }
+    }
+}
+
+impl Drop for ProcessEffectBroker {
+    fn drop(&mut self) {
+        // 尽力优雅关闭；随后显式丢弃 stdin 让宿主见 EOF，最后收割
+        // 子进程——任何路径都不留下僵尸。之后的方法调用按"已关闭"
+        // 拒绝。
+        use std::io::Write as _;
+        let mut guard = self.connection.lock().expect("coordinator poisoned");
+        if let Some(mut connection) = guard.take() {
+            let _ = connection
+                .stdin
+                .write_all(b"{\"op\":\"shutdown\"}\n")
+                .and_then(|_| connection.stdin.flush());
+            drop(connection.stdin);
+            let _ = connection.child.wait();
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl EffectBroker for ProcessEffectBroker {
+    async fn reserve(&self, reservation: EffectReservation) -> AgentResult<String> {
+        let mut guard = self.connection.lock().expect("coordinator poisoned");
+        let connection = guard
+            .as_mut()
+            .ok_or_else(|| AgentError::Storage("effect coordinator is closed".into()))?;
+        let record = ReservedRecord::from_reservation(String::new(), &reservation);
+        let reply = Self::require_ok(Self::rpc(
+            connection,
+            CoordinatorRequest::Reserve {
+                effect_id: reservation.effect_id,
+                record: Box::new(record),
+            },
+        )?)?;
+        reply.reservation_id.ok_or_else(|| {
+            AgentError::Storage("coordinator reserve reply missing reservation id".into())
+        })
+    }
+
+    async fn dispatch(&self, reserved: ReservedEffect) -> EffectReceipt {
+        let effect_id = reserved.reservation.effect_id;
+        let reservation_id = reserved.reservation_id.clone();
+        let journaled = {
+            let mut guard = self.connection.lock().expect("coordinator poisoned");
+            match guard.as_mut() {
+                Some(connection) => Self::rpc(
+                    connection,
+                    CoordinatorRequest::Dispatched {
+                        effect_id,
+                        reservation_id: reservation_id.clone(),
+                    },
+                ),
+                None => Err(AgentError::Storage("effect coordinator is closed".into())),
+            }
+        };
+        if let Err(error) = journaled.and_then(Self::require_ok) {
+            // 账本拒绝即不派发：先回滚已暂存效果，再如实报告未应用。
+            let reason = format!("coordinator refused the dispatch of effect {effect_id}: {error}");
+            let rollback_error = reserved
+                .effect
+                .rollback(&reason)
+                .await
+                .err()
+                .map(|rollback| format!("; rollback failed: {rollback}"))
+                .unwrap_or_default();
+            return EffectReceipt::NotApplied {
+                error: format!("{reason}{rollback_error}"),
+            };
+        }
+        // 执行留在请求方本地：效果体不可跨进程。崩溃窗口由账本覆盖
+        // ——已记 dispatched 而未见应答时恢复为 Ambiguous。
+        reserved.effect.commit().await
+    }
+
+    async fn ack(&self, ack: EffectAck) -> AgentResult<()> {
+        let mut guard = self.connection.lock().expect("coordinator poisoned");
+        let connection = guard
+            .as_mut()
+            .ok_or_else(|| AgentError::Storage("effect coordinator is closed".into()))?;
+        Self::require_ok(Self::rpc(
+            connection,
+            CoordinatorRequest::Acknowledged {
+                reservation_id: ack.reservation_id,
+                applied: ack.applied,
+            },
+        )?)?;
+        Ok(())
+    }
+
+    fn reconcile_reservation(
+        &self,
+        context: &OperationEffectContext,
+    ) -> AgentResult<Option<EffectReconciliation>> {
+        let mut guard = self.connection.lock().expect("coordinator poisoned");
+        let connection = guard
+            .as_mut()
+            .ok_or_else(|| AgentError::Storage("effect coordinator is closed".into()))?;
+        let reply = Self::require_ok(Self::rpc(
+            connection,
+            CoordinatorRequest::Reconcile {
+                context: context.clone(),
+            },
+        )?)?;
+        Ok(reply.reconciliation.flatten())
     }
 }
 

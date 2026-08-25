@@ -164,9 +164,18 @@ Core crash: startup reconciliation consults `EffectBroker::reconcile_reservation
 whenever the workspace adapter answers NotManaged, reusing the same
 reconciliation enum (reserved-not-dispatched → NotApplied, dispatched-unacked
 → Ambiguous, acked → Applied/NotApplied, identity drift → Ambiguous).
-Remaining M12 work is the out-of-process coordinator transport itself; its
-durability and reconciliation contract already exists in that reference.
-Do not close M12 because structured intents or the local barrier landed.
+The out-of-process coordinator transport exists as a process-separated
+durable ledger, not an executor: `broker_host` opens the same
+`ReservationJournal` and serves line-delimited reserve/dispatched/ack/
+reconcile requests on stdin/stdout (bounded frames, exclusive journal lock,
+fold-validated transitions), while `ProcessEffectBroker` journals each phase
+across the pipe and applies the effect body locally at the requester —
+effect bodies are not remotable in v0, so the crash-window semantics are
+identical to the in-process reference: between a dispatched record and its
+ack record the classification can only be Ambiguous. Broker-owned execution
+and HTTP/gRPC coordinator shells stay future work until a consumer needs
+remotable effects. Do not close M12 because structured intents, the local
+barrier, or this transport landed.
 
 ## HostLifecycle (restart)
 
