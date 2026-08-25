@@ -65,8 +65,17 @@ instance is wired into the kernel lease path
 with no injection everything falls back to the declared-risk empty bound.
 
 Still open (M12): the plugin manifest → operator review → `admit()` flow
-itself. Until that lands, external write plugins stay safely
-non-functional.
+itself landed 2026-08-25 — an installed package manifest provides candidate
+tool names only, while the operator review artifact supplies the actual
+`HostToolPolicy` bindings; `admit_reviewed` installs them atomically (any
+builtin shadow, duplicate admission, or out-of-manifest tool name refuses
+the whole batch) and `revoke_admitted` withdraws a binding; both advance the
+versioned snapshot and never re-interpret old-snapshot consumers. A revoked
+tool stops receiving new authority immediately (unbound intent fails closed
+at the approval gate). Remaining (M12): fence already-minted leases when
+their binding is revoked mid-flight, via an explicit per-binding revocation
+epoch consumed by the kernel lease path — one revision field must not carry
+that meaning.
 
 ### CORE-12 — M13 attestation depth (open)
 
@@ -461,57 +470,17 @@ be sized against real demand. Residency loosening stays rejected on
 current evidence; the tiny current-turn LRU gets built only if this
 motive shows up in live runs.
 
-### EXEC-REV-01 — anchor CAS and verification basis are coupled inconsistently (open)
+### EXEC-REV-01 — anchor CAS and verification basis are coupled inconsistently (core defect fixed 2026-08-25)
 
-`ExecutionState` already carries `VerificationObligation.spec_revision`, but
-verification pass/fail records currently copy the whole `anchor_revision`, and
-every accepted anchor replacement calls `mark_spec_changed`. An out-of-turn
-plan-only patch therefore marks otherwise Current verification stale. The
-active `task.manage` path can then overwrite that task-resume state from the
-turn execution after observing its own result at the new anchor revision, yet
-exact-PASS reuse still rejects the older fact because its anchor revision no
-longer matches. The same progress-only semantic change therefore has
-path-dependent completion-freshness and reuse behavior. The code behavior is
-confirmed; its contribution to live round/call cost has not yet been measured.
-
-Retain `anchor_revision` as the whole-record compare-and-swap fence, but give
-verification basis an independent revision meaning. Progress-only changes
-advance CAS without invalidating verification; goal, constraint and
-authoritative-criterion changes advance both. Treat `current_interpretation`
-through an explicit host policy. ActiveTurn, task resume, completion and exact
-reuse must share one currentness predicate; cover both revisions through
-checkpoint/restore.
-
-### LONGTASK-03 — safe-point artifact is not a complete cold-restorable checkpoint (open)
-
-The actor safe-point snapshot writes an empty capability list and persists that
-actor-owned value directly; only an external `RuntimeInstance::checkpoint()`
-merges the host registry. `CheckpointStore` has a write-plus-rename path but no
-matching artifact load API, whole-artifact checksum, file sync or parent-
-directory sync. The file is atomically visible but has no power-loss durability
-claim. The live pilot has capability-aware mode disabled, so this is a
-production recovery-contract defect, not the cause of its missing closure.
-
-Make one actor/host ownership handshake produce a complete checkpoint at the
-safe point, persist and load/validate it with explicit platform durability
-semantics, and acknowledge the exact durable resume revision. Prove artifact
-restore with a fresh Runtime and Context engine, without phase-one in-memory
-state. Contract and tests:
-[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
-
-### LONGTASK-04 — checkpoint failure does not fail-closed continuation (open)
-
-`await_pending_checkpoint` records failure and returns no error. The
-continuation path waits for it, does not test the failed outcome, and then
-starts the next turn. `CheckpointDurable` also lacks the revision that its
-contract says it acknowledges. A failed safe-point write can therefore leave
-debt visible while continuation still emits `TaskContinuationStarted`.
-
-Track `resume_state_revision`, `required_durable_revision` and
-`durable_revision`. Capture, write, checksum, rename or acknowledgement
-failure must make `continue_active_task` return an error before any model
-request or continuation event. Retry of the same required revision releases
-the fence only after its durable acknowledgement.
+The confirmed defect — an out-of-turn plan-only patch marking otherwise
+Current verification stale, with path-dependent completion-freshness and
+reuse — is fixed by LT-RUN-04 Slice B: authority gating on the single record
+revision gives verification basis independent meaning, so a progress-only
+anchor CAS advances the record and its resume fence without staling a
+Current verifier, while goal/constraint movement stales it
+(`progress_only_cas_keeps_current_verification_and_boundary_change_stales_it`).
+If live evidence ever shows currentness drifting between resume, completion
+and exact reuse, reopen from this entry.
 
 ### CONV-01 / CONV-02 / PROTO-EVID-01 — closed 2026-08-23
 
@@ -520,6 +489,28 @@ All three landed in Execution Convergence V1 (see
 [`EXECUTION_COHERENCE.md`](EXECUTION_COHERENCE.md)); write-ups moved to
 the second-round section below and to the closed archive. The remaining,
 narrower residuals are CAP-OBS-01 and CONV-03 there.
+
+### LONGTASK-03 / LONGTASK-04 / EVAL-05 — closed 2026-08-25 by LT-RUN-04
+
+LONGTASK-03: safe-point checkpoints capture every visible plane including
+the host capability registry under the generation handshake and persist as
+sha256 + fsync'd atomic-rename envelopes with a corruption-refusing
+`load_verified` (`agent-runtime/src/checkpoint.rs`). LONGTASK-04:
+continuation is gated by monotonic `resume_state_revision` /
+`required_durable_revision` / `durable_revision` watermarks that fail closed
+until the required write lands, with `CheckpointWriteFailed` events
+(`agent-runtime/src/actor/safepoint.rs`). EVAL-05: resume twins build a
+fresh Context engine per phase and cross the boundary only with the
+checksum-verified artifact locator. Design and contract:
+[`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
+
+### EVAL-06 — live cargo acceptance runs agent-editable tests (closed 2026-08-25)
+
+LT-RUN-04 Slice A landed the equivalent isolated oracle: read-only
+acceptance always runs on an inspectable workspace through a harness-owned
+frozen-API oracle executing outside the agent-editable workspace after the
+diff scan; the in-workspace cargo self-check remains a separately named
+outcome dimension.
 
 ## Second-round review 2026-08-23 — trust & obligation
 
@@ -791,48 +782,18 @@ Frozen `context-bench.v1` SPEC / pack digest stay frozen. Wave-1 live
 retune GC from that live or from an `add_test` cell. Do not treat
 `Likely optimization target` as a modification order.
 
-### EVAL-03 — pilot conflates closure with behavioral acceptance (open)
+### EVAL-03 — pilot conflates closure with behavioral acceptance (evaluator split landed 2026-08-25; promotion still open)
 
-The `retry_policy_dev` deterministic gate is green and the first four C live
-cells ran. All four canonical cells lack `TaskCompleted`, but the evaluator
-returns the lifecycle error before executing its post-run diff/cargo checks.
-Thus their reports cannot distinguish a behaviorally correct workspace with
-missing closure from an incorrect implementation. Additional provider-dead
-attempts must stay outside the canonical four-cell behavior aggregate.
-
-Record behavioral oracle, allowed diff, task closure, continuation and
-provider/runtime health independently; keep the final PASS conjunctive. If the
-workspace is inspectable, missing closure or a late provider failure must not
-suppress read-only acceptance checks. Then use the final evaluator in the
-default-off CompletionOpportunity C off/on promotion gate; only a promoted,
-frozen setting may enter same-model A/C. The pilot is development evidence,
-not M15 acceptance. Design and exit gate:
+The evaluator now records behavioral oracle, allowed diff, task closure,
+continuation and provider/runtime health independently; read-only acceptance
+always runs on an inspectable workspace even when closure or a late provider
+failure is missing, and provider-dead attempts stay outside the canonical
+behavior aggregate (LT-RUN-04 Slice A). The default-off CompletionOpportunity
+off/on gate ran twice with that evaluator on 2026-08-25 and failed to promote
+both times (see [`STATUS.md`](STATUS.md)); the candidate stays off, so no
+promoted frozen setting exists yet for same-model A/C. The pilot remains
+development evidence, not M15 acceptance. Design and exit gate:
 [`LONG_TASK_EVALUATION.md`](LONG_TASK_EVALUATION.md).
-
-### EVAL-05 — resume twin does not prove a cold artifact restore (open)
-
-Both phases receive the same `ContextEngine` object. After the durable event,
-the harness separately captures an in-memory full checkpoint and passes that
-value directly to phase two instead of loading the artifact named by the
-event. `SimpleContextEngine::restore` replaces its state, so this does not
-prove an in-memory leak; it proves only that cold-engine/cold-artifact recovery
-has not been tested.
-
-Phase two must allocate a fresh Context engine and host, retain only the
-artifact locator/digest/revision across the boundary, load that artifact, and
-prove the same task/directive/authority identity with no duplicated effect.
-
-### EVAL-06 — live cargo acceptance runs agent-editable tests (open)
-
-The frozen seed contains no harness-owned tests. The post-run `cargo test`
-therefore executes tests the evaluated agent may add inside its editable
-workspace; the other hidden predicates are implementation-marker diagnostics.
-That cargo result is a useful self-check, not an independent behavioral oracle.
-
-Add a network-free harness-owned external test crate or equivalent isolated
-oracle for retry bounds, transient/permanent behavior, saturation/overflow and
-public API compatibility. Multiple correct implementations must pass without
-a golden patch; keep the workspace self-check as a separately named outcome.
 
 ## Closed archive (index only)
 
