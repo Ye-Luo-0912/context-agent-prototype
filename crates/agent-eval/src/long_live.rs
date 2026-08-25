@@ -632,7 +632,7 @@ async fn compose_cell(
     opportunity: bool,
 ) -> anyhow::Result<agent_compose::ComposedRuntime> {
     let workspace = agent_workspace::Workspace::open(root).await?;
-    let verification_recipes = tool_runtime::VerificationRecipes::discover(&workspace);
+    let verification_recipes = pilot_verification_recipes();
     let tools: Arc<dyn ToolDispatcher> = Arc::new(
         tool_runtime::BuiltinToolDispatcher::with_config_and_verification_recipes(
             workspace.clone(),
@@ -674,6 +674,50 @@ fn c_engine(model: Arc<dyn ModelTransport>) -> Arc<dyn ContextEngine> {
     let engine =
         context_simple::SimpleContextEngine::new(context_simple::SimpleContextConfig::default());
     Arc::new(engine.with_compactor(Arc::new(agent_compose::ModelBackedCompactor::new(model))))
+}
+
+/// The pilot composition root's verifier set: discovery mirrored for this
+/// Cargo fixture (the general runner stays TaskScoped exactly as
+/// `VerificationRecipes::discover` would produce it) plus one host-registered
+/// source-read-only ExactCurrentWorld recipe. Without the registered exact
+/// recipe no live `verify.run` PASS can ever carry an identity, and the
+/// opportunity candidate's fail-closed precondition is unreachable (see
+/// opportunity-gate REPORT, attempt 1). The set is identical across off/on
+/// arms; the switch remains the only paired variable.
+fn pilot_verification_recipes() -> tool_runtime::VerificationRecipes {
+    let mut recipes = Vec::new();
+    // Mirror of discovery for a Cargo workspace fixture.
+    if let Ok(recipe) = tool_runtime::VerificationRecipe::new(
+        "rust.workspace",
+        "Run all Cargo workspace tests",
+        "cargo-workspace-v1",
+        vec!["cargo".into(), "test".into(), "--workspace".into()],
+    ) {
+        recipes.push(recipe);
+    }
+    // Host opt-in: the fixture's tests are pure unit tests whose writes stay
+    // inside target/, so the source-read-only assertion holds. Declared
+    // inputs are exactly the seed-guaranteed files; content changes create a
+    // new exact world.
+    let exact = tool_runtime::VerificationRecipe::new(
+        "jobrunner.exact",
+        "Exact-world jobrunner test suite (source-read-only)",
+        "jobrunner-exact-v1",
+        vec!["cargo".into(), "test".into(), "--workspace".into()],
+    )
+    .and_then(|recipe| {
+        recipe
+            .with_exact_current_world_reuse()
+            .with_exact_inputs(vec![
+                "Cargo.toml".into(),
+                "src/config.rs".into(),
+                "src/error.rs".into(),
+                "src/lib.rs".into(),
+            ])
+    })
+    .expect("pilot exact recipe is valid");
+    recipes.push(exact);
+    tool_runtime::VerificationRecipes::new(recipes).expect("pilot recipe set is valid")
 }
 
 /// Cold boundary: read the acknowledged safe-point artifact from the
@@ -1354,6 +1398,40 @@ pub fn spec_sha256() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pre-flight for the opportunity gate: the registered exact recipe
+    /// must produce non-empty identity material in this environment. If
+    /// capture degrades to TaskScoped (env caps, missing inputs, unresolvable
+    /// executable), live eligibility can never arm and the gate would waste
+    /// its paired cells measuring nothing again.
+    #[tokio::test]
+    async fn registered_exact_recipe_produces_identity_material() {
+        let dir = tempfile::tempdir().unwrap();
+        long_task::seed_workspace(dir.path()).unwrap();
+        let workspace = agent_workspace::Workspace::open(dir.path()).await.unwrap();
+        let dispatcher = tool_runtime::BuiltinToolDispatcher::with_config_and_verification_recipes(
+            workspace,
+            tool_runtime::ToolLifecycleConfig::default(),
+            pilot_verification_recipes(),
+        );
+        use agent_contracts::{ToolCall, ToolDispatcher as _, ToolExecutionPurpose};
+        let call = ToolCall {
+            id: "preflight".into(),
+            name: "verify.run".into(),
+            arguments: serde_json::json!({"recipe_id": "jobrunner.exact"}),
+        };
+        let attribution = dispatcher.execution_attribution(&call);
+        assert_eq!(attribution.purpose, ToolExecutionPurpose::Verify);
+        assert!(
+            attribution.reusable_verification(),
+            "the exact recipe must stay reusable"
+        );
+        assert!(
+            !attribution.verification_identity.is_empty(),
+            "identity capture must succeed in this environment; \
+             the opportunity gate cannot arm without it"
+        );
+    }
 
     #[test]
     fn mode_parse_covers_both_single_and_all() {
