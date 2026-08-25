@@ -118,12 +118,18 @@ pub struct AuthorityLease {
     pub decision: ApprovalDecision,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
-    /// 授予本意图的宿主策略版本（M12 P0）：由
+    /// 授予本意图的宿主策略版本：由
     /// [`crate::HostToolPolicies::policy_revision`] 盖章，审计可回答
     /// "这条授权当时依据哪一版策略"。旧快照缺省为 None；强制校验
-    /// （revision 失配即回滚）属于 M12 版本化运行时准入线。
+    /// （revision 失配即回滚）由版本化运行时准入线负责。
     #[serde(default)]
     pub policy_revision: Option<u64>,
+    /// 签发时该工具准入绑定的撤销纪元：由
+    /// [`crate::HostToolPolicies::binding_epoch`] 盖章。提交时当前纪元
+    /// 与盖章值不同 => 绑定被显式撤销/重装，租约按绑定围栏。内置授权
+    /// 与从未准入的工具为 None。
+    #[serde(default)]
+    pub binding_epoch: Option<u64>,
 }
 
 impl AuthorityLease {
@@ -180,6 +186,7 @@ mod tests {
             issued_at_ms: 1_000,
             expires_at_ms: 2_000,
             policy_revision: Some(3),
+            binding_epoch: Some(2),
         };
 
         // Serialization is the wire contract: the lease travels with the

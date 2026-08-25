@@ -49,7 +49,7 @@ first cut.
 Named pipes/UDS are not a fix for CORE-01. V1 still trusts Runtime in
 the same address space.
 
-### CORE-11 — HostToolPolicy registry & plugin admission (registry landed 2026-08-23)
+### CORE-11 — HostToolPolicy registry & plugin admission (closed 2026-08-26)
 
 Landed: `agent-contracts/src/host_policy.rs` is vocabulary only —
 `HostToolPolicy`/`HostEffectBinding` carry owned names (serde-ready) plus
@@ -72,10 +72,12 @@ builtin shadow, duplicate admission, or out-of-manifest tool name refuses
 the whole batch) and `revoke_admitted` withdraws a binding; both advance the
 versioned snapshot and never re-interpret old-snapshot consumers. A revoked
 tool stops receiving new authority immediately (unbound intent fails closed
-at the approval gate). Remaining (M12): fence already-minted leases when
-their binding is revoked mid-flight, via an explicit per-binding revocation
-epoch consumed by the kernel lease path — one revision field must not carry
-that meaning.
+at the approval gate). Fencing landed 2026-08-26: a lease stamps its
+binding's epoch at mint; commit consults Core's own operation record for
+the tool name and refuses with a typed rejection when the binding was
+revoked or replaced since — a missing record fences too, while builtin and
+never-admitted tools carry no epoch and are never fenced. CORE-11 is
+closed; M12 remains open only for the coordinator transport.
 
 ### CORE-12 — M13 attestation depth (attestation landed 2026-08-25)
 

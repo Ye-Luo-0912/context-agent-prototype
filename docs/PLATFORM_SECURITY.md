@@ -35,9 +35,11 @@ admission, or tool outside the reviewed manifest refuses the whole batch.
 `revoke_admitted` withdraws a previously admitted binding; builtins are
 irrevocable. Both moves advance the snapshot revision and digest, and
 consumers holding the old snapshot keep its exact authority, so an operator
-update never re-interprets an in-flight operation. Still open (M12):
-fencing already-minted leases when their tool's binding is revoked
-mid-flight via an explicit per-binding revocation epoch.
+update never re-interprets an in-flight operation. A lease stamps its
+binding's epoch at mint (`binding_epoch`), and commit refuses with a typed
+rejection when that tool's binding was explicitly revoked or replaced
+since — fenced per binding, while snapshot identity continues to prevent
+reinterpretation and never fences.
 
 `HostEffectBinding::ExecRecipe` is the trusted indirection for
 `verify.run { recipe_id }`: the model-visible call contains no argv, and the

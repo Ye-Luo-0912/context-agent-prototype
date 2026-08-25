@@ -425,6 +425,25 @@ impl CoreAuthority {
         self.operations.issued_lease_matches(operation_id, lease)
     }
 
+    /// 操作记录里的工具名：撤销围栏用它查当前绑定纪元，不信任提交方。
+    pub(crate) fn operation_tool_name(&self, operation_id: OperationId) -> Option<String> {
+        match self.operations.query(operation_id) {
+            agent_contracts::OperationQueryResult::Found { snapshot } => {
+                Some(snapshot.identity.tool_name)
+            }
+            _ => None,
+        }
+    }
+
+    /// 工具当前准入绑定的纪元；None = 没有可围栏的准入绑定（内置
+    /// 授权或从未准入）。
+    pub(crate) fn current_binding_epoch(&self, tool_name: &str) -> Option<u64> {
+        self.config
+            .host_policies
+            .as_ref()
+            .and_then(|policies| policies.binding_epoch(tool_name))
+    }
+
     /// The approval authority seam: policy verdicts.
     pub(crate) fn approval(&self) -> &ApprovalAuthority {
         &self.approval
@@ -1103,13 +1122,18 @@ impl CoreAuthority {
                 decision: agent_contracts::ApprovalDecision::Allow,
                 issued_at_ms,
                 expires_at_ms: issued_at_ms.saturating_add(ttl),
-                // M12 P0：记录本意图依据的策略版本（可审计）；强制
-                // 校验属于版本化运行时准入线。
+                // 记录本意图依据的策略版本（可审计）与当时该工具绑定
+                // 的撤销纪元；提交期按后者做撤销围栏。
                 policy_revision: self
                     .config
                     .host_policies
                     .as_ref()
                     .and_then(|policies| policies.policy_revision()),
+                binding_epoch: self
+                    .config
+                    .host_policies
+                    .as_ref()
+                    .and_then(|policies| policies.binding_epoch(&call.name)),
             };
             if let Err(error) = self
                 .operations

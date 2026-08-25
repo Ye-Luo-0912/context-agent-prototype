@@ -185,6 +185,11 @@ pub enum EffectCommitRejection {
     /// before dispatch. Nothing was applied; the prepared effect is
     /// settled as NotApplied and the decision returns as a rejection.
     BrokerUnavailable,
+    /// Revocation fence: the tool's admitted binding was explicitly
+    /// revoked or replaced after this lease was minted, so its authority
+    /// was withdrawn. Fenced per binding — other tools' in-flight
+    /// operations are unaffected. Nothing was applied.
+    BindingRevoked,
 }
 
 /// M12 reserved/dispatch/ack barrier — phase 1 input: the approved
@@ -653,7 +658,26 @@ impl CorePort for CoreAuthority {
                 {
                     Some(EffectCommitRejection::InvalidLease)
                 }
-                Some(_) => None,
+                Some(lease) => {
+                    // 撤销围栏：仅当租约盖过绑定纪元且当前纪元已变。
+                    // 工具名取自 Core 自己的操作记录，不信任提交方；查不到
+                    // 记录的租约按已撤销处理，从未盖纪元的租约（内置授权）
+                    // 不围栏。
+                    let fenced = match &lease.binding_epoch {
+                        Some(leased_epoch) => match self.operation_tool_name(operation_id) {
+                            Some(tool_name) => {
+                                self.current_binding_epoch(&tool_name) != Some(*leased_epoch)
+                            }
+                            None => true,
+                        },
+                        None => false,
+                    };
+                    if fenced {
+                        Some(EffectCommitRejection::BindingRevoked)
+                    } else {
+                        None
+                    }
+                }
             }
         };
 
@@ -1368,6 +1392,177 @@ mod tests {
         }
     }
 
+    /// 可控绑定纪元的策略桩：只服务撤销围栏行为测试。
+    struct EpochPolicies {
+        epoch: std::sync::atomic::AtomicU64,
+    }
+
+    impl agent_contracts::HostToolPolicies for EpochPolicies {
+        fn policy_for(&self, _tool_name: &str) -> Option<&agent_contracts::HostToolPolicy> {
+            None
+        }
+        fn policy_revision(&self) -> Option<u64> {
+            Some(self.epoch.load(Ordering::SeqCst))
+        }
+        fn binding_epoch(&self, _tool_name: &str) -> Option<u64> {
+            Some(self.epoch.load(Ordering::SeqCst))
+        }
+    }
+
+    /// 走生产准入→发布→执行流，拿到一个已盖绑定纪元的租约与已暂存
+    /// 效果；提交由调用方在改变（或不改）纪元后自行驱动。
+    async fn prepare_leased_effect(
+        state: &Arc<Mutex<String>>,
+        policies: Arc<EpochPolicies>,
+    ) -> (
+        Arc<dyn CorePort>,
+        OperationId,
+        EffectId,
+        ArgumentDigest,
+        u64,
+        AuthorityLease,
+        Box<dyn Effect>,
+    ) {
+        let port = build_core_port(
+            CoreAuthorityConfig {
+                host_policies: Some(policies),
+                ..CoreAuthorityConfig::default()
+            },
+            Arc::new(StubContext),
+            Arc::new(PreparedEffectTools {
+                state: state.clone(),
+                risk: agent_contracts::ToolRisk::WorkspaceWrite,
+                actual: None,
+                name: "prepared.effect",
+            }),
+            Arc::new(Allow),
+            None,
+        );
+        let call = ToolCall {
+            id: "write-1".into(),
+            name: "prepared.effect".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs", "content": "x"}),
+        };
+        let surface = ToolSurfaceSnapshot {
+            specs: PreparedEffectTools {
+                state: state.clone(),
+                risk: agent_contracts::ToolRisk::WorkspaceWrite,
+                actual: None,
+                name: "prepared.effect",
+            }
+            .specs(),
+            ..ToolSurfaceSnapshot::default()
+        };
+        let generation = port.current_authority_epoch();
+        let operation_id = OperationId::new();
+        let argument_digest = ArgumentDigest::from_json(&call.arguments);
+        let execution = admit_and_execute(
+            port.as_ref(),
+            ToolOperationIdentity {
+                run_id: port.run_id(),
+                task_id: None,
+                turn_id: TurnId::new(),
+                scope_id: None,
+                operation_id,
+                generation,
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest,
+            },
+            call,
+            CancellationToken::new(),
+            &surface,
+        )
+        .await;
+        let CoreToolExecution {
+            outcome,
+            lease,
+            effect_id,
+            ..
+        } = execution;
+        let ToolOutcome::PreparedEffect { effect, .. } = outcome else {
+            panic!("fixture must return a prepared effect")
+        };
+        let effect_id = effect_id.expect("Core assigns prepared effect identity");
+        let lease = lease.expect("write-risk operation receives a lease");
+        (
+            port,
+            operation_id,
+            effect_id,
+            argument_digest,
+            generation,
+            lease,
+            effect,
+        )
+    }
+
+    #[tokio::test]
+    async fn commit_fences_a_lease_whose_binding_epoch_moved_after_mint() {
+        let state = Arc::new(Mutex::new(String::new()));
+        let policies = Arc::new(EpochPolicies {
+            epoch: std::sync::atomic::AtomicU64::new(5),
+        });
+        let (port, operation_id, effect_id, argument_digest, generation, lease, effect) =
+            prepare_leased_effect(&state, policies.clone()).await;
+        assert_eq!(
+            lease.binding_epoch,
+            Some(5),
+            "mint must stamp the binding epoch"
+        );
+
+        // 绑定被显式撤销/重装：纪元前进，盖着旧纪元的租约按绑定围栏。
+        policies.epoch.store(7, Ordering::SeqCst);
+        let receipt = port
+            .commit_effect(EffectCommitRequest {
+                run_id: port.run_id(),
+                turn_id: TurnId::new(),
+                operation_id,
+                effect_id,
+                argument_digest,
+                generation,
+                lease: Some(lease),
+                effect,
+            })
+            .await;
+        assert!(matches!(
+            receipt,
+            EffectCommitDisposition::Rejected(EffectCommitRejection::BindingRevoked)
+        ));
+        assert!(
+            state.lock().unwrap().starts_with("rolled back:"),
+            "a fenced effect must be settled NotApplied"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_stays_allowed_while_the_binding_epoch_holds() {
+        let state = Arc::new(Mutex::new(String::new()));
+        let policies = Arc::new(EpochPolicies {
+            epoch: std::sync::atomic::AtomicU64::new(5),
+        });
+        let (port, operation_id, effect_id, argument_digest, generation, lease, effect) =
+            prepare_leased_effect(&state, policies).await;
+
+        // 纪元未变（包括其他工具的准入变动也不推进它）：提交照常。
+        let receipt = port
+            .commit_effect(EffectCommitRequest {
+                run_id: port.run_id(),
+                turn_id: TurnId::new(),
+                operation_id,
+                effect_id,
+                argument_digest,
+                generation,
+                lease: Some(lease),
+                effect,
+            })
+            .await;
+        assert!(matches!(
+            receipt,
+            EffectCommitDisposition::Receipt(EffectReceipt::Applied { .. })
+        ));
+        assert_eq!(&*state.lock().unwrap(), "committed");
+    }
+
     #[test]
     fn durable_core_startup_advances_recovered_epoch_before_publication() {
         let journal = Arc::new(RecoveredJournal {
@@ -1716,6 +1911,7 @@ mod tests {
             grant_id: None,
             decision: ApprovalDecision::Allow,
             policy_revision: None,
+            binding_epoch: None,
             issued_at_ms: 0,
             expires_at_ms,
         }

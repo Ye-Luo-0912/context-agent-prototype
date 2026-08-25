@@ -1137,6 +1137,9 @@ impl RuntimeActor {
                                 EffectCommitRejection::BrokerUnavailable => {
                                     "the effect broker could not reserve the approved effect before dispatch; nothing was applied"
                                 }
+                                EffectCommitRejection::BindingRevoked => {
+                                    "the tool's admitted authority binding was revoked or replaced after this lease was issued; nothing was applied"
+                                }
                             };
                             unsettled_effect_output(
                                 output,

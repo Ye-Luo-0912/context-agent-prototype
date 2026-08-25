@@ -539,19 +539,25 @@ and sandbox contracts live elsewhere. Experiment facts live in
 
 **P0 — trusted execution.** Finish M12/M13 gates in
 [`PLATFORM_SECURITY.md`](PLATFORM_SECURITY.md): one brokerable
-`EffectRequest` path; the landed `HostToolPolicyRegistry` now needs the
-runtime admission flow itself — manifest → operator review → versioned,
-mutable snapshot install (`HostPolicySnapshot{policy, revision, digest}`)
-with the policy revision bound to operation authority, so an operator
-update never re-interprets an in-flight operation. Revision enforcement
-is **per binding** (`tool_name` + policy digest): adding `plugin.foo`
-policy must not stale an already-approved `fs.write`; only replacing or
-revoking the same binding affects that tool's later authority. Global
-"revision changed → all old leases invalid" is rejected by design, and
-two concerns stay separate: the policy snapshot identity prevents
-*reinterpretation* of approved operations, while an explicit authority
-revocation epoch is the only mechanism that may fence live leases — one
-revision field must not carry both meanings.
+`EffectRequest` path. Landed by 2026-08-26: the full admission flow —
+an installed package manifest supplies candidate tool names only, the
+operator review artifact supplies the actual bindings,
+`admit_reviewed` installs them atomically, and versioned snapshots bind
+operation authority so an operator update never re-interprets an
+in-flight operation — plus per-binding revocation fencing: a lease
+stamps its binding's epoch at mint and commit refuses when that binding
+was explicitly revoked or replaced since; other tools' in-flight
+operations are unaffected, and snapshot identity never fences.
+Adding `plugin.foo` policy does not stale an already-approved `fs.write`;
+only replacing or revoking the same binding affects that tool's later
+authority. Global "revision changed → all old leases invalid" is rejected
+by design, and two concerns stay separate: the policy snapshot identity
+prevents *reinterpretation* of approved operations, while the explicit
+binding revocation epoch is the only mechanism that may fence live
+leases — one revision field must not carry both meanings.
+Remaining for M12 closure: the out-of-process coordinator transport
+implementing reserve/dispatch/ack plus crash reconciliation of
+broker-owned reservations.
 Do not build a second registry. Attestation is actual enforced
 capabilities; generic process tools stay non-transactional.
 UntrustedGenerated stays fail-closed on native. Multi-file

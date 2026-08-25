@@ -72,6 +72,15 @@ pub trait HostToolPolicies: Send + Sync {
     fn policy_revision(&self) -> Option<u64> {
         None
     }
+
+    /// 该工具当前准入绑定的纪元：仅在显式撤销或重装同一绑定时
+    /// 前进，与 [`Self::policy_revision`]（快照身份，防重释）语义分离
+    /// ——撤销纪元是唯一允许围栏在途租约的机制。租约签发时盖章；提交
+    /// 时当前值与盖章值不同 => 该租约跨越了一次撤销，按绑定围栏，其他
+    /// 工具的在途操作不受影响。内置授权与从未准入的工具返回 None。
+    fn binding_epoch(&self, _tool_name: &str) -> Option<u64> {
+        None
+    }
     /// 在本映射下推导一次调用的具体效果意图。所有消费方（审批门、
     /// 租约铸造、提交检查）共用这一份推导，不会漂移。
     fn effect_intent(&self, call: &ToolCall, spec: &ToolSpec) -> EffectIntent {

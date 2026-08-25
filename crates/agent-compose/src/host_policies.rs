@@ -2,6 +2,7 @@
 //! 的插件绑定经准入安装——清单请求本身永远不等于授权。同一实例必须
 //! 同时交给内核配置与审批门，两边才不会漂移。
 
+use std::collections::HashMap;
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicU64, Ordering},
@@ -15,11 +16,16 @@ pub struct HostToolPolicyRegistry {
     builtins: Vec<HostToolPolicy>,
     /// 运维准入的插件绑定。
     admitted: Vec<HostToolPolicy>,
-    /// 版本化快照缓存（M12 P0）：`admit` 后失效，下一次
+    /// 版本化快照缓存：`admit` 后失效，下一次
     /// [`Self::resolve_policy`] 以递增 revision 重建。消费方持有
     /// Arc 并绑定 revision；revision 变化即策略已换版。
     snapshot: RwLock<Option<Arc<HostPolicySnapshot>>>,
     revision: AtomicU64,
+    /// 每个准入绑定的当前纪元：安装时分配新值、撤销时移除。租约
+    /// 签发时盖章，提交期失配即按该绑定围栏——与快照 revision
+    /// （表身份，防重释）语义分离，纪元从不承担表身份职责。
+    binding_epochs: std::sync::Mutex<HashMap<String, u64>>,
+    next_binding_epoch: AtomicU64,
 }
 
 impl HostToolPolicyRegistry {
@@ -56,6 +62,8 @@ impl HostToolPolicyRegistry {
             admitted: Vec::new(),
             snapshot: RwLock::new(None),
             revision: AtomicU64::new(1),
+            binding_epochs: std::sync::Mutex::new(HashMap::new()),
+            next_binding_epoch: AtomicU64::new(1),
         })
     }
 
@@ -66,15 +74,26 @@ impl HostToolPolicyRegistry {
     }
 
     /// 安装一条运维审核过的插件绑定。撞内置名或重复准入一律失败：
-    /// 内置工具的授权不重新下放。成功后使快照失效。
+    /// 内置工具的授权不重新下放。成功后使快照失效并为绑定分配新纪元。
     pub fn admit(&mut self, policy: HostToolPolicy) -> Result<(), String> {
         self.ensure_admissible(&policy)?;
+        let tool_name = policy.tool_name.clone();
         self.admitted.push(policy);
+        self.assign_binding_epoch(&tool_name);
         *self
             .snapshot
             .write()
             .expect("host policy snapshot poisoned") = None;
         Ok(())
+    }
+
+    /// 为刚安装的绑定分配当前纪元：每次（重）安装都是新值。
+    fn assign_binding_epoch(&self, tool_name: &str) {
+        let epoch = self.next_binding_epoch.fetch_add(1, Ordering::Relaxed);
+        self.binding_epochs
+            .lock()
+            .expect("binding epochs poisoned")
+            .insert(tool_name.to_string(), epoch);
     }
 
     /// 准入前的共享检查：撞内置名或重复准入一律拒绝。批量准入先对
@@ -127,7 +146,10 @@ impl HostToolPolicyRegistry {
             self.ensure_admissible(policy)?;
         }
         let count = policies.len();
-        self.admitted.extend(policies);
+        for policy in &policies {
+            self.admitted.push(policy.clone());
+            self.assign_binding_epoch(&policy.tool_name);
+        }
         *self
             .snapshot
             .write()
@@ -136,8 +158,9 @@ impl HostToolPolicyRegistry {
     }
 
     /// 撤销一条运维准入的绑定：内置授权不可撤销，未准入的名字报错。
-    /// 撤销推进快照版本——此后解析的新操作不再看到该工具的宿主授权；
-    /// 已批准的在途操作仍持旧快照，不被重释。
+    /// 撤销移除该绑定的纪元——此后解析的新操作不再看到宿主授权，而
+    /// 盖着旧纪元的在途租约在提交期按该绑定围栏；已批准的操作仍持
+    /// 旧快照，不被重释。
     pub fn revoke_admitted(&mut self, tool_name: &str) -> Result<(), String> {
         if self.builtins.iter().any(|p| p.tool_name == tool_name) {
             return Err(format!(
@@ -151,6 +174,10 @@ impl HostToolPolicyRegistry {
                 "tool '{tool_name}' has no admitted binding to revoke"
             ));
         }
+        self.binding_epochs
+            .lock()
+            .expect("binding epochs poisoned")
+            .remove(tool_name);
         *self
             .snapshot
             .write()
@@ -205,6 +232,14 @@ impl HostToolPolicies for HostToolPolicyRegistry {
 
     fn policy_revision(&self) -> Option<u64> {
         Some(self.resolve_policy().revision())
+    }
+
+    fn binding_epoch(&self, tool_name: &str) -> Option<u64> {
+        self.binding_epochs
+            .lock()
+            .expect("binding epochs poisoned")
+            .get(tool_name)
+            .copied()
     }
 }
 
@@ -455,5 +490,39 @@ mod tests {
         let shared = HostToolPolicyRegistry::with_builtins().shared();
         let second: Arc<dyn HostToolPolicies> = shared.clone();
         assert!(second.policy_for("edit.patch").is_some());
+    }
+
+    /// 绑定纪元按工具隔离：其他绑定的安装不改变本绑定纪元；撤销
+    /// 移除它，重装得到不同新值。内置授权永无纪元。
+    #[test]
+    fn binding_epochs_are_per_binding_and_survive_only_until_revocation() {
+        let mut registry = HostToolPolicyRegistry::with_builtins();
+        assert_eq!(registry.binding_epoch("fs.write"), None);
+
+        registry.admit(write_binding()).unwrap();
+        let first = registry.binding_epoch("plugin.notes.write");
+        assert!(first.is_some(), "admission assigns an epoch");
+
+        registry
+            .admit_reviewed(
+                &["plugin.cache.clear".to_string()],
+                vec![HostToolPolicy {
+                    tool_name: "plugin.cache.clear".into(),
+                    binding: HostEffectBinding::ReadOnly,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            registry.binding_epoch("plugin.notes.write"),
+            first,
+            "another tool's admission must not move this binding's epoch"
+        );
+
+        registry.revoke_admitted("plugin.notes.write").unwrap();
+        assert_eq!(registry.binding_epoch("plugin.notes.write"), None);
+
+        registry.admit(write_binding()).unwrap();
+        let second = registry.binding_epoch("plugin.notes.write");
+        assert_ne!(second, first, "a re-admitted binding gets a new epoch");
     }
 }
