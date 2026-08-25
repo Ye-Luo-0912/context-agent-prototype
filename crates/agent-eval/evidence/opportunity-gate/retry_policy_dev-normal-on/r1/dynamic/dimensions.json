@@ -1,0 +1,15 @@
+{
+  "allowed_diff": "pass",
+  "behavioral_oracle": "fail",
+  "completion_opportunity": "on",
+  "continuation": "n/a",
+  "final_passed": false,
+  "mode": "normal",
+  "opportunity_called": true,
+  "opportunity_offers": [],
+  "provider_runtime": "healthy",
+  "runtime_error": null,
+  "schema": "retry-pilot-cell-v2",
+  "task_closure": "completed",
+  "workspace_self_check": "pass"
+}

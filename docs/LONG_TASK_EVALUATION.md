@@ -524,7 +524,14 @@ durable mutation plus one real registered-recipe `verify.run` pass under an
 unchanged basis yields exactly one offer, and the leased decision closes the
 task through `task.complete` alone; with the candidate disabled the identical
 script emits zero opportunity events and never surfaces the tool. The item-8
-off/on paired live promotion gate itself has not run.
+off/on paired live promotion gate itself ran on 2026-08-25 (8 cells,
+`evidence/opportunity-gate/REPORT.md`) and **failed to promote**: zero offers
+armed in every on-cell because discovered live verifiers are TaskScoped by
+design and never carry an exact identity, so the fail-closed positive-evidence
+precondition is structurally unreachable on this fixture today. The candidate
+stays off; making the gate measurable requires a host-registered
+source-read-only ExactCurrentWorld recipe for the fixture, which remains a
+separate gated decision.
 
 ### Slice D — one complete durable checkpoint boundary
 
