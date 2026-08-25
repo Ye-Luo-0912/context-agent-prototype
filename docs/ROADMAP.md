@@ -46,9 +46,11 @@ in parallel, but it does not reorder or close either gate.
    settlement. This supports the current path but is not formal acceptance or
    a general failure-rate estimate. Next run the unchanged frozen pack on a
    clean source tree. Core-managed prepare crash seams after authority intent,
-   stage sync, and review record now have bounded fail-closed unit coverage;
-   next extend external-race, abrupt-process, disk/journal fault, partial-batch
-   fixtures and staged-byte accounting before broader filesystem reliability
+   stage sync, and review record now have bounded fail-closed unit coverage,
+   and abrupt OS-level kills during prepare and right after commit are
+   exercised through a real child process whose staged-byte frames survive
+   the death; next extend external-race, disk/journal fault, and abrupt
+   partial-batch fixtures before broader filesystem reliability
    claims. Do not turn expected stale refusal into a first-attempt
    defect: grade the bounded read→stale→reread→retry state machine. Unit fixes
    or this diagnostic alone do not close M12, M13, or M15.
