@@ -923,3 +923,273 @@ async fn focus_switch_clears_previous_tasks_raw_assistant_evidence() {
     );
     instance.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// One-shot and terminal-safety proofs for *accepted* completions,
+// independent of any long-flow baseline (CONV-04): the retained runs had
+// zero completion calls, so these properties need their own deterministic
+// evidence through the real actor.
+// ---------------------------------------------------------------------------
+
+/// One model decision per script entry.
+#[derive(Debug)]
+enum CompletionRound {
+    /// Call `task.complete` with this summary.
+    Complete(&'static str),
+    /// A plain final answer with no tool calls.
+    Plain(&'static str),
+}
+
+/// Plays its script round by round and panics if the runtime asks for a
+/// decision the script does not contain — an extra round after an accepted
+/// completion would be exactly such a violation.
+#[derive(Debug)]
+struct ScriptedCompletionModel {
+    script: Vec<CompletionRound>,
+    rounds: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for ScriptedCompletionModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let Some(decision) = self.script.get(round) else {
+            panic!("the runtime requested model round {round} beyond the script");
+        };
+        Ok(match decision {
+            CompletionRound::Complete(summary) => ModelOutput {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: format!("call-{round}"),
+                    name: "task.complete".into(),
+                    arguments: json!({"summary": summary, "artifacts": []}),
+                }],
+                usage: Default::default(),
+            },
+            CompletionRound::Plain(text) => ModelOutput {
+                content: (*text).into(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+            },
+        })
+    }
+}
+
+async fn completion_services(
+    dir: &tempfile::TempDir,
+    model: Arc<ScriptedCompletionModel>,
+) -> RuntimeServices {
+    let workspace = Arc::new(agent_workspace::Workspace::open(dir.path()).await.unwrap());
+    RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        model,
+        Arc::new(CompletionToolDispatcher {
+            workspace: Some((*workspace).clone()),
+        }),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    )
+    .with_artifact_workspace(workspace)
+}
+
+/// Two `task.complete` calls in one successful batch must commit exactly
+/// one CompletionRecord. The typed proposal slot holds the last accepted
+/// proposal of the batch, so "second" wins; whatever the order, one-shot
+/// storage is the terminal-safety contract under proof.
+#[tokio::test]
+async fn duplicate_completions_in_one_batch_commit_exactly_one_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedCompletionModel {
+        script: vec![
+            CompletionRound::Complete("first"),
+            CompletionRound::Complete("second"),
+        ],
+        rounds: AtomicUsize::new(0),
+    });
+    let services = completion_services(&dir, model.clone()).await;
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    instance.start().await.unwrap();
+    handle.user_message("finish the work".into()).await.unwrap();
+
+    // The TaskCompleted event lands after TurnCompleted at the safe point,
+    // so waiting for it implies the whole commit transaction ran.
+    let mut summaries_seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match tokio::time::timeout(Duration::from_millis(50), events.recv()).await {
+            Ok(Ok(envelope)) => {
+                if let RuntimeEvent::TaskCompleted { summary, .. } = &envelope.event {
+                    summaries_seen.push(summary.clone());
+                }
+            }
+            _ => assert!(
+                tokio::time::Instant::now() < deadline,
+                "the duplicated completion never committed"
+            ),
+        }
+        if !summaries_seen.is_empty() {
+            break;
+        }
+    }
+    // Quiesce and prove nothing else rides past acceptance.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    while let Ok(envelope) = events.try_recv() {
+        if let RuntimeEvent::TaskCompleted { summary, .. } = &envelope.event {
+            summaries_seen.push(summary.clone());
+        }
+        assert!(
+            !matches!(envelope.event, RuntimeEvent::RecoveryRequired),
+            "a duplicated batch must never fence the runtime: {:?}",
+            envelope.event
+        );
+    }
+    assert_eq!(
+        summaries_seen.len(),
+        1,
+        "one batch owns at most one committed completion record"
+    );
+    assert!(
+        summaries_seen[0] == "first" || summaries_seen[0] == "second",
+        "the committed record must be one of the batch's accepted proposals, got {:?}",
+        summaries_seen[0]
+    );
+    // Which of two concurrently settling proposals wins the single slot is
+    // unspecified; what matters for terminal safety is that exactly one
+    // durable record exists and the turn still ends without another round.
+
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert_eq!(
+        checkpoint.tasks.completed.len(),
+        1,
+        "exactly one durable CompletionRecord exists"
+    );
+    assert_eq!(
+        model.rounds.load(Ordering::SeqCst),
+        1,
+        "an accepted completion is already the terminal decision — no next round"
+    );
+    instance.shutdown().await.unwrap();
+}
+
+/// An accepted completion stays terminal for its own turn while a queued
+/// user message still drains into a clean follow-up turn: no duplicate
+/// record, no error, no recovery fence.
+#[tokio::test]
+async fn an_accepted_completion_leaves_a_clean_turn_for_queued_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedCompletionModel {
+        script: vec![
+            CompletionRound::Complete("done once"),
+            CompletionRound::Plain("next"),
+        ],
+        rounds: AtomicUsize::new(0),
+    });
+    let services = completion_services(&dir, model.clone()).await;
+    let instance = RuntimeInstance::spawn(ModuleHost::new(), services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    instance.start().await.unwrap();
+    handle.user_message("finish the work".into()).await.unwrap();
+    // Queued before the first turn finishes: it must drain into a fresh
+    // turn after the one-shot completion, not ride along inside it.
+    handle
+        .user_message("and then continue".into())
+        .await
+        .unwrap();
+
+    // One continuous collection pass covers the whole run: the first
+    // TurnCompleted may land before the TaskCompleted event, so counters
+    // must exist before either arrives.
+    let mut turn_completed_events = 0usize;
+    let mut task_completed_events = 0usize;
+    let mut accepted_input_bodies = std::collections::HashSet::new();
+    let mut failures = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        match tokio::time::timeout(Duration::from_millis(100), events.recv()).await {
+            Ok(Ok(envelope)) => match &envelope.event {
+                RuntimeEvent::TurnCompleted => turn_completed_events += 1,
+                RuntimeEvent::TaskCompleted { .. } => task_completed_events += 1,
+                // One input is accounted at queue time and again when it
+                // drains, so count distinct bodies.
+                RuntimeEvent::UserMessageAccepted { input } => {
+                    accepted_input_bodies.insert(input.preview.clone());
+                }
+                RuntimeEvent::RecoveryRequired | RuntimeEvent::Error { .. } => {
+                    failures.push(format!("{:?}", envelope.event))
+                }
+                _ => {}
+            },
+            Ok(Err(error)) => {
+                // A lagged subscriber silently losing events would fake a
+                // terminal-safety violation; surface it instead.
+                failures.push(format!("event stream error: {error}"));
+            }
+            Err(_) => {}
+        }
+        if task_completed_events >= 1 && turn_completed_events >= 2 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    // Quiesce before counting.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    loop {
+        match events.try_recv() {
+            Ok(envelope) => match &envelope.event {
+                RuntimeEvent::TurnCompleted => turn_completed_events += 1,
+                RuntimeEvent::TaskCompleted { .. } => task_completed_events += 1,
+                RuntimeEvent::UserMessageAccepted { input } => {
+                    accepted_input_bodies.insert(input.preview.clone());
+                }
+                RuntimeEvent::RecoveryRequired | RuntimeEvent::Error { .. } => {
+                    failures.push(format!("{:?}", envelope.event))
+                }
+                _ => {}
+            },
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                failures.push(format!("event stream lagged; {skipped} events dropped"));
+            }
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        accepted_input_bodies.len(),
+        2,
+        "both queued messages must be accounted for by the input ledger"
+    );
+    assert_eq!(
+        turn_completed_events, 2,
+        "the queued input must drain into a follow-up turn (tasks={task_completed_events}, failures={failures:?})"
+    );
+    assert_eq!(
+        task_completed_events, 1,
+        "only the accepted completion commits a record — the plain follow-up turn must not"
+    );
+    assert!(
+        failures.is_empty(),
+        "terminal safety means no errors or fences around the edge: {failures:?}"
+    );
+
+    let checkpoint = instance.checkpoint().await.unwrap();
+    assert_eq!(
+        checkpoint.tasks.completed.len(),
+        1,
+        "the completed-task catalog holds exactly the one accepted record"
+    );
+    assert_eq!(
+        model.rounds.load(Ordering::SeqCst),
+        2,
+        "one terminal decision per turn, nothing more"
+    );
+    instance.shutdown().await.unwrap();
+}

@@ -723,9 +723,18 @@ Open implementation must remain execution-only and staged:
   with exact per-call counts, keeps live settle-time missing/unexpected
   terminals as a separate integrity signal, and ignores tool events outside
   any model round instead of inventing attributions;
-- independently make accepted completion one-shot and terminal-safe; the
-  retained baseline has zero completion calls, so this cannot be presented as
-  the cause of its 49/65 versus 38/29 gap.
+- independently make accepted completion one-shot and terminal-safe.
+  Landed 2026-08-26 as a deterministic proof matrix through the real actor,
+  independent of the retained baseline (whose zero completion calls proved
+  nothing): duplicate `task.complete` proposals inside one successful batch
+  commit exactly one durable record (which concurrently-settling proposal
+  wins the single slot is unspecified; uniqueness, no extra model round, and
+  no fence are the contract), and an accepted completion stays terminal for
+  its own turn while queued user input still drains into a clean follow-up
+  turn with exactly one TaskCompleted, per-turn TurnCompleted events, and a
+  completed-task catalog holding exactly the accepted record. The retained
+  baseline still has zero completion calls, so its 49/65 versus 38/29 gap
+  must not be attributed to this edge either way.
 
 Do not lower the 18 KiB watermark globally, choose a call cutoff from this one
 trace, parse arbitrary command strings to infer read-only/verification, or add
