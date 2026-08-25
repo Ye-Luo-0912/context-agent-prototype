@@ -145,8 +145,11 @@ What remains before a decision-grade rerun:
 1. the rare arming rate — models rarely re-verify after their last mutation
    with nothing else pending; whether to surface verification demand
    differently is a gated design question, not something this report changes;
-2. the journal-lock flake on checkpoint artifact load (resume/off r1) must
-   be fixed or made retryable, because it censors cells asymmetrically;
-3. more paired repeats once both hold, since n=2 medians stay noise-dominated.
+2. ~~the journal-lock flake on checkpoint artifact load~~ fixed
+   (2026-08-25): `WorkspaceEffectJournal::open` now retries the exclusive
+   lock with bounded backoff, since a predecessor runtime releases its
+   handle asynchronously and a quick reopen raced that window;
+3. more paired repeats once (1) is decided, since n=2 medians stay
+   noise-dominated.
 Whether general discovered runners should ever be upgraded is a separate,
 gated decision; this report does not propose retuning them.

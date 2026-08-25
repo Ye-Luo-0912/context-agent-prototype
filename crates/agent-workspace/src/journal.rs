@@ -139,6 +139,14 @@ impl std::fmt::Debug for WorkspaceEffectJournal {
 }
 
 impl WorkspaceEffectJournal {
+    /// Transient contention window for the exclusive journal lock: a
+    /// predecessor runtime releases its handle asynchronously (detached
+    /// writer tasks drop their `Arc`s shortly after shutdown), so a quick
+    /// reopen must retry briefly instead of failing fast. Bounded and off
+    /// any hot path — this runs once per `Workspace::open`.
+    const LOCK_RETRY_ATTEMPTS: u32 = 20;
+    const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
     pub(crate) fn open(authority_dir: ConfinedDir) -> AgentResult<Self> {
         let path = authority_dir.display().join("workspace-effects.jsonl");
         let existed = authority_dir
@@ -152,12 +160,29 @@ impl WorkspaceEffectJournal {
                     path.display()
                 ))
             })?;
-        file.try_lock().map_err(|error| {
-            AgentError::Storage(format!(
-                "lock workspace effect journal {} exclusively: {error}",
-                path.display()
-            ))
-        })?;
+        let mut lock_error = None;
+        for attempt in 0..Self::LOCK_RETRY_ATTEMPTS {
+            match file.try_lock() {
+                Ok(()) => {
+                    lock_error = None;
+                    break;
+                }
+                Err(error) => {
+                    lock_error = Some(error);
+                    if attempt + 1 < Self::LOCK_RETRY_ATTEMPTS {
+                        std::thread::sleep(Self::LOCK_RETRY_DELAY);
+                    }
+                }
+            }
+        }
+        if let Some(error) = lock_error {
+            return Err(AgentError::Storage(format!(
+                "lock workspace effect journal {} exclusively: {error} \
+                 (still contested after {} retries)",
+                path.display(),
+                Self::LOCK_RETRY_ATTEMPTS
+            )));
+        }
         if !existed {
             file.sync_all().map_err(|error| {
                 AgentError::Storage(format!(
@@ -1648,6 +1673,32 @@ mod tests {
             budget.charge(1),
             Err(AgentError::RecoveryRequired(_))
         ));
+    }
+
+    #[test]
+    fn open_retries_until_a_just_released_predecessor_lock_clears() {
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().unwrap();
+        let predecessor = {
+            let authority = ConfinedDir::open_root(directory.path()).unwrap();
+            WorkspaceEffectJournal::open(authority).unwrap()
+        };
+        // Release from another thread after a bounded delay, so the reopen
+        // can only succeed through the retry path.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(predecessor);
+        });
+        let started = Instant::now();
+        let authority = ConfinedDir::open_root(directory.path()).unwrap();
+        let reopened = WorkspaceEffectJournal::open(authority);
+        releaser.join().unwrap();
+        reopened.expect("reopen must succeed once the predecessor releases");
+        assert!(
+            started.elapsed() >= Duration::from_millis(140),
+            "success before release would mean the lock was not exclusive"
+        );
     }
 
     #[test]
