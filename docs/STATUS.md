@@ -556,8 +556,10 @@ prevents *reinterpretation* of approved operations, while the explicit
 binding revocation epoch is the only mechanism that may fence live
 leases — one revision field must not carry both meanings.
 Remaining for M12 closure: the out-of-process coordinator transport
-implementing reserve/dispatch/ack plus crash reconciliation of
-broker-owned reservations.
+implementing reserve/dispatch/ack over a wire protocol; its required
+durability and reconciliation contract already exists as the in-process
+`JournaledEffectBroker` reference (journal-before-act phases, startup
+reconciliation consultation).
 Do not build a second registry. Attestation is actual enforced
 capabilities; generic process tools stay non-transactional.
 UntrustedGenerated stays fail-closed on native. Multi-file

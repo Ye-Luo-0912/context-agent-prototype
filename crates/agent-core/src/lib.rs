@@ -1,5 +1,6 @@
 mod approval;
 mod authority;
+mod broker;
 mod capability_admission;
 mod capability_state;
 mod kernel;
@@ -13,6 +14,7 @@ pub use approval::{
     TaskApprovalGate,
 };
 pub use authority::ApprovalVerdict;
+pub use broker::JournaledEffectBroker;
 pub use capability_admission::{
     AdmissionContext, CapabilityAdmission, MAX_TOOL_DESCRIPTION_CHARS, MAX_TOOL_NAME_CHARS,
     MAX_TOOL_SCHEMA_BYTES, MAX_TOOLS_PER_CAPABILITY,

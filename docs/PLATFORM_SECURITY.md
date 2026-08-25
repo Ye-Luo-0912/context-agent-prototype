@@ -155,9 +155,17 @@ NotApplied as a `BrokerUnavailable` rejection), `dispatch` applies the
 prepared effect exactly once under its reservation, and `ack` reports the
 outcome without ever rolling an applied effect back. The default local
 broker preserves inline behavior byte-for-byte; the operation terminal
-record remains the durability barrier. A future HTTP/gRPC coordinator
-implements the same three calls against this trait — that transport, plus
-crash reconciliation of broker-owned reservations, is still M12 work.
+record remains the durability barrier. `JournaledEffectBroker` wraps any
+inner broker and journals every phase before acting — reserve after the
+inner id is assigned, dispatch BEFORE applying (its crash window can only
+be Ambiguous; a journal refusal rolls the staged effect back and reports
+NotApplied), ack before forwarding — so broker-owned reservations survive a
+Core crash: startup reconciliation consults `EffectBroker::reconcile_reservation`
+whenever the workspace adapter answers NotManaged, reusing the same
+reconciliation enum (reserved-not-dispatched → NotApplied, dispatched-unacked
+→ Ambiguous, acked → Applied/NotApplied, identity drift → Ambiguous).
+Remaining M12 work is the out-of-process coordinator transport itself; its
+durability and reconciliation contract already exists in that reference.
 Do not close M12 because structured intents or the local barrier landed.
 
 ## HostLifecycle (restart)

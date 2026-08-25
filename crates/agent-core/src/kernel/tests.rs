@@ -7,7 +7,6 @@ use agent_contracts::{
     ScopeKind, SemanticState, ToolRisk, ToolSemanticRole, ToolSpec, ToolSurfaceDemand,
     ToolSurfaceOmission, ToolSurfaceOmissionReason, TurnId,
 };
-
 fn call(name: &str) -> ToolCall {
     ToolCall {
         id: "call-1".into(),
@@ -1537,4 +1536,126 @@ async fn lease_is_minted_even_when_the_shadow_gate_denies() {
         lease.intent,
         agent_contracts::shell_exec_intent("", "cargo test")
     );
+}
+
+/// 启动对账的经纪咨询面：工作区不管理该效果时，持久预留分类直接
+/// 决定终结——Ambiguous 围栏，NotApplied 无围栏地终结。
+struct ReconciliationStubBroker {
+    result: EffectReconciliation,
+}
+
+#[async_trait::async_trait]
+impl crate::port::EffectBroker for ReconciliationStubBroker {
+    async fn reserve(&self, _reservation: crate::port::EffectReservation) -> AgentResult<String> {
+        panic!("startup reconciliation never reserves")
+    }
+
+    async fn dispatch(
+        &self,
+        _reserved: crate::port::ReservedEffect,
+    ) -> agent_contracts::EffectReceipt {
+        panic!("startup reconciliation never dispatches")
+    }
+
+    async fn ack(&self, _ack: crate::port::EffectAck) -> AgentResult<()> {
+        panic!("startup reconciliation never acknowledges")
+    }
+
+    fn reconcile_reservation(
+        &self,
+        _context: &OperationEffectContext,
+    ) -> AgentResult<Option<EffectReconciliation>> {
+        Ok(Some(self.result.clone()))
+    }
+}
+
+fn registry_with_prepared_effect(
+    effect_id: EffectId,
+) -> (OperationRegistry, ToolOperationIdentity) {
+    let registry = OperationRegistry::new(DEFAULT_OPERATION_REGISTRY_CAPACITY);
+    let identity = ToolOperationIdentity {
+        run_id: RunId::new(),
+        task_id: None,
+        turn_id: TurnId::new(),
+        scope_id: None,
+        operation_id: OperationId::new(),
+        generation: 1,
+        call_id: "call-1".into(),
+        tool_name: "cap.remote".into(),
+        argument_digest: ArgumentDigest::sha256_bytes(b"args"),
+    };
+    registry.accept(identity.clone()).unwrap();
+    registry
+        .mark_executing(identity.operation_id, Some(effect_id))
+        .unwrap();
+    registry
+        .mark_prepared(identity.operation_id, effect_id)
+        .unwrap();
+    (registry, identity)
+}
+
+#[test]
+fn broker_reconciliation_fences_an_ambiguous_reserved_effect() {
+    let effect_id = EffectId::new();
+    let (registry, identity) = registry_with_prepared_effect(effect_id);
+    let broker = ReconciliationStubBroker {
+        result: EffectReconciliation::Ambiguous {
+            reason: "fixture ambiguity".into(),
+        },
+    };
+    let snapshot = match registry.query(identity.operation_id) {
+        OperationQueryResult::Found { snapshot } => snapshot,
+        other => panic!("unexpected query result: {other:?}"),
+    };
+    assert!(reconcile_recovered_effect(
+        &registry,
+        None,
+        Some(&broker as &dyn crate::port::EffectBroker),
+        *snapshot,
+        effect_id
+    ));
+    assert!(matches!(
+        registry.recovery_status(),
+        AuthorityRecoveryStatus::RecoveryRequired { .. }
+    ));
+}
+
+#[test]
+fn broker_reconciliation_settles_not_applied_without_fencing() {
+    let effect_id = EffectId::new();
+    let (registry, identity) = registry_with_prepared_effect(effect_id);
+    let broker = ReconciliationStubBroker {
+        result: EffectReconciliation::NotApplied {
+            evidence: Some("fixture: never dispatched".into()),
+        },
+    };
+    let snapshot = match registry.query(identity.operation_id) {
+        OperationQueryResult::Found { snapshot } => snapshot,
+        other => panic!("unexpected query result: {other:?}"),
+    };
+    assert!(reconcile_recovered_effect(
+        &registry,
+        None,
+        Some(&broker as &dyn crate::port::EffectBroker),
+        *snapshot,
+        effect_id
+    ));
+    assert!(matches!(
+        registry.recovery_status(),
+        AuthorityRecoveryStatus::Ready
+    ));
+    match registry.query(identity.operation_id) {
+        OperationQueryResult::Found { snapshot } => assert!(
+            matches!(
+                snapshot.state,
+                OperationState::Terminal {
+                    terminal: OperationTerminal::NotApplied { .. },
+                    ..
+                }
+            ),
+            "expected a NotApplied terminal, got {:?}",
+            snapshot.state
+        ),
+        other => panic!("unexpected query result: {other:?}"),
+    }
 }

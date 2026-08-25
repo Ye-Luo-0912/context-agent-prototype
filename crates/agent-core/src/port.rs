@@ -242,6 +242,16 @@ pub trait EffectBroker: Send + Sync {
     /// surfaced but never rolls an already-applied effect back — the
     /// operation terminal record remains Core's durability barrier.
     async fn ack(&self, ack: EffectAck) -> AgentResult<()>;
+
+    /// 崩溃后按效果身份分类本经纪的持久预留；None 表示没有可查询
+    /// 的预留面（默认实现，本地经纪即如此）。启动对账只在工作区
+    /// 对账器回答 NotManaged 时咨询它，分类直接复用对账枚举。
+    fn reconcile_reservation(
+        &self,
+        _context: &agent_contracts::OperationEffectContext,
+    ) -> AgentResult<Option<agent_contracts::EffectReconciliation>> {
+        Ok(None)
+    }
 }
 
 /// The default in-process broker: reserve derives a bounded id from the

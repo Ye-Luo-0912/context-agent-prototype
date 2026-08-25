@@ -184,11 +184,15 @@ impl CoreAuthority {
         // Fence old actors first, then fold only exact, durable effect
         // evidence. Unknown outcomes remain queryable and install a global
         // mutation fence; Core never schedules or blindly replays them.
-        reconcile_recovered_operations(&operations, effect_reconciler.as_deref());
         let broker = config
             .effect_broker
             .clone()
             .unwrap_or_else(|| Arc::new(crate::port::LocalEffectBroker));
+        reconcile_recovered_operations(
+            &operations,
+            effect_reconciler.as_deref(),
+            Some(broker.as_ref()),
+        );
         Ok(Self {
             run_id: RunId::new(),
             authority_epoch: AtomicU64::new(authority_epoch),
@@ -1429,6 +1433,7 @@ impl CoreAuthority {
 fn reconcile_recovered_operations(
     operations: &OperationRegistry,
     reconciler: Option<&dyn EffectReconciler>,
+    broker: Option<&dyn crate::port::EffectBroker>,
 ) {
     for snapshot in operations.recovered_snapshots() {
         let effect_id = match snapshot.state {
@@ -1472,7 +1477,7 @@ fn reconcile_recovered_operations(
             | OperationState::Prepared { effect_id }
             | OperationState::CommitStarted { effect_id } => effect_id,
         };
-        if !reconcile_recovered_effect(operations, reconciler, snapshot, effect_id) {
+        if !reconcile_recovered_effect(operations, reconciler, broker, snapshot, effect_id) {
             break;
         }
     }
@@ -1488,36 +1493,58 @@ fn reconcile_recovered_operations(
 fn reconcile_recovered_effect(
     operations: &OperationRegistry,
     reconciler: Option<&dyn EffectReconciler>,
+    broker: Option<&dyn crate::port::EffectBroker>,
     snapshot: OperationSnapshot,
     effect_id: EffectId,
 ) -> bool {
     let operation_id = snapshot.identity.operation_id;
-    let Some(reconciler) = reconciler else {
-        operations.require_recovery(format!(
-            "operation {operation_id} has unresolved effect {effect_id} and no recovery adapter"
-        ));
-        return true;
-    };
     let context = OperationEffectContext {
         identity: snapshot.identity.clone(),
         effect_id,
     };
-    let result = match reconciler.reconcile(&context) {
-        Ok(result) => {
-            if let Err(error) = result.validate() {
+    // 工作区对账器不管理该效果时，先问经纪的持久预留面；两边都给
+    // 不出证据才围栏。经纪分类直接复用同一对账枚举与校验。
+    let result = match reconciler.map(|reconciler| reconciler.reconcile(&context)) {
+        Some(Ok(EffectReconciliation::NotManaged)) | None => {
+            match broker.map(|broker| broker.reconcile_reservation(&context)) {
+                None | Some(Ok(None)) => {
+                    if reconciler.is_none() {
+                        operations.require_recovery(format!(
+                            "operation {operation_id} has unresolved effect {effect_id} and no recovery adapter"
+                        ));
+                    } else {
+                        operations.require_recovery(format!(
+                            "operation {operation_id} effect {effect_id} is not managed by the configured recovery adapter"
+                        ));
+                    }
+                    return true;
+                }
+                Some(Ok(Some(candidate))) => match candidate.validate() {
+                    Ok(()) => candidate,
+                    Err(error) => {
+                        operations.require_recovery(format!(
+                            "operation {operation_id} broker reconciliation returned invalid evidence: {error}"
+                        ));
+                        return true;
+                    }
+                },
+                Some(Err(error)) => {
+                    operations.require_recovery(format!(
+                        "operation {operation_id} effect reconciliation failed: {error}"
+                    ));
+                    return true;
+                }
+            }
+        }
+        Some(other) => match other {
+            Ok(result) => result,
+            Err(error) => {
                 operations.require_recovery(format!(
-                    "operation {operation_id} effect reconciliation returned invalid evidence: {error}"
+                    "operation {operation_id} effect reconciliation failed: {error}"
                 ));
                 return true;
             }
-            result
-        }
-        Err(error) => {
-            operations.require_recovery(format!(
-                "operation {operation_id} effect reconciliation failed: {error}"
-            ));
-            return true;
-        }
+        },
     };
     let (terminal, keep_fenced) = match result {
         EffectReconciliation::NotManaged => {
