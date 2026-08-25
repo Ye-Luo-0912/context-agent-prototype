@@ -129,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
         project_task_progress: true,
         project_completion_opportunity: false,
         host_policies: Some(host_policies),
+        effect_reservation_journal: None,
     })
     .await?;
     let mut runtime_events = composed.subscribe();

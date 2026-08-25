@@ -30,7 +30,8 @@ pub use plugin_admission::{
 };
 pub use plugin_state::PluginStateAuthority;
 pub use port::{
-    AdmittedToolPermit, CorePort, CoreToolExecution, EffectCommitDisposition,
-    EffectCommitRejection, EffectCommitRequest, EffectRollbackRequest, OperationCancelDisposition,
-    PublishedToolPermit, ToolOperationAdmission, build_core_port, try_build_core_port,
+    AdmittedToolPermit, CorePort, CoreToolExecution, EffectBroker, EffectCommitDisposition,
+    EffectCommitRejection, EffectCommitRequest, EffectRollbackRequest, LocalEffectBroker,
+    OperationCancelDisposition, PublishedToolPermit, ToolOperationAdmission, build_core_port,
+    try_build_core_port,
 };

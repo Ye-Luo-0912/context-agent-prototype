@@ -214,6 +214,9 @@ pub struct ComposeConfig {
     /// 受信的宿主授权注册表。缺省只装内置表；插件工具没有条目就没有
     /// 授权，保持 fail-closed。同一来源接入内核配置与能力分发器。
     pub host_policies: Option<Arc<HostToolPolicyRegistry>>,
+    /// 预留日志开关（默认关）：给出路径后，每个已批准效果跨持久
+    /// 三相屏障，崩溃后启动对账可咨询经纪预留面。晋级语义不变。
+    pub effect_reservation_journal: Option<std::path::PathBuf>,
 }
 
 /// A composed runtime. Owns the workspace and the spawned `RuntimeInstance`
@@ -270,6 +273,7 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         project_task_progress,
         project_completion_opportunity,
         host_policies,
+        effect_reservation_journal,
     } = config;
 
     // 授权映射是组合根的决定：内置表加运维准入的插件绑定，内核与
@@ -329,6 +333,15 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
     };
     if let Some(max_tool_rounds) = max_tool_rounds {
         authority.max_tool_rounds = max_tool_rounds;
+    }
+    // 预留日志开关（默认关）：开启后每个已批准效果跨持久三相屏障，
+    // 崩溃后启动对账可咨询经纪预留面；关闭时保持内联行为不变。
+    if let Some(journal_path) = effect_reservation_journal {
+        let journaled = agent_core::JournaledEffectBroker::open(
+            Arc::new(agent_core::LocalEffectBroker),
+            &journal_path,
+        )?;
+        authority.effect_broker = Some(Arc::new(journaled));
     }
     let mut services = RuntimeServices::from_registry_with_operation_journal(
         host.registry(),

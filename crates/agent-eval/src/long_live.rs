@@ -662,6 +662,7 @@ async fn compose_cell(
             )
             .map_err(anyhow::Error::msg)?,
         )),
+        effect_reservation_journal: None,
     })
     .await?;
     composed.instance.start().await?;

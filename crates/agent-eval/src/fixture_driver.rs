@@ -1112,6 +1112,7 @@ async fn run_workspace_session_harness_ops(
             )
             .map_err(anyhow::Error::msg)?,
         )),
+        effect_reservation_journal: None,
     })
     .await?;
     let mut events = composed.subscribe();
