@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use agent_contracts::{
     ArgumentDigest, EffectId, OperationEffectContext, OperationId, RunId, ToolOperationIdentity,
@@ -201,4 +202,73 @@ async fn abrupt_kill_mid_batch_reports_applied_but_incomplete_and_cleans_the_rem
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn a_second_official_process_is_refused_while_the_first_holds_the_journal() {
+    let directory = tempfile::tempdir().unwrap();
+    let signals = tempfile::tempdir().unwrap();
+    let holder = Workspace::open(directory.path()).await.unwrap();
+
+    // The probe retries for the bounded window, then must fail closed with
+    // the exhaustion message instead of sharing or bypassing the lock.
+    let program = crash_probe().expect("crash_probe builds with this package");
+    let output = Command::new(program)
+        .arg(directory.path())
+        .arg("hold")
+        .env("WORKSPACE_CRASH_HELD", signals.path().join("held.flag"))
+        .env("WORKSPACE_CRASH_RELEASE", signals.path().join("release.flag"))
+        .output()
+        .expect("spawn crash_probe");
+    assert!(
+        !output.status.success(),
+        "a second official writer must be refused while the journal is held"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("still contested"),
+        "expected bounded-lock exhaustion, got: {stderr}"
+    );
+
+    // Once the in-process holder drops, an official reopen wins.
+    drop(holder);
+    Workspace::open(directory.path()).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_open_wins_its_retry_window_when_a_process_predecessor_releases() {
+    let directory = tempfile::tempdir().unwrap();
+    let signals = tempfile::tempdir().unwrap();
+    let held_flag = signals.path().join("held.flag");
+    let release_flag = signals.path().join("release.flag");
+
+    let program = crash_probe().expect("crash_probe builds with this package");
+    let mut child = Command::new(program)
+        .arg(directory.path())
+        .arg("hold")
+        .env("WORKSPACE_CRASH_HELD", &held_flag)
+        .env("WORKSPACE_CRASH_RELEASE", &release_flag)
+        .spawn()
+        .expect("spawn crash_probe");
+
+    // Wait until the probe provably owns the lock before sequencing the
+    // release, so the ordering never depends on process startup speed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !held_flag.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the predecessor never acquired the journal lock"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::write(&release_flag, b"release").unwrap();
+
+    // The predecessor releases asynchronously; the official open must win
+    // inside its bounded retry window instead of failing fast.
+    let reopened = Workspace::open(directory.path()).await.unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "the releasing predecessor must exit cleanly"
+    );
+    drop(reopened);
 }

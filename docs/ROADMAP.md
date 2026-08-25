@@ -49,8 +49,11 @@ in parallel, but it does not reorder or close either gate.
    stage sync, and review record now have bounded fail-closed unit coverage,
    and abrupt OS-level kills during prepare, right after commit, and
    mid-batch are exercised through a real child process whose staged-byte
-   frames survive the death; next extend external-race and disk/journal
-   fault fixtures before broader filesystem reliability
+   frames survive the death; cross-process external races (a refused second
+   official writer and a retry-window lock handoff) and mid-journal
+   corruption or checksum-valid sequence gaps have deterministic fail-closed
+   fixtures; portable disk-full injection still needs a storage seam before
+   broader filesystem reliability
    claims. Do not turn expected stale refusal into a first-attempt
    defect: grade the bounded read→stale→reread→retry state machine. Unit fixes
    or this diagnostic alone do not close M12, M13, or M15.

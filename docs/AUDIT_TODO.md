@@ -377,8 +377,12 @@ Confirmed residuals:
 - the r4 live diagnostic did not exercise external-process races, process
   crash, disk-full/journal failures, or partial multi-file recovery, and does
   not yet aggregate staged bytes. Deterministic unit tests now cover three
-  Core-managed prepare crash seams and conservative stage cleanup, but broader
-  process/fault fixtures remain open. A successful edit currently performs the snapshot
+  Core-managed prepare crash seams and conservative stage cleanup; real
+  child-process fixtures cover abrupt kills at prepare, right after commit,
+  and mid-batch (staged-byte frames verified intact), cross-process journal-
+  lock races (refused second official writer, retry-window handoff), and
+  mid-journal corruption plus checksum-valid sequence gaps. Portable
+  disk-full injection remains open behind a storage seam. A successful edit currently performs the snapshot
   plus repeated bounded full-file integrity hashes; treat that as a candidate
   measurement, not an established performance hotspot.
 

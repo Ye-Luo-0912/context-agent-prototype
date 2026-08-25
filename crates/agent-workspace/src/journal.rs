@@ -1733,4 +1733,103 @@ mod tests {
         ));
         assert_eq!(file.metadata().unwrap().len(), MAX_FILE_BYTES);
     }
+
+    #[tokio::test]
+    async fn middle_frame_corruption_fails_closed_and_preserves_the_file() {
+        let (workspace, directory) = workspace().await;
+        let first_context = context();
+        let second_context = context();
+        let first = workspace
+            .begin_mutation("fs.write", "write", "value.txt")
+            .await
+            .unwrap()
+            .prepare_with_effect_context(b"one", first_context)
+            .await
+            .unwrap();
+        first.simulate_process_exit();
+        let second = workspace
+            .begin_mutation("fs.write", "write", "other.txt")
+            .await
+            .unwrap()
+            .prepare_with_effect_context(b"two", second_context)
+            .await
+            .unwrap();
+        second.simulate_process_exit();
+        drop(workspace);
+
+        let path = directory
+            .path()
+            .join(".focus-agent/authority/workspace-effects.jsonl");
+        // Flip one byte of the FIRST frame's checksum while the trailing
+        // frame stays valid: recovery must refuse instead of silently
+        // truncating the tail back to the damaged frame.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let first_line_end = bytes.iter().position(|&byte| byte == b'\n').unwrap();
+        let mark = b"\"checksum\":\"".len();
+        let checksum_start = bytes[..first_line_end]
+            .windows(mark)
+            .position(|window| window == b"\"checksum\":\"")
+            .expect("first frame carries a checksum field")
+            + mark;
+        bytes[checksum_start] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+
+        for _ in 0..2 {
+            assert!(matches!(
+                Workspace::open(directory.path()).await,
+                Err(AgentError::RecoveryRequired(_))
+            ));
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                bytes.len() as u64,
+                "a refused open must never rewrite the journal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sequence_gap_with_valid_checksums_refuses_recovery() {
+        let (workspace, directory) = workspace().await;
+        let context = context();
+        let prepared = workspace
+            .begin_mutation("fs.write", "write", "value.txt")
+            .await
+            .unwrap()
+            .prepare_with_effect_context(b"new", context)
+            .await
+            .unwrap();
+        let tx_id = prepared.tx_id.clone();
+        prepared.simulate_process_exit();
+        drop(workspace);
+
+        // Handcraft a syntactically valid record whose sequence skips
+        // ahead: a recomputed checksum must not buy a broken history.
+        let path = directory
+            .path()
+            .join(".focus-agent/authority/workspace-effects.jsonl");
+        let gap = JournalRecord {
+            version: JOURNAL_VERSION,
+            seq: 3,
+            transition: JournalTransition::Committed { tx_id },
+        };
+        let payload = serde_json::to_vec(&gap).unwrap();
+        let frame = StoredFrame {
+            checksum: checksum_hex(&payload),
+            record: gap,
+        };
+        let mut encoded = serde_json::to_vec(&frame).unwrap();
+        encoded.push(b'\n');
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&encoded)
+            .unwrap();
+
+        let error = Workspace::open(directory.path()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("non-contiguous sequence"),
+            "a valid-checksum history gap must fail closed: {error}"
+        );
+    }
 }
