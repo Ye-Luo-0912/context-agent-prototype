@@ -354,6 +354,88 @@ impl SandboxProfile {
     }
 }
 
+/// Bound on one flag's proof text; longer explanations belong in docs,
+/// not in spawn-critical attestation payloads.
+pub const MAX_SANDBOX_PROOF_CHARS: usize = 200;
+/// Bound on the backend / backend-version labels.
+pub const MAX_SANDBOX_BACKEND_CHARS: usize = 64;
+
+/// Per-flag proof of *how* each enforced capability is realized. A `true`
+/// boolean without matching proof fails [`Self::consistent_with`] — a
+/// boolean must never claim a stronger OS guarantee than it delivers
+/// (`fs_write_confined` names its mechanism, `memory_quota` carries its
+/// byte limit).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxEvidence {
+    pub fs_read_confined: Option<String>,
+    pub fs_write_confined: Option<String>,
+    pub tcp_connect_denied: Option<String>,
+    pub udp_denied: Option<String>,
+    pub unix_socket_denied: Option<String>,
+    pub process_count_quota: Option<String>,
+    pub signal_scoped: Option<String>,
+    pub cpu_quota: Option<String>,
+    pub memory_quota: Option<String>,
+    pub fd_quota: Option<String>,
+}
+
+impl SandboxEvidence {
+    fn proof_ok(proof: &Option<String>, flag: bool) -> bool {
+        match proof {
+            Some(text) => {
+                flag && !text.is_empty() && text.chars().count() <= MAX_SANDBOX_PROOF_CHARS
+            }
+            None => !flag,
+        }
+    }
+
+    /// Every true flag carries bounded non-empty proof; every false flag
+    /// carries none. Unattested-but-true is a contradiction this type
+    /// refuses to represent.
+    pub fn consistent_with(&self, caps: &SandboxCapabilities) -> bool {
+        Self::proof_ok(&self.fs_read_confined, caps.fs_read_confined)
+            && Self::proof_ok(&self.fs_write_confined, caps.fs_write_confined)
+            && Self::proof_ok(&self.tcp_connect_denied, caps.tcp_connect_denied)
+            && Self::proof_ok(&self.udp_denied, caps.udp_denied)
+            && Self::proof_ok(&self.unix_socket_denied, caps.unix_socket_denied)
+            && Self::proof_ok(&self.process_count_quota, caps.process_count_quota)
+            && Self::proof_ok(&self.signal_scoped, caps.signal_scoped)
+            && Self::proof_ok(&self.cpu_quota, caps.cpu_quota)
+            && Self::proof_ok(&self.memory_quota, caps.memory_quota)
+            && Self::proof_ok(&self.fd_quota, caps.fd_quota)
+    }
+}
+
+/// What the host *actually* enforced on a child, plus the mechanism that
+/// produced each flag. `capabilities` stays the wire-compatible boolean
+/// floor consumed by `SandboxProfile::allows_start`; `backend` names the
+/// OS mechanism family, `backend_version` its probed level, and
+/// `evidence` explains every enforced flag.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxAttestation {
+    pub capabilities: SandboxCapabilities,
+    pub backend: String,
+    pub backend_version: String,
+    pub evidence: SandboxEvidence,
+}
+
+impl SandboxAttestation {
+    /// Refuse empty or oversized mechanism labels and evidence that
+    /// disagrees with the boolean floor.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.backend.is_empty() || self.backend.chars().count() > MAX_SANDBOX_BACKEND_CHARS {
+            return Err("sandbox attestation backend label is empty or oversized".into());
+        }
+        if self.backend_version.chars().count() > MAX_SANDBOX_BACKEND_CHARS {
+            return Err("sandbox attestation backend version is oversized".into());
+        }
+        if !self.evidence.consistent_with(&self.capabilities) {
+            return Err("sandbox evidence disagrees with the enforced capability flags".into());
+        }
+        Ok(())
+    }
+}
+
 /// A confined view of the agent's workspace handed to a capability for one
 /// invocation. Capabilities never hold the workspace, the engine or the
 /// memory stores directly — everything they can touch is granted here, and
@@ -584,6 +666,84 @@ mod tests {
         assert!(permission_is_side_effecting(PROCESS_RUN));
         assert!(permission_is_side_effecting(RUNTIME_CONTEXT_CONTROL));
         assert!(permission_is_side_effecting("artifact:write"));
+    }
+
+    /// 一个 true 布尔位必须携带有界非空证明，false 位必须没有证明：
+    /// 证明与布尔位互相矛盾的结构本身就是非法状态。
+    #[test]
+    fn sandbox_evidence_must_agree_with_the_boolean_floor() {
+        let caps = SandboxCapabilities {
+            fs_write_confined: true,
+            memory_quota: true,
+            ..SandboxCapabilities::default()
+        };
+        let good = SandboxEvidence {
+            fs_write_confined: Some("landlock write roots=1".into()),
+            memory_quota: Some(format!("rlimit_as={} bytes", 512 * 1024)),
+            ..SandboxEvidence::default()
+        };
+        assert!(good.consistent_with(&caps));
+
+        // true 但无证明：拒绝。
+        let missing_proof = SandboxEvidence {
+            fs_write_confined: None,
+            ..good.clone()
+        };
+        assert!(!missing_proof.consistent_with(&caps));
+        // false 却带证明：拒绝。
+        let phantom_proof = SandboxEvidence {
+            cpu_quota: Some("rlimit_cpu=5s hard".into()),
+            ..good.clone()
+        };
+        assert!(!phantom_proof.consistent_with(&caps));
+        // 空或超长证明：拒绝。
+        let empty_proof = SandboxEvidence {
+            fs_write_confined: Some(String::new()),
+            ..good.clone()
+        };
+        assert!(!empty_proof.consistent_with(&caps));
+        let oversized = SandboxEvidence {
+            memory_quota: Some("x".repeat(MAX_SANDBOX_PROOF_CHARS + 1)),
+            ..good
+        };
+        assert!(!oversized.consistent_with(&caps));
+    }
+
+    #[test]
+    fn attestation_validate_refuses_bad_labels_and_disagreeing_evidence() {
+        let caps = SandboxCapabilities {
+            fs_read_confined: true,
+            ..SandboxCapabilities::default()
+        };
+        let evidence = SandboxEvidence {
+            fs_read_confined: Some("broker read path".into()),
+            ..SandboxEvidence::default()
+        };
+        let valid = SandboxAttestation {
+            capabilities: caps,
+            backend: "landlock+rlimits".into(),
+            backend_version: "abi6".into(),
+            evidence,
+        };
+        assert!(valid.validate().is_ok());
+
+        let empty_backend = SandboxAttestation {
+            backend: String::new(),
+            ..valid.clone()
+        };
+        assert!(empty_backend.validate().is_err());
+
+        let oversized_version = SandboxAttestation {
+            backend_version: "v".repeat(MAX_SANDBOX_BACKEND_CHARS + 1),
+            ..valid.clone()
+        };
+        assert!(oversized_version.validate().is_err());
+
+        let disagreeing = SandboxAttestation {
+            evidence: SandboxEvidence::default(),
+            ..valid
+        };
+        assert!(disagreeing.validate().is_err());
     }
 
     #[test]

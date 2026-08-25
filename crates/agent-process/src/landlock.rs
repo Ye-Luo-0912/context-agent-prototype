@@ -195,6 +195,38 @@ pub fn signal_scope_available() -> bool {
     })
 }
 
+/// Highest landlock ABI this kernel accepts, probed by creating real
+/// rulesets newest-first (`0` = landlock unsupported). Attestation uses
+/// this as the backend version so the write fence names its ABI.
+pub fn abi_level() -> u8 {
+    if signal_scope_available() {
+        return 6;
+    }
+    if ioctl_dev_deny_available() {
+        return 5;
+    }
+    if tcp_deny_available() {
+        return 4;
+    }
+    for (candidate, level) in [
+        (WRITE_ACCESS | FS_TRUNCATE | FS_REFER, 3_u8),
+        (WRITE_ACCESS | FS_REFER, 2),
+    ] {
+        let attr = RulesetAttrFs {
+            handled_access_fs: candidate,
+        };
+        if close_if_ruleset(unsafe {
+            create_ruleset(
+                std::ptr::from_ref(&attr).cast(),
+                std::mem::size_of::<RulesetAttrFs>(),
+            )
+        }) {
+            return level;
+        }
+    }
+    u8::from(available())
+}
+
 fn close_if_ruleset(ret: i64) -> bool {
     if ret >= 0 {
         unsafe {

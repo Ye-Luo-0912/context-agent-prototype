@@ -196,6 +196,20 @@ the fail-closed posture honest.
 Attestation is computed from what was applied (landlock actually applied,
 Windows job assigned, rlimits > 0). `false` means "not proven".
 
+Every enforced flag now carries its mechanism:
+`ProcessHost::sandbox_attestation` returns
+`SandboxAttestation { capabilities, backend, backend_version, evidence }`.
+`capabilities` stays the wire-compatible boolean floor that activation
+consumes; `backend` names the OS family (`landlock+rlimits`,
+`integrity+jobobject`, `rlimits`) with a probed landlock ABI level as the
+Linux version; `evidence` explains each true flag from real enforcement
+inputs (write-root counts, rlimit and job-object values) and refuses proof
+for flags that are not enforced (`SandboxEvidence::consistent_with`,
+checked by `validate()`). A boolean must still never claim more than it
+delivers — `process_count_quota` remains a count quota, and
+UntrustedGenerated stays fail-closed on native until the residual planes
+(UDP / raw / pathname-Unix, absolute OS reads) can attest.
+
 ## Per-OS enforcement matrix
 
 What v0 can currently *attest* as true. Blank / false = not proven.

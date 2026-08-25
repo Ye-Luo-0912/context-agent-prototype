@@ -217,7 +217,10 @@ async fn a_second_official_process_is_refused_while_the_first_holds_the_journal(
         .arg(directory.path())
         .arg("hold")
         .env("WORKSPACE_CRASH_HELD", signals.path().join("held.flag"))
-        .env("WORKSPACE_CRASH_RELEASE", signals.path().join("release.flag"))
+        .env(
+            "WORKSPACE_CRASH_RELEASE",
+            signals.path().join("release.flag"),
+        )
         .output()
         .expect("spawn crash_probe");
     assert!(

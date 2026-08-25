@@ -194,13 +194,17 @@ impl Capability for ProcessCapabilityAdapter {
         }
         match ProcessHost::connect(self.config.clone()).await {
             Ok(host) => {
-                let actual = host.sandbox_attestation();
+                let attestation = host.sandbox_attestation();
                 let profile = self.manifest.sandbox_profile;
-                if !profile.allows_start(actual) {
+                if !profile.allows_start(attestation.capabilities) {
                     host.shutdown().await;
                     let error = AgentError::Context(format!(
-                        "capability '{}' sandbox profile {:?} is not covered by enforced {:?}",
-                        self.manifest.id, profile, actual
+                        "capability '{}' sandbox profile {:?} is not covered by enforced {:?} (backend {} {})",
+                        self.manifest.id,
+                        profile,
+                        attestation.capabilities,
+                        attestation.backend,
+                        attestation.backend_version
                     ));
                     slot.record_connect_failure(error.to_string());
                     return Err(error);

@@ -270,32 +270,94 @@ fn attest_sandbox(
     sandbox: &ProcessSandbox,
     landlock_applied: bool,
     windows_job: bool,
-) -> agent_contracts::SandboxCapabilities {
+) -> agent_contracts::SandboxAttestation {
     let mut actual = agent_contracts::SandboxCapabilities::default();
+    let mut evidence = agent_contracts::SandboxEvidence::default();
     #[cfg(target_os = "linux")]
     if landlock_applied {
         actual.fs_write_confined = true;
+        evidence.fs_write_confined = Some(format!(
+            "landlock ruleset confines writes to {} roots",
+            sandbox.landlock_write_roots.len()
+        ));
         actual.tcp_connect_denied = crate::landlock::tcp_deny_available();
+        if actual.tcp_connect_denied {
+            evidence.tcp_connect_denied =
+                Some("landlock handled_access_net denies tcp bind/connect".into());
+        }
         actual.signal_scoped = crate::landlock::signal_scope_available();
+        if actual.signal_scoped {
+            evidence.signal_scoped =
+                Some("landlock ipc scope blocks signals outside the domain".into());
+        }
     }
     #[cfg(unix)]
     {
         actual.cpu_quota = sandbox.cpu_time_limit_secs > 0;
+        if actual.cpu_quota {
+            evidence.cpu_quota = Some(format!("rlimit_cpu hard={}s", sandbox.cpu_time_limit_secs));
+        }
         actual.memory_quota = sandbox.max_memory_bytes > 0;
+        if actual.memory_quota {
+            evidence.memory_quota = Some(format!("rlimit_as={} bytes", sandbox.max_memory_bytes));
+        }
         actual.fd_quota = sandbox.max_open_files > 0;
+        if actual.fd_quota {
+            evidence.fd_quota = Some(format!("rlimit_nofile={}", sandbox.max_open_files));
+        }
         // RLIMIT_NPROC is a user-level *count quota*, not proof that
         // arbitrary spawning is impossible; the attestation field is
         // named for exactly that guarantee.
         actual.process_count_quota = sandbox.process_limit > 0;
+        if actual.process_count_quota {
+            evidence.process_count_quota = Some(format!(
+                "rlimit_nproc={} (count quota, not spawn denial)",
+                sandbox.process_limit
+            ));
+        }
     }
     #[cfg(windows)]
     {
         actual.fs_write_confined = !sandbox.integrity_write_roots.is_empty();
+        if actual.fs_write_confined {
+            evidence.fs_write_confined = Some(format!(
+                "integrity labels confine writes to {} roots",
+                sandbox.integrity_write_roots.len()
+            ));
+        }
         actual.process_count_quota = windows_job;
+        if actual.process_count_quota {
+            evidence.process_count_quota = Some("job object active-process count quota".into());
+        }
         actual.memory_quota = windows_job && sandbox.job_max_memory_bytes > 0;
+        if actual.memory_quota {
+            evidence.memory_quota = Some(format!(
+                "job object memory={} bytes",
+                sandbox.job_max_memory_bytes
+            ));
+        }
     }
-    let _ = (sandbox, landlock_applied, windows_job);
-    actual
+    #[cfg(target_os = "linux")]
+    let (backend, backend_version) = if landlock_applied {
+        (
+            "landlock+rlimits".to_string(),
+            format!("abi{}", crate::landlock::abi_level()),
+        )
+    } else {
+        ("rlimits".to_string(), "none".to_string())
+    };
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let (backend, backend_version) = ("rlimits".to_string(), "none".to_string());
+    #[cfg(windows)]
+    let (backend, backend_version) = ("integrity+jobobject".to_string(), "1".to_string());
+    // Platform-specific branches consume only their own parameters.
+    let _ = (landlock_applied, windows_job);
+    agent_contracts::SandboxAttestation {
+        capabilities: actual,
+        backend,
+        backend_version,
+        evidence,
+    }
 }
 
 /// A live child process speaking JSON-lines on stdio. Strict ping-pong:
@@ -317,7 +379,7 @@ pub struct ProcessHost {
     /// ping 握手交叉后的特性。缺省为空：历史纯 ToolOutput 默认关闭。
     negotiated_features: ActiveFeatures,
     /// Capabilities actually applied at spawn, not the configured policy.
-    attestation: agent_contracts::SandboxCapabilities,
+    attestation: agent_contracts::SandboxAttestation,
 }
 
 impl ProcessHost {
@@ -581,9 +643,10 @@ impl ProcessHost {
         Ok(host)
     }
 
-    /// Capabilities the OS actually applied to this child.
-    pub fn sandbox_attestation(&self) -> agent_contracts::SandboxCapabilities {
-        self.attestation
+    /// Capabilities the OS actually applied to this child, with the
+    /// mechanism behind every enforced flag.
+    pub fn sandbox_attestation(&self) -> agent_contracts::SandboxAttestation {
+        self.attestation.clone()
     }
 
     /// Connection health and epochs. Never task or Core authority.
@@ -1402,6 +1465,75 @@ pub(crate) use job_object::JobObject;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 证明串必须从真实配置值生成，且整体通过契约校验：布尔位与
+    /// 证明一一对应，backend 标签有界。
+    #[test]
+    fn attestation_proves_every_enforced_flag_from_real_inputs() {
+        let sandbox = ProcessSandbox {
+            #[cfg(unix)]
+            cpu_time_limit_secs: 20,
+            #[cfg(unix)]
+            process_limit: 64,
+            #[cfg(unix)]
+            max_memory_bytes: 512 * 1024 * 1024,
+            #[cfg(unix)]
+            max_open_files: 256,
+            #[cfg(target_os = "linux")]
+            landlock_write_roots: vec![std::path::PathBuf::from("/tmp/sandbox")],
+            ..ProcessSandbox::default()
+        };
+        let attestation = attest_sandbox(&sandbox, cfg!(target_os = "linux"), false);
+        attestation
+            .validate()
+            .expect("a real configuration must attest validly");
+        assert!(
+            !attestation.backend.is_empty(),
+            "the backend must name its OS mechanism family"
+        );
+        #[cfg(unix)]
+        {
+            assert!(attestation.capabilities.cpu_quota);
+            assert_eq!(
+                attestation.evidence.cpu_quota.as_deref(),
+                Some("rlimit_cpu hard=20s")
+            );
+            assert_eq!(
+                attestation.evidence.memory_quota.as_deref(),
+                Some("rlimit_as=536870912 bytes")
+            );
+            assert!(
+                attestation
+                    .evidence
+                    .fd_quota
+                    .as_deref()
+                    .unwrap()
+                    .contains("256")
+            );
+            assert!(
+                attestation
+                    .evidence
+                    .process_count_quota
+                    .as_deref()
+                    .unwrap()
+                    .contains("rlimit_nproc=64")
+            );
+            #[cfg(target_os = "linux")]
+            {
+                assert!(attestation.capabilities.fs_write_confined);
+                assert!(
+                    attestation
+                        .evidence
+                        .fs_write_confined
+                        .as_deref()
+                        .unwrap()
+                        .starts_with("landlock write roots=1")
+                );
+            }
+        }
+        // 未强制的标志不得携带证明（validate 已整体检查，这里抽查）。
+        assert!(attestation.evidence.udp_denied.is_none());
+    }
 
     #[test]
     fn probe_finds_the_service_next_to_the_profile_dir() {

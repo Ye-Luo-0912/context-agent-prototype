@@ -77,16 +77,18 @@ their binding is revoked mid-flight, via an explicit per-binding revocation
 epoch consumed by the kernel lease path — one revision field must not carry
 that meaning.
 
-### CORE-12 — M13 attestation depth (open)
+### CORE-12 — M13 attestation depth (attestation landed 2026-08-25)
 
-`SandboxCapabilities` booleans are the v1 floor. M13 acceptance should
-upgrade to `SandboxAttestation { capabilities, backend,
-backend_version, evidence }` so each enforced capability is
-explainable (`fs_write_confined` → landlock ABI, `memory_quota` →
-rlimit_as bytes). A boolean must not claim a stronger OS guarantee
-than it delivers — `process_count_quota` was renamed from
-`process_spawn_controlled` for exactly that (serde alias keeps the
-wire compatible).
+Landed: `SandboxAttestation { capabilities, backend, backend_version,
+evidence }` — the boolean floor keeps its wire shape while every enforced
+flag names its mechanism (probed landlock ABI level, rlimit and job-object
+values, integrity root counts) with bounded proof text,
+consistency-checked against the flags by
+`SandboxEvidence::consistent_with` / `SandboxAttestation::validate()`.
+Remaining before M13 closes: UntrustedGenerated is still fail-closed on
+native because UDP / raw / pathname-Unix denials and absolute OS-level
+reads cannot attest yet (the CORE-01 residual); a renamed
+`process_count_quota` keeps its serde alias for wire compatibility.
 
 ## Open P1 — Tool Surface reliability
 
