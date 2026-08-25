@@ -709,9 +709,15 @@ spawn (`Recorded=1`, `Reused=1`). Generic shell/process behavior is unchanged.
 
 Open implementation must remain execution-only and staged:
 
-- extend the landed exact-current completed-PASS identity with broader bounded
-  coverage/obligation provenance, identical in-flight joining, and explicit
-  host-declared equivalence classes; do not infer equivalence from commands;
+- extend the landed exact-current completed-PASS identity with broader
+  bounded coverage/obligation provenance and explicit host-declared
+  equivalence classes; do not infer equivalence from commands. Identical
+  in-flight joining inside one batch is landed and proven: duplicate
+  typed-verification calls settle as one spawn plus one truthful no-dispatch
+  reuse (`ExecutionVerificationPass` Recorded/Reused, batch accounting
+  `(2, 2, 1, 1)`), and the same joining holds for the negative-fact path;
+  the sequential single-flight actor makes a second concurrent join window
+  structurally impossible;
 - extend the landed exact result-delivery/task/verification roots with trusted
   obligation-scoped provenance source tools;
 - complete the table-driven crash/restart matrix. Normal, transient,
