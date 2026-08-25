@@ -127,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
         output_broker: Some(output_broker),
         max_tool_rounds: None,
         project_task_progress: true,
+        project_completion_opportunity: false,
         host_policies: Some(host_policies),
     })
     .await?;

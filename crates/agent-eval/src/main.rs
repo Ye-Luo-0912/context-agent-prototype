@@ -101,6 +101,12 @@ fn usage() -> ! {
          \n\
          usage: agent-eval [--repeats N] --long-task-live [normal|resume]\n\
          \n\
+         usage: agent-eval [--repeats N] --opportunity-gate [normal|resume]\n\
+         \n\
+         Item-8 off/on paired live gate for the advisory completion\n\
+         opportunity: identical cells with the candidate switch as the only\n\
+         variable; evidence records the setting per cell.\n\
+         \n\
          retry_policy_dev live pilot (layer 2): the C engine runs the frozen\n\
          one-directive fixture with a real model. Resume cells interrupt on\n\
          the semantic trigger (first durably settled mutation + its durable\n\
@@ -578,6 +584,16 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
+            "--opportunity-gate" => {
+                let mode_filter = args.next().filter(|value| !value.starts_with('-'));
+                let repeats = if repeats_set {
+                    repeats
+                } else {
+                    long_live::DEFAULT_REPEATS
+                };
+                run_opportunity_gate(mode_filter, repeats, evidence_dir, allow_dirty).await?;
+                return Ok(());
+            }
             "--long-task-live" => {
                 let mode_filter = args.next().filter(|value| !value.starts_with('-'));
                 let repeats = if repeats_set {
@@ -1016,7 +1032,8 @@ async fn run_long_task_live(
                 repeats,
                 true,
             );
-            let outcome = long_live::run_cell(*mode, &pair, model.clone(), dir.path()).await?;
+            let outcome =
+                long_live::run_cell(*mode, &pair, model.clone(), dir.path(), false).await?;
             println!("{}", outcome.render_line());
             for violation in &outcome.diff_violations {
                 println!("diff: {violation}");
@@ -1032,6 +1049,99 @@ async fn run_long_task_live(
             }
         }
     }
+    Ok(())
+}
+
+/// ROADMAP item-8 off/on paired live gate for the advisory
+/// completion-opportunity candidate. The switch is the only variable:
+/// identical fixture, model/provider, tool surface and substrate, with
+/// normal/resume repeats in both arms. Evidence lands per cell with its
+/// recorded setting; the runner prints paired facts and leaves promotion
+/// judgment to the REPORT.
+async fn run_opportunity_gate(
+    mode_filter: Option<String>,
+    repeats: u32,
+    evidence_dir: Option<std::path::PathBuf>,
+    allow_dirty: bool,
+) -> anyhow::Result<()> {
+    bundle::require_clean_tree(allow_dirty)?;
+    let modes = long_live::PilotMode::parse(mode_filter.as_deref())?;
+    anyhow::ensure!((1..=4).contains(&repeats), "repeats must be 1..=4");
+    let model = driver::build_live_coding_model()?;
+    let evidence_root = evidence_dir
+        .unwrap_or_else(|| std::path::PathBuf::from("crates/agent-eval/evidence/opportunity-gate"));
+    std::fs::create_dir_all(&evidence_root)?;
+    eprintln!("evidence dir: {}", evidence_root.display());
+
+    let mut outcomes = Vec::new();
+    for opportunity in [false, true] {
+        for repeat in 1..=repeats {
+            for mode in &modes {
+                eprintln!(
+                    "== retry_policy_dev {} live (C, opp={}) repeat {repeat}/{repeats} ==",
+                    mode.id(),
+                    if opportunity { "on" } else { "off" },
+                );
+                let dir = tempfile::tempdir()?;
+                let pair = bundle::PairSink::claim(
+                    evidence_root.clone(),
+                    format!(
+                        "retry_policy_dev-{}-{}",
+                        mode.id(),
+                        if opportunity { "on" } else { "off" }
+                    ),
+                    repeat,
+                    repeats,
+                    true,
+                );
+                let outcome =
+                    long_live::run_cell(*mode, &pair, model.clone(), dir.path(), opportunity)
+                        .await?;
+                println!("{}", outcome.render_line());
+                match bundle::render_evidence(&pair.repeat_path()) {
+                    Ok(rendered) => println!("{rendered}"),
+                    Err(e) => eprintln!("warning: evidence render failed: {e}"),
+                }
+                outcomes.push(outcome);
+            }
+        }
+    }
+
+    println!("\n== paired summary (off vs on; facts only) ==");
+    for mode in &modes {
+        for (label, switch) in [("off", false), ("on", true)] {
+            let cells: Vec<&long_live::CellOutcome> = outcomes
+                .iter()
+                .filter(|cell| cell.mode == *mode && cell.opportunity == switch)
+                .collect();
+            if cells.is_empty() {
+                continue;
+            }
+            let mut rounds: Vec<u64> = cells
+                .iter()
+                .map(|cell| (cell.model_rounds_phase_one + cell.model_rounds_phase_two) as u64)
+                .collect();
+            let median_rounds = checked_percentile(&mut rounds, 50).unwrap_or(0);
+            println!(
+                "{:<6} opp={} cells={} passed={} median_total_rounds={} offers={} called={} completed={}",
+                mode.id(),
+                label,
+                cells.len(),
+                cells.iter().filter(|cell| cell.passed).count(),
+                median_rounds,
+                cells
+                    .iter()
+                    .map(|cell| cell.opportunity_offers.len())
+                    .sum::<usize>(),
+                cells.iter().filter(|cell| cell.opportunity_called).count(),
+                cells
+                    .iter()
+                    .filter(|cell| cell.closure == "completed")
+                    .count(),
+            );
+        }
+    }
+    println!("promotion judgment belongs to the evidence REPORT, not this runner");
     Ok(())
 }
 

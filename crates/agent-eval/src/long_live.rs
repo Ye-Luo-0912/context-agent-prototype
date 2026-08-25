@@ -21,8 +21,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_contracts::{
-    AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, ContextEngine, ModelTransport,
-    RuntimeEvent, RuntimeEventEnvelope, ToolCall, ToolDispatcher, ToolSpec,
+    AgentResult, ApprovalDecision, ApprovalGate, CancellationToken,
+    CompletionOpportunityDisposition, ContextEngine, ModelTransport, RuntimeEvent,
+    RuntimeEventEnvelope, ToolCall, ToolDispatcher, ToolSpec,
 };
 use anyhow::bail;
 use sha2::{Digest as _, Sha256};
@@ -31,7 +32,7 @@ use crate::bundle::PairSink;
 use crate::long_task::{self, DIRECTIVE, FINAL_FILES, FIXTURE_FILES};
 use crate::workload::{HiddenAssertionResult, HiddenCommandResult, HiddenFileBody, HiddenReport};
 
-pub const PILOT_SCHEMA: &str = "retry-pilot-cell-v1";
+pub const PILOT_SCHEMA: &str = "retry-pilot-cell-v2";
 /// LONG_TASK_EVALUATION layer 2: normal and resume, two repeats each.
 pub const DEFAULT_REPEATS: u32 = 2;
 
@@ -255,6 +256,13 @@ pub struct CellOutcome {
     pub resume_trigger: Option<&'static str>,
     pub diff_violations: Vec<String>,
     pub marker_violations: Vec<String>,
+    /// Whether the advisory completion-opportunity candidate was enabled
+    /// for this cell (the item-8 gate's only variable).
+    pub opportunity: bool,
+    /// Offered opportunity keys, in arrival order across both phases.
+    pub opportunity_offers: Vec<String>,
+    /// The model called `task.complete` after an offer was live.
+    pub opportunity_called: bool,
 }
 
 impl CellOutcome {
@@ -281,6 +289,9 @@ impl CellOutcome {
             resume_trigger: None,
             diff_violations: Vec::new(),
             marker_violations: Vec::new(),
+            opportunity: false,
+            opportunity_offers: Vec::new(),
+            opportunity_called: false,
         }
     }
 
@@ -291,8 +302,17 @@ impl CellOutcome {
             .resume_trigger
             .map(|tool| format!(" trigger={tool}"))
             .unwrap_or_default();
+        let opp = if self.opportunity {
+            format!(
+                " opp=on offers={} called={}",
+                self.opportunity_offers.len(),
+                self.opportunity_called
+            )
+        } else {
+            " opp=off".to_string()
+        };
         format!(
-            "retry_policy_dev {:<6} {} behavior={} diff={} closure={} continuation={} provider={} rounds={}+{} resumes={} durables={}{}{}",
+            "retry_policy_dev {:<6} {} behavior={} diff={} closure={} continuation={} provider={} rounds={}+{} resumes={} durables={}{}{}{}",
             self.mode.id(),
             status,
             self.behavior,
@@ -305,6 +325,7 @@ impl CellOutcome {
             self.resume_committed,
             self.checkpoint_durable,
             trigger,
+            opp,
             self.error
                 .as_ref()
                 .map(|reason| format!(" error={reason}"))
@@ -343,6 +364,10 @@ struct PhaseState {
     checkpoint_durable: u64,
     turn_completed: bool,
     task_completed: bool,
+    /// Offered opportunity keys, in arrival order (candidate-on cells).
+    opportunity_offers: Vec<String>,
+    /// The model called `task.complete` while an offer was live.
+    opportunity_called: bool,
 }
 
 enum StepOutcome {
@@ -416,6 +441,21 @@ fn step_event(
             state.task_completed = true;
             collector.push(envelope);
             StepOutcome::TaskCompleted
+        }
+        RuntimeEvent::CompletionOpportunity {
+            ref disposition,
+            ref key,
+            ..
+        } => {
+            match disposition {
+                CompletionOpportunityDisposition::Offered => {
+                    state.opportunity_offers.push(key.clone());
+                }
+                CompletionOpportunityDisposition::Called => state.opportunity_called = true,
+                _ => {}
+            }
+            collector.push(envelope);
+            StepOutcome::Continue
         }
         RuntimeEvent::TurnCompleted => {
             state.turn_completed = true;
@@ -589,6 +629,7 @@ async fn compose_cell(
     root: &Path,
     model: Arc<dyn ModelTransport>,
     engine: Arc<dyn ContextEngine>,
+    opportunity: bool,
 ) -> anyhow::Result<agent_compose::ComposedRuntime> {
     let workspace = agent_workspace::Workspace::open(root).await?;
     let verification_recipes = tool_runtime::VerificationRecipes::discover(&workspace);
@@ -614,6 +655,7 @@ async fn compose_cell(
         output_broker: None,
         max_tool_rounds: Some(LIVE_MAX_MODEL_ROUNDS as usize),
         project_task_progress: true,
+        project_completion_opportunity: opportunity,
         host_policies: Some(Arc::new(
             agent_compose::HostToolPolicyRegistry::with_builtins_and_verification(
                 &verification_recipes,
@@ -659,6 +701,7 @@ pub async fn run_cell(
     pair: &PairSink,
     model: Arc<dyn ModelTransport>,
     root: &Path,
+    opportunity: bool,
 ) -> anyhow::Result<CellOutcome> {
     let started = Instant::now();
     let failed =
@@ -680,12 +723,14 @@ pub async fn run_cell(
     let mut rounds_two = 0u32;
     let mut task_completed = false;
     let mut phase_two_restored = false;
+    let mut opportunity_offers = Vec::new();
+    let mut opportunity_called = false;
 
     // ---- Phase one: drive the directive from the clean seed. The engine
     // instance is per-phase; the resume twin must not inherit any
     // phase-one in-memory state through a shared object.
     let mut checkpoint_artifact: Option<String> = None;
-    match compose_cell(root, model.clone(), c_engine(model.clone())).await {
+    match compose_cell(root, model.clone(), c_engine(model.clone()), opportunity).await {
         Err(e) => error = Some(format!("phase-one compose failed: {e:#}")),
         Ok(composed) => {
             let handle = composed.handle().clone();
@@ -718,6 +763,8 @@ pub async fn run_cell(
                     resume_committed += state.resume_committed;
                     checkpoint_durable += state.checkpoint_durable;
                     task_completed |= state.task_completed;
+                    opportunity_offers.extend(state.opportunity_offers.iter().cloned());
+                    opportunity_called |= state.opportunity_called;
                     trigger_tool = state.mutation_tool;
                     if mode == PilotMode::Normal && !task_completed {
                         error = Some("normal run ended without TaskCompleted".into());
@@ -762,7 +809,8 @@ pub async fn run_cell(
         match loaded {
             Err(e) => error = Some(format!("checkpoint artifact load failed: {e:#}")),
             Ok(checkpoint) => {
-                match compose_cell(root, model.clone(), c_engine(model.clone())).await {
+                match compose_cell(root, model.clone(), c_engine(model.clone()), opportunity).await
+                {
                     Err(e) => error = Some(format!("phase-two compose failed: {e:#}")),
                     Ok(composed) => {
                         let handle = composed.handle().clone();
@@ -789,6 +837,8 @@ pub async fn run_cell(
                                 resume_committed += state.resume_committed;
                                 checkpoint_durable += state.checkpoint_durable;
                                 task_completed |= state.task_completed;
+                                opportunity_offers.extend(state.opportunity_offers.iter().cloned());
+                                opportunity_called |= state.opportunity_called;
                                 if !task_completed {
                                     error = Some("continuation ended without TaskCompleted".into());
                                 }
@@ -901,6 +951,9 @@ pub async fn run_cell(
         resume_trigger: trigger_tool,
         diff_violations,
         marker_violations,
+        opportunity,
+        opportunity_offers,
+        opportunity_called,
     };
     write_evidence(
         pair,
@@ -976,6 +1029,11 @@ fn write_evidence(
         "workspace_self_check": outcome.self_check,
         "final_passed": outcome.passed,
         "runtime_error": outcome.error,
+        // Item-8 candidate bookkeeping: the switch setting and the
+        // per-cell opportunity account (offers per key, call-through).
+        "completion_opportunity": if outcome.opportunity { "on" } else { "off" },
+        "opportunity_offers": outcome.opportunity_offers,
+        "opportunity_called": outcome.opportunity_called,
     });
     let dimensions_path = pair.cell_dir("dynamic").join("dimensions.json");
     if let Err(e) = std::fs::write(

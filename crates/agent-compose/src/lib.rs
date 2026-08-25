@@ -208,6 +208,9 @@ pub struct ComposeConfig {
     pub max_tool_rounds: Option<usize>,
     /// Ablation: omit TaskProgress from the Focus frame. Default true.
     pub project_task_progress: bool,
+    /// LONG-TASK Slice C 候选开关（默认关）：派生 advisory 完成机会并
+    /// 允许一次决策的 `task.complete` 租赁。晋级门通过前保持关。
+    pub project_completion_opportunity: bool,
     /// 受信的宿主授权注册表。缺省只装内置表；插件工具没有条目就没有
     /// 授权，保持 fail-closed。同一来源接入内核配置与能力分发器。
     pub host_policies: Option<Arc<HostToolPolicyRegistry>>,
@@ -265,6 +268,7 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         output_broker,
         max_tool_rounds,
         project_task_progress,
+        project_completion_opportunity,
         host_policies,
     } = config;
 
@@ -332,6 +336,7 @@ pub async fn compose(config: ComposeConfig) -> anyhow::Result<ComposedRuntime> {
         AuthorityRecoveryServices::new(operation_journal, Some(Arc::new(workspace.clone()))),
     )?;
     services = services.with_project_task_progress(project_task_progress);
+    services = services.with_project_completion_opportunity(project_completion_opportunity);
     let instance = RuntimeInstance::spawn(host, services);
     Ok(ComposedRuntime {
         workspace,

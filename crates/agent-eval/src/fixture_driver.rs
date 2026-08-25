@@ -1104,6 +1104,7 @@ async fn run_workspace_session_harness_ops(
         output_broker: None,
         max_tool_rounds: limits.max_model_rounds.map(|n| n as usize),
         project_task_progress,
+        project_completion_opportunity: false,
         // 与生产组合一致的内置授权映射；缺省也会装同一张表。
         host_policies: Some(Arc::new(
             agent_compose::HostToolPolicyRegistry::with_builtins_and_verification(
