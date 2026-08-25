@@ -1,0 +1,118 @@
+{
+  "schema": "retry-pilot-cell-v2",
+  "kind": "retry_pilot_oracle",
+  "fixture_id": "retry_policy_dev-resume",
+  "expected_edit": "",
+  "passed": false,
+  "replay_complete": true,
+  "assertions": [
+    {
+      "path": "src/config.rs",
+      "pred": "max_delay_ms field exists exactly once",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "src/error.rs",
+      "pred": "transient classification implemented",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "retry loop bounds on max_attempts",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "delay growth saturates at max_delay_ms",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    },
+    {
+      "path": "src/lib.rs",
+      "pred": "public run_job signature preserved",
+      "needles": [],
+      "passed": true,
+      "file_exists": true
+    },
+    {
+      "path": "README.md",
+      "pred": "README documents the saturation boundary",
+      "needles": [],
+      "passed": false,
+      "file_exists": true
+    }
+  ],
+  "files": [
+    {
+      "path": "src/config.rs",
+      "exists": true,
+      "sha256": "96b1af8bbf0f6fa21d5a5d3f22b5e9cbed654d9b164ec88517a573ce63e58a69",
+      "bytes": 758,
+      "truncated": false,
+      "body": "//! Retry configuration.\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct RetryConfig {\n    /// Total attempts allowed, including the first call. Must be >= 1.\n    pub max_attempts: u32,\n    /// Base delay before the first retry, in milliseconds.\n    pub base_delay_ms: u64,\n    /// Maximum delay between retries, in milliseconds.\n    pub max_delay_ms: u64,\n}\n\nimpl RetryConfig {\n    /// Returns the delay for a retry, capped at the configured maximum.\n    pub(crate) fn retry_delay(&self, retry_number: u32) -> u64 {\n        let exponent = retry_number.saturating_sub(1);\n        let multiplier = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);\n        self.base_delay_ms\n            .saturating_mul(multiplier)\n            .min(self.max_delay_ms)\n    }\n}\n"
+    },
+    {
+      "path": "src/lib.rs",
+      "exists": true,
+      "sha256": "b501ddced0de16f299e4075447bc0eb8af2ac427ed0ed031a8b7868279390bde",
+      "bytes": 636,
+      "truncated": false,
+      "body": "mod config;\nmod error;\nmod sleeper;\n\npub use config::RetryConfig;\npub use error::RetryError;\npub use sleeper::{FakeSleeper, Sleeper};\n\n/// Runs `job` until it succeeds or the retry budget is exhausted.\n/// The public signature is frozen; do not change it.\npub fn run_job(\n    _config: &RetryConfig,\n    _sleeper: &mut dyn Sleeper,\n    job: impl FnMut() -> Result<(), RetryError>,\n) -> Result<(), RetryError> {\n    // TODO(retry-policy): bounded exponential retries. Retry only\n    // transient errors; permanent errors return immediately;\n    // max_attempts includes the first call; delays saturate at\n    // max_delay_ms.\n    job()\n}\n"
+    },
+    {
+      "path": "src/error.rs",
+      "exists": true,
+      "sha256": "73a5c709b3d7caca6aea5c3c652b693d54a3c019adb4b4407897b7b099dc4b8e",
+      "bytes": 476,
+      "truncated": false,
+      "body": "//! Error taxonomy for the job runner.\n#[derive(Debug, Clone, PartialEq, Eq)]\npub enum RetryError {\n    /// Transient faults may be retried (network blips, temporary locks).\n    Transient(String),\n    /// Permanent faults must return immediately (bad input, missing job).\n    Permanent(String),\n}\n\nimpl RetryError {\n    /// Returns whether this error is eligible for another attempt.\n    pub fn is_transient(&self) -> bool {\n        matches!(self, Self::Transient(_))\n    }\n}\n"
+    },
+    {
+      "path": "README.md",
+      "exists": true,
+      "sha256": "9cddcc8a067d0e6f9dbff9be53bb840bbc6d3316624df51a2e0495c320ded6c5",
+      "bytes": 240,
+      "truncated": false,
+      "body": "# jobrunner\n\nSmall job runner with a pluggable retry policy.\n\n## Status\n\nThe retry policy is not implemented yet: `run_job` performs a single\nattempt and never waits. Configuration currently exposes `max_attempts`\nand `base_delay_ms` only.\n"
+    }
+  ],
+  "commands": [
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expect_exit": 0,
+      "exit": null,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "oracle injection failed: 系统找不到指定的路径。 (os error 3)",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expect_exit": 0,
+      "exit": 101,
+      "timed_out": false,
+      "stdout": "",
+      "stderr": "error[E0596]: cannot borrow `job` as mutable, as it is not declared as mutable\n  --> src\\lib.rs:20:5\n   |\n20 |     job()\n   |     ^^^ cannot borrow as mutable\n   |\nhelp: consider changing this to be mutable\n   |\n14 |     mut job: impl FnMut() -> Result<(), RetryError>,\n   |     +++\n\nFor more information about this error, try `rustc --explain E0596`.\nerror: could not compile `jobrunner` (lib) due to 1 previous error\nerror: could not compile `jobrunner` (lib test) due to 1 previous error\n\n(self-check over agent-authored tests; informational)",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "passed": false
+    }
+  ]
+}

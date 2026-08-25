@@ -1,0 +1,17 @@
+{
+  "allowed_diff": "pass",
+  "behavioral_oracle": "pass",
+  "completion_opportunity": "on",
+  "continuation": "restored",
+  "final_passed": true,
+  "mode": "resume",
+  "opportunity_called": true,
+  "opportunity_offers": [
+    "opp/3ee64b0f-adb8-4c4f-9241-5e156046a88b/a0/d2/w18/cf1cb53e35cd8e35"
+  ],
+  "provider_runtime": "healthy",
+  "runtime_error": null,
+  "schema": "retry-pilot-cell-v2",
+  "task_closure": "completed",
+  "workspace_self_check": "pass"
+}

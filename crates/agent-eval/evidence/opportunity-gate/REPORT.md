@@ -69,17 +69,84 @@ exhaustion message and the harness-side `ModelStarted` counters disagree for
 this cell; the trace is retained. Recorded as an open harness-accounting
 question, not attributed to any component.
 
+## Attempt 2 — host-registered exact verifier (2026-08-25, same day)
+
+Substrate change (declared, identical across both arms): the pilot
+composition root now registers `jobrunner.exact`, a source-read-only
+ExactCurrentWorld recipe binding the seed-guaranteed inputs, beside the
+unchanged TaskScoped mirror of discovery (`rust.workspace`). A pre-flight
+test pins that identity capture succeeds in this environment. Eight fresh
+cells ran under `*-attempt2` repeat dirs; attempt-1 bundles are retained.
+
+| cell | opp | verdict | behavior | diff | closure | rounds | offers | called |
+| --- | --- | --- | --- | ---: | --- | --- | ---: | --- |
+| normal r1 | off | FAIL | fail | pass | failed | 24+0 | 0 | no |
+| resume r1 | off | FAIL | fail | pass | failed | 6+0 | 0 | no |
+| normal r2 | off | PASS | pass | pass | completed | 21+0 | 0 | no |
+| resume r2 | off | PASS | pass | pass | completed | 5+11 | 0 | no |
+| normal r1 | on | FAIL | fail | pass | failed | 11+0 | 0 | no |
+| resume r1 | on | FAIL | fail | pass | failed | 6+0 | 0 | no |
+| normal r2 | on | FAIL | pass | pass | failed | 32+0 | 1 | no |
+| resume r2 | on | PASS | pass | pass | completed | 5+29 | 1 | yes |
+
+Provider health was `healthy` in all eight cells.
+
+What worked as designed:
+
+- Arming is now possible and happened: exactly one receipt-backed offer in
+  each mode's second repeat
+  (`opp/<task>/a0/d1/w18/8da6ede1da6222b7`,
+  `opp/<task>/a0/d2/w18/cf1cb53e35cd8e35`), matching one-to-one the two
+  cells whose traces contain an `ExecutionVerificationPass` receipt.
+- resume/on r2 executed the full intended chain live: offer -> leased
+  surface decision -> model called `task.complete` -> committed closure ->
+  the cell PASSED every dimension (behavior, diff, closure, restored
+  continuation). This is the first live end-to-end proof of the candidate's
+  contract.
+- normal/on r2 exercised the once-per-basis limit honestly: the model
+  ignored the leased decision, was not re-offered, and kept working until
+  the round budget ended the turn without closure.
+
+Why the gate still fails to promote:
+
+- Paired outcomes fell: off passed 2/4 versus on 1/4.
+- Medians moved the wrong way: normal 24->32 total rounds, resume 16->34.
+- Arming remains rare (2 of 6 on-cells): eligibility needs a post-mutation
+  re-verification landing as a Current exact pass at a settled batch, and
+  the r1 on-cells died earlier instead (two behavioral-oracle failures, one
+  event-drain stall).
+- One infrastructure flake hit an off cell: resume/off r1 failed loading the
+  checkpoint artifact with an exclusive file-lock conflict on
+  `.focus-agent/authority/workspace-effects.jsonl` ("the operation would
+  block"). Recorded as a real defect candidate for the harness/journal lock
+  path, not attributed to either arm.
+
 ## Verdict
 
-**The promotion gate fails: the candidate remains default-off** and must not
-enter any same-model A/C comparison. The paired medians (normal 37→14,
-resume 34→21 total rounds) carry no evidential weight at n=2 with zero
-offers armed and mixed behavioral outcomes.
+Both attempts **fail promotion; the candidate remains default-off** and out
+of any same-model A/C comparison. Attempt 1 proved nothing measurable
+(structural non-arming); attempt 2 proves the mechanism works end to end in
+live conditions at least once per mode while failing the promotion criteria
+on outcome count and median rounds at n=2. Raising repeats would tighten
+noise but does not address the two structural costs this report records: the
+rare arming rate and the journal-lock flake. Both are prerequisites before
+any future rerun can be decision-grade.
 
 ## What would make the gate measurable
 
-Before any rerun, the host side must give the fixture an opt-in
+~~Before any rerun, the host side must give the fixture an opt-in
 source-read-only ExactCurrentWorld recipe (as the deterministic replay does),
-so a live `verify.run` PASS can produce an exact receipt and arm eligibility.
+so a live `verify.run` PASS can produce an exact receipt and arm eligibility.~~
+Done in attempt 2: the registered recipe arms eligibility, and one on-cell
+executed the full offer->lease->call->pass chain live.
+
+What remains before a decision-grade rerun:
+
+1. the rare arming rate — models rarely re-verify after their last mutation
+   with nothing else pending; whether to surface verification demand
+   differently is a gated design question, not something this report changes;
+2. the journal-lock flake on checkpoint artifact load (resume/off r1) must
+   be fixed or made retryable, because it censors cells asymmetrically;
+3. more paired repeats once both hold, since n=2 medians stay noise-dominated.
 Whether general discovered runners should ever be upgraded is a separate,
 gated decision; this report does not propose retuning them.

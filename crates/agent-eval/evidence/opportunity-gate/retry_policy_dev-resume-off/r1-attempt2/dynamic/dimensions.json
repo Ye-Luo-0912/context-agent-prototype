@@ -1,0 +1,15 @@
+{
+  "allowed_diff": "pass",
+  "behavioral_oracle": "fail",
+  "completion_opportunity": "off",
+  "continuation": "failed",
+  "final_passed": false,
+  "mode": "resume",
+  "opportunity_called": false,
+  "opportunity_offers": [],
+  "provider_runtime": "healthy",
+  "runtime_error": "checkpoint artifact load failed: storage error: lock workspace effect journal C:\\Users\\Ye_Luo\\AppData\\Local\\Temp\\.tmps9sENZ\\.focus-agent\\authority\\workspace-effects.jsonl exclusively: lock acquisition failed because the operation would block",
+  "schema": "retry-pilot-cell-v2",
+  "task_closure": "failed",
+  "workspace_self_check": "not_run"
+}

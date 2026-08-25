@@ -431,21 +431,20 @@ and sandbox contracts live elsewhere. Experiment facts live in
   item 8 off/on paired repeats) has not run — the candidate stays off until
   it does.
 - The item-8 off/on paired live gate for the `CompletionOpportunity`
-  candidate ran (2026-08-25, 8 cells over `retry_policy_dev`, C engine,
-  evidence under
+  candidate ran twice (2026-08-25, 8 cells each over `retry_policy_dev`,
+  C engine, evidence under
   [`evidence/opportunity-gate/REPORT.md`](../crates/agent-eval/evidence/opportunity-gate/REPORT.md))
-  and **failed to promote; the candidate stays off**. Zero offers armed in
-  every candidate-on cell: live `verify.run` calls used the discovered
-  `rust.workspace` recipe, which is TaskScoped by design, so successful runs
-  produce no exact-identity receipt and the fail-closed eligibility
-  precondition never held — confirmed by zero
-  `ExecutionVerificationPass` events across all eight traces. The pairing
-  therefore measured model variance, not the candidate; medians carry no
-  weight at n=2. A counterexample surfaced independently of the candidate:
-  one on-cell closed the task while the behavioral oracle failed, through
-  the model's own explicit path. Making the gate measurable requires a
-  host-registered source-read-only ExactCurrentWorld recipe for the fixture;
-  upgrading discovered general runners remains a separate gated decision.
+  and **failed to promote both times; the candidate stays off**. Attempt 1:
+  zero offers armed — discovered verifiers are TaskScoped by design, so no
+  exact-identity receipt ever existed and the fail-closed precondition never
+  held. Attempt 2 registered a host opt-in source-read-only
+  ExactCurrentWorld recipe on both arms: receipt-backed offers fired once
+  per mode, and one cell executed the full intended chain live (offer ->
+  leased `task.complete` call -> committed closure -> behavior/diff/closure/
+  continuation all pass). Promotion still fails: paired outcomes fell 2/4 to
+  1/4, medians rose, arming stayed rare, and a journal-lock flake censored
+  an off cell (exclusive-lock conflict on the workspace effect journal
+  during checkpoint artifact load — recorded as a real defect candidate).
   Separately, the deterministic already-satisfied replay froze green: with a
   registered exact recipe, one offer fires per basis and the leased decision
   closes through `task.complete` alone, while the disabled twin stays fully
