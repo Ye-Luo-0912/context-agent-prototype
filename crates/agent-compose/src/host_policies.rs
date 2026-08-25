@@ -68,6 +68,18 @@ impl HostToolPolicyRegistry {
     /// 安装一条运维审核过的插件绑定。撞内置名或重复准入一律失败：
     /// 内置工具的授权不重新下放。成功后使快照失效。
     pub fn admit(&mut self, policy: HostToolPolicy) -> Result<(), String> {
+        self.ensure_admissible(&policy)?;
+        self.admitted.push(policy);
+        *self
+            .snapshot
+            .write()
+            .expect("host policy snapshot poisoned") = None;
+        Ok(())
+    }
+
+    /// 准入前的共享检查：撞内置名或重复准入一律拒绝。批量准入先对
+    /// 全部条目跑完这里，再统一落盘——半装状态比整体拒绝更危险。
+    fn ensure_admissible(&self, policy: &HostToolPolicy) -> Result<(), String> {
         if self
             .builtins
             .iter()
@@ -88,7 +100,57 @@ impl HostToolPolicyRegistry {
                 policy.tool_name
             ));
         }
-        self.admitted.push(policy);
+        Ok(())
+    }
+
+    /// 安装一批运维审核过的插件包绑定。清单的角色只有两个：提供候选
+    /// 工具名、证明包已安装并被审阅——授权内容（含参数名到效果意图的
+    /// 绑定）完全来自运维审核产物，清单本身永远不产生授权。任一条目
+    /// 不可准入则整批拒绝，绝不留下半装状态。
+    pub fn admit_reviewed(
+        &mut self,
+        reviewed_tool_names: &[String],
+        policies: Vec<HostToolPolicy>,
+    ) -> Result<usize, String> {
+        for policy in &policies {
+            if !reviewed_tool_names
+                .iter()
+                .any(|name| name == &policy.tool_name)
+            {
+                return Err(format!(
+                    "tool '{}' is not part of the reviewed package manifest",
+                    policy.tool_name
+                ));
+            }
+        }
+        for policy in &policies {
+            self.ensure_admissible(policy)?;
+        }
+        let count = policies.len();
+        self.admitted.extend(policies);
+        *self
+            .snapshot
+            .write()
+            .expect("host policy snapshot poisoned") = None;
+        Ok(count)
+    }
+
+    /// 撤销一条运维准入的绑定：内置授权不可撤销，未准入的名字报错。
+    /// 撤销推进快照版本——此后解析的新操作不再看到该工具的宿主授权；
+    /// 已批准的在途操作仍持旧快照，不被重释。
+    pub fn revoke_admitted(&mut self, tool_name: &str) -> Result<(), String> {
+        if self.builtins.iter().any(|p| p.tool_name == tool_name) {
+            return Err(format!(
+                "builtin tool '{tool_name}' authority cannot be revoked"
+            ));
+        }
+        let before = self.admitted.len();
+        self.admitted.retain(|p| p.tool_name != tool_name);
+        if self.admitted.len() == before {
+            return Err(format!(
+                "tool '{tool_name}' has no admitted binding to revoke"
+            ));
+        }
         *self
             .snapshot
             .write()
@@ -267,6 +329,125 @@ mod tests {
         let mut registry = HostToolPolicyRegistry::with_builtins();
         registry.admit(write_binding()).unwrap();
         assert!(registry.admit(write_binding()).is_err());
+    }
+
+    /// 运维准入流：清单只提供候选工具名，授权内容来自运维审核产物。
+    #[test]
+    fn reviewed_admission_installs_operator_authority_end_to_end() {
+        use agent_contracts::ToolCall;
+
+        let mut registry = HostToolPolicyRegistry::with_builtins();
+        // 审阅过的清单工具名（来自已安装包的 tools 表）。
+        let reviewed = vec!["plugin.notes.write".to_string()];
+        let policies = vec![write_binding()];
+        assert_eq!(registry.admit_reviewed(&reviewed, policies).unwrap(), 1);
+
+        let call = ToolCall {
+            id: "c".into(),
+            name: "plugin.notes.write".into(),
+            arguments: json!({"path": "notes/a.md", "text": "hello"}),
+        };
+        let spec = agent_contracts::ToolSpec {
+            name: "plugin.notes.write".into(),
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+            risk: agent_contracts::ToolRisk::WorkspaceWrite,
+            output_budget: None,
+            roles: vec![],
+        };
+        assert_eq!(
+            registry.effect_intent(&call, &spec),
+            EffectIntent::WorkspaceWrite {
+                path: "notes/a.md".into(),
+                content_bytes: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn reviewed_admission_refuses_tools_outside_the_manifest_and_is_atomic() {
+        let mut registry = HostToolPolicyRegistry::with_builtins();
+        let reviewed = vec!["plugin.notes.write".to_string()];
+        let batch = vec![
+            write_binding(),
+            HostToolPolicy {
+                // 清单里没有这个工具名：整批必须拒绝。
+                tool_name: "plugin.other.write".into(),
+                binding: write_binding().binding,
+            },
+        ];
+        assert!(registry.admit_reviewed(&reviewed, batch).is_err());
+        // 原子性：第一条也不能被半装。
+        assert!(registry.policy_for("plugin.notes.write").is_none());
+
+        // 审核产物试图给内置工具发绑定：同样整批拒绝。
+        let shadow_batch = vec![HostToolPolicy {
+            tool_name: "fs.write".into(),
+            binding: write_binding().binding,
+        }];
+        assert!(registry.admit_reviewed(&reviewed, shadow_batch).is_err());
+        assert!(
+            !matches!(
+                registry.policy_for("fs.write").unwrap().binding,
+                HostEffectBinding::ReadOnly
+            ),
+            "a refused batch must leave builtin authority in place"
+        );
+    }
+
+    #[test]
+    fn revocation_removes_only_the_named_admitted_tool() {
+        use agent_contracts::HostEffectBinding as Binding;
+
+        let mut registry = HostToolPolicyRegistry::with_builtins();
+        let reviewed = vec![
+            "plugin.notes.write".to_string(),
+            "plugin.cache.clear".to_string(),
+        ];
+        registry
+            .admit_reviewed(
+                &reviewed,
+                vec![
+                    write_binding(),
+                    HostToolPolicy {
+                        tool_name: "plugin.cache.clear".into(),
+                        binding: Binding::ReadOnly,
+                    },
+                ],
+            )
+            .unwrap();
+        let before = registry.resolve_policy();
+
+        // 内置授权不可撤销。
+        assert!(registry.revoke_admitted("fs.write").is_err());
+        // 未准入的名字不可撤销。
+        assert!(registry.revoke_admitted("plugin.never.admitted").is_err());
+        // 撤销一条：另一条不受影响，被撤的工具回到无宿主授权。
+        registry.revoke_admitted("plugin.cache.clear").unwrap();
+        assert!(registry.policy_for("plugin.notes.write").is_some());
+        assert!(registry.policy_for("plugin.cache.clear").is_none());
+
+        let after = registry.resolve_policy();
+        assert_ne!(
+            after.revision(),
+            before.revision(),
+            "revocation bumps revision"
+        );
+        assert_ne!(after.digest(), before.digest());
+        // 旧快照消费者不被重释：仍解析出被撤销工具的旧授权。
+        assert!(before.policy_for("plugin.cache.clear").is_some());
+
+        // 撤销后可重新走准入流装回新绑定。
+        registry
+            .admit_reviewed(
+                &reviewed,
+                vec![HostToolPolicy {
+                    tool_name: "plugin.cache.clear".into(),
+                    binding: Binding::ReadOnly,
+                }],
+            )
+            .unwrap();
+        assert!(registry.policy_for("plugin.cache.clear").is_some());
     }
 
     #[test]

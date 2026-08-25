@@ -26,7 +26,18 @@ in `tool-runtime` (`BuiltinToolPolicies`); trusted composition owns
 `agent-compose::HostToolPolicyRegistry`, which admits operator-reviewed
 plugin bindings and never lets them shadow a builtin. The same registry
 reaches the kernel lease path, the approval gate, and the capability
-dispatcher — approval and lease minting cannot drift.
+dispatcher — approval and lease minting cannot drift. The admission flow is
+explicit: an installed package manifest contributes only candidate tool
+names, while the operator review artifact supplies the actual
+`HostToolPolicy` bindings (including argument-name binding);
+`admit_reviewed` installs them atomically — any builtin shadow, duplicate
+admission, or tool outside the reviewed manifest refuses the whole batch.
+`revoke_admitted` withdraws a previously admitted binding; builtins are
+irrevocable. Both moves advance the snapshot revision and digest, and
+consumers holding the old snapshot keep its exact authority, so an operator
+update never re-interprets an in-flight operation. Still open (M12):
+fencing already-minted leases when their tool's binding is revoked
+mid-flight via an explicit per-binding revocation epoch.
 
 `HostEffectBinding::ExecRecipe` is the trusted indirection for
 `verify.run { recipe_id }`: the model-visible call contains no argv, and the
