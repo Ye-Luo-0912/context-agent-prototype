@@ -709,7 +709,12 @@ Open implementation must remain execution-only and staged:
 - complete the table-driven crash/restart matrix. Normal, transient,
   recovery-refused, duplicate, oversized-batch, scope-open, admission and
   publication abort paths now settle or expose a missing terminal through the
-  actor-local ledger; abrupt process loss still needs replay evidence;
+  actor-local ledger; abrupt-loss replay evidence landed 2026-08-26:
+  trace-only `analyze_batch_interruptions` in the agent-replay recovery
+  report flags rounds killed between tool start and durable batch settlement
+  with exact per-call counts, keeps live settle-time missing/unexpected
+  terminals as a separate integrity signal, and ignores tool events outside
+  any model round instead of inventing attributions;
 - independently make accepted completion one-shot and terminal-safe; the
   retained baseline has zero completion calls, so this cannot be presented as
   the cause of its 49/65 versus 38/29 gap.

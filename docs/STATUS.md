@@ -595,7 +595,11 @@ machinery fired zero times. Loop persistence is stochastic, but a
 all 11 multi-line `no_exact_match` refusals in those four cells were
 the deterministic LF-view/CRLF-raw mismatch. Remaining convergence
 work is still a deterministic harness where the loop actually forms,
-not more Context live cells.
+not more Context live cells. Abrupt-loss replay evidence landed
+2026-08-26: the agent-replay recovery report now flags tool batches
+killed between dispatch and durable settlement with exact per-call
+counts, and keeps settle-time missing/unexpected terminals as a live
+integrity signal.
 
 **P1 — Tool Surface edit reliability.** `edit.patch` stays the only
 production-always-loaded mutation primitive; matching remains exact and no

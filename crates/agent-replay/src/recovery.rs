@@ -30,7 +30,7 @@
 use std::path::Path;
 
 use agent_contracts::{
-    ContextDiagnostics, ContextEngine, RunId, RuntimeEvent, RuntimeEventEnvelope,
+    ContextDiagnostics, ContextEngine, RunId, RuntimeEvent, RuntimeEventEnvelope, TurnId,
 };
 use context_baselines::{AppendOnlyEngine, RollingConfig, RollingSummaryEngine};
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
@@ -109,6 +109,10 @@ pub struct RecoveryReport {
     pub rebuilt: ReplayOutcome,
     /// Final diagnostics of the rebuilt engine (the "truth" state).
     pub rebuilt_diagnostics: ContextDiagnostics,
+    /// Action-batch interruption evidence: rounds killed by process loss
+    /// before their settlement accounting landed, plus live settle-time
+    /// integrity violations seen in the trace.
+    pub batch_interruptions: BatchInterruptionReport,
 }
 
 /// Proof that restoring a context checkpoint and then replaying the events
@@ -178,6 +182,152 @@ pub fn first_seq_gap(events: &[RuntimeEventEnvelope]) -> Option<(u64, u64)> {
     None
 }
 
+/// One model round whose tool batch never settled: abrupt process loss
+/// killed the runtime after calls started but before the durable
+/// `ExecutionBatchSettled` accounting landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedBatch {
+    pub turn_id: TurnId,
+    pub model_round: usize,
+    /// seq of the `ModelStarted` that opened the round.
+    pub opened_seq: u64,
+    /// seq of the last event observed inside the interrupted window.
+    pub last_seq: u64,
+    pub started_calls: usize,
+    pub finished_calls: usize,
+}
+
+/// A settled batch whose own accounting reported missing or unexpected
+/// terminals. This is live integrity damage (the actor saw it while
+/// settling), not crash loss — recovery must surface it separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettleIntegrityViolation {
+    pub seq: u64,
+    pub turn_id: TurnId,
+    pub model_round: usize,
+    pub missing_terminal: usize,
+    pub unexpected_terminal: usize,
+}
+
+/// Trace-only evidence about action batches that never received durable
+/// settlement accounting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchInterruptionReport {
+    pub interrupted_rounds: Vec<InterruptedBatch>,
+    pub integrity_violations: Vec<SettleIntegrityViolation>,
+}
+
+struct OpenRound {
+    turn_id: TurnId,
+    model_round: usize,
+    opened_seq: u64,
+    last_seq: u64,
+    started_calls: usize,
+    finished_calls: usize,
+}
+
+impl OpenRound {
+    fn into_interrupted(self) -> Option<InterruptedBatch> {
+        // A round with no tool activity leaves nothing to account for;
+        // flagging it would turn every plain text turn into a defect.
+        if self.started_calls == 0 && self.finished_calls == 0 {
+            return None;
+        }
+        Some(InterruptedBatch {
+            turn_id: self.turn_id,
+            model_round: self.model_round,
+            opened_seq: self.opened_seq,
+            last_seq: self.last_seq,
+            started_calls: self.started_calls,
+            finished_calls: self.finished_calls,
+        })
+    }
+}
+
+/// Detect interrupted tool batches from the trace alone. A healthy runtime
+/// settles every batch (`ExecutionBatchSettled`) before the next model round
+/// and before every terminal path; any window left open at a new round, a
+/// turn boundary, or the end of the trace is therefore evidence of abrupt
+/// process loss, and its per-call counts are what replay can honestly claim:
+/// calls were started, some finished, and none was accounted.
+///
+/// Tool events outside any `ModelStarted`-anchored window are ignored — old
+/// or synthetic traces may carry them, and inventing an attribution would
+/// defeat the purpose of evidence.
+pub fn analyze_batch_interruptions(events: &[RuntimeEventEnvelope]) -> BatchInterruptionReport {
+    let mut report = BatchInterruptionReport::default();
+    let mut open: Option<OpenRound> = None;
+    let flush = |open: &mut Option<OpenRound>, report: &mut BatchInterruptionReport| {
+        if let Some(round) = open.take()
+            && let Some(interrupted) = round.into_interrupted()
+        {
+            report.interrupted_rounds.push(interrupted);
+        }
+    };
+
+    for envelope in events {
+        match &envelope.event {
+            RuntimeEvent::ModelStarted {
+                turn_id,
+                model_round,
+                ..
+            } => {
+                // The runtime settles before requesting the next round; an
+                // open window here is itself interruption evidence.
+                flush(&mut open, &mut report);
+                open = Some(OpenRound {
+                    turn_id: *turn_id,
+                    model_round: *model_round,
+                    opened_seq: envelope.seq,
+                    last_seq: envelope.seq,
+                    started_calls: 0,
+                    finished_calls: 0,
+                });
+            }
+            RuntimeEvent::ToolStarted { .. } => {
+                if let Some(round) = open.as_mut() {
+                    round.started_calls += 1;
+                    round.last_seq = envelope.seq;
+                }
+            }
+            RuntimeEvent::ToolFinished { .. } => {
+                if let Some(round) = open.as_mut() {
+                    round.finished_calls += 1;
+                    round.last_seq = envelope.seq;
+                }
+            }
+            RuntimeEvent::ExecutionBatchSettled {
+                turn_id,
+                model_round,
+                missing_terminal,
+                unexpected_terminal,
+                ..
+            } => {
+                if *missing_terminal > 0 || *unexpected_terminal > 0 {
+                    report.integrity_violations.push(SettleIntegrityViolation {
+                        seq: envelope.seq,
+                        turn_id: *turn_id,
+                        model_round: *model_round,
+                        missing_terminal: *missing_terminal,
+                        unexpected_terminal: *unexpected_terminal,
+                    });
+                }
+                // Settlement is the accounting authority for its window even
+                // when the trace's identity fields disagree with it.
+                open = None;
+            }
+            RuntimeEvent::TurnCompleted
+            | RuntimeEvent::TurnCancelled { .. }
+            | RuntimeEvent::TurnCommitFailed { .. } => flush(&mut open, &mut report),
+            _ => {}
+        }
+    }
+    // Abrupt loss usually ends the trace mid-round: whatever is still open
+    // here never got its accounting.
+    flush(&mut open, &mut report);
+    report
+}
+
 /// Rebuild the context-engine state from one run's envelopes: a fresh
 /// engine of the requested kind replays every event deterministically.
 /// Returns the measurement outcome and the final diagnostics of that engine.
@@ -236,6 +386,7 @@ pub async fn recovery_replay(
         .ok_or_else(|| anyhow::anyhow!("recovery replay needs at least one event"))?;
     let barrier = analyze_barrier(events);
     let seq_gap = first_seq_gap(events);
+    let batch_interruptions = analyze_batch_interruptions(events);
     let (rebuilt, rebuilt_diagnostics) = rebuild_engine_state(events, config, kind).await?;
     Ok(RecoveryReport {
         run_id,
@@ -245,6 +396,7 @@ pub async fn recovery_replay(
         barrier,
         rebuilt,
         rebuilt_diagnostics,
+        batch_interruptions,
     })
 }
 
@@ -405,6 +557,33 @@ pub fn render_recovery_report(report: &RecoveryReport) -> String {
         }
         None => out.push_str("  no turn-commit failure in this trace\n"),
     }
+    let interruptions = &report.batch_interruptions;
+    if interruptions.interrupted_rounds.is_empty() && interruptions.integrity_violations.is_empty()
+    {
+        out.push_str("action batches: every started batch settled\n");
+    } else {
+        for batch in &interruptions.interrupted_rounds {
+            out.push_str(&format!(
+                "INTERRUPTED batch: turn {} round {} (opened at seq {}, last event seq {}): {} call(s) started, {} finished, none accounted — abrupt loss evidence\n",
+                batch.turn_id,
+                batch.model_round,
+                batch.opened_seq,
+                batch.last_seq,
+                batch.started_calls,
+                batch.finished_calls,
+            ));
+        }
+        for violation in &interruptions.integrity_violations {
+            out.push_str(&format!(
+                "SETTLE INTEGRITY: turn {} round {} settled at seq {} with {} missing / {} unexpected terminal(s)\n",
+                violation.turn_id,
+                violation.model_round,
+                violation.seq,
+                violation.missing_terminal,
+                violation.unexpected_terminal,
+            ));
+        }
+    }
     let diagnostics = &report.rebuilt_diagnostics;
     out.push_str(&format!(
         "rebuilt context: total={} active={} cooling={} archived={} resident={} bytes={} warm={} cold={} external={} | turn={} event_seq={}\n",
@@ -428,7 +607,8 @@ mod tests {
     use super::*;
     use agent_contracts::{
         ContextConsumptionAck, ContextMaintenanceReport, ContextMaintenanceTrigger,
-        ContextSelection, OperationId, TaskId, ToolOutput, TurnCancellationReason, TurnId,
+        ContextSelection, OperationId, TaskId, ToolCall, ToolOutput, TurnCancellationReason,
+        TurnId,
     };
     use serde_json::json;
 
@@ -813,5 +993,231 @@ mod tests {
             "replaying events the checkpoint already contains must diverge"
         );
         assert!(report.first_difference.is_some());
+    }
+
+    fn model_started_event(
+        run: RunId,
+        seq: u64,
+        turn: TurnId,
+        round: usize,
+    ) -> RuntimeEventEnvelope {
+        envelope(
+            run,
+            seq,
+            RuntimeEvent::ModelStarted {
+                turn_id: turn,
+                operation_id: OperationId::new(),
+                generation: 1,
+                surface_revision: 0,
+                model_round: round,
+                prompt_layers: agent_contracts::PromptLayerCosts::default(),
+                turn_checkpoint: agent_contracts::TurnCheckpointStats::default(),
+            },
+        )
+    }
+
+    fn tool_started_event(run: RunId, seq: u64, call_id: &str) -> RuntimeEventEnvelope {
+        envelope(
+            run,
+            seq,
+            RuntimeEvent::ToolStarted {
+                call: ToolCall {
+                    id: call_id.into(),
+                    name: "fs.read".into(),
+                    arguments: json!({}),
+                },
+            },
+        )
+    }
+
+    fn settled_event(
+        run: RunId,
+        seq: u64,
+        turn: TurnId,
+        round: usize,
+        missing_terminal: usize,
+        unexpected_terminal: usize,
+    ) -> RuntimeEventEnvelope {
+        envelope(
+            run,
+            seq,
+            RuntimeEvent::ExecutionBatchSettled {
+                turn_id: turn,
+                model_round: round,
+                requested: 1,
+                terminal: 1 - missing_terminal.min(1),
+                spawned: 1,
+                refused: 0,
+                reused: 0,
+                persist_observation: 1,
+                transient_no_persist: 0,
+                access_event_only: 0,
+                succeeded: 1,
+                failed: 0,
+                known_mutation_results: 1,
+                typed_verification_results: 0,
+                unknown_invalidations: 0,
+                completion_proposals: 0,
+                outcome_advances: 1,
+                no_outcome_results: 0,
+                missing_terminal,
+                unexpected_terminal,
+            },
+        )
+    }
+
+    #[test]
+    fn abrupt_loss_leaves_an_interrupted_batch_in_the_trace() {
+        let run = RunId::new();
+        let turn = TurnId::new();
+        let events = vec![
+            envelope(run, 1, RuntimeEvent::RunStarted),
+            model_started_event(run, 2, turn, 1),
+            tool_started_event(run, 3, "call-1"),
+            tool_started_event(run, 4, "call-2"),
+            envelope(
+                run,
+                5,
+                RuntimeEvent::ToolFinished {
+                    output: tool_output(true, "one result landed before the loss"),
+                },
+            ),
+        ];
+
+        let report = analyze_batch_interruptions(&events);
+
+        assert_eq!(
+            report.interrupted_rounds,
+            vec![InterruptedBatch {
+                turn_id: turn,
+                model_round: 1,
+                opened_seq: 2,
+                last_seq: 5,
+                started_calls: 2,
+                finished_calls: 1,
+            }],
+            "the trace ends mid-round: two calls started, one finished, none accounted"
+        );
+        assert!(report.integrity_violations.is_empty());
+    }
+
+    #[test]
+    fn settled_batches_and_plain_text_rounds_are_never_flagged() {
+        let run = RunId::new();
+        let turn = TurnId::new();
+        let events = vec![
+            envelope(run, 1, RuntimeEvent::RunStarted),
+            model_started_event(run, 2, turn, 1),
+            tool_started_event(run, 3, "call-1"),
+            envelope(
+                run,
+                4,
+                RuntimeEvent::ToolFinished {
+                    output: tool_output(true, "settled normally"),
+                },
+            ),
+            settled_event(run, 5, turn, 1, 0, 0),
+            envelope(run, 6, RuntimeEvent::TurnCompleted),
+            // A plain text round without any tool activity is normal.
+            model_started_event(run, 7, turn, 2),
+            envelope(run, 8, RuntimeEvent::TurnCompleted),
+        ];
+
+        assert_eq!(
+            analyze_batch_interruptions(&events),
+            BatchInterruptionReport::default()
+        );
+    }
+
+    #[test]
+    fn a_new_model_round_over_an_unsettled_batch_is_interruption_evidence() {
+        let run = RunId::new();
+        let turn = TurnId::new();
+        let events = vec![
+            model_started_event(run, 1, turn, 1),
+            tool_started_event(run, 2, "call-1"),
+            // The runtime always settles before requesting the next round;
+            // this window was killed without accounting.
+            model_started_event(run, 3, turn, 2),
+            tool_started_event(run, 4, "call-2"),
+            settled_event(run, 5, turn, 2, 0, 0),
+        ];
+
+        let report = analyze_batch_interruptions(&events);
+
+        assert_eq!(
+            report.interrupted_rounds,
+            vec![InterruptedBatch {
+                turn_id: turn,
+                model_round: 1,
+                opened_seq: 1,
+                last_seq: 2,
+                started_calls: 1,
+                finished_calls: 0,
+            }],
+        );
+    }
+
+    #[test]
+    fn settle_accounting_mismatch_is_a_live_integrity_violation_not_crash_evidence() {
+        let run = RunId::new();
+        let turn = TurnId::new();
+        let events = vec![
+            model_started_event(run, 1, turn, 1),
+            tool_started_event(run, 2, "call-1"),
+            envelope(
+                run,
+                3,
+                RuntimeEvent::ToolFinished {
+                    output: tool_output(true, "finished but unaccounted"),
+                },
+            ),
+            settled_event(run, 4, turn, 1, 1, 0),
+            envelope(run, 5, RuntimeEvent::TurnCompleted),
+        ];
+
+        let report = analyze_batch_interruptions(&events);
+
+        assert!(report.interrupted_rounds.is_empty());
+        assert_eq!(
+            report.integrity_violations,
+            vec![SettleIntegrityViolation {
+                seq: 4,
+                turn_id: turn,
+                model_round: 1,
+                missing_terminal: 1,
+                unexpected_terminal: 0,
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_replay_reports_the_interrupted_batch_end_to_end() {
+        let run = RunId::new();
+        let turn = TurnId::new();
+        let events = vec![
+            envelope(run, 1, RuntimeEvent::RunStarted),
+            model_started_event(run, 2, turn, 1),
+            tool_started_event(run, 3, "call-1"),
+            envelope(
+                run,
+                4,
+                RuntimeEvent::ToolFinished {
+                    output: tool_output(true, "lost mid-batch"),
+                },
+            ),
+        ];
+        let config = ReplayConfig::default();
+
+        let report = recovery_replay(&events, &config, ReplayEngineKind::Dynamic)
+            .await
+            .unwrap();
+
+        assert_eq!(report.batch_interruptions.interrupted_rounds.len(), 1);
+        let rendered = render_recovery_report(&report);
+        assert!(
+            rendered.contains("INTERRUPTED batch"),
+            "rendered recovery report must surface the interruption evidence:\n{rendered}"
+        );
     }
 }

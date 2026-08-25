@@ -41,9 +41,10 @@ pub use facts::{
 };
 pub use frontier::{FrontierRebuild, rebuild_frontier};
 pub use recovery::{
-    RecoveryBarrier, RecoveryFailure, RecoveryReport, ReplayEngineKind, RestoreConsistencyReport,
-    analyze_barrier, first_seq_gap, rebuild_engine_state, recovery_replay, recovery_replay_file,
-    render_recovery_report, verify_restore_consistency,
+    BatchInterruptionReport, InterruptedBatch, RecoveryBarrier, RecoveryFailure, RecoveryReport,
+    ReplayEngineKind, RestoreConsistencyReport, SettleIntegrityViolation, analyze_barrier,
+    analyze_batch_interruptions, first_seq_gap, rebuild_engine_state, recovery_replay,
+    recovery_replay_file, render_recovery_report, verify_restore_consistency,
 };
 pub use scenarios::{
     Scenario, all_scenarios, compare_config, compare_scenario, engine_variants, render_comparison,
