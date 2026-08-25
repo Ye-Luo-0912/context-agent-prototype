@@ -55,6 +55,11 @@ pub struct CoreAuthorityConfig {
     /// 同一来源交给审批门。缺省时一切意图按声明风险的空界限推导，
     /// 永远匹配不到授权。
     pub host_policies: Option<Arc<dyn agent_contracts::HostToolPolicies>>,
+    /// M12 reserved/dispatch/ack barrier for brokerable effects. `None`
+    /// installs the local broker, which preserves today's inline commit
+    /// behavior exactly while structuring the three phases for a future
+    /// HTTP/gRPC coordinator.
+    pub effect_broker: Option<Arc<dyn crate::port::EffectBroker>>,
 }
 
 impl std::fmt::Debug for CoreAuthorityConfig {
@@ -67,6 +72,7 @@ impl std::fmt::Debug for CoreAuthorityConfig {
             .field("shadow_gate", &"<shadow gate>")
             .field("lease_ttl_ms", &self.lease_ttl_ms)
             .field("host_policies", &"<host policies>")
+            .field("effect_broker", &"<effect broker>")
             .finish()
     }
 }
@@ -81,6 +87,7 @@ impl Default for CoreAuthorityConfig {
             shadow_gate: None,
             lease_ttl_ms: None,
             host_policies: None,
+            effect_broker: None,
         }
     }
 }
@@ -111,6 +118,7 @@ pub(crate) struct CoreAuthority {
     approval: ApprovalAuthority,
     effect: EffectAuthority,
     output: OutputAuthority,
+    broker: Arc<dyn crate::port::EffectBroker>,
 }
 
 impl CoreAuthority {
@@ -177,6 +185,10 @@ impl CoreAuthority {
         // evidence. Unknown outcomes remain queryable and install a global
         // mutation fence; Core never schedules or blindly replays them.
         reconcile_recovered_operations(&operations, effect_reconciler.as_deref());
+        let broker = config
+            .effect_broker
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::port::LocalEffectBroker));
         Ok(Self {
             run_id: RunId::new(),
             authority_epoch: AtomicU64::new(authority_epoch),
@@ -189,6 +201,7 @@ impl CoreAuthority {
             approval,
             effect: EffectAuthority,
             output: OutputAuthority::new(output_broker),
+            broker,
         })
     }
 
@@ -420,6 +433,12 @@ impl CoreAuthority {
     /// The effect authority seam: commit/rollback of staged effects.
     pub(crate) fn effect(&self) -> &EffectAuthority {
         &self.effect
+    }
+
+    /// The broker seam: reserved/dispatch/ack barrier for brokerable
+    /// effects (M12). The local default preserves inline behavior.
+    pub(crate) fn broker(&self) -> &Arc<dyn crate::port::EffectBroker> {
+        &self.broker
     }
 
     /// The broadcast sender behind `subscribe`, for live event sinks.

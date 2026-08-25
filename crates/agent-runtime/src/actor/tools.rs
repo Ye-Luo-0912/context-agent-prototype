@@ -1134,6 +1134,9 @@ impl RuntimeActor {
                                 EffectCommitRejection::ActualExceedsApproved => {
                                     "the prepared effect reported a workspace write to a path the approved intent never named"
                                 }
+                                EffectCommitRejection::BrokerUnavailable => {
+                                    "the effect broker could not reserve the approved effect before dispatch; nothing was applied"
+                                }
                             };
                             unsettled_effect_output(
                                 output,

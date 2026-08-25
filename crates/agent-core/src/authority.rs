@@ -17,9 +17,9 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_contracts::{
-    AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, Effect, EffectReceipt,
-    EventJournal, IntentShadowGate, OutputBroker, RunId, RuntimeEvent, RuntimeEventEnvelope,
-    ShadowVerdict, ToolCall, ToolOutput, ToolSpec, apply_runtime_diagnosis, take_runtime_diagnosis,
+    AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, Effect, EventJournal,
+    IntentShadowGate, OutputBroker, RunId, RuntimeEvent, RuntimeEventEnvelope, ShadowVerdict,
+    ToolCall, ToolOutput, ToolSpec, apply_runtime_diagnosis, take_runtime_diagnosis,
 };
 use tokio::sync::broadcast;
 
@@ -215,16 +215,10 @@ impl ApprovalAuthority {
 pub struct EffectAuthority;
 
 impl EffectAuthority {
-    /// Commit a staged effect. The `EffectReceipt` classification is
-    /// preserved so the caller can tell the model the truth about what
-    /// happened.
-    pub async fn commit(&self, effect: Box<dyn Effect>) -> EffectReceipt {
-        effect.commit().await
-    }
-
     /// Roll a staged effect back because its operation turned stale or the
     /// turn aborted. The reason is surfaced through the effect's own
-    /// bookkeeping.
+    /// bookkeeping. Commit moved to the M12 broker barrier: dispatch runs
+    /// through `EffectBroker::dispatch`, never around it.
     pub async fn rollback(&self, effect: Box<dyn Effect>, reason: &str) -> AgentResult<()> {
         effect.rollback(reason).await
     }
@@ -565,21 +559,26 @@ mod tests {
     // --- EffectAuthority ---
 
     #[tokio::test]
-    async fn effect_authority_commits_and_rolls_back_through_one_seam() {
-        let authority = EffectAuthority;
+    async fn effect_receipt_classification_survives_the_local_broker_dispatch() {
+        use crate::port::EffectBroker as _;
+        let broker = crate::port::LocalEffectBroker;
 
         let action = Arc::new(std::sync::Mutex::new("pending"));
-        let receipt = authority
-            .commit(Box::new(RecordingEffect {
-                action: action.clone(),
-                commit_fails: false,
-            }))
+        let receipt = broker
+            .dispatch(crate::port::ReservedEffect {
+                reservation: test_reservation(),
+                reservation_id: "r1".into(),
+                effect: Box::new(RecordingEffect {
+                    action: action.clone(),
+                    commit_fails: false,
+                }),
+            })
             .await;
         assert_eq!(*action.lock().unwrap(), "committed");
         assert!(
             matches!(
                 &receipt,
-                EffectReceipt::Applied {
+                agent_contracts::EffectReceipt::Applied {
                     durability: EffectDurability::Durable,
                     evidence: Some(id),
                 } if id == "tx-1"
@@ -588,6 +587,7 @@ mod tests {
         );
 
         let action = Arc::new(std::sync::Mutex::new("pending"));
+        let authority = EffectAuthority;
         authority
             .rollback(
                 Box::new(RecordingEffect {
@@ -608,16 +608,31 @@ mod tests {
 
         // The commit-failure classification survives the seam.
         let action = Arc::new(std::sync::Mutex::new("pending"));
-        let result = authority
-            .commit(Box::new(RecordingEffect {
-                action,
-                commit_fails: true,
-            }))
+        let result = broker
+            .dispatch(crate::port::ReservedEffect {
+                reservation: test_reservation(),
+                reservation_id: "r2".into(),
+                effect: Box::new(RecordingEffect {
+                    action,
+                    commit_fails: true,
+                }),
+            })
             .await;
         assert!(
-            matches!(result, EffectReceipt::NotApplied { .. }),
+            matches!(result, agent_contracts::EffectReceipt::NotApplied { .. }),
             "a refused commit returns NotApplied: {result:?}"
         );
+    }
+
+    fn test_reservation() -> crate::port::EffectReservation {
+        crate::port::EffectReservation {
+            run_id: RunId::new(),
+            operation_id: agent_contracts::OperationId::new(),
+            effect_id: agent_contracts::EffectId::new(),
+            argument_digest: agent_contracts::ArgumentDigest::sha256_bytes(b"args"),
+            generation: 0,
+            intent: None,
+        }
     }
 
     // --- OutputAuthority ---

@@ -181,6 +181,85 @@ pub enum EffectCommitRejection {
     /// to a path the leased intent never approved. Authority widening at
     /// commit time — rollback, never commit.
     ActualExceedsApproved,
+    /// M12 barrier: the broker could not reserve the approved effect
+    /// before dispatch. Nothing was applied; the prepared effect is
+    /// settled as NotApplied and the decision returns as a rejection.
+    BrokerUnavailable,
+}
+
+/// M12 reserved/dispatch/ack barrier — phase 1 input: the approved
+/// authority shape of one effect, registered with the broker BEFORE any
+/// mutation applies. Carries identities and the leased intent only;
+/// never argument bodies or effect internals.
+#[derive(Debug, Clone)]
+pub struct EffectReservation {
+    pub run_id: RunId,
+    pub operation_id: OperationId,
+    pub effect_id: EffectId,
+    pub argument_digest: ArgumentDigest,
+    pub generation: u64,
+    /// The leased intent when a lease exists. A remote broker sees the
+    /// authority shape it may be asked to coordinate; `None` follows the
+    /// legacy no-lease read-only path.
+    pub intent: Option<agent_contracts::EffectIntent>,
+}
+
+/// Phase 2 input: the reservation plus the prepared effect to apply.
+pub struct ReservedEffect {
+    pub reservation: EffectReservation,
+    /// Opaque broker-assigned identity from [`EffectBroker::reserve`].
+    pub reservation_id: String,
+    pub effect: Box<dyn agent_contracts::Effect>,
+}
+
+/// Phase 3 input: durable acknowledgement keyed by the reservation.
+pub struct EffectAck {
+    pub reservation_id: String,
+    pub operation_id: OperationId,
+    pub applied: bool,
+    /// Bounded receipt summary for broker-side audit.
+    pub receipt_summary: String,
+}
+
+/// The reserved/dispatch/ack barrier every committed effect crosses.
+/// The default [`LocalEffectBroker`] preserves today's inline behavior
+/// exactly; a remote coordinator implements the same three calls so a
+/// future HTTP/gRPC broker can own execution without changing Core's
+/// authority checks or Runtime's actor.
+#[async_trait::async_trait]
+pub trait EffectBroker: Send + Sync {
+    /// Reserve the approved effect before dispatch. An error fences
+    /// dispatch: nothing was applied and the commit settles rejected.
+    async fn reserve(&self, reservation: EffectReservation) -> AgentResult<String>;
+    /// Apply the prepared effect under its reservation, exactly once.
+    async fn dispatch(&self, reserved: ReservedEffect) -> EffectReceipt;
+    /// Acknowledge the outcome after the receipt is known. A failure is
+    /// surfaced but never rolls an already-applied effect back — the
+    /// operation terminal record remains Core's durability barrier.
+    async fn ack(&self, ack: EffectAck) -> AgentResult<()>;
+}
+
+/// The default in-process broker: reserve derives a bounded id from the
+/// request identities, dispatch commits the prepared effect, ack is a
+/// no-op (durability stays with the operation terminal record).
+pub struct LocalEffectBroker;
+
+#[async_trait::async_trait]
+impl EffectBroker for LocalEffectBroker {
+    async fn reserve(&self, reservation: EffectReservation) -> AgentResult<String> {
+        Ok(format!(
+            "local/{}/{}/g{}",
+            reservation.run_id, reservation.operation_id, reservation.generation
+        ))
+    }
+
+    async fn dispatch(&self, reserved: ReservedEffect) -> EffectReceipt {
+        reserved.effect.commit().await
+    }
+
+    async fn ack(&self, _ack: EffectAck) -> AgentResult<()> {
+        Ok(())
+    }
 }
 
 /// Atomic Core result for Runtime's exact-current-operation cancellation.
@@ -676,7 +755,74 @@ impl CorePort for CoreAuthority {
                 }
                 return EffectCommitDisposition::Rejected(rejection);
             }
-            let receipt = self.effect().commit(effect).await;
+            // M12 reserved/dispatch/ack barrier: reserve BEFORE anything
+            // applies. A reservation failure fences dispatch — the effect
+            // settles NotApplied and the commit returns rejected.
+            let reservation = EffectReservation {
+                run_id,
+                operation_id,
+                effect_id,
+                argument_digest,
+                generation,
+                intent: lease.as_ref().map(|lease| lease.intent.clone()),
+            };
+            let reservation_id = match self.broker().reserve(reservation).await {
+                Ok(reservation_id) => reservation_id,
+                Err(error) => {
+                    if let Err(settle_error) = settle_rejected_effect(
+                        self,
+                        operation_id,
+                        effect_id,
+                        argument_digest,
+                        effect,
+                        format!("broker could not reserve the approved effect: {error}"),
+                    )
+                    .await
+                    {
+                        return EffectCommitDisposition::AuthorityRecordFailed {
+                            receipt: EffectReceipt::NotApplied {
+                                error:
+                                    "effect commit was rejected because its broker reservation failed"
+                                        .into(),
+                            },
+                            error: settle_error,
+                        };
+                    }
+                    return EffectCommitDisposition::Rejected(
+                        EffectCommitRejection::BrokerUnavailable,
+                    );
+                }
+            };
+            let receipt = self
+                .broker()
+                .dispatch(ReservedEffect {
+                    reservation: EffectReservation {
+                        run_id,
+                        operation_id,
+                        effect_id,
+                        argument_digest,
+                        generation,
+                        intent: lease.as_ref().map(|lease| lease.intent.clone()),
+                    },
+                    reservation_id: reservation_id.clone(),
+                    effect,
+                })
+                .await;
+            let applied = !matches!(receipt, EffectReceipt::NotApplied { .. });
+            if let Err(error) = self
+                .broker()
+                .ack(EffectAck {
+                    reservation_id,
+                    operation_id,
+                    applied,
+                    receipt_summary: format!("applied={applied}"),
+                })
+                .await
+            {
+                // The effect already applied (or truthfully reported
+                // NotApplied); an ack failure never rolls it back.
+                tracing::error!(%error, %operation_id, "effect broker ack failed");
+            }
             if let Err(error) = self.finish_operation_effect(operation_id, &receipt) {
                 tracing::error!(%error, %operation_id, "operation terminal record failed");
                 return EffectCommitDisposition::AuthorityRecordFailed {
@@ -1185,6 +1331,43 @@ mod tests {
         )
     }
 
+    /// Records the barrier phase order and the reservation id that threads
+    /// through dispatch/ack; can be told to fail the reserve phase.
+    struct RecordingBroker {
+        phases: Arc<Mutex<Vec<String>>>,
+        fail_reserve: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl EffectBroker for RecordingBroker {
+        async fn reserve(&self, reservation: EffectReservation) -> AgentResult<String> {
+            if self.fail_reserve {
+                return Err(AgentError::Storage(
+                    "simulated broker reservation failure".into(),
+                ));
+            }
+            let id = format!("broker/{}", reservation.operation_id);
+            self.phases.lock().unwrap().push(format!("reserve:{id}"));
+            Ok(id)
+        }
+
+        async fn dispatch(&self, reserved: ReservedEffect) -> EffectReceipt {
+            self.phases
+                .lock()
+                .unwrap()
+                .push(format!("dispatch:{}", reserved.reservation_id));
+            reserved.effect.commit().await
+        }
+
+        async fn ack(&self, ack: EffectAck) -> AgentResult<()> {
+            self.phases.lock().unwrap().push(format!(
+                "ack:{}:applied={}",
+                ack.reservation_id, ack.applied
+            ));
+            Ok(())
+        }
+    }
+
     #[test]
     fn durable_core_startup_advances_recovered_epoch_before_publication() {
         let journal = Arc::new(RecoveredJournal {
@@ -1633,6 +1816,200 @@ mod tests {
             EffectCommitDisposition::Rejected(EffectCommitRejection::ForeignRun)
         ));
         assert!(state.lock().unwrap().starts_with("rolled back:"));
+    }
+
+    #[tokio::test]
+    async fn commit_crosses_reserve_dispatch_ack_in_order_and_threads_the_reservation() {
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let state = Arc::new(Mutex::new(String::new()));
+        let port = build_core_port(
+            CoreAuthorityConfig {
+                effect_broker: Some(Arc::new(RecordingBroker {
+                    phases: phases.clone(),
+                    fail_reserve: false,
+                })),
+                ..CoreAuthorityConfig::default()
+            },
+            Arc::new(StubContext),
+            Arc::new(PreparedEffectTools {
+                state: state.clone(),
+                risk: agent_contracts::ToolRisk::WorkspaceWrite,
+                actual: None,
+                name: "prepared.effect",
+            }),
+            Arc::new(Allow),
+            None,
+        );
+        let call = ToolCall {
+            id: "write-1".into(),
+            name: "prepared.effect".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs", "content": "x"}),
+        };
+        let surface = ToolSurfaceSnapshot {
+            specs: PreparedEffectTools {
+                state: state.clone(),
+                risk: agent_contracts::ToolRisk::WorkspaceWrite,
+                actual: None,
+                name: "prepared.effect",
+            }
+            .specs(),
+            ..ToolSurfaceSnapshot::default()
+        };
+        let generation = port.current_authority_epoch();
+        let operation_id = OperationId::new();
+        let argument_digest = ArgumentDigest::from_json(&call.arguments);
+        let execution = admit_and_execute(
+            port.as_ref(),
+            ToolOperationIdentity {
+                run_id: port.run_id(),
+                task_id: None,
+                turn_id: TurnId::new(),
+                scope_id: None,
+                operation_id,
+                generation,
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest,
+            },
+            call,
+            CancellationToken::new(),
+            &surface,
+        )
+        .await;
+        let CoreToolExecution {
+            outcome,
+            lease,
+            effect_id,
+            ..
+        } = execution;
+        let ToolOutcome::PreparedEffect { effect, .. } = outcome else {
+            panic!("fixture must return a prepared effect")
+        };
+        let effect_id = effect_id.expect("Core assigns prepared effect identity");
+        let lease = lease.expect("write-risk operation receives a lease");
+        let receipt = port
+            .commit_effect(EffectCommitRequest {
+                run_id: port.run_id(),
+                turn_id: TurnId::new(),
+                operation_id,
+                effect_id,
+                argument_digest,
+                generation,
+                lease: Some(lease),
+                effect,
+            })
+            .await;
+        assert!(matches!(
+            receipt,
+            EffectCommitDisposition::Receipt(EffectReceipt::Applied { .. })
+        ));
+        let phases = phases.lock().unwrap().clone();
+        assert_eq!(phases.len(), 3, "{phases:?}");
+        let reservation_id = phases[0]
+            .strip_prefix("reserve:")
+            .expect("phase 1 is reserve")
+            .to_string();
+        assert_eq!(phases[1], format!("dispatch:{reservation_id}"));
+        assert_eq!(phases[2], format!("ack:{reservation_id}:applied=true"));
+        assert_eq!(&*state.lock().unwrap(), "committed");
+    }
+
+    #[tokio::test]
+    async fn failed_broker_reservation_fences_dispatch_and_settles_not_applied() {
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let state = Arc::new(Mutex::new(String::new()));
+        let port = build_core_port(
+            CoreAuthorityConfig {
+                effect_broker: Some(Arc::new(RecordingBroker {
+                    phases: phases.clone(),
+                    fail_reserve: true,
+                })),
+                ..CoreAuthorityConfig::default()
+            },
+            Arc::new(StubContext),
+            Arc::new(PreparedEffectTools {
+                state: state.clone(),
+                risk: agent_contracts::ToolRisk::WorkspaceWrite,
+                actual: None,
+                name: "prepared.effect",
+            }),
+            Arc::new(Allow),
+            None,
+        );
+        let call = ToolCall {
+            id: "write-2".into(),
+            name: "prepared.effect".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs", "content": "x"}),
+        };
+        let surface = ToolSurfaceSnapshot {
+            specs: PreparedEffectTools {
+                state: state.clone(),
+                risk: agent_contracts::ToolRisk::WorkspaceWrite,
+                actual: None,
+                name: "prepared.effect",
+            }
+            .specs(),
+            ..ToolSurfaceSnapshot::default()
+        };
+        let generation = port.current_authority_epoch();
+        let operation_id = OperationId::new();
+        let argument_digest = ArgumentDigest::from_json(&call.arguments);
+        let execution = admit_and_execute(
+            port.as_ref(),
+            ToolOperationIdentity {
+                run_id: port.run_id(),
+                task_id: None,
+                turn_id: TurnId::new(),
+                scope_id: None,
+                operation_id,
+                generation,
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                argument_digest,
+            },
+            call,
+            CancellationToken::new(),
+            &surface,
+        )
+        .await;
+        let CoreToolExecution {
+            outcome,
+            lease,
+            effect_id,
+            ..
+        } = execution;
+        let ToolOutcome::PreparedEffect { effect, .. } = outcome else {
+            panic!("fixture must return a prepared effect")
+        };
+        let effect_id = effect_id.expect("Core assigns prepared effect identity");
+        let lease = lease.expect("write-risk operation receives a lease");
+        let disposition = port
+            .commit_effect(EffectCommitRequest {
+                run_id: port.run_id(),
+                turn_id: TurnId::new(),
+                operation_id,
+                effect_id,
+                argument_digest,
+                generation,
+                lease: Some(lease),
+                effect,
+            })
+            .await;
+        assert!(
+            matches!(
+                disposition,
+                EffectCommitDisposition::Rejected(EffectCommitRejection::BrokerUnavailable)
+            ),
+            "unexpected disposition: {disposition:?}"
+        );
+        assert!(
+            phases.lock().unwrap().is_empty(),
+            "no dispatch or ack may follow a failed reservation"
+        );
+        assert!(
+            state.lock().unwrap().starts_with("rolled back:"),
+            "the prepared effect settles NotApplied through rollback"
+        );
     }
 
     #[tokio::test]

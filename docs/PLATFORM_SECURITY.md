@@ -135,8 +135,17 @@ Standing grants: a process grant is exactly one of `exec_argv_prefix` or
 covers the actual spawn.
 
 M12 remaining: one `EffectRequest`/commit path for brokerable side
-effects. A future HTTP/gRPC broker still needs the reserved/dispatch/ack
-barrier. Do not close M12 because structured intents landed.
+effects. The reserved/dispatch/ack barrier is now structured in Core:
+every approved effect crosses an `EffectBroker` seam — `reserve` before
+anything applies (failure fences dispatch and settles the prepared effect
+NotApplied as a `BrokerUnavailable` rejection), `dispatch` applies the
+prepared effect exactly once under its reservation, and `ack` reports the
+outcome without ever rolling an applied effect back. The default local
+broker preserves inline behavior byte-for-byte; the operation terminal
+record remains the durability barrier. A future HTTP/gRPC coordinator
+implements the same three calls against this trait — that transport, plus
+crash reconciliation of broker-owned reservations, is still M12 work.
+Do not close M12 because structured intents or the local barrier landed.
 
 ## HostLifecycle (restart)
 
