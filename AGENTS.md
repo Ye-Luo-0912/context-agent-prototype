@@ -32,6 +32,10 @@ Do not duplicate those lists here. Do not treat
 4. **Keep code maintainable.** Use single-purpose functions, clear names, and
    comments that explain *why*. Tests and failures should be understandable
    without reverse-engineering the system.
+5. **Keep tracking numbers out of code comments.** Milestone, defect and
+   slice ids (`M12`, `MOD-AUTH-02`, `LT-RUN-04`, ...) are tracking
+   vocabulary for `docs/*` only. Code comments state facts and constraints
+   in plain language and never carry them.
 
 ## Non-negotiable invariants
 
