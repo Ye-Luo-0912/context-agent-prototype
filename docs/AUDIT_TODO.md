@@ -562,12 +562,17 @@ Landed 2026-08-23: fail-closed routing-layer sanitizer
 (`sanitize_untrusted_producer_output`) strips reserved diagnosis keys
 before Core reads them plus the producer-authority keys from every
 capability output; contract direction written into
-[`TOOL_RESULT_ENVELOPE.md`](TOOL_RESULT_ENVELOPE.md). Still open before
-Self-Iteration: introduce the typed host-trusted `ToolExecutionFacts`
-channel so context heating, ExecutionState, Evidence Frontier,
-RetryDomain and Verification consume runtime/verified facts instead of
-producer metadata at all (capability default = empty facts; effect
-receipts and workspace handles generate Runtime-owned facts).
+[`TOOL_RESULT_ENVELOPE.md`](TOOL_RESULT_ENVELOPE.md). Typed-facts
+substrate landed 2026-08-26: `ToolExecutionFacts` in
+`agent-contracts/src/execution_facts.rs` carries resources / mutation
+bound / verification stamp / runtime diagnosis as typed values with
+constructors that mirror the legacy accessors exactly and default to
+empty facts; no consumer reads them yet and there is no durable wire
+form. Still open before
+Self-Iteration: switch context heating, ExecutionState, Evidence
+Frontier, RetryDomain and Verification to consume the typed facts
+instead of producer metadata at all (capability default = empty facts;
+effect receipts and workspace handles generate Runtime-owned facts).
 
 ### PROTO-EVID-02 — cache correctness + observability (fixed 2026-08-23)
 

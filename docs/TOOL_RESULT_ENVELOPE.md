@@ -71,9 +71,16 @@ Tool execution
 Direction for the follow-up mainline (before Self-Iteration): introduce
 the typed host-trusted `ToolExecutionFacts` channel so context heating,
 ExecutionState, Evidence Frontier, RetryDomain and Verification consume
-facts that never originate in producer metadata. Do not add new
-authority-bearing keys to `metadata`; plugin authors must not assume
-`metadata.path`/`metadata.revision` reaches the Runtime as truth.
+facts that never originate in producer metadata. The typed vocabulary
+landed 2026-08-26 (`agent-contracts/src/execution_facts.rs`): it carries
+the same four fact groups as typed values, mirrors today's
+resource/mutation/heating derivation rules exactly, defaults dynamic
+capabilities to empty facts, and has no durable wire form yet. Still
+open: switching the listed consumers from metadata-derived accessors to
+the typed facts, and runtime-side construction from effect receipts and
+workspace handles. Do not add new authority-bearing keys to `metadata`;
+plugin authors must not assume `metadata.path`/`metadata.revision`
+reaches the Runtime as truth.
 
 ## 2. Error envelope
 

@@ -7,6 +7,7 @@ pub mod context;
 pub mod discovery;
 pub mod error;
 pub mod event;
+pub mod execution_facts;
 pub mod host_policy;
 pub mod ids;
 pub mod input;
@@ -30,6 +31,7 @@ pub use context::*;
 pub use discovery::*;
 pub use error::*;
 pub use event::*;
+pub use execution_facts::*;
 pub use host_policy::{
     HostEffectBinding, HostExecRecipe, HostPolicySnapshot, HostToolPolicies, HostToolPolicy,
     unbound_effect_intent,
