@@ -222,6 +222,7 @@ version = "0.1.0"
 dependencies = [
  "agent-contracts",
  "agent-process",
+ "agent-workspace",
  "async-trait",
  "libc",
  "serde",

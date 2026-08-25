@@ -52,9 +52,13 @@ in parallel, but it does not reorder or close either gate.
    frames survive the death; cross-process external races (a refused second
    official writer and a retry-window lock handoff) and mid-journal
    corruption or checksum-valid sequence gaps have deterministic fail-closed
-   fixtures; portable disk-full injection still needs a storage seam before
-   broader filesystem reliability
-   claims. Do not turn expected stale refusal into a first-attempt
+   fixtures. Portable disk-full injection landed 2026-08-26 behind a
+   feature-gated storage seam (`test-faults`): injected refusals at the
+   authority-intent append, the staged temp bytes, and the committed-record
+   append have deterministic child-process fixtures pinning the honest
+   classifications — nothing staged, rolled-back cleanup of the truncated
+   stage, and applied-but-not-durably-acknowledged recovery by hash
+   evidence (`Applied { complete: false }`). Do not turn expected stale refusal into a first-attempt
    defect: grade the bounded read→stale→reread→retry state machine. Unit fixes
    or this diagnostic alone do not close M12, M13, or M15.
 5. Formal M15 only from versioned per-cell artifacts. Do not use one

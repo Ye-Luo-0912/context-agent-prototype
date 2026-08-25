@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Portable storage-full fault injection for the disk-full recovery fixtures.
+# Default builds carry no injection surface; only this package's own tests,
+# its crash_probe helper, and fixtures that opt in through the self
+# dev-dependency below can arm a plan.
+test-faults = []
+
 [dependencies]
 agent-contracts.workspace = true
 agent-process.workspace = true
@@ -31,3 +38,6 @@ windows-sys = { version = "0.59", features = [
 
 [dev-dependencies]
 tempfile = "3"
+# Self-dependency so integration tests and the crash_probe bin are built
+# against this crate with the test-faults feature enabled during test runs.
+agent-workspace = { path = ".", features = ["test-faults"] }

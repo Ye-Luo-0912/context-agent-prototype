@@ -420,8 +420,11 @@ non-conflict first-patch success, correct proactive/reactive stale recovery,
 edit-to-passing verification, failure class, fallback-to-shell/`fs.write`,
 confirm reads, rounds, tokens, p50/p95 latency, bytes read/staged, commit
 conflicts and partial recovery. Safety refusals may be a separate class, but
-remain in end-to-end task success/time/cost. Add deterministic fault/race
-fixtures before broader filesystem claims. M12 and M13 mainline does not move.
+remain in end-to-end task success/time/cost. Deterministic fault/race
+coverage is landed through 2026-08-26, including portable disk-full
+injection behind the `test-faults` storage seam (intent append, staged
+bytes, committed record) with fail-closed recovery fixtures. M12 and M13
+mainline does not move.
 
 ## Open P1 — runtime scheduling correctness
 

@@ -25,6 +25,7 @@ mod journal;
 mod process_journal;
 mod remote_journal;
 mod runtime_facts;
+mod storage_faults;
 
 pub use agent_contracts::{ArtifactLocator, MAX_ARTIFACT_REFERENCE_BYTES};
 pub use broker::WorkspaceOutputBroker;
@@ -33,6 +34,7 @@ pub use handles::{ArtifactStoreHandle, ConfinedWorkspaceHandle};
 pub use journal::WorkspaceEffectRecovery;
 pub use remote_journal::RemoteEffectAck;
 pub use runtime_facts::capture_host_runtime_facts;
+pub use storage_faults::StorageFaultPlan;
 
 /// One record in the workspace change journal (`.focus-agent/changes.jsonl`).
 ///
@@ -363,6 +365,9 @@ pub struct Workspace {
     remote_journal: Arc<remote_journal::RemoteEffectJournal>,
     mutation_locks: Arc<MutationLockRegistry>,
     change_journal_lock: Arc<StdMutex<()>>,
+    /// Inert unless a fixture arms a plan through
+    /// [`Self::arm_storage_faults`]; default behavior never reads it.
+    storage_faults: storage_faults::SharedFaultPlan,
 }
 
 /// One existing-file snapshot and the journal transaction that owns its
@@ -490,6 +495,7 @@ impl Workspace {
             remote_journal,
             mutation_locks: Arc::new(MutationLockRegistry::default()),
             change_journal_lock: Arc::new(StdMutex::new(())),
+            storage_faults: StorageFaultPlan::shared(),
         })
     }
 
@@ -499,6 +505,17 @@ impl Workspace {
 
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
+    }
+
+    /// Arm a portable storage-full fault plan on this instance. Only
+    /// compiled into test builds (`test-faults`); passing `None` disarms
+    /// every point again.
+    #[cfg(feature = "test-faults")]
+    pub fn arm_storage_faults(&self, plan: Option<StorageFaultPlan>) {
+        *self
+            .storage_faults
+            .lock()
+            .expect("storage fault plan poisoned") = plan;
     }
 
     async fn acquire_mutation_keys(&self, mut keys: Vec<String>) -> Arc<MutationLeaseGroup> {
@@ -1398,6 +1415,14 @@ impl MutationTransaction {
             .unwrap_or_else(|| ContentDigest::sha256_bytes(&[]))
             .to_string();
         if let Some(context) = &effect_context {
+            if let Some(plan) = storage_faults::active_plan(&self.workspace.storage_faults)
+                && plan.refuse_prepare_intent_append
+            {
+                return Err(AgentError::Storage(
+                    storage_faults::StorageFaultPlan::storage_full("authority intent append")
+                        .to_string(),
+                ));
+            }
             self.workspace
                 .effect_journal
                 .append_prepared(journal::PreparedEvidence {
@@ -1448,6 +1473,21 @@ impl MutationTransaction {
             use std::io::Write;
 
             let file = staged_cleanup.file_mut();
+            // A truncated stage leaves exactly what a full disk would:
+            // partial bytes in the exclusively-created temp, which the
+            // prepare path must clean up itself before rolling the intent
+            // back.
+            if let Some(budget) = storage_faults::active_plan(&self.workspace.storage_faults)
+                .and_then(|plan| plan.stage_write_budget_bytes)
+                && (budget as usize) < content.len()
+            {
+                let budget = budget as usize;
+                file.write_all(&content[..budget])?;
+                file.flush()?;
+                return Err(storage_faults::StorageFaultPlan::storage_full(
+                    "staged temp write",
+                ));
+            }
             file.write_all(content)?;
             file.flush()?;
             #[cfg(not(windows))]
@@ -1767,13 +1807,25 @@ impl PreparedMutation {
                 evidence: Some(self.tx_id.clone()),
             };
         }
-        if self.effect_context.is_some()
-            && let Err(error) = self.workspace.effect_journal.append_committed(&self.tx_id)
-        {
-            return EffectReceipt::Applied {
-                durability: EffectDurability::DurabilityFailed(error.to_string()),
-                evidence: Some(self.tx_id.clone()),
-            };
+        if self.effect_context.is_some() {
+            // The replace already landed; a full disk here is an applied-
+            // but-not-durably-acknowledged outcome, never a rollback.
+            if let Some(plan) = storage_faults::active_plan(&self.workspace.storage_faults)
+                && plan.refuse_commit_record_append
+            {
+                return EffectReceipt::Applied {
+                    durability: EffectDurability::DurabilityFailed(
+                        "injected storage full during the committed-record append".into(),
+                    ),
+                    evidence: Some(self.tx_id.clone()),
+                };
+            }
+            if let Err(error) = self.workspace.effect_journal.append_committed(&self.tx_id) {
+                return EffectReceipt::Applied {
+                    durability: EffectDurability::DurabilityFailed(error.to_string()),
+                    evidence: Some(self.tx_id.clone()),
+                };
+            }
         }
         let record = ChangeRecord::MutationCommitted {
             tx_id: self.tx_id.clone(),

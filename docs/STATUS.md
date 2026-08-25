@@ -643,8 +643,13 @@ the r4 evidence `REPORT.md`. This proves the combined contract on that frozen
 surface, not a general task-failure rate or a causal performance gain.
 
 `TOOL-EDIT-02` remains open for the same frozen run on a clean source tree.
-Deterministic external-race/crash/disk/journal fault coverage and staged-byte
-accounting are the next breadth/reliability work; they are not evidence that
+Deterministic external-race, crash, journal-fault and — since 2026-08-26 —
+disk-full coverage are landed: the feature-gated `test-faults` storage seam
+injects storage-full refusals at the authority intent, the staged temp bytes
+and the committed record, with fixtures pinning nothing-staged, rolled-back
+cleanup of a truncated stage, and `Applied { complete: false }` recovery by
+hash evidence. Broader staged-byte accounting breadth remains reliability
+work; it is not evidence that
 the 12-cell diagnostic failed. Clones share the lease and a second official
 `Workspace::open` on the same root is refused by the authority-journal lock;
 direct or authority-bypassing filesystem writers remain outside it, and
