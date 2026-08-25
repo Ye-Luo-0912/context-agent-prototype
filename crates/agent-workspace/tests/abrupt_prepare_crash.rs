@@ -155,3 +155,50 @@ async fn abrupt_kill_right_after_commit_recovers_durable_applied_content() {
         WorkspaceEffectRecovery::Applied { .. }
     ));
 }
+
+#[tokio::test]
+async fn abrupt_kill_mid_batch_reports_applied_but_incomplete_and_cleans_the_remainder() {
+    let directory = tempfile::tempdir().unwrap();
+    let context = crash_context();
+
+    kill_probe_during(directory.path(), "partial", &context);
+
+    let reopened = Workspace::open(directory.path()).await.unwrap();
+    match reopened.reconcile_effect(&context).unwrap() {
+        WorkspaceEffectRecovery::Applied { tx_ids, complete } => {
+            assert_eq!(tx_ids.len(), 2);
+            assert!(
+                !complete,
+                "a batch whose second target never committed is incomplete"
+            );
+        }
+        other => panic!("unexpected recovery after a mid-batch kill: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(directory.path().join("one.txt")).unwrap(),
+        b"one",
+        "the landed first target keeps its committed content"
+    );
+    assert!(
+        !directory.path().join("second.txt").exists(),
+        "the killed second stage must never surface as a target"
+    );
+    let leaked_temp = std::fs::read_dir(directory.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"));
+    assert!(
+        !leaked_temp,
+        "recovery must clean the remainder a killed batch left behind"
+    );
+
+    drop(reopened);
+    let again = Workspace::open(directory.path()).await.unwrap();
+    assert!(matches!(
+        again.reconcile_effect(&context).unwrap(),
+        WorkspaceEffectRecovery::Applied {
+            complete: false,
+            ..
+        }
+    ));
+}
