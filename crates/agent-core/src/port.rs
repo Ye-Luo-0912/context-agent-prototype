@@ -1573,6 +1573,170 @@ mod tests {
         assert_eq!(&*state.lock().unwrap(), "committed");
     }
 
+    /// 端到端：真实带日志经纪作为配置传入时，启动对账按持久预留
+    /// 分类终结未决操作——只预约未派发无围栏终结，已派发未应答围栏。
+    #[tokio::test]
+    async fn startup_reconciles_through_a_configured_journaled_broker() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("reservations.jsonl");
+        let effect_id = EffectId::new();
+        let identity = ToolOperationIdentity {
+            run_id: RunId::new(),
+            task_id: None,
+            turn_id: TurnId::new(),
+            scope_id: None,
+            operation_id: OperationId::new(),
+            generation: 7,
+            call_id: "recovered-call".into(),
+            tool_name: "cap.remote".into(),
+            argument_digest: ArgumentDigest::sha256_bytes(b"recovered-args"),
+        };
+        use crate::port::EffectBroker as _;
+
+        // 只预约未派发：重开后必须无围栏地终结为 NotApplied。
+        {
+            let broker = crate::broker::JournaledEffectBroker::open(
+                Arc::new(LocalEffectBroker),
+                &journal_path,
+            )
+            .unwrap();
+            broker
+                .reserve(EffectReservation {
+                    run_id: identity.run_id,
+                    operation_id: identity.operation_id,
+                    effect_id,
+                    argument_digest: identity.argument_digest,
+                    generation: identity.generation,
+                    intent: None,
+                })
+                .await
+                .unwrap();
+        }
+        let snapshot = OperationSnapshot {
+            identity: identity.clone(),
+            state: OperationState::Prepared { effect_id },
+        };
+        let operation_journal = Arc::new(RecoveredJournal {
+            recovery: agent_contracts::OperationJournalRecovery {
+                authority_epoch: 7,
+                operations: vec![snapshot],
+                ..agent_contracts::OperationJournalRecovery::default()
+            },
+            transitions: Mutex::new(Vec::new()),
+        });
+        let config = CoreAuthorityConfig {
+            effect_broker: Some(Arc::new(
+                crate::broker::JournaledEffectBroker::open(
+                    Arc::new(LocalEffectBroker),
+                    &journal_path,
+                )
+                .unwrap(),
+            )),
+            ..CoreAuthorityConfig::default()
+        };
+        let core = try_build_core_port(
+            config,
+            Arc::new(StubContext),
+            Arc::new(StubTools),
+            Arc::new(Allow),
+            None,
+            Some(operation_journal),
+            None,
+        )
+        .unwrap();
+        assert_eq!(core.recovery_status(), AuthorityRecoveryStatus::Ready);
+        assert!(matches!(
+            core.query_operation(identity.operation_id),
+            OperationQueryResult::Found { snapshot }
+                if matches!(
+                    snapshot.state,
+                    OperationState::Terminal {
+                        effect_id: Some(terminal_effect),
+                        terminal: OperationTerminal::NotApplied { .. },
+                    } if terminal_effect == effect_id
+                )
+        ));
+
+        // 已派发未应答：重开必须围栏，绝不猜测。
+        let ambiguous_dir = tempfile::tempdir().unwrap();
+        let ambiguous_path = ambiguous_dir.path().join("reservations.jsonl");
+        let pending = EffectId::new();
+        {
+            let broker = crate::broker::JournaledEffectBroker::open(
+                Arc::new(LocalEffectBroker),
+                &ambiguous_path,
+            )
+            .unwrap();
+            broker
+                .reserve(EffectReservation {
+                    run_id: identity.run_id,
+                    operation_id: identity.operation_id,
+                    effect_id: pending,
+                    argument_digest: identity.argument_digest,
+                    generation: identity.generation,
+                    intent: None,
+                })
+                .await
+                .unwrap();
+            broker
+                .dispatch(ReservedEffect {
+                    reservation: EffectReservation {
+                        run_id: identity.run_id,
+                        operation_id: identity.operation_id,
+                        effect_id: pending,
+                        argument_digest: identity.argument_digest,
+                        generation: identity.generation,
+                        intent: None,
+                    },
+                    reservation_id: format!(
+                        "local/{}/{}/g{}",
+                        identity.run_id, identity.operation_id, identity.generation
+                    ),
+                    effect: Box::new(RecordingEffect {
+                        state: Arc::new(Mutex::new(String::new())),
+                        actual: None,
+                    }),
+                })
+                .await;
+        }
+        let snapshot = OperationSnapshot {
+            identity: identity.clone(),
+            state: OperationState::Prepared { effect_id: pending },
+        };
+        let operation_journal = Arc::new(RecoveredJournal {
+            recovery: agent_contracts::OperationJournalRecovery {
+                authority_epoch: 7,
+                operations: vec![snapshot],
+                ..agent_contracts::OperationJournalRecovery::default()
+            },
+            transitions: Mutex::new(Vec::new()),
+        });
+        let config = CoreAuthorityConfig {
+            effect_broker: Some(Arc::new(
+                crate::broker::JournaledEffectBroker::open(
+                    Arc::new(LocalEffectBroker),
+                    &ambiguous_path,
+                )
+                .unwrap(),
+            )),
+            ..CoreAuthorityConfig::default()
+        };
+        let core = try_build_core_port(
+            config,
+            Arc::new(StubContext),
+            Arc::new(StubTools),
+            Arc::new(Allow),
+            None,
+            Some(operation_journal),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            core.recovery_status(),
+            AuthorityRecoveryStatus::RecoveryRequired { .. }
+        ));
+    }
+
     #[test]
     fn durable_core_startup_advances_recovered_epoch_before_publication() {
         let journal = Arc::new(RecoveredJournal {

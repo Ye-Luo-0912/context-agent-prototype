@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let mut context_policy = "dynamic".to_string();
     let mut root_arg: Option<PathBuf> = None;
     let mut grant_args: Vec<String> = Vec::new();
+    let mut effect_reservation_journal: Option<PathBuf> = None;
     for arg in std::env::args().skip(1) {
         if arg == "--read-only" {
             read_only = true;
@@ -50,6 +51,8 @@ async fn main() -> anyhow::Result<()> {
             context_policy = value.to_string();
         } else if let Some(value) = arg.strip_prefix("--grant=") {
             grant_args.push(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("--effect-reservation-journal=") {
+            effect_reservation_journal = Some(PathBuf::from(value));
         } else if root_arg.is_none() {
             root_arg = Some(PathBuf::from(arg));
         }
@@ -115,6 +118,15 @@ async fn main() -> anyhow::Result<()> {
     ));
     let artifact_store = Arc::new(workspace.clone());
     let output_broker = Arc::new(WorkspaceOutputBroker::new(workspace.clone().into()));
+    // 交互运行默认启用持久预留屏障：路径落在状态目录的权威层，
+    // 可用 --effect-reservation-journal= 覆盖。崩溃后启动对账按
+    // 经纪预留分类未决操作；评估组合保持 None，不扰动冻结测量。
+    let reservation_journal = effect_reservation_journal.unwrap_or_else(|| {
+        workspace
+            .state_dir()
+            .join("authority")
+            .join("broker-reservations.jsonl")
+    });
     let composed = compose(ComposeConfig {
         workspace,
         context_engine,
@@ -129,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
         project_task_progress: true,
         project_completion_opportunity: false,
         host_policies: Some(host_policies),
-        effect_reservation_journal: None,
+        effect_reservation_journal: Some(reservation_journal),
     })
     .await?;
     let mut runtime_events = composed.subscribe();
