@@ -1500,6 +1500,30 @@ fn only_trusted_verify_attribution_mints_reusable_verification() {
 }
 
 #[test]
+fn dispatcher_lane_facts_verify_without_metadata_stamps() {
+    let mut state = ExecutionState::default();
+    // The output carries no verification metadata at all; the typed facts
+    // captured on the dispatcher lane are the trusted claim.
+    let verify = output("test.verify", true, "tests passed");
+    let claimed = ToolExecutionFacts::empty().with_verification(true);
+    state.observe_tool_facts(&verify, 7, 1, "arg-f", &claimed);
+    assert_eq!(state.verifications.len(), 1);
+    assert!(state.verifications[0].ok);
+
+    // Frames without a stamped claim keep the legacy metadata read.
+    let mut stamped = output("test.verify", true, "tests passed");
+    stamped.metadata = json!({"verification": true});
+    state.observe_tool_with_digest(&stamped, 7, 2, "arg-s");
+    assert_eq!(state.verifications.len(), 2);
+
+    // An unstamped claim falls back per value: no metadata, no fact row.
+    let plain = output("test.verify", true, "tests passed");
+    let empty = ToolExecutionFacts::empty();
+    state.observe_tool_facts(&plain, 7, 3, "arg-p", &empty);
+    assert_eq!(state.verifications.len(), 2);
+}
+
+#[test]
 fn exact_verification_pass_reuse_requires_the_complete_current_identity() {
     let mut state = ExecutionState::default();
     state.on_user_turn("verify current state");

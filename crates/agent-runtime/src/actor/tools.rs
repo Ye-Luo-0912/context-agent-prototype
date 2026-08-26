@@ -230,15 +230,16 @@ impl RuntimeActor {
                     ActionDispatch::Refused,
                     None,
                 );
+                let facts = self.services.tools().execution_facts(&output);
                 if let Some(turn) = self.state.turn.as_mut() {
-                    let facts = self.services.tools().execution_facts(&output);
                     turn.turn_frame
-                        .push_tool_result(output.clone(), None, facts);
+                        .push_tool_result(output.clone(), None, facts.clone());
                 }
                 let frontier = self.observe_persistable_tool(
                     &output,
                     ToolResultDisposition::PersistObservation,
                     "",
+                    &facts,
                     None,
                 );
                 self.report_frontier(frontier).await;
@@ -1251,6 +1252,7 @@ impl RuntimeActor {
                         .map(RuntimeExecutionAttribution::reusable_verification),
                 );
                 self.update_result_delivery_from_catalog_control(&output);
+                let facts = self.services.tools().execution_facts(&output);
                 let frontier = self.observe_persistable_tool(
                     &output,
                     completion.disposition,
@@ -1260,6 +1262,7 @@ impl RuntimeActor {
                         .map(|digest| digest.to_string())
                         .unwrap_or_default()
                         .as_str(),
+                    &facts,
                     settled_attribution.as_ref(),
                 );
                 // MOD-PROG-01: remember deterministic edit refusals so an
@@ -1384,6 +1387,7 @@ impl RuntimeActor {
         output: &ToolOutput,
         disposition: ToolResultDisposition,
         argument_digest: &str,
+        facts: &agent_contracts::ToolExecutionFacts,
         attribution: Option<&RuntimeExecutionAttribution>,
     ) -> Option<crate::execution::FrontierObservation> {
         if disposition != ToolResultDisposition::PersistObservation {
@@ -1405,11 +1409,15 @@ impl RuntimeActor {
                 argument_digest,
                 attribution,
             ),
-            None => turn.execution.observe_tool_with_digest(
+            // Without pre-dispatch attribution the dispatcher-lane facts
+            // are the trusted verification source, with the legacy
+            // metadata read as per-value fallback.
+            None => turn.execution.observe_tool_facts(
                 output,
                 anchor_revision,
                 turn_number,
                 argument_digest,
+                facts,
             ),
         };
         Some(observation)
@@ -1671,15 +1679,16 @@ impl RuntimeActor {
             ActionDispatch::Reused,
             attribution.map(RuntimeExecutionAttribution::reusable_verification),
         );
+        let facts = self.services.tools().execution_facts(&output);
         if let Some(turn) = self.state.turn.as_mut() {
-            let facts = self.services.tools().execution_facts(&output);
             turn.turn_frame
-                .push_tool_result(output.clone(), None, facts);
+                .push_tool_result(output.clone(), None, facts.clone());
         }
         let frontier = self.observe_persistable_tool(
             &output,
             ToolResultDisposition::PersistObservation,
             argument_digest,
+            &facts,
             attribution,
         );
         self.report_frontier(frontier).await;

@@ -589,9 +589,14 @@ single observation-ingest site with zero extra dispatcher calls, and the
 context engine reads heating/observation identity facts-first with a
 per-value legacy-metadata fallback for frames without captured touches.
 Still open before
-Self-Iteration: switch Verification's representation to the typed facts,
-move fact construction into individual trusted handlers, and define the
-event-level durable wire form. Sequencing note: once trusted handlers
+Self-Iteration: move fact construction into individual trusted handlers,
+and define the event-level durable wire form. Verification's
+representation landed 2026-08-26: the no-attribution frontier entry now
+reads its verification claim from the dispatcher-lane facts with a
+per-value legacy fallback, while `observe_tool_attributed` keeps
+pre-dispatch attribution as the only reusable-verifier authority —
+producer metadata can no longer mint even the compat path's claim when
+facts are present. Sequencing note: once trusted handlers
 stop stamping
 metadata keys entirely, the legacy derivation returns empty by
 construction and every ingest/prompt fallback becomes removal of dead

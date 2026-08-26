@@ -64,9 +64,6 @@ impl ExecutionState {
         turn: u64,
         argument_digest: &str,
     ) -> super::state::FrontierObservation {
-        // Compatibility path for deterministic state tests and old callers.
-        // Production uses `observe_tool_attributed`; only the trusted
-        // pre-dispatch channel may mint a reusable verifier there.
         self.observe_tool_inner(
             output,
             anchor_revision,
@@ -74,6 +71,31 @@ impl ExecutionState {
             argument_digest,
             None,
             output.is_verification(),
+        )
+    }
+
+    /// Observation without pre-dispatch attribution: verification authority
+    /// comes from facts captured on the dispatcher lane. Frames without a
+    /// stamped claim fall back to the legacy metadata read, which yields
+    /// identical values for every producer class today.
+    pub fn observe_tool_facts(
+        &mut self,
+        output: &ToolOutput,
+        anchor_revision: u64,
+        turn: u64,
+        argument_digest: &str,
+        facts: &agent_contracts::ToolExecutionFacts,
+    ) -> super::state::FrontierObservation {
+        let is_verification = facts
+            .is_verification()
+            .unwrap_or_else(|| output.is_verification());
+        self.observe_tool_inner(
+            output,
+            anchor_revision,
+            turn,
+            argument_digest,
+            None,
+            is_verification,
         )
     }
 

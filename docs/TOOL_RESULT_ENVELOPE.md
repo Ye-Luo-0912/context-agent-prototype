@@ -85,8 +85,11 @@ carries `facts` (same serde-defaulted shape) forwarded from turn-frame
 step facts at the actor's single observation-ingest site, and the context
 engine reads heating/observation identity facts-first with a per-value
 legacy fallback for frames without captured touches — identical values
-today for every producer class. Still open: Verification representation
-unification, handler-level direct construction (which retires the legacy
+today for every producer class. Verification's representation landed the
+same way: the no-attribution frontier entry reads its claim from
+dispatcher-lane facts first, and the attributed production entry keeps
+pre-dispatch attribution as the sole reusable-verifier authority. Still
+open: handler-level direct construction (which retires the legacy
 derivation by construction), and an event-level durable wire DTO. Do not
 add
 new authority-bearing keys to `metadata`; plugin authors must not assume
